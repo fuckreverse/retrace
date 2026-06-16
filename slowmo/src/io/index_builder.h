@@ -1,0 +1,113 @@
+#pragma once
+
+#include "common/types.h"
+#include "io/trace_reader.h"
+
+#include <rocksdb/db.h>
+#include <rocksdb/options.h>
+#include <rocksdb/slice.h>
+#include <rocksdb/write_batch.h>
+
+#include <filesystem>
+#include <functional>
+#include <memory>
+
+namespace tenet {
+
+/// Callback for progress reporting: (processed_records, total_file_bytes)
+using ProgressCallback = std::function<void(uint64_t processed, uint64_t total)>;
+
+/// Statistics from an index build.
+struct IndexStats {
+    uint64_t inst_count = 0;
+    uint64_t anchor_count = 0;
+    uint64_t code_count = 0;
+    uint64_t event_count = 0;
+    uint64_t total_records = 0;
+    double build_seconds = 0.0;
+};
+
+/// Column family names used in the RocksDB index.
+namespace cf {
+    constexpr const char* META       = "meta";
+    constexpr const char* OFFSET     = "offset";     // sparse inst_id → file_offset
+    constexpr const char* ANCHOR     = "anchor";     // anchor sequential id → file_offset
+    constexpr const char* MEM_WRITE  = "mem_write";  // [page|byte_off|inst_id] → byte_val
+}
+
+/// Manages the RocksDB-based trace index.
+/// For M1 we build: sparse offset index + anchor index.
+/// PC/mem indices are deferred to M2/M3.
+class TraceIndex {
+public:
+    ~TraceIndex();
+
+    // Movable but not copyable
+    TraceIndex(TraceIndex&& other) noexcept;
+    TraceIndex& operator=(TraceIndex&& other) noexcept;
+    TraceIndex(const TraceIndex&) = delete;
+    TraceIndex& operator=(const TraceIndex&) = delete;
+
+    /// Open or build the index for a given trace file.
+    /// If a valid cached index exists, opens it directly (< 50ms).
+    /// Otherwise, performs a full sequential build.
+    static Result<TraceIndex> open_or_build(
+        const TraceReader& reader,
+        ProgressCallback progress = nullptr);
+
+    /// Get file offset for a given inst_id.
+    /// Uses sparse index (every 256th inst) + linear scan.
+    uint64_t offset_of(uint64_t inst_id, const TraceReader& reader) const;
+
+    /// Find the nearest anchor at or before the given inst_id.
+    /// Returns (anchor_sequential_index, file_offset, inst_id_of_anchor).
+    struct AnchorInfo {
+        uint64_t anchor_idx;
+        uint64_t file_offset;
+        uint64_t inst_id;  // the inst_id at which this anchor appears
+    };
+    AnchorInfo nearest_anchor_before(uint64_t inst_id) const;
+
+    /// Get total instruction count in the trace.
+    uint64_t inst_count() const { return stats_.inst_count; }
+
+    /// Get build statistics.
+    const IndexStats& stats() const { return stats_; }
+
+    /// Check if this index is still valid for the given reader.
+    bool is_valid_for(const TraceReader& reader) const;
+
+private:
+    TraceIndex() = default;
+
+    /// Build the index from scratch.
+    static Result<TraceIndex> build(const TraceReader& reader, 
+                                    const std::filesystem::path& db_path,
+                                    ProgressCallback progress);
+
+    std::unique_ptr<rocksdb::DB> db_;
+    std::vector<rocksdb::ColumnFamilyHandle*> cf_handles_;
+    IndexStats stats_;
+    std::filesystem::path db_path_;
+
+    // In-memory anchor table for fast binary search.
+    // Each entry: (inst_id_at_anchor, file_offset_of_anchor)
+    struct AnchorEntry {
+        uint64_t inst_id;
+        uint64_t file_offset;
+    };
+    std::vector<AnchorEntry> anchors_;
+
+    // Sparse offset granularity
+    static constexpr uint64_t SPARSE_INTERVAL = 256;
+
+    // Helper: get column family handle by name
+    rocksdb::ColumnFamilyHandle* get_cf(const char* name) const;
+
+    // Public access to DB and mem_write CF for MemoryModel
+public:
+    rocksdb::DB* raw_db() const { return db_.get(); }
+    rocksdb::ColumnFamilyHandle* mem_write_cf() const { return get_cf(cf::MEM_WRITE); }
+};
+
+}  // namespace tenet
