@@ -8,11 +8,13 @@
 #include <yara.h>
 #endif
 
+#include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
 #include <deque>
 #include <algorithm>
 #include <cstring>
 #include <string_view>
+#include <unordered_map>
 
 namespace tenet {
 
@@ -32,6 +34,23 @@ constexpr uint8_t REG_X16 = 16;
 
 // Syscall buffer entry size: 8 (inst_id) + 2 (syscall_no) + 6 (pad) = 16
 constexpr size_t SYSCALL_ENTRY_SIZE = 16;
+
+// ─── Per-PC classification (pre-computed from code table) ─────────────────
+
+enum MnemonicClass : uint8_t {
+    MC_OTHER        = 0,
+    MC_HW_AES       = 1,  // aese, aesd, aesmc, aesimc
+    MC_HW_SHA       = 2,  // sha1*, sha256*
+    MC_EOR          = 3,  // eor (XOR)
+    MC_MOVZ         = 4,  // movz, mov
+    MC_MOVK         = 5,  // movk
+    MC_SVC          = 6,  // svc (syscall)
+};
+
+struct PCMnemonicInfo {
+    MnemonicClass cls = MC_OTHER;
+    std::string_view mnemonic;  // points into decoder cache (stable lifetime)
+};
 
 }  // anonymous namespace
 
@@ -235,7 +254,7 @@ bool PatternPass::load_rules() {
 #endif
 }
 
-// ─── PatternPass::run ─────────────────────────────────────────────────────
+// ─── PatternPass::run (optimized: merged mnemonic detection) ──────────────
 
 PassResult PatternPass::run(PassContext& ctx) {
     PatternResult result;
@@ -301,15 +320,10 @@ PassResult PatternPass::run(PassContext& ctx) {
     (void)has_yara;
 #endif
 
-    // Phase 3: Mnemonic-based detection (retained for HW crypto, XOR loops, const loading)
-    ctx.progress(0.6f, "Pattern: detecting hardware crypto instructions...");
-    detect_hw_crypto(ctx, result);
-
-    ctx.progress(0.7f, "Pattern: detecting XOR loops...");
-    detect_xor_loops(ctx, result);
-
-    ctx.progress(0.85f, "Pattern: detecting constant loading sequences...");
-    detect_constant_loading(ctx, result);
+    // Phase 3: MERGED mnemonic-based detection (single pass)
+    // Previously this was 3 separate full-trace scans. Now it's 1.
+    ctx.progress(0.6f, "Pattern: merged mnemonic detection (single pass)...");
+    detect_all_mnemonic_patterns(ctx, result);
 
     // Phase 4: Build category index
     build_category_index(result);
@@ -317,6 +331,240 @@ PassResult PatternPass::run(PassContext& ctx) {
     ctx.progress(1.0f, fmt::format("Pattern: {} matches found (YARA {})",
                                     result.total(), has_yara ? "enabled" : "disabled"));
     return PassResult::success(std::move(result));
+}
+
+// ─── Merged mnemonic detection (replaces 3 separate trace scans) ──────────
+
+void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result) {
+    auto& reader = ctx.reader();
+    auto& index = ctx.index();
+    auto& code_table = ctx.code_table();
+    auto& decoder = ctx.decoder();
+
+    const auto& range = ctx.range();
+    uint64_t start = range.start_inst_id;
+    uint64_t end = std::min(range.end_inst_id, index.inst_count());
+    if (end == 0) end = index.inst_count();
+
+    // ─── Pre-classify all unique PCs from code table ──────────────────────
+    // Key optimization: decode each PC only ONCE, not once per instruction.
+
+    std::unordered_map<uint64_t, PCMnemonicInfo> pc_class;
+    {
+        auto all = code_table.all_entries();
+        pc_class.reserve(all.size());
+
+        for (const auto& [pc, opcode] : all) {
+            PCMnemonicInfo info;
+            auto d = decoder.decode(pc, opcode);
+            if (d) {
+                std::string_view mn = d->mnemonic_sv();
+                // Classify
+                if (mn == "aese" || mn == "aesd" || mn == "aesmc" || mn == "aesimc") {
+                    info.cls = MC_HW_AES;
+                } else if (mn == "sha1c" || mn == "sha1h" || mn == "sha1m" ||
+                           mn == "sha1p" || mn == "sha1su0" || mn == "sha1su1" ||
+                           mn == "sha256h" || mn == "sha256h2" ||
+                           mn == "sha256su0" || mn == "sha256su1") {
+                    info.cls = MC_HW_SHA;
+                } else if (mn == "eor") {
+                    info.cls = MC_EOR;
+                } else if (mn == "movz" || mn == "mov") {
+                    info.cls = MC_MOVZ;
+                } else if (mn == "movk") {
+                    info.cls = MC_MOVK;
+                } else if (mn == "svc") {
+                    info.cls = MC_SVC;
+                }
+                info.mnemonic = mn;
+            }
+            pc_class.emplace(pc, info);
+        }
+    }
+
+    // ─── Single trace scan with all 3 detectors running in parallel ───────
+
+    // HW crypto: deduplicate by PC to avoid one match per loop iteration.
+    // We accumulate per-PC execution counts and emit one match per unique PC.
+    struct HWCryptoSite {
+        MnemonicClass cls = MC_OTHER;
+        std::string_view mn;
+        uint64_t exec_count   = 0;
+        uint64_t first_inst_id = 0;
+        uint64_t last_inst_id  = 0;
+    };
+    ankerl::unordered_dense::map<uint64_t, HWCryptoSite> hw_sites;  // pc → site
+
+    // XOR loop state
+    std::deque<bool> xor_window;
+    size_t xor_eor_count = 0;
+    bool in_xor_loop = false;
+    uint64_t xor_loop_start = 0;
+    std::vector<uint64_t> xor_loop_insts;
+
+    // Constant loading state
+    bool in_load_seq = false;
+    uint64_t load_seq_start = 0;
+    std::vector<uint64_t> load_seq_insts;
+    uint64_t last_movz_pc = 0;
+
+    uint64_t inst_id = 0;
+
+    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
+        auto rec = *it;
+        if (rec.kind != RecordKind::Inst) continue;
+        if (inst_id < start) { inst_id++; continue; }
+
+        auto inst = rec.as_inst();
+
+        // Look up pre-classified mnemonic (O(1) hash lookup, no Capstone call)
+        MnemonicClass cls = MC_OTHER;
+        std::string_view mn;
+        auto pc_it = pc_class.find(inst.pc);
+        if (pc_it != pc_class.end()) {
+            cls = pc_it->second.cls;
+            mn = pc_it->second.mnemonic;
+        }
+
+        // ─── Detector 1: Hardware crypto (PC-deduped) ─────────────────────
+        // Do NOT add one match per execution — hot AES loops run millions of
+        // times.  Instead accumulate per-PC stats; emit matches after the scan.
+        if (cls == MC_HW_AES || cls == MC_HW_SHA) {
+            auto& site = hw_sites[inst.pc];
+            if (site.exec_count == 0) {
+                site.cls          = cls;
+                site.mn           = mn;
+                site.first_inst_id = inst_id;
+            }
+            site.exec_count++;
+            site.last_inst_id = inst_id;
+        }
+
+        // ─── Detector 2: XOR loop (sliding window) ───────────────────────
+        {
+            bool is_eor = (cls == MC_EOR);
+
+            if (xor_window.size() >= XOR_WINDOW_SIZE) {
+                if (xor_window.front()) xor_eor_count--;
+                xor_window.pop_front();
+            }
+            xor_window.push_back(is_eor);
+            if (is_eor) xor_eor_count++;
+
+            if (xor_window.size() >= XOR_WINDOW_SIZE && xor_eor_count >= XOR_THRESHOLD) {
+                if (!in_xor_loop) {
+                    in_xor_loop = true;
+                    xor_loop_start = (inst_id >= XOR_WINDOW_SIZE - 1)
+                                         ? inst_id - XOR_WINDOW_SIZE + 1 : 0;
+                    xor_loop_insts.clear();
+                }
+                xor_loop_insts.push_back(inst_id);
+            } else {
+                if (in_xor_loop && !xor_loop_insts.empty()) {
+                    add_match(result, PatternMatch{
+                        "XOR loop",
+                        PatternCategory::Crypto,
+                        PatternConfidence::Medium,
+                        xor_loop_start, xor_loop_insts.back(), inst.pc,
+                        fmt::format("XOR loop: {} eor instructions at inst #{}-#{}",
+                                     xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
+                        std::move(xor_loop_insts), {},
+                    });
+                    xor_loop_insts.clear();
+                }
+                in_xor_loop = false;
+            }
+        }
+
+        // ─── Detector 3: Constant loading (movz + movk sequences) ────────
+        {
+            bool is_movz = (cls == MC_MOVZ);
+            bool is_movk = (cls == MC_MOVK);
+
+            if (is_movz) {
+                if (!in_load_seq) {
+                    in_load_seq = true;
+                    load_seq_start = inst_id;
+                    load_seq_insts.clear();
+                } else {
+                    if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
+                        add_match(result, PatternMatch{
+                            "Constant loading sequence",
+                            PatternCategory::KeySchedule,
+                            PatternConfidence::Medium,
+                            load_seq_start, load_seq_insts.back(), last_movz_pc,
+                            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
+                                         load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
+                            load_seq_insts, {},
+                        });
+                    }
+                    load_seq_insts.clear();
+                    load_seq_start = inst_id;
+                }
+                last_movz_pc = inst.pc;
+                load_seq_insts.push_back(inst_id);
+            } else if (is_movk && in_load_seq) {
+                load_seq_insts.push_back(inst_id);
+            } else if (in_load_seq) {
+                if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
+                    add_match(result, PatternMatch{
+                        "Constant loading sequence",
+                        PatternCategory::KeySchedule,
+                        PatternConfidence::Medium,
+                        load_seq_start, load_seq_insts.back(), last_movz_pc,
+                        fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
+                                     load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
+                        load_seq_insts, {},
+                    });
+                }
+                in_load_seq = false;
+                load_seq_insts.clear();
+            }
+        }
+
+        inst_id++;
+        if (ctx.cancelled()) return;
+    }
+
+    // ─── Emit one match per unique HW crypto PC ──────────────────────────
+    for (const auto& [pc, site] : hw_sites) {
+        bool is_aes = (site.cls == MC_HW_AES);
+        add_match(result, PatternMatch{
+            fmt::format("{} instruction ({})", is_aes ? "AES" : "SHA", site.mn),
+            PatternCategory::Crypto,
+            PatternConfidence::High,
+            site.first_inst_id, site.last_inst_id, pc,
+            fmt::format("Hardware {} instruction {} at PC 0x{:x} ({} executions)",
+                        is_aes ? "AES" : "SHA", site.mn, pc, site.exec_count),
+            {site.first_inst_id}, {},
+        });
+    }
+
+    // Flush pending XOR loop
+    if (in_xor_loop && !xor_loop_insts.empty()) {
+        add_match(result, PatternMatch{
+            "XOR loop",
+            PatternCategory::Crypto,
+            PatternConfidence::Medium,
+            xor_loop_start, xor_loop_insts.back(), 0,
+            fmt::format("XOR loop: {} eor instructions at inst #{}-#{} (end of trace)",
+                         xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
+            std::move(xor_loop_insts), {},
+        });
+    }
+
+    // Flush pending constant loading
+    if (in_load_seq && load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
+        add_match(result, PatternMatch{
+            "Constant loading sequence",
+            PatternCategory::KeySchedule,
+            PatternConfidence::Medium,
+            load_seq_start, load_seq_insts.back(), last_movz_pc,
+            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{} (end of trace)",
+                         load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
+            load_seq_insts, {},
+        });
+    }
 }
 
 // ─── Buffer construction ──────────────────────────────────────────────────
@@ -421,245 +669,6 @@ PatternPass::CodeBuffer PatternPass::build_code_buffer(PassContext& ctx) {
     }
 
     return buf;
-}
-
-// ─── Mnemonic-based detection: HW crypto ──────────────────────────────────
-
-void PatternPass::detect_hw_crypto(PassContext& ctx, PatternResult& result) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    uint64_t inst_id = 0;
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (opcode_opt) {
-            auto decoded = decoder.decode(inst.pc, *opcode_opt);
-            if (decoded) {
-                std::string_view mn = decoded->mnemonic_sv();
-
-                if (mn == "aese" || mn == "aesd" || mn == "aesmc" || mn == "aesimc") {
-                    add_match(result, PatternMatch{
-                        fmt::format("AES instruction ({})", mn),
-                        PatternCategory::Crypto,
-                        PatternConfidence::High,
-                        inst_id, inst_id, inst.pc,
-                        fmt::format("Hardware AES instruction {} at PC 0x{:x}", mn, inst.pc),
-                        {inst_id}, {},
-                    });
-                }
-
-                if (mn == "sha1c" || mn == "sha1h" || mn == "sha1m" ||
-                    mn == "sha1p" || mn == "sha1su0" || mn == "sha1su1" ||
-                    mn == "sha256h" || mn == "sha256h2" ||
-                    mn == "sha256su0" || mn == "sha256su1") {
-                    add_match(result, PatternMatch{
-                        fmt::format("SHA instruction ({})", mn),
-                        PatternCategory::Crypto,
-                        PatternConfidence::High,
-                        inst_id, inst_id, inst.pc,
-                        fmt::format("Hardware SHA instruction {} at PC 0x{:x}", mn, inst.pc),
-                        {inst_id}, {},
-                    });
-                }
-            }
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) return;
-    }
-}
-
-// ─── XOR loop detection ───────────────────────────────────────────────────
-
-void PatternPass::detect_xor_loops(PassContext& ctx, PatternResult& result) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    uint64_t inst_id = 0;
-    std::deque<bool> window;
-    size_t eor_count = 0;
-    bool in_xor_loop = false;
-    uint64_t xor_loop_start = 0;
-    std::vector<uint64_t> xor_loop_insts;
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-        bool is_eor = false;
-
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (opcode_opt) {
-            auto decoded = decoder.decode(inst.pc, *opcode_opt);
-            if (decoded) {
-                is_eor = (decoded->mnemonic_sv() == "eor");
-            }
-        }
-
-        if (window.size() >= XOR_WINDOW_SIZE) {
-            if (window.front()) eor_count--;
-            window.pop_front();
-        }
-        window.push_back(is_eor);
-        if (is_eor) eor_count++;
-
-        if (window.size() >= XOR_WINDOW_SIZE && eor_count >= XOR_THRESHOLD) {
-            if (!in_xor_loop) {
-                in_xor_loop = true;
-                xor_loop_start = (inst_id >= XOR_WINDOW_SIZE - 1)
-                                     ? inst_id - XOR_WINDOW_SIZE + 1 : 0;
-                xor_loop_insts.clear();
-            }
-            xor_loop_insts.push_back(inst_id);
-        } else {
-            if (in_xor_loop && !xor_loop_insts.empty()) {
-                add_match(result, PatternMatch{
-                    "XOR loop",
-                    PatternCategory::Crypto,
-                    PatternConfidence::Medium,
-                    xor_loop_start, xor_loop_insts.back(), inst.pc,
-                    fmt::format("XOR loop: {} eor instructions at inst #{}-#{}",
-                                 xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
-                    std::move(xor_loop_insts), {},
-                });
-                xor_loop_insts.clear();
-            }
-            in_xor_loop = false;
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) return;
-    }
-
-    if (in_xor_loop && !xor_loop_insts.empty()) {
-        add_match(result, PatternMatch{
-            "XOR loop",
-            PatternCategory::Crypto,
-            PatternConfidence::Medium,
-            xor_loop_start, xor_loop_insts.back(), 0,
-            fmt::format("XOR loop: {} eor instructions at inst #{}-#{} (end of trace)",
-                         xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
-            std::move(xor_loop_insts), {},
-        });
-    }
-}
-
-// ─── Constant loading detection ───────────────────────────────────────────
-
-void PatternPass::detect_constant_loading(PassContext& ctx, PatternResult& result) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    uint64_t inst_id = 0;
-    bool in_load_seq = false;
-    uint64_t load_seq_start = 0;
-    std::vector<uint64_t> load_seq_insts;
-    uint64_t last_movz_pc = 0;
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-        bool is_movz = false;
-        bool is_movk = false;
-
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (opcode_opt) {
-            auto decoded = decoder.decode(inst.pc, *opcode_opt);
-            if (decoded) {
-                std::string_view mn = decoded->mnemonic_sv();
-                if (mn == "movz" || mn == "mov") is_movz = true;
-                else if (mn == "movk") is_movk = true;
-            }
-        }
-
-        if (is_movz) {
-            if (!in_load_seq) {
-                in_load_seq = true;
-                load_seq_start = inst_id;
-                load_seq_insts.clear();
-            } else {
-                if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-                    add_match(result, PatternMatch{
-                        "Constant loading sequence",
-                        PatternCategory::KeySchedule,
-                        PatternConfidence::Medium,
-                        load_seq_start, load_seq_insts.back(), last_movz_pc,
-                        fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                     load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-                        load_seq_insts, {},
-                    });
-                }
-                load_seq_insts.clear();
-                load_seq_start = inst_id;
-            }
-            last_movz_pc = inst.pc;
-            load_seq_insts.push_back(inst_id);
-        } else if (is_movk && in_load_seq) {
-            load_seq_insts.push_back(inst_id);
-        } else if (in_load_seq) {
-            if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-                add_match(result, PatternMatch{
-                    "Constant loading sequence",
-                    PatternCategory::KeySchedule,
-                    PatternConfidence::Medium,
-                    load_seq_start, load_seq_insts.back(), last_movz_pc,
-                    fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                 load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-                    load_seq_insts, {},
-                });
-            }
-            in_load_seq = false;
-            load_seq_insts.clear();
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) return;
-    }
-
-    if (in_load_seq && load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-        add_match(result, PatternMatch{
-            "Constant loading sequence",
-            PatternCategory::KeySchedule,
-            PatternConfidence::Medium,
-            load_seq_start, load_seq_insts.back(), last_movz_pc,
-            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{} (end of trace)",
-                         load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-            load_seq_insts, {},
-        });
-    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

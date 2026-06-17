@@ -1,11 +1,9 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
-#include "analysis/trace_collector.h"
 #include <cstdint>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -73,106 +71,36 @@ struct LoopResult {
     }
 };
 
-// ─── Loop collector (single-pass scan) ───────────────────────────────────
-
-/// Collector that detects back-edges during a single sequential scan.
-///
-/// Strategy:
-///   A back-edge occurs when a branch instruction jumps to a PC that is
-///   strictly less than the branch's own PC AND has already been seen in
-///   the trace (i.e., it is the target of a backward branch).
-///
-/// We track:
-///   - seen_pcs: a sorted vector of all unique PCs encountered so far
-///   - back_edge_map: maps header_pc → {back_edge_pc, iteration_count}
-///   - For each back-edge, we also collect the set of body PCs
-///     (all PCs that appear between the header and the back-edge in the trace).
-class LoopCollector final : public TraceCollector {
-public:
-    std::string_view name() const override { return "loop_collector"; }
-
-    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
-        return true;
-    }
-
-    void on_inst(uint64_t inst_id, const InstView& inst) override {
-        // Track the most recent 'active window' PC → inst_id mapping.
-        // We only need: if current PC < last_pc AND it was already seen → back-edge.
-        //
-        // To detect "was the target PC already seen", we maintain a hash set.
-        // For body PC collection, we record the sequential inst range for each
-        // (header, back_edge) pair.
-
-        uint64_t pc = inst.pc;
-
-        // Mark as seen
-        seen_pcs_.insert({pc, true});
-
-        // Check if this PC is a back-edge target (it was seen before and
-        // last instruction jumped backward to here).
-        // We detect back-edges by observing that: when the previous instruction's
-        // PC was > pc, and pc has been seen before — it's a backward branch target.
-        if (last_pc_ != 0 && pc < last_pc_ && seen_pcs_.count(pc)) {
-            // This is a backward branch: last_pc_ → pc (pc is the loop header)
-            auto& be = back_edges_[pc];
-            if (be.back_edge_pc == 0) {
-                be.back_edge_pc = last_pc_;
-                be.first_header_inst_id = inst_id;
-            }
-            be.iteration_count++;
-            be.back_edge_pc = last_pc_;  // Update to most recent back-edge source
-
-            // Record body window: from first_header_inst_id to current inst_id
-            // We only keep the first instance for body PC collection
-            if (be.body_inst_start == 0 || be.body_inst_start > be.first_header_inst_id) {
-                be.body_inst_start = be.first_header_inst_id;
-            }
-            be.body_inst_end = inst_id;  // The back-edge instruction
-        }
-
-        last_pc_ = pc;
-    }
-
-    void end() override {
-        // Sort back-edges by header_pc for deterministic output
-    }
-
-    struct BackEdgeInfo {
-        uint64_t back_edge_pc = 0;
-        uint64_t iteration_count = 0;
-        uint64_t first_header_inst_id = 0;
-        uint64_t body_inst_start = 0;
-        uint64_t body_inst_end = 0;
-    };
-
-    uint64_t last_pc_ = 0;
-    ankerl::unordered_dense::map<uint64_t, bool> seen_pcs_;
-    ankerl::unordered_dense::map<uint64_t, BackEdgeInfo> back_edges_;
-};
-
 // ─── Loop pass ────────────────────────────────────────────────────────────
 
-/// Detects loops in the execution trace by finding backward branches.
+/// Detects loops in the execution trace using CFG-based dominator tree analysis.
 ///
-/// Algorithm:
-///   Phase 1 (collect): Single-pass scan to find all backward branches.
-///   Phase 2 (body PCs): Second pass to collect body PCs for each detected loop.
-///   Phase 3 (nesting): Compute nesting depths by checking containment.
+/// Algorithm (LLVM LoopInfo-style, adapted for dynamic CFG):
+///   1. Depend on "cfg" pass to get the basic block graph with edge counts.
+///   2. Build a dominator tree on the block graph using the Semi-NCA algorithm.
+///   3. Identify back-edges: an edge (u → v) where v dominates u.
+///   4. For each back-edge, compute the natural loop body via reverse BFS
+///      from u to v within the dominator tree.
+///   5. Compute nesting by checking loop containment (fast set intersection).
+///
+/// Complexity: O(|V| + |E|) where V = basic blocks, E = CFG edges.
+///   Typically V is in the thousands and E in the tens of thousands,
+///   making this 1000x+ faster than full trace scans for large traces.
 ///
 /// Result type: LoopResult
 class LoopPass final : public AnalysisPass {
 public:
     std::string_view name() const override { return "loop"; }
     std::string_view description() const override {
-        return "Loop detection via backward branch analysis";
+        return "Loop detection via dominator tree on CFG (LLVM-style)";
     }
 
     std::vector<std::string_view> dependencies() const override {
-        return {};  // Standalone pass
+        return { "cfg" };  // Depends on CFG pass (which depends on xref)
     }
 
     PassResult run(PassContext& ctx) override;
-    float estimated_cost() const override { return 8.0f; }
+    float estimated_cost() const override { return 2.0f; }  // Much cheaper now
 };
 
 }  // namespace tenet

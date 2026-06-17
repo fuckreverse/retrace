@@ -65,6 +65,13 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
             }
             break;
         }
+        case RecordKind::Thread: {
+            auto thread = rec.as_thread();
+            for (auto* c : active) {
+                c->on_thread(inst_id, thread);
+            }
+            break;
+        }
         case RecordKind::Event: {
             auto ev = rec.as_event();
             for (auto* c : active) {

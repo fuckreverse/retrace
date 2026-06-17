@@ -4,6 +4,7 @@
 #include "io/code_table.h"
 
 #include <fmt/core.h>
+#include <fmt/format.h>
 #include <sstream>
 
 namespace tenet {
@@ -44,81 +45,196 @@ std::string node_id(uint64_t block_start_pc) {
 
 }  // namespace detail
 
-// ─── CFGLayoutPass implementation ──────────────────────────────────────────
+// ─── Configuration thresholds ──────────────────────────────────────────────
+
+namespace {
+
+// Skip annotated DOT generation for CFGs larger than this (saves O(N) decode).
+// The annotated DOT can still be generated on-demand later if needed.
+constexpr size_t MAX_BLOCKS_FOR_ANNOTATED_DOT = 500;
+
+// Use simplified (Narrow) layout for very large CFGs to avoid expensive
+// crossing minimization iterations.
+constexpr size_t LARGE_CFG_THRESHOLD = 2000;
+
+}  // anonymous namespace
+
+// ─── CFGLayoutPass::run ────────────────────────────────────────────────────
 
 PassResult CFGLayoutPass::run(PassContext& ctx) {
     const auto& cfg = ctx.require<CFGResult>("cfg");
 
     CFGLayoutResult result;
-    result.node_count_ = cfg.blocks.size();
 
     if (cfg.blocks.empty()) {
-        result.dot = "digraph cfg {\n}\n";
+        result.dot          = "digraph cfg {\n}\n";
         result.dot_annotated = "digraph cfg {\n}\n";
         ctx.progress(1.0f, "CFG layout: empty CFG");
         return PassResult::success(std::move(result));
     }
 
-    // Generate both DOT variants
+    const size_t num_blocks = cfg.blocks.size();
+
+    // ─── Step 1: build GraphGridLayout graph ────────────────────────────
+
+    // Estimate block pixel size based on instruction count
+    Graph layout_graph;
+    layout_graph.reserve(num_blocks);
+    for (const auto& [pc, block] : cfg.blocks) {
+        GraphBlock gb;
+        gb.entry  = pc;
+        gb.width  = default_block_width;
+        // Height: one line per instruction, plus a header line for the PC label
+        gb.height = insn_height * static_cast<int>(block.instructions.size() + 1);
+        gb.height = std::max(gb.height, default_block_height);
+        layout_graph[pc] = gb;
+    }
+
+    // Add edges
+    for (const auto& edge : cfg.edges) {
+        auto it = layout_graph.find(edge.from_block);
+        if (it == layout_graph.end()) continue;
+        it->second.edges.emplace_back(GraphEdge(edge.to_block));
+    }
+
+    ctx.progress(0.1f, "CFG layout: graph built");
+
+    // ─── Step 2: run layout ──────────────────────────────────────────────
+
+    uint64_t entry = cfg.blocks.begin()->first;
+
+    // For very large CFGs, use Narrow layout to reduce computation
+    auto effective_layout_type = layout_type;
+    if (num_blocks > LARGE_CFG_THRESHOLD) {
+        effective_layout_type = GraphGridLayout::LayoutType::Narrow;
+    }
+
+    GraphGridLayout layout_algo(effective_layout_type);
+
+    // For extremely large CFGs, disable the expensive optimization pass
+    if (num_blocks > LARGE_CFG_THRESHOLD) {
+        layout_algo.setLayoutOptimization(false);
+    }
+
+    layout_algo.calculateLayout(layout_graph, entry,
+                                result.canvas_width, result.canvas_height);
+
+    ctx.progress(0.6f, "CFG layout: positions computed");
+
+    // ─── Step 3: copy computed coordinates into result ───────────────────
+
+    result.block_layouts.clear();
+    for (const auto& [pc, gb] : layout_graph) {
+        BlockLayout bl;
+        bl.x      = gb.x;
+        bl.y      = gb.y;
+        bl.width  = gb.width;
+        bl.height = gb.height;
+        result.block_layouts[pc] = bl;
+    }
+
+    // Copy routed edge polylines
+    result.edge_layouts.reserve(cfg.edges.size());
+    for (const auto& [pc, gb] : layout_graph) {
+        for (const auto& ge : gb.edges) {
+            EdgeLayout el;
+            el.from_block = pc;
+            el.to_block   = ge.target;
+            el.polyline   = ge.polyline;
+            el.arrow      = ge.arrow;
+            result.edge_layouts.push_back(std::move(el));
+        }
+    }
+
+    ctx.progress(0.75f, "CFG layout: coordinates extracted");
+
+    // ─── Step 4: DOT output ───────────────────────────────────────────────
+
+    // Simple DOT is always generated (cheap: O(V+E) with just PC labels)
     result.dot = generate_dot(cfg);
 
-    auto& decoder = ctx.decoder();
-    auto& code_table = ctx.code_table();
-    result.dot_annotated = generate_dot_annotated(cfg, decoder, code_table);
+    // Annotated DOT with full disassembly — expensive for large CFGs
+    // Skip for large graphs; it can be generated on-demand if needed.
+    if (num_blocks <= MAX_BLOCKS_FOR_ANNOTATED_DOT) {
+        auto& decoder    = ctx.decoder();
+        auto& code_table = ctx.code_table();
+        result.dot_annotated = generate_dot_annotated(cfg, decoder, code_table);
+    } else {
+        // Provide a placeholder that indicates on-demand generation is available
+        result.dot_annotated = fmt::format(
+            "// Annotated DOT skipped: {} blocks exceeds threshold ({}). "
+            "Generate on demand via generate_dot_annotated().\n",
+            num_blocks, MAX_BLOCKS_FOR_ANNOTATED_DOT);
+    }
 
-    ctx.progress(1.0f, fmt::format("CFG DOT: {} nodes, {} edges",
-                                    cfg.blocks.size(), cfg.edges.size()));
+    ctx.progress(1.0f, fmt::format(
+        "CFG grid layout: {} nodes, {} edges, canvas {}x{}{}",
+        num_blocks, cfg.edges.size(),
+        result.canvas_width, result.canvas_height,
+        num_blocks > LARGE_CFG_THRESHOLD ? " (fast mode)" : ""));
+
     return PassResult::success(std::move(result));
 }
 
 // ─── generate_dot (simple) ────────────────────────────────────────────────
 
 std::string generate_dot(const CFGResult& cfg) {
-    std::ostringstream os;
-    os << "digraph cfg {\n";
-    os << "    rankdir=TB;\n";
-    os << "    node [shape=box, fontname=\"Courier New\", fontsize=10];\n";
-    os << "    edge [fontname=\"Courier New\", fontsize=9];\n\n";
+    // Use fmt::memory_buffer for faster string building than ostringstream
+    fmt::memory_buffer buf;
+    fmt::format_to(std::back_inserter(buf), "digraph cfg {{\n");
+    fmt::format_to(std::back_inserter(buf), "    rankdir=TB;\n");
+    fmt::format_to(std::back_inserter(buf), "    node [shape=box, fontname=\"Courier New\", fontsize=10];\n");
+    fmt::format_to(std::back_inserter(buf), "    edge [fontname=\"Courier New\", fontsize=9];\n\n");
 
-    // Nodes: simple labels with start PC and instruction count
+    // Nodes
     for (const auto& [pc, block] : cfg.blocks) {
-        os << "    " << detail::node_id(pc)
-           << " [label=\"" << detail::fmt_pc(pc)
-           << " (" << block.instructions.size() << " insns)\"];\n";
+        fmt::format_to(std::back_inserter(buf),
+            "    n_{:x} [label=\"0x{:x} ({} insns)\"];\n",
+            pc, pc, block.instructions.size());
     }
-    os << "\n";
+    fmt::format_to(std::back_inserter(buf), "\n");
 
-    // Edges with taken_count labels
+    // Edges
     for (const auto& edge : cfg.edges) {
-        os << "    " << detail::node_id(edge.from_block)
-           << " -> " << detail::node_id(edge.to_block);
+        fmt::format_to(std::back_inserter(buf),
+            "    n_{:x} -> n_{:x}",
+            edge.from_block, edge.to_block);
 
-        std::string attrs;
+        bool has_attrs = false;
+        auto start_attrs = [&]() {
+            if (!has_attrs) {
+                fmt::format_to(std::back_inserter(buf), " [");
+                has_attrs = true;
+            } else {
+                fmt::format_to(std::back_inserter(buf), ", ");
+            }
+        };
+
         if (edge.taken_count > 0) {
-            attrs += fmt::format("label=\"{}\"", edge.taken_count);
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "label=\"{}\"", edge.taken_count);
         }
 
-        // Call edges are dashed
         auto src_it = cfg.blocks.find(edge.from_block);
-        if (src_it != cfg.blocks.end() && src_it->second.terminator == TerminatorKind::Call) {
-            if (!attrs.empty()) attrs += ", ";
-            attrs += "style=dashed";
+        if (src_it != cfg.blocks.end() &&
+            src_it->second.terminator == TerminatorKind::Call) {
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "style=dashed");
         }
 
-        // Fallthrough edges in gray
         if (edge.is_fallthrough) {
-            if (!attrs.empty()) attrs += ", ";
-            attrs += "color=\"#888888\"";
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "color=\"#888888\"");
         }
 
-        if (!attrs.empty()) {
-            os << " [" << attrs << "]";
+        if (has_attrs) {
+            fmt::format_to(std::back_inserter(buf), "]");
         }
-        os << ";\n";
+        fmt::format_to(std::back_inserter(buf), ";\n");
     }
 
-    os << "}\n";
-    return os.str();
+    fmt::format_to(std::back_inserter(buf), "}}\n");
+    return fmt::to_string(buf);
 }
 
 // ─── generate_dot_annotated (with disassembly) ────────────────────────────
@@ -128,15 +244,16 @@ std::string generate_dot_annotated(
     InstructionDecoder& decoder,
     const CodeTable& code_table) {
 
-    std::ostringstream os;
-    os << "digraph cfg {\n";
-    os << "    rankdir=TB;\n";
-    os << "    node [shape=box, fontname=\"Courier New\", fontsize=9];\n";
-    os << "    edge [fontname=\"Courier New\", fontsize=8];\n\n";
+    fmt::memory_buffer buf;
+    fmt::format_to(std::back_inserter(buf), "digraph cfg {{\n");
+    fmt::format_to(std::back_inserter(buf), "    rankdir=TB;\n");
+    fmt::format_to(std::back_inserter(buf), "    node [shape=box, fontname=\"Courier New\", fontsize=9];\n");
+    fmt::format_to(std::back_inserter(buf), "    edge [fontname=\"Courier New\", fontsize=8];\n\n");
 
-    // Nodes with full disassembly labels
     for (const auto& [pc, block] : cfg.blocks) {
         std::string label;
+        label.reserve(block.instructions.size() * 40);  // estimate avg line length
+
         for (uint64_t insn_pc : block.instructions) {
             auto opcode = code_table.opcode_at(insn_pc);
             if (opcode) {
@@ -151,40 +268,52 @@ std::string generate_dot_annotated(
             }
         }
 
-        os << "    " << detail::node_id(pc)
-           << " [label=\"" << detail::dot_escape(label) << "\"];\n";
+        fmt::format_to(std::back_inserter(buf),
+            "    n_{:x} [label=\"{}\"];\n",
+            pc, detail::dot_escape(label));
     }
-    os << "\n";
+    fmt::format_to(std::back_inserter(buf), "\n");
 
-    // Edges
     for (const auto& edge : cfg.edges) {
-        os << "    " << detail::node_id(edge.from_block)
-           << " -> " << detail::node_id(edge.to_block);
+        fmt::format_to(std::back_inserter(buf),
+            "    n_{:x} -> n_{:x}",
+            edge.from_block, edge.to_block);
 
-        std::string attrs;
+        bool has_attrs = false;
+        auto start_attrs = [&]() {
+            if (!has_attrs) {
+                fmt::format_to(std::back_inserter(buf), " [");
+                has_attrs = true;
+            } else {
+                fmt::format_to(std::back_inserter(buf), ", ");
+            }
+        };
+
         if (edge.taken_count > 0) {
-            attrs += fmt::format("label=\"{}\"", edge.taken_count);
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "label=\"{}\"", edge.taken_count);
         }
 
         auto src_it = cfg.blocks.find(edge.from_block);
-        if (src_it != cfg.blocks.end() && src_it->second.terminator == TerminatorKind::Call) {
-            if (!attrs.empty()) attrs += ", ";
-            attrs += "style=dashed";
+        if (src_it != cfg.blocks.end() &&
+            src_it->second.terminator == TerminatorKind::Call) {
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "style=dashed");
         }
 
         if (edge.is_fallthrough) {
-            if (!attrs.empty()) attrs += ", ";
-            attrs += "color=\"#888888\"";
+            start_attrs();
+            fmt::format_to(std::back_inserter(buf), "color=\"#888888\"");
         }
 
-        if (!attrs.empty()) {
-            os << " [" << attrs << "]";
+        if (has_attrs) {
+            fmt::format_to(std::back_inserter(buf), "]");
         }
-        os << ";\n";
+        fmt::format_to(std::back_inserter(buf), ";\n");
     }
 
-    os << "}\n";
-    return os.str();
+    fmt::format_to(std::back_inserter(buf), "}}\n");
+    return fmt::to_string(buf);
 }
 
 }  // namespace tenet

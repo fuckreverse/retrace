@@ -6,6 +6,7 @@
 #include <vector>
 #include <algorithm>
 #include <roaring64map.hh>
+#include <roaring/roaring64.h>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {

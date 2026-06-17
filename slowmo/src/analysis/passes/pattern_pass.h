@@ -157,16 +157,11 @@ private:
     };
     CodeBuffer build_code_buffer(PassContext& ctx);
 
-    // ─── Mnemonic-based detection (retained) ─────────────────────────────
+    // ─── Merged mnemonic-based detection (single pass) ──────────────────
 
-    /// Detect hardware crypto instructions (AES/SHA) by mnemonic.
-    void detect_hw_crypto(PassContext& ctx, PatternResult& result);
-
-    /// Detect XOR loops via sliding window.
-    void detect_xor_loops(PassContext& ctx, PatternResult& result);
-
-    /// Detect constant-loading sequences (movz + movk).
-    void detect_constant_loading(PassContext& ctx, PatternResult& result);
+    /// Detect all mnemonic-based patterns (HW crypto, XOR loops, constant loading)
+    /// in a single trace scan. Replaces the previous 3 separate scan functions.
+    void detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result);
 
     /// Build the by_category index from the matches vector.
     void build_category_index(PatternResult& result);

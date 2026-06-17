@@ -31,6 +31,11 @@ public:
     /// Called for Svc records.
     virtual void on_svc(uint64_t inst_id, const SvcView& svc) { (void)inst_id; (void)svc; }
 
+    /// Called for Thread records (thread context switch).
+    virtual void on_thread(uint64_t inst_id, const ThreadView& thread) {
+        (void)inst_id; (void)thread;
+    }
+
     /// Called for Event records.
     virtual void on_event(const EventView& ev) { (void)ev; }
 
