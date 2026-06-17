@@ -1,0 +1,43 @@
+Opening: tests/traces/perf/perf_linear_scan.trace
+  Size: 47.09 MB
+  Index: 2907037 insts, 0 anchors (780.2 ms)
+  CodeTable: 1 PCs
+  Memory build: 19.4 ms
+
+PASS                           OWN (ms)   STATUS
+--------------------------------------------------
+xref                            194.97       OK
+function                         28.01       OK
+loop                         113490.15       OK
+pattern                         623.24       OK
+constant_materialization         22.24       OK
+strings                           8.68       OK
+disassembly                     298.58       OK
+objc                             36.47       OK
+thread                           39.08       OK
+backward_taint                   66.85       OK
+trace_diff                        0.70       OK
+memory_snapshot                  28.80       OK
+dataflow_graph                    0.03       OK
+cfg                              72.80       OK
+cfg_layout                       31.49       OK
+taint                            56.58       OK
+call_graph                        0.01       OK
+loop_semantics                12293.45       OK
+symbol_annotation                51.54       OK
+algorithm_summary                 2.75       OK
+--------------------------------------------------
+
+  Root passes total:      114837.8 ms
+  Derived passes (own):   12454.3 ms
+  Composite passes (own): 54.3 ms
+  Grand total (all own):  127346.4 ms
+
+  Top 5 slowest (own time):
+     1. loop                     113490.15 ms
+     2. loop_semantics           12293.45 ms
+     3. pattern                  623.24 ms
+     4. disassembly              298.58 ms
+     5. xref                     194.97 ms
+
+Results written to: bench/results_linear_scan.json

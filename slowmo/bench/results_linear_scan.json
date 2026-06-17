@@ -1,0 +1,202 @@
+{
+  "benchmark": "tenet_all_passes",
+  "passes": [
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "xref",
+      "own_ms": 194.967708,
+      "success": true,
+      "total_ms": 194.967708
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "function",
+      "own_ms": 28.009,
+      "success": true,
+      "total_ms": 28.009
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "loop",
+      "own_ms": 113490.146875,
+      "success": true,
+      "total_ms": 113490.146875
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "pattern",
+      "own_ms": 623.238792,
+      "success": true,
+      "total_ms": 623.238792
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "constant_materialization",
+      "own_ms": 22.2365,
+      "success": true,
+      "total_ms": 22.2365
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "strings",
+      "own_ms": 8.678667,
+      "success": true,
+      "total_ms": 8.678667
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "disassembly",
+      "own_ms": 298.58125,
+      "success": true,
+      "total_ms": 298.58125
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "objc",
+      "own_ms": 36.469208,
+      "success": true,
+      "total_ms": 36.469208
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "thread",
+      "own_ms": 39.0815,
+      "success": true,
+      "total_ms": 39.0815
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "backward_taint",
+      "own_ms": 66.845292,
+      "success": true,
+      "total_ms": 66.845292
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "trace_diff",
+      "own_ms": 0.696625,
+      "success": true,
+      "total_ms": 0.696625
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "memory_snapshot",
+      "own_ms": 28.801333,
+      "success": true,
+      "total_ms": 28.801333
+    },
+    {
+      "category": "root",
+      "dependencies": [],
+      "name": "dataflow_graph",
+      "own_ms": 0.027917,
+      "success": true,
+      "total_ms": 0.027917
+    },
+    {
+      "category": "derived",
+      "dependencies": [
+        "xref"
+      ],
+      "name": "cfg",
+      "own_ms": 72.800125,
+      "success": true,
+      "total_ms": 267.767833
+    },
+    {
+      "category": "derived",
+      "dependencies": [
+        "xref",
+        "cfg"
+      ],
+      "name": "cfg_layout",
+      "own_ms": 31.492958,
+      "success": true,
+      "total_ms": 494.228499
+    },
+    {
+      "category": "derived",
+      "dependencies": [
+        "xref"
+      ],
+      "name": "taint",
+      "own_ms": 56.575334,
+      "success": true,
+      "total_ms": 251.54304199999999
+    },
+    {
+      "category": "derived",
+      "dependencies": [
+        "function"
+      ],
+      "name": "call_graph",
+      "own_ms": 0.005083,
+      "success": true,
+      "total_ms": 28.014083
+    },
+    {
+      "category": "derived",
+      "dependencies": [
+        "loop"
+      ],
+      "name": "loop_semantics",
+      "own_ms": 12293.447959,
+      "success": true,
+      "total_ms": 125783.594834
+    },
+    {
+      "category": "composite",
+      "dependencies": [
+        "function",
+        "loop",
+        "constant_materialization",
+        "pattern"
+      ],
+      "name": "symbol_annotation",
+      "own_ms": 51.544625,
+      "success": true,
+      "total_ms": 114215.17579200001
+    },
+    {
+      "category": "composite",
+      "dependencies": [
+        "pattern",
+        "constant_materialization",
+        "loop_semantics",
+        "function",
+        "call_graph"
+      ],
+      "name": "algorithm_summary",
+      "own_ms": 2.748083,
+      "success": true,
+      "total_ms": 126487.84129200001
+    }
+  ],
+  "summary": {
+    "failed": 0,
+    "passed": 20,
+    "sum_own_ms": 127346.39483399998,
+    "total_passes": 20
+  },
+  "trace": "perf_linear_scan",
+  "trace_info": {
+    "anchor_count": 0,
+    "file_size_mb": 47.094444274902344,
+    "index_build_ms": 780.208334,
+    "inst_count": 2907037,
+    "memory_build_ms": 19.394834,
+    "unique_pcs": 1
+  }
+}

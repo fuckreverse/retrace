@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "tenet": {
+      "command": "python3",
+      "args": [
+        "/Users/liqiang/src/Clion/QBDI/tools/tenet/mcp/tenet_mcp_server.py"
+      ],
+      "env": {
+        "TENET_BIN": "/Users/liqiang/src/Clion/QBDI/tools/tenet/build/tenet"
+      }
+    }
+  }
+}

@@ -1,0 +1,213 @@
+{
+  "benchmark": "tenet",
+  "version": "1.0",
+  "date": "2026-06-16 21:38:41",
+  "scale": "1M",
+  "system": {
+    "arch": "aarch64",
+    "os": "macOS",
+    "cpu": "Apple M1"
+  },
+  "results": [
+    {
+      "anchor_count": 0,
+      "cache_stats": {
+        "mem_cache_hits": 184,
+        "mem_rocksdb_reads": 0,
+        "regfile_hit_rate": 0.047619047619047616,
+        "regfile_hits": 10,
+        "regfile_misses": 200
+      },
+      "file_size_bytes": 44971384,
+      "file_size_mb": 42.88805389404297,
+      "inst_count": 2774112,
+      "mem_read_latency": {
+        "max_us": 1.375,
+        "mean_us": 0.1788,
+        "min_us": 0.0,
+        "p50_us": 0.042,
+        "p95_us": 0.584,
+        "p99_us": 0.917,
+        "samples": 100
+      },
+      "pass_ms": {
+        "call_graph": 0.004292,
+        "cfg": 46.561542,
+        "function": 12.274167,
+        "taint": 15.01475,
+        "xref": 421.957541
+      },
+      "seek_latency": {
+        "max_us": 20.291,
+        "mean_us": 9.490639999999997,
+        "min_us": 0.0,
+        "p50_us": 9.542,
+        "p95_us": 18.334,
+        "p99_us": 19.417,
+        "samples": 200
+      },
+      "throughput": {
+        "io_mb_per_sec": 12503.805800012526,
+        "io_minst_per_sec": 808.7790087463557
+      },
+      "timing_ms": {
+        "code_table_load": 105.187125,
+        "index_build": 29.166042,
+        "io_scan": 3.43,
+        "memory_build": 11.430875
+      },
+      "trace": "perf_cfg_explosion",
+      "unique_pcs": 1
+    },
+    {
+      "anchor_count": 34261,
+      "cache_stats": {
+        "mem_cache_hits": 264,
+        "mem_rocksdb_reads": 0,
+        "regfile_hit_rate": 0.047619047619047616,
+        "regfile_hits": 10,
+        "regfile_misses": 200
+      },
+      "file_size_bytes": 80091864,
+      "file_size_mb": 76.38155364990234,
+      "inst_count": 3515666,
+      "mem_read_latency": {
+        "max_us": 1.625,
+        "mean_us": 0.18541999999999997,
+        "min_us": 0.0,
+        "p50_us": 0.042,
+        "p95_us": 0.666,
+        "p99_us": 1.5,
+        "samples": 100
+      },
+      "pass_ms": {
+        "call_graph": 0.003333,
+        "cfg": 55.618708,
+        "function": 18.874792,
+        "taint": 23.977167,
+        "xref": 543.387292
+      },
+      "seek_latency": {
+        "max_us": 68.708,
+        "mean_us": 29.434364999999993,
+        "min_us": 0.0,
+        "p50_us": 26.875,
+        "p95_us": 63.084,
+        "p99_us": 64.875,
+        "samples": 200
+      },
+      "throughput": {
+        "io_mb_per_sec": 4723.792323474262,
+        "io_minst_per_sec": 217.4252194295435
+      },
+      "timing_ms": {
+        "code_table_load": 16.435083,
+        "index_build": 87.762958,
+        "io_scan": 16.169541,
+        "memory_build": 16.781667
+      },
+      "trace": "perf_heavy_memory",
+      "unique_pcs": 1
+    },
+    {
+      "anchor_count": 250,
+      "cache_stats": {
+        "mem_cache_hits": 80,
+        "mem_rocksdb_reads": 0,
+        "regfile_hit_rate": 0.047619047619047616,
+        "regfile_hits": 10,
+        "regfile_misses": 200
+      },
+      "file_size_bytes": 60112448,
+      "file_size_mb": 57.32769775390625,
+      "inst_count": 3244055,
+      "mem_read_latency": {
+        "max_us": 0.917,
+        "mean_us": 0.09212,
+        "min_us": 0.0,
+        "p50_us": 0.042,
+        "p95_us": 0.458,
+        "p99_us": 0.709,
+        "samples": 100
+      },
+      "pass_ms": {
+        "call_graph": 0.002375,
+        "cfg": 15.573167,
+        "function": 17.687125,
+        "taint": 22.79675,
+        "xref": 105.1345
+      },
+      "seek_latency": {
+        "max_us": 52.584,
+        "mean_us": 26.427305,
+        "min_us": 0.0,
+        "p50_us": 27.667,
+        "p95_us": 50.584,
+        "p99_us": 52.083,
+        "samples": 200
+      },
+      "throughput": {
+        "io_mb_per_sec": 4041.609006664464,
+        "io_minst_per_sec": 228.70623485349196
+      },
+      "timing_ms": {
+        "code_table_load": 13.109708,
+        "index_build": 207.056542,
+        "io_scan": 14.184375,
+        "memory_build": 14.030083
+      },
+      "trace": "perf_taint_explosion",
+      "unique_pcs": 1
+    },
+    {
+      "anchor_count": 0,
+      "cache_stats": {
+        "mem_cache_hits": 88,
+        "mem_rocksdb_reads": 0,
+        "regfile_hit_rate": 0.09090909090909091,
+        "regfile_hits": 10,
+        "regfile_misses": 100
+      },
+      "file_size_bytes": 49382104,
+      "file_size_mb": 47.094444274902344,
+      "inst_count": 2907037,
+      "mem_read_latency": {
+        "max_us": 9.667,
+        "mean_us": 0.39165999999999995,
+        "min_us": 0.0,
+        "p50_us": 0.042,
+        "p95_us": 0.625,
+        "p99_us": 3.459,
+        "samples": 50
+      },
+      "pass_ms": {
+        "call_graph": 0.002458,
+        "cfg": 18.292834,
+        "function": 14.862917,
+        "taint": 23.467917,
+        "xref": 59.940042
+      },
+      "seek_latency": {
+        "max_us": 5250.833,
+        "mean_us": 2368.98714,
+        "min_us": 0.0,
+        "p50_us": 2312.167,
+        "p95_us": 4615.0,
+        "p99_us": 5072.208,
+        "samples": 100
+      },
+      "throughput": {
+        "io_mb_per_sec": 13180.028886112052,
+        "io_minst_per_sec": 813.5743445520458
+      },
+      "timing_ms": {
+        "code_table_load": 89.633541,
+        "index_build": 56.16425,
+        "io_scan": 3.573167,
+        "memory_build": 11.340125
+      },
+      "trace": "perf_linear_scan",
+      "unique_pcs": 1
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+Opening: tests/traces/perf/perf_cfg_explosion.trace
+  Size: 42.89 MB
+  Index: 2774112 insts, 251 anchors (458.8 ms)
+  CodeTable: 1 PCs
+  Memory build: 16.4 ms
+
+PASS                           OWN (ms)   STATUS
+--------------------------------------------------
+xref                           1696.69       OK
+function                         41.35       OK
