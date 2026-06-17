@@ -2,9 +2,10 @@
 
 面向 iOS AArch64（越狱真机）逆向场景的逐指令 trace 工具。在指定地址区间内，
 记录每条指令执行后的**写入寄存器 diff（改前→改后）、NZCV 标志、内存访问（含
-store value）、SVC 系统调用、objc_msgSend 类/方法派发、以及跨区间调用/返回的
-目标地址**；区间之外的代码以原生速度运行、零 trace 开销。运行期只写裸二进制，
-反汇编与符号化全部交给离线解码器，因此热路径极快。
+store value，支持 9-16 字节宽 store）、SVC 系统调用、objc_msgSend 类/方法派发
+（含运行时类名）、以及跨区间调用/返回的目标地址**；区间之外的代码以原生速度
+运行、零 trace 开销。运行期只写裸二进制，反汇编与符号化全部交给离线解码器，
+因此热路径极快。
 
 针对 iOS/arm64e 真机做了专门处理：VM 开启 `OPT_BYPASS_PAUTH` 绕过指针认证，
 因此 `braa/blraa` 这类带认证的间接跳转（例如 `objc_msgSend` 尾部的 `braa x17`、
@@ -15,7 +16,7 @@ PAC 化的 `br x16`）不会导致崩溃，控制流可以被正确跟踪。
 整体分三层，把开销尽量推离运行期热路径：
 
 1. **运行期（注入进目标进程的 dylib）**：逐指令回调里只做最小动作——读 NZCV、
-   按 PC 查缓存好的“写哪些寄存器”列表并读新值、按需取内存访问、把一条变长记录
+   按 PC 查缓存好的"写哪些寄存器"列表并读新值、按需取内存访问、把一条变长记录
    追加到 thread-local 无锁缓冲区。没有任何反汇编、符号化、加锁或同步 I/O。
 2. **异步落盘**：每个线程独立 ring buffer，单个后台 writer 线程统一刷盘。缓冲区
    满时采用**全量落盘**（不丢数据）。
@@ -32,7 +33,7 @@ PAC 化的 `br x16`）不会导致崩溃，控制流可以被正确跟踪。
 为了让 trace 文件**开箱即用地离线反汇编**，运行期在某条 PC **首次执行**时，把这条
 指令的原始字节（AArch64 定长 4 字节）作为一条 `CODE` 记录随流落盘。由于按 PC 去重
 （每线程一个 `seen` 集合），循环/递归等稳态热路径**零额外开销**，文件体积增量也很小
-（只与“执行过的不同指令条数”成正比，而非指令执行次数）。解码器读这些 `CODE` 记录
+（只与"执行过的不同指令条数"成正比，而非指令执行次数）。解码器读这些 `CODE` 记录
 建立 `静态PC → 字节` 的码表，反汇编时优先查码表，因此**不依赖外部 `--image`**。该
 特性默认开启，可在引导脚本里关闭。
 
@@ -40,8 +41,37 @@ PAC 化的 `br x16`）不会导致崩溃，控制流可以被正确跟踪。
 寄存器快照（anchor），其后每条指令只记录变化的寄存器。解码器从最近的 anchor
 出发回放 diff，即可在任意点得到准确的完整寄存器状态。
 
+### 容错内存读取（Fault-tolerant Memory Probe）
+
+目标进程可能有 guard page、已释放/未映射区域、MMIO 等危险地址。tracer 使用
+`vm_read_overwrite`（mach VM 接口）实现容错读取：对不可读的地址返回错误（而非
+触发 SIGSEGV 崩溃），保证 store value 补读、ObjC 接收者类名解析、以及内嵌码表
+的字节抓取均不会导致 tracer 崩溃。不可读的地址会被标记为 unknown 而非触发异常。
+
+### 宽 store 补读
+
 write 指令的 value QBDI 有时拿不到（标记 `MEMORY_UNKNOWN_VALUE`）。此时在
 POSTINST 阶段（store 已执行）从目标地址重新读回字节补齐，并清掉 unknown 标记。
+支持 1-16 字节的标量和 NEON 宽 store（`stp x,x` / 128-bit 向量）：低 8 字节
+存入 `value`，高 8 字节存入 `value_hi`。更宽的 store（>16B，极罕见）仍保留
+unknown 标记。
+
+### 整模块插桩
+
+当前版本默认使用 `addInstrumentedModuleFromAddr` 对**目标函数所在模块的整个可执行
+段**进行插桩（而非仅限于 `[trace_start, trace_end)` 固定窗口）。这解决了以下问题：
+目标函数体超过原始固定窗口大小或尾调用相邻 helper 时，PC 离开窗口会触发非预期的
+ExecBroker 行为（甚至死锁）。整模块插桩覆盖所有模块内子调用，而系统库调用自然
+落在模块外、通过 transfer 事件原生执行。如果模块解析失败（匿名映射），自动退化为
+固定窗口。
+
+### Safe Return Address（ARC 兼容）
+
+QBDI 默认的 `FAKE_RET_ADDR == 42 (0x2a)` 会导致含 ARC 返回值优化路径（如
+`objc_autoreleaseReturnValue`）的函数崩溃——该 helper 会解引用 LR 查找 ARC
+elision marker。tracer 分配了一个独立的 RX 页（首字节为 AArch64 `ret` 指令），
+用作 safe return address，使 ARC probe 读到合法内存而非 fault。对含 ObjC ARC
+代码的 iOS 目标至关重要。
 
 ### iOS 流跟踪与调用信息
 
@@ -49,54 +79,73 @@ POSTINST 阶段（store 已执行）从目标地址重新读回字节补齐，�
   QBDI 通过 ExecBroker 原生执行并触发 `EXEC_TRANSFER_CALL/RETURN` 事件。记录里
   既保存**调用点 PC（site，区间内的那条 `br/blr`）**，又保存**转移目标地址
   （target，跳到哪去了）**，便于还原 `br x16`、OC 之间跳转、`objc_msgSend` 等
-  原本“跟丢”的控制流。
+  原本"跟丢"的控制流。
 - **objc_msgSend 派发**：由引导脚本解析 `objc_msgSend / objc_msgSendSuper /
   objc_msgSendSuper2 / objc_msgSend_stret` 的运行期地址传入。当某次跨区间调用的
   目标命中其中之一时，在调用点抓取 `x0`（self / 接收者）与选择子寄存器（普通变体
-  是 `x1=SEL`，stret 变体接收者在 `x1`、SEL 在 `x2`），离线由选择子指针解析出
-  方法名字符串。
+  是 `x1=SEL`，stret 变体接收者在 `x1`、SEL 在 `x2`）。此外，**运行时通过
+  `object_getClassName` 捕获接收者的类名**（存入 `OBJC` 记录的 `cls[48]` 字段），
+  tagged pointer 和 arm64e isa packing 均可正确处理。对 `*Super` 变体（接收者为
+  `objc_super` 结构体指针，非对象）跳过类名解析。只有通过 `looksLikeObjcObject`
+  验证（对齐、非空、isa 可读）的接收者才会尝试类名解析，避免对野指针的解引用。
 - **SVC 系统调用**：用 mnemonic 回调只在 `svc` 指令上触发（对普通指令零开销），
   记录 Darwin 系统调用号（`x16`）与参数 `x0..x5`，离线映射成 syscall 名。
 
 ### 寄存器 diff 的前后值
 
-每条变化的寄存器同时记录**改前值与改后值**，解码器以 `reg: 0xOLD -> 0xNEW`
-形式打印，无需依赖 anchor 回放也能直观看出单条指令对寄存器的影响。
+每条变化的寄存器记录其**改后值**（绝对值）。解码器通过 anchor + diff 链维护一份
+running register file，因此能在输出时同时给出改前值，以 `reg: 0xOLD -> 0xNEW`
+形式打印，完全无损。diff 存储绝对值（而非 delta），因此即使跨 sequence/transfer
+边界也能正确重建，不依赖连续的 anchor。
 
 多线程：每个线程有独立的 `ThreadCtx` + ring buffer，记录流里带 thread id 标记，
 解码器按线程分别重建。
 
+### 崩溃定位 PC ring window（诊断）
+
+tracer 维护一个大小为 2048 的内存环形缓冲（`g_pc_ring`），PREINST 回调里
+每条指令只做一次 cheap 的环写入（PC + opcode 字节），零 IO 开销。当进程发生
+SIGSEGV/SIGBUS 时，内置的 fault handler 将最近 2048 条 PC（连同指令编码）
+dump 到 `QBDI_LOG_FILE` 环境变量指定的文件（或 stderr），然后 re-raise 让进程
+自然崩溃。
+
+此外，导出函数 `qbditrace_dump_pcring(path)` 允许 Frida 端在自己的异常处理中
+主动读取 ring（Frida 的 exceptor 会在 NativeFunction trampoline 内截获 fault，
+此时 native signal handler 不会运行；调用此导出后可从 ring 中恢复崩溃前 PC 序列）。
+
 ### 关于 GCD / 多线程的语义边界
 
-QBDI 的 VM 是**单线程**的：`qbditrace_run_call` 只接管发起调用的那个线程，并
-在该线程的栈上用 QBDI 执行目标函数。这带来两点必须明确的限制：
+QBDI 的 VM 是**单线程**的：`qbditrace_run_call` / `qbditrace_run_at` 只接管发起
+调用的那个线程，并在该线程的栈上用 QBDI 执行目标函数。这带来两点限制：
 
 - **dispatch_async / GCD 派发出去的 block 跟不到**。当目标代码调用
   `dispatch_async` 把一个 block 丢到其它队列/线程执行时，那段 block 在**另一个
   原生线程**上运行，并不在当前 VM 的接管范围内，因此不会被 trace。能看到的只是
-  “调用了 dispatch_async”这一跨区间 call 事件本身。
+  "调用了 dispatch_async"这一跨区间 call 事件本身。
 - **同步派发（dispatch_sync）/ 普通函数调用**只要最终在当前线程、且落在插桩
   区间内执行，就能正常 trace；落在区间外则原生执行并以 transfer 事件记录目标。
 
-本版本**不做多线程并发 trace**：让多个线程同时用各自 VM 去 trace **同一个函数**
-存在内存/状态冲突的本质矛盾，且会显著放大复杂度。如果确实需要覆盖多线程，推荐的
-方向是**串行化**（一次只让一个线程进入被 trace 的函数），而非真并发。
+本版本**不做多线程并发 trace**。如果需要覆盖多线程，推荐**串行化**（一次只让一个
+线程进入被 trace 的函数），而非真并发。
 
 ## 文件结构
 
 ```
 tools/qbditrace/
 ├── TraceFormat.h        二进制格式契约（writer 与 decoder 共用）
-├── QBDITrace.h          公共 C ABI（configure / run_call / stop / output_path）
+├── QBDITrace.h          公共 C ABI（configure / run_call / run_at / stop / output_path / dump_pcring）
 ├── RingBuffer.h         thread-local 缓冲 + 后台 writer 线程
-├── QBDITrace.cpp        核心 tracer（QBDI 回调、热路径、VM 接管）
+├── QBDITrace.cpp        核心 tracer（QBDI 回调、热路径、VM 接管、fault handler、safe ret addr）
 ├── qbditrace.js         Frida 引导脚本（仅负责加载与一次性接管，与热路径无关）
 ├── decoder/
-│   └── trace_decode.cpp 离线解码器（Capstone 反汇编 + 状态重建）
-├── test/                Apple Silicon 上的自包含闭环测试（见第 4 节）
-│   ├── test_target.c    覆盖 5 类特性的目标函数（控制流/内存/调用/objc/SVC）
-│   ├── test_harness.c   standalone harness：直接调 configure/run_call/stop
-│   └── run_macos.sh     一键构建并运行测试 + 解码
+│   └── trace_decode.cpp 离线解码器（Capstone 反汇编 + 状态重建 + diff）
+├── benchmark/
+│   ├── bench_harness.c  基础 benchmark harness
+│   ├── run_benchmark.sh 一键运行基础 benchmark
+│   ├── targets.c/h      7 类 target
+│   └── advanced/        高级 benchmark 套件（22 target，真实加密+OLLVM 混淆）
+│       ├── run_advanced.sh
+│       └── README.md
 └── CMakeLists.txt       两个目标：dylib（iOS）+ decoder（host）
 ```
 
@@ -165,14 +214,14 @@ Frida 只做引导，核心 trace 逻辑全在 native，与 Frida 无关。
 | `dylibPath`    | 设备上 `libqbditrace.dylib` 的绝对路径 |
 | `moduleName`   | 目标函数所在模块名；`null` 表示主可执行文件 |
 | `funcOffset`   | 目标函数相对模块基址的**静态偏移**（= IDA 中地址 − 镜像基址） |
-| `rangeSize`    | trace 区间长度（字节），区间 = `[start, start+rangeSize)` |
+| `rangeSize`    | trace 区间长度（字节）。实际上 tracer 会尝试整模块插桩（`addInstrumentedModuleFromAddr`），此字段仅作为退化时的回退窗口 |
 | `outputPath`   | 设备上 trace 二进制的输出路径 |
 | `record`       | 位掩码：1=NZCV，2=寄存器 diff，4=内存访问，8=SVC，16=objc_msgSend；31=全部 |
-| `resolveObjc`  | 是否解析 `objc_msgSend` 家族地址以捕获 self/SEL（非 OC 目标可设 false） |
-| `anchorInterval` | 每 N 条指令打一次全量寄存器重同步快照（0 = 默认 1024）。anchor 只是 seek/部分读的重同步检查点，diff 存的是绝对值，跨序列/transfer 边界也能重建，无需每次都打 |
+| `resolveObjc`  | 是否解析 `objc_msgSend` 家族地址以捕获 self/SEL/类名（非 OC 目标可设 false） |
+| `anchorInterval` | 每 N 条指令打一次全量寄存器重同步快照（0 = 默认 1024） |
 | `ringBytes`    | 每线程 ring buffer 字节数（0 = 默认 64 MiB） |
 | `embedCode`    | 是否在 trace 里内嵌去重码表以支持离线自带反汇编（默认 `true`；设 `false` 关闭） |
-| `argCount`     | 目标函数的整型参数个数（转发给 QBDI 的 x0..x7） |
+| `argCount`     | 目标函数的整型参数个数（转发给 QBDI 的 x0..x7，最大 8） |
 
 `funcOffset` 怎么取：在 IDA 里看到函数地址例如 `0x100A1B2C0`，镜像基址
 `0x100000000`，则 `funcOffset = 0xA1B2C0`。脚本会自动加上运行期的 ASLR slide。
@@ -210,7 +259,7 @@ frida -H 127.0.0.1:27042 -f <bundle.id> -l tools/qbditrace/qbditrace.js --no-pau
 ./trace_decode qbditrace.bin --diff qbditrace_run2.bin
 
 # 其他选项
-#   --image <f> --image-base <hex>  [已废弃] 外部裸代码 dump 兜底（见下）
+#   --image <f> --image-base <hex>  [已废弃] 外部裸代码 dump 兜底
 #   --no-regs            不打印寄存器变化
 #   --no-mem             不打印内存访问
 #   --no-symbols         关闭 adrp/adr 目标 + 静态字符串标注（e2）
@@ -221,17 +270,11 @@ frida -H 127.0.0.1:27042 -f <bundle.id> -l tools/qbditrace/qbditrace.js --no-pau
 
 **内嵌码表（默认开）**：trace 写入时会把每条**执行过的不同指令**的原始字节随流
 落盘（去重，循环/递归稳态零额外开销），解码器据此自带反汇编，**不再需要 `--image`**。
-解码头部的 `code=1` 与 `; code : embedded ...` 即表示该 trace 自包含。
 
-`--image` 现已**废弃（deprecated）**：内嵌码表已让离线反汇编自包含，几乎不存在它
-能比码表多救出指令的场景（缺失的 PC 往往是 guard page / 已 unmap，磁盘镜像同样读
-不到；旧版本 trace 又会被版本校验直接拒绝）。它目前仅作为旧 trace 的兜底保留，**后续
-版本可能直接移除**。若仍要使用：提供代码段裸 dump，其首字节对应 `--image-base` 指定
-的静态地址，解码器按 `static_pc - image_base` 取字节;注意它只认**裸代码 dump**，不
-解析磁盘 Mach-O 段布局。
+`--image` 现已**废弃（deprecated）**：内嵌码表已让离线反汇编自包含。它目前仅作为
+旧 trace 的兜底保留，**后续版本可能直接移除**。
 
-> 关闭内嵌码表：在 `qbditrace.js` 的 `CONFIG` 里设 `embedCode: false`（默认开）。
-> 一般无需关闭——去重后体积增量很小，换来开箱即用的离线反汇编。
+> 关闭内嵌码表：在 `qbditrace.js` 的 `CONFIG` 里设 `embedCode: false`。
 
 输出里每条指令的地址都是**静态地址**（已减去 module_slide），可直接和 IDA 里看到
 的地址对照。示例：
@@ -247,123 +290,95 @@ frida -H 127.0.0.1:27042 -f <bundle.id> -l tools/qbditrace/qbditrace.js --no-pau
 0x0001001b2c0  sub sp, sp, #0x40                 ; sp: 0x16d... -> 0x16d...
 0x0001001b2c4  stp x29, x30, [sp, #0x30]         ; mem[W ] [0x16d...] (16B) = 0x...
 0x0001001b2c8  add x0, x0, #1                    ; x0: 0x29 -> 0x2a ; nzcv=----
-; [objc_msgSend] @ 0x1001b2d0 (static 0x1001b2d0) self=0x283f... sel="length"
+; [objc_msgSend] @ 0x1001b2d0 (static 0x1001b2d0) cls="NSString" sel="length"
 ; [xfer_call] 0x1001b2d0 (static 0x1001b2d0) -> target 0x1c0a... (static 0x...)
 ; [svc] @ 0x1001b3e0 (static 0x1001b3e0) syscall=4 (write) args=0x1,0x16d...,0x10,...
 ```
 
-## 4. 在 Apple Silicon（macOS arm64）上做初步测试
+## 4. C ABI 参考
 
-在没有真机的情况下，可以先在 Apple Silicon Mac 上跑一个**自包含闭环**，验证 tracer
-的五类记录都能正确工作。这一步既能确认工具链可用，也能评估在真机上的通用性。
+`QBDITrace.h` 定义了 tracer dylib 导出的公共 C 接口：
 
-### 4.1 思路
-
-macOS arm64 和 iOS arm64e 都是 AArch64，QBDI 的指令级语义完全一致，差别只在：
-
-- iOS A12+ 是 **arm64e（带指针认证 PAC）**，需要 `OPT_BYPASS_PAUTH`；macOS 是
-  **普通 arm64（无 PAC）**，该选项无害。tracer 已用 `#if !defined(__x86_64__)`
-  自动走对应分支，源码无需改动。
-- 注入方式不同：真机用 Frida 注入 dylib，初测时直接把 tracer 编进一个
-  **standalone harness**，在 `main` 里调用 `qbditrace_configure` / `qbditrace_run_call`
-  / `qbditrace_stop`，跑完用 decoder 看输出。
-
-因此只需要把 QBDI 的库编成 macOS arm64 版本，就能把同一套 tracer 代码直接跑起来。
-
-### 4.2 构建 macOS arm64 版 QBDI
-
-```sh
-# 在 QBDI 仓库根目录
-sh cmake/config/config-macOS-AARCH64.sh   # 约 2 分钟
-ninja QBDI_static qbdi-llvm               # 编译 LLVM 子集，数分钟
-lipo -info build-macos/libQBDI.a          # 应显示 architecture: arm64
+```c
+int  qbditrace_configure(const qbditrace_config_t *cfg);
+int  qbditrace_run_call(uint64_t *ret_out, uint64_t function,
+                        uint32_t argc, const uint64_t *argv);
+int  qbditrace_run_at(uint64_t *ret_out, uint64_t start_pc,
+                      const uint64_t *gpr, uint64_t sp, uint64_t lr);
+void qbditrace_stop(void);
+const char *qbditrace_output_path(void);
+int  qbditrace_dump_pcring(const char *path);
 ```
 
-### 4.3 一键运行测试
+### qbditrace_configure
 
-```sh
-sh tools/qbditrace/test/run_macos.sh        # 用默认 seed
-sh tools/qbditrace/test/run_macos.sh 0x42   # 自定义 seed
-```
+配置 tracer，必须在任何 `run_*` 之前调用。会拷贝 config（字符串也会 dup），
+调用方无需保持 struct 存活。成功返回 0，失败返回负值。
 
-脚本做三件事：编译 `tracer + test_target + test_harness` 成可执行文件、运行它生成
-trace、再编译 decoder 并解码输出。
+### qbditrace_run_call
 
-测试目标 `trace_target()` 故意把五类特性都覆盖到：写一个数组（**内存写**）、按
-seed 奇偶分支（**控制流**）、调用 `helper_sum` 和递归 `fib`（**跨函数调用 + 控制流**）、
-调 `objc_msgSend`（**objc**）、以及一条 inline `svc #0x80`（**SVC**）。harness 会把
-插桩结果 `ret` 和不插桩的 native 结果对比，确认插桩不改变语义。
+用 QBDI VM 接管目标函数执行，trace 落在配置区间内的一切。在隔离的假栈上执行。
+argc 可为 0..8（AArch64 整型参数）。返回值写入 `*ret_out`。
 
-### 4.4 验证结果（五类记录全部命中）
+这是**推荐入口**：Frida hook 目标函数后在回调中调用此函数转发原始参数。
 
-```
-; [seq_entry]  @ ...                     ; 控制流：序列入口/出口、fib 递归跳转
-0x...  str x8, [x9]    ; mem[W ] [0x...] = 0x1234   ; 内存写（数组等差 3）
-0x...  ldr x8, [x9]    ; mem[R ] [0x...]            ; 内存读（helper_sum 求和）
-; [xfer_call]   site -> target 0x183a11800          ; 跨函数调用，target=真实库函数
-; [xfer_return] ...
-; [objc_msgSend] @ ... self=0x1f0d76918 sel=0x1feda6050
-; [svc]         @ ... syscall=20 (getpid) args=...
-```
+内部使用 safe return address（映射 RX 页，含 `ret` 指令）替代 QBDI 默认的
+`FAKE_RET_ADDR == 42`，修复 ARC `objc_autoreleaseReturnValue` 解引用 LR
+导致的 fault。
 
-最后 harness 打印 `instrumented ret == native result`，两值一致（例如
-`0x8f5bf4300367ab67`），说明插桩没有改变程序语义。
+### qbditrace_run_at
 
-### 4.5 两个真机逆向中也会遇到的关键点
+原地 trace：以捕获的寄存器上下文重放一次真实调用。**不分配假栈**——使用调用者的
+真实 SP 和完整寄存器状态，trace 代码看到的环境与真实调用完全一致。
 
-测试过程中暴露并解决了两个在真机上同样存在的难点：
+适用场景：非可重入的薄 wrapper（行为依赖调用者已准备好的栈帧/全局状态，如
+VM dispatch 入口），它们不能在隔离环境下正确执行。
 
-**stub 链导致 xfer target 落在 stub 而非真实函数。** macOS/iOS 上目标函数调用外部库
-函数（如 `objc_msgSend`）时，先 `bl` 到本模块的 `__stubs` / `__auth_stubs`
-（`adrp x16; ldr x16; br x16`），stub 再跳到 dyld 共享缓存里的真实函数。如果只插桩
-目标函数本身，QBDI 在执行流离开插桩区（即到达 stub）时就触发 `EXEC_TRANSFER_CALL`，
-此时 target 是 **stub 地址而不是真实 objc_msgSend**，导致 objc 等值匹配失败。
+参数含义：
 
-解决办法是把 `__stubs` / `__auth_stubs` section 也纳入插桩范围，让 QBDI trace 进
-stub，等 stub 的 `br x16` 真正跳到库函数时才触发 transfer，此时 target 就是真实地址。
-为此 tracer 的 config 新增了一个**第二插桩区间** `extra_range_start/end`
-（`QBDITrace.h`/`.cpp` 已支持，JS 也已透传）。harness 用
-`getsectiondata(__TEXT,__auth_stubs)` 定位该区间并填入 config。加上 stubs 后，四个
-xfer target 全部命中真实的 dyld 缓存地址（getpid / objc_getClass / sel_registerName /
-objc_msgSend），与 harness `dlsym` 解析的结果完全一致。
+- `start_pc`：函数入口运行时 PC（被 hook 的地址）
+- `gpr`：30 个值的数组 = x0..x28 (idx 0..28) + x29/FP (idx 29)
+- `sp`：入口时捕获的真实栈指针
+- `lr`：入口时捕获的真实返回地址；VM 运行到此地址时停止
 
-**SVC 必须在插桩区内才能捕获。** `getpid()` 的 svc 指令在 libsystem（dyld 缓存、
-插桩区外）里执行，不会触发 SVC 回调，只表现为一次 transfer。要捕获 SVC，svc 指令本身
-必须落在插桩区内 —— 这正是混淆 / 反调试 iOS 代码常用的 **inline syscall** 模式。
-测试用一条 inline `svc #0x80`（getpid，选择子 x16=20）在 `trace_target` 内验证，成功
-被 SVC 回调捕获并记录参数。
+### qbditrace_stop
 
-### 4.6 通用性结论
+刷盘并关闭 trace 文件。可重复调用。显式调用可保证 trace 完整且立即可读。
 
-同一套 tracer 源码在 macOS arm64 上闭环验证通过，五类记录全部正确、语义一致。迁移到
-iOS arm64e 真机时只需：换用 iOS dylib（已有 `1.1` 的编译命令）、保留
-`OPT_BYPASS_PAUTH`、用 Frida 注入并把目标函数 + 其 `__auth_stubs` 区间填入 config。
-PAC 差异已被 tracer 自动适配，无需改动逻辑。
+### qbditrace_output_path
 
-## 二进制格式速览
+返回当前正在写入的 trace 文件路径。返回指针由库管理。
 
-`TraceFormat.h` 是唯一的格式契约（writer 与 decoder 共用，保证 ABI 一致）。
+### qbditrace_dump_pcring
 
-- 512 字节文件头：magic `"QBDT"`、version、arch、num_gpr、module_base、
-  module_slide、trace 区间、flags、module_name。flags 标记内容特性：
-  `HAS_MEM`、`HAS_NZCV`、`REG_DIFF`、`HAS_CODE`（内嵌码表存在）。
-- 记录流由变长记录组成，首字节为 `kind`：
-  - `INST`：`{kind,nzcv,n_regdiff,n_mem,pc}` +
-    n_regdiff×`{reg_index,value}` + n_mem×`{mem_type,mem_flags,size,addr,value}`。
-    （diff 只存改后值；解码器从 running register file 回放得到改前值，因此不再
-    冗余存 prev_value。）
-  - `ANCHOR`：全量寄存器快照（重建检查点）
-  - `THREAD`：线程标记（thread id）
-  - `EVENT`：VM 事件（序列入口/出口、跨区间 call/return）。XFER_CALL 的
-    `addr` 是转移目标，`site` 是区间内的调用点 PC
-  - `SVC`：`{pc, syscall_no(x16), args[6]=x0..x5}`
-  - `OBJC`：`{variant, pc, recv(self), sel}`
-  - `CODE`：`{kind,size,pc}` + size 个原始指令字节。某 PC 首次执行时写入一条，
-    供解码器自带反汇编（AArch64 定长 4 字节）。去重后稳态零开销。
-- 寄存器索引采用 QBDI GPR 顺序：0..28=x0..x28，29=fp，30=lr，31=sp，
-  32=nzcv，33=pc。
-- 格式版本随不兼容变更递增，当前为 **v4**（v3 去掉 diff 的 prev_value，v4 新增
-  内嵌码表 `CODE` 记录）；解码器只接受与自身一致的版本。
+诊断用途：将崩溃定位 PC ring window（最后 2048 条执行的 PC + opcode）写入指定
+文件（追加模式），`path` 为 NULL 时写 stderr。供 Frida 端在自己的异常处理中调用
+（Frida 的 exceptor 会在 NativeFunction trampoline 内拦截 fault，此时 native
+signal handler 不会运行）。返回写出的 PC 条目数。
+
+### qbditrace_config_t 结构体
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `trace_start` | `uint64_t` | 运行时起始地址（含 ASLR） |
+| `trace_end` | `uint64_t` | 运行时结束地址（不含） |
+| `module_base` | `uint64_t` | 模块运行期基址 |
+| `module_slide` | `uint64_t` | ASLR slide；静态地址 = 运行时 - slide |
+| `module_name` | `const char*` | 模块路径（可为 NULL） |
+| `output_path` | `const char*` | 输出文件路径（NULL => 默认路径） |
+| `record` | `uint32_t` | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC |
+| `anchor_interval` | `uint32_t` | 每 N 条指令打一次全量快照（0 = 默认 1024） |
+| `ring_bytes` | `uint64_t` | 每线程 ring buffer 字节数（0 = 默认 64 MiB） |
+| `objc_msgSend` | `uint64_t` | 运行期 objc_msgSend 地址（0 = 不捕获） |
+|`objc_msgSendSuper` | `uint64_t` | 运行期 objc_msgSendSuper 地址 |
+| `objc_msgSendSuper2` | `uint64_t` | 运行期 objc_msgSendSuper2 地址 |
+| `objc_msgSend_stret` | `uint64_t` | 运行期 objc_msgSend_stret 地址 |
+| `extra_range_start` | `uint64_t` | 第二插桩区间起始（0 = 未用） |
+| `extra_range_end` | `uint64_t` | 第二插桩区间结束 |
+| `disable_embed_code` | `uint32_t` | 非零关闭内嵌码表（默认 0 = 开启，反转语义） |
+
+**`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
+`run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。
 
 ## 5. Benchmark 套件
 
@@ -403,8 +418,7 @@ sh tools/qbditrace/benchmark/advanced/run_advanced.sh --group B --tenet /path/to
 sh tools/qbditrace/benchmark/advanced/run_advanced.sh --filter aes_cff_mba --decode-all
 ```
 
-高级集的设计细节、各 target 说明和编译注意事项见
-[`benchmark/advanced/README.md`](benchmark/advanced/README.md)。
+高级集的设计细节见 [`benchmark/advanced/README.md`](benchmark/advanced/README.md)。
 
 **编译注意**：target 源码必须用 `-march=armv8-a+nosha3+nocrypto+noaes+nosha2
 -fno-vectorize -fno-slp-vectorize` 编译，以防编译器生成 ARMv8.2 SHA3/Crypto NEON
@@ -412,27 +426,50 @@ sh tools/qbditrace/benchmark/advanced/run_advanced.sh --filter aes_cff_mba --dec
 
 ### 5.3 可选：真实 OLLVM 编译
 
-如果需要用 Pluto-Obfuscator（LLVM 14.0.6）编译真正的 OLLVM 混淆版本做对比：
-
 ```sh
 sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
 ```
 
-该脚本会从 GitHub 克隆 Pluto-Obfuscator 源码、编译 clang，并对各 crypto target 分别
-应用 CFF/BCF/SUB/ALL 四种混淆组合。编译时间约 30 分钟。
+## 二进制格式速览
+
+`TraceFormat.h` 是唯一的格式契约（writer 与 decoder 共用，保证 ABI 一致）。
+
+- 512 字节文件头：magic `"QBDT"`、version、arch、num_gpr、module_base、
+  module_slide、trace 区间、flags、module_name。flags 标记内容特性：
+  `HAS_MEM`、`HAS_NZCV`、`REG_DIFF`、`HAS_CODE`（内嵌码表存在）。
+- 记录流由变长记录组成，首字节为 `kind`：
+  - `INST (0)`：`{kind,nzcv,n_regdiff,n_mem,pc}` +
+    n_regdiff × `{reg_index,value}` + n_mem × `{mem_type,mem_flags,size,addr,value,value_hi}`
+  - `ANCHOR (1)`：全量寄存器快照（重建检查点）
+  - `THREAD (2)`：线程标记（thread id）
+  - `EVENT (3)`：VM 事件（SEQ_ENTRY/SEQ_EXIT/XFER_CALL/XFER_RETURN）。
+    XFER_CALL 的 `addr` 是转移目标，`site` 是调用点 PC
+  - `SVC (4)`：`{pc, syscall_no(x16), args[6]=x0..x5}`
+  - `OBJC (5)`：`{variant, pc, recv(self), sel, cls[48]}`（cls 为运行时类名，
+    最多 47 字符，NUL 结尾；tagged pointer / normal object 均可解析）
+  - `CODE (6)`：`{kind,size,pc}` + size 个原始指令字节（AArch64 = 4B）
+- 寄存器索引采用 QBDI GPR 顺序：0..28=x0..x28，29=fp，30=lr，31=sp，
+  32=nzcv，33=pc。
+- 内存访问含 `value`（低 8B）+ `value_hi`（高 8B，用于 stp/NEON 9-16B store）。
+- 格式版本当前为 **v4**（v3: 去掉 diff prev_value 改为绝对值 + 新增 value_hi；
+  v4: 新增 CODE 记录 + OBJC cls 字段）。解码器只接受与自身一致的版本。
+
+## 诊断与环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `QBDI_LOG_FILE` | 设为文件路径后，fault handler 自动把 PC ring dump 到此文件（追加）。不设置则写 stderr |
+| `QBDITRACE_OUT` | 默认 trace 输出路径的环境变量覆盖（未通过 config 指定 output_path 时生效） |
 
 ## 已知限制
 
-- write value 补读仅覆盖 `size <= 8` 的标量 store；更宽的向量 store 的 value
-  保留 unknown 标记。
-- Frida 引导默认**只 trace 目标函数的首次调用**（逆向常见需求）。如需每次都 trace，
-  需要改造为带原始字节 save/restore 的重装逻辑（注意线程安全）。
-- 仅在 iOS AArch64 上验证；`TraceFormat.h` 预留了 x86_64 的 arch 标记，但 x86_64
-  写入路径未做完整适配（SVC/objc/PAuth 等增强均为 AArch64 专属）。
-- objc 记录里的 **self（接收者）是运行期对象指针**，其类名需运行期对象布局才能
-  解析，离线解码器只打印指针；选择子（SEL）通常指向镜像内 `__objc_methname`，
-  能离线还原成方法名字符串。
-- syscall 名表只覆盖常见子集，未命中的号码按原始数字显示；Mach trap（负号选择子）
-  不在此表内。
-- GCD / 跨线程派发出去的 block 不在当前 VM 线程内执行，无法被 trace（详见上文
-  “GCD / 多线程的语义边界”）。
+- write value 补读覆盖 `size <= 16` 的 store（使用 `vm_read_overwrite` 容错读取）；
+  更宽的向量 store 的 value 保留 unknown 标记。
+- Frida 引导默认**只 trace 目标函数的首次调用**。如需每次都 trace，需改造为带原始
+  字节 save/restore 的重装逻辑。
+- 仅在 iOS AArch64 上验证；x86_64 写入路径未做完整适配。
+- objc 记录的 cls 字段容量 48 字节；`*Super` 变体跳过类名解析（接收者为 objc_super
+  结构体指针）。选择子通常可离线还原为方法名字符串。
+- syscall 名表只覆盖常见子集，未命中的号码按原始数字显示；Mach trap 不在此表内。
+- GCD / 跨线程派发出去的 block 无法被 trace（不在当前 VM 线程内执行）。
+- `addInstrumentedModuleFromAddr` 整模块插桩；模块解析失败时退化为固定窗口。
