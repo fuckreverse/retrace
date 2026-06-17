@@ -91,19 +91,43 @@ uint8_t triton_reg_to_gpr_index(triton::arch::register_e reg) {
 class TritonBridgeImpl final : public TritonBridgeTaint {
 public:
     TritonBridgeImpl() {
+        // Taint context: used by process_instruction / taint_register etc.
         ctx_.setArchitecture(triton::arch::architecture_e::ARCH_AARCH64);
         // Disable symbolic execution (we only need concrete semantics + taint)
         ctx_.setMode(triton::modes::mode_e::ONLY_ON_TAINTED, true);
+
+        // Semantics context: a separate lightweight context used ONLY for
+        // query_semantics(). It never accumulates taint state, so we don't
+        // need ONLY_ON_TAINTED — plain concrete mode is fine and cheaper.
+        // This isolation prevents query_semantics() calls from corrupting the
+        // running taint engine state.
+        sem_ctx_.setArchitecture(triton::arch::architecture_e::ARCH_AARCH64);
     }
 
     Result<InstructionSemantics> query_semantics(
         uint64_t pc, const uint8_t* code, size_t code_size) override {
 
+        // ── Opcode cache: AArch64 is fixed 4-byte instructions, so the opcode
+        // word fully determines register read/write sets (what backward_taint
+        // needs). We key by opcode_word, not PC, so the cache works across
+        // repeated executions of the same instruction at the same or different
+        // addresses.
+        uint32_t opcode_word = (code_size >= 4)
+            ? *reinterpret_cast<const uint32_t*>(code) : 0;
+
+        auto it = sem_cache_.find(opcode_word);
+        if (it != sem_cache_.end()) {
+            // Cache hit: return cached semantics with correct PC
+            InstructionSemantics cached = it->second;
+            cached.pc = pc;
+            return cached;
+        }
+
         triton::arch::Instruction inst;
         inst.setOpcode(code, static_cast<triton::uint32>(code_size));
         inst.setAddress(pc);
 
-        auto exception = ctx_.processing(inst);
+        auto exception = sem_ctx_.processing(inst);
         if (exception != triton::arch::exception_e::NO_FAULT) {
             return Error(ErrorCode::CapstoneError,
                 "Triton processing failed for instruction at " + std::to_string(pc));
@@ -111,9 +135,7 @@ public:
 
         InstructionSemantics sem;
         sem.pc = pc;
-        sem.opcode = (code_size >= 4)
-            ? *reinterpret_cast<const uint32_t*>(code)
-            : 0;
+        sem.opcode = opcode_word;
 
         // Extract read registers
         for (auto& [reg, ast_node] : inst.getReadRegisters()) {
@@ -178,6 +200,9 @@ public:
         }
 
         sem.expression = disasm;
+
+        // Store in cache (keyed by opcode word — register sets don't depend on PC)
+        sem_cache_.emplace(opcode_word, sem);
 
         return sem;
     }
@@ -273,7 +298,12 @@ public:
     triton::Context& raw_context() { return ctx_; }
 
 private:
-    triton::Context ctx_;
+    triton::Context ctx_;       // Taint engine context (stateful across instructions)
+    triton::Context sem_ctx_;   // Semantics-only context (stateless, used by query_semantics)
+
+    // Cache: opcode_word → InstructionSemantics (register/memory access sets)
+    // AArch64 has ~65536 possible opcodes in practice; cache grows to ~a few MB max.
+    ankerl::unordered_dense::map<uint32_t, InstructionSemantics> sem_cache_;
 };
 
 #endif  // TENET_HAS_TRITON

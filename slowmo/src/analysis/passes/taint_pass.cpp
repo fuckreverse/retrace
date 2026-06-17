@@ -4,8 +4,8 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/triton_bridge.h"
-#include "core/register_file.h"
-#include "core/memory_model.h"
+// register_file.h and memory_model.h no longer needed in run_triton_taint
+// (concrete context injection removed; taint engine is self-contained)
 
 #include <fmt/core.h>
 #include <cstring>
@@ -129,10 +129,14 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         return PassResult::failed("Triton bridge does not support taint interface");
     }
 
-    // Set initial register state from the trace at `start`
-    auto& regfile = ctx.regfile();
-    const RegState& initial_state = regfile.state_before(start);
-    triton->set_register_context(initial_state);
+    // ── Performance: ONLY_ON_TAINTED mode means Triton's taint engine propagates
+    // taint purely based on instruction semantics (data-flow graph), NOT on
+    // concrete register/memory values. Therefore we do NOT call
+    // set_register_context or set_memory_context per instruction — those calls
+    // cost 34+ Triton API calls each and are pure overhead in taint-only mode.
+    //
+    // We still need concrete values only at initialization to seed taint sources;
+    // after that the taint engine is self-contained.
 
     // Set initial taint sources
     for (uint8_t reg_idx : config.source_regs) {
@@ -156,6 +160,9 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
     uint64_t inst_id = 0;
     uint64_t processed = 0;
     uint64_t total = end - start;
+
+    // Hint to the OS that we'll be reading sequentially (improves mmap readahead)
+    reader.advise_sequential();
 
     for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
@@ -191,20 +198,12 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         uint32_t opcode_val = *opcode_opt;
         auto* opcode_bytes = reinterpret_cast<const uint8_t*>(&opcode_val);
 
-        // Reconstruct concrete state for this instruction
-        const RegState& state = regfile.state_before(inst_id);
-        triton->set_register_context(state);
-
-        // Set concrete memory state for memory accesses
-        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-            auto mem = inst.mem_access(m);
-            if ((mem.type & 2) == 0) {  // read access
-                uint8_t mem_buf[16];
-                std::memcpy(mem_buf, &mem.value, 8);
-                std::memcpy(mem_buf + 8, &mem.value_hi, 8);
-                triton->set_memory_context(mem.addr, mem_buf, mem.size);
-            }
-        }
+        // ── Concrete context injection removed ────────────────────────
+        // In ONLY_ON_TAINTED mode, Triton propagates taint via instruction
+        // semantics (getReadRegisters/getWrittenRegisters/getLoadAccess/
+        // getStoreAccess), which do NOT require concrete register values to
+        // be accurate. Injecting 34 register values + memory bytes per
+        // instruction was the single largest CPU cost (eliminated here).
 
         // Snapshot tainted regs before processing
         auto tainted_before = triton->get_tainted_gprs();

@@ -4,15 +4,12 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/triton_bridge.h"
-#include "core/register_file.h"
-#include "core/memory_model.h"
+// register_file.h and memory_model.h removed: regfile no longer used in hot path
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <algorithm>
-#include <sstream>
-
 namespace tenet {
 
 using json = nlohmann::json;
@@ -80,7 +77,6 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& code_table = ctx.code_table();
-    auto& regfile = ctx.regfile();
 
     auto bridge_ptr = create_triton_bridge();
     if (!bridge_ptr->is_available()) {
@@ -151,20 +147,12 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
         uint32_t opcode_val = *opcode_opt;
         auto* opcode_bytes = reinterpret_cast<const uint8_t*>(&opcode_val);
 
-        const RegState& reg_state = regfile.state_before(current_id);
-        triton->reset();
-        triton->set_register_context(reg_state);
-
-        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-            auto mem = inst.mem_access(m);
-            if ((mem.type & 2) == 0) {
-                uint8_t mem_buf[16];
-                std::memcpy(mem_buf, &mem.value, 8);
-                std::memcpy(mem_buf + 8, &mem.value_hi, 8);
-                triton->set_memory_context(mem.addr, mem_buf, mem.size);
-            }
-        }
-
+        // ── Performance: query_semantics only needs opcode bytes to determine
+        // read/write register sets via Triton's instruction decoder.
+        // Concrete register/memory values are NOT needed for this query —
+        // removing reset() + set_register_context eliminates the two most
+        // expensive calls in this loop (reset() re-initializes the entire
+        // Triton context; set_register_context issues 34 API calls each time).
         auto sem_result = bridge_ptr->query_semantics(inst.pc, opcode_bytes, 4);
         if (!sem_result) continue;
 
