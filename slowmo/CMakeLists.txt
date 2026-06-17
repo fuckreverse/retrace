@@ -26,10 +26,31 @@ endif()
 # ─── Options ────────────────────────────────────────────────────────────────
 option(TENET_USE_SYSTEM_ROCKSDB "Use system-installed RocksDB" OFF)
 option(TENET_USE_SYSTEM_CAPSTONE "Use system-installed Capstone" OFF)
-option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint analysis" OFF)
+option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint analysis" ON)
 option(TENET_ENABLE_YARA "Enable YARA rule engine for pattern detection" ON)
 option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" ON)
 option(TENET_BUILD_TESTS "Build unit tests" ON)
+
+# ─── FetchContent global shared cache ──────────────────────────────────────
+# All build trees (build/, build-triton/, build-no-triton/, …) share a single
+# _deps directory so sources are only git-cloned once.
+#
+# FETCHCONTENT_BASE_DIR  – points every build tree at the same source pool.
+# FETCHCONTENT_UPDATES_DISCONNECTED – once a package is cloned, never contact
+#   the network again (even on re-configure).  Use -DFETCHCONTENT_UPDATES_DISCONNECTED=OFF
+#   or delete the shared _deps/<pkg>-src dir to force a fresh fetch.
+#
+# The canonical location is <project-root>/_deps so it survives wipe-and-rebuild
+# of any individual build sub-directory.  Override with
+#   cmake -DFETCHCONTENT_BASE_DIR=/your/path …
+if(NOT DEFINED FETCHCONTENT_BASE_DIR OR FETCHCONTENT_BASE_DIR STREQUAL "")
+    set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_deps" CACHE PATH
+        "Shared FetchContent source cache (shared across all build trees)" FORCE)
+endif()
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+    "Skip network update check for already-downloaded FetchContent packages" FORCE)
+message(STATUS "FetchContent cache : ${FETCHCONTENT_BASE_DIR}")
+message(STATUS "FetchContent offline: ${FETCHCONTENT_UPDATES_DISCONNECTED}")
 
 # ─── FetchContent dependencies ──────────────────────────────────────────────
 include(FetchContent)
@@ -224,9 +245,19 @@ add_library(tenet_lib STATIC
     src/analysis/passes/call_graph_pass.cpp
     src/analysis/passes/cfg_pass.cpp
     src/analysis/passes/cfg_layout_pass.cpp
+    src/analysis/passes/GraphGridLayout.cpp
     src/analysis/passes/string_pass.cpp
     src/analysis/passes/pattern_pass.cpp
+    src/analysis/passes/constant_materialization_pass.cpp
     src/analysis/passes/loop_pass.cpp
+    src/analysis/passes/loop_semantics_pass.cpp
+    src/analysis/passes/algorithm_summary_pass.cpp
+    src/analysis/passes/trace_diff_pass.cpp
+    src/analysis/passes/symbol_annotation_pass.cpp
+    src/analysis/passes/memory_snapshot_pass.cpp
+    src/analysis/passes/dataflow_graph_pass.cpp
+    src/analysis/passes/objc_pass.cpp
+    src/analysis/passes/thread_pass.cpp
     src/tui/tui_app.cpp
     src/tui/hex_dump_view.cpp
 )
@@ -299,12 +330,25 @@ endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
 add_executable(tenet src/main.cpp)
-target_link_libraries(tenet PRIVATE tenet_lib)
 
 if(TENET_ENABLE_GUI)
+    # tenet_gui_lib already PUBLIC-links tenet_lib; no need to add tenet_lib again
+    # (avoids "ignoring duplicate libraries" linker warning on Apple ld).
     target_link_libraries(tenet PRIVATE tenet_gui_lib)
     target_compile_definitions(tenet PRIVATE TENET_HAS_GUI=1)
+else()
+    target_link_libraries(tenet PRIVATE tenet_lib)
 endif()
+
+# ─── Benchmark ───────────────────────────────────────────────────────────────
+add_executable(bench_tenet bench/bench_tenet.cpp)
+target_link_libraries(bench_tenet PRIVATE tenet_lib)
+
+add_executable(bench_all_passes bench/bench_all_passes.cpp)
+target_link_libraries(bench_all_passes PRIVATE tenet_lib)
+
+add_executable(bench_loop_only bench/bench_loop_only.cpp)
+target_link_libraries(bench_loop_only PRIVATE tenet_lib)
 
 # ─── Tests ──────────────────────────────────────────────────────────────────
 if(TENET_BUILD_TESTS)
