@@ -30,6 +30,7 @@ struct StringResult;
 struct CallEvent;
 struct CallGraphResult;
 struct LoopResult;
+struct ThreadResult;
 
 // ─── TUI Application State ────────────────────────────────────────────────
 
@@ -196,6 +197,18 @@ private:
     void open_function_filter_dialog();
     void close_function_filter_dialog();
     void execute_function_filter();
+
+    // ─── Thread analysis state ──────────────────────────────────────────
+    const ThreadResult* thread_result_ = nullptr;
+    bool show_threads_ = false;
+    bool thread_panel_focused_ = false;
+    size_t thread_cursor_ = 0;  // Selected thread in thread list
+
+    void run_thread_analysis();
+    ftxui::Element render_thread_panel();
+    bool handle_thread_panel_event(ftxui::Event event);
+    void goto_next_thread_switch();
+    void goto_prev_thread_switch();
 
     // ─── Loop analysis state ────────────────────────────────────────────
     const LoopResult* loop_result_ = nullptr;

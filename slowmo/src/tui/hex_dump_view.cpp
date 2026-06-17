@@ -66,6 +66,59 @@ void HexDumpView::goto_address(uint64_t addr) {
     cache_valid_ = false;
 }
 
+// ─── Cursor ─────────────────────────────────────────────────────────────────
+
+void HexDumpView::cursor_left() {
+    if (cursor_col_ > 0) {
+        cursor_col_--;
+    } else if (cursor_row_ > 0) {
+        cursor_row_--;
+        cursor_col_ = BYTES_PER_ROW - 1;
+    }
+}
+
+void HexDumpView::cursor_right() {
+    if (cursor_col_ < BYTES_PER_ROW - 1) {
+        cursor_col_++;
+    } else if (cursor_row_ < num_rows_ - 1) {
+        cursor_row_++;
+        cursor_col_ = 0;
+    }
+}
+
+void HexDumpView::cursor_up() {
+    if (cursor_row_ > 0) {
+        cursor_row_--;
+    } else {
+        // Scroll up to keep cursor visible
+        scroll_up(1);
+    }
+}
+
+void HexDumpView::cursor_down() {
+    if (cursor_row_ < num_rows_ - 1) {
+        cursor_row_++;
+    } else {
+        // Scroll down to keep cursor visible
+        scroll_down(1);
+    }
+}
+
+uint64_t HexDumpView::selected_address() const {
+    return base_addr_ + static_cast<uint64_t>(cursor_row_) * BYTES_PER_ROW
+         + static_cast<uint64_t>(cursor_col_);
+}
+
+uint64_t HexDumpView::selected_last_writer() const {
+    // Ensure we have cached data
+    if (!cache_valid_ || cursor_row_ >= static_cast<int>(cached_rows_.size())) {
+        return 0;
+    }
+    // Use memory model to get the last writer before current time
+    uint64_t addr = selected_address();
+    return const_cast<MemoryModel&>(memory_).last_writer(addr, 1, at_inst_id_);
+}
+
 // ─── Time navigation ────────────────────────────────────────────────────────
 
 void HexDumpView::step_forward() {
@@ -177,6 +230,7 @@ Element HexDumpView::render() {
     lines.push_back(hbox({text("─") | color(Color::GrayDark)}) | flex);
 
     // ─── Data rows ──────────────────────────────────────────────────────
+    int row_idx = 0;
     for (const auto& row : cached_rows_) {
         Elements hex_parts;
         Elements ascii_parts;
@@ -187,10 +241,15 @@ Element HexDumpView::render() {
                 hex_parts.push_back(text("  ") | size(WIDTH, EQUAL, 2));
             }
 
+            bool is_cursor = (row_idx == cursor_row_ && b == cursor_col_);
+
             if (row.known[b]) {
                 std::string byte_str = fmt::format("{:02X}", row.data[b]);
 
-                if (row.modified[b]) {
+                if (is_cursor) {
+                    // Cursor position → inverted colors (white on blue)
+                    hex_parts.push_back(text(byte_str) | color(Color::White) | bgcolor(Color::Blue) | bold);
+                } else if (row.modified[b]) {
                     // Byte modified at current inst_id → red bold
                     hex_parts.push_back(text(byte_str) | color(Color::Red) | bold);
                 } else {
@@ -198,8 +257,12 @@ Element HexDumpView::render() {
                     hex_parts.push_back(text(byte_str) | color(Color::White));
                 }
             } else {
-                // Unknown byte → "??" in gray
-                hex_parts.push_back(text("??") | color(Color::GrayDark));
+                // Unknown byte → "??" in gray (or cursor highlight)
+                if (is_cursor) {
+                    hex_parts.push_back(text("??") | color(Color::White) | bgcolor(Color::Blue) | bold);
+                } else {
+                    hex_parts.push_back(text("??") | color(Color::GrayDark));
+                }
             }
 
             // Separator between bytes (single space, except after byte 7 handled above)
@@ -210,7 +273,10 @@ Element HexDumpView::render() {
             // ASCII representation
             if (row.known[b]) {
                 char c = static_cast<char>(row.data[b]);
-                if (row.modified[b]) {
+                if (is_cursor) {
+                    std::string s(1, std::isprint(static_cast<unsigned char>(c)) ? c : '.');
+                    ascii_parts.push_back(text(s) | color(Color::White) | bgcolor(Color::Blue) | bold);
+                } else if (row.modified[b]) {
                     // Modified byte in ASCII → red
                     std::string s(1, std::isprint(static_cast<unsigned char>(c)) ? c : '.');
                     ascii_parts.push_back(text(s) | color(Color::Red) | bold);
@@ -220,7 +286,11 @@ Element HexDumpView::render() {
                 }
             } else {
                 // Unknown byte in ASCII → gray dot
-                ascii_parts.push_back(text(".") | color(Color::GrayDark));
+                if (is_cursor) {
+                    ascii_parts.push_back(text(".") | color(Color::White) | bgcolor(Color::Blue) | bold);
+                } else {
+                    ascii_parts.push_back(text(".") | color(Color::GrayDark));
+                }
             }
         }
 
@@ -237,14 +307,16 @@ Element HexDumpView::render() {
         });
 
         lines.push_back(line);
+        row_idx++;
     }
 
     // ─── Footer with navigation info ────────────────────────────────────
     lines.push_back(hbox({text("─") | color(Color::GrayDark)}) | flex);
     lines.push_back(hbox({
-        text(" ↑↓/jk:scroll  PgUp/PgDn:page  g:goto  </>:time-nav") | color(Color::GrayLight),
-        text("  ") | size(WIDTH, EQUAL, 2),
-        text(fmt::format("@inst={}", at_inst_id_)) | color(Color::Cyan),
+        text(" hl/←→:cursor  jk/↑↓:row  PgUp/Dn:page  g:goto  </>:time  Enter:jump-to-writer") | color(Color::GrayLight),
+    }));
+    lines.push_back(hbox({
+        text(fmt::format(" @inst={}  cursor=0x{:X}", at_inst_id_, selected_address())) | color(Color::Cyan),
     }));
 
     return vbox(lines) | flex | border;

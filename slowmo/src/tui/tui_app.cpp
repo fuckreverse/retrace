@@ -9,6 +9,7 @@
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/loop_pass.h"
+#include "analysis/passes/thread_pass.h"
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
@@ -560,6 +561,9 @@ Element TuiApp::render_main_layout() {
     if (show_strings_) {
         right_panels.push_back(render_strings_panel());
     }
+    if (show_threads_) {
+        right_panels.push_back(render_thread_panel());
+    }
 
     // Build center content: instruction list with optional minimap on the left
     Element center;
@@ -756,12 +760,22 @@ bool TuiApp::handle_hex_dump_event(Event event) {
         hex_dump_focused_ = false;
         return true;
     }
+    // Cursor movement: h/l or left/right for byte-level navigation
+    if (event == Event::Character('h') || event == Event::ArrowLeft) {
+        hex_dump_view_->cursor_left();
+        return true;
+    }
+    if (event == Event::Character('l') || event == Event::ArrowRight) {
+        hex_dump_view_->cursor_right();
+        return true;
+    }
+    // Row movement: j/k or up/down
     if (event == Event::Character('j') || event == Event::ArrowDown) {
-        hex_dump_view_->scroll_down(1);
+        hex_dump_view_->cursor_down();
         return true;
     }
     if (event == Event::Character('k') || event == Event::ArrowUp) {
-        hex_dump_view_->scroll_up(1);
+        hex_dump_view_->cursor_up();
         return true;
     }
     if (event == Event::PageDown) {
@@ -770,6 +784,15 @@ bool TuiApp::handle_hex_dump_event(Event event) {
     }
     if (event == Event::PageUp) {
         hex_dump_view_->page_up();
+        return true;
+    }
+    // Enter: jump to the instruction that last wrote the byte under cursor
+    if (event == Event::Return) {
+        uint64_t writer = hex_dump_view_->selected_last_writer();
+        if (writer > 0) {
+            navigate_to(writer);
+            hex_dump_focused_ = false;  // Switch focus back to instruction view
+        }
         return true;
     }
     if (event == Event::Character('g')) {
@@ -869,6 +892,11 @@ bool TuiApp::handle_event(Event event) {
     // Memory panel focused mode — intercept first
     if (memory_panel_focused_) {
         return handle_memory_panel_event(event);
+    }
+
+    // Thread panel focused mode — intercept first
+    if (thread_panel_focused_ && show_threads_ && thread_result_) {
+        return handle_thread_panel_event(event);
     }
 
     // String panel focused mode — intercept first
@@ -1038,6 +1066,25 @@ bool TuiApp::handle_event(Event event) {
                 function_panel_focused_ = !function_panel_focused_;
             }
         }
+        return true;
+    }
+
+    // ─── Thread analysis (t = toggle panel, T = jump to next switch) ─────────
+    if (event == Event::Character('t')) {
+        if (!thread_result_) {
+            run_thread_analysis();
+            thread_panel_focused_ = true;
+        } else if (!show_threads_) {
+            show_threads_ = true;
+            thread_panel_focused_ = true;
+        } else {
+            thread_panel_focused_ = !thread_panel_focused_;
+        }
+        return true;
+    }
+    if (event == Event::Character('T')) {
+        if (!thread_result_) run_thread_analysis();
+        goto_next_thread_switch();
         return true;
     }
 
@@ -1466,6 +1513,7 @@ void TuiApp::clear_analysis() {
     string_result_ = nullptr;
     call_graph_result_ = nullptr;
     loop_result_ = nullptr;
+    thread_result_ = nullptr;
     show_taint_ = false;
     show_slice_ = false;
     show_backward_taint_ = false;
@@ -1473,6 +1521,9 @@ void TuiApp::clear_analysis() {
     show_functions_ = false;
     show_strings_ = false;
     show_loops_ = false;
+    show_threads_ = false;
+    thread_panel_focused_ = false;
+    thread_cursor_ = 0;
     xref_cursor_ = 0;
     string_cursor_ = 0;
     string_filter_.clear();
@@ -2336,6 +2387,151 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
     }
 
     return 0;
+}
+
+// ─── Thread analysis ─────────────────────────────────────────────────────────
+
+void TuiApp::run_thread_analysis() {
+    if (!pass_manager_) {
+        pass_manager_ = std::make_unique<PassManager>();
+        pass_manager_->set_reader(&reader_);
+        pass_manager_->set_index(&index_);
+        pass_manager_->set_code_table(&code_table_);
+        pass_manager_->set_decoder(&decoder_);
+        pass_manager_->set_regfile(&regfile_);
+        pass_manager_->set_memory(&memory_);
+    }
+
+    pass_manager_->register_pass(std::make_unique<ThreadPass>());
+    auto& result = pass_manager_->require("thread");
+    if (result.ok()) {
+        thread_result_ = &result.get<ThreadResult>();
+        show_threads_ = true;
+    }
+}
+
+Element TuiApp::render_thread_panel() {
+    using namespace ftxui;
+    Elements lines;
+
+    // Header with focus indicator
+    auto header_label = thread_panel_focused_
+        ? text("[THREADS]") | bold | bgcolor(Color::Blue) | color(Color::White)
+        : text("Threads") | bold | color(Color::Yellow);
+    lines.push_back(header_label);
+    lines.push_back(separator());
+
+    if (!thread_result_) {
+        lines.push_back(text("(not computed)") | color(Color::GrayLight));
+        return vbox(lines) | size(WIDTH, GREATER_THAN, 30) | border;
+    }
+
+    // Summary line
+    lines.push_back(hbox({
+        text(fmt::format(" {} threads, {} switches",
+            thread_result_->thread_count(),
+            thread_result_->switch_count())) | color(Color::Cyan),
+    }));
+    lines.push_back(separator());
+
+    // Current thread indicator
+    uint64_t cur_tid = thread_result_->thread_at(current_inst_);
+    if (cur_tid != 0) {
+        lines.push_back(hbox({
+            text(fmt::format(" Active: tid=0x{:x}", cur_tid)) | color(Color::Green) | bold,
+        }));
+        lines.push_back(separator());
+    }
+
+    // Thread list
+    size_t idx = 0;
+    for (const auto& [tid, info] : thread_result_->threads) {
+        bool is_selected = (idx == thread_cursor_);
+        bool is_active = (tid == cur_tid);
+
+        auto line_text = fmt::format(" tid=0x{:x}  insts={}", tid, info.total_instructions);
+        if (info.switch_in_count > 1) {
+            line_text += fmt::format("  sw={}", info.switch_in_count);
+        }
+
+        Element line_elem;
+        if (is_selected && thread_panel_focused_) {
+            line_elem = text(line_text) | bgcolor(Color::Blue) | color(Color::White);
+        } else if (is_active) {
+            line_elem = text(line_text) | color(Color::Green) | bold;
+        } else {
+            line_elem = text(line_text) | color(Color::White);
+        }
+        lines.push_back(line_elem);
+        idx++;
+    }
+
+    // Footer with keybindings
+    lines.push_back(separator());
+    lines.push_back(text(" t:toggle  T:next-switch  Enter:filter") | color(Color::GrayLight));
+
+    return vbox(lines) | size(WIDTH, GREATER_THAN, 35) | border;
+}
+
+bool TuiApp::handle_thread_panel_event(Event event) {
+    if (event == Event::Escape) {
+        thread_panel_focused_ = false;
+        return true;
+    }
+    if (event == Event::Character('j') || event == Event::ArrowDown) {
+        if (thread_result_ && thread_cursor_ < thread_result_->thread_count() - 1) {
+            thread_cursor_++;
+        }
+        return true;
+    }
+    if (event == Event::Character('k') || event == Event::ArrowUp) {
+        if (thread_cursor_ > 0) {
+            thread_cursor_--;
+        }
+        return true;
+    }
+    if (event == Event::Return) {
+        // Jump to the first instruction of the selected thread
+        if (thread_result_ && thread_cursor_ < thread_result_->thread_count()) {
+            size_t i = 0;
+            for (const auto& [tid, info] : thread_result_->threads) {
+                if (i == thread_cursor_) {
+                    navigate_to(info.first_seen_inst);
+                    thread_panel_focused_ = false;
+                    break;
+                }
+                i++;
+            }
+        }
+        return true;
+    }
+    // 'T' / 'N' — jump to next switch from current position
+    if (event == Event::Character('T') || event == Event::Character('n')) {
+        goto_next_thread_switch();
+        return true;
+    }
+    // 'P' / 'p' — jump to previous switch
+    if (event == Event::Character('p') || event == Event::Character('N')) {
+        goto_prev_thread_switch();
+        return true;
+    }
+    return false;
+}
+
+void TuiApp::goto_next_thread_switch() {
+    if (!thread_result_) return;
+    auto* ev = thread_result_->next_switch_after(current_inst_);
+    if (ev) {
+        navigate_to(ev->inst_id);
+    }
+}
+
+void TuiApp::goto_prev_thread_switch() {
+    if (!thread_result_) return;
+    auto* ev = thread_result_->prev_switch_before(current_inst_);
+    if (ev) {
+        navigate_to(ev->inst_id);
+    }
 }
 
 }  // namespace tenet

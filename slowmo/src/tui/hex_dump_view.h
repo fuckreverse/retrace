@@ -45,6 +45,27 @@ public:
     /// Jump to a specific address (aligned to 16-byte boundary).
     void goto_address(uint64_t addr);
 
+    // ─── Cursor ─────────────────────────────────────────────────────────
+
+    /// Move cursor left by one byte.
+    void cursor_left();
+
+    /// Move cursor right by one byte.
+    void cursor_right();
+
+    /// Move cursor up by one row.
+    void cursor_up();
+
+    /// Move cursor down by one row.
+    void cursor_down();
+
+    /// Get the absolute address of the byte under the cursor.
+    uint64_t selected_address() const;
+
+    /// Get the last writer inst_id for the byte under cursor.
+    /// Returns 0 if unknown.
+    uint64_t selected_last_writer() const;
+
     // ─── Time navigation ────────────────────────────────────────────────
 
     /// Move to the next inst_id that modifies any byte in the current visible region.
@@ -72,6 +93,10 @@ private:
     uint64_t base_addr_ = 0;
     uint64_t at_inst_id_ = 0;
     int num_rows_ = 16;  // Each row = 16 bytes, default 16 rows = 256 bytes
+
+    // Cursor position within the viewport
+    int cursor_row_ = 0;
+    int cursor_col_ = 0;
 
     static constexpr int BYTES_PER_ROW = 16;
 

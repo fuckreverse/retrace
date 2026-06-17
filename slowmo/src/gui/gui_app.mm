@@ -7,6 +7,9 @@
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/loop_pass.h"
+#include "analysis/passes/cfg_layout_pass.h"
+#include "analysis/passes/cfg_pass.h"
+#include "analysis/passes/thread_pass.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -94,6 +97,15 @@ bool GuiApp::init_imgui() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    // Pin imgui.ini to ~/.config/tenet/ so it doesn't land in the CWD
+    {
+        std::string dir = GuiSettings::default_path();
+        auto sep = dir.rfind('/');
+        if (sep != std::string::npos) dir.resize(sep);
+        imgui_ini_path_ = dir + "/imgui.ini";
+        io.IniFilename = imgui_ini_path_.c_str();
+    }
 
     // Setup platform/renderer backends
     ImGui_ImplSDL3_InitForMetal(window_);
@@ -391,6 +403,7 @@ void GuiApp::render_frame() {
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
     // ─── Default layout (first frame only) ───────────────────────────
+    // IDA-style: Left=Functions | Center=Instructions+CFG (tabbed) | Right=Registers/Memory
     if (first_frame_) {
         first_frame_ = false;
 
@@ -398,32 +411,39 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
 
-        // Split: far-left minimap (6%) | center (66%) | right (28%)
-        ImGuiID dock_minimap, dock_rest;
-        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.06f, &dock_minimap, &dock_rest);
+        // Split: left sidebar (18%) | rest (82%)
+        ImGuiID dock_left_sidebar, dock_rest;
+        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.18f, &dock_left_sidebar, &dock_rest);
 
-        ImGuiID dock_left, dock_right;
-        ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Left, 0.70f, &dock_left, &dock_right);
+        // Split rest: center (72%) | right (28%)
+        ImGuiID dock_center, dock_right;
+        ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Left, 0.72f, &dock_center, &dock_right);
 
-        // Split left: top 75% (instructions) | bottom 25% (analysis)
-        ImGuiID dock_left_top, dock_left_bottom;
-        ImGui::DockBuilderSplitNode(dock_left, ImGuiDir_Up, 0.75f, &dock_left_top, &dock_left_bottom);
+        // Split center: top main area (75%) | bottom analysis/output (25%)
+        ImGuiID dock_center_main, dock_center_bottom;
+        ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Up, 0.75f, &dock_center_main, &dock_center_bottom);
 
         // Split right: top 55% (registers) | bottom 45% (memory)
         ImGuiID dock_right_top, dock_right_bottom;
         ImGui::DockBuilderSplitNode(dock_right, ImGuiDir_Up, 0.55f, &dock_right_top, &dock_right_bottom);
 
-        // Dock panels into their slots
-        ImGui::DockBuilderDockWindow("Minimap", dock_minimap);
-        ImGui::DockBuilderDockWindow("Instructions", dock_left_top);
+        // Left sidebar: Functions (primary) + Strings as tab
+        ImGui::DockBuilderDockWindow("Functions", dock_left_sidebar);
+        ImGui::DockBuilderDockWindow("Strings", dock_left_sidebar);
+
+        // Center main: Instructions + CFG as tabs (IDA-style disasm/graph toggle)
+        ImGui::DockBuilderDockWindow("Instructions", dock_center_main);
+        ImGui::DockBuilderDockWindow("CFG", dock_center_main);
+
+        // Center bottom: Analysis + Call Stack + Hex Dump + Minimap
+        ImGui::DockBuilderDockWindow("Analysis", dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Call Stack", dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Hex Dump", dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Minimap", dock_center_bottom);
+
+        // Right: Registers on top, Memory on bottom
         ImGui::DockBuilderDockWindow("Registers", dock_right_top);
         ImGui::DockBuilderDockWindow("Memory Accesses", dock_right_bottom);
-        ImGui::DockBuilderDockWindow("Analysis", dock_left_bottom);
-        // Tabbed together in bottom-left
-        ImGui::DockBuilderDockWindow("Call Stack", dock_left_bottom);
-        ImGui::DockBuilderDockWindow("Hex Dump", dock_left_bottom);
-        ImGui::DockBuilderDockWindow("Functions", dock_left_bottom);
-        ImGui::DockBuilderDockWindow("Strings", dock_left_bottom);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
@@ -509,6 +529,12 @@ void GuiApp::render_frame() {
     if (show_strings_) {
         render_strings_panel();
     }
+    if (show_threads_) {
+        render_thread_panel();
+    }
+    if (show_cfg_) {
+        render_cfg_panel();
+    }
 
     // ─── Popups / Settings ──────────────────────────────────────────
     render_goto_popup();
@@ -553,9 +579,11 @@ void GuiApp::render_menu_bar() {
             ImGui::MenuItem("Hex Dump", "H", &show_hex_dump_);
             ImGui::MenuItem("Strings", "I", &show_strings_);
             ImGui::MenuItem("Functions", "L", &show_functions_);
+            ImGui::MenuItem("Threads", "T", &show_threads_);
             ImGui::Separator();
             ImGui::MenuItem("Minimap", "V", &show_minimap_);
             ImGui::MenuItem("Loop Highlight", "O", &show_loops_);
+            ImGui::MenuItem("CFG View", "K", &show_cfg_);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
             ImGui::EndMenu();
@@ -664,11 +692,17 @@ void GuiApp::render_menu_bar() {
             if (ImGui::MenuItem("String Analysis", "I")) {
                 run_string_analysis();
             }
+            if (ImGui::MenuItem("Thread Analysis", "T")) {
+                run_thread_analysis();
+            }
             if (ImGui::MenuItem("Call Graph Analysis")) {
                 run_call_graph_analysis();
             }
             if (ImGui::MenuItem("Loop Analysis", "O")) {
                 run_loop_analysis();
+            }
+            if (ImGui::MenuItem("CFG Layout", "K")) {
+                run_cfg_layout();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Clear All Analysis", "C")) {
@@ -1508,56 +1542,83 @@ void GuiApp::render_hex_dump_panel() {
         }
         ImGui::SameLine();
 
-        // Hex bytes
-        char hex_part[64] = {};
-        char ascii_part[20] = {};
-        int hex_pos = 0;
-
+        // Hex bytes — each byte is individually clickable
         for (int b = 0; b < 16; b++) {
             uint64_t byte_addr = row_addr + b;
             auto byte_val = memory_.byte_at(byte_addr, current_inst_);
 
             bool is_highlighted = (byte_addr == display_addr);
 
-            if (b == 8) hex_pos += snprintf(hex_part + hex_pos, sizeof(hex_part) - hex_pos, " ");
+            if (b == 8) {
+                ImGui::SameLine(0, 0);
+                ImGui::TextDisabled(" ");
+            }
+            if (b > 0) ImGui::SameLine(0, 0);
+
+            char byte_str[8];
+            if (byte_val.has_value()) {
+                snprintf(byte_str, sizeof(byte_str), "%02x ", *byte_val);
+            } else {
+                snprintf(byte_str, sizeof(byte_str), "?? ");
+            }
+
+            // Push unique ID for each byte so ImGui can track them
+            ImGui::PushID(static_cast<int>(row * 16 + b));
 
             if (is_highlighted) {
-                // Render hex bytes up to this point
-                if (hex_pos > 0) {
-                    ImGui::TextDisabled("%s", hex_part);
-                    ImGui::SameLine(0, 0);
-                    hex_pos = 0;
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", byte_str);
+            } else if (is_active_row) {
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", byte_str);
+            } else {
+                ImGui::TextDisabled("%s", byte_str);
+            }
+
+            // Double-click: jump to the instruction that last wrote this byte
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                uint64_t writer = memory_.last_writer(byte_addr, 1, current_inst_);
+                if (writer > 0) {
+                    navigate_to(writer);
+                }
+            }
+            // Single-click: update display address to this byte
+            if (ImGui::IsItemClicked()) {
+                display_addr = byte_addr;
+                ctx_mem_addr_ = byte_addr;
+            }
+            // Tooltip on hover
+            if (ImGui::IsItemHovered()) {
+                uint64_t writer = memory_.last_writer(byte_addr, 1, current_inst_);
+                if (writer > 0) {
+                    ImGui::SetTooltip("0x%llx: last written by inst #%llu\nDouble-click to jump",
+                        (unsigned long long)byte_addr, (unsigned long long)writer);
+                } else {
+                    ImGui::SetTooltip("0x%llx: no known writer",
+                        (unsigned long long)byte_addr);
                 }
             }
 
+            ImGui::PopID();
+        }
+
+        // ASCII part
+        ImGui::SameLine();
+        char ascii_part[20] = {};
+        for (int b = 0; b < 16; b++) {
+            uint64_t byte_addr = row_addr + b;
+            auto byte_val = memory_.byte_at(byte_addr, current_inst_);
             if (byte_val.has_value()) {
                 uint8_t v = *byte_val;
-                hex_pos += snprintf(hex_part + hex_pos, sizeof(hex_part) - hex_pos, "%02x ", v);
                 ascii_part[b] = (v >= 0x20 && v < 0x7F) ? static_cast<char>(v) : '.';
             } else {
-                hex_pos += snprintf(hex_part + hex_pos, sizeof(hex_part) - hex_pos, "?? ");
                 ascii_part[b] = '?';
             }
         }
         ascii_part[16] = '\0';
-
-        if (is_active_row) {
-            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", hex_part);
-        } else {
-            ImGui::TextDisabled("%s", hex_part);
-        }
-        ImGui::SameLine();
         ImGui::TextDisabled("| %s", ascii_part);
-
-        // Allow clicking on a row to update the target address
-        if (ImGui::IsItemClicked()) {
-            display_addr = row_addr;
-            ctx_mem_addr_ = row_addr;
-        }
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Click row to focus  |  Use 'From Inst' to follow current instruction");
+    ImGui::TextDisabled("Click: select byte  |  Double-click: jump to writer  |  'From Inst': follow current instruction");
 
     ImGui::End();
 }
@@ -1918,6 +1979,127 @@ void GuiApp::run_string_analysis() {
         string_filter_.clear();
         std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
     }
+}
+
+void GuiApp::run_thread_analysis() {
+    ensure_pass_manager();
+
+    pass_manager_->register_pass(std::make_unique<ThreadPass>());
+    auto& result = pass_manager_->require("thread");
+    if (result.ok()) {
+        thread_result_ = &result.get<ThreadResult>();
+        show_threads_ = true;
+    }
+}
+
+// ─── Thread Panel ────────────────────────────────────────────────────────────
+
+void GuiApp::render_thread_panel() {
+    if (!ImGui::Begin("Threads", &show_threads_)) {
+        ImGui::End();
+        return;
+    }
+
+    if (!thread_result_) {
+        if (ImGui::Button("Run Thread Analysis")) {
+            run_thread_analysis();
+        }
+        ImGui::End();
+        return;
+    }
+
+    // Summary
+    ImGui::Text("Threads: %zu  |  Context Switches: %zu",
+        thread_result_->thread_count(), thread_result_->switch_count());
+    ImGui::Separator();
+
+    // Active thread at current instruction
+    uint64_t cur_tid = thread_result_->thread_at(current_inst_);
+    if (cur_tid != 0) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+            "Active Thread: tid=0x%llx", (unsigned long long)cur_tid);
+    } else {
+        ImGui::TextDisabled("Active Thread: unknown");
+    }
+
+    // Navigation buttons
+    if (ImGui::Button("< Prev Switch")) {
+        auto* ev = thread_result_->prev_switch_before(current_inst_);
+        if (ev) navigate_to(ev->inst_id);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next Switch >")) {
+        auto* ev = thread_result_->next_switch_after(current_inst_);
+        if (ev) navigate_to(ev->inst_id);
+    }
+
+    ImGui::Separator();
+
+    // Thread list table
+    if (ImGui::BeginTable("ThreadTable", 4,
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("Thread ID", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Instructions", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Switches", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Range", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        for (const auto& [tid, info] : thread_result_->threads) {
+            ImGui::TableNextRow();
+            bool is_active = (tid == cur_tid);
+
+            // Thread ID
+            ImGui::TableNextColumn();
+            char label[64];
+            snprintf(label, sizeof(label), "0x%llx", (unsigned long long)tid);
+            if (is_active) {
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", label);
+            } else {
+                ImGui::Text("%s", label);
+            }
+            // Double-click to jump to first instruction of this thread
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                navigate_to(info.first_seen_inst);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Double-click to jump to first instruction of this thread");
+            }
+
+            // Instructions
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", (unsigned long long)info.total_instructions);
+
+            // Switch count
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", (unsigned long long)info.switch_in_count);
+
+            // Range
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("#%llu - #%llu",
+                (unsigned long long)info.first_seen_inst,
+                (unsigned long long)info.last_seen_inst);
+        }
+        ImGui::EndTable();
+    }
+
+    // Spans section (collapsible)
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Execution Spans", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Total spans: %zu", thread_result_->spans.size());
+        // Show spans around current instruction
+        auto* cur_span = thread_result_->span_at(current_inst_);
+        if (cur_span) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+                "Current span: tid=0x%llx [#%llu - #%llu] (%llu insts)",
+                (unsigned long long)cur_span->thread_id,
+                (unsigned long long)cur_span->start_inst_id,
+                (unsigned long long)cur_span->end_inst_id,
+                (unsigned long long)cur_span->inst_count);
+        }
+    }
+
+    ImGui::End();
 }
 
 // ─── Functions Panel ─────────────────────────────────────────────────────────
@@ -2296,7 +2478,11 @@ void GuiApp::clear_analysis() {
     string_result_ = nullptr;
     call_graph_result_ = nullptr;
     loop_result_ = nullptr;
+    thread_result_ = nullptr;
+    cfg_result_        = nullptr;
+    cfg_layout_result_ = nullptr;
     show_taint_ = false;
+    show_threads_ = false;
     show_slice_ = false;
     show_backward_taint_ = false;
     show_callstack_ = false;
@@ -3168,6 +3354,522 @@ void GuiApp::render_minimap_panel() {
         ImGui::TextUnformatted("Click to navigate");
         ImGui::PopStyleColor();
     }
+
+    ImGui::End();
+}
+
+// ─── CFG Layout Analysis ─────────────────────────────────────────────────────
+
+void GuiApp::run_cfg_layout() {
+    ensure_pass_manager();
+
+    // CFGLayoutPass depends on cfg which depends on xref
+    pass_manager_->register_pass(std::make_unique<XrefPass>());
+    pass_manager_->register_pass(std::make_unique<CFGPass>());
+    pass_manager_->register_pass(std::make_unique<CFGLayoutPass>());
+
+    // Also cache xref result so the CFG panel can use inst_ids_at() for jump navigation
+    auto& xref_res = pass_manager_->require("xref");
+    if (xref_res.ok()) {
+        xref_result_ = &xref_res.get<XrefResult>();
+    }
+
+    auto& cfg_res = pass_manager_->require("cfg");
+    if (cfg_res.ok()) {
+        cfg_result_ = &cfg_res.get<CFGResult>();
+    }
+
+    auto& layout_res = pass_manager_->require("cfg_layout");
+    if (layout_res.ok()) {
+        cfg_layout_result_ = &layout_res.get<CFGLayoutResult>();
+        show_cfg_ = true;
+        // Reset pan/zoom and selection
+        cfg_scroll_ = ImVec2(0.0f, 0.0f);
+        cfg_zoom_   = 1.0f;
+        cfg_selected_block_ = 0;
+        cfg_block_cursor_   = 0;
+
+        // Pre-compute max execution_count for heatmap normalisation
+        cfg_max_exec_count_ = 1;
+        cfg_max_edge_count_ = 1;
+        if (cfg_result_) {
+            for (const auto& [pc, blk] : cfg_result_->blocks) {
+                if (blk.execution_count > cfg_max_exec_count_)
+                    cfg_max_exec_count_ = blk.execution_count;
+            }
+            for (const auto& edge : cfg_result_->edges) {
+                if (edge.taken_count > cfg_max_edge_count_)
+                    cfg_max_edge_count_ = edge.taken_count;
+            }
+        }
+    }
+}
+
+// ─── CFG Panel ───────────────────────────────────────────────────────────────
+// An interactive, pannable, zoomable CFG view.
+// Blocks are drawn as rounded rectangles with instruction text.
+// Edges are drawn as polylines with arrowheads.
+
+void GuiApp::render_cfg_panel() {
+    if (!ImGui::Begin("CFG", &show_cfg_)) {
+        ImGui::End();
+        return;
+    }
+
+    // ── Toolbar row 1: controls ───────────────────────────────────────
+    if (ImGui::Button("Run CFG Layout")) {
+        run_cfg_layout();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.0f);
+    ImGui::SliderFloat("Zoom##cfg", &cfg_zoom_, 0.05f, 8.0f, "%.1fx");
+    ImGui::SameLine();
+    if (ImGui::Button("Reset View")) {
+        cfg_scroll_ = ImVec2(0.0f, 0.0f);
+        cfg_zoom_ = 1.0f;
+    }
+    ImGui::SameLine();
+    // "Center on current block" button
+    if (ImGui::Button("Center Here") && cfg_result_ && cfg_layout_result_) {
+        uint64_t cur_pc2 = 0;
+        if (total_inst_ > 0) cur_pc2 = fetch_row(current_inst_).pc;
+        auto* blk2 = cfg_result_->block_containing(cur_pc2);
+        if (blk2) {
+            auto it2 = cfg_layout_result_->block_layouts.find(blk2->start_pc);
+            if (it2 != cfg_layout_result_->block_layouts.end()) {
+                const auto& lo = it2->second;
+                ImVec2 avail2 = ImGui::GetContentRegionAvail();
+                cfg_scroll_.x = avail2.x * 0.5f - (lo.x + lo.width  * 0.5f) * cfg_zoom_;
+                cfg_scroll_.y = avail2.y * 0.5f - (lo.y + lo.height * 0.5f) * cfg_zoom_;
+            }
+        }
+    }
+
+    // ── Toolbar row 2: stats + selected-block jump controls ──────────
+    if (cfg_layout_result_) {
+        ImGui::TextDisabled("%zu blocks, %zu edges",
+            cfg_layout_result_->block_layouts.size(),
+            cfg_layout_result_->edge_layouts.size());
+    } else {
+        ImGui::TextDisabled("(no layout — run Analysis > CFG Layout)");
+    }
+
+    // Jump controls for selected block
+    if (cfg_selected_block_ != 0 && xref_result_) {
+        auto inst_ids = xref_result_->inst_ids_at(cfg_selected_block_);
+        if (!inst_ids.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f),
+                "Block 0x%llx (%zu visits)",
+                (unsigned long long)cfg_selected_block_,
+                inst_ids.size());
+            ImGui::SameLine();
+            if (ImGui::Button("|<##cfg_first")) {
+                cfg_block_cursor_ = 0;
+                navigate_to(inst_ids[0]);
+            }
+            ImGui::SetItemTooltip("Jump to first visit in trace");
+            ImGui::SameLine();
+            if (ImGui::Button("<##cfg_prev") && cfg_block_cursor_ > 0) {
+                cfg_block_cursor_--;
+                navigate_to(inst_ids[cfg_block_cursor_]);
+            }
+            ImGui::SetItemTooltip("Previous visit");
+            ImGui::SameLine();
+            ImGui::Text("%zu/%zu", cfg_block_cursor_ + 1, inst_ids.size());
+            ImGui::SameLine();
+            if (ImGui::Button(">##cfg_next") && cfg_block_cursor_ + 1 < inst_ids.size()) {
+                cfg_block_cursor_++;
+                navigate_to(inst_ids[cfg_block_cursor_]);
+            }
+            ImGui::SetItemTooltip("Next visit");
+            ImGui::SameLine();
+            if (ImGui::Button(">|##cfg_last")) {
+                cfg_block_cursor_ = inst_ids.size() - 1;
+                navigate_to(inst_ids[cfg_block_cursor_]);
+            }
+            ImGui::SetItemTooltip("Jump to last visit in trace");
+        }
+    }
+
+    ImGui::Separator();
+
+    if (!cfg_layout_result_ || cfg_layout_result_->block_layouts.empty()) {
+        ImGui::TextDisabled("No CFG available.\nRun Analysis > CFG Layout first.");
+        ImGui::End();
+        return;
+    }
+
+    // ── Canvas ────────────────────────────────────────────────────────
+    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+    if (canvas_size.x < 10.0f || canvas_size.y < 10.0f) {
+        ImGui::End();
+        return;
+    }
+
+    ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
+
+    // Invisible button captures mouse events for the canvas area
+    ImGui::InvisibleButton("##cfg_canvas", canvas_size,
+        ImGuiButtonFlags_MouseButtonLeft |
+        ImGuiButtonFlags_MouseButtonRight |
+        ImGuiButtonFlags_MouseButtonMiddle);
+
+    bool canvas_hovered = ImGui::IsItemHovered();
+    bool canvas_active  = ImGui::IsItemActive();
+
+    // Pan with left mouse drag
+    if (canvas_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 delta = ImGui::GetIO().MouseDelta;
+        cfg_scroll_.x += delta.x;
+        cfg_scroll_.y += delta.y;
+    }
+
+    // Zoom with scroll wheel
+    if (canvas_hovered) {
+        float scroll = ImGui::GetIO().MouseWheel;
+        if (scroll != 0.0f) {
+            // Zoom towards mouse cursor
+            ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+            ImVec2 mouse_canvas = ImVec2(
+                mouse_pos.x - canvas_origin.x - cfg_scroll_.x,
+                mouse_pos.y - canvas_origin.y - cfg_scroll_.y);
+
+            float old_zoom = cfg_zoom_;
+            cfg_zoom_ *= (scroll > 0.0f ? 1.1f : 0.9f);
+            cfg_zoom_ = std::max(0.05f, std::min(cfg_zoom_, 8.0f));
+
+            float scale_change = cfg_zoom_ / old_zoom;
+            cfg_scroll_.x -= mouse_canvas.x * (scale_change - 1.0f);
+            cfg_scroll_.y -= mouse_canvas.y * (scale_change - 1.0f);
+        }
+    }
+
+    // Draw background
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(canvas_origin,
+        ImVec2(canvas_origin.x + canvas_size.x, canvas_origin.y + canvas_size.y),
+        IM_COL32(18, 20, 26, 255));
+
+    // Grid dots for reference
+    {
+        const float grid_step = 40.0f * cfg_zoom_;
+        float grid_x = fmodf(cfg_scroll_.x, grid_step);
+        float grid_y = fmodf(cfg_scroll_.y, grid_step);
+        for (float x = canvas_origin.x + grid_x; x < canvas_origin.x + canvas_size.x; x += grid_step) {
+            for (float y = canvas_origin.y + grid_y; y < canvas_origin.y + canvas_size.y; y += grid_step) {
+                draw->AddCircleFilled(ImVec2(x, y), 1.0f, IM_COL32(50, 55, 70, 120));
+            }
+        }
+    }
+
+    // Helper: convert layout coordinate to screen coordinate
+    auto to_screen = [&](float lx, float ly) -> ImVec2 {
+        return ImVec2(
+            canvas_origin.x + cfg_scroll_.x + lx * cfg_zoom_,
+            canvas_origin.y + cfg_scroll_.y + ly * cfg_zoom_);
+    };
+
+    // Clip to canvas
+    draw->PushClipRect(canvas_origin,
+        ImVec2(canvas_origin.x + canvas_size.x, canvas_origin.y + canvas_size.y), true);
+
+    // Determine the "current" block (containing current_inst_'s PC)
+    uint64_t cur_pc = 0;
+    if (total_inst_ > 0) {
+        auto row = fetch_row(current_inst_);
+        cur_pc = row.pc;
+    }
+    // Find block containing cur_pc
+    uint64_t highlight_block_pc = 0;
+    if (cfg_result_) {
+        auto* blk = cfg_result_->block_containing(cur_pc);
+        if (blk) highlight_block_pc = blk->start_pc;
+    }
+
+    // ── Helper: heatmap colour (cold blue → hot red) ──────────────────
+    // t in [0,1]; returns RGBA
+    auto heatmap_color = [](float t, uint8_t alpha) -> ImU32 {
+        // cold (0) = dark blue, warm (0.5) = teal/green, hot (1) = red/orange
+        t = std::max(0.0f, std::min(t, 1.0f));
+        uint8_t r, g, b;
+        if (t < 0.5f) {
+            float s = t * 2.0f;
+            r = static_cast<uint8_t>(20  + s * 60);   // 20→80
+            g = static_cast<uint8_t>(60  + s * 100);  // 60→160
+            b = static_cast<uint8_t>(120 - s * 60);   // 120→60
+        } else {
+            float s = (t - 0.5f) * 2.0f;
+            r = static_cast<uint8_t>(80  + s * 175);  // 80→255
+            g = static_cast<uint8_t>(160 - s * 130);  // 160→30
+            b = static_cast<uint8_t>(60  - s * 50);   // 60→10
+        }
+        return IM_COL32(r, g, b, alpha);
+    };
+
+    // Handle click on canvas to select a block
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f)) {
+        ImVec2 mouse = ImGui::GetIO().MousePos;
+        // Convert mouse position to layout coordinates
+        float lx = (mouse.x - canvas_origin.x - cfg_scroll_.x) / cfg_zoom_;
+        float ly = (mouse.y - canvas_origin.y - cfg_scroll_.y) / cfg_zoom_;
+
+        // Hit-test all blocks
+        uint64_t clicked_block = 0;
+        for (const auto& [bpc, lo] : cfg_layout_result_->block_layouts) {
+            if (lx >= lo.x && lx <= lo.x + lo.width &&
+                ly >= lo.y && ly <= lo.y + lo.height) {
+                clicked_block = bpc;
+                break;
+            }
+        }
+        if (clicked_block != 0 && clicked_block != cfg_selected_block_) {
+            cfg_selected_block_ = clicked_block;
+            cfg_block_cursor_   = 0;
+            // Auto-navigate to first execution of this block
+            if (xref_result_) {
+                auto ids = xref_result_->inst_ids_at(clicked_block);
+                if (!ids.empty()) navigate_to(ids[0]);
+            }
+        }
+    }
+
+    // ── Draw edges ───────────────────────────────────────────────────
+    for (const auto& edge : cfg_layout_result_->edge_layouts) {
+        if (edge.polyline.size() < 2) continue;
+
+        // Defaults
+        ImU32 edge_color = IM_COL32(70, 75, 100, 180);
+        float  edge_width = 1.0f;
+
+        if (cfg_result_) {
+            for (const auto& cfg_edge : cfg_result_->edges) {
+                if (cfg_edge.from_block == edge.from_block &&
+                    cfg_edge.to_block   == edge.to_block) {
+                    // Width proportional to taken_count (log scale, 1..4px)
+                    float t_edge = (cfg_max_edge_count_ > 1)
+                        ? static_cast<float>(cfg_edge.taken_count) / static_cast<float>(cfg_max_edge_count_)
+                        : 0.0f;
+                    edge_width = 1.0f + t_edge * 3.0f;
+
+                    // Hue: fallthrough = green tint, branch = orange/red tint, scaled by hotness
+                    if (cfg_edge.is_fallthrough) {
+                        uint8_t g_val = static_cast<uint8_t>(100 + t_edge * 155);
+                        edge_color = IM_COL32(40, g_val, 60, 200);
+                    } else {
+                        uint8_t r_val = static_cast<uint8_t>(120 + t_edge * 135);
+                        edge_color = IM_COL32(r_val, static_cast<uint8_t>(80 - t_edge * 40), 40, 200);
+                    }
+
+                    // Extra highlight if this edge connects to/from current block
+                    bool is_active_edge = (cfg_edge.from_block == highlight_block_pc ||
+                                           cfg_edge.to_block   == highlight_block_pc);
+                    if (is_active_edge) {
+                        edge_color = IM_COL32(100, 200, 255, 255);
+                        edge_width = std::max(edge_width, 2.0f);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Draw polyline segments
+        for (size_t i = 0; i + 1 < edge.polyline.size(); ++i) {
+            ImVec2 p0 = to_screen(edge.polyline[i].x, edge.polyline[i].y);
+            ImVec2 p1 = to_screen(edge.polyline[i + 1].x, edge.polyline[i + 1].y);
+            draw->AddLine(p0, p1, edge_color, edge_width);
+        }
+
+        // Arrowhead at last segment
+        if (edge.polyline.size() >= 2) {
+            size_t n = edge.polyline.size();
+            ImVec2 tip  = to_screen(edge.polyline[n - 1].x, edge.polyline[n - 1].y);
+            ImVec2 base = to_screen(edge.polyline[n - 2].x, edge.polyline[n - 2].y);
+            float dx = tip.x - base.x;
+            float dy = tip.y - base.y;
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len > 0.001f) {
+                float ux = dx / len, uy = dy / len;
+                float px = -uy, py = ux;
+                float arrow_len  = (6.0f + edge_width * 2.0f) * cfg_zoom_;
+                float arrow_half = (3.0f + edge_width) * cfg_zoom_;
+                ImVec2 left  = ImVec2(tip.x - ux * arrow_len + px * arrow_half,
+                                       tip.y - uy * arrow_len + py * arrow_half);
+                ImVec2 right = ImVec2(tip.x - ux * arrow_len - px * arrow_half,
+                                       tip.y - uy * arrow_len - py * arrow_half);
+                draw->AddTriangleFilled(tip, left, right, edge_color);
+            }
+        }
+    }
+
+    // ── Draw blocks ──────────────────────────────────────────────────
+    const float corner_radius = 4.0f;
+    const float font_size = 11.0f * cfg_zoom_;
+    ImVec2 mouse_pos_canvas = ImGui::GetIO().MousePos;
+
+    for (const auto& [block_pc, layout] : cfg_layout_result_->block_layouts) {
+        ImVec2 tl = to_screen((float)layout.x, (float)layout.y);
+        ImVec2 br = to_screen((float)(layout.x + layout.width),
+                               (float)(layout.y + layout.height));
+
+        // Skip blocks outside canvas (rough cull)
+        if (br.x < canvas_origin.x || tl.x > canvas_origin.x + canvas_size.x) continue;
+        if (br.y < canvas_origin.y || tl.y > canvas_origin.y + canvas_size.y) continue;
+
+        // ── Compute heatmap intensity ─────────────────────────────────
+        float heat = 0.0f;
+        uint64_t exec_count = 0;
+        if (cfg_result_) {
+            auto it_blk = cfg_result_->blocks.find(block_pc);
+            if (it_blk != cfg_result_->blocks.end()) {
+                exec_count = it_blk->second.execution_count;
+                if (cfg_max_exec_count_ > 0)
+                    heat = static_cast<float>(exec_count) / static_cast<float>(cfg_max_exec_count_);
+            }
+        }
+        // Use log scale so cold blocks (executed once) are visible
+        if (exec_count > 0 && cfg_max_exec_count_ > 1) {
+            heat = logf(1.0f + static_cast<float>(exec_count)) /
+                   logf(1.0f + static_cast<float>(cfg_max_exec_count_));
+        }
+
+        // ── State flags ───────────────────────────────────────────────
+        bool is_current   = (block_pc == highlight_block_pc);    // block containing current PC
+        bool is_selected  = (block_pc == cfg_selected_block_);   // user-clicked block
+        bool is_hovered   = (mouse_pos_canvas.x >= tl.x && mouse_pos_canvas.x <= br.x &&
+                             mouse_pos_canvas.y >= tl.y && mouse_pos_canvas.y <= br.y &&
+                             canvas_hovered);
+
+        // ── Colours ───────────────────────────────────────────────────
+        ImU32 bg_color, border_color, header_color;
+
+        if (is_current) {
+            // Bright blue for the block the trace cursor is in
+            bg_color     = IM_COL32(30, 70, 130, 245);
+            border_color = IM_COL32(80, 180, 255, 255);
+            header_color = IM_COL32(50, 110, 180, 255);
+        } else if (is_selected) {
+            // Cyan outline for user-selected block
+            bg_color     = heatmap_color(heat, 230);
+            border_color = IM_COL32(0, 220, 220, 255);
+            header_color = IM_COL32(0, 100, 120, 255);
+        } else if (exec_count == 0) {
+            // Never executed (dead code or not-yet-visited) — dim grey
+            bg_color     = IM_COL32(20, 22, 28, 200);
+            border_color = IM_COL32(50, 55, 70, 150);
+            header_color = IM_COL32(28, 30, 38, 200);
+        } else {
+            // Heatmap colouring for executed blocks
+            bg_color     = heatmap_color(heat, 220);
+            border_color = heatmap_color(heat, 255);
+            header_color = heatmap_color(heat * 0.8f, 255);
+        }
+
+        // Lighten border on hover
+        if (is_hovered && !is_current && !is_selected) {
+            border_color = IM_COL32(200, 200, 255, 255);
+        }
+
+        draw->AddRectFilled(tl, br, bg_color, corner_radius);
+        draw->AddRect(tl, br, border_color, corner_radius, 0,
+                      is_current || is_selected ? 2.0f : 1.0f);
+
+        // Header bar with address
+        float header_h = 16.0f * cfg_zoom_;
+        draw->AddRectFilled(tl, ImVec2(br.x, tl.y + header_h),
+            header_color, corner_radius, ImDrawFlags_RoundCornersTop);
+
+        // Draw text only if zoom is large enough to be readable
+        if (cfg_zoom_ >= 0.35f) {
+            // Address + exec count in header
+            char addr_buf[64];
+            if (exec_count > 0) {
+                snprintf(addr_buf, sizeof(addr_buf), "0x%llx  ×%llu",
+                    (unsigned long long)block_pc,
+                    (unsigned long long)exec_count);
+            } else {
+                snprintf(addr_buf, sizeof(addr_buf), "0x%llx",
+                    (unsigned long long)block_pc);
+            }
+            draw->AddText(nullptr, font_size,
+                ImVec2(tl.x + 4.0f * cfg_zoom_, tl.y + 2.0f * cfg_zoom_),
+                IM_COL32(220, 230, 255, 230),
+                addr_buf);
+
+            // Instruction body
+            if (cfg_result_) {
+                auto it = cfg_result_->blocks.find(block_pc);
+                if (it != cfg_result_->blocks.end()) {
+                    const auto& blk = it->second;
+                    float text_y = tl.y + header_h + 2.0f * cfg_zoom_;
+
+                    if (cfg_zoom_ >= 0.7f) {
+                        // Show individual instructions
+                        for (size_t i = 0; i < blk.instructions.size() && text_y + font_size < br.y; ++i) {
+                            uint64_t insn_pc = blk.instructions[i];
+                            bool is_cur_insn = (insn_pc == cur_pc);
+                            ImU32 insn_color = is_cur_insn
+                                ? IM_COL32(255, 245, 60, 255)   // bright yellow for current insn
+                                : IM_COL32(200, 210, 225, 200);
+
+                            // Current-instruction marker on left
+                            if (is_cur_insn) {
+                                draw->AddTriangleFilled(
+                                    ImVec2(tl.x + 2.0f * cfg_zoom_,    text_y + font_size * 0.15f),
+                                    ImVec2(tl.x + 2.0f * cfg_zoom_,    text_y + font_size * 0.85f),
+                                    ImVec2(tl.x + 5.0f * cfg_zoom_,    text_y + font_size * 0.5f),
+                                    IM_COL32(255, 240, 60, 255));
+                            }
+
+                            // Get disassembly
+                            auto opcode = code_table_.opcode_at(insn_pc);
+                            std::string disasm_str;
+                            if (opcode) {
+                                auto d = decoder_.decode(insn_pc, *opcode);
+                                if (d) {
+                                    disasm_str = fmt::format("{:x}: {} {}",
+                                        insn_pc - reader_.header().module_slide,
+                                        d->mnemonic, d->op_str);
+                                } else {
+                                    disasm_str = fmt::format("{:x}: .word 0x{:08x}",
+                                        insn_pc - reader_.header().module_slide, *opcode);
+                                }
+                            } else {
+                                disasm_str = fmt::format("{:x}: ?", insn_pc);
+                            }
+
+                            float text_x  = tl.x + 7.0f * cfg_zoom_;
+                            float max_w   = br.x - text_x - 4.0f * cfg_zoom_;
+                            if (max_w > 0.0f) {
+                                draw->AddText(nullptr, font_size,
+                                    ImVec2(text_x, text_y), insn_color,
+                                    disasm_str.c_str(),
+                                    disasm_str.c_str() + disasm_str.size(),
+                                    max_w);
+                            }
+                            text_y += font_size + 1.5f * cfg_zoom_;
+                        }
+                    } else {
+                        // Compact: instruction count + exec count
+                        char cnt_buf[64];
+                        snprintf(cnt_buf, sizeof(cnt_buf), "%zu insns", blk.instructions.size());
+                        draw->AddText(nullptr, font_size,
+                            ImVec2(tl.x + 4.0f * cfg_zoom_, text_y),
+                            IM_COL32(180, 190, 210, 200), cnt_buf);
+                    }
+                }
+            }
+        }
+
+        // Hover tooltip with execution count
+        if (is_hovered && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("0x%llx\n%llu executions\n(click to select & navigate)",
+                (unsigned long long)block_pc,
+                (unsigned long long)exec_count);
+        }
+    }
+
+    draw->PopClipRect();
 
     ImGui::End();
 }

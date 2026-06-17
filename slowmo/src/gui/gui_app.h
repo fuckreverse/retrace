@@ -10,6 +10,7 @@
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
+#include "analysis/passes/cfg_layout_pass.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -29,6 +30,7 @@
 namespace tenet {
 
 // Forward declarations
+struct CFGResult;
 struct TaintResult;
 struct SliceResult;
 struct BackwardTaintResult;
@@ -37,6 +39,7 @@ struct XrefResult;
 struct StringResult;
 struct CallGraphResult;
 struct LoopResult;
+struct ThreadResult;
 
 /// Main GUI Application using Dear ImGui + SDL3 + Metal
 class GuiApp {
@@ -105,7 +108,7 @@ private:
     bool show_registers_ = true;
     bool show_memory_ = true;
     bool show_callstack_ = false;
-    bool show_functions_ = false;
+    bool show_functions_ = true;   // IDA-style: functions panel visible by default
     bool show_analysis_ = true;
     bool show_hex_dump_ = false;
     bool show_strings_ = false;
@@ -116,6 +119,7 @@ private:
     GuiSettings settings_;
     bool settings_font_dirty_ = false;   // Font needs rebuild
     std::vector<std::string> available_fonts_;  // Cached list
+    std::string imgui_ini_path_;          // Persistent path for io.IniFilename
 
     // ─── Cached row data ────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{4096};
@@ -172,6 +176,28 @@ private:
     bool show_loops_ = false;        // highlight loop instructions
     bool show_minimap_ = true;       // show minimap panel
 
+    // ─── CFG view state ───────────────────────────────────────────────
+    const CFGResult*       cfg_result_        = nullptr;
+    const CFGLayoutResult* cfg_layout_result_ = nullptr;
+    bool   show_cfg_        = true;   // IDA-style: CFG tab visible by default
+    // Pan/zoom for CFG canvas
+    ImVec2 cfg_scroll_      = {0.0f, 0.0f};  // pan offset in pixels
+    float  cfg_zoom_        = 1.0f;          // zoom factor
+    // Which block is highlighted (current PC)
+    uint64_t cfg_highlight_pc_ = 0;
+    // Heatmap cache: max execution count across all blocks (for normalisation)
+    uint64_t cfg_max_exec_count_  = 1;
+    // Max taken_count across all edges (for edge width normalisation)
+    uint64_t cfg_max_edge_count_  = 1;
+    // Selected block for jump-to-trace (start_pc, 0 = none)
+    uint64_t cfg_selected_block_  = 0;
+    // Cursor into the inst_ids list of cfg_selected_block_
+    size_t   cfg_block_cursor_    = 0;
+
+    // ─── Thread analysis state ─────────────────────────────────────
+    const ThreadResult* thread_result_ = nullptr;
+    bool show_threads_ = false;
+
     // ─── String analysis state ─────────────────────────────────────
     const StringResult* string_result_ = nullptr;
     char string_filter_buf_[256] = {};
@@ -204,7 +230,9 @@ private:
     void render_analysis_panel();
     void render_hex_dump_panel();
     void render_strings_panel();
+    void render_thread_panel();       // Thread timeline / switching panel
     void render_minimap_panel();      // Bird's-eye minimap
+    void render_cfg_panel();          // CFG graph view
     void render_progress_overlay();  // Execution progress bar with markers
 
     // ─── Popups / Windows ───────────────────────────────────────────
@@ -228,7 +256,9 @@ private:
     void run_xref_analysis();
     void run_string_analysis();
     void run_call_graph_analysis();
+    void run_thread_analysis();
     void run_loop_analysis();
+    void run_cfg_layout();
     void clear_analysis();
 
     // ─── Rendering helpers ─────────────────────────────────────────

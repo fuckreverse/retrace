@@ -14,10 +14,20 @@
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/pattern_pass.h"
+#include "analysis/passes/constant_materialization_pass.h"
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
+#include "analysis/passes/loop_pass.h"
+#include "analysis/passes/loop_semantics_pass.h"
+#include "analysis/passes/trace_diff_pass.h"
+#include "analysis/passes/symbol_annotation_pass.h"
+#include "analysis/passes/memory_snapshot_pass.h"
+#include "analysis/passes/dataflow_graph_pass.h"
+#include "analysis/passes/algorithm_summary_pass.h"
+#include "analysis/passes/objc_pass.h"
+#include "analysis/passes/thread_pass.h"
 
 #include <fmt/core.h>
 #include <fmt/color.h>
@@ -463,11 +473,26 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --taint-no-kills          Don't emit kill events in output\n");
     fmt::print(stderr, "  --strings                 Discover printable strings in traced memory\n");
     fmt::print(stderr, "  --pattern                 Detect crypto/anti-debug/obfuscation patterns\n");
+    fmt::print(stderr, "  --constants               Extract materialized constants (movz+movk)\n");
+    fmt::print(stderr, "  --constants-min-parts <N> Min movz+movk parts to report (default: 2)\n");
     fmt::print(stderr, "  --call-graph <file.dot>   Export call graph as Graphviz DOT\n");
     fmt::print(stderr, "  --backward-taint <inst_id> <reg>  Backward taint from sink instruction\n");
     fmt::print(stderr, "  --backward-taint-max-steps <N>    Limit backward walk steps (default: unlimited)\n");
     fmt::print(stderr, "  --backward-taint-graph <file>     Export dataflow graph (.dot or .json)\n");
     fmt::print(stderr, "  --critical-path                   Compute forward+backward intersection\n");
+    fmt::print(stderr, "  --trace-diff <a_start> <a_end> <b_start> <b_end>  Differential trace analysis\n");
+    fmt::print(stderr, "  --loop-semantics              Identify round functions / crypto loop semantics\n");
+    fmt::print(stderr, "  --symbol-annotation           Generate symbol annotations for all PCs\n");
+    fmt::print(stderr, "  --memory-snapshot <inst_id>    Capture memory snapshot (repeatable)\n");
+    fmt::print(stderr, "  --memory-snapshot-size <N>     Bytes per region in snapshot (default: 64)\n");
+    fmt::print(stderr, "  --dataflow-graph <start> <end> Build dataflow graph for instruction range\n");
+    fmt::print(stderr, "  --dataflow-graph-output <file> Export dataflow graph (.dot or .json)\n");
+    fmt::print(stderr, "  --algorithm-summary           Generate algorithm summary report\n");
+    fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
+    fmt::print(stderr, "\nQuery options (JSON output):\n");
+    fmt::print(stderr, "  --memread <addr> <size> <inst_id> Read memory at a point in time\n");
+    fmt::print(stderr, "  --mem-history <addr> <size>       List all writes to an address\n");
+    fmt::print(stderr, "  --search-pc <addr> [limit]        Find all inst_ids visiting a PC\n");
     fmt::print(stderr, "\nMultiple analysis options can be combined; they execute in order.\n");
 }
 
@@ -502,6 +527,8 @@ int main(int argc, char** argv) {
     bool taint_no_kills = false;
     bool opt_strings = false;
     bool opt_pattern = false;
+    bool opt_constants = false;
+    uint8_t constants_min_parts = 2;
     std::string call_graph_path;
     bool opt_backward_taint = false;
     uint64_t backward_taint_sink_id = 0;
@@ -509,6 +536,31 @@ int main(int argc, char** argv) {
     uint64_t backward_taint_max_steps = 0;
     std::string backward_taint_graph_path;
     bool opt_critical_path = false;
+    bool opt_trace_diff = false;
+    uint64_t trace_diff_a_start = 0, trace_diff_a_end = 0;
+    uint64_t trace_diff_b_start = 0, trace_diff_b_end = 0;
+    bool opt_loop_semantics = false;
+    bool opt_symbol_annotation = false;
+    bool opt_memory_snapshot = false;
+    std::vector<uint64_t> memory_snapshot_ids;
+    uint32_t memory_snapshot_size = 64;
+    bool opt_dataflow_graph = false;
+    uint64_t dataflow_start = 0, dataflow_end = 0;
+    std::string dataflow_output_path;
+    bool opt_algorithm_summary = false;
+    bool opt_objc = false;
+
+    // Query options
+    bool opt_memread = false;
+    uint64_t memread_addr = 0;
+    uint8_t memread_size = 16;
+    uint64_t memread_inst_id = 0;
+    bool opt_mem_history = false;
+    uint64_t mem_history_addr = 0;
+    uint8_t mem_history_size = 8;
+    bool opt_search_pc = false;
+    uint64_t search_pc_addr = 0;
+    uint64_t search_pc_limit = 100;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -552,6 +604,10 @@ int main(int argc, char** argv) {
             opt_strings = true;
         } else if (arg == "--pattern") {
             opt_pattern = true;
+        } else if (arg == "--constants") {
+            opt_constants = true;
+        } else if (arg == "--constants-min-parts" && i + 1 < argc) {
+            constants_min_parts = static_cast<uint8_t>(std::stoul(argv[++i]));
         } else if (arg == "--call-graph" && i + 1 < argc) {
             call_graph_path = argv[++i];
         } else if (arg == "--backward-taint" && i + 2 < argc) {
@@ -564,6 +620,46 @@ int main(int argc, char** argv) {
             backward_taint_graph_path = argv[++i];
         } else if (arg == "--critical-path") {
             opt_critical_path = true;
+        } else if (arg == "--trace-diff" && i + 4 < argc) {
+            opt_trace_diff = true;
+            trace_diff_a_start = std::stoull(argv[++i]);
+            trace_diff_a_end = std::stoull(argv[++i]);
+            trace_diff_b_start = std::stoull(argv[++i]);
+            trace_diff_b_end = std::stoull(argv[++i]);
+        } else if (arg == "--loop-semantics") {
+            opt_loop_semantics = true;
+        } else if (arg == "--symbol-annotation") {
+            opt_symbol_annotation = true;
+        } else if (arg == "--memory-snapshot" && i + 1 < argc) {
+            opt_memory_snapshot = true;
+            memory_snapshot_ids.push_back(std::stoull(argv[++i]));
+        } else if (arg == "--memory-snapshot-size" && i + 1 < argc) {
+            memory_snapshot_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--dataflow-graph" && i + 2 < argc) {
+            opt_dataflow_graph = true;
+            dataflow_start = std::stoull(argv[++i]);
+            dataflow_end = std::stoull(argv[++i]);
+        } else if (arg == "--dataflow-graph-output" && i + 1 < argc) {
+            dataflow_output_path = argv[++i];
+        } else if (arg == "--algorithm-summary") {
+            opt_algorithm_summary = true;
+        } else if (arg == "--objc") {
+            opt_objc = true;
+        } else if (arg == "--memread" && i + 3 < argc) {
+            opt_memread = true;
+            memread_addr = std::stoull(argv[++i], nullptr, 16);
+            memread_size = static_cast<uint8_t>(std::stoul(argv[++i]));
+            memread_inst_id = std::stoull(argv[++i]);
+        } else if (arg == "--mem-history" && i + 2 < argc) {
+            opt_mem_history = true;
+            mem_history_addr = std::stoull(argv[++i], nullptr, 16);
+            mem_history_size = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--search-pc" && i + 1 < argc) {
+            opt_search_pc = true;
+            search_pc_addr = std::stoull(argv[++i], nullptr, 16);
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                search_pc_limit = std::stoull(argv[++i]);
+            }
         } else if (arg[0] != '-') {
             trace_path = arg;
         }
@@ -577,9 +673,14 @@ int main(int argc, char** argv) {
 
     // Determine if any analysis option was specified → suppress TUI
     bool has_analysis_option = !export_cfg_path.empty() || opt_taint ||
-                               opt_strings || opt_pattern ||
+                               opt_strings || opt_pattern || opt_constants ||
                                !call_graph_path.empty() ||
-                               opt_backward_taint || opt_critical_path;
+                               opt_backward_taint || opt_critical_path ||
+                               opt_trace_diff || opt_loop_semantics ||
+                               opt_symbol_annotation || opt_memory_snapshot ||
+                               opt_dataflow_graph || opt_algorithm_summary ||
+                               opt_objc ||
+                               opt_memread || opt_mem_history || opt_search_pc;
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
@@ -708,6 +809,13 @@ int main(int argc, char** argv) {
             pm.register_pass(std::make_unique<PatternPass>());
         }
 
+        // --constants needs ConstantMaterializationPass
+        if (opt_constants) {
+            auto cmp = std::make_unique<ConstantMaterializationPass>();
+            cmp->set_min_parts(constants_min_parts);
+            pm.register_pass(std::move(cmp));
+        }
+
         // --call-graph needs function -> call_graph
         if (!call_graph_path.empty()) {
             pm.register_pass(std::make_unique<FunctionPass>());
@@ -726,6 +834,63 @@ int main(int argc, char** argv) {
                 bt_cfg.max_steps = backward_taint_max_steps;
             }
             pm.register_pass(std::make_unique<BackwardTaintPass>(std::move(bt_cfg)));
+        }
+
+        // --trace-diff
+        if (opt_trace_diff) {
+            TraceDiffConfig td_cfg;
+            td_cfg.trace_a_start = trace_diff_a_start;
+            td_cfg.trace_a_end = trace_diff_a_end;
+            td_cfg.trace_b_start = trace_diff_b_start;
+            td_cfg.trace_b_end = trace_diff_b_end;
+            pm.register_pass(std::make_unique<TraceDiffPass>(std::move(td_cfg)));
+        }
+
+        // --loop-semantics needs loop pass
+        if (opt_loop_semantics) {
+            pm.register_pass(std::make_unique<LoopPass>());
+            pm.register_pass(std::make_unique<LoopSemanticsPass>());
+        }
+
+        // --symbol-annotation needs function, loop, constant_materialization, pattern
+        if (opt_symbol_annotation) {
+            pm.register_pass(std::make_unique<FunctionPass>());
+            pm.register_pass(std::make_unique<LoopPass>());
+            pm.register_pass(std::make_unique<ConstantMaterializationPass>());
+            pm.register_pass(std::make_unique<PatternPass>());
+            pm.register_pass(std::make_unique<SymbolAnnotationPass>());
+        }
+
+        // --memory-snapshot
+        if (opt_memory_snapshot) {
+            MemorySnapshotConfig ms_cfg;
+            ms_cfg.snapshot_inst_ids = memory_snapshot_ids;
+            ms_cfg.snapshot_size = memory_snapshot_size;
+            pm.register_pass(std::make_unique<MemorySnapshotPass>(std::move(ms_cfg)));
+        }
+
+        // --dataflow-graph
+        if (opt_dataflow_graph) {
+            DataflowGraphConfig dg_cfg;
+            dg_cfg.start_inst_id = dataflow_start;
+            dg_cfg.end_inst_id = dataflow_end;
+            pm.register_pass(std::make_unique<DataflowGraphPass>(std::move(dg_cfg)));
+        }
+
+        // --algorithm-summary needs pattern, constant_materialization, loop_semantics, function, call_graph
+        if (opt_algorithm_summary) {
+            pm.register_pass(std::make_unique<PatternPass>());
+            pm.register_pass(std::make_unique<ConstantMaterializationPass>());
+            pm.register_pass(std::make_unique<LoopPass>());
+            pm.register_pass(std::make_unique<LoopSemanticsPass>());
+            pm.register_pass(std::make_unique<FunctionPass>());
+            pm.register_pass(std::make_unique<CallGraphPass>());
+            pm.register_pass(std::make_unique<AlgorithmSummaryPass>());
+        }
+
+        // --objc
+        if (opt_objc) {
+            pm.register_pass(std::make_unique<ObjcPass>());
         }
 
         // --critical-path also needs forward taint
@@ -758,6 +923,62 @@ int main(int argc, char** argv) {
 
         if (opt_pattern) {
             rc |= run_pattern(pm);
+        }
+
+        if (opt_constants) {
+            const auto& cm_raw = pm.require("constant_materialization");
+            if (!cm_raw.ok()) {
+                fmt::print(stderr, "[constants] Constant materialization pass failed: {}\n",
+                           cm_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& cm_result = cm_raw.get<ConstantMaterializationResult>();
+                fmt::print("[constants] Found {} materialized constants ({} identified as known)\n\n",
+                           cm_result.total(), cm_result.identified_count());
+
+                // Print identified (known) constants first
+                if (!cm_result.identified_indices.empty()) {
+                    fmt::print("  === Identified Algorithm Constants ===\n");
+                    fmt::print("  {:<18} {:<6} {:<12} {:<20} {}\n",
+                               "VALUE", "REG", "ALGORITHM", "NAME", "INST_RANGE");
+                    for (size_t idx : cm_result.identified_indices) {
+                        const auto& c = cm_result.constants[idx];
+                        fmt::print("  0x{:016X} x{:<4} {:<12} {:<20} #{}-#{}\n",
+                                   c.value, c.dst_reg,
+                                   c.known_match->algorithm,
+                                   c.known_match->name,
+                                   c.first_inst_id, c.last_inst_id);
+                    }
+                    fmt::print("\n");
+                }
+
+                // Summary by algorithm
+                if (!cm_result.by_algorithm.empty()) {
+                    fmt::print("  === Summary by Algorithm ===\n");
+                    for (const auto& [algo, indices] : cm_result.by_algorithm) {
+                        fmt::print("  {}: {} constants\n", algo, indices.size());
+                    }
+                    fmt::print("\n");
+                }
+
+                // Print all constants (summary)
+                fmt::print("  === All Materialized Constants (top 200) ===\n");
+                fmt::print("  {:<18} {:<6} {:<6} {:<14} {}\n",
+                           "VALUE", "REG", "PARTS", "INST_RANGE", "KNOWN_AS");
+                size_t limit = std::min(cm_result.constants.size(), size_t(200));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& c = cm_result.constants[i];
+                    std::string known_str = c.known_match
+                        ? fmt::format("{} ({})", c.known_match->name, c.known_match->algorithm)
+                        : "-";
+                    fmt::print("  0x{:016X} x{:<4} {:<6} #{:<5}-#{:<5} {}\n",
+                               c.value, c.dst_reg, c.num_parts,
+                               c.first_inst_id, c.last_inst_id, known_str);
+                }
+                if (cm_result.constants.size() > 200) {
+                    fmt::print("  ... and {} more\n", cm_result.constants.size() - 200);
+                }
+            }
         }
 
         if (!call_graph_path.empty()) {
@@ -813,6 +1034,282 @@ int main(int argc, char** argv) {
                 if (cp.cardinality() > 200) cp_output["truncated"] = true;
                 fmt::print("{}\n", cp_output.dump(2));
             }
+        }
+
+        // --trace-diff: output JSON
+        if (opt_trace_diff) {
+            const auto& td_raw = pm.require("trace_diff");
+            if (!td_raw.ok()) {
+                fmt::print(stderr, "[trace-diff] Pass failed: {}\n", td_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& td_result = td_raw.get<TraceDiffResult>();
+                fmt::print(stderr, "[trace-diff] {} diverged, {} register diffs, {} control-flow diffs\n",
+                           td_result.diverged_count, td_result.register_value_diffs().size(),
+                           td_result.control_flow_diffs().size());
+                json td_json;
+                td_json["diverged_count"] = td_result.diverged_count;
+                td_json["matched_count"] = td_result.matched_count;
+                td_json["has_divergence"] = td_result.has_divergence();
+                json diffs_arr = json::array();
+                size_t limit = std::min(td_result.diffs.size(), size_t(500));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& d = td_result.diffs[i];
+                    diffs_arr.push_back({
+                        {"pc", fmt::format("0x{:X}", d.pc)},
+                        {"offset_a", d.inst_offset_a},
+                        {"offset_b", d.inst_offset_b},
+                        {"type", static_cast<int>(d.type)},
+                        {"detail", d.detail}
+                    });
+                }
+                td_json["diffs"] = std::move(diffs_arr);
+                if (td_result.diffs.size() > 500) td_json["truncated"] = true;
+                fmt::print("{}\n", td_json.dump(2));
+            }
+        }
+
+        // --loop-semantics
+        if (opt_loop_semantics) {
+            const auto& ls_raw = pm.require("loop_semantics");
+            if (!ls_raw.ok()) {
+                fmt::print(stderr, "[loop-semantics] Pass failed: {}\n", ls_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ls_result = ls_raw.get<LoopSemanticsResult>();
+                fmt::print(stderr, "[loop-semantics] {} loops analyzed, {} Feistel, {} crypto\n",
+                           ls_result.loop_semantics.size(),
+                           ls_result.feistel_loops().size(),
+                           ls_result.crypto_loops().size());
+                json ls_json;
+                json loops_arr = json::array();
+                for (const auto& l : ls_result.loop_semantics) {
+                    json lj;
+                    lj["pc"] = fmt::format("0x{:X}", l.header_pc);
+                    lj["iteration_count"] = l.iteration_count;
+                    lj["kind"] = loop_kind_name(l.kind);
+                    lj["confidence"] = l.confidence;
+                    lj["description"] = l.description;
+                    lj["body_instruction_count"] = l.body_instruction_count;
+                    lj["has_sbox_pattern"] = l.has_sbox_pattern;
+                    lj["has_xor_mix"] = l.has_xor_mix;
+                    lj["has_shift_rotate"] = l.has_shift_rotate;
+                    loops_arr.push_back(std::move(lj));
+                }
+                ls_json["loops"] = std::move(loops_arr);
+                fmt::print("{}\n", ls_json.dump(2));
+            }
+        }
+
+        // --symbol-annotation
+        if (opt_symbol_annotation) {
+            const auto& sa_raw = pm.require("symbol_annotation");
+            if (!sa_raw.ok()) {
+                fmt::print(stderr, "[symbol-annotation] Pass failed: {}\n", sa_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& sa_result = sa_raw.get<AnnotationResult>();
+                fmt::print(stderr, "[symbol-annotation] {} PCs annotated\n",
+                           sa_result.by_pc.size());
+                json sa_json;
+                json ann_arr = json::array();
+                size_t count = 0;
+                for (const auto& [pc, annotations] : sa_result.by_pc) {
+                    if (count >= 1000) break;
+                    for (const auto& a : annotations) {
+                        ann_arr.push_back({
+                            {"pc", fmt::format("0x{:X}", pc)},
+                            {"label", a.label},
+                            {"detail", a.detail},
+                            {"kind", static_cast<int>(a.kind)}
+                        });
+                    }
+                    count++;
+                }
+                sa_json["annotations"] = std::move(ann_arr);
+                sa_json["total_pcs"] = sa_result.by_pc.size();
+                if (sa_result.by_pc.size() > 1000) sa_json["truncated"] = true;
+                fmt::print("{}\n", sa_json.dump(2));
+            }
+        }
+
+        // --memory-snapshot
+        if (opt_memory_snapshot) {
+            const auto& ms_raw = pm.require("memory_snapshot");
+            if (!ms_raw.ok()) {
+                fmt::print(stderr, "[memory-snapshot] Pass failed: {}\n", ms_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ms_result = ms_raw.get<MemorySnapshotResult>();
+                fmt::print(stderr, "[memory-snapshot] {} snapshots captured\n", ms_result.total());
+                json ms_json;
+                json snaps_arr = json::array();
+                for (const auto& r : ms_result.snapshots) {
+                    snaps_arr.push_back({
+                        {"addr", fmt::format("0x{:X}", r.addr)},
+                        {"at_inst_id", r.at_inst_id},
+                        {"label", r.label},
+                        {"hex", MemorySnapshotResult::hex_dump(r)}
+                    });
+                }
+                ms_json["snapshots"] = std::move(snaps_arr);
+                ms_json["total"] = ms_result.total();
+                fmt::print("{}\n", ms_json.dump(2));
+            }
+        }
+
+        // --dataflow-graph
+        if (opt_dataflow_graph) {
+            const auto& dg_raw = pm.require("dataflow_graph");
+            if (!dg_raw.ok()) {
+                fmt::print(stderr, "[dataflow-graph] Pass failed: {}\n", dg_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& dg_result = dg_raw.get<DataflowGraphResult>();
+                fmt::print(stderr, "[dataflow-graph] {} nodes, {} edges\n",
+                           dg_result.nodes.size(), dg_result.edges.size());
+                if (!dataflow_output_path.empty()) {
+                    bool is_json = (dataflow_output_path.size() >= 5 &&
+                        dataflow_output_path.substr(dataflow_output_path.size() - 5) == ".json");
+                    std::ofstream dg_out(dataflow_output_path);
+                    if (dg_out.is_open()) {
+                        if (is_json) {
+                            dg_out << dg_result.to_json();
+                        } else {
+                            dg_out << dg_result.to_dot();
+                        }
+                        dg_out.close();
+                        fmt::print(stderr, "[dataflow-graph] -> {}\n", dataflow_output_path);
+                    }
+                } else {
+                    fmt::print("{}\n", dg_result.to_json());
+                }
+            }
+        }
+
+        // --algorithm-summary
+        if (opt_algorithm_summary) {
+            const auto& as_raw = pm.require("algorithm_summary");
+            if (!as_raw.ok()) {
+                fmt::print(stderr, "[algorithm-summary] Pass failed: {}\n", as_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& as_result = as_raw.get<AlgorithmSummaryResult>();
+                fmt::print(stderr, "[algorithm-summary] {} algorithms detected, has_crypto={}\n",
+                           as_result.total(), as_result.has_crypto());
+                fmt::print("{}\n", as_result.summary_json.dump(2));
+            }
+        }
+
+        // --objc
+        if (opt_objc) {
+            const auto& oc_raw = pm.require("objc");
+            if (!oc_raw.ok()) {
+                fmt::print(stderr, "[objc] Pass failed: {}\n", oc_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& oc_result = oc_raw.get<ObjcResult>();
+                fmt::print(stderr, "[objc] {} messages, {} classes\n",
+                           oc_result.total_messages(), oc_result.unique_classes());
+                fmt::print("{}\n", oc_result.to_json().dump(2));
+            }
+        }
+
+        // --memread: read memory at a specific point in time
+        if (opt_memread) {
+            auto mem_result = memory.read(memread_addr, memread_size, memread_inst_id);
+            json output;
+            output["addr"] = fmt::format("0x{:X}", memread_addr);
+            output["size"] = memread_size;
+            output["at_inst_id"] = memread_inst_id;
+
+            // Build hex string and per-byte info
+            std::string hex_str;
+            json bytes_arr = json::array();
+            for (uint8_t i = 0; i < memread_size; i++) {
+                json byte_info;
+                byte_info["offset"] = i;
+                byte_info["addr"] = fmt::format("0x{:X}", memread_addr + i);
+                if (mem_result.known[i]) {
+                    byte_info["value"] = fmt::format("0x{:02X}", mem_result.data[i]);
+                    byte_info["writer_inst_id"] = mem_result.writer_id[i];
+                    hex_str += fmt::format("{:02X} ", mem_result.data[i]);
+                } else {
+                    byte_info["value"] = "??";
+                    hex_str += "?? ";
+                }
+                bytes_arr.push_back(std::move(byte_info));
+            }
+            output["hex"] = hex_str;
+            output["bytes"] = std::move(bytes_arr);
+            fmt::print("{}\n", output.dump(2));
+        }
+
+        // --mem-history: find all writes to an address
+        if (opt_mem_history) {
+            auto history = memory.write_history(mem_history_addr, mem_history_size);
+            json output;
+            output["addr"] = fmt::format("0x{:X}", mem_history_addr);
+            output["size"] = mem_history_size;
+            output["write_count"] = history.size();
+
+            json writes_arr = json::array();
+            size_t limit = std::min(history.size(), size_t(500));
+            for (size_t i = 0; i < limit; i++) {
+                json w;
+                w["inst_id"] = history[i];
+                // Get the PC at this instruction via offset_of + record_at
+                uint64_t off = index.offset_of(history[i], reader);
+                if (off != 0) {
+                    auto rec = reader.record_at(off);
+                    if (rec.kind == RecordKind::Inst) {
+                        auto inst = rec.as_inst();
+                        w["pc"] = fmt::format("0x{:X}", inst.pc);
+                    }
+                }
+                writes_arr.push_back(std::move(w));
+            }
+            output["writes"] = std::move(writes_arr);
+            if (history.size() > 500) {
+                output["truncated"] = true;
+                output["total_writes"] = history.size();
+            }
+            fmt::print("{}\n", output.dump(2));
+        }
+
+        // --search-pc: find all instructions visiting a PC (linear scan with index assist)
+        if (opt_search_pc) {
+            json output;
+            output["pc"] = fmt::format("0x{:X}", search_pc_addr);
+
+            // Linear scan through trace to find matching PCs
+            // (uses mmap sequential access — efficient for this query)
+            std::vector<uint64_t> inst_ids;
+            uint64_t inst_id = 0;
+            reader.advise_sequential();
+            for (auto it = reader.begin(); it != reader.end(); ++it) {
+                auto rec = *it;
+                if (rec.kind == RecordKind::Inst) {
+                    auto inst = rec.as_inst();
+                    if (inst.pc == search_pc_addr) {
+                        inst_ids.push_back(inst_id);
+                        if (inst_ids.size() >= search_pc_limit) break;
+                    }
+                    inst_id++;
+                }
+            }
+            reader.advise_random();
+
+            output["hit_count"] = inst_ids.size();
+            json ids_arr = json::array();
+            for (auto id : inst_ids) {
+                ids_arr.push_back(id);
+            }
+            output["instruction_ids"] = std::move(ids_arr);
+            if (inst_ids.size() >= search_pc_limit) {
+                output["limit_reached"] = true;
+            }
+            fmt::print("{}\n", output.dump(2));
         }
 
         return rc;
