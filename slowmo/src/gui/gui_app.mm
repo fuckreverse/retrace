@@ -407,6 +407,11 @@ int GuiApp::run() {
     if (!init_sdl()) return 1;
     if (!init_imgui()) return 1;
 
+    // Kick off background startup analysis immediately after UI is ready.
+    // The analyses run in a detached thread; results are written atomically
+    // and the render loop will display them as they complete.
+    run_startup_analysis();
+
     while (running_) {
         // ─── 1. Poll SDL events ─────────────────────────────────────
         SDL_Event event;
@@ -3062,6 +3067,83 @@ void GuiApp::ensure_pass_manager() {
         pass_manager_->set_regfile(&regfile_);
         pass_manager_->set_memory(&memory_);
     }
+}
+
+// ─── Startup Analysis ───────────────────────────────────────────────────────
+// Runs a curated set of "always-useful" analyses in a background thread so
+// the UI is immediately responsive while analysis proceeds.
+// Order matters: Function → XRef → String → CallGraph
+// (XRef is needed by CFG/CallGraph; Function populates the call-stack panel)
+
+void GuiApp::run_startup_analysis() {
+    // Guard: don't double-launch
+    if (analysis_running_.exchange(true)) return;
+
+    // Ensure pass manager is ready on the main thread before handing off
+    ensure_pass_manager();
+
+    startup_analysis_thread_ = std::thread([this]() {
+        auto set_status = [this](const char* msg) {
+            std::lock_guard<std::mutex> lock(analysis_mutex_);
+            analysis_status_ = msg;
+        };
+
+        // ── 1. Function analysis ──────────────────────────────────────
+        set_status("Functions...");
+        {
+            pass_manager_->register_pass(std::make_unique<FunctionPass>());
+            auto& r = pass_manager_->require("function");
+            if (r.ok()) {
+                function_result_ = &r.get<FunctionResult>();
+                show_callstack_   = true;
+                show_functions_   = true;
+                goto_candidates_dirty_ = true;
+            }
+        }
+
+        // ── 2. XRef analysis ─────────────────────────────────────────
+        set_status("XRefs...");
+        {
+            pass_manager_->register_pass(std::make_unique<XrefPass>());
+            auto& r = pass_manager_->require("xref");
+            if (r.ok()) {
+                xref_result_  = &r.get<XrefResult>();
+                xref_cursor_  = 0;
+            }
+        }
+
+        // ── 3. String analysis ───────────────────────────────────────
+        set_status("Strings...");
+        {
+            pass_manager_->register_pass(std::make_unique<StringPass>());
+            auto& r = pass_manager_->require("strings");
+            if (r.ok()) {
+                string_result_  = &r.get<StringResult>();
+                show_strings_   = true;
+                string_cursor_  = 0;
+                string_filter_.clear();
+                std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
+            }
+        }
+
+        // ── 4. Call graph ─────────────────────────────────────────────
+        set_status("Call graph...");
+        {
+            pass_manager_->register_pass(std::make_unique<CallGraphPass>());
+            auto& r = pass_manager_->require("call_graph");
+            if (r.ok()) {
+                call_graph_result_ = &r.get<CallGraphResult>();
+            }
+        }
+
+        // Done
+        {
+            std::lock_guard<std::mutex> lock(analysis_mutex_);
+            analysis_status_.clear();
+        }
+        analysis_running_.store(false);
+    });
+    startup_analysis_thread_.detach();
 }
 
 void GuiApp::run_taint_analysis() {

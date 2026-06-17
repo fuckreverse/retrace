@@ -238,6 +238,7 @@ private:
     std::atomic<bool> analysis_running_{false};
     std::string analysis_status_;
     std::mutex analysis_mutex_;
+    std::thread startup_analysis_thread_;  // background startup analysis
 
     // ─── Initialization ─────────────────────────────────────────────
     bool init_sdl();
@@ -280,6 +281,7 @@ private:
 
     // ─── Analysis helpers ───────────────────────────────────────────
     void ensure_pass_manager();
+    void run_startup_analysis();    // Runs essential analyses in background on startup
     void run_taint_analysis();
     void run_backward_taint_analysis();
     void run_slice_analysis();
