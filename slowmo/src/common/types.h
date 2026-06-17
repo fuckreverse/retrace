@@ -212,6 +212,19 @@ public:
     size_t size() const { return size_; }
     size_t capacity() const { return capacity_; }
 
+    /// Remove a single entry by key (no-op if not found).
+    void erase(const Key& key) {
+        auto it = map_.find(key);
+        if (it == map_.end()) return;
+        uint32_t idx = it->second;
+        unlink(idx);
+        map_.erase(it);
+        size_--;
+    }
+
+    /// Alias for erase() — invalidate a cached entry.
+    void invalidate(const Key& key) { erase(key); }
+
     void clear() {
         map_.clear();
         size_ = 0;

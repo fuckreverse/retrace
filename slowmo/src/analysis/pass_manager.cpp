@@ -1,5 +1,6 @@
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -83,6 +84,8 @@ void PassManager::execute_pass(PassEntry* entry) {
         const auto& dep_result = require(dep_name);
         if (!dep_result.ok()) {
             // Dependency failed — propagate failure.
+            LOG_WARN("pass '{}': dependency '{}' failed — skipping",
+                     entry->pass->name(), dep_name);
             {
                 std::lock_guard<std::mutex> lk(entry->mtx);
                 entry->result = PassResult::failed(
@@ -95,8 +98,23 @@ void PassManager::execute_pass(PassEntry* entry) {
     }
 
     // Execute the pass itself.
+    LOG_DEBUG("pass '{}': starting", entry->pass->name());
+    auto t0  = TENET_TIMER_START();
+    double m0 = ::tenet::log::rss_mb();
+
     PassContext ctx(*this, range_);
     PassResult result = entry->pass->run(ctx);
+
+    double ms   = TENET_TIMER_MS(t0);
+    double dmem = ::tenet::log::rss_mb() - m0;
+
+    if (result.ok()) {
+        LOG_INFO("pass '{}': OK  {:.1f}ms  mem {:+.1f}MB",
+                 entry->pass->name(), ms, dmem);
+    } else {
+        LOG_WARN("pass '{}': FAILED  {:.1f}ms  — {}",
+                 entry->pass->name(), ms, result.error_message);
+    }
 
     {
         std::lock_guard<std::mutex> lk(entry->mtx);

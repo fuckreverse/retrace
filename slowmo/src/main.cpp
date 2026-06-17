@@ -29,6 +29,8 @@
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/thread_pass.h"
 
+#include "common/logger.h"
+
 #include <fmt/core.h>
 #include <fmt/color.h>
 #include <nlohmann/json.hpp>
@@ -39,6 +41,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unistd.h>
 
 using namespace tenet;
 using json = nlohmann::json;
@@ -671,6 +674,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ─── Init logger ────────────────────────────────────────────────────
+    tenet::log::init();
+    LOG_INFO("tenet starting  pid={}", (int)getpid());
+
     // Determine if any analysis option was specified → suppress TUI
     bool has_analysis_option = !export_cfg_path.empty() || opt_taint ||
                                opt_strings || opt_pattern || opt_constants ||
@@ -684,6 +691,8 @@ int main(int argc, char** argv) {
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
+    LOG_INFO("opening trace: {}", trace_path);
+    auto t_open = TENET_TIMER_START();
 
     auto reader_result = TraceReader::open(trace_path);
     if (!reader_result) {
@@ -691,6 +700,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     auto& reader = *reader_result;
+    LOG_INFO("trace opened in {:.1f}ms  size={:.2f}MB",
+             TENET_TIMER_MS(t_open),
+             reader.file_size() / (1024.0 * 1024.0));
 
     const auto& hdr = reader.header();
     fmt::print("  Magic:     0x{:08X}\n", hdr.magic);
@@ -705,9 +717,14 @@ int main(int argc, char** argv) {
     fmt::print("  Flags:     mem={} nzcv={} diff={} code={}\n",
                hdr.has_mem(), hdr.has_nzcv(), hdr.reg_diff(), hdr.has_code());
     fmt::print("\n");
+    LOG_DEBUG("trace header: arch={} gpr={} module={} slide=0x{:X}",
+              hdr.arch == 1 ? "AArch64" : "x86_64",
+              hdr.num_gpr, hdr.module_name, hdr.module_slide);
 
     // ─── Build/load index ───────────────────────────────────────────────
     fmt::print("Building index...\n");
+    LOG_INFO("building/loading RocksDB index");
+    auto t_index = TENET_TIMER_START();
 
     auto index_result = TraceIndex::open_or_build(reader,
         [](uint64_t processed, uint64_t total) {
@@ -726,6 +743,9 @@ int main(int argc, char** argv) {
     fmt::print("\r  Done. {} instructions, {} anchors, built in {:.2f}s\n",
                index.stats().inst_count, index.stats().anchor_count,
                index.stats().build_seconds);
+    LOG_INFO("index ready: {} instructions, {} anchors  ({:.1f}ms total)",
+             index.stats().inst_count, index.stats().anchor_count,
+             TENET_TIMER_MS(t_index));
 
     if (show_index_stats) {
         fmt::print("  Code records: {}\n", index.stats().code_count);
@@ -737,29 +757,38 @@ int main(int argc, char** argv) {
     // ─── Populate CodeTable from trace ──────────────────────────────────
     CodeTable code_table;
     fmt::print("Loading code table...\n");
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
-        auto rec = *it;
-        if (rec.kind == RecordKind::Code) {
-            auto code = rec.as_code();
-            if (code.size == 4) {
-                uint32_t opcode = 0;
-                std::memcpy(&opcode, code.bytes, 4);
-                code_table.insert(code.pc, opcode);
+    {
+        TENET_SCOPE_TIMER("code_table_load");
+        for (auto it = reader.begin(); it != reader.end(); ++it) {
+            auto rec = *it;
+            if (rec.kind == RecordKind::Code) {
+                auto code = rec.as_code();
+                if (code.size == 4) {
+                    uint32_t opcode = 0;
+                    std::memcpy(&opcode, code.bytes, 4);
+                    code_table.insert(code.pc, opcode);
+                }
             }
         }
     }
     fmt::print("  Loaded {} distinct PCs\n\n", code_table.size());
+    LOG_DEBUG("code table: {} distinct PCs", code_table.size());
 
     // ─── Initialize decoder ─────────────────────────────────────────────
     InstructionDecoder decoder;
-    if (!decoder.init()) {
-        fmt::print(stderr, "Error: failed to initialize Capstone\n");
-        return 1;
+    {
+        auto t = TENET_TIMER_START();
+        if (!decoder.init()) {
+            fmt::print(stderr, "Error: failed to initialize Capstone\n");
+            return 1;
+        }
+        LOG_DEBUG("Capstone decoder initialized in {:.1f}ms", TENET_TIMER_MS(t));
     }
 
     // ─── Initialize RegisterFile and MemoryModel ──────────────────────────
     RegisterFile regfile(reader, index);
     MemoryModel memory(reader, index);
+    LOG_DEBUG("RegisterFile + MemoryModel ready");
 
     // ─── Run analysis options (batch mode) ─────────────────────────────────
     if (has_analysis_option) {

@@ -155,48 +155,137 @@ void GuiApp::shutdown() {
 }
 
 // ─── Style Setup ────────────────────────────────────────────────────────────
+// Inspired by IDA Pro / Binary Ninja dark themes — clean, dense, low-eye-strain
 
 void GuiApp::setup_style() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
 
-    // Compact spacing for dense data display
-    style.WindowPadding = ImVec2(6.0f, 6.0f);
-    style.FramePadding = ImVec2(4.0f, 2.0f);
-    style.ItemSpacing = ImVec2(6.0f, 3.0f);
-    style.ItemInnerSpacing = ImVec2(4.0f, 4.0f);
-    style.ScrollbarSize = 12.0f;
-    style.GrabMinSize = 8.0f;
-    style.WindowRounding = 4.0f;
-    style.FrameRounding = 2.0f;
-    style.ScrollbarRounding = 2.0f;
-    style.GrabRounding = 2.0f;
-    style.TabRounding = 2.0f;
+    // ── Spacing & sizing: dense like IDA, but not cramped ─────────────
+    style.WindowPadding      = ImVec2(8.0f, 8.0f);
+    style.FramePadding       = ImVec2(5.0f, 3.0f);
+    style.CellPadding        = ImVec2(4.0f, 2.0f);
+    style.ItemSpacing        = ImVec2(6.0f, 4.0f);
+    style.ItemInnerSpacing   = ImVec2(4.0f, 4.0f);
+    style.TouchExtraPadding  = ImVec2(0.0f, 0.0f);
+    style.IndentSpacing      = 18.0f;
+    style.ScrollbarSize      = 11.0f;
+    style.GrabMinSize        = 8.0f;
 
-    // Custom dark theme for reverse engineering tool
-    ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg]             = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    colors[ImGuiCol_ChildBg]              = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
-    colors[ImGuiCol_PopupBg]              = ImVec4(0.10f, 0.10f, 0.12f, 0.95f);
-    colors[ImGuiCol_Border]               = ImVec4(0.25f, 0.25f, 0.30f, 0.60f);
-    colors[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.12f, 0.15f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.18f, 0.18f, 0.22f, 1.00f);
-    colors[ImGuiCol_FrameBgActive]        = ImVec4(0.22f, 0.22f, 0.28f, 1.00f);
-    colors[ImGuiCol_TitleBg]              = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]        = ImVec4(0.10f, 0.10f, 0.14f, 1.00f);
-    colors[ImGuiCol_MenuBarBg]            = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.05f, 0.05f, 0.07f, 0.80f);
-    colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.30f, 0.30f, 0.35f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
-    colors[ImGuiCol_Header]               = ImVec4(0.18f, 0.18f, 0.22f, 1.00f);
-    colors[ImGuiCol_HeaderHovered]        = ImVec4(0.25f, 0.25f, 0.32f, 1.00f);
-    colors[ImGuiCol_HeaderActive]         = ImVec4(0.30f, 0.30f, 0.38f, 1.00f);
-    colors[ImGuiCol_Tab]                  = ImVec4(0.12f, 0.12f, 0.15f, 1.00f);
-    colors[ImGuiCol_TabHovered]           = ImVec4(0.25f, 0.40f, 0.55f, 1.00f);
-    colors[ImGuiCol_TabSelected]          = ImVec4(0.18f, 0.30f, 0.45f, 1.00f);
-    colors[ImGuiCol_DockingPreview]       = ImVec4(0.20f, 0.40f, 0.70f, 0.70f);
-    colors[ImGuiCol_TextSelectedBg]       = ImVec4(0.20f, 0.40f, 0.70f, 0.50f);
+    // ── Borders & rounding: subtle — like Binary Ninja/Ghidra ─────────
+    style.WindowBorderSize   = 1.0f;
+    style.ChildBorderSize    = 1.0f;
+    style.PopupBorderSize    = 1.0f;
+    style.FrameBorderSize    = 0.0f;
+    style.TabBorderSize      = 0.0f;
+    style.WindowRounding     = 6.0f;
+    style.ChildRounding      = 4.0f;
+    style.FrameRounding      = 3.0f;
+    style.PopupRounding      = 4.0f;
+    style.ScrollbarRounding  = 3.0f;
+    style.GrabRounding       = 3.0f;
+    style.TabRounding        = 4.0f;
+
+    // ── Alignment ─────────────────────────────────────────────────────
+    style.WindowTitleAlign   = ImVec2(0.0f, 0.5f);
+    style.ButtonTextAlign    = ImVec2(0.5f, 0.5f);
+
+    // ── Colors: "Tenet Dark" — deep navy + accent blue, IDA-inspired ──
+    ImVec4* c = style.Colors;
+
+    // Base background layers (darkest → lightest)
+    c[ImGuiCol_WindowBg]              = ImVec4(0.075f, 0.078f, 0.095f, 1.00f);  // main bg
+    c[ImGuiCol_ChildBg]               = ImVec4(0.060f, 0.063f, 0.078f, 1.00f);  // child panels
+    c[ImGuiCol_PopupBg]               = ImVec4(0.095f, 0.098f, 0.120f, 0.97f);  // dropdowns/popups
+
+    // Borders: very subtle separation lines
+    c[ImGuiCol_Border]                = ImVec4(0.22f, 0.22f, 0.30f, 0.55f);
+    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.30f);
+
+    // Frame backgrounds (input fields, etc.)
+    c[ImGuiCol_FrameBg]               = ImVec4(0.11f, 0.11f, 0.14f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.17f, 0.18f, 0.23f, 1.00f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0.22f, 0.23f, 0.30f, 1.00f);
+
+    // Title bar
+    c[ImGuiCol_TitleBg]               = ImVec4(0.055f, 0.057f, 0.072f, 1.00f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(0.090f, 0.095f, 0.130f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.055f, 0.057f, 0.072f, 0.75f);
+
+    // Menu & toolbar
+    c[ImGuiCol_MenuBarBg]             = ImVec4(0.085f, 0.088f, 0.110f, 1.00f);
+
+    // Scrollbars
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.04f, 0.04f, 0.055f, 0.90f);
+    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.28f, 0.29f, 0.38f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.38f, 0.39f, 0.50f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.50f, 0.51f, 0.64f, 1.00f);
+
+    // Check / radio marks
+    c[ImGuiCol_CheckMark]             = ImVec4(0.40f, 0.75f, 1.00f, 1.00f);
+
+    // Sliders & grabs
+    c[ImGuiCol_SliderGrab]            = ImVec4(0.35f, 0.60f, 0.90f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.45f, 0.70f, 1.00f, 1.00f);
+
+    // Buttons — muted steel blue (like IDA action buttons)
+    c[ImGuiCol_Button]                = ImVec4(0.17f, 0.22f, 0.35f, 1.00f);
+    c[ImGuiCol_ButtonHovered]         = ImVec4(0.23f, 0.32f, 0.52f, 1.00f);
+    c[ImGuiCol_ButtonActive]          = ImVec4(0.28f, 0.40f, 0.65f, 1.00f);
+
+    // Headers (TreeNode, CollapsingHeader, Table header cells)
+    c[ImGuiCol_Header]                = ImVec4(0.16f, 0.18f, 0.26f, 1.00f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(0.22f, 0.28f, 0.42f, 1.00f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(0.28f, 0.36f, 0.54f, 1.00f);
+
+    // Separators
+    c[ImGuiCol_Separator]             = ImVec4(0.22f, 0.22f, 0.30f, 0.80f);
+    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.35f, 0.50f, 0.75f, 1.00f);
+    c[ImGuiCol_SeparatorActive]       = ImVec4(0.45f, 0.62f, 0.90f, 1.00f);
+
+    // Resize grips
+    c[ImGuiCol_ResizeGrip]            = ImVec4(0.25f, 0.35f, 0.55f, 0.30f);
+    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.35f, 0.50f, 0.75f, 0.70f);
+    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.45f, 0.62f, 0.90f, 0.95f);
+
+    // Tabs — IDA-style: inactive tabs are very dark, active has a colored underline feel
+    c[ImGuiCol_Tab]                   = ImVec4(0.09f, 0.09f, 0.12f, 1.00f);
+    c[ImGuiCol_TabHovered]            = ImVec4(0.20f, 0.32f, 0.52f, 1.00f);
+    c[ImGuiCol_TabSelected]           = ImVec4(0.15f, 0.26f, 0.44f, 1.00f);
+    c[ImGuiCol_TabSelectedOverline]   = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);  // accent line on active tab
+    c[ImGuiCol_TabDimmed]             = ImVec4(0.07f, 0.07f, 0.09f, 1.00f);
+    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.11f, 0.16f, 0.26f, 1.00f);
+
+    // Docking
+    c[ImGuiCol_DockingPreview]        = ImVec4(0.25f, 0.45f, 0.75f, 0.65f);
+    c[ImGuiCol_DockingEmptyBg]        = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
+
+    // Plot lines
+    c[ImGuiCol_PlotLines]             = ImVec4(0.45f, 0.75f, 0.45f, 1.00f);
+    c[ImGuiCol_PlotLinesHovered]      = ImVec4(0.60f, 1.00f, 0.60f, 1.00f);
+    c[ImGuiCol_PlotHistogram]         = ImVec4(0.35f, 0.60f, 0.90f, 1.00f);
+    c[ImGuiCol_PlotHistogramHovered]  = ImVec4(0.50f, 0.75f, 1.00f, 1.00f);
+
+    // Table
+    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.09f, 0.09f, 0.13f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.20f, 0.20f, 0.28f, 1.00f);
+    c[ImGuiCol_TableBorderLight]      = ImVec4(0.14f, 0.14f, 0.19f, 1.00f);
+    c[ImGuiCol_TableRowBg]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_TableRowBgAlt]         = ImVec4(1.00f, 1.00f, 1.00f, 0.025f);  // very subtle stripe
+
+    // Text selection
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.22f, 0.42f, 0.72f, 0.55f);
+
+    // Drag & drop
+    c[ImGuiCol_DragDropTarget]        = ImVec4(0.40f, 0.75f, 1.00f, 0.90f);
+
+    // Nav highlight
+    c[ImGuiCol_NavHighlight]          = ImVec4(0.40f, 0.65f, 1.00f, 1.00f);
+    c[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+
+    // Modal dimming
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.05f, 0.05f, 0.08f, 0.55f);
 
     // Scale for HiDPI
     style.ScaleAllSizes(dpi_scale_);
@@ -373,16 +462,44 @@ int GuiApp::run() {
 }
 
 // ─── Main Frame Render ──────────────────────────────────────────────────────
+// Layout inspired by IDA Pro / Binary Ninja:
+//  ┌──────────────────────────────────────────────────────────┐
+//  │ Menu Bar                                                  │
+//  ├──────────────────────────────────────────────────────────┤
+//  │ Toolbar (fixed height, not docked)                       │
+//  ├──────────────────────────────────────────────────────────┤
+//  │ Timeline (fixed height, execution progress bar)          │
+//  ├────────────┬──────────────────────────┬──────────────────┤
+//  │ Functions  │  Instructions / CFG      │  Registers       │
+//  │ Strings    │  (main content, ~65%)    │  Memory Accesses │
+//  │  (~15%)    │                          │  (~20%)          │
+//  │            ├──────────────────────────┤                  │
+//  │            │  Analysis / Call Stack / │                  │
+//  │            │  Hex Dump  (~22%)        │                  │
+//  ├────────────┴──────────────────────────┴──────────────────┤
+//  │ Status Bar (fixed height, not docked)                    │
+//  └──────────────────────────────────────────────────────────┘
+
+static const float kToolbarHeight  = 30.0f;   // toolbar window height
+static const float kTimelineHeight = 22.0f;   // execution timeline height
+static const float kStatusBarHeight = 22.0f;  // bottom status bar height
 
 void GuiApp::render_frame() {
-    // Create a DockSpace over the entire viewport
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
+
+    // ─── Toolbar (fixed at top, above dockspace) ─────────────────────
+    const float toolbar_y  = viewport->WorkPos.y;
+    const float timeline_y = toolbar_y + kToolbarHeight;
+    const float dockspace_y = timeline_y + kTimelineHeight;
+    const float status_y   = viewport->WorkPos.y + viewport->WorkSize.y - kStatusBarHeight;
+    const float dockspace_h = status_y - dockspace_y;
+
+    // ─── Create a DockSpace covering the area between timeline and status bar ──
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, dockspace_y));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, dockspace_h));
     ImGui::SetNextWindowViewport(viewport->ID);
 
     ImGuiWindowFlags dock_flags =
-        ImGuiWindowFlags_MenuBar |
         ImGuiWindowFlags_NoDocking |
         ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoCollapse |
@@ -395,109 +512,268 @@ void GuiApp::render_frame() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
 
-    ImGui::Begin("DockSpace", nullptr, dock_flags);
+    ImGui::Begin("DockSpaceHost", nullptr, dock_flags);
     ImGui::PopStyleVar(3);
 
     // Create the DockSpace
     ImGuiID dockspace_id = ImGui::GetID("TenetDockSpace");
-    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f),
+        ImGuiDockNodeFlags_PassthruCentralNode);
 
     // ─── Default layout (first frame only) ───────────────────────────
-    // IDA-style: Left=Functions | Center=Instructions+CFG (tabbed) | Right=Registers/Memory
+    // Layout proportions tuned to match IDA Pro's information density:
+    //   - Left  15% : Functions/Strings sidebar (narrow, just enough for names)
+    //   - Center 65%: Instructions+CFG (core analysis area, maximum width)
+    //   - Right  20%: Registers+Memory (compact but readable)
     if (first_frame_) {
         first_frame_ = false;
 
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
-        ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+        ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2(viewport->WorkSize.x, dockspace_h));
 
-        // Split: left sidebar (18%) | rest (82%)
+        // ── Step 1: carve off left sidebar (15%) ──
         ImGuiID dock_left_sidebar, dock_rest;
-        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.18f, &dock_left_sidebar, &dock_rest);
+        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.15f,
+                                    &dock_left_sidebar, &dock_rest);
 
-        // Split rest: center (72%) | right (28%)
+        // ── Step 2: carve off right panel (≈24% of total = 20% visible) ──
         ImGuiID dock_center, dock_right;
-        ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Left, 0.72f, &dock_center, &dock_right);
+        ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Right, 0.24f,
+                                    &dock_right, &dock_center);
 
-        // Split center: top main area (75%) | bottom analysis/output (25%)
+        // ── Step 3: split center vertically: main (78%) | output (22%) ──
         ImGuiID dock_center_main, dock_center_bottom;
-        ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Up, 0.75f, &dock_center_main, &dock_center_bottom);
+        ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Down, 0.22f,
+                                    &dock_center_bottom, &dock_center_main);
 
-        // Split right: top 55% (registers) | bottom 45% (memory)
-        ImGuiID dock_right_top, dock_right_bottom;
-        ImGui::DockBuilderSplitNode(dock_right, ImGuiDir_Up, 0.55f, &dock_right_top, &dock_right_bottom);
+        // ── Step 4: split right vertically: registers (62%) | memory (38%) ──
+        ImGuiID dock_right_regs, dock_right_mem;
+        ImGui::DockBuilderSplitNode(dock_right, ImGuiDir_Down, 0.38f,
+                                    &dock_right_mem, &dock_right_regs);
 
-        // Left sidebar: Functions (primary) + Strings as tab
+        // ── Assign windows to nodes ──
+
+        // Left sidebar: Functions (primary tab, shown first) + Strings
         ImGui::DockBuilderDockWindow("Functions", dock_left_sidebar);
-        ImGui::DockBuilderDockWindow("Strings", dock_left_sidebar);
+        ImGui::DockBuilderDockWindow("Strings",   dock_left_sidebar);
+        ImGui::DockBuilderDockWindow("Threads",   dock_left_sidebar);
 
-        // Center main: Instructions + CFG as tabs (IDA-style disasm/graph toggle)
+        // Center main: Instructions (primary) + CFG tab (IDA-style disasm/graph toggle)
         ImGui::DockBuilderDockWindow("Instructions", dock_center_main);
-        ImGui::DockBuilderDockWindow("CFG", dock_center_main);
+        ImGui::DockBuilderDockWindow("CFG",          dock_center_main);
 
-        // Center bottom: Analysis + Call Stack + Hex Dump + Minimap
-        ImGui::DockBuilderDockWindow("Analysis", dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Call Stack", dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Hex Dump", dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Minimap", dock_center_bottom);
+        // Center bottom output: Analysis (primary) + supplementary tabs
+        ImGui::DockBuilderDockWindow("Analysis",      dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Call Stack",    dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Hex Dump",      dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Minimap",       dock_center_bottom);
 
-        // Right: Registers on top, Memory on bottom
-        ImGui::DockBuilderDockWindow("Registers", dock_right_top);
-        ImGui::DockBuilderDockWindow("Memory Accesses", dock_right_bottom);
+        // Right column: Registers on top (more important), Memory below
+        ImGui::DockBuilderDockWindow("Registers",       dock_right_regs);
+        ImGui::DockBuilderDockWindow("Memory Accesses", dock_right_mem);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
 
-    // ─── Menu bar ───────────────────────────────────────────────────
-    render_menu_bar();
+    // ─── Menu bar: rendered inside the host window ───────────────────
+    // NOTE: We removed the MenuBar from the host window flags, so we render
+    //       the menu bar separately as a standalone menu bar window.
+    ImGui::End();
 
+    // ─── Actual menu bar (rendered as top-most, full-width strip) ────
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, 0.0f));  // auto-height
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("##MainMenuBar", nullptr,
+        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_MenuBar |
+        ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleVar(3);
+    render_menu_bar();
     ImGui::End();
 
     // ─── Toolbar ────────────────────────────────────────────────────
     render_toolbar();
 
     // ─── Global keyboard shortcuts ───────────────────────────────────
-    // Note: ImGui keyboard shortcuts work best when no text input has focus
-    if (!ImGui::GetIO().WantCaptureKeyboard || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        // Navigation history: Alt+Left / Alt+Right (or Cmd+[ / Cmd+] on Mac)
-        bool alt_down = ImGui::GetIO().KeyAlt;
-        if (alt_down && ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
-            nav_back();
-        }
-        if (alt_down && ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
-            nav_forward();
-        }
+    // Dispatch when no text input is focused, OR on Escape
+    // Follows IDA Pro / Binary Ninja conventions
+    {
+        bool want_kb = ImGui::GetIO().WantCaptureKeyboard;
+        bool ctrl  = ImGui::GetIO().KeyCtrl;
+        bool alt   = ImGui::GetIO().KeyAlt;
+        bool shift = ImGui::GetIO().KeyShift;
+        bool super = ImGui::GetIO().KeySuper;  // Cmd on macOS
 
-        // Taint jump: [ and ]
-        bool shift_down = ImGui::GetIO().KeyShift;
-        if (!shift_down && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
-            if (show_taint_ && taint_result_) jump_taint_next();
-            else if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_next();
-        }
-        if (!shift_down && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
-            if (show_taint_ && taint_result_) jump_taint_prev();
-            else if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev();
-        }
-        if (shift_down && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
-            if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_next();
-        }
-        if (shift_down && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
-            if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev();
-        }
-
-        // Navigate step with arrow keys (without modifier)
-        if (!alt_down && !shift_down) {
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
-                navigate_to(current_inst_ + 1);
+        // Escape: close any active popup / search
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            if (search_active_) {
+                search_active_ = false;
+                search_results_.clear();
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
-                if (current_inst_ > 0) navigate_to(current_inst_ - 1);
-            }
+            show_goto_popup_   = false;
+            show_search_popup_ = false;
         }
 
-        // G → goto popup
-        if (ImGui::IsKeyPressed(ImGuiKey_G) && !show_goto_popup_) {
-            show_goto_popup_ = true;
+        // ── Actions that should work even with keyboard focused ───────────
+        // (Cmd+Q: quit)
+        if ((super || ctrl) && ImGui::IsKeyPressed(ImGuiKey_Q)) {
+            running_ = false;
+        }
+        // (Cmd+,: settings)
+        if ((super || ctrl) && ImGui::IsKeyPressed(ImGuiKey_Comma)) {
+            show_settings_ = !show_settings_;
+        }
+
+        // ── Non-text-input shortcuts ──────────────────────────────────────
+        if (!want_kb) {
+            // Navigation history: Alt+Left / Alt+Right (Binary Ninja / IDA)
+            if (alt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                nav_back();
+            }
+            if (alt && ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                nav_forward();
+            }
+
+            // Step with arrow keys (no modifier)
+            if (!alt && !shift && !ctrl && !super) {
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                    if (current_inst_ + 1 < total_inst_) navigate_to(current_inst_ + 1);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                    if (current_inst_ > 0) navigate_to(current_inst_ - 1);
+                }
+            }
+
+            // Page Up/Down: jump ±100 instructions
+            if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+                uint64_t step = 100;
+                uint64_t next = (current_inst_ + step < total_inst_) ? current_inst_ + step : total_inst_ - 1;
+                navigate_to(next);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+                uint64_t step = 100;
+                navigate_to(current_inst_ > step ? current_inst_ - step : 0);
+            }
+
+            // Home: first instruction
+            if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Home)) {
+                navigate_to(0);
+            }
+            // End: last instruction
+            if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_End)) {
+                navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0);
+            }
+
+            // G → Goto popup
+            if (ImGui::IsKeyPressed(ImGuiKey_G) && !show_goto_popup_) {
+                show_goto_popup_ = true;
+            }
+
+            // / or Ctrl+F → Search popup
+            if (ImGui::IsKeyPressed(ImGuiKey_Slash) || (ctrl && ImGui::IsKeyPressed(ImGuiKey_F))) {
+                show_search_popup_ = true;
+            }
+
+            // F3 → Next search result
+            if (ImGui::IsKeyPressed(ImGuiKey_F3)) {
+                if (search_active_ && !search_results_.empty()) {
+                    if (shift) {
+                        // Shift+F3: previous result
+                        if (search_current_ > 0) search_current_--;
+                        else search_current_ = search_results_.size() - 1;
+                    } else {
+                        // F3: next result
+                        search_current_++;
+                        if (search_current_ >= search_results_.size()) search_current_ = 0;
+                    }
+                    navigate_to(search_results_[search_current_]);
+                }
+            }
+
+            // B → toggle bookmark
+            if (ImGui::IsKeyPressed(ImGuiKey_B) && !shift && !ctrl && !alt) {
+                toggle_bookmark();
+            }
+
+            // Taint jump: [ and ]
+            if (!shift && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+                if (show_taint_ && taint_result_) jump_taint_next();
+                else if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_next();
+            }
+            if (!shift && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
+                if (show_taint_ && taint_result_) jump_taint_prev();
+                else if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev();
+            }
+            if (shift && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+                if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_next();
+            }
+            if (shift && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
+                if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev();
+            }
+
+            // E → follow call (enter callee)
+            if (ImGui::IsKeyPressed(ImGuiKey_E) && function_result_) {
+                auto* evt = function_result_->call_at(current_inst_);
+                if (evt && evt->call_inst_id + 1 < total_inst_)
+                    navigate_to(evt->call_inst_id + 1);
+            }
+
+            // Backspace → follow return (back to call site)
+            if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && function_result_) {
+                auto* ret = function_result_->return_at(current_inst_);
+                if (ret) {
+                    navigate_to(ret->call_inst_id);
+                } else {
+                    auto stk = function_result_->call_stack_at(current_inst_);
+                    if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
+                }
+            }
+
+            // F5 / Space → toggle CFG view
+            if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+                show_cfg_ = !show_cfg_;
+            }
+
+            // + / - for CFG zoom (when CFG is visible)
+            if (show_cfg_) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Equal) && (shift || ctrl)) {
+                    // Shift+= is "+" on most keyboards
+                    cfg_zoom_ = std::min(cfg_zoom_ * 1.2f, 8.0f);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_Minus) && (ctrl || true)) {
+                    cfg_zoom_ = std::max(cfg_zoom_ * 0.8f, 0.05f);
+                }
+            }
+
+            // X → run xref analysis
+            if (ImGui::IsKeyPressed(ImGuiKey_X) && !ctrl) {
+                if (!xref_result_) run_xref_analysis();
+                else {
+                    // cycle through xrefs at current PC
+                    auto row = fetch_row(current_inst_);
+                    auto xrefs = xref_result_->inst_ids_at(row.pc);
+                    if (!xrefs.empty()) {
+                        xref_cursor_++;
+                        if (xref_cursor_ >= xrefs.size()) xref_cursor_ = 0;
+                        navigate_to(xrefs[xref_cursor_]);
+                    }
+                }
+            }
+
+            // Ctrl+C / Cmd+C → copy current instruction address
+            if ((ctrl || super) && ImGui::IsKeyPressed(ImGuiKey_C)) {
+                auto row = fetch_row(current_inst_);
+                char buf[24];
+                snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)row.static_pc);
+                ImGui::SetClipboardText(buf);
+            }
         }
     }
 
@@ -535,6 +811,9 @@ void GuiApp::render_frame() {
     if (show_cfg_) {
         render_cfg_panel();
     }
+
+    // ─── Status bar (always rendered at bottom) ─────────────────────
+    render_status_bar();
 
     // ─── Popups / Settings ──────────────────────────────────────────
     render_goto_popup();
@@ -724,86 +1003,116 @@ void GuiApp::render_menu_bar() {
 }
 
 // ─── Toolbar ────────────────────────────────────────────────────────────────
+// Redesigned: clear icon-like labels, logical grouping with visual separators,
+// status badges on the right (Binary Ninja / IDA style)
 
 void GuiApp::render_toolbar() {
-    ImGui::Begin("##Toolbar", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoSavedSettings);
+    // ── Fixed position: pinned below menu bar, full width ─────────────
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    // Menu bar auto-height: use GetFrameHeight (approx) + padding
+    const float menu_h = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
+    const float toolbar_y = vp->WorkPos.y + menu_h;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbar_y));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, kToolbarHeight));
+    ImGui::SetNextWindowViewport(vp->ID);
 
-    // ── Navigation history: Back / Forward ────────────────────────────
+    // Style overrides for toolbar: tighter frame padding for compact buttons
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,    ImVec2(5.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(3.0f, 2.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(4.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    // Slightly different bg than main windows to distinguish toolbar area
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.085f, 0.090f, 0.115f, 1.0f));
+
+    ImGui::Begin("##Toolbar", nullptr,
+        ImGuiWindowFlags_NoTitleBar    | ImGuiWindowFlags_NoResize  |
+        ImGuiWindowFlags_NoMove        | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDocking     | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus);
+
+    const float btn_h = ImGui::GetFrameHeight();
+
+    // ── GROUP 1: History navigation ───────────────────────────────────
     {
         bool can_back = can_nav_back();
         bool can_fwd  = can_nav_forward();
 
         if (!can_back) ImGui::BeginDisabled();
-        if (ImGui::Button("<<")) nav_back();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Back (Alt+Left)\nHistory: [%zu/%zu]",
+        if (ImGui::Button("\xe2\x86\x90##navback", ImVec2(26.0f, btn_h)))  // ← (UTF-8 U+2190)
+            nav_back();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Back  Alt+\xe2\x86\x90\nHistory: [%zu/%zu]",
                 nav_history_pos_ + 1, nav_history_.size());
-        }
         if (!can_back) ImGui::EndDisabled();
 
         ImGui::SameLine();
 
         if (!can_fwd) ImGui::BeginDisabled();
-        if (ImGui::Button(">>")) nav_forward();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Forward (Alt+Right)\nHistory: [%zu/%zu]",
+        if (ImGui::Button("\xe2\x86\x92##navfwd", ImVec2(26.0f, btn_h)))   // → (UTF-8 U+2192)
+            nav_forward();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Forward  Alt+\xe2\x86\x92\nHistory: [%zu/%zu]",
                 nav_history_pos_ + 1, nav_history_.size());
-        }
         if (!can_fwd) ImGui::EndDisabled();
     }
 
+    // ── Separator ─────────────────────────────────────────────────────
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+    ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+    ImGui::PopStyleColor();
     ImGui::SameLine();
 
-    // ── Step navigation ───────────────────────────────────────────────
-    if (ImGui::Button("|<")) navigate_to(0);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("First instruction");
+    // ── GROUP 2: Step / seek ─────────────────────────────────────────
+    if (ImGui::Button("|<##seek0", ImVec2(26.0f, btn_h)))
+        navigate_to(0);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("First instruction  Home");
     ImGui::SameLine();
-    if (ImGui::Button("<")) {
+
+    if (ImGui::Button("\xe2\x96\xb2##stepup", ImVec2(26.0f, btn_h))) {  // ▲
         if (current_inst_ > 0) navigate_to(current_inst_ - 1);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous instruction");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous instruction  \xe2\x86\x91");
     ImGui::SameLine();
-    if (ImGui::Button(">")) {
+
+    if (ImGui::Button("\xe2\x96\xbc##stepdn", ImVec2(26.0f, btn_h))) {  // ▼
         navigate_to(current_inst_ + 1);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next instruction");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next instruction  \xe2\x86\x93");
     ImGui::SameLine();
-    if (ImGui::Button(">|")) {
+
+    if (ImGui::Button(">|##seekend", ImVec2(26.0f, btn_h)))
         navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0);
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Last instruction");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Last instruction  End");
 
+    // ── Separator ─────────────────────────────────────────────────────
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+    ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+    ImGui::PopStyleColor();
     ImGui::SameLine();
 
-    // ── Follow call / return ─────────────────────────────────────────
+    // ── GROUP 3: Call/Return follow (only when function analysis available) ──
     if (function_result_) {
         bool has_call = (function_result_->call_at(current_inst_) != nullptr);
         bool has_ret  = (function_result_->return_at(current_inst_) != nullptr ||
                          !function_result_->call_stack_at(current_inst_).empty());
 
         if (!has_call) ImGui::BeginDisabled();
-        if (ImGui::Button("Enter")) {
+        if (ImGui::Button("\xe2\x86\xb3 Enter", ImVec2(0, btn_h))) {  // ↳
             auto* evt = function_result_->call_at(current_inst_);
-            if (evt && evt->call_inst_id + 1 < total_inst_) {
+            if (evt && evt->call_inst_id + 1 < total_inst_)
                 navigate_to(evt->call_inst_id + 1);
-            }
         }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Follow call into callee (E)");
-        }
         if (!has_call) ImGui::EndDisabled();
 
         ImGui::SameLine();
 
         if (!has_ret) ImGui::BeginDisabled();
-        if (ImGui::Button("Return")) {
+        if (ImGui::Button("\xe2\x86\xb5 Return", ImVec2(0, btn_h))) {  // ↵
             auto* evt = function_result_->return_at(current_inst_);
             if (evt) {
                 navigate_to(evt->call_inst_id);
@@ -812,107 +1121,230 @@ void GuiApp::render_toolbar() {
                 if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
             }
         }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Follow return to call site (R)");
-        }
         if (!has_ret) ImGui::EndDisabled();
 
         ImGui::SameLine();
-        ImGui::TextDisabled("|");
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::PopStyleColor();
         ImGui::SameLine();
     }
 
-    // ── Taint jump buttons ────────────────────────────────────────────
-    if (show_taint_ && taint_result_) {
-        if (ImGui::Button("[T")) jump_taint_prev();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev tainted inst ([)");
-        ImGui::SameLine();
-        if (ImGui::Button("T]")) jump_taint_next();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next tainted inst (])");
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-    }
-    if (show_backward_taint_ && backward_taint_result_) {
-        if (ImGui::Button("[BT")) jump_backward_taint_prev();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev backward-tainted inst");
-        ImGui::SameLine();
-        if (ImGui::Button("BT]")) jump_backward_taint_next();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next backward-tainted inst");
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
+    // ── GROUP 4: Taint navigation (only when active) ─────────────────
+    bool has_taint_nav = (show_taint_ && taint_result_) ||
+                         (show_backward_taint_ && backward_taint_result_);
+    if (has_taint_nav) {
+        if (show_taint_ && taint_result_) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.28f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.40f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.50f, 0.20f, 1.0f));
+            if (ImGui::Button("\xe2\x97\x81 T", ImVec2(0, btn_h))) jump_taint_prev();  // ◁
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev tainted inst ([)");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.28f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.40f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.50f, 0.20f, 1.0f));
+            if (ImGui::Button("T \xe2\x96\xb7", ImVec2(0, btn_h))) jump_taint_next();  // ▷
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next tainted inst (])");
+            ImGui::SameLine();
+        }
+        if (show_backward_taint_ && backward_taint_result_) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.28f, 0.08f, 0.08f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.12f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::Button("\xe2\x97\x81 BT", ImVec2(0, btn_h))) jump_backward_taint_prev();  // ◁
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev backward-tainted inst");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.28f, 0.08f, 0.08f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.12f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::Button("BT \xe2\x96\xb7", ImVec2(0, btn_h))) jump_backward_taint_next();  // ▷
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next backward-tainted inst");
+            ImGui::SameLine();
+        }
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::PopStyleColor();
         ImGui::SameLine();
     }
 
-    // ── Current instruction display ───────────────────────────────────
+    // ── GROUP 5: Current instruction info ────────────────────────────
     auto row = fetch_row(current_inst_);
-    ImGui::Text("PC: 0x%016llx", (unsigned long long)row.static_pc);
-    ImGui::SameLine();
+    // PC in dimmed monospace style
+    ImGui::TextColored(ImVec4(0.50f, 0.55f, 0.70f, 1.0f),
+        "0x%llx", (unsigned long long)row.static_pc);
+    ImGui::SameLine(0, 8.0f);
+    // Mnemonic colored
     ImGui::TextColored(inst_color(row.mnemonic), "%s", row.mnemonic.c_str());
-    ImGui::SameLine(0, 0);
-    ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.8f, 1.0f), " %s", row.operands.c_str());
+    ImGui::SameLine(0, 4.0f);
+    // Operands lighter
+    ImGui::TextColored(ImVec4(0.78f, 0.78f, 0.84f, 1.0f), "%s", row.operands.c_str());
 
-    ImGui::SameLine();
-    ImGui::TextDisabled("|");
-    ImGui::SameLine();
+    // ── STATUS BADGES (right-aligned) ─────────────────────────────────
+    // Compute total width for the right side to right-align it
+    float win_w = ImGui::GetWindowWidth();
 
-    // ── Analysis status ───────────────────────────────────────────────
-    if (analysis_running_.load()) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Analyzing...");
-    } else if (show_backward_taint_) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "BACK-TAINT");
-    } else if (show_taint_) {
-        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "TAINT");
-    } else if (show_slice_) {
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "SLICE");
-    }
+    // Build status string(s)
+    bool has_status = analysis_running_.load() || show_taint_ || show_backward_taint_ ||
+                      show_slice_ || (show_loops_ && loop_result_);
 
-    if (show_loops_ && loop_result_) {
+    if (has_status) {
+        // estimate approx position
         ImGui::SameLine();
         ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.1f, 1.0f), "LOOPS(%zu)",
-                           loop_result_->loops.size());
+        ImGui::SameLine(0, 8.0f);
+
+        if (analysis_running_.load()) {
+            // Animated spinner character (cycle through ⣾⣽⣻⢿⡿⣟⣯⣷)
+            static const char* spinner[] = {
+                "\xe2\xa3\xbe","\xe2\xa3\xbd","\xe2\xa3\xbb","\xe2\xa2\xbf",
+                "\xe2\xa1\xbf","\xe2\xa3\x9f","\xe2\xa3\xaf","\xe2\xa3\xb7"
+            };
+            static int spin_frame = 0;
+            spin_frame = (spin_frame + 1) % 8;
+            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f),
+                "%s Analyzing...", spinner[spin_frame]);
+        } else {
+            // Show active analysis mode badges
+            bool first_badge = true;
+            auto badge = [&](const char* label, ImVec4 col) {
+                if (!first_badge) ImGui::SameLine(0, 4.0f);
+                first_badge = false;
+                ImGui::PushStyleColor(ImGuiCol_Button, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  col);
+                ImGui::Button(label);
+                ImGui::PopStyleColor(3);
+            };
+            if (show_backward_taint_ && backward_taint_result_)
+                badge("BACK-TAINT", ImVec4(0.55f, 0.10f, 0.10f, 0.90f));
+            else if (show_taint_ && taint_result_)
+                badge("TAINT", ImVec4(0.10f, 0.40f, 0.12f, 0.90f));
+            if (show_slice_ && slice_result_)
+                badge("SLICE", ImVec4(0.40f, 0.10f, 0.42f, 0.90f));
+            if (show_loops_ && loop_result_) {
+                char loop_label[32];
+                snprintf(loop_label, sizeof(loop_label), "\xe2\x86\xba %zu LOOPS",
+                         loop_result_->loops.size());  // ↺
+                badge(loop_label, ImVec4(0.38f, 0.20f, 0.03f, 0.90f));
+            }
+        }
     }
 
-    // ── Compact progress bar ──────────────────────────────────────────
+    // ── Right side: progress ─────────────────────────────────────────
     if (total_inst_ > 0) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        float progress = static_cast<float>(current_inst_) / static_cast<float>(total_inst_);
-        char overlay[32];
-        snprintf(overlay, sizeof(overlay), "%llu / %llu",
-                 (unsigned long long)current_inst_,
+        // Right-align the counter
+        char counter[48];
+        snprintf(counter, sizeof(counter), "%llu / %llu",
+                 (unsigned long long)(current_inst_ + 1),
                  (unsigned long long)total_inst_);
-        ImGui::SetNextItemWidth(200.0f);
-        ImGui::ProgressBar(progress, ImVec2(200.0f, 0.0f), overlay);
+        float counter_w = ImGui::CalcTextSize(counter).x + 8.0f;
+        float bar_w = 160.0f;
+        float right_x = win_w - counter_w - bar_w - 16.0f;
+        if (right_x > ImGui::GetCursorPosX()) {
+            ImGui::SameLine(right_x);
+        } else {
+            ImGui::SameLine();
+        }
+        float progress = static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1);
+        // Colored progress bar: accent blue fill
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,       ImVec4(0.08f, 0.09f, 0.12f, 1.0f));
+        ImGui::SetNextItemWidth(bar_w);
+        ImGui::ProgressBar(progress, ImVec2(bar_w, btn_h), "");
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine(0, 4.0f);
+        ImGui::TextDisabled("%s", counter);
     }
 
     ImGui::End();
+    ImGui::PopStyleColor(1);  // WindowBg
+    ImGui::PopStyleVar(5);    // FramePadding, ItemSpacing, WindowPadding, WindowRounding, WindowBorderSize
 }
 
 // ─── Instruction Panel ──────────────────────────────────────────────────────
+// Redesigned: richer row markers, cleaner column headers, IDA-style current
+// line indicator, search-result navigation strip, and bookmark count badge.
 
 void GuiApp::render_instruction_panel() {
     ImGui::Begin("Instructions");
 
-    // Table: marker | index | address | mnemonic | operands
+    // ── Header strip: search result nav + bookmark count ──────────────
+    if (search_active_ && !search_results_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.15f, 0.12f, 1.0f));
+        ImGui::BeginChild("##search_strip", ImVec2(0, ImGui::GetFrameHeightWithSpacing()), false,
+                          ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
+            "\xE2\x8C\x95  %zu results", search_results_.size());  // ⌕
+        ImGui::SameLine(0, 10.0f);
+        if (ImGui::SmallButton("\xe2\x97\x81##sprev")) {  // ◁
+            if (search_current_ > 0) search_current_--;
+            else search_current_ = search_results_.size() - 1;
+            navigate_to(search_results_[search_current_]);
+        }
+        ImGui::SameLine(0, 2.0f);
+        ImGui::TextDisabled("%zu / %zu", search_current_ + 1, search_results_.size());
+        ImGui::SameLine(0, 2.0f);
+        if (ImGui::SmallButton("\xe2\x96\xb7##snext")) {  // ▷
+            search_current_++;
+            if (search_current_ >= search_results_.size()) search_current_ = 0;
+            navigate_to(search_results_[search_current_]);
+        }
+        ImGui::SameLine(0, 12.0f);
+        if (ImGui::SmallButton("  \xc3\x97  ")) {  // ×
+            search_active_ = false;
+            search_results_.clear();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear search");
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
+
+    if (!bookmarks_.empty()) {
+        // Small right-aligned bookmark count
+        char bm_label[32];
+        snprintf(bm_label, sizeof(bm_label), "\xe2\x98\x86 %zu bookmarks", bookmarks_.size());  // ☆
+        float text_w = ImGui::CalcTextSize(bm_label).x;
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - text_w + ImGui::GetCursorPosX());
+        ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.20f, 0.70f), "%s", bm_label);
+    }
+
+    // ── Instruction table ────────────────────────────────────────────────
+    // Flags: scroll, alternating row bg, inner vertical borders, fixed columns
     const ImGuiTableFlags table_flags =
         ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit |
         ImGuiTableFlags_Resizable | ImGuiTableFlags_NoHostExtendX;
 
-    if (ImGui::BeginTable("InstTable", 5, table_flags)) {
-        ImGui::TableSetupScrollFreeze(0, 1);  // Freeze header row
-        ImGui::TableSetupColumn(" ",        ImGuiTableColumnFlags_WidthFixed, 24.0f);
-        ImGui::TableSetupColumn("#",        ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Address",  ImGuiTableColumnFlags_WidthFixed, 140.0f);
-        ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
+    // Reserve the full remaining height
+    float table_height = ImGui::GetContentRegionAvail().y;
 
-        // Use a clipper for efficient rendering of large instruction lists
+    if (ImGui::BeginTable("InstTable", 5, table_flags, ImVec2(0, table_height))) {
+        ImGui::TableSetupScrollFreeze(0, 1);  // Freeze header row
+        // Col 0: narrow gutter (marker/bookmark/arrow)
+        ImGui::TableSetupColumn(" ",        ImGuiTableColumnFlags_WidthFixed |
+                                            ImGuiTableColumnFlags_NoResize, 22.0f);
+        // Col 1: instruction index — fixed but wide enough for 7-digit numbers
+        ImGui::TableSetupColumn("#",        ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        // Col 2: address — fixed monospace
+        ImGui::TableSetupColumn("Address",  ImGuiTableColumnFlags_WidthFixed, 132.0f);
+        // Col 3: mnemonic — fixed, auto-fitted to longest common mnemonic
+        ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        // Col 4: operands — stretches to fill remaining space
+        ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
+
+        // Custom styled header row (slightly taller, blue-tinted)
+        ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, ImVec4(0.10f, 0.12f, 0.20f, 1.0f));
+        ImGui::TableHeadersRow();
+        ImGui::PopStyleColor();
+
+        // ── Virtual list clipper for performance ─────────────────────────
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(total_inst_));
 
@@ -921,100 +1353,170 @@ void GuiApp::render_instruction_panel() {
                 uint64_t inst_id = static_cast<uint64_t>(i);
                 auto row = fetch_row(inst_id);
 
-                bool is_current = (inst_id == current_inst_);
-                bool is_bookmarked = row.has_bookmark;
-                bool is_tainted = show_taint_ && taint_result_ && taint_result_->has_event_at(inst_id);
-                bool is_sliced = show_slice_ && slice_result_ && slice_result_->is_in_slice(inst_id);
-                bool is_backward_tainted = show_backward_taint_ && backward_taint_result_ &&
-                    backward_taint_result_->is_contributing(inst_id);
+                bool is_current   = (inst_id == current_inst_);
+                bool is_bookmarked= row.has_bookmark;
+                bool is_tainted   = show_taint_ && taint_result_ &&
+                                    taint_result_->has_event_at(inst_id);
+                bool is_sliced    = show_slice_ && slice_result_ &&
+                                    slice_result_->is_in_slice(inst_id);
+                bool is_back_taint= show_backward_taint_ && backward_taint_result_ &&
+                                    backward_taint_result_->is_contributing(inst_id);
+                bool is_search_hit= search_active_ &&
+                                    std::binary_search(search_results_.begin(),
+                                                       search_results_.end(), inst_id);
 
                 // Loop state
-                bool is_loop_header = show_loops_ && loop_result_ && loop_result_->is_loop_header(row.pc);
-                uint32_t loop_depth = (show_loops_ && loop_result_) ? loop_result_->loop_depth_at(row.pc) : 0;
-                bool is_in_loop = loop_depth > 0;
+                bool is_loop_header = show_loops_ && loop_result_ &&
+                                      loop_result_->is_loop_header(row.pc);
+                uint32_t loop_depth = (show_loops_ && loop_result_) ?
+                                      loop_result_->loop_depth_at(row.pc) : 0;
+                bool is_in_loop     = loop_depth > 0;
 
                 ImGui::TableNextRow();
 
-                // Row background highlight (priority: current > analysis > loop header > loop body)
+                // ── Row background priority (high → low) ─────────────────
+                // 1) current instruction: bright blue-white
+                // 2) analysis overlays: taint/slice/backward-taint
+                // 3) loop markers
+                // 4) search hits: subtle gold
                 if (is_current) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.20f, 0.30f, 0.50f, 0.65f)));
-                } else if (is_backward_tainted) {
+                        IM_COL32(30, 70, 145, 175));
+                } else if (is_back_taint) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.40f, 0.10f, 0.10f, 0.45f)));
+                        IM_COL32(110, 22, 22, 115));
                 } else if (is_sliced) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.30f, 0.10f, 0.40f, 0.45f)));
+                        IM_COL32(80, 22, 110, 115));
                 } else if (is_tainted) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.10f, 0.30f, 0.10f, 0.45f)));
-                } else if (is_loop_header) {
-                    // Loop header: vivid orange tint
+                        IM_COL32(20, 80, 28, 115));
+                } else if (is_search_hit) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.55f, 0.25f, 0.02f, 0.80f)));
+                        IM_COL32(90, 75, 10, 120));
+                } else if (is_loop_header) {
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+                        IM_COL32(140, 62, 4, 200));
                 } else if (is_in_loop) {
-                    // Loop body: subtle warm tint, darker with nesting depth
                     float d = std::min(static_cast<float>(loop_depth - 1) * 0.06f, 0.18f);
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        ImGui::GetColorU32(ImVec4(0.28f + d, 0.15f, 0.02f, 0.40f)));
+                        ImGui::GetColorU32(ImVec4(0.26f + d, 0.13f, 0.02f, 0.38f)));
                 }
 
-                // Column 0: Marker (bookmark / current / loop indicator)
+                // ── Column 0: Gutter marker + invisible full-row hit-area ──
+                // Pattern: render gutter text first, then SameLine + Selectable
+                // with SpanAllColumns so it covers the entire row for click/hover
+                // detection without shifting any column layout.
                 ImGui::TableNextColumn();
-                if (is_bookmarked && is_current)
-                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "*>");
-                else if (is_bookmarked)
-                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "* ");
-                else if (is_current)
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), " >");
-                else if (is_loop_header)
-                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), "\xE2\x87\x86 "); // ⇆ loop-head marker
-                else if (is_in_loop)
-                    ImGui::TextColored(ImVec4(0.75f, 0.45f, 0.1f, 0.8f), "\xE2\x86\xBA "); // ↺ loop body
-                else
+                if (is_current && is_bookmarked) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), "\xe2\x98\x85\xe2\x96\xb6");  // ★▶
+                } else if (is_current) {
+                    ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), " \xe2\x96\xb6");  // ▶
+                } else if (is_bookmarked) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), "\xe2\x98\x85 ");  // ★
+                } else if (is_loop_header) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), "\xe2\x87\x86 ");   // ⇆
+                } else if (is_in_loop) {
+                    ImGui::TextColored(ImVec4(0.72f, 0.43f, 0.1f, 0.75f), "\xe2\x86\xba ");  // ↺
+                } else {
                     ImGui::TextDisabled("  ");
+                }
+                // Overlay: transparent full-row Selectable for click & hover
+                ImGui::SameLine(0, 0);
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX()
+                                     - ImGui::GetItemRectSize().x
+                                     - ImGui::GetStyle().ItemSpacing.x);
+                {
+                    char sel_id[32];
+                    snprintf(sel_id, sizeof(sel_id), "##irow%llu", (unsigned long long)inst_id);
+                    // Push transparent colors so Selectable is invisible
+                    ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0,0,0,0));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1,1,1,0.06f));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(1,1,1,0.10f));
+                    ImGui::Selectable(sel_id, false,
+                        ImGuiSelectableFlags_SpanAllColumns |
+                        ImGuiSelectableFlags_AllowOverlap,
+                        ImVec2(0, ImGui::GetTextLineHeight()));
+                    ImGui::PopStyleColor(3);
 
-                // Column 1: Instruction index
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                        navigate_to(inst_id);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        std::string tip;
+                        tip += fmt::format("inst #{}\n", inst_id);
+                        tip += fmt::format("addr: 0x{:016x}\n", row.static_pc);
+                        tip += fmt::format("{} {}", row.mnemonic, row.operands);
+                        if (row.mem_access_count > 0) {
+                            tip += fmt::format("\n{} memory access(es)", row.mem_access_count);
+                        }
+                        tip += "\nRight-click for more options";
+                        ImGui::SetTooltip("%s", tip.c_str());
+                    }
+
+                    // Right-click context menu: BeginPopupContextItem is the
+                    // most reliable ImGui API - it both opens and renders the popup.
+                    if (ImGui::BeginPopupContextItem(nullptr)) {
+                        // Capture context on first open
+                        ctx_inst_id_        = inst_id;
+                        ctx_inst_pc_        = row.pc;
+                        ctx_inst_static_pc_ = row.static_pc;
+                        ctx_inst_disasm_    = fmt::format("{} {}", row.mnemonic, row.operands);
+                        // Delegate rendering to the shared function
+                        render_inst_context_menu_contents();
+                        ImGui::EndPopup();
+                    }
+                }
+
+                // ── Column 1: Instruction index ───────────────────────────
                 ImGui::TableNextColumn();
-                ImGui::TextDisabled("%llu", (unsigned long long)inst_id);
+                if (is_current) {
+                    ImGui::TextColored(ImVec4(0.7f, 0.82f, 1.0f, 1.0f),
+                        "%llu", (unsigned long long)inst_id);
+                } else {
+                    ImGui::TextDisabled("%llu", (unsigned long long)inst_id);
+                }
 
-                // Column 2: Address (gray)
+                // ── Column 2: Address ─────────────────────────────────────
                 ImGui::TableNextColumn();
-                ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.65f, 1.0f), "%016llx",
-                    (unsigned long long)row.static_pc);
+                if (is_current) {
+                    ImGui::TextColored(ImVec4(0.65f, 0.72f, 0.95f, 1.0f),
+                        "%016llx", (unsigned long long)row.static_pc);
+                } else {
+                    ImGui::TextColored(ImVec4(0.50f, 0.52f, 0.65f, 1.0f),
+                        "%016llx", (unsigned long long)row.static_pc);
+                }
 
-                // Column 3: Mnemonic (syntax-colored)
+                // ── Column 3: Mnemonic (syntax-colored) ───────────────────
                 ImGui::TableNextColumn();
                 ImVec4 mnem_color = inst_color(row.mnemonic);
                 ImGui::TextColored(mnem_color, "%s", row.mnemonic.c_str());
 
-                // Column 4: Operands (light color, highlight registers/immediates)
+                // ── Column 4: Operands (tokenized highlighting) ───────────
                 ImGui::TableNextColumn();
                 render_operands_highlighted(row.operands);
 
-                // Handle click on entire row via invisible button overlay
-                ImGui::SameLine(0, 0);
-                char sel_id[32];
-                snprintf(sel_id, sizeof(sel_id), "##inst%llu", (unsigned long long)inst_id);
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() - ImGui::GetContentRegionAvail().x);
-                if (ImGui::InvisibleButton(sel_id, ImVec2(-FLT_MIN, ImGui::GetTextLineHeight()))) {
-                    navigate_to(inst_id);
-                }
             }
         }
         clipper.End();
 
-        // Auto-scroll to keep current instruction visible
-        if (current_inst_ < total_inst_) {
-            float item_height = ImGui::GetTextLineHeightWithSpacing();
-            float target_scroll = static_cast<float>(current_inst_) * item_height -
-                                  ImGui::GetWindowHeight() * 0.5f;
-            if (target_scroll < 0.0f) target_scroll = 0.0f;
-            ImGui::SetScrollY(target_scroll);
+        // ── Auto-scroll: keep current instruction centered ────────────
+        // Only scroll if the current instruction changed this frame
+        static uint64_t last_scrolled_inst = UINT64_MAX;
+        if (current_inst_ != last_scrolled_inst && current_inst_ < total_inst_) {
+            last_scrolled_inst = current_inst_;
+            float item_h    = ImGui::GetTextLineHeightWithSpacing();
+            float panel_h   = ImGui::GetWindowHeight();
+            float target_y  = static_cast<float>(current_inst_) * item_h - panel_h * 0.45f;
+            if (target_y < 0.0f) target_y = 0.0f;
+            ImGui::SetScrollY(target_y);
         }
 
         ImGui::EndTable();
     }
+
+    // Render instruction context menu (must be called before End())
+    render_inst_context_menu();
 
     ImGui::End();
 }
@@ -1029,7 +1531,14 @@ void GuiApp::render_register_panel() {
 
     const auto& state = regfile_.state_before(current_inst_);
 
-    // Determine read/written registers
+    // Get previous state for delta highlighting
+    const bool has_prev = (current_inst_ > 0);
+    RegState prev_state{};
+    if (has_prev) {
+        prev_state = regfile_.state_before(current_inst_ - 1);
+    }
+
+    // Determine read/written registers for current instruction
     std::vector<uint8_t> read_regs, write_regs;
     {
         uint64_t offset = index_.offset_of(current_inst_, reader_);
@@ -1055,78 +1564,268 @@ void GuiApp::render_register_panel() {
         return false;
     };
 
-    auto get_reg_color = [&](uint8_t idx) -> ImVec4 {
+    enum class RegHighlight { Normal, Read, Write, ReadWrite };
+    auto get_reg_state = [&](uint8_t idx) -> RegHighlight {
         bool r = is_in(read_regs, idx);
         bool w = is_in(write_regs, idx);
-        if (r && w) return reg_color_both();
-        if (w) return reg_color_write();
-        if (r) return reg_color_read();
-        return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        if (r && w) return RegHighlight::ReadWrite;
+        if (w)      return RegHighlight::Write;
+        if (r)      return RegHighlight::Read;
+        return RegHighlight::Normal;
     };
 
-    // Legend
-    ImGui::TextColored(reg_color_read(), "R");
-    ImGui::SameLine();
-    ImGui::TextDisabled("/");
-    ImGui::SameLine();
-    ImGui::TextColored(reg_color_write(), "W");
-    ImGui::SameLine();
-    ImGui::TextDisabled("/");
-    ImGui::SameLine();
-    ImGui::TextColored(reg_color_both(), "RW");
-    ImGui::Separator();
-
-    // Helper: render a register row with right-click context menu
-    auto render_reg_row = [&](uint8_t idx, const char* name, uint64_t value) {
-        ImGui::PushStyleColor(ImGuiCol_Text, get_reg_color(idx));
-        char label[64];
-        snprintf(label, sizeof(label), "%s=0x%016llx##regrow%u",
-                 name, (unsigned long long)value, idx);
-        ImGui::Selectable(label, false, ImGuiSelectableFlags_AllowOverlap);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Right-click for options");
+    auto state_to_color = [](RegHighlight s) -> ImVec4 {
+        switch (s) {
+            case RegHighlight::Read:      return reg_color_read();
+            case RegHighlight::Write:     return reg_color_write();
+            case RegHighlight::ReadWrite: return reg_color_both();
+            default:                      return ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+    };
+
+    // ── Compact header: legend + instruction count ──────────────────
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 2));
+
+    // Colored legend dots
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    auto draw_dot = [&](ImVec4 col) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        p.x += 5.0f; p.y += ImGui::GetTextLineHeight() * 0.5f - 3.0f;
+        draw->AddCircleFilled(p, 4.0f, ImGui::ColorConvertFloat4ToU32(col));
+        ImGui::Dummy(ImVec2(12, ImGui::GetTextLineHeight()));
+    };
+
+    draw_dot(reg_color_read());
+    ImGui::SameLine(0, 2);
+    ImGui::TextDisabled("R");
+    ImGui::SameLine(0, 8);
+    draw_dot(reg_color_write());
+    ImGui::SameLine(0, 2);
+    ImGui::TextDisabled("W");
+    ImGui::SameLine(0, 8);
+    draw_dot(reg_color_both());
+    ImGui::SameLine(0, 2);
+    ImGui::TextDisabled("RW");
+    ImGui::SameLine();
+    ImGui::TextDisabled("  |  inst #%llu", (unsigned long long)current_inst_);
+
+    ImGui::PopStyleVar();
+
+    // Thin separator with slightly different shade
+    ImVec2 sep_p0 = ImGui::GetCursorScreenPos();
+    sep_p0.y += 2.0f;
+    draw->AddLine(sep_p0, ImVec2(sep_p0.x + ImGui::GetContentRegionAvail().x, sep_p0.y),
+                  IM_COL32(70, 78, 110, 200), 1.0f);
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // ── Render a register cell (name col + value col) ──────────────
+    // Returns true if right-clicked
+    auto render_reg_cell = [&](uint8_t idx, const char* name, uint64_t value,
+                                uint64_t prev_value, bool changed_vs_prev) -> bool {
+        RegHighlight rs  = get_reg_state(idx);
+        ImVec4 color = state_to_color(rs);
+
+        // Background tint for written registers
+        ImVec2 cell_pos = ImGui::GetCursorScreenPos();
+        float cell_w = ImGui::GetContentRegionAvail().x;
+        float cell_h = ImGui::GetTextLineHeightWithSpacing();
+
+        if (rs == RegHighlight::Write || rs == RegHighlight::ReadWrite) {
+            // Strong highlight for written registers
+            ImU32 bg = (rs == RegHighlight::ReadWrite)
+                ? IM_COL32(80, 60, 20, 80)
+                : IM_COL32(20, 70, 50, 80);
+            draw->AddRectFilled(cell_pos, ImVec2(cell_pos.x + cell_w, cell_pos.y + cell_h - 1), bg);
+        } else if (changed_vs_prev) {
+            // Subtle change indicator (compared to previous instruction)
+            draw->AddRectFilled(cell_pos, ImVec2(cell_pos.x + cell_w, cell_pos.y + cell_h - 1),
+                                IM_COL32(40, 40, 70, 60));
+        }
+
+        // State indicator bar on the left edge
+        if (rs != RegHighlight::Normal) {
+            ImU32 bar_col = ImGui::ColorConvertFloat4ToU32(color);
+            bar_col = (bar_col & 0x00FFFFFF) | 0xCC000000; // 80% alpha
+            draw->AddRectFilled(cell_pos, ImVec2(cell_pos.x + 2.5f, cell_pos.y + cell_h - 1), bar_col);
+        }
+
+        // Name (fixed-width, dimmed)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.62f, 0.80f, 1.0f));
+        ImGui::SetNextItemWidth(32.0f);
+        ImGui::Text("%-4s", name);
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 4);
+
+        // Value (colored by state)
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        char val_str[24];
+        snprintf(val_str, sizeof(val_str), "%016llx", (unsigned long long)value);
+
+        char sel_id[32];
+        snprintf(sel_id, sizeof(sel_id), "##reg%u", idx);
+        ImGui::Selectable((std::string(val_str) + sel_id).c_str(),
+                          false, ImGuiSelectableFlags_AllowOverlap, ImVec2(0, 0));
+        ImGui::PopStyleColor();
+
+        // Tooltip
+        if (ImGui::IsItemHovered()) {
+            if (changed_vs_prev || rs != RegHighlight::Normal) {
+                char tip[128];
+                if (changed_vs_prev && has_prev) {
+                    int64_t delta = (int64_t)(value - prev_value);
+                    snprintf(tip, sizeof(tip),
+                             "%s = 0x%016llx\n\u0394 = %+lld (0x%llx)\nRight-click for options",
+                             name, (unsigned long long)value,
+                             (long long)delta, (unsigned long long)(value - prev_value));
+                } else {
+                    snprintf(tip, sizeof(tip),
+                             "%s = 0x%016llx\nRight-click for options", name, (unsigned long long)value);
+                }
+                ImGui::SetTooltip("%s", tip);
+            }
+        }
+        // BeginPopupContextItem is the most reliable right-click menu API.
+        // It checks IsItemHovered internally on mouse release.
+        bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        if (ImGui::BeginPopupContextItem(nullptr)) {
             ctx_reg_idx_   = idx;
             ctx_reg_value_ = value;
-            show_reg_ctx_menu_ = true;
+            // ── Register context menu contents ────────────────────────
+            std::string rname;
+            if (idx <= 28) rname = fmt::format("x{}", idx);
+            else if (idx == 29) rname = "fp";
+            else if (idx == 30) rname = "lr";
+            else if (idx == 31) rname = "sp";
+            else rname = fmt::format("reg{}", idx);
+            ImGui::TextDisabled("%s = 0x%016llx", rname.c_str(), (unsigned long long)value);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Open Value in Hex Dump")) {
+                open_hex_dump_at(value);
+            }
+            if (ImGui::MenuItem("Copy Value")) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)value);
+                ImGui::SetClipboardText(buf);
+            }
+            if (idx == 30 && function_result_) {
+                ImGui::Separator();
+                if (ImGui::MenuItem("Follow LR (jump to call site)")) {
+                    auto stack = function_result_->call_stack_at(current_inst_);
+                    if (!stack.empty()) navigate_to(stack.back()->call_inst_id);
+                }
+            }
+            if ((idx == 29 || idx == 31) && function_result_) {
+                ImGui::Separator();
+                ImGui::TextDisabled("(stack pointer/frame pointer)");
+            }
+            ImGui::EndPopup();
         }
+        return right_clicked;
     };
 
-    // GPR x0-x28 (two columns)
-    if (ImGui::BeginTable("GPR", 2, ImGuiTableFlags_SizingFixedFit)) {
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(4, 1));
+
+    // ── GPR table: 2 columns, x0-x28 ──────────────────────────────
+    const float col_w = (ImGui::GetContentRegionAvail().x - 8.0f) * 0.5f;
+    ImGuiTableFlags tbl_flags = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX;
+    if (ImGui::BeginTable("GPR", 2, tbl_flags)) {
+        ImGui::TableSetupColumn("Col0", ImGuiTableColumnFlags_WidthFixed, col_w);
+        ImGui::TableSetupColumn("Col1", ImGuiTableColumnFlags_WidthFixed, col_w);
+
         for (int i = 0; i < 29; i += 2) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            render_reg_row(static_cast<uint8_t>(i),
-                reg_name(static_cast<uint8_t>(i)).c_str(), state.gpr[i]);
+            {
+                uint8_t ri = static_cast<uint8_t>(i);
+                bool changed = has_prev && (state.gpr[i] != prev_state.gpr[i]);
+                if (render_reg_cell(ri, reg_name(ri).c_str(), state.gpr[i],
+                                    has_prev ? prev_state.gpr[i] : 0, changed)) {
+                    ctx_reg_idx_   = ri;
+                    ctx_reg_value_ = state.gpr[i];
+                }
+            }
             ImGui::TableNextColumn();
             if (i + 1 < 29) {
-                render_reg_row(static_cast<uint8_t>(i + 1),
-                    reg_name(static_cast<uint8_t>(i + 1)).c_str(), state.gpr[i + 1]);
+                uint8_t ri = static_cast<uint8_t>(i + 1);
+                bool changed = has_prev && (state.gpr[i+1] != prev_state.gpr[i+1]);
+                if (render_reg_cell(ri, reg_name(ri).c_str(), state.gpr[i+1],
+                                    has_prev ? prev_state.gpr[i+1] : 0, changed)) {
+                    ctx_reg_idx_   = ri;
+                    ctx_reg_value_ = state.gpr[i+1];
+                }
             }
         }
         ImGui::EndTable();
     }
 
-    ImGui::Separator();
+    // ── Special registers ──────────────────────────────────────────
+    // Thin divider
+    ImVec2 sp_p0 = ImGui::GetCursorScreenPos();
+    draw->AddLine(sp_p0, ImVec2(sp_p0.x + ImGui::GetContentRegionAvail().x, sp_p0.y),
+                  IM_COL32(50, 55, 80, 180), 1.0f);
+    ImGui::Dummy(ImVec2(0, 3));
 
-    // Special registers
-    render_reg_row(IDX_FP, " fp", state.fp());
-    render_reg_row(IDX_LR, " lr", state.lr());
-    render_reg_row(IDX_SP, " sp", state.sp());
-    render_reg_row(IDX_PC, " pc", state.pc());
-    ImGui::TextColored(get_reg_color(IDX_NZCV), "nzcv=%x", state.nzcv());
+    struct SpecReg { uint8_t idx; const char* name; uint64_t value; uint64_t prev; };
+    SpecReg spec_regs[] = {
+        { IDX_FP,   "fp",   state.fp(),   has_prev ? prev_state.fp()   : 0 },
+        { IDX_LR,   "lr",   state.lr(),   has_prev ? prev_state.lr()   : 0 },
+        { IDX_SP,   "sp",   state.sp(),   has_prev ? prev_state.sp()   : 0 },
+        { IDX_PC,   "pc",   state.pc(),   has_prev ? prev_state.pc()   : 0 },
+    };
+
+    if (ImGui::BeginTable("SpecRegs", 2, tbl_flags)) {
+        ImGui::TableSetupColumn("Col0", ImGuiTableColumnFlags_WidthFixed, col_w);
+        ImGui::TableSetupColumn("Col1", ImGuiTableColumnFlags_WidthFixed, col_w);
+        for (int si = 0; si < 4; si += 2) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            bool changed = has_prev && (spec_regs[si].value != spec_regs[si].prev);
+            if (render_reg_cell(spec_regs[si].idx, spec_regs[si].name,
+                                spec_regs[si].value, spec_regs[si].prev, changed)) {
+                ctx_reg_idx_   = spec_regs[si].idx;
+                ctx_reg_value_ = spec_regs[si].value;
+            }
+            ImGui::TableNextColumn();
+            if (si + 1 < 4) {
+                bool ch2 = has_prev && (spec_regs[si+1].value != spec_regs[si+1].prev);
+                if (render_reg_cell(spec_regs[si+1].idx, spec_regs[si+1].name,
+                                    spec_regs[si+1].value, spec_regs[si+1].prev, ch2)) {
+                    ctx_reg_idx_   = spec_regs[si+1].idx;
+                    ctx_reg_value_ = spec_regs[si+1].value;
+                }
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    // NZCV flags — special display with individual flag bits
+    {
+        uint32_t nzcv = state.nzcv();
+        bool nzcv_changed = has_prev && (nzcv != prev_state.nzcv());
+        ImVec4 nzcv_col = get_reg_state(IDX_NZCV) != RegHighlight::Normal
+            ? state_to_color(get_reg_state(IDX_NZCV))
+            : (nzcv_changed ? ImVec4(0.85f, 0.75f, 0.40f, 1.0f) : ImVec4(0.55f, 0.62f, 0.80f, 1.0f));
+        // Bit labels: N Z C V (bits 31,30,29,28 of NZCV)
+        bool N = (nzcv >> 31) & 1, Z = (nzcv >> 30) & 1;
+        bool C = (nzcv >> 29) & 1, V = (nzcv >> 28) & 1;
+        ImGui::TextColored(ImVec4(0.55f, 0.62f, 0.80f, 1.0f), "nzcv");
+        ImGui::SameLine(0, 4);
+        auto flag_label = [&](bool set, const char* name) {
+            if (set)
+                ImGui::TextColored(nzcv_col, "%s", name);
+            else
+                ImGui::TextDisabled("%s", name);
+            ImGui::SameLine(0, 3);
+        };
+        flag_label(N, "N"); flag_label(Z, "Z"); flag_label(C, "C"); flag_label(V, "V");
+        ImGui::TextDisabled("(0x%x)", nzcv);
+    }
+
+    ImGui::PopStyleVar(2);
 
     // Render register context menu
     render_reg_context_menu();
-
-    // Cache stats
-    ImGui::Separator();
-    auto stats = regfile_.cache_stats();
-    ImGui::TextDisabled("Cache: %llu hits / %llu misses",
-        (unsigned long long)stats.hits, (unsigned long long)stats.misses);
 
     ImGui::End();
 }
@@ -1192,14 +1891,30 @@ void GuiApp::render_memory_panel() {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Double-click: open in Hex Dump\nRight-click: context menu");
             if (ImGui::IsMouseDoubleClicked(0)) {
-                // Double click → open hex dump at this address
                 open_hex_dump_at(mem.addr);
             }
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            ctx_mem_addr_ = mem.addr;
+        if (ImGui::BeginPopupContextItem(nullptr)) {
+            ctx_mem_addr_    = mem.addr;
             ctx_mem_inst_id_ = current_inst_;
-            show_mem_ctx_menu_ = true;
+            ImGui::TextDisabled("addr: 0x%016llx", (unsigned long long)mem.addr);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Open in Hex Dump")) {
+                open_hex_dump_at(mem.addr);
+            }
+            if (ImGui::MenuItem("Copy Address")) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)mem.addr);
+                ImGui::SetClipboardText(buf);
+            }
+            if (mem.size <= 8) {
+                if (ImGui::MenuItem("Copy Value")) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)mem.value);
+                    ImGui::SetClipboardText(buf);
+                }
+            }
+            ImGui::EndPopup();
         }
         ImGui::PopStyleColor();
 
@@ -1343,11 +2058,10 @@ void GuiApp::render_callstack_panel() {
                     (unsigned long long)evt->call_inst_id,
                     (unsigned long long)static_target);
             }
-            // Right-click context menu
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                 ctx_callstack_frame_ = i;
-                show_callstack_ctx_menu_ = true;
             }
+            ImGui::OpenPopupOnItemClick("##cs_ctx", ImGuiPopupFlags_MouseButtonRight);
         }
     }
 
@@ -1409,48 +2123,271 @@ void GuiApp::render_analysis_panel() {
         return;
     }
 
-    // Status
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    float panel_w = ImGui::GetContentRegionAvail().x;
+
+    // ── Status banner ───────────────────────────────────────────────
     if (analysis_running_.load()) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Running...");
+        // Animated busy indicator — full-width colored banner
+        static const char* spinner[] = {
+            "\xe2\xa3\xbe","\xe2\xa3\xbd","\xe2\xa3\xbb","\xe2\xa2\xbf",
+            "\xe2\xa1\xbf","\xe2\xa3\x9f","\xe2\xa3\xaf","\xe2\xa3\xb7"
+        };
+        static int spin_frame = 0;
+        spin_frame = (spin_frame + 1) % 8;
+
+        ImVec2 banner_p0 = ImGui::GetCursorScreenPos();
+        float banner_h = ImGui::GetFrameHeightWithSpacing();
+        draw->AddRectFilled(banner_p0,
+            ImVec2(banner_p0.x + panel_w, banner_p0.y + banner_h),
+            IM_COL32(140, 110, 0, 80));
+
+        ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f),
+            " %s  Running...", spinner[spin_frame]);
+
         std::lock_guard<std::mutex> lock(analysis_mutex_);
         if (!analysis_status_.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", analysis_status_.c_str());
         }
     } else {
-        ImGui::TextDisabled("Idle");
+        // Idle or active analysis indicator
+        bool any_active = show_taint_ || show_slice_ || show_backward_taint_
+                       || (show_loops_ && loop_result_)
+                       || function_result_ || string_result_;
+        if (any_active) {
+            ImVec2 b0 = ImGui::GetCursorScreenPos();
+            float bh = ImGui::GetFrameHeightWithSpacing();
+            draw->AddRectFilled(b0, ImVec2(b0.x + panel_w, b0.y + bh),
+                                IM_COL32(20, 80, 30, 60));
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f), " \xe2\x9c\x93  Analysis active");
+        } else {
+            ImGui::TextDisabled(" \xe2\x80\x94  Idle (no analysis loaded)");
+        }
     }
 
-    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 3));
 
-    // Results summary
-    if (show_taint_ && taint_result_) {
-        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Taint:");
+    // ── Section helper ──────────────────────────────────────────────
+    auto section_header = [&](const char* title, ImVec4 color) {
+        ImVec2 hp = ImGui::GetCursorScreenPos();
+        draw->AddRectFilled(hp, ImVec2(hp.x + panel_w, hp.y + ImGui::GetFrameHeight()),
+                            ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(color.x*0.4f, color.y*0.4f, color.z*0.4f, 0.55f)));
+        draw->AddRectFilled(hp, ImVec2(hp.x + 3.0f, hp.y + ImGui::GetFrameHeight()),
+                            ImGui::ColorConvertFloat4ToU32(color));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f);
+        ImGui::TextColored(color, "%s", title);
+    };
+
+    // ── GROUP 1: Taint analysis ─────────────────────────────────────
+    section_header("  Taint Analysis", ImVec4(0.20f, 0.82f, 0.35f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 3));
+
+    // Forward taint
+    {
+        bool active = show_taint_ && taint_result_;
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.35f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.45f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.12f, 0.55f, 0.18f, 1.0f));
+        }
+        if (ImGui::Button("Run Taint##fwd")) {
+            run_taint_analysis();
+        }
+        if (active) ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Forward taint from selected register\nAnalysis > Taint to choose source");
         ImGui::SameLine();
-        ImGui::Text("%llu instructions tainted",
-            (unsigned long long)taint_result_->tainted_inst_count());
-    }
-    if (show_slice_ && slice_result_) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 1.0f, 1.0f), "Slice:");
-        ImGui::SameLine();
-        ImGui::Text("active");
-    }
-    if (show_backward_taint_ && backward_taint_result_) {
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Backward Taint:");
-        ImGui::SameLine();
-        ImGui::Text("active");
-    }
-    if (function_result_) {
-        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Functions:");
-        ImGui::SameLine();
-        ImGui::Text("%zu discovered", function_result_->functions.size());
+        if (active) {
+            ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f), "\xe2\x9c\x93");
+            ImGui::SameLine(0, 4);
+            ImGui::Text("%llu tainted", (unsigned long long)taint_result_->tainted_inst_count());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##clrtaint")) {
+                show_taint_ = false;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear taint overlay");
+        } else {
+            ImGui::TextDisabled("(not active)");
+        }
     }
 
-    ImGui::Separator();
-    if (ImGui::Button("Clear All")) {
+    // Backward taint
+    {
+        bool active = show_backward_taint_ && backward_taint_result_;
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f, 0.08f, 0.08f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.10f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
+        }
+        if (ImGui::Button("Run BackTaint")) {
+            run_backward_taint_analysis();
+        }
+        if (active) ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Backward taint from current instruction");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "\xe2\x9c\x93 active");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##clrbt")) {
+                show_backward_taint_ = false;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear backward-taint overlay");
+        } else {
+            ImGui::TextDisabled("(not active)");
+        }
+    }
+
+    // Slice
+    {
+        bool active = show_slice_ && slice_result_;
+        if (ImGui::Button("Run Slice##slc")) {
+            run_slice_analysis();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Program slice for current instruction");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(0.80f, 0.25f, 0.80f, 1.0f), "\xe2\x9c\x93 active");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##clrslc")) { show_slice_ = false; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear slice overlay");
+        } else {
+            ImGui::TextDisabled("(not active)");
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // ── GROUP 2: Code Structure ─────────────────────────────────────
+    section_header("  Code Structure", ImVec4(0.35f, 0.62f, 1.0f, 1.0f));
+
+    // Functions
+    {
+        bool active = (function_result_ != nullptr);
+        if (ImGui::Button("Run Functions##fn")) {
+            run_function_analysis();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Discover call/return pairs, build function list");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
+                "\xe2\x9c\x93 %zu functions", function_result_->functions.size());
+        } else {
+            ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    // Loops
+    {
+        bool active = show_loops_ && loop_result_;
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f, 0.18f, 0.02f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.25f, 0.03f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.30f, 0.04f, 1.0f));
+        }
+        if (ImGui::Button("Run Loops##lp")) {
+            run_loop_analysis();
+        }
+        if (active) ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Detect loops (back-edges in CFG)");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.12f, 1.0f),
+                "\xe2\x9c\x93 %zu loops", loop_result_->loops.size());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##clrlp")) { show_loops_ = false; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear loop overlay");
+        } else {
+            ImGui::TextDisabled("(not active)");
+        }
+    }
+
+    // XRef
+    {
+        bool active = (xref_result_ != nullptr);
+        if (ImGui::Button("Run XRef##xref")) {
+            run_xref_analysis();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Build cross-reference index (PC → inst_ids)");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(0.65f, 0.75f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
+        } else {
+            ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    // CFG
+    {
+        bool active = (cfg_result_ != nullptr);
+        if (ImGui::Button("Run CFG##cfg")) {
+            run_cfg_layout();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Compute control-flow graph + layout for CFG view");
+        ImGui::SameLine();
+        if (active) {
+            ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
+        } else {
+            ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // ── GROUP 3: String & Call Graph ───────────────────────────────
+    section_header("  Strings / Calls", ImVec4(0.75f, 0.55f, 1.0f, 1.0f));
+
+    {
+        bool has_str = (string_result_ != nullptr);
+        if (ImGui::Button("Run Strings##str")) {
+            run_string_analysis();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Find string accesses in the trace");
+        ImGui::SameLine();
+        if (has_str) {
+            ImGui::TextColored(ImVec4(0.78f, 0.62f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
+        } else {
+            ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    {
+        bool has_cg = (call_graph_result_ != nullptr);
+        if (ImGui::Button("Run CallGraph##cg")) {
+            run_call_graph_analysis();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Build call graph across functions");
+        ImGui::SameLine();
+        if (has_cg) {
+            ImGui::TextColored(ImVec4(0.78f, 0.62f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
+        } else {
+            ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 6));
+
+    // ── Clear All ───────────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.10f, 0.10f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.15f, 0.15f, 1.0f));
+    if (ImGui::Button("  \xe2\x9c\x95  Clear All  ")) {  // ✕
         clear_analysis();
     }
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Clear all analysis results and overlays");
 
+    ImGui::PopStyleVar();  // ItemSpacing
     ImGui::End();
 }
 
@@ -1625,42 +2562,323 @@ void GuiApp::render_hex_dump_panel() {
 
 // ─── Popups ─────────────────────────────────────────────────────────────────
 
+// ─── Goto helpers ────────────────────────────────────────────────────────────
+
+/// Rebuild the autocomplete candidate list from the function result.
+/// Sorted by call count descending (most used functions first).
+void GuiApp::rebuild_goto_candidates() {
+    goto_candidates_.clear();
+    if (!function_result_) return;
+
+    // Build candidates from function map
+    for (const auto& [pc, info] : function_result_->functions) {
+        // Find the first inst_id for this function entry
+        uint64_t inst_id = 0;
+        bool found = false;
+        // Look up the first call event that enters this function
+        for (const auto& idx : info.call_event_indices) {
+            if (idx < function_result_->call_events.size()) {
+                const auto& evt = function_result_->call_events[idx];
+                if (!found || evt.call_inst_id + 1 < inst_id) {
+                    inst_id = evt.call_inst_id + 1;
+                    found = true;
+                }
+            }
+        }
+        if (!found) inst_id = 0; // fallback
+
+        // Format display: "func_name (0x1234abcd)"
+        char disp[192];
+        snprintf(disp, sizeof(disp), "%s  (0x%llx)",
+                 info.name.c_str(), (unsigned long long)pc);
+
+        goto_candidates_.push_back({disp, info.name, pc, inst_id});
+    }
+
+    // Sort by call count descending (most frequently called first)
+    std::sort(goto_candidates_.begin(), goto_candidates_.end(),
+              [&](const GotoCandidate& a, const GotoCandidate& b) {
+                  auto it_a = function_result_->functions.find(a.pc);
+                  auto it_b = function_result_->functions.find(b.pc);
+                  uint64_t ca = (it_a != function_result_->functions.end()) ? it_a->second.total_calls : 0;
+                  uint64_t cb = (it_b != function_result_->functions.end()) ? it_b->second.total_calls : 0;
+                  if (ca != cb) return ca > cb;
+                  return a.name < b.name;
+              });
+
+    goto_candidates_dirty_ = false;
+}
+
+/// Parse the input string and navigate:
+///   - "0x..." → treat as runtime address, find first xref
+///   - pure digits → treat as instruction ID
+///   - otherwise → search function names
+void GuiApp::goto_commit(const char* buf) {
+    if (!buf || buf[0] == '\0') return;
+
+    std::string s(buf);
+
+    // Trim whitespace
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.pop_back();
+    if (s.empty()) return;
+
+    // 1. Hex address? starts with "0x" or "0X"
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        try {
+            uint64_t addr = std::stoull(s.substr(2), nullptr, 16);
+            // Try xref lookup first (PC → inst_id)
+            if (xref_result_) {
+                auto ids = xref_result_->inst_ids_at(addr);
+                if (!ids.empty()) {
+                    navigate_to(ids[0]);
+                    return;
+                }
+            }
+            // Fall back: treat as instruction count / address raw
+            // Try decoding address as a static PC (add slide if known)
+            // We don't know the slide here, so just warn with a candidate search
+            // If the xref has slide info we could subtract; for now skip.
+        } catch (...) {}
+        return;
+    }
+
+    // 2. Pure numeric? → instruction ID
+    bool all_digits = !s.empty();
+    for (char c : s) {
+        if (c < '0' || c > '9') { all_digits = false; break; }
+    }
+    if (all_digits) {
+        try {
+            uint64_t target = std::stoull(s);
+            if (target < total_inst_) navigate_to(target);
+        } catch (...) {}
+        return;
+    }
+
+    // 3. Function name lookup (exact match, then prefix/contains)
+    if (!goto_candidates_.empty()) {
+        // Lowercase query for case-insensitive matching
+        std::string query = s;
+        std::transform(query.begin(), query.end(), query.begin(), ::tolower);
+
+        // Exact match first
+        for (const auto& c : goto_candidates_) {
+            std::string lower = c.name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (lower == query) {
+                navigate_to(c.inst_id);
+                return;
+            }
+        }
+        // Prefix match
+        for (const auto& c : goto_candidates_) {
+            std::string lower = c.name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (lower.compare(0, query.size(), query) == 0) {
+                navigate_to(c.inst_id);
+                return;
+            }
+        }
+        // Contains match
+        for (const auto& c : goto_candidates_) {
+            std::string lower = c.name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (lower.find(query) != std::string::npos) {
+                navigate_to(c.inst_id);
+                return;
+            }
+        }
+    }
+}
+
 void GuiApp::render_goto_popup() {
     if (!show_goto_popup_) return;
 
-    ImGui::OpenPopup("Goto Instruction");
+    // Rebuild candidates if function result is available and dirty
+    if (goto_candidates_dirty_ && function_result_) {
+        rebuild_goto_candidates();
+    }
+
+    // Widen the popup when we have function candidates to show
+    bool has_candidates = !goto_candidates_.empty();
+    if (has_candidates) {
+        ImGui::SetNextWindowSize(ImVec2(480.0f, 0.0f), ImGuiCond_Appearing);
+    }
+
+    ImGui::OpenPopup("Go to...");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
-    if (ImGui::BeginPopupModal("Goto Instruction", &show_goto_popup_,
+    if (ImGui::BeginPopupModal("Go to...", &show_goto_popup_,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Enter instruction ID (0 - %llu):",
-                    (unsigned long long)(total_inst_ > 0 ? total_inst_ - 1 : 0));
 
-        bool enter_pressed = ImGui::InputText("##goto", goto_buf_, sizeof(goto_buf_),
-                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        // ─── Hint text ──────────────────────────────────────────────────
+        ImGui::TextDisabled("Instruction ID, 0x<address>, or function name:");
+        ImGui::Spacing();
 
+        // ─── Input field ────────────────────────────────────────────────
+        ImGui::SetNextItemWidth(has_candidates ? 440.0f : 280.0f);
+        bool enter_pressed = ImGui::InputText("##goto_input", goto_buf_, sizeof(goto_buf_),
+                                              ImGuiInputTextFlags_EnterReturnsTrue |
+                                              ImGuiInputTextFlags_AutoSelectAll);
+
+        // Auto-focus on first appearance
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetKeyboardFocusHere(-1);
         }
 
-        if (enter_pressed || ImGui::Button("Go")) {
-            try {
-                uint64_t target = std::stoull(goto_buf_);
-                navigate_to(target);
-            } catch (...) {
-                // Invalid input, ignore
-            }
+        // Down arrow in input → move to candidate list
+        bool arrow_down = ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+
+        // ─── Commit on Enter ────────────────────────────────────────────
+        if (enter_pressed) {
+            // goto_buf_ always contains the best text to navigate to:
+            // - user typed it directly, OR
+            // - single-click on candidate filled it with the function name
+            // goto_commit() handles hex/decimal/function-name parsing
+            goto_commit(goto_buf_);
             show_goto_popup_ = false;
+            goto_selected_candidate_ = -1;
+            std::memset(goto_buf_, 0, sizeof(goto_buf_));
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        // ─── Autocomplete candidate list ────────────────────────────────
+        if (has_candidates) {
+            std::string query(goto_buf_);
+            // Lowercase
+            std::string ql = query;
+            std::transform(ql.begin(), ql.end(), ql.begin(), ::tolower);
+
+            // Collect matching candidates (limit display to 12)
+            std::vector<const GotoCandidate*> visible;
+            if (ql.empty()) {
+                // Show top-N by call count
+                for (size_t i = 0; i < goto_candidates_.size() && visible.size() < 12; i++) {
+                    visible.push_back(&goto_candidates_[i]);
+                }
+            } else {
+                // Filter: prefix first, then contains
+                for (const auto& c : goto_candidates_) {
+                    std::string cl = c.name;
+                    std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
+                    if (cl.compare(0, ql.size(), ql) == 0) {
+                        visible.push_back(&c);
+                        if (visible.size() >= 12) break;
+                    }
+                }
+                if (visible.size() < 12) {
+                    for (const auto& c : goto_candidates_) {
+                        std::string cl = c.name;
+                        std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
+                        if (cl.find(ql) != std::string::npos &&
+                            cl.compare(0, ql.size(), ql) != 0) {
+                            visible.push_back(&c);
+                            if (visible.size() >= 12) break;
+                        }
+                    }
+                }
+            }
+
+            if (!visible.empty()) {
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextDisabled("Functions (%zu):", visible.size());
+                ImGui::Spacing();
+
+                // Keyboard navigation in list
+                if (arrow_down || ImGui::IsItemFocused()) {
+                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && goto_selected_candidate_ < (int)visible.size() - 1)
+                        goto_selected_candidate_++;
+                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && goto_selected_candidate_ > 0)
+                        goto_selected_candidate_--;
+                }
+
+                // List child window for scrolling
+                float list_h = std::min((int)visible.size(), 10) * ImGui::GetTextLineHeightWithSpacing() + 4.0f;
+                ImGui::BeginChild("##goto_list", ImVec2(440.0f, list_h), false,
+                                  ImGuiWindowFlags_NoScrollbar);
+
+                for (int i = 0; i < (int)visible.size(); i++) {
+                    const auto* c = visible[i];
+                    bool selected = (goto_selected_candidate_ == i);
+
+                    // Get call count for display
+                    uint64_t calls = 0;
+                    if (function_result_) {
+                        auto it = function_result_->functions.find(c->pc);
+                        if (it != function_result_->functions.end())
+                            calls = it->second.total_calls;
+                    }
+
+                    // Format entry: name + address + call count
+                    char row_buf[220];
+                    snprintf(row_buf, sizeof(row_buf), "%-40s  %5llu calls",
+                             c->display.c_str(), (unsigned long long)calls);
+
+                    // Color: dim non-selected, highlight selected
+                    if (selected) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.75f, 0.75f, 1.0f));
+                    }
+
+                    if (ImGui::Selectable(row_buf, selected,
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                        if (ImGui::IsMouseDoubleClicked(0)) {
+                            navigate_to(c->inst_id);
+                            show_goto_popup_ = false;
+                            goto_selected_candidate_ = -1;
+                            std::memset(goto_buf_, 0, sizeof(goto_buf_));
+                            ImGui::PopStyleColor();
+                            ImGui::EndChild();
+                            ImGui::EndPopup();
+                            return;
+                        }
+                        goto_selected_candidate_ = i;
+                        // Single-click: copy name into input field
+                        std::strncpy(goto_buf_, c->name.c_str(), sizeof(goto_buf_) - 1);
+                        goto_buf_[sizeof(goto_buf_) - 1] = '\0';
+                    }
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::EndChild();
+            } else if (!ql.empty()) {
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextDisabled("(no matching functions)");
+                ImGui::Spacing();
+            }
+        }
+
+        // ─── Bottom buttons ─────────────────────────────────────────────
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button("Go", ImVec2(80, 0))) {
+            // goto_buf_ is always authoritative: user typed it or click filled it
+            goto_commit(goto_buf_);
+            show_goto_popup_ = false;
+            goto_selected_candidate_ = -1;
             std::memset(goto_buf_, 0, sizeof(goto_buf_));
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (ImGui::Button("Cancel", ImVec2(80, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             show_goto_popup_ = false;
+            goto_selected_candidate_ = -1;
             std::memset(goto_buf_, 0, sizeof(goto_buf_));
             ImGui::CloseCurrentPopup();
         }
+
+        // ─── Keyboard tip ───────────────────────────────────────────────
+        ImGui::SameLine();
+        ImGui::TextDisabled("  Enter=go  ↑↓=select  DblClick=jump");
 
         ImGui::EndPopup();
     }
@@ -1953,6 +3171,7 @@ void GuiApp::run_function_analysis() {
     if (result.ok()) {
         function_result_ = &result.get<FunctionResult>();
         show_callstack_ = true;
+        goto_candidates_dirty_ = true;  // Rebuild goto autocomplete on next open
     }
 }
 
@@ -2259,14 +3478,43 @@ void GuiApp::render_functions_panel() {
                         navigate_to(evt.call_inst_id + 1);
                     }
                 }
-                if (ImGui::IsItemHovered() && call_graph_result_) {
-                    // Tooltip with callers/callees info
-                    auto* node = call_graph_result_->node_at(entry.pc);
-                    if (node) {
-                        std::string tip = fmt::format("Callees: {}, Callers: {}",
-                            node->outgoing_edges.size(), node->incoming_edges.size());
-                        ImGui::SetTooltip("%s", tip.c_str());
+                if (ImGui::IsItemHovered()) {
+                    std::string tip = fmt::format("{}\n0x{:016x}\ncalls: {}, insts: {}",
+                        entry.info->name, static_pc,
+                        (unsigned long long)entry.info->total_calls,
+                        (unsigned long long)entry.info->total_instructions);
+                    if (call_graph_result_) {
+                        auto* node = call_graph_result_->node_at(entry.pc);
+                        if (node) {
+                            tip += fmt::format("\ncallees: {}, callers: {}",
+                                node->outgoing_edges.size(), node->incoming_edges.size());
+                        }
                     }
+                    tip += "\nRight-click for more options";
+                    ImGui::SetTooltip("%s", tip.c_str());
+                }
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ctx_func_pc_   = entry.pc;
+                    ctx_func_name_ = entry.info->name;
+                    uint64_t s_pc  = entry.pc - reader_.header().module_slide;
+                    ImGui::TextDisabled("%s", ctx_func_name_.c_str());
+                    ImGui::TextDisabled("0x%llx", (unsigned long long)s_pc);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Jump to First Call")) {
+                        if (!entry.info->call_event_indices.empty()) {
+                            const auto& evt = function_result_->call_events[entry.info->call_event_indices[0]];
+                            navigate_to(evt.call_inst_id + 1);
+                        }
+                    }
+                    if (ImGui::MenuItem("Copy Name")) {
+                        ImGui::SetClipboardText(ctx_func_name_.c_str());
+                    }
+                    if (ImGui::MenuItem("Copy Address")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)s_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // Entry PC column
@@ -2333,6 +3581,9 @@ void GuiApp::render_functions_panel() {
             ImGui::TextDisabled("(navigate to a function to see call graph info)");
         }
     }
+
+    // Function panel right-click menu
+    render_func_context_menu();
 
     ImGui::End();
 }
@@ -2434,9 +3685,26 @@ void GuiApp::render_strings_panel() {
                     // Jump to the instruction that discovered this string
                     navigate_to(ref->discovered_at);
                 }
-                // Double-click to jump
-                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-                    navigate_to(ref->discovered_at);
+                if (ImGui::IsItemHovered()) {
+                    std::string tip = fmt::format("\"{}\"\nDiscovered at inst #{}\nRight-click for options",
+                        ref->content, ref->discovered_at);
+                    ImGui::SetTooltip("%s", tip.c_str());
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        navigate_to(ref->discovered_at);
+                    }
+                }
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ctx_string_inst_id_ = ref->discovered_at;
+                    ctx_string_text_    = ref->content;
+                    ImGui::TextDisabled("\"%s\"", ctx_string_text_.c_str());
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Jump to Discovery")) {
+                        navigate_to(ctx_string_inst_id_);
+                    }
+                    if (ImGui::MenuItem("Copy String")) {
+                        ImGui::SetClipboardText(ctx_string_text_.c_str());
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // Encoding column
@@ -2465,6 +3733,9 @@ void GuiApp::render_strings_panel() {
         clipper.End();
         ImGui::EndTable();
     }
+
+    // String panel right-click menu
+    render_string_context_menu();
 
     ImGui::End();
 }
@@ -2497,6 +3768,9 @@ void GuiApp::clear_analysis() {
     std::memset(function_filter_buf_, 0, sizeof(function_filter_buf_));
     taint_sorted_ids_.clear();
     taint_sorted_ids_dirty_ = true;
+    goto_candidates_.clear();
+    goto_candidates_dirty_ = true;
+    goto_selected_candidate_ = -1;
     if (pass_manager_) {
         pass_manager_->invalidate_all();
     }
@@ -2592,10 +3866,7 @@ void GuiApp::open_hex_dump_at(uint64_t addr) {
 // ─── Context menu helpers ────────────────────────────────────────────────────
 
 void GuiApp::render_mem_context_menu() {
-    if (!show_mem_ctx_menu_) return;
-    ImGui::OpenPopup("##mem_ctx");
-    show_mem_ctx_menu_ = false;
-
+    // Popup opened via OpenPopupOnItemClick in render_memory_panel().
     if (ImGui::BeginPopup("##mem_ctx")) {
         ImGui::TextDisabled("addr: 0x%016llx", (unsigned long long)ctx_mem_addr_);
         ImGui::Separator();
@@ -2632,52 +3903,11 @@ void GuiApp::render_mem_context_menu() {
 }
 
 void GuiApp::render_reg_context_menu() {
-    if (!show_reg_ctx_menu_) return;
-    ImGui::OpenPopup("##reg_ctx");
-    show_reg_ctx_menu_ = false;
-
-    if (ImGui::BeginPopup("##reg_ctx")) {
-        std::string rname;
-        if (ctx_reg_idx_ <= 28) rname = fmt::format("x{}", ctx_reg_idx_);
-        else if (ctx_reg_idx_ == 29) rname = "fp";
-        else if (ctx_reg_idx_ == 30) rname = "lr";
-        else if (ctx_reg_idx_ == 31) rname = "sp";
-        else rname = fmt::format("reg{}", ctx_reg_idx_);
-
-        ImGui::TextDisabled("%s = 0x%016llx", rname.c_str(), (unsigned long long)ctx_reg_value_);
-        ImGui::Separator();
-
-        if (ImGui::MenuItem("Open Value in Hex Dump")) {
-            open_hex_dump_at(ctx_reg_value_);
-        }
-        if (ImGui::MenuItem("Copy Value")) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)ctx_reg_value_);
-            ImGui::SetClipboardText(buf);
-        }
-        if (ctx_reg_idx_ == 30 && function_result_) {
-            // LR — jump to caller
-            ImGui::Separator();
-            if (ImGui::MenuItem("Follow LR (jump to call site)")) {
-                auto stack = function_result_->call_stack_at(current_inst_);
-                if (!stack.empty()) {
-                    navigate_to(stack.back()->call_inst_id);
-                }
-            }
-        }
-        if ((ctx_reg_idx_ == 29 || ctx_reg_idx_ == 31) && function_result_) {
-            // FP/SP context
-            ImGui::Separator();
-            ImGui::TextDisabled("(stack pointer/frame pointer)");
-        }
-        ImGui::EndPopup();
-    }
+    // No-op: register cell now uses BeginPopupContextItem inline in render_reg_cell().
 }
 
 void GuiApp::render_callstack_context_menu() {
-    if (!show_callstack_ctx_menu_) return;
-    ImGui::OpenPopup("##cs_ctx");
-    show_callstack_ctx_menu_ = false;
+    // Popup opened via OpenPopupOnItemClick in render_callstack_panel().
 
     if (!function_result_) {
         ImGui::BeginPopup("##cs_ctx");
@@ -2709,6 +3939,326 @@ void GuiApp::render_callstack_context_menu() {
                 }
             }
         }
+        ImGui::EndPopup();
+    }
+}
+
+// ─── Instruction Panel Context Menu ─────────────────────────────────────────
+// IDA-style per-instruction right-click menu with full analysis actions
+
+void GuiApp::render_inst_context_menu_contents() {
+    // ── Header: address + disasm ───────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.62f, 0.80f, 1.0f));
+    ImGui::Text("inst #%llu", (unsigned long long)ctx_inst_id_);
+    ImGui::Text("0x%016llx", (unsigned long long)ctx_inst_static_pc_);
+    ImGui::PopStyleColor();
+    ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.90f, 1.0f), "%s", ctx_inst_disasm_.c_str());
+    ImGui::Separator();
+
+    // ── Copy actions ──────────────────────────────────────────────────
+    if (ImGui::BeginMenu("Copy")) {
+        if (ImGui::MenuItem("Copy Address (hex)")) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)ctx_inst_static_pc_);
+            ImGui::SetClipboardText(buf);
+        }
+        if (ImGui::MenuItem("Copy Address (decimal)")) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long)ctx_inst_static_pc_);
+            ImGui::SetClipboardText(buf);
+        }
+        if (ImGui::MenuItem("Copy Disassembly")) {
+            ImGui::SetClipboardText(ctx_inst_disasm_.c_str());
+        }
+        if (ImGui::MenuItem("Copy Instruction ID")) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long)ctx_inst_id_);
+            ImGui::SetClipboardText(buf);
+        }
+        ImGui::EndMenu();
+    }
+
+    ImGui::Separator();
+
+    // ── Navigation ────────────────────────────────────────────────────
+    if (ImGui::MenuItem("Navigate Here")) {
+        navigate_to(ctx_inst_id_);
+    }
+    if (ImGui::MenuItem("Goto Instruction... (G)")) {
+        show_goto_popup_ = true;
+    }
+
+    // Bookmark toggle
+    bool is_bookmarked = std::binary_search(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
+    if (is_bookmarked) {
+        if (ImGui::MenuItem("\xe2\x98\x85 Remove Bookmark")) {  // ★
+            auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
+            if (it != bookmarks_.end() && *it == ctx_inst_id_) {
+                bookmarks_.erase(it);
+                row_cache_.invalidate(ctx_inst_id_);
+            }
+        }
+    } else {
+        if (ImGui::MenuItem("\xe2\x98\x86 Add Bookmark (B)")) {  // ☆
+            auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
+            bookmarks_.insert(it, ctx_inst_id_);
+            row_cache_.invalidate(ctx_inst_id_);
+        }
+    }
+
+    ImGui::Separator();
+
+    // ── Taint analysis from this instruction ──────────────────────────
+    if (ImGui::BeginMenu("Taint Analysis")) {
+        const auto& state = regfile_.state_before(ctx_inst_id_);
+        if (ImGui::MenuItem("Forward Taint from x0")) {
+            navigate_to(ctx_inst_id_);
+            run_taint_analysis();
+        }
+        ImGui::Separator();
+        static const struct { uint8_t idx; const char* name; } kArgRegs[] = {
+            {0,"x0"},{1,"x1"},{2,"x2"},{3,"x3"},{4,"x4"},{5,"x5"}
+        };
+        for (auto& reg : kArgRegs) {
+            char label[32];
+            snprintf(label, sizeof(label), "Forward Taint from %s = 0x%llx",
+                     reg.name, (unsigned long long)state.gpr[reg.idx]);
+            if (ImGui::MenuItem(label)) {
+                navigate_to(ctx_inst_id_);
+                run_taint_analysis();
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Backward Taint from here")) {
+            navigate_to(ctx_inst_id_);
+            run_backward_taint_analysis();
+        }
+        ImGui::EndMenu();
+    }
+
+    // ── Xref navigation ───────────────────────────────────────────────
+    if (ImGui::BeginMenu("Xrefs")) {
+        if (!xref_result_) {
+            if (ImGui::MenuItem("Run Xref Analysis first")) {
+                run_xref_analysis();
+            }
+        } else {
+            auto xrefs = xref_result_->inst_ids_at(ctx_inst_pc_);
+            uint64_t exec_count = xref_result_->execution_count(ctx_inst_pc_);
+            ImGui::TextDisabled("0x%llx: %llu executions",
+                (unsigned long long)ctx_inst_static_pc_,
+                (unsigned long long)exec_count);
+            ImGui::Separator();
+            if (!xrefs.empty()) {
+                size_t limit = std::min(xrefs.size(), size_t(20));
+                for (size_t xi = 0; xi < limit; xi++) {
+                    char lbl[48];
+                    snprintf(lbl, sizeof(lbl), "  Jump to inst #%llu", (unsigned long long)xrefs[xi]);
+                    if (ImGui::MenuItem(lbl)) {
+                        xref_cursor_ = xi;
+                        navigate_to(xrefs[xi]);
+                    }
+                }
+                if (xrefs.size() > 20) {
+                    ImGui::TextDisabled("  ... and %zu more", xrefs.size() - 20);
+                }
+            } else {
+                ImGui::TextDisabled("  (no other executions)");
+            }
+        }
+        ImGui::EndMenu();
+    }
+
+    // ── Function context ──────────────────────────────────────────────
+    if (function_result_) {
+        ImGui::Separator();
+        auto* func = function_result_->function_at(ctx_inst_id_);
+        if (func) {
+            ImGui::TextDisabled("In: %s", func->name.c_str());
+            if (ImGui::MenuItem("Jump to Function Entry")) {
+                auto it = function_result_->functions.find(func->entry_pc);
+                if (it != function_result_->functions.end() &&
+                    !it->second.call_event_indices.empty()) {
+                    const auto& evt = function_result_->call_events[
+                        it->second.call_event_indices[0]];
+                    navigate_to(evt.call_inst_id + 1);
+                }
+            }
+            auto* call = function_result_->call_at(ctx_inst_id_);
+            if (call) {
+                if (ImGui::MenuItem("Follow Call (Enter)")) {
+                    navigate_to(call->call_inst_id + 1);
+                }
+            }
+            auto* ret = function_result_->return_at(ctx_inst_id_);
+            if (ret) {
+                if (ImGui::MenuItem("Follow Return")) {
+                    navigate_to(ret->call_inst_id);
+                }
+            }
+        }
+    }
+
+    // ── Hex dump ──────────────────────────────────────────────────────
+    ImGui::Separator();
+    if (ImGui::MenuItem("Open PC in Hex Dump")) {
+        open_hex_dump_at(ctx_inst_pc_);
+    }
+
+    // ── CFG ───────────────────────────────────────────────────────────
+    if (show_cfg_ && cfg_result_) {
+        if (ImGui::MenuItem("Highlight Block in CFG")) {
+            cfg_highlight_pc_ = ctx_inst_pc_;
+        }
+    }
+}
+
+void GuiApp::render_inst_context_menu() {
+    // No-op: instruction panel now uses BeginPopupContextItem inline.
+}
+
+// ─── Function Panel Context Menu ─────────────────────────────────────────────
+
+void GuiApp::render_func_context_menu() {
+    // Popup opened via OpenPopupOnItemClick in render_function_panel().
+    if (ImGui::BeginPopup("##func_ctx")) {
+        ImGui::TextDisabled("%s", ctx_func_name_.c_str());
+        uint64_t static_pc = ctx_func_pc_ - reader_.header().module_slide;
+        ImGui::TextDisabled("0x%016llx", (unsigned long long)static_pc);
+        ImGui::Separator();
+
+        if (function_result_) {
+            auto it = function_result_->functions.find(ctx_func_pc_);
+            if (it != function_result_->functions.end()) {
+                const auto& info = it->second;
+                if (!info.call_event_indices.empty()) {
+                    if (ImGui::MenuItem("Jump to First Invocation")) {
+                        const auto& evt = function_result_->call_events[info.call_event_indices[0]];
+                        navigate_to(evt.call_inst_id + 1);
+                    }
+                    if (info.call_event_indices.size() > 1) {
+                        // Show jump to each invocation (up to 10)
+                        if (ImGui::BeginMenu("Jump to Invocation...")) {
+                            size_t limit = std::min(info.call_event_indices.size(), size_t(10));
+                            for (size_t ci = 0; ci < limit; ci++) {
+                                const auto& evt = function_result_->call_events[info.call_event_indices[ci]];
+                                char lbl[48];
+                                snprintf(lbl, sizeof(lbl), "  Call #%zu (@inst %llu)",
+                                    ci + 1, (unsigned long long)evt.call_inst_id);
+                                if (ImGui::MenuItem(lbl)) {
+                                    navigate_to(evt.call_inst_id + 1);
+                                }
+                            }
+                            if (info.call_event_indices.size() > 10) {
+                                ImGui::TextDisabled("  ... and %zu more", info.call_event_indices.size() - 10);
+                            }
+                            ImGui::EndMenu();
+                        }
+                    }
+                }
+            }
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Copy Name")) {
+            ImGui::SetClipboardText(ctx_func_name_.c_str());
+        }
+        if (ImGui::MenuItem("Copy Address")) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)static_pc);
+            ImGui::SetClipboardText(buf);
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Run Xref on this Function")) {
+            if (!xref_result_) run_xref_analysis();
+            if (xref_result_) {
+                auto xrefs = xref_result_->inst_ids_at(ctx_func_pc_);
+                if (!xrefs.empty()) {
+                    xref_cursor_ = 0;
+                    navigate_to(xrefs[0]);
+                }
+            }
+        }
+
+        if (call_graph_result_) {
+            auto* node = call_graph_result_->node_at(ctx_func_pc_);
+            if (node) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Callers: %zu, Callees: %zu",
+                    node->incoming_edges.size(), node->outgoing_edges.size());
+            }
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+// ─── String Panel Context Menu ────────────────────────────────────────────────
+
+void GuiApp::render_string_context_menu() {
+    // Popup opened via OpenPopupOnItemClick in render_string_panel().
+
+    if (ImGui::BeginPopup("##str_ctx")) {
+        ImGui::TextDisabled("\"%s\"", ctx_string_text_.c_str());
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Jump to Discovery")) {
+            navigate_to(ctx_string_inst_id_);
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Copy String")) {
+            ImGui::SetClipboardText(ctx_string_text_.c_str());
+        }
+
+        if (ImGui::MenuItem("Search for This String")) {
+            // Put the string into the search buffer and trigger search
+            strncpy(search_buf_, ctx_string_text_.c_str(), sizeof(search_buf_) - 1);
+            search_buf_[sizeof(search_buf_) - 1] = '\0';
+            // Run search
+            std::string query(search_buf_);
+            search_results_.clear();
+            search_current_ = 0;
+            search_active_ = false;
+            if (!query.empty()) {
+                for (uint64_t i = 0; i < total_inst_ && i < 1000000; i++) {
+                    auto row = fetch_row(i);
+                    if (row.disasm.find(query) != std::string::npos) {
+                        search_results_.push_back(i);
+                    }
+                }
+                if (!search_results_.empty()) {
+                    search_active_ = true;
+                    navigate_to(search_results_[0]);
+                }
+            }
+        }
+
+        ImGui::Separator();
+
+        if (xref_result_) {
+            // Show xrefs for the instruction that found this string
+            auto row = fetch_row(ctx_string_inst_id_);
+            auto xrefs = xref_result_->inst_ids_at(row.pc);
+            if (!xrefs.empty()) {
+                if (ImGui::BeginMenu("Xrefs (Discovery PC)")) {
+                    size_t limit = std::min(xrefs.size(), size_t(10));
+                    for (size_t xi = 0; xi < limit; xi++) {
+                        char lbl[48];
+                        snprintf(lbl, sizeof(lbl), "  inst #%llu", (unsigned long long)xrefs[xi]);
+                        if (ImGui::MenuItem(lbl)) {
+                            navigate_to(xrefs[xi]);
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+            }
+        }
+
         ImGui::EndPopup();
     }
 }
@@ -3068,24 +4618,26 @@ void GuiApp::run_loop_analysis() {
     }
 }
 
-// ─── Progress Overlay ─────────────────────────────────────────────────────────
-// Renders a full-width execution timeline bar as a separate floating window
-// overlaid above the instruction list. Markers for bookmarks, tainted insts,
-// and loop headers are drawn using ImDrawList.
+// ─── Progress Overlay / Timeline ──────────────────────────────────────────────
+// Redesigned as a proper Binary Ninja-style execution timeline:
+//  - Multi-lane rendering (top half: taint/BT overlay; bottom half: call events)
+//  - Gradient fill for progress
+//  - Bookmark diamonds, loop header notches, search-hit sparks
+//  - Click + drag to seek; hover tooltip with full disasm preview
+//  - No background window border — blends cleanly into the layout
 
 void GuiApp::render_progress_overlay() {
     if (total_inst_ == 0) return;
 
-    // Position: just below the toolbar, full width
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float bar_height = 18.0f;
-    const float bar_y = vp->WorkPos.y + ImGui::GetFrameHeight() * 2.2f;  // below menu + toolbar
+    const float bar_height = 22.0f;   // slightly taller than before for more lanes
+    const float bar_y = vp->WorkPos.y + ImGui::GetFrameHeight() * 2.2f;
     ImVec2 bar_pos(vp->WorkPos.x, bar_y);
     ImVec2 bar_size(vp->WorkSize.x, bar_height);
 
     ImGui::SetNextWindowPos(bar_pos);
     ImGui::SetNextWindowSize(bar_size);
-    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::SetNextWindowBgAlpha(0.0f);  // transparent window — we draw everything manually
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
@@ -3094,9 +4646,9 @@ void GuiApp::render_progress_overlay() {
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs;
+        ImGuiWindowFlags_NoDecoration;
 
-    if (!ImGui::Begin("##ProgressBar", nullptr, flags)) {
+    if (!ImGui::Begin("##Timeline", nullptr, flags)) {
         ImGui::End();
         ImGui::PopStyleVar(2);
         return;
@@ -3107,95 +4659,176 @@ void GuiApp::render_progress_overlay() {
     float W = ImGui::GetWindowWidth();
     float H = bar_height;
 
-    // Background gradient: dark gray track
-    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H),
-                        IM_COL32(25, 25, 30, 220));
+    // ── Track background ─────────────────────────────────────────────
+    // Dark navy with subtle top/bottom gradient edges
+    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H), IM_COL32(18, 20, 28, 235));
+    // Top subtle highlight line
+    draw->AddLine(p0, ImVec2(p0.x + W, p0.y),
+                  IM_COL32(80, 90, 130, 100), 1.0f);
 
-    // Progress fill (current position)
-    float progress = static_cast<float>(current_inst_) / static_cast<float>(total_inst_);
-    float fill_x = p0.x + progress * W;
-    draw->AddRectFilled(p0, ImVec2(fill_x, p0.y + H),
-                        IM_COL32(40, 70, 120, 180));
-
-    // Current position cursor line
-    draw->AddLine(ImVec2(fill_x, p0.y), ImVec2(fill_x, p0.y + H),
-                  IM_COL32(100, 160, 255, 255), 2.0f);
-
-    // Helper: inst_id → x coordinate
+    // ── Helper: inst_id → x ──────────────────────────────────────────
     auto inst_to_x = [&](uint64_t id) -> float {
         return p0.x + static_cast<float>(id) / static_cast<float>(total_inst_) * W;
     };
 
-    // Draw bookmark markers (gold diamonds)
-    for (uint64_t bid : bookmarks_) {
-        float bx = inst_to_x(bid);
-        draw->AddTriangleFilled(
-            ImVec2(bx, p0.y + H * 0.1f),
-            ImVec2(bx - 3.0f, p0.y + H * 0.6f),
-            ImVec2(bx + 3.0f, p0.y + H * 0.6f),
-            IM_COL32(255, 200, 40, 230));
-    }
+    // ── Lane constants ───────────────────────────────────────────────
+    // Lane 0 (top):    taint / backward-taint overlays
+    // Lane 1 (middle): loop headers, call events
+    // Lane 2 (bottom): current-position fill + cursor
+    const float lane_top_h   = H * 0.40f;
+    const float lane_mid_top = H * 0.40f;
+    const float lane_mid_bot = H * 0.72f;
 
-    // Draw taint markers (green tick marks)
+    // ── Progress fill (gradient blue) ────────────────────────────────
+    float progress = (total_inst_ > 1)
+        ? static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1)
+        : 0.0f;
+    float fill_x = p0.x + progress * W;
+
+    // Two-tone gradient: left part brighter, blending right to darker
+    draw->AddRectFilledMultiColor(
+        p0, ImVec2(fill_x, p0.y + H),
+        IM_COL32(32, 60, 115, 140),   // TL
+        IM_COL32(42, 85, 155, 170),   // TR
+        IM_COL32(42, 85, 155, 170),   // BR
+        IM_COL32(32, 60, 115, 140));  // BL
+
+    // ── Taint overlays (top lane) ─────────────────────────────────────
     if (show_taint_ && taint_result_ && !taint_sorted_ids_.empty()) {
-        // Sample at most 2000 markers to avoid overloading the draw list
-        const size_t kMaxMarkers = 2000;
-        size_t step = std::max(size_t(1), taint_sorted_ids_.size() / kMaxMarkers);
+        const size_t kMax = 3000;
+        size_t step = std::max(size_t(1), taint_sorted_ids_.size() / kMax);
         for (size_t ti = 0; ti < taint_sorted_ids_.size(); ti += step) {
             float tx = inst_to_x(taint_sorted_ids_[ti]);
-            draw->AddLine(ImVec2(tx, p0.y + H * 0.5f), ImVec2(tx, p0.y + H),
-                          IM_COL32(40, 200, 80, 180), 1.0f);
+            draw->AddLine(ImVec2(tx, p0.y + lane_mid_top),
+                          ImVec2(tx, p0.y + H),
+                          IM_COL32(42, 195, 82, 160), 1.0f);
         }
     }
-
-    // Draw backward taint markers (red)
     if (show_backward_taint_ && backward_taint_result_) {
-        // Build sorted list on-the-fly (cap at 2000)
         size_t shown = 0;
-        for (uint64_t id = 0; id < total_inst_ && shown < 2000; id++) {
+        for (uint64_t id = 0; id < total_inst_ && shown < 3000; id++) {
             if (backward_taint_result_->is_contributing(id)) {
                 float tx = inst_to_x(id);
-                draw->AddLine(ImVec2(tx, p0.y), ImVec2(tx, p0.y + H * 0.5f),
-                              IM_COL32(220, 60, 60, 180), 1.0f);
+                draw->AddLine(ImVec2(tx, p0.y),
+                              ImVec2(tx, p0.y + lane_top_h),
+                              IM_COL32(215, 55, 55, 165), 1.0f);
                 shown++;
             }
         }
     }
 
-    // Draw loop header markers (orange notch at top)
-    if (show_loops_ && loop_result_) {
+    // ── Loop header markers (orange notches in middle lane) ───────────
+    if (show_loops_ && loop_result_ && xref_result_) {
         for (const auto& loop : loop_result_->loops) {
-            // Find an inst_id that corresponds to loop.header_pc
-            // We use xref_result_ if available, else skip
-            if (xref_result_) {
-                auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
-                if (!inst_ids.empty()) {
-                    float lx = inst_to_x(inst_ids.front());
-                    draw->AddRectFilled(ImVec2(lx - 2.0f, p0.y),
-                                       ImVec2(lx + 2.0f, p0.y + H * 0.45f),
-                                       IM_COL32(255, 140, 30, 230));
-                }
+            auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
+            if (!inst_ids.empty()) {
+                float lx = inst_to_x(inst_ids.front());
+                draw->AddRectFilled(
+                    ImVec2(lx - 1.5f, p0.y + lane_mid_top),
+                    ImVec2(lx + 1.5f, p0.y + lane_mid_bot),
+                    IM_COL32(255, 138, 24, 225));
             }
         }
     }
 
-    // Bottom edge separator
-    draw->AddLine(ImVec2(p0.x, p0.y + H - 1.0f), ImVec2(p0.x + W, p0.y + H - 1.0f),
-                  IM_COL32(60, 60, 80, 200), 1.0f);
+    // ── Call event markers (small blue ticks) ────────────────────────
+    if (function_result_) {
+        const size_t kMaxCalls = 2000;
+        size_t call_shown = 0;
+        for (const auto& evt : function_result_->call_events) {
+            if (call_shown++ >= kMaxCalls) break;
+            float cx = inst_to_x(evt.call_inst_id);
+            draw->AddLine(
+                ImVec2(cx, p0.y + lane_mid_top),
+                ImVec2(cx, p0.y + lane_mid_bot),
+                IM_COL32(60, 145, 255, 130), 1.0f);
+        }
+    }
 
-    // Tooltip: clicking the bar navigates to that position
-    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+    // ── Search-hit sparks (gold) ─────────────────────────────────────
+    if (search_active_ && !search_results_.empty()) {
+        const size_t kMaxHits = 1000;
+        size_t step = std::max(size_t(1), search_results_.size() / kMaxHits);
+        for (size_t hi = 0; hi < search_results_.size(); hi += step) {
+            float hx = inst_to_x(search_results_[hi]);
+            draw->AddLine(ImVec2(hx, p0.y),
+                          ImVec2(hx, p0.y + H),
+                          IM_COL32(255, 200, 30, 200), 1.0f);
+        }
+    }
+
+    // ── Bookmark diamonds ────────────────────────────────────────────
+    for (uint64_t bid : bookmarks_) {
+        float bx = inst_to_x(bid);
+        float cy = p0.y + H * 0.5f;
+        float r  = 4.0f;
+        draw->AddQuadFilled(
+            ImVec2(bx,     cy - r),   // top
+            ImVec2(bx + r, cy),        // right
+            ImVec2(bx,     cy + r),   // bottom
+            ImVec2(bx - r, cy),        // left
+            IM_COL32(255, 205, 45, 235));
+        draw->AddQuad(
+            ImVec2(bx,     cy - r),
+            ImVec2(bx + r, cy),
+            ImVec2(bx,     cy + r),
+            ImVec2(bx - r, cy),
+            IM_COL32(255, 240, 130, 180), 1.0f);
+    }
+
+    // ── Current position cursor ───────────────────────────────────────
+    // Bright vertical line + small top triangle marker
+    draw->AddLine(ImVec2(fill_x, p0.y), ImVec2(fill_x, p0.y + H),
+                  IM_COL32(110, 175, 255, 255), 2.0f);
+    // Small downward-pointing triangle at top
+    draw->AddTriangleFilled(
+        ImVec2(fill_x - 4.0f, p0.y),
+        ImVec2(fill_x + 4.0f, p0.y),
+        ImVec2(fill_x, p0.y + 6.0f),
+        IM_COL32(140, 195, 255, 230));
+
+    // ── Bottom separator ─────────────────────────────────────────────
+    draw->AddLine(ImVec2(p0.x, p0.y + H - 0.5f),
+                  ImVec2(p0.x + W, p0.y + H - 0.5f),
+                  IM_COL32(50, 55, 80, 180), 1.0f);
+
+    // ── Interaction: hover tooltip + click/drag to seek ──────────────
+    // Use an invisible button over the entire bar for interaction
+    ImGui::SetCursorPos(ImVec2(0, 0));
+    ImGui::InvisibleButton("##timeline_btn", ImVec2(W, H),
+        ImGuiButtonFlags_MouseButtonLeft);
+
+    bool is_hovered = ImGui::IsItemHovered();
+    bool is_active  = ImGui::IsItemActive();
+
+    if ((is_active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) || ImGui::IsItemClicked()) {
+        float mx = ImGui::GetIO().MousePos.x;
+        float rel = (mx - p0.x) / W;
+        if (rel >= 0.0f && rel <= 1.0f) {
+            uint64_t target = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
+            if (target >= total_inst_) target = total_inst_ - 1;
+            navigate_to(target);
+        }
+    }
+
+    if (is_hovered) {
         float mx = ImGui::GetIO().MousePos.x;
         float rel = (mx - p0.x) / W;
         if (rel >= 0.0f && rel <= 1.0f) {
             uint64_t hover_id = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
             if (hover_id >= total_inst_) hover_id = total_inst_ - 1;
             auto hover_row = fetch_row(hover_id);
-            ImGui::SetTooltip("inst %llu  PC:0x%llx\n%s",
+            ImGui::SetTooltip("#%llu  0x%llx\n%s\n(click or drag to seek)",
                 (unsigned long long)hover_id,
                 (unsigned long long)hover_row.static_pc,
                 hover_row.disasm.c_str());
         }
+
+        // Vertical hover line (dim)
+        float mx_screen = ImGui::GetIO().MousePos.x;
+        draw->AddLine(ImVec2(mx_screen, p0.y),
+                      ImVec2(mx_screen, p0.y + H),
+                      IM_COL32(200, 200, 200, 60), 1.0f);
     }
 
     ImGui::End();
@@ -3861,15 +5494,232 @@ void GuiApp::render_cfg_panel() {
             }
         }
 
-        // Hover tooltip with execution count
+        // Hover tooltip with execution count + right-click menu trigger
         if (is_hovered && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("0x%llx\n%llu executions\n(click to select & navigate)",
+            std::string tip = fmt::format(
+                "0x{:016x}\n{} executions\n",
                 (unsigned long long)block_pc,
                 (unsigned long long)exec_count);
+            if (cfg_result_) {
+                auto it = cfg_result_->blocks.find(block_pc);
+                if (it != cfg_result_->blocks.end()) {
+                    tip += fmt::format("{} instructions in block\n", it->second.instructions.size());
+                }
+            }
+            tip += "Left-click: select & navigate\nRight-click: more options";
+            ImGui::SetTooltip("%s", tip.c_str());
+
+            // Right-click → CFG block context menu
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                // Store block info for context menu
+                ImGui::OpenPopup("##cfg_ctx");
+                // Save state for menu
+                ctx_inst_pc_        = block_pc;  // reuse ctx field for block PC
+                ctx_inst_static_pc_ = block_pc - reader_.header().module_slide;
+            }
         }
     }
 
+    // ── CFG right-click context menu ─────────────────────────────────
+    if (ImGui::BeginPopup("##cfg_ctx")) {
+        ImGui::TextDisabled("Block: 0x%llx", (unsigned long long)ctx_inst_static_pc_);
+        if (cfg_result_) {
+            auto it = cfg_result_->blocks.find(ctx_inst_pc_);
+            if (it != cfg_result_->blocks.end()) {
+                ImGui::TextDisabled("%zu instructions, %llu executions",
+                    it->second.instructions.size(),
+                    (unsigned long long)it->second.execution_count);
+            }
+        }
+        ImGui::Separator();
+
+        // Navigation
+        if (ImGui::MenuItem("Navigate to Block Entry")) {
+            if (xref_result_) {
+                auto ids = xref_result_->inst_ids_at(ctx_inst_pc_);
+                if (!ids.empty()) {
+                    cfg_selected_block_ = ctx_inst_pc_;
+                    cfg_block_cursor_ = 0;
+                    navigate_to(ids[0]);
+                }
+            }
+        }
+        if (xref_result_) {
+            auto ids = xref_result_->inst_ids_at(ctx_inst_pc_);
+            if (!ids.empty() && ImGui::BeginMenu(fmt::format("Jump to Execution ({})...", ids.size()).c_str())) {
+                size_t limit = std::min(ids.size(), size_t(15));
+                for (size_t xi = 0; xi < limit; xi++) {
+                    char lbl[48];
+                    snprintf(lbl, sizeof(lbl), "  inst #%llu", (unsigned long long)ids[xi]);
+                    if (ImGui::MenuItem(lbl)) {
+                        cfg_selected_block_ = ctx_inst_pc_;
+                        cfg_block_cursor_   = xi;
+                        navigate_to(ids[xi]);
+                    }
+                }
+                if (ids.size() > 15) {
+                    ImGui::TextDisabled("  ... and %zu more", ids.size() - 15);
+                }
+                ImGui::EndMenu();
+            }
+        }
+
+        ImGui::Separator();
+
+        // Zoom controls
+        if (ImGui::MenuItem("Zoom In (+)")) {
+            cfg_zoom_ = std::min(cfg_zoom_ * 1.25f, 8.0f);
+        }
+        if (ImGui::MenuItem("Zoom Out (-)")) {
+            cfg_zoom_ = std::max(cfg_zoom_ * 0.8f, 0.05f);
+        }
+        if (ImGui::MenuItem("Reset Zoom (1:1)")) {
+            cfg_zoom_   = 1.0f;
+        }
+        if (ImGui::MenuItem("Fit to Window")) {
+            // Auto-fit: center all blocks
+            if (cfg_layout_result_ && !cfg_layout_result_->block_layouts.empty()) {
+                float lo_x = FLT_MAX, lo_y = FLT_MAX, hi_x = -FLT_MAX, hi_y = -FLT_MAX;
+                for (const auto& [bpc, lo] : cfg_layout_result_->block_layouts) {
+                    lo_x = std::min(lo_x, static_cast<float>(lo.x));
+                    lo_y = std::min(lo_y, static_cast<float>(lo.y));
+                    hi_x = std::max(hi_x, static_cast<float>(lo.x + lo.width));
+                    hi_y = std::max(hi_y, static_cast<float>(lo.y + lo.height));
+                }
+                float avail_w = ImGui::GetWindowWidth();
+                float avail_h = ImGui::GetWindowHeight();
+                float box_w = hi_x - lo_x;
+                float box_h = hi_y - lo_y;
+                if (box_w > 0 && box_h > 0) {
+                    cfg_zoom_ = std::min(avail_w / box_w, avail_h / box_h) * 0.85f;
+                    cfg_zoom_ = std::max(0.05f, std::min(cfg_zoom_, 8.0f));
+                    cfg_scroll_.x = avail_w * 0.5f - (lo_x + box_w * 0.5f) * cfg_zoom_;
+                    cfg_scroll_.y = avail_h * 0.5f - (lo_y + box_h * 0.5f) * cfg_zoom_;
+                }
+            }
+        }
+
+        ImGui::Separator();
+
+        // Copy
+        if (ImGui::MenuItem("Copy Block Address")) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)ctx_inst_static_pc_);
+            ImGui::SetClipboardText(buf);
+        }
+
+        ImGui::EndPopup();
+    }
+
     draw->PopClipRect();
+
+    ImGui::End();
+}
+
+// ─── Status Bar ─────────────────────────────────────────────────────────────
+// VS Code / IDA style: fixed-height strip at the very bottom of the viewport.
+// Shows: inst position | mnemonic | active analyses | trace stats | mode badges
+
+void GuiApp::render_status_bar() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float bar_y = vp->WorkPos.y + vp->WorkSize.y - kStatusBarHeight;
+
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, bar_y));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, kStatusBarHeight));
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(8.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.060f, 0.085f, 1.0f));
+
+    ImGui::Begin("##StatusBar", nullptr,
+        ImGuiWindowFlags_NoTitleBar    | ImGuiWindowFlags_NoResize  |
+        ImGuiWindowFlags_NoMove        | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDocking     | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoFocusOnAppearing);
+
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor();
+
+    // ─── Left section: position + current instruction ────────────────
+    // Instruction index / total (IDA style: "0001234 / 0056789")
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.65f, 0.85f, 1.0f));
+    ImGui::TextUnformatted("\xe2\x96\xb6");   // ▶
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 4.0f);
+
+    ImGui::TextColored(ImVec4(0.80f, 0.85f, 1.00f, 1.0f),
+        "%llu / %llu",
+        (unsigned long long)current_inst_,
+        (unsigned long long)total_inst_);
+
+    ImGui::SameLine(0, 10.0f);
+
+    // Progress percentage
+    float pct = (total_inst_ > 1)
+        ? 100.0f * static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1)
+        : 0.0f;
+    ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.65f, 1.0f), "(%.1f%%)", pct);
+
+    ImGui::SameLine(0, 14.0f);
+
+    // Current PC in muted monospace
+    {
+        auto row = fetch_row(current_inst_);
+        if (!row.mnemonic.empty()) {
+            // Vertical separator
+            ImGui::TextColored(ImVec4(0.25f, 0.28f, 0.38f, 1.0f), "|");
+            ImGui::SameLine(0, 10.0f);
+
+            ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.65f, 1.0f),
+                "0x%llx", (unsigned long long)row.static_pc);
+            ImGui::SameLine(0, 6.0f);
+            ImGui::TextColored(inst_color(row.mnemonic), "%s", row.mnemonic.c_str());
+            ImGui::SameLine(0, 4.0f);
+            ImGui::TextColored(ImVec4(0.70f, 0.72f, 0.80f, 1.0f), "%s", row.operands.c_str());
+        }
+    }
+
+    // ─── Right section: active analyses + bookmarks + file ───────────
+    // We compute items right-to-left, accumulate total width, then set cursor.
+    // For simplicity, build a string for the right side and right-align.
+    std::string right;
+
+    // Bookmarks count
+    if (!bookmarks_.empty()) {
+        right += fmt::format("  \xe2\x98\x85 {} bkm", bookmarks_.size());  // ★
+    }
+
+    // Active analyses badges
+    if (show_taint_ && taint_result_) {
+        right += "  [TAINT]";
+    }
+    if (show_backward_taint_ && backward_taint_result_) {
+        right += "  [BT]";
+    }
+    if (show_slice_ && slice_result_) {
+        right += "  [SLICE]";
+    }
+    if (show_loops_ && loop_result_) {
+        right += fmt::format("  [\xe2\x86\xba {}L]", loop_result_->loops.size());  // ↺
+    }
+    if (analysis_running_.load()) {
+        right += "  \xe2\xa3\xbe Analyzing...";  // ⣾
+    }
+
+    // Search result position
+    if (search_active_ && !search_results_.empty()) {
+        right += fmt::format("  Search: {}/{}", search_current_ + 1, search_results_.size());
+    }
+
+    if (!right.empty()) {
+        float text_w = ImGui::CalcTextSize(right.c_str()).x;
+        float win_w  = ImGui::GetWindowWidth();
+        ImGui::SameLine(win_w - text_w - 8.0f);
+        ImGui::TextColored(ImVec4(0.50f, 0.55f, 0.70f, 1.0f), "%s", right.c_str());
+    }
 
     ImGui::End();
 }

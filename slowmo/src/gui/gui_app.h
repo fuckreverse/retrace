@@ -94,12 +94,26 @@ private:
 
     // ─── Search state ─────────────────────────────────────────────────
     char search_buf_[256] = {};
-    char goto_buf_[64] = {};
+    char goto_buf_[128] = {};
     std::vector<uint64_t> search_results_;
     size_t search_current_ = 0;
     bool search_active_ = false;
     bool show_goto_popup_ = false;
     bool show_search_popup_ = false;
+
+    // ─── Goto popup state ────────────────────────────────────────────
+    // Autocomplete candidates: (display string, inst_id to jump to)
+    struct GotoCandidate {
+        std::string display;    // e.g. "sub_1234 (0x1234)"
+        std::string name;       // function name
+        uint64_t    pc;         // function PC
+        uint64_t    inst_id;    // first inst_id of this function
+    };
+    std::vector<GotoCandidate> goto_candidates_;
+    int  goto_selected_candidate_ = -1;   // -1 = no selection
+    bool goto_candidates_dirty_   = true;  // rebuild candidates when functions change
+    void rebuild_goto_candidates();        // populate goto_candidates_ from function_result_
+    void goto_commit(const char* buf);     // parse buf and navigate
 
     // ─── Bookmarks ────────────────────────────────────────────────────
     std::vector<uint64_t> bookmarks_;
@@ -152,18 +166,34 @@ private:
     void open_hex_dump_at(uint64_t addr);
 
     // ─── Right-click context menus ───────────────────────────────────
-    bool show_mem_ctx_menu_ = false;
+    // Context state is set on right-click; popup opened via OpenPopupOnItemClick.
     uint64_t ctx_mem_addr_ = 0;
     uint64_t ctx_mem_inst_id_ = 0;
-    bool show_reg_ctx_menu_ = false;
     uint8_t ctx_reg_idx_ = 0;
     uint64_t ctx_reg_value_ = 0;
-    bool show_callstack_ctx_menu_ = false;
     size_t ctx_callstack_frame_ = 0;
+
+    // Instruction panel context menu state
+    uint64_t ctx_inst_id_ = 0;        // instruction index (0-based)
+    uint64_t ctx_inst_pc_ = 0;        // runtime PC
+    uint64_t ctx_inst_static_pc_ = 0; // static PC (PC - slide)
+    std::string ctx_inst_disasm_;     // disassembly text
+
+    // Function panel context menu state
+    uint64_t ctx_func_pc_ = 0;        // function start PC
+    std::string ctx_func_name_;
+
+    // String panel context menu state
+    uint64_t ctx_string_inst_id_ = 0;
+    std::string ctx_string_text_;
 
     void render_mem_context_menu();
     void render_reg_context_menu();
     void render_callstack_context_menu();
+    void render_inst_context_menu();          // Instruction panel right-click menu (legacy)
+    void render_inst_context_menu_contents(); // Renders only the menu items (no Begin/EndPopup)
+    void render_func_context_menu();          // Function panel right-click menu
+    void render_string_context_menu();        // String panel right-click menu
 
     // ─── Function list state ─────────────────────────────────────────
     char function_filter_buf_[256] = {};
@@ -220,6 +250,7 @@ private:
     void render_frame();
     void render_menu_bar();
     void render_toolbar();
+    void render_status_bar();   // Bottom status bar (VS Code / IDA style)
 
     // ─── Panels (implemented in separate files) ──────────────────────
     void render_instruction_panel();
