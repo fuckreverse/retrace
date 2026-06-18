@@ -130,7 +130,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
             {cf::META, rocksdb::ColumnFamilyOptions()},
             {cf::OFFSET, rocksdb::ColumnFamilyOptions()},
             {cf::ANCHOR, rocksdb::ColumnFamilyOptions()},
-            {cf::MEM_WRITE, rocksdb::ColumnFamilyOptions()},
+            {cf::MEM_WRITE, [](){ rocksdb::ColumnFamilyOptions o; o.compression = rocksdb::kLZ4Compression; return o; }()},
             {cf::REG_WRITES, rocksdb::ColumnFamilyOptions()},
         };
 
@@ -202,7 +202,7 @@ Result<TraceIndex> TraceIndex::build(
     opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
 
     rocksdb::ColumnFamilyOptions mem_write_cf_opts;
-    mem_write_cf_opts.compression = rocksdb::kNoCompression;
+    mem_write_cf_opts.compression = rocksdb::kLZ4Compression;
     // mem_write CF uses SeekForPrev on [page(8B)|offset(2B)|inst_id(8B)] keys.
     // Prefix bloom on the first 10 bytes (page+offset) dramatically speeds up
     // seeks for cold pages by skipping SST files entirely.

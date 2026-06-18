@@ -172,6 +172,14 @@ public:
     void set_scan_engine(TraceScanEngine* e) { scan_engine_ = e; }
     TraceScanEngine* scan_engine() { return scan_engine_; }
 
+    // ─── Memory pressure management ────────────────────────────────────
+
+    /// Set the RSS limit in MB. When exceeded, non-critical passes are skipped.
+    void set_rss_limit_mb(double limit_mb) { rss_limit_mb_ = limit_mb; }
+
+    /// Check if memory pressure is high (RSS > limit).
+    bool is_memory_pressure() const;
+
     // ─── Execution ─────────────────────────────────────────────────────
 
     /// Run a specific pass by name (and all its dependencies).
@@ -235,6 +243,7 @@ private:
     TraceScanEngine* scan_engine_ = nullptr;
 
     AnalysisRange range_;
+    double rss_limit_mb_ = 0.0;  // 0 = no limit (default)
     mutable std::mutex registry_mutex_;  // protects entries_/name_map_ during registration
 
     static PassResult not_found_result_;

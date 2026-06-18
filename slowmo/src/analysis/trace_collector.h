@@ -5,8 +5,11 @@
 #include <string_view>
 #include <functional>
 #include <cstdint>
+#include <memory>
 
 namespace tenet {
+
+class TraceIndex;  // forward declaration
 
 /// Lightweight callback interface for observing trace records during a single sequential scan.
 /// Multiple collectors can run simultaneously on one traversal.
@@ -44,13 +47,30 @@ public:
 
     /// Name of this collector (for debugging).
     virtual std::string_view name() const = 0;
+
+    /// Whether this collector supports parallel scanning (must be thread-safe).
+    /// If true, the scan engine may call on_inst() from multiple threads
+    /// on independent shard clones. Non-INST records (Code, Event, Svc, Thread)
+    /// are NOT delivered during parallel scanning.
+    virtual bool supports_parallel() const { return false; }
+
+    /// Create a clone of this collector for parallel scanning.
+    /// Each shard gets its own clone; after scanning, merge() combines results.
+    /// Returns nullptr if parallel scanning is not supported.
+    virtual std::unique_ptr<TraceCollector> clone() const { return nullptr; }
+
+    /// Merge results from a parallel shard collector into this one.
+    /// Called after all shards finish. `shard` is a clone produced by clone().
+    /// Only called when supports_parallel() returns true.
+    virtual void merge(TraceCollector& shard) { (void)shard; }
 };
 
 /// Engine that performs a single sequential scan and broadcasts to all registered collectors.
 class TraceScanEngine {
 public:
-    TraceScanEngine(const TraceReader& reader, uint64_t inst_count)
-        : reader_(reader), inst_count_(inst_count) {}
+    TraceScanEngine(const TraceReader& reader, uint64_t inst_count,
+                    const TraceIndex* index = nullptr)
+        : reader_(reader), inst_count_(inst_count), index_(index) {}
 
     /// Register a collector. Must be called before run().
     void add_collector(TraceCollector* collector) {
@@ -62,6 +82,27 @@ public:
     /// Returns the number of instructions processed.
     uint64_t run(uint64_t start_inst_id = 0, uint64_t end_inst_id = UINT64_MAX);
 
+    /// Perform a parallel multi-threaded scan.
+    ///
+    /// Collectors that return supports_parallel()==true and provide a valid clone()
+    /// are scanned in parallel using raw pointer parsing (modeled after XrefPass).
+    /// Each shard receives only on_inst() callbacks; non-INST records are not
+    /// delivered during the parallel phase.
+    ///
+    /// Collectors that do NOT support parallel scanning are run sequentially
+    /// in a separate pass (the normal run() path) so correctness is preserved.
+    ///
+    /// After all shards complete, merge() is called on each original collector
+    /// with each of its shard clones.
+    ///
+    /// `num_threads` == 0 means auto-detect from hardware_concurrency().
+    /// Falls back to sequential run() when the trace is small (<50K insts),
+    /// no index is available, or no collectors support parallel scanning.
+    ///
+    /// Returns the number of instructions processed.
+    uint64_t run_parallel(uint64_t start_inst_id = 0, uint64_t end_inst_id = UINT64_MAX,
+                          unsigned num_threads = 0);
+
     /// Set a progress callback: (processed_count, total_count)
     using ProgressFn = std::function<void(uint64_t, uint64_t)>;
     void set_progress(ProgressFn fn) { progress_fn_ = std::move(fn); }
@@ -72,6 +113,7 @@ public:
 private:
     const TraceReader& reader_;
     uint64_t inst_count_;
+    const TraceIndex* index_ = nullptr;
     std::vector<TraceCollector*> collectors_;
     ProgressFn progress_fn_;
     std::function<bool()> cancel_fn_;

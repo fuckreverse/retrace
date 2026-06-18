@@ -47,6 +47,13 @@ void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {
     name_map_[name] = ptr;
 }
 
+// ─── Memory pressure ──────────────────────────────────────────────────────
+
+bool PassManager::is_memory_pressure() const {
+    if (rss_limit_mb_ <= 0.0) return false;
+    return ::tenet::log::rss_mb() > rss_limit_mb_;
+}
+
 // ─── Lock-free fast path + CAS claiming ──────────────────────────────────
 
 const PassResult& PassManager::require(std::string_view pass_name) {
@@ -97,6 +104,20 @@ void PassManager::execute_pass(PassEntry* entry) {
         }
     }
 
+    // Memory pressure check: skip non-critical passes when RSS exceeds limit.
+    // Critical passes (cost < 2.0) always run; others are skipped under pressure.
+    if (is_memory_pressure() && entry->pass->estimated_cost() >= 2.0f) {
+        LOG_WARN("pass '{}': skipped due to memory pressure (RSS {:.0f}MB > {:.0f}MB limit)",
+                 entry->pass->name(), ::tenet::log::rss_mb(), rss_limit_mb_);
+        {
+            std::lock_guard<std::mutex> lk(entry->mtx);
+            entry->result = PassResult::skipped();
+            entry->state.store(PassState::Failed, std::memory_order_release);
+        }
+        entry->cv.notify_all();
+        return;
+    }
+
     // Execute the pass itself.
     LOG_DEBUG("pass '{}': starting", entry->pass->name());
     auto t0  = TENET_TIMER_START();
@@ -129,11 +150,16 @@ void PassManager::execute_pass(PassEntry* entry) {
 // ─── Parallel run_all using topological levels ────────────────────────────
 
 void PassManager::run_all(size_t num_threads) {
+    LOG_INFO("PassManager::run_all: {} passes, {} threads, RSS limit={}MB",
+             entries_.size(), num_threads,
+             rss_limit_mb_ > 0 ? fmt::format("{:.0f}", rss_limit_mb_) : "none");
+
     if (num_threads <= 1) {
         // Sequential fallback: just require each pass.
         for (auto& entry : entries_) {
             require(entry->pass->name());
         }
+        LOG_INFO("PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
         return;
     }
 
@@ -169,6 +195,8 @@ void PassManager::run_all(size_t num_threads) {
             }
         }
     }
+
+    LOG_INFO("PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
 }
 
 // ─── Invalidation ─────────────────────────────────────────────────────────
