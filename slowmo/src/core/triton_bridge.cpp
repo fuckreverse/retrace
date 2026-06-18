@@ -1,5 +1,6 @@
 #include "core/triton_bridge.h"
 #include <mutex>
+#include <shared_mutex>
 
 #ifdef TENET_HAS_TRITON
 #include <triton/context.hpp>
@@ -86,11 +87,34 @@ uint8_t triton_reg_to_gpr_index(triton::arch::register_e reg) {
     return 0xFF;  // not a GPR we track
 }
 
+/// Thread-safe shared semantic cache across TritonPool instances.
+/// Keyed by opcode word (AArch64 fixed 4-byte instructions produce
+/// identical register/memory access sets regardless of PC).
+class SharedSemCache {
+public:
+    std::optional<InstructionSemantics> lookup(uint32_t opcode) const {
+        std::shared_lock<std::shared_mutex> lk(mutex_);
+        auto it = cache_.find(opcode);
+        if (it != cache_.end()) return it->second;
+        return std::nullopt;
+    }
+
+    void insert(uint32_t opcode, const InstructionSemantics& sem) {
+        std::unique_lock<std::shared_mutex> lk(mutex_);
+        cache_.emplace(opcode, sem);
+    }
+
+private:
+    mutable std::shared_mutex mutex_;
+    ankerl::unordered_dense::map<uint32_t, InstructionSemantics> cache_;
+};
+
 }  // anonymous namespace
 
 class TritonBridgeImpl final : public TritonBridgeTaint {
 public:
-    TritonBridgeImpl() {
+    explicit TritonBridgeImpl(std::shared_ptr<SharedSemCache> shared_cache = nullptr)
+        : shared_cache_(std::move(shared_cache)) {
         // Taint context: used by process_instruction / taint_register etc.
         ctx_.setArchitecture(triton::arch::architecture_e::ARCH_AARCH64);
         // Disable symbolic execution (we only need concrete semantics + taint)
@@ -115,9 +139,18 @@ public:
         uint32_t opcode_word = (code_size >= 4)
             ? *reinterpret_cast<const uint32_t*>(code) : 0;
 
+        // Check shared cache first (lock-free read path via shared_mutex)
+        if (shared_cache_) {
+            auto cached = shared_cache_->lookup(opcode_word);
+            if (cached) {
+                cached->pc = pc;
+                return *cached;
+            }
+        }
+
+        // Check local cache (no lock needed, single-threaded per instance)
         auto it = sem_cache_.find(opcode_word);
         if (it != sem_cache_.end()) {
-            // Cache hit: return cached semantics with correct PC
             InstructionSemantics cached = it->second;
             cached.pc = pc;
             return cached;
@@ -201,8 +234,12 @@ public:
 
         sem.expression = disasm;
 
-        // Store in cache (keyed by opcode word — register sets don't depend on PC)
+        // Store in local cache (fast, no lock)
         sem_cache_.emplace(opcode_word, sem);
+        // Propagate to shared cache (thread-safe, visible to other pool instances)
+        if (shared_cache_) {
+            shared_cache_->insert(opcode_word, sem);
+        }
 
         return sem;
     }
@@ -301,9 +338,11 @@ private:
     triton::Context ctx_;       // Taint engine context (stateful across instructions)
     triton::Context sem_ctx_;   // Semantics-only context (stateless, used by query_semantics)
 
-    // Cache: opcode_word → InstructionSemantics (register/memory access sets)
-    // AArch64 has ~65536 possible opcodes in practice; cache grows to ~a few MB max.
+    // Per-instance local cache (fast, no synchronization needed)
     ankerl::unordered_dense::map<uint32_t, InstructionSemantics> sem_cache_;
+
+    // Shared cache across all pool instances (thread-safe via shared_mutex)
+    std::shared_ptr<SharedSemCache> shared_cache_;
 };
 
 #endif  // TENET_HAS_TRITON
@@ -322,9 +361,16 @@ std::unique_ptr<TritonBridge> create_triton_bridge() {
 
 TritonPool::TritonPool(size_t pool_size) {
     pool_.reserve(pool_size);
+#ifdef TENET_HAS_TRITON
+    auto shared_cache = std::make_shared<SharedSemCache>();
+    for (size_t i = 0; i < pool_size; i++) {
+        pool_.push_back(std::make_unique<TritonBridgeImpl>(shared_cache));
+    }
+#else
     for (size_t i = 0; i < pool_size; i++) {
         pool_.push_back(create_triton_bridge());
     }
+#endif
 }
 
 TritonPool::~TritonPool() = default;
