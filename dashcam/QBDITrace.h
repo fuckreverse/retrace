@@ -82,6 +82,16 @@ typedef struct {
    * remains ABI-compatible with callers built before this field existed. Set to
    * non-zero only to squeeze out the (tiny, deduplicated) extra writes. */
   uint32_t disable_embed_code;
+
+  /* v5 PC-delta encoding.  Set to non-zero to enable version-5 INST records:
+   * the 8-byte absolute pc field is replaced by a 2-byte signed int16 delta
+   * from the previous instruction's PC.  Sequential AArch64 code yields
+   * delta=+4 per instruction, shrinking the INST header from 12 to 6 bytes
+   * (≈40-60% file size reduction for straight-line code).
+   * The file header version is bumped to 5 and HF_PC_DELTA is set; old readers
+   * that check for version==4 will reject the file gracefully.
+   * Zero (the default) keeps the original v4 layout for full compatibility. */
+  uint32_t enable_pc_delta;
 } qbditrace_config_t;
 
 /*

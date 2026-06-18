@@ -24,6 +24,17 @@ namespace qbditrace {
 #endif
 
 /* Bump whenever the on-disk layout changes incompatibly.
+ * v5 changes vs v4 (backward-incompatible, gated by HF_PC_DELTA flag):
+ *   - REC_INST uses qbditrace_inst_head_v5_t: the 8-byte absolute `pc` field
+ *     is replaced by a 2-byte signed `pc_delta` (little-endian int16).
+ *     AArch64 sequential execution: delta = +4 (fits in 1-2 bytes after VLE).
+ *     For taken branches / irregular deltas, the writer stores the raw delta;
+ *     if |delta| overflows int16 it falls back to emitting a full ANCHOR first
+ *     (which re-anchors the decoder's running PC) and then delta = ±4.
+ *     The decoder reconstructs the absolute PC as: pc = prev_pc + pc_delta.
+ *     The HF_PC_DELTA flag in the file header activates this layout.
+ *   - No other record types are changed. Readers that do not recognise
+ *     HF_PC_DELTA should reject the file (or treat it as unknown version).
  * v4 changes vs v3:
  *   - New REC_CODE record carries the raw instruction bytes for each distinct
  *     executed PC (emitted once, on first sight). With it the offline decoder
@@ -40,7 +51,8 @@ namespace qbditrace {
  *     than on every sequence entry, removing the dominant space cost.
  */
 #define QBDITRACE_MAGIC 0x51424454u /* "QBDT" */
-#define QBDITRACE_VERSION 4u
+#define QBDITRACE_VERSION 4u  /* writer still produces v4 unless HF_PC_DELTA is set */
+#define QBDITRACE_VERSION_V5_PC_DELTA 5u  /* version tag written when HF_PC_DELTA is used */
 
 /* Architecture tags (kept independent of QBDI enums for decoder portability). */
 typedef enum {
@@ -73,10 +85,17 @@ typedef struct {
 } qbditrace_file_header_t;
 
 typedef enum {
-  QBDITRACE_HF_HAS_MEM = 1u << 0, /* records may carry memory accesses */
+  QBDITRACE_HF_HAS_MEM  = 1u << 0, /* records may carry memory accesses */
   QBDITRACE_HF_HAS_NZCV = 1u << 1,
   QBDITRACE_HF_REG_DIFF = 1u << 2, /* records store reg diff (vs full snapshot) */
   QBDITRACE_HF_HAS_CODE = 1u << 3, /* stream contains REC_CODE (raw insn bytes) */
+  /* v5: REC_INST uses pc_delta (int16) instead of absolute pc (uint64).
+   * The decoder maintains a running `current_pc` and reconstructs each
+   * instruction's absolute address as: current_pc += pc_delta.
+   * Writers that overflow int16 emit an ANCHOR (which carries the full PC)
+   * and resume from delta = 0 after it.
+   * Incompatible with v4 readers — check this flag before parsing. */
+  QBDITRACE_HF_PC_DELTA = 1u << 4,
 } qbditrace_header_flags;
 
 /*
@@ -94,15 +113,20 @@ typedef enum {
 } qbditrace_record_kind_t;
 
 /* ---- QBDITRACE_REC_INST ----
- * Layout (all packed, little-endian):
- *   u8   kind            (== QBDITRACE_REC_INST)
- *   u8   nzcv            (low 4 bits = NZCV; 0 if not captured)
- *   u8   n_regdiff       (number of changed GPRs recorded)
- *   u8   n_mem           (number of memory accesses recorded)
- *   u64  pc              (runtime address of the executed instruction)
- *   n_regdiff * { u8 reg_index; u64 value; }
- *   n_mem      * { u8 mem_type; u8 mem_flags; u16 size; u64 addr;
- *                 u64 value; u64 value_hi; }
+ * On-disk layout: structures are written with std::memcpy(p, &struct, sizeof(struct)),
+ * so the C compiler's natural alignment padding IS present in the stream.
+ * Decoder must use sizeof() to determine field offsets, NOT hand-counted byte sizes.
+ *
+ * Effective sizes on AArch64/x86_64 (64-bit, 8-byte alignment for uint64_t):
+ *   qbditrace_inst_head_t   = 16 bytes  (4B fields + 4B pad + 8B pc)
+ *   qbditrace_inst_head_v5_t = 6 bytes  (4B fields + 2B pc_delta, no pad needed)
+ *   qbditrace_regdiff_t      = 16 bytes (1B reg_index + 7B pad + 8B value)
+ *   qbditrace_memacc_t       = 32 bytes (4B fields + 4B pad + 8B addr + 8B value + 8B value_hi)
+ *
+ * Logical layout (v4, HF_PC_DELTA not set):
+ *   qbditrace_inst_head_t  (16 bytes)
+ *   n_regdiff * qbditrace_regdiff_t  (16 bytes each)
+ *   n_mem      * qbditrace_memacc_t  (32 bytes each)
  *
  * reg_index uses the QBDI GPR ordering (0=x0 ... 30=lr, 31=sp, 32=nzcv, 33=pc).
  * The previous value is NOT stored: the decoder rebuilds the register file from
@@ -120,6 +144,27 @@ typedef struct {
   uint8_t n_mem;
   uint64_t pc;
 } qbditrace_inst_head_t;
+
+/* v5 variant (HF_PC_DELTA): identical to qbditrace_inst_head_t except the
+ * 8-byte absolute `pc` is replaced by a 2-byte signed `pc_delta` (LE int16).
+ * Record size: 6 bytes (vs 12 bytes for v4), reducing the INST record header
+ * size by 50% for sequential code (delta = +4 every instruction).
+ *
+ * The decoder maintains a `running_pc` state variable:
+ *   running_pc += pc_delta   after reading each REC_INST
+ * REC_ANCHOR resets `running_pc` to the anchor's absolute PC (carried in the
+ * anchor's existing `pc` field, which is always 8-byte absolute).
+ *
+ * Writers that produce a delta outside [-32768, +32767] must emit an ANCHOR
+ * immediately before the problematic INST and set pc_delta = 0.
+ */
+typedef struct {
+  uint8_t  kind;
+  uint8_t  nzcv;
+  uint8_t  n_regdiff;
+  uint8_t  n_mem;
+  int16_t  pc_delta; /* signed delta from previous instruction's PC (LE) */
+} qbditrace_inst_head_v5_t;
 
 typedef struct {
   uint8_t reg_index;
