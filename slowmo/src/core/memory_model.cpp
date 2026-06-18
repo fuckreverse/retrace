@@ -14,16 +14,32 @@ namespace tenet {
 // This ensures RocksDB's byte-wise comparator groups by page, then offset, then time.
 // page_offset is the starting offset of the write within the page.
 
+// Stack-local key encoding — zero heap allocation.
+// Returns a Slice pointing into the caller-provided 18-byte buffer.
+// For the hot path (find_covering_write called per-byte), this eliminates
+// millions of std::string constructions during a typical session.
+static inline rocksdb::Slice encode_key_to(uint64_t page_addr, uint16_t page_offset,
+                                            uint64_t inst_id, char buf[18]) {
+#if defined(__GNUC__) || defined(__clang__)
+    uint64_t pa_be = __builtin_bswap64(page_addr);
+    uint64_t id_be = __builtin_bswap64(inst_id);
+#else
+    uint64_t pa_be = 0, id_be = 0;
+    for (int i = 7; i >= 0; --i) pa_be = (pa_be << 8) | ((page_addr >> (i*8)) & 0xFF);
+    for (int i = 7; i >= 0; --i) id_be = (id_be << 8) | ((inst_id >> (i*8)) & 0xFF);
+#endif
+    std::memcpy(buf, &pa_be, 8);
+    buf[8] = static_cast<char>((page_offset >> 8) & 0xFF);
+    buf[9] = static_cast<char>(page_offset & 0xFF);
+    std::memcpy(buf + 10, &id_be, 8);
+    return rocksdb::Slice(buf, 18);
+}
+
+// Legacy heap-allocating version (kept for compatibility with external callers)
 std::string MemoryModel::encode_key(uint64_t page_addr, uint16_t page_offset, uint64_t inst_id) {
-    std::string key(KEY_SIZE, '\0');
-    // page_addr big-endian
-    for (int i = 7; i >= 0; --i) key[7 - i] = static_cast<char>((page_addr >> (i * 8)) & 0xFF);
-    // page_offset big-endian
-    key[8] = static_cast<char>((page_offset >> 8) & 0xFF);
-    key[9] = static_cast<char>(page_offset & 0xFF);
-    // inst_id big-endian
-    for (int i = 7; i >= 0; --i) key[10 + (7 - i)] = static_cast<char>((inst_id >> (i * 8)) & 0xFF);
-    return key;
+    char buf[18];
+    encode_key_to(page_addr, page_offset, inst_id, buf);
+    return std::string(buf, 18);
 }
 
 void MemoryModel::decode_key(const rocksdb::Slice& key,
@@ -222,7 +238,8 @@ void MemoryModel::find_covering_write(rocksdb::Iterator* iter,
     //   - If entry_offset + write_size > target_offset: this write covers our byte!
     //     (i.e., entry_offset <= target_offset && entry_offset + write_size - 1 >= target_offset)
 
-    auto seek_key = encode_key(page, target_offset, at_inst_id);
+    char seek_key_buf[KEY_SIZE];
+    auto seek_key = encode_key_to(page, target_offset, at_inst_id, seek_key_buf);
     iter->SeekForPrev(seek_key);
 
     uint16_t min_offset = (target_offset >= (MAX_WRITE_SIZE - 1))
