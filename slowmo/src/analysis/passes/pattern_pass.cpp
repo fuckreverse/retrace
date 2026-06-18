@@ -569,45 +569,35 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
 
 // ─── Buffer construction ──────────────────────────────────────────────────
 
+// ── MERGED: build both reg_value and syscall buffers in a single trace scan ──
+// Previously these were 2 independent full-trace scans. For a 1GB trace with
+// 100M instructions, each scan takes ~3 seconds; merging saves ~3 seconds total.
+
 PatternPass::RegValueBuffer PatternPass::build_reg_value_buffer(PassContext& ctx) {
-    RegValueBuffer buf;
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    buf.data.reserve((end - start) * 2 * 8);
-    buf.offset_to_inst_id.reserve((end - start) * 2);
-
-    uint64_t inst_id = 0;
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            if (diff.index >= 31 && diff.index <= 33) continue;
-
-            uint64_t val = diff.value;
-            const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
-            buf.data.insert(buf.data.end(), bytes, bytes + 8);
-            buf.offset_to_inst_id.push_back(inst_id);
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) break;
-    }
-
-    return buf;
+    // Delegate to the merged builder
+    RegValueBuffer reg_buf;
+    SyscallBuffer sys_buf;
+    build_buffers_merged(ctx, reg_buf, sys_buf);
+    cached_syscall_buf_ = std::move(sys_buf);
+    return reg_buf;
 }
 
 PatternPass::SyscallBuffer PatternPass::build_syscall_buffer(PassContext& ctx) {
+    // If already built by the merged scan, return cached result
+    if (!cached_syscall_buf_.entries.empty() || cached_syscall_buf_built_) {
+        cached_syscall_buf_built_ = false;
+        return std::move(cached_syscall_buf_);
+    }
+    // Fallback: build standalone (shouldn't happen in normal flow)
+    RegValueBuffer dummy_reg;
     SyscallBuffer buf;
+    build_buffers_merged(ctx, dummy_reg, buf);
+    return buf;
+}
+
+void PatternPass::build_buffers_merged(PassContext& ctx,
+                                        RegValueBuffer& reg_buf,
+                                        SyscallBuffer& sys_buf) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& regfile = ctx.regfile();
@@ -619,7 +609,22 @@ PatternPass::SyscallBuffer PatternPass::build_syscall_buffer(PassContext& ctx) {
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
+    // Pre-allocate reg_value buffer
+    reg_buf.data.reserve((end - start) * 2 * 8);
+    reg_buf.offset_to_inst_id.reserve((end - start) * 2);
+
+    // Pre-compute SVC PC set for O(1) lookup (avoids per-inst decoder.decode())
+    ankerl::unordered_dense::set<uint64_t> svc_pcs;
+    for (const auto& [pc, opcode] : code_table) {
+        auto decoded = decoder.decode(pc, opcode);
+        if (decoded && decoded->mnemonic_sv() == "svc") {
+            svc_pcs.insert(pc);
+        }
+    }
+
     uint64_t inst_id = 0;
+    reader.advise_sequential();
+
     for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
@@ -627,30 +632,39 @@ PatternPass::SyscallBuffer PatternPass::build_syscall_buffer(PassContext& ctx) {
 
         auto inst = rec.as_inst();
 
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (opcode_opt) {
-            auto decoded = decoder.decode(inst.pc, *opcode_opt);
-            if (decoded && decoded->mnemonic_sv() == "svc") {
-                auto state = regfile.state_before(inst_id);
-                uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
+        // ── Collect reg-value entries ──
+        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+            auto diff = inst.reg_diff(i);
+            if (diff.index >= 31 && diff.index <= 33) continue;
 
-                SyscallEntry entry;
-                entry.inst_id = inst_id;
-                entry.syscall_no = syscall_no;
-                buf.entries.push_back(entry);
+            uint64_t val = diff.value;
+            const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
+            reg_buf.data.insert(reg_buf.data.end(), bytes, bytes + 8);
+            reg_buf.offset_to_inst_id.push_back(inst_id);
+        }
 
-                uint8_t record[SYSCALL_ENTRY_SIZE] = {};
-                std::memcpy(record, &inst_id, 8);
-                std::memcpy(record + 8, &syscall_no, 2);
-                buf.data.insert(buf.data.end(), record, record + SYSCALL_ENTRY_SIZE);
-            }
+        // ── Collect syscall entries (SVC instructions only) ──
+        if (svc_pcs.contains(inst.pc)) {
+            auto state = regfile.state_before(inst_id);
+            uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
+
+            SyscallEntry entry;
+            entry.inst_id = inst_id;
+            entry.syscall_no = syscall_no;
+            sys_buf.entries.push_back(entry);
+
+            uint8_t record[SYSCALL_ENTRY_SIZE] = {};
+            std::memcpy(record, &inst_id, 8);
+            std::memcpy(record + 8, &syscall_no, 2);
+            sys_buf.data.insert(sys_buf.data.end(), record, record + SYSCALL_ENTRY_SIZE);
         }
 
         inst_id++;
         if (ctx.cancelled()) break;
     }
 
-    return buf;
+    reader.advise_random();
+    cached_syscall_buf_built_ = true;
 }
 
 PatternPass::CodeBuffer PatternPass::build_code_buffer(PassContext& ctx) {

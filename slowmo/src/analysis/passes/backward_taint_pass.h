@@ -112,6 +112,13 @@ struct BackwardTaintConfig {
 
     /// Compute per-sink attribution tags.
     bool per_sink_tags = true;
+
+    /// Use REG_WRITES inverted index for O(log N) backward jumps.
+    /// When true (default), for each needed register in the current state
+    /// the pass jumps directly to its last writer (via TraceIndex::find_last_writer_of)
+    /// instead of stepping backward one instruction at a time.
+    /// Disable only for debugging or when REG_WRITES CF is absent.
+    bool use_index_acceleration = true;
 };
 
 /// Backward taint analysis pass result.
@@ -210,7 +217,7 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
-        return {};  // Runs standalone, uses index for random access
+        return {};  // Runs standalone; uses REG_WRITES index for acceleration when available
     }
 
     PassResult run(PassContext& ctx) override;

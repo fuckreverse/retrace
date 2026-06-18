@@ -35,8 +35,8 @@ PassResult SlicePass::run(PassContext& ctx) {
         current_id--;
         steps++;
 
-        uint64_t offset = index.offset_of(current_id, reader);
-        auto rec = reader.record_at(offset);
+        auto [offset, seed_pc] = index.offset_of_with_pc(current_id, reader);
+        auto rec = reader.record_at(offset, seed_pc);
         if (rec.kind != RecordKind::Inst) continue;
 
         auto inst = rec.as_inst();

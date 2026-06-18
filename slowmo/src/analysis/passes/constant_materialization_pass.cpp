@@ -220,6 +220,231 @@ void ConstantMaterializationPass::build_known_db() {
     // ── BLAKE2b IV ───────────────────────────────────────────────────────
     // (Same as SHA-512 H values, already registered above)
 
+    // ── SHA-256 round constants K[16..63] ─────────────────────────────────
+    static const uint32_t sha256_k_rest[] = {
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    for (int i = 0; i < 48; i++) {
+        add(sha256_k_rest[i],
+            fmt::format("SHA256_K{}", i + 16).c_str(),
+            "SHA-256",
+            fmt::format("Round constant K[{}]", i + 16).c_str(),
+            true);
+    }
+
+    // ── SHA-384 initial hash values (different from SHA-512) ──────────────
+    add(0xcbbb9d5dc1059ed8ULL, "SHA384_H0", "SHA-384", "Initial hash value H0");
+    add(0x629a292a367cd507ULL, "SHA384_H1", "SHA-384", "Initial hash value H1");
+    add(0x9159015a3070dd17ULL, "SHA384_H2", "SHA-384", "Initial hash value H2");
+    add(0x152fecd8f70e5939ULL, "SHA384_H3", "SHA-384", "Initial hash value H3");
+    add(0x67332667ffc00b31ULL, "SHA384_H4", "SHA-384", "Initial hash value H4");
+    add(0x8eb44a8768581511ULL, "SHA384_H5", "SHA-384", "Initial hash value H5");
+    add(0xdb0c2e0d64f98fa7ULL, "SHA384_H6", "SHA-384", "Initial hash value H6");
+    add(0x47b5481dbefa4fa4ULL, "SHA384_H7", "SHA-384", "Initial hash value H7");
+
+    // ── SHA-512 round constants K[0..79] ──────────────────────────────────
+    static const uint64_t sha512_k[] = {
+        0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
+        0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+        0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
+        0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+        0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL,
+        0xc19bf174cf692694ULL, 0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+        0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL, 0x2de92c6f592b0275ULL,
+        0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+        0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL,
+        0xbf597fc7beef0ee4ULL, 0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+        0x06ca6351e003826fULL, 0x142929670a0e6e70ULL, 0x27b70a8546d22ffcULL,
+        0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+        0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL,
+        0x92722c851482353bULL, 0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+        0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL, 0xd192e819d6ef5218ULL,
+        0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+        0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL,
+        0x34b0bcb5e19b48a8ULL, 0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+        0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL, 0x748f82ee5defb2fcULL,
+        0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+        0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL,
+        0xc67178f2e372532bULL, 0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+        0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL,
+        0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+        0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
+        0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+        0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+    };
+    for (int i = 0; i < 80; i++) {
+        add(sha512_k[i],
+            fmt::format("SHA512_K{}", i).c_str(),
+            "SHA-512",
+            fmt::format("Round constant K[{}]", i).c_str());
+    }
+
+    // ── MD5 sine table T[9..64] ───────────────────────────────────────────
+    static const uint32_t md5_t_rest[] = {
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    };
+    for (int i = 0; i < 56; i++) {
+        add(md5_t_rest[i],
+            fmt::format("MD5_T{}", i + 9).c_str(),
+            "MD5",
+            fmt::format("Sine table T[{}]", i + 9).c_str(),
+            true);
+    }
+
+    // ── SM4 constant key CK[4..31] ───────────────────────────────────────
+    static const uint32_t sm4_ck_rest[] = {
+        0x70777e85, 0x8c939aa1, 0xa8afb6bd, 0xc4cbd2d9,
+        0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249,
+        0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9,
+        0xc0c7ced5, 0xdce3eaf1, 0xf8ff060d, 0x141b2229,
+        0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
+        0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209,
+        0x10171e25, 0x2c333a41, 0x484f565d, 0x646b7279,
+    };
+    for (int i = 0; i < 28; i++) {
+        add(sm4_ck_rest[i],
+            fmt::format("SM4_CK{}", i + 4).c_str(),
+            "SM4",
+            fmt::format("Constant key CK[{}]", i + 4).c_str(),
+            true);
+    }
+
+    // ── Keccak/SHA-3 round constants (24 rounds) ──────────────────────────
+    static const uint64_t keccak_rc[] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
+        0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
+        0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008aULL,
+        0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL,
+        0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
+        0x000000000000800aULL, 0x800000008000000aULL, 0x8000000080008081ULL,
+        0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL,
+    };
+    for (int i = 0; i < 24; i++) {
+        add(keccak_rc[i],
+            fmt::format("KECCAK_RC{}", i).c_str(),
+            "SHA-3/Keccak",
+            fmt::format("Round constant iota[{}]", i).c_str());
+    }
+
+    // ── SipHash IV constants ──────────────────────────────────────────────
+    add(0x736f6d6570736575ULL, "SIPHASH_IV0", "SipHash", "IV 'somepseu'");
+    add(0x646f72616e646f6dULL, "SIPHASH_IV1", "SipHash", "IV 'dorandom'");
+    add(0x6c7967656e657261ULL, "SIPHASH_IV2", "SipHash", "IV 'lygenera'");
+    add(0x7465646279746573ULL, "SIPHASH_IV3", "SipHash", "IV 'tedbytes'");
+
+    // ── HMAC padding constants ────────────────────────────────────────────
+    add(0x36363636, "HMAC_IPAD", "HMAC", "Inner padding (ipad) repeated", true);
+    add(0x5c5c5c5c, "HMAC_OPAD", "HMAC", "Outer padding (opad) repeated", true);
+    add(0x3636363636363636ULL, "HMAC_IPAD64", "HMAC", "Inner padding (ipad) 64-bit");
+    add(0x5c5c5c5c5c5c5c5cULL, "HMAC_OPAD64", "HMAC", "Outer padding (opad) 64-bit");
+
+    // ── Poly1305 clamp mask ───────────────────────────────────────────────
+    add(0x0ffffffc0ffffffcULL, "POLY1305_CLAMP", "Poly1305", "Clamp mask (low 64 bits)");
+    add(0x0ffffffc0fffffffULL, "POLY1305_CLAMP_HI", "Poly1305", "Clamp mask (high 64 bits)");
+
+    // ── GCM/GHASH polynomial ──────────────────────────────────────────────
+    add(0xE1000000, "GCM_POLY", "GCM", "Irreducible polynomial (0xE1 << 24)", true);
+    add(0x00000000000000E1ULL, "GCM_POLY64", "GCM", "Irreducible polynomial (64-bit)");
+    add(0xC200000000000000ULL, "GCM_POLY_REV", "GCM", "Reversed polynomial for PMULL");
+
+    // ── RIPEMD-160 initial values ─────────────────────────────────────────
+    // (Same as MD5/SHA-1: 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, already registered)
+    add(0xC3D2E1F0, "RIPEMD160_H4", "RIPEMD-160", "Initial hash value H4", true);
+
+    // ── Whirlpool round constants ─────────────────────────────────────────
+    add(0x1823c6e887b8014fULL, "WHIRLPOOL_RC0", "Whirlpool", "Round constant RC[0]");
+    add(0x36a6d2f5796f9152ULL, "WHIRLPOOL_RC1", "Whirlpool", "Round constant RC[1]");
+    add(0x60bc9b8ea30c7b35ULL, "WHIRLPOOL_RC2", "Whirlpool", "Round constant RC[2]");
+    add(0x1de0d7c22e4bfe57ULL, "WHIRLPOOL_RC3", "Whirlpool", "Round constant RC[3]");
+    add(0x157737e59ff04adaULL, "WHIRLPOOL_RC4", "Whirlpool", "Round constant RC[4]");
+    add(0x58c9290ab1a06b85ULL, "WHIRLPOOL_RC5", "Whirlpool", "Round constant RC[5]");
+    add(0xbd5d10f4cb3e0567ULL, "WHIRLPOOL_RC6", "Whirlpool", "Round constant RC[6]");
+    add(0xe427418ba77d95d8ULL, "WHIRLPOOL_RC7", "Whirlpool", "Round constant RC[7]");
+    add(0xfbee7c66dd17479eULL, "WHIRLPOOL_RC8", "Whirlpool", "Round constant RC[8]");
+    add(0xca2dbf07ad5a8333ULL, "WHIRLPOOL_RC9", "Whirlpool", "Round constant RC[9]");
+
+    // ── Camellia sigma constants ──────────────────────────────────────────
+    add(0xA09E667F3BCC908BULL, "CAMELLIA_SIGMA1", "Camellia", "Sigma constant 1");
+    add(0xB67AE8584CAA73B2ULL, "CAMELLIA_SIGMA2", "Camellia", "Sigma constant 2");
+    add(0xC6EF372FE94F82BEULL, "CAMELLIA_SIGMA3", "Camellia", "Sigma constant 3");
+    add(0x54FF53A5F1D36F1CULL, "CAMELLIA_SIGMA4", "Camellia", "Sigma constant 4");
+    add(0x10E527FADE682D1DULL, "CAMELLIA_SIGMA5", "Camellia", "Sigma constant 5");
+    add(0xB05688C2B3E6C1FDULL, "CAMELLIA_SIGMA6", "Camellia", "Sigma constant 6");
+
+    // ── ECDSA P-256 curve parameters (64-bit fragments) ───────────────────
+    add(0xFFFFFFFF00000001ULL, "P256_P_HI", "ECDSA-P256", "Prime p high 64 bits");
+    add(0x0000000000000000ULL, "P256_P_MID", "ECDSA-P256", "Prime p mid (skip, too common)");
+    add(0x00000000FFFFFFFFULL, "P256_P_LO", "ECDSA-P256", "Prime p low fragment");
+    add(0xFFFFFFFF00000000ULL, "P256_A", "ECDSA-P256", "Curve param a = p-3 (high)");
+    add(0x5AC635D8AA3A93E7ULL, "P256_B_HI", "ECDSA-P256", "Curve param b (high 64)");
+
+    // ── Ed25519 constants ─────────────────────────────────────────────────
+    add(0x75EB4DCA135978A3ULL, "ED25519_D_LO", "Ed25519", "Curve constant d (low 64 bits)");
+    add(0x00000000000014DEULL, "ED25519_COFACTOR", "Ed25519", "Cofactor value");
+
+    // ── ZUC (Chinese stream cipher) constants ─────────────────────────────
+    add(0x44D7, "ZUC_D1", "ZUC", "Linear constant d1", true);
+    add(0x26BC, "ZUC_D2", "ZUC", "Linear constant d2", true);
+    add(0x626B, "ZUC_D3", "ZUC", "Linear constant d3", true);
+    add(0x135E, "ZUC_D4", "ZUC", "Linear constant d4", true);
+    add(0x5789, "ZUC_D5", "ZUC", "Linear constant d5", true);
+    add(0x35E2, "ZUC_D6", "ZUC", "Linear constant d6", true);
+    add(0x7135, "ZUC_D7", "ZUC", "Linear constant d7", true);
+    add(0x09AF, "ZUC_D8", "ZUC", "Linear constant d8", true);
+
+    // ── Salsa20 tau constant (16-byte key variant) ────────────────────────
+    add(0x61707865, "SALSA20_TAU0", "Salsa20", "Tau 'expa' (same as ChaCha)", true);
+    add(0x3120646e, "SALSA20_TAU1", "Salsa20", "Tau 'nd 1'", true);
+    add(0x79622d36, "SALSA20_TAU2", "Salsa20", "Tau '6-by'", true);
+    add(0x6b206574, "SALSA20_TAU3", "Salsa20", "Tau 'te k' (same as ChaCha)", true);
+
+    // ── Blowfish P-array [4..17] ──────────────────────────────────────────
+    add(0xA4093822, "BF_P4",  "Blowfish", "P-array P[4]", true);
+    add(0x299F31D0, "BF_P5",  "Blowfish", "P-array P[5]", true);
+    add(0x082EFA98, "BF_P6",  "Blowfish", "P-array P[6]", true);
+    add(0xEC4E6C89, "BF_P7",  "Blowfish", "P-array P[7]", true);
+    add(0x452821E6, "BF_P8",  "Blowfish", "P-array P[8]", true);
+    add(0x38D01377, "BF_P9",  "Blowfish", "P-array P[9]", true);
+    add(0xBE5466CF, "BF_P10", "Blowfish", "P-array P[10]", true);
+    add(0x34E90C6C, "BF_P11", "Blowfish", "P-array P[11]", true);
+    add(0xC0AC29B7, "BF_P12", "Blowfish", "P-array P[12]", true);
+    add(0xC97C50DD, "BF_P13", "Blowfish", "P-array P[13]", true);
+    add(0x3F84D5B5, "BF_P14", "Blowfish", "P-array P[14]", true);
+    add(0xB5470917, "BF_P15", "Blowfish", "P-array P[15]", true);
+    add(0x9216D5D9, "BF_P16", "Blowfish", "P-array P[16]", true);
+    add(0x8979FB1B, "BF_P17", "Blowfish", "P-array P[17]", true);
+
+    // ── DES initial/final permutation constants ───────────────────────────
+    add(0x0F0F0F0F, "DES_MASK_NIBBLE", "DES", "Nibble mask for IP/FP", true);
+    add(0x00FF00FF, "DES_MASK_BYTE", "DES", "Byte mask for IP/FP", true);
+    add(0x33333333, "DES_MASK_2BIT", "DES", "2-bit group mask for IP/FP", true);
+    add(0x55555555, "DES_MASK_BIT", "DES", "Bit interleave mask for IP/FP", true);
+
     // ── Miscellaneous magic numbers ──────────────────────────────────────
     add(0xDEADBEEF, "DEADBEEF", "Debug", "Debug magic 0xDEADBEEF", true);
     add(0xCAFEBABE, "CAFEBABE", "Java", "Java class file magic", true);

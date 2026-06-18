@@ -150,6 +150,9 @@ private:
     };
     SyscallBuffer build_syscall_buffer(PassContext& ctx);
 
+    /// Merged builder: constructs both reg_value and syscall buffers in one scan.
+    void build_buffers_merged(PassContext& ctx, RegValueBuffer& reg_buf, SyscallBuffer& sys_buf);
+
     /// Build the code buffer (continuous opcode bytes from code table).
     struct CodeBuffer {
         std::vector<uint8_t> data;
@@ -176,6 +179,10 @@ private:
     YR_RULES* yr_rules_ = nullptr;
 #endif
     bool rules_loaded_ = false;
+
+    // Cached syscall buffer from merged build (avoids redundant scan)
+    SyscallBuffer cached_syscall_buf_;
+    bool cached_syscall_buf_built_ = false;
 };
 
 }  // namespace tenet

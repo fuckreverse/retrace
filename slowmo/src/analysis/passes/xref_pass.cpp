@@ -32,35 +32,53 @@ namespace tenet {
 namespace {
 
 /// Compute record size from raw pointer (avoids virtual dispatch and RecordView overhead)
-inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr) {
+/// All sizes include compiler alignment padding (structures NOT packed):
+///   qbditrace_inst_head_t    = 16 (4B fields + 4B pad + 8B pc)
+///   qbditrace_regdiff_t      = 16 (1B index + 7B pad + 8B value)
+///   qbditrace_memacc_t       = 32 (4B fields + 4B pad + 8B addr + 8B value + 8B value_hi)
+///   qbditrace_anchor_head_t  = 16 (4B fields + 4B pad + 8B pc)
+///   qbditrace_thread_head_t  = 16 (4B fields + 4B pad + 8B thread_id)
+///   qbditrace_event_head_t   = 24 (4B fields + 4B pad + 8B addr + 8B site)
+///   qbditrace_svc_head_t     = 72 (4B+4B pad+8B pc+8B syscall_no+48B args)
+///   qbditrace_objc_head_t    = 80 (4B+4B pad+8B pc+8B recv+8B sel+48B cls)
+///   qbditrace_code_head_t    = 16 (4B fields + 4B pad + 8B pc)
+/// This function handles v4 (absolute PC) only.
+/// For v5 (HF_PC_DELTA), the caller must use is_v5 flag and sizeof(inst_head_v5_t)=6.
+inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr, bool is_v5 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
         uint8_t n_mem = ptr[3];
-        return 12 + n_regdiff * 9 + n_mem * 28;
+        size_t hdr = is_v5
+            ? sizeof(qbditrace::qbditrace_inst_head_v5_t)    // 6 bytes
+            : sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
+        return hdr
+            + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
+            + n_mem     * sizeof(qbditrace::qbditrace_memacc_t);    // 32 bytes each
     }
     case 1: // ANCHOR
-        return 12 + num_gpr * 8;
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;   // 16 + N*8
     case 2: // THREAD
-        return 12;
+        return sizeof(qbditrace::qbditrace_thread_head_t);  // 16
     case 3: // EVENT
-        return 20;
+        return sizeof(qbditrace::qbditrace_event_head_t);   // 24
     case 4: // SVC
-        return 60;
+        return sizeof(qbditrace::qbditrace_svc_head_t);     // 72
     case 5: // OBJC
-        return 72;
+        return sizeof(qbditrace::qbditrace_objc_head_t);    // 80
     case 6: // CODE
-        return 12 + ptr[1];
+        return sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];  // 16 + size
     default:
         return 1; // shouldn't happen
     }
 }
 
-/// Extract PC from an INST record (at offset 4, little-endian u64)
+/// Extract PC from a v4 INST record.
+/// qbditrace_inst_head_t layout: kind(1)+nzcv(1)+n_regdiff(1)+n_mem(1)+pad(4)+pc(8)
+/// PC is at byte offset 8 (not 4!), due to alignment padding before the uint64_t field.
 inline uint64_t raw_inst_pc(const uint8_t* ptr) {
-    uint64_t pc;
-    std::memcpy(&pc, ptr + 4, 8);
-    return pc;
+    const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
+    return hdr->pc;
 }
 
 /// Determine hardware concurrency, capped to reasonable values
@@ -146,9 +164,12 @@ void scan_shard(const Shard& shard, uint32_t num_gpr, ShardResult& out) {
             }
 
             // Advance past INST record
+            // sizeof(qbditrace_inst_head_t)=16, sizeof(regdiff)=16, sizeof(memacc)=32
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
-            ptr += 12 + n_regdiff * 9 + n_mem * 28;
+            ptr += sizeof(qbditrace::qbditrace_inst_head_t)
+                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_mem     * sizeof(qbditrace::qbditrace_memacc_t);
             inst_id++;
         } else {
             // Non-INST record: skip it (doesn't increment inst_id)
