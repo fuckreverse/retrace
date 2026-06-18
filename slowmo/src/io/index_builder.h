@@ -33,6 +33,13 @@ namespace cf {
     constexpr const char* OFFSET     = "offset";     // sparse inst_id → file_offset
     constexpr const char* ANCHOR     = "anchor";     // anchor sequential id → file_offset
     constexpr const char* MEM_WRITE  = "mem_write";  // [page|byte_off|inst_id] → byte_val
+    // REG_WRITES: inverted index for fast "find last writer of register R before inst_id".
+    // Key format (10 bytes, big-endian for correct sort order):
+    //   u16 reg_index (0..33)  +  u64 inst_id
+    // Value: empty (key encodes all needed info).
+    // SeekForPrev on key=(reg, inst_id) returns the largest entry ≤ (reg, inst_id),
+    // giving the most recent write of that register in O(log N) instead of O(N).
+    constexpr const char* REG_WRITES = "reg_writes"; // (reg_idx << 48 | inst_id) → ""
 }
 
 /// Manages the RocksDB-based trace index.
@@ -55,9 +62,23 @@ public:
         const TraceReader& reader,
         ProgressCallback progress = nullptr);
 
+    /// Result of offset_of_with_pc(): file offset + resolved PC at that offset.
+    /// `seed_pc` is only meaningful for v5 (HF_PC_DELTA) traces;
+    /// it equals the absolute PC of the target instruction so callers can
+    /// create a seeded Iterator or directly call as_inst() correctly.
+    struct OffsetResult {
+        uint64_t offset;    ///< byte offset into the trace file
+        uint64_t seed_pc;   ///< resolved PC of the instruction at `offset`
+    };
+
     /// Get file offset for a given inst_id.
     /// Uses sparse index (every 256th inst) + linear scan.
+    /// Compatible with both v4 and v5 traces (correct byte-size calculation).
     uint64_t offset_of(uint64_t inst_id, const TraceReader& reader) const;
+
+    /// Like offset_of() but also returns the resolved absolute PC of the target
+    /// instruction. Required for correctly calling as_inst() on v5 traces.
+    OffsetResult offset_of_with_pc(uint64_t inst_id, const TraceReader& reader) const;
 
     /// Find the nearest anchor at or before the given inst_id.
     /// Returns (anchor_sequential_index, file_offset, inst_id_of_anchor).
@@ -67,6 +88,14 @@ public:
         uint64_t inst_id;  // the inst_id at which this anchor appears
     };
     AnchorInfo nearest_anchor_before(uint64_t inst_id) const;
+
+    /// Find the most recent instruction before `before_id` that wrote `reg_idx`.
+    /// Uses the REG_WRITES inverted index: O(log N) via RocksDB SeekForPrev.
+    /// Returns the inst_id of the last writer, or 0 if no writer exists.
+    /// Falls back to linear scan (offset_of + iterate) when REG_WRITES CF is absent
+    /// (e.g., old cache rebuilt before this CF was introduced).
+    uint64_t find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
+                                 const TraceReader& reader) const;
 
     /// Get total instruction count in the trace.
     uint64_t inst_count() const { return stats_.inst_count; }

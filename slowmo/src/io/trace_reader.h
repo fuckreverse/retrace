@@ -31,34 +31,45 @@ struct InstView {
     uint8_t mem_access_count;
     const uint8_t* raw_diffs;   // points into mmap region
     const uint8_t* raw_mems;    // points into mmap region
+    bool is_v5 = false;         // true when record uses v5 (pc_delta) layout
 
     RegDiffView reg_diff(uint8_t i) const {
-        // Each regdiff is 9 bytes: u8 index + u64 value (packed, little-endian)
-        const uint8_t* p = raw_diffs + i * 9;
+        // qbditrace_regdiff_t: u8 reg_index @0, pad[7], u64 value @8
+        // stride = sizeof(qbditrace_regdiff_t) (includes padding)
+        const uint8_t* p = raw_diffs + i * sizeof(qbditrace::qbditrace_regdiff_t);
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(p);
         RegDiffView d;
-        d.index = p[0];
-        std::memcpy(&d.value, p + 1, 8);
+        d.index = hdr->reg_index;
+        d.value = hdr->value;
         return d;
     }
 
     MemAccessView mem_access(uint8_t i) const {
-        // Each memacc is 28 bytes: u8+u8+u16+u64+u64+u64
-        const uint8_t* p = raw_mems + i * 28;
+        // qbditrace_memacc_t: u8+u8+u16 @0-3, pad[4], u64 addr @8, u64 value @16, u64 value_hi @24
+        // stride = sizeof(qbditrace_memacc_t) (includes padding)
+        const uint8_t* p = raw_mems + i * sizeof(qbditrace::qbditrace_memacc_t);
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_memacc_t*>(p);
         MemAccessView m;
-        m.type = p[0];
-        m.flags = p[1];
-        std::memcpy(&m.size, p + 2, 2);
-        std::memcpy(&m.addr, p + 4, 8);
-        std::memcpy(&m.value, p + 12, 8);
-        std::memcpy(&m.value_hi, p + 20, 8);
+        m.type = hdr->mem_type;
+        m.flags = hdr->mem_flags;
+        m.size = hdr->size;
+        m.addr = hdr->addr;
+        m.value = hdr->value;
+        m.value_hi = hdr->value_hi;
         return m;
     }
 
     // Total byte size of this INST record
     size_t byte_size() const {
-        return sizeof(qbditrace::qbditrace_inst_head_t) +
-               reg_diff_count * 9 +
-               mem_access_count * 28;
+        size_t hdr = is_v5
+            ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
+            : sizeof(qbditrace::qbditrace_inst_head_t);
+        // Use sizeof() to respect struct alignment padding in the on-disk layout.
+        // qbditrace_regdiff_t: reg_index(u8) + pad(7) + value(u64) = 16 bytes
+        // qbditrace_memacc_t:  type+flags+size(4) + pad(4) + addr+value+value_hi = 32 bytes
+        return hdr
+            + reg_diff_count  * sizeof(qbditrace::qbditrace_regdiff_t)
+            + mem_access_count * sizeof(qbditrace::qbditrace_memacc_t);
     }
 };
 
@@ -128,6 +139,12 @@ struct RecordView {
     uint64_t file_offset;
     const uint8_t* raw_ptr;  // start of record in mmap
 
+    // When HF_PC_DELTA is active, the Iterator reconstructs the absolute PC
+    // and stores it here so callers always get the resolved address.
+    // In v4 mode this field is unused (as_inst() reads pc directly from raw_ptr).
+    // For random-access via record_at(offset, seed_pc), the caller supplies seed_pc.
+    uint64_t resolved_pc = 0;  // filled by Iterator in v5 mode, or by record_at(offset, seed_pc)
+
     // Parse helpers (caller checks kind first)
     InstView as_inst() const;
     AnchorView as_anchor(uint32_t num_gpr) const;
@@ -191,21 +208,39 @@ public:
     /// Get a RecordView at a given file offset.
     RecordView record_at(uint64_t offset) const;
 
+    /// Get a RecordView at a given file offset, with a pre-resolved absolute PC.
+    /// Use this for v5 (HF_PC_DELTA) traces when calling as_inst() on a record
+    /// obtained via random access (not Iterator). `seed_pc` is the absolute PC of
+    /// the instruction at `offset`, as computed by offset_of_with_pc().
+    RecordView record_at(uint64_t offset, uint64_t seed_pc) const {
+        RecordView rv = record_at(offset);
+        rv.resolved_pc = seed_pc;
+        return rv;
+    }
+
     // ─── Sequential iteration ───────────────────────────────────────────
 
     class Iterator {
     public:
         Iterator(const TraceReader* reader, uint64_t offset)
-            : reader_(reader), offset_(offset) {}
+            : reader_(reader), offset_(offset), current_pc_(0) {}
 
-        RecordView operator*() const { return reader_->record_at(offset_); }
+        // Constructor with a pre-seeded `current_pc` for v5 mid-stream seek.
+        Iterator(const TraceReader* reader, uint64_t offset, uint64_t seed_pc)
+            : reader_(reader), offset_(offset), current_pc_(seed_pc) {}
+
+        RecordView operator*() const;
         Iterator& operator++();
         bool operator==(const Iterator& other) const { return offset_ >= other.offset_; }
         bool operator!=(const Iterator& other) const { return !(*this == other); }
 
+        /// Current PC state (valid after at least one INST record in v5 mode).
+        uint64_t current_pc() const { return current_pc_; }
+
     private:
         const TraceReader* reader_;
         uint64_t offset_;
+        mutable uint64_t current_pc_;  // running PC for HF_PC_DELTA reconstruction
     };
 
     Iterator begin() const;
