@@ -40,6 +40,11 @@ struct StringResult;
 struct CallGraphResult;
 struct LoopResult;
 struct ThreadResult;
+struct ConstantMaterializationResult;
+struct PatternResult;
+struct LoopSemanticsResult;
+struct AlgorithmSummaryResult;
+struct AnnotationResult;
 
 /// Main GUI Application using Dear ImGui + SDL3 + Metal
 class GuiApp {
@@ -233,6 +238,13 @@ private:
     char string_filter_buf_[256] = {};
     std::string string_filter_;
     size_t string_cursor_ = 0;
+
+    // ─── Startup deep-analysis results ────────────────────────────────
+    const ConstantMaterializationResult* constant_result_          = nullptr;
+    const PatternResult*                 pattern_result_           = nullptr;
+    const LoopSemanticsResult*           loop_semantics_result_    = nullptr;
+    const AlgorithmSummaryResult*        algorithm_summary_result_ = nullptr;
+    const AnnotationResult*              annotation_result_        = nullptr;
 
     // ─── Async analysis ─────────────────────────────────────────────
     std::atomic<bool> analysis_running_{false};

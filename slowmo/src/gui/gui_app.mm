@@ -10,6 +10,11 @@
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/thread_pass.h"
+#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"
+#include "analysis/passes/loop_semantics_pass.h"
+#include "analysis/passes/algorithm_summary_pass.h"
+#include "analysis/passes/symbol_annotation_pass.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -1546,8 +1551,8 @@ void GuiApp::render_register_panel() {
     // Determine read/written registers for current instruction
     std::vector<uint8_t> read_regs, write_regs;
     {
-        uint64_t offset = index_.offset_of(current_inst_, reader_);
-        auto rec = reader_.record_at(offset);
+        auto [offset, seed_pc_rw] = index_.offset_of_with_pc(current_inst_, reader_);
+        auto rec = reader_.record_at(offset, seed_pc_rw);
         if (rec.kind == RecordKind::Inst) {
             auto inst = rec.as_inst();
             for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
@@ -1843,8 +1848,8 @@ void GuiApp::render_memory_panel() {
         return;
     }
 
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
+    auto [offset, seed_pc_mem] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec = reader_.record_at(offset, seed_pc_mem);
     if (rec.kind != RecordKind::Inst) {
         ImGui::TextDisabled("(no instruction)");
         ImGui::End();
@@ -2414,8 +2419,8 @@ void GuiApp::render_hex_dump_panel() {
         display_addr = ctx_mem_addr_;
         has_addr = true;
     } else {
-        uint64_t offset = index_.offset_of(current_inst_, reader_);
-        auto rec = reader_.record_at(offset);
+        auto [offset, seed_pc_da] = index_.offset_of_with_pc(current_inst_, reader_);
+        auto rec = reader_.record_at(offset, seed_pc_da);
         if (rec.kind == RecordKind::Inst) {
             auto inst = rec.as_inst();
             if (inst.mem_access_count > 0) {
@@ -2955,8 +2960,10 @@ InstructionRow GuiApp::fetch_row(uint64_t inst_id) {
     InstructionRow row{};
     row.inst_id = inst_id;
 
-    uint64_t offset = index_.offset_of(inst_id, reader_);
-    auto rec = reader_.record_at(offset);
+    auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
+    // Pass seed_pc: record_at(offset, seed_pc) sets resolved_pc so as_inst()
+    // uses the correct 6-byte v5 header layout (vs 12-byte v4) when needed.
+    auto rec = reader_.record_at(offset, seed_pc);
     if (rec.kind != RecordKind::Inst) {
         row.disasm = "<not an instruction>";
         row_cache_.put(inst_id, row);
@@ -3136,6 +3143,84 @@ void GuiApp::run_startup_analysis() {
             }
         }
 
+        // ── 5. CFG ───────────────────────────────────────────────────
+        // Needed by loop_pass and loop_semantics_pass downstream.
+        set_status("CFG...");
+        {
+            pass_manager_->register_pass(std::make_unique<CFGPass>());
+            auto& r = pass_manager_->require("cfg");
+            if (r.ok()) {
+                cfg_result_ = &r.get<CFGResult>();
+            }
+        }
+
+        // ── 6. Loop detection ────────────────────────────────────────
+        set_status("Loops...");
+        {
+            pass_manager_->register_pass(std::make_unique<LoopPass>());
+            auto& r = pass_manager_->require("loop");
+            if (r.ok()) {
+                loop_result_ = &r.get<LoopResult>();
+                show_loops_  = true;
+            }
+        }
+
+        // ── 7. Constant materialisation ──────────────────────────────
+        // Identifies crypto/hash constants (SHA-256, SM4, ChaCha20, TEA…).
+        set_status("Constants...");
+        {
+            pass_manager_->register_pass(std::make_unique<ConstantMaterializationPass>());
+            auto& r = pass_manager_->require("constant_materialization");
+            if (r.ok()) {
+                constant_result_ = &r.get<ConstantMaterializationResult>();
+            }
+        }
+
+        // ── 8. Pattern detection (YARA + mnemonic heuristics) ────────
+        set_status("Patterns...");
+        {
+            pass_manager_->register_pass(std::make_unique<PatternPass>());
+            auto& r = pass_manager_->require("pattern");
+            if (r.ok()) {
+                pattern_result_ = &r.get<PatternResult>();
+            }
+        }
+
+        // ── 9. Loop semantics ────────────────────────────────────────
+        // Classifies loops (Feistel, SPN, ARX, MemcpyLike, …).
+        set_status("Loop semantics...");
+        {
+            pass_manager_->register_pass(std::make_unique<LoopSemanticsPass>());
+            auto& r = pass_manager_->require("loop_semantics");
+            if (r.ok()) {
+                loop_semantics_result_ = &r.get<LoopSemanticsResult>();
+            }
+        }
+
+        // ── 10. Algorithm summary ────────────────────────────────────
+        // Cross-references constants + patterns + loop semantics to produce
+        // a human-readable algorithm identification (AES, SHA-256, etc.).
+        set_status("Algorithm summary...");
+        {
+            pass_manager_->register_pass(std::make_unique<AlgorithmSummaryPass>());
+            auto& r = pass_manager_->require("algorithm_summary");
+            if (r.ok()) {
+                algorithm_summary_result_ = &r.get<AlgorithmSummaryResult>();
+            }
+        }
+
+        // ── 11. Symbol annotation ────────────────────────────────────
+        // Aggregates results from function/loop/constant/pattern passes
+        // into a unified PC → label map used by the disassembly view.
+        set_status("Annotations...");
+        {
+            pass_manager_->register_pass(std::make_unique<SymbolAnnotationPass>());
+            auto& r = pass_manager_->require("symbol_annotation");
+            if (r.ok()) {
+                annotation_result_ = &r.get<AnnotationResult>();
+            }
+        }
+
         // Done
         {
             std::lock_guard<std::mutex> lock(analysis_mutex_);
@@ -3158,10 +3243,10 @@ void GuiApp::run_taint_analysis() {
     config.max_instructions = 100000;
 
     // Use current instruction's register diffs as initial taint sources
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_ts, seed_pc_ts] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_ts = reader_.record_at(offset_ts, seed_pc_ts);
+    if (rec_ts.kind == RecordKind::Inst) {
+        auto inst = rec_ts.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
             config.source_regs.insert(diff.index);
@@ -3189,10 +3274,10 @@ void GuiApp::run_backward_taint_analysis() {
     config.max_tainted_insts = 50000;
 
     // Use current instruction's register diffs as sink registers
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_sk, seed_pc_sk] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_sk = reader_.record_at(offset_sk, seed_pc_sk);
+    if (rec_sk.kind == RecordKind::Inst) {
+        auto inst = rec_sk.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
             config.sink_regs.insert(diff.index);
@@ -3225,10 +3310,10 @@ void GuiApp::run_slice_analysis() {
 
     // Determine which register to slice from current instruction
     uint8_t target_reg = 0;
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_sl, seed_pc_sl] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_sl = reader_.record_at(offset_sl, seed_pc_sl);
+    if (rec_sl.kind == RecordKind::Inst) {
+        auto inst = rec_sl.as_inst();
         if (inst.reg_diff_count > 0) {
             target_reg = inst.reg_diff(0).index;
         }
@@ -3834,6 +3919,11 @@ void GuiApp::clear_analysis() {
     thread_result_ = nullptr;
     cfg_result_        = nullptr;
     cfg_layout_result_ = nullptr;
+    constant_result_          = nullptr;
+    pattern_result_           = nullptr;
+    loop_semantics_result_    = nullptr;
+    algorithm_summary_result_ = nullptr;
+    annotation_result_        = nullptr;
     show_taint_ = false;
     show_threads_ = false;
     show_slice_ = false;

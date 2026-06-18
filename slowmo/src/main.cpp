@@ -28,6 +28,14 @@
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/thread_pass.h"
+#include "analysis/passes/trace_fold_pass.h"
+#include "analysis/passes/reg_timeline_pass.h"
+#include "analysis/passes/mem_search_pass.h"
+#include "analysis/passes/call_context_pass.h"
+#include "analysis/passes/producer_chain_pass.h"
+#include "analysis/passes/window_stats_pass.h"
+#include "analysis/passes/entropy_pass.h"
+#include "analysis/passes/literal_search_pass.h"
 
 #include "common/logger.h"
 
@@ -565,6 +573,38 @@ int main(int argc, char** argv) {
     uint64_t search_pc_addr = 0;
     uint64_t search_pc_limit = 100;
 
+    // New pass options
+    bool opt_trace_fold = false;
+    uint64_t trace_fold_start = 0, trace_fold_end = 0;
+    uint32_t trace_fold_min_iter = 3;
+
+    bool opt_reg_timeline = false;
+    uint8_t reg_timeline_reg = 0;
+    uint64_t reg_timeline_start = 0, reg_timeline_end = 0;
+
+    bool opt_mem_search = false;
+    std::string mem_search_pattern;   // hex string "AA BB ?? CC"
+    uint64_t mem_search_start = 0, mem_search_end = 0;
+
+    bool opt_call_context = false;
+    uint64_t call_context_inst_id = 0;
+
+    bool opt_producer_chain = false;
+    uint64_t producer_chain_inst_id = 0;
+    uint8_t producer_chain_reg = 0;
+    uint32_t producer_chain_depth = 32;
+
+    bool opt_window_stats = false;
+    uint64_t window_stats_start = 0, window_stats_end = 0;
+    uint32_t window_stats_size = 1024;
+
+    bool opt_entropy = false;
+    uint64_t entropy_start = 0, entropy_end = 0;
+
+    bool opt_literal_search = false;
+    uint64_t literal_search_value = 0;
+    uint64_t literal_search_start = 0, literal_search_end = 0;
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -663,6 +703,49 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 search_pc_limit = std::stoull(argv[++i]);
             }
+        } else if (arg == "--trace-fold" && i + 2 < argc) {
+            opt_trace_fold = true;
+            trace_fold_start = std::stoull(argv[++i]);
+            trace_fold_end = std::stoull(argv[++i]);
+        } else if (arg == "--trace-fold-min-iter" && i + 1 < argc) {
+            trace_fold_min_iter = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--reg-timeline" && i + 1 < argc) {
+            opt_reg_timeline = true;
+            reg_timeline_reg = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--reg-timeline-range" && i + 2 < argc) {
+            reg_timeline_start = std::stoull(argv[++i]);
+            reg_timeline_end = std::stoull(argv[++i]);
+        } else if (arg == "--mem-search" && i + 1 < argc) {
+            opt_mem_search = true;
+            mem_search_pattern = argv[++i];
+        } else if (arg == "--mem-search-range" && i + 2 < argc) {
+            mem_search_start = std::stoull(argv[++i]);
+            mem_search_end = std::stoull(argv[++i]);
+        } else if (arg == "--call-context" && i + 1 < argc) {
+            opt_call_context = true;
+            call_context_inst_id = std::stoull(argv[++i]);
+        } else if (arg == "--producer-chain" && i + 2 < argc) {
+            opt_producer_chain = true;
+            producer_chain_inst_id = std::stoull(argv[++i]);
+            producer_chain_reg = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--producer-chain-depth" && i + 1 < argc) {
+            producer_chain_depth = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--window-stats" && i + 2 < argc) {
+            opt_window_stats = true;
+            window_stats_start = std::stoull(argv[++i]);
+            window_stats_end = std::stoull(argv[++i]);
+        } else if (arg == "--window-stats-size" && i + 1 < argc) {
+            window_stats_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--entropy" && i + 2 < argc) {
+            opt_entropy = true;
+            entropy_start = std::stoull(argv[++i]);
+            entropy_end = std::stoull(argv[++i]);
+        } else if (arg == "--literal-search" && i + 1 < argc) {
+            opt_literal_search = true;
+            literal_search_value = std::stoull(argv[++i], nullptr, 16);
+        } else if (arg == "--literal-search-range" && i + 2 < argc) {
+            literal_search_start = std::stoull(argv[++i]);
+            literal_search_end = std::stoull(argv[++i]);
         } else if (arg[0] != '-') {
             trace_path = arg;
         }
@@ -687,7 +770,11 @@ int main(int argc, char** argv) {
                                opt_symbol_annotation || opt_memory_snapshot ||
                                opt_dataflow_graph || opt_algorithm_summary ||
                                opt_objc ||
-                               opt_memread || opt_mem_history || opt_search_pc;
+                               opt_memread || opt_mem_history || opt_search_pc ||
+                               opt_trace_fold || opt_reg_timeline ||
+                               opt_mem_search || opt_call_context ||
+                               opt_producer_chain || opt_window_stats ||
+                               opt_entropy || opt_literal_search;
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
@@ -1287,10 +1374,10 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < limit; i++) {
                 json w;
                 w["inst_id"] = history[i];
-                // Get the PC at this instruction via offset_of + record_at
-                uint64_t off = index.offset_of(history[i], reader);
+                // Get the PC at this instruction via offset_of_with_pc + record_at
+                auto [off, seed_pc_w] = index.offset_of_with_pc(history[i], reader);
                 if (off != 0) {
-                    auto rec = reader.record_at(off);
+                    auto rec = reader.record_at(off, seed_pc_w);
                     if (rec.kind == RecordKind::Inst) {
                         auto inst = rec.as_inst();
                         w["pc"] = fmt::format("0x{:X}", inst.pc);
@@ -1339,6 +1426,270 @@ int main(int argc, char** argv) {
                 output["limit_reached"] = true;
             }
             fmt::print("{}\n", output.dump(2));
+        }
+
+        // --trace-fold: fold repetitive loop iterations
+        if (opt_trace_fold) {
+            pm.register_pass(std::make_unique<LoopPass>());
+            pm.register_pass(std::make_unique<XrefPass>());
+            TraceFoldConfig tf_cfg;
+            tf_cfg.min_iterations_to_fold = trace_fold_min_iter;
+            pm.register_pass(std::make_unique<TraceFoldPass>(std::move(tf_cfg)));
+            const auto& tf_raw = pm.require("trace_fold");
+            if (!tf_raw.ok()) {
+                fmt::print(stderr, "[trace-fold] Pass failed: {}\n", tf_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& tf_result = tf_raw.get<TraceFoldResult>();
+                fmt::print(stderr, "[trace-fold] {} foldable regions, {} total folded instructions\n",
+                           tf_result.folded_regions.size(), tf_result.total_instructions_removed);
+                json tf_json;
+                json regions_arr = json::array();
+                for (const auto& r : tf_result.folded_regions) {
+                    regions_arr.push_back({
+                        {"loop_header_pc", fmt::format("0x{:X}", r.header_pc)},
+                        {"iteration_count", r.total_iterations},
+                        {"first_inst_id", r.first_inst_id},
+                        {"last_inst_id", r.last_inst_id},
+                        {"instructions_per_iteration", r.instructions_per_iteration}
+                    });
+                }
+                tf_json["regions"] = std::move(regions_arr);
+                tf_json["total_folded"] = tf_result.total_instructions_removed;
+                fmt::print("{}\n", tf_json.dump(2));
+            }
+        }
+
+        // --reg-timeline: track register value changes over time
+        if (opt_reg_timeline) {
+            RegTimelineConfig rt_cfg;
+            rt_cfg.target_reg = reg_timeline_reg;
+            rt_cfg.start_inst_id = reg_timeline_start;
+            rt_cfg.end_inst_id = reg_timeline_end;
+            pm.register_pass(std::make_unique<RegTimelinePass>(std::move(rt_cfg)));
+            const auto& rt_raw = pm.require("reg_timeline");
+            if (!rt_raw.ok()) {
+                fmt::print(stderr, "[reg-timeline] Pass failed: {}\n", rt_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& rt_result = rt_raw.get<RegTimelineResult>();
+                fmt::print(stderr, "[reg-timeline] x{}: {} change events\n",
+                           reg_timeline_reg, rt_result.entries.size());
+                json rt_json;
+                json events_arr = json::array();
+                size_t limit = std::min(rt_result.entries.size(), size_t(2000));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& e = rt_result.entries[i];
+                    events_arr.push_back({
+                        {"inst_id", e.inst_id},
+                        {"pc", fmt::format("0x{:X}", e.pc)},
+                        {"old_value", fmt::format("0x{:X}", e.old_value)},
+                        {"new_value", fmt::format("0x{:X}", e.new_value)}
+                    });
+                }
+                rt_json["register"] = reg_timeline_reg;
+                rt_json["events"] = std::move(events_arr);
+                rt_json["total_changes"] = rt_result.entries.size();
+                if (rt_result.entries.size() > 2000) rt_json["truncated"] = true;
+                fmt::print("{}\n", rt_json.dump(2));
+            }
+        }
+
+        // --mem-search: Boyer-Moore-Horspool multi-pattern memory search
+        if (opt_mem_search) {
+            MemSearchConfig ms_cfg;
+            // Parse hex pattern string into bytes and add as a Pattern
+            {
+                std::vector<uint8_t> pat_bytes;
+                std::string hex = mem_search_pattern;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    pat_bytes.push_back((uint8_t)std::stoul(hex.substr(i, 2), nullptr, 16));
+                }
+                ms_cfg.patterns.emplace_back(std::move(pat_bytes), mem_search_pattern);
+            }
+            ms_cfg.start_inst_id = mem_search_start;
+            ms_cfg.end_inst_id = mem_search_end;
+            pm.register_pass(std::make_unique<MemSearchPass>(std::move(ms_cfg)));
+            const auto& ms_raw = pm.require("mem_search");
+            if (!ms_raw.ok()) {
+                fmt::print(stderr, "[mem-search] Pass failed: {}\n", ms_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ms_result = ms_raw.get<MemSearchResult>();
+                fmt::print(stderr, "[mem-search] {} matches found\n", ms_result.matches.size());
+                json ms_json;
+                json matches_arr = json::array();
+                size_t limit = std::min(ms_result.matches.size(), size_t(500));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& m = ms_result.matches[i];
+                    matches_arr.push_back({
+                        {"addr", fmt::format("0x{:X}", m.addr)},
+                        {"inst_id", m.inst_id},
+                        {"pc", fmt::format("0x{:X}", m.pc)},
+                        {"source", m.source == MemSearchMatch::MemWrite ? "mem" : "reg"}
+                    });
+                }
+                ms_json["matches"] = std::move(matches_arr);
+                ms_json["total"] = ms_result.matches.size();
+                if (ms_result.matches.size() > 500) ms_json["truncated"] = true;
+                fmt::print("{}\n", ms_json.dump(2));
+            }
+        }
+
+        // --call-context: reconstruct call stack at a specific instruction
+        if (opt_call_context) {
+            pm.register_pass(std::make_unique<LoopPass>());
+            CallContextConfig cc_cfg;
+            cc_cfg.target_inst_id = call_context_inst_id;
+            pm.register_pass(std::make_unique<CallContextPass>(std::move(cc_cfg)));
+            const auto& cc_raw = pm.require("call_context");
+            if (!cc_raw.ok()) {
+                fmt::print(stderr, "[call-context] Pass failed: {}\n", cc_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& cc_result = cc_raw.get<CallContextResult>();
+                fmt::print(stderr, "[call-context] stack depth={}\n", cc_result.call_stack.size());
+                json cc_json;
+                json frames_arr = json::array();
+                for (const auto& f : cc_result.call_stack) {
+                    frames_arr.push_back({
+                        {"call_site_pc", fmt::format("0x{:X}", f.call_site_pc)},
+                        {"callee_pc", fmt::format("0x{:X}", f.callee_pc)},
+                        {"call_inst_id", f.call_inst_id},
+                        {"return_addr", fmt::format("0x{:X}", f.return_addr)}
+                    });
+                }
+                cc_json["target_inst_id"] = call_context_inst_id;
+                cc_json["frames"] = std::move(frames_arr);
+                cc_json["depth"] = cc_result.call_stack.size();
+                fmt::print("{}\n", cc_json.dump(2));
+            }
+        }
+
+        // --producer-chain: backward reg_diff chain tracing
+        if (opt_producer_chain) {
+            ProducerChainConfig pc_cfg;
+            pc_cfg.start_inst_id = producer_chain_inst_id;
+            pc_cfg.start_reg = producer_chain_reg;
+            pc_cfg.max_depth = producer_chain_depth;
+            pm.register_pass(std::make_unique<ProducerChainPass>(std::move(pc_cfg)));
+            const auto& pc_raw = pm.require("producer_chain");
+            if (!pc_raw.ok()) {
+                fmt::print(stderr, "[producer-chain] Pass failed: {}\n", pc_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& pc_result = pc_raw.get<ProducerChainResult>();
+                fmt::print(stderr, "[producer-chain] {} nodes in chain\n", pc_result.chain.size());
+                json pc_json;
+                json chain_arr = json::array();
+                for (const auto& n : pc_result.chain) {
+                    chain_arr.push_back({
+                        {"inst_id", n.inst_id},
+                        {"pc", fmt::format("0x{:X}", n.pc)},
+                        {"reg", n.produced_reg},
+                        {"value", fmt::format("0x{:X}", n.value)}
+                    });
+                }
+                pc_json["chain"] = std::move(chain_arr);
+                pc_json["depth"] = pc_result.chain.size();
+                fmt::print("{}\n", pc_json.dump(2));
+            }
+        }
+
+        // --window-stats: sliding window instruction metrics
+        if (opt_window_stats) {
+            WindowStatsConfig ws_cfg;
+            ws_cfg.window_size = window_stats_size;
+            pm.register_pass(std::make_unique<WindowStatsPass>(std::move(ws_cfg)));
+            const auto& ws_raw = pm.require("window_stats");
+            if (!ws_raw.ok()) {
+                fmt::print(stderr, "[window-stats] Pass failed: {}\n", ws_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ws_result = ws_raw.get<WindowStatsResult>();
+                fmt::print(stderr, "[window-stats] {} windows analyzed\n", ws_result.windows.size());
+                json ws_json;
+                json windows_arr = json::array();
+                size_t limit = std::min(ws_result.windows.size(), size_t(500));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& w = ws_result.windows[i];
+                    windows_arr.push_back({
+                        {"start_inst_id", w.start_inst_id},
+                        {"end_inst_id", w.end_inst_id},
+                        {"instruction_count", w.instruction_count}
+                    });
+                }
+                ws_json["windows"] = std::move(windows_arr);
+                ws_json["total_windows"] = ws_result.windows.size();
+                if (ws_result.windows.size() > 500) ws_json["truncated"] = true;
+                fmt::print("{}\n", ws_json.dump(2));
+            }
+        }
+
+        // --entropy: Shannon entropy analysis on memory writes
+        if (opt_entropy) {
+            EntropyConfig ent_cfg;
+            ent_cfg.at_inst_id = entropy_start;  // use start as sample point
+            pm.register_pass(std::make_unique<EntropyPass>(std::move(ent_cfg)));
+            const auto& ent_raw = pm.require("entropy");
+            if (!ent_raw.ok()) {
+                fmt::print(stderr, "[entropy] Pass failed: {}\n", ent_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ent_result = ent_raw.get<EntropyResult>();
+                fmt::print(stderr, "[entropy] classification={}, entropy={:.4f}\n",
+                           static_cast<int>(ent_result.classification), ent_result.overall_entropy);
+                json ent_json;
+                ent_json["overall_entropy"] = ent_result.overall_entropy;
+                ent_json["classification"] = static_cast<int>(ent_result.classification);
+                json blocks_arr = json::array();
+                size_t limit = std::min(ent_result.blocks.size(), size_t(200));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& b = ent_result.blocks[i];
+                    blocks_arr.push_back({
+                        {"offset", b.offset},
+                        {"entropy", b.entropy},
+                        {"size", b.size}
+                    });
+                }
+                ent_json["blocks"] = std::move(blocks_arr);
+                if (ent_result.blocks.size() > 200) ent_json["truncated"] = true;
+                fmt::print("{}\n", ent_json.dump(2));
+            }
+        }
+
+        // --literal-search: find a specific value in registers and memory
+        if (opt_literal_search) {
+            LiteralSearchConfig ls_cfg;
+            ls_cfg.search_values.push_back(literal_search_value);
+            pm.register_pass(std::make_unique<LiteralSearchPass>(std::move(ls_cfg)));
+            const auto& ls_raw = pm.require("literal_search");
+            if (!ls_raw.ok()) {
+                fmt::print(stderr, "[literal-search] Pass failed: {}\n", ls_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& ls_result = ls_raw.get<LiteralSearchResult>();
+                fmt::print(stderr, "[literal-search] {} hits for 0x{:X}\n",
+                           ls_result.hits.size(), literal_search_value);
+                json ls_json;
+                json hits_arr = json::array();
+                size_t limit = std::min(ls_result.hits.size(), size_t(1000));
+                for (size_t i = 0; i < limit; i++) {
+                    const auto& h = ls_result.hits[i];
+                    hits_arr.push_back({
+                        {"inst_id", h.inst_id},
+                        {"pc", fmt::format("0x{:X}", h.pc)},
+                        {"matched_value", fmt::format("0x{:X}", h.matched_value)},
+                        {"source", h.source == LiteralHit::RegDiff ? "reg" :
+                                   h.source == LiteralHit::MemWrite ? "mem" : "imm"}
+                    });
+                }
+                ls_json["value"] = fmt::format("0x{:X}", literal_search_value);
+                ls_json["hits"] = std::move(hits_arr);
+                ls_json["total"] = ls_result.hits.size();
+                if (ls_result.hits.size() > 1000) ls_json["truncated"] = true;
+                fmt::print("{}\n", ls_json.dump(2));
+            }
         }
 
         return rc;

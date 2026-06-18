@@ -5,14 +5,41 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ─── Performance: LTO and architecture-specific tuning ──────────────────────
+# ─── Performance: LTO, PGO, and architecture-specific tuning ────────────────
 include(CheckIPOSupported)
 check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
 if(_ipo_supported)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-    message(STATUS "LTO enabled (interprocedural optimization)")
+    message(STATUS "ThinLTO enabled (interprocedural optimization)")
 else()
     message(STATUS "LTO not supported: ${_ipo_error}")
+endif()
+
+# ─── PGO (Profile-Guided Optimization) ─────────────────────────────────────
+# Usage:
+#   1. Generate: cmake .. -DTENET_PGO_MODE=generate && ninja && ./tenet <trace>
+#   2. Merge:    llvm-profdata merge -output=default.profdata default_*.profraw
+#   3. Use:      cmake .. -DTENET_PGO_MODE=use -DTENET_PGO_PROFILE=default.profdata
+#   4. Build:    ninja
+# This typically yields 15-30% speedup on hot iteration loops.
+set(TENET_PGO_MODE "" CACHE STRING "PGO mode: '' (off), 'generate', or 'use'")
+set(TENET_PGO_PROFILE "${CMAKE_BINARY_DIR}/default.profdata" CACHE FILEPATH
+    "Path to merged .profdata file (for PGO 'use' mode)")
+
+if(TENET_PGO_MODE STREQUAL "generate")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-generate")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-generate")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-generate")
+    message(STATUS "PGO: instrumented build (profile generation)")
+elseif(TENET_PGO_MODE STREQUAL "use")
+    if(NOT EXISTS "${TENET_PGO_PROFILE}")
+        message(WARNING "PGO profile not found: ${TENET_PGO_PROFILE} — building without PGO")
+    else()
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+        message(STATUS "PGO: optimized build using ${TENET_PGO_PROFILE}")
+    endif()
 endif()
 
 # Target Apple Silicon (M1+) for NEON auto-vectorization and LSE atomics.
@@ -70,7 +97,18 @@ if(NOT TENET_USE_SYSTEM_CAPSTONE)
     set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(capstone)
 else()
-    find_package(capstone REQUIRED)
+    # Homebrew capstone does not ship a CMake config file; use pkg-config instead.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CAPSTONE REQUIRED capstone)
+    # Expose an imported target named 'capstone' so target_link_libraries works unchanged.
+    if(NOT TARGET capstone)
+        add_library(capstone INTERFACE IMPORTED)
+        set_target_properties(capstone PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${CAPSTONE_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES      "${CAPSTONE_LINK_LIBRARIES}"
+            INTERFACE_COMPILE_OPTIONS     "${CAPSTONE_CFLAGS_OTHER}"
+        )
+    endif()
 endif()
 
 # RocksDB
@@ -258,6 +296,14 @@ add_library(tenet_lib STATIC
     src/analysis/passes/dataflow_graph_pass.cpp
     src/analysis/passes/objc_pass.cpp
     src/analysis/passes/thread_pass.cpp
+    src/analysis/passes/trace_fold_pass.cpp
+    src/analysis/passes/reg_timeline_pass.cpp
+    src/analysis/passes/mem_search_pass.cpp
+    src/analysis/passes/call_context_pass.cpp
+    src/analysis/passes/producer_chain_pass.cpp
+    src/analysis/passes/window_stats_pass.cpp
+    src/analysis/passes/entropy_pass.cpp
+    src/analysis/passes/literal_search_pass.cpp
     src/tui/tui_app.cpp
     src/tui/hex_dump_view.cpp
 )

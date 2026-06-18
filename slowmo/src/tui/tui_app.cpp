@@ -75,8 +75,10 @@ InstructionRow TuiApp::fetch_row(uint64_t inst_id) {
     InstructionRow row;
     row.inst_id = inst_id;
 
-    uint64_t offset = index_.offset_of(inst_id, reader_);
-    auto rec = reader_.record_at(offset);
+    auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
+    // Pass seed_pc: record_at(offset, seed_pc) sets resolved_pc so as_inst()
+    // uses the correct 6-byte v5 header layout (vs 12-byte v4) when needed.
+    auto rec = reader_.record_at(offset, seed_pc);
     if (rec.kind != RecordKind::Inst) {
         row.disasm = "<not an instruction>";
         row_cache_.put(inst_id, row);
@@ -193,8 +195,8 @@ Element TuiApp::render_instruction_list() {
 
         // Memory access lines (if enabled)
         if (show_mem_ && row.mem_access_count > 0) {
-            uint64_t offset = index_.offset_of(row.inst_id, reader_);
-            auto rec = reader_.record_at(offset);
+            auto [offset, seed_pc_mi] = index_.offset_of_with_pc(row.inst_id, reader_);
+            auto rec = reader_.record_at(offset, seed_pc_mi);
             auto inst = rec.as_inst();
             for (uint8_t i = 0; i < inst.mem_access_count; i++) {
                 auto mem = inst.mem_access(i);
@@ -219,8 +221,8 @@ Element TuiApp::render_register_panel() {
     // Determine which registers are read/written by the current instruction
     std::vector<uint8_t> read_regs, write_regs;
     {
-        uint64_t offset = index_.offset_of(current_inst_, reader_);
-        auto rec = reader_.record_at(offset);
+        auto [offset, seed_pc_ri] = index_.offset_of_with_pc(current_inst_, reader_);
+        auto rec = reader_.record_at(offset, seed_pc_ri);
         if (rec.kind == RecordKind::Inst) {
             auto inst = rec.as_inst();
             // Written registers from trace reg_diffs (ground truth)
@@ -334,8 +336,8 @@ Element TuiApp::render_memory_panel() {
     lines.push_back(separator());
 
     // Get current instruction's memory accesses
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
+    auto [offset, seed_pc_ma] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec = reader_.record_at(offset, seed_pc_ma);
     if (rec.kind != RecordKind::Inst) {
         lines.push_back(text("(no instruction)") | color(Color::GrayLight));
         return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
@@ -424,8 +426,8 @@ bool TuiApp::handle_memory_panel_event(Event event) {
     }
 
     // Get current instruction's memory access count
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
+    auto [offset, seed_pc_mp] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec = reader_.record_at(offset, seed_pc_mp);
     if (rec.kind != RecordKind::Inst) {
         memory_panel_focused_ = false;
         return true;
@@ -796,8 +798,8 @@ bool TuiApp::handle_hex_dump_event(Event event) {
         return true;
     }
     if (event == Event::Character('g')) {
-        uint64_t offset = index_.offset_of(current_inst_, reader_);
-        auto rec = reader_.record_at(offset);
+        auto [offset, seed_pc_g] = index_.offset_of_with_pc(current_inst_, reader_);
+        auto rec = reader_.record_at(offset, seed_pc_g);
         if (rec.kind == RecordKind::Inst) {
             auto inst = rec.as_inst();
             if (inst.mem_access_count > 0) {
@@ -958,8 +960,8 @@ bool TuiApp::handle_event(Event event) {
         show_hex_dump_ = !show_hex_dump_;
         if (show_hex_dump_ && hex_dump_view_) {
             hex_dump_focused_ = false;
-            uint64_t offset = index_.offset_of(current_inst_, reader_);
-            auto rec = reader_.record_at(offset);
+            auto [offset, seed_pc_hd] = index_.offset_of_with_pc(current_inst_, reader_);
+            auto rec = reader_.record_at(offset, seed_pc_hd);
             if (rec.kind == RecordKind::Inst) {
                 auto inst = rec.as_inst();
                 if (inst.mem_access_count > 0) {
@@ -1410,10 +1412,10 @@ void TuiApp::run_taint_analysis() {
     config.max_instructions = 100000;
 
     // Use current instruction's register diffs as initial taint sources
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_ts, seed_pc_ts] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_ts = reader_.record_at(offset_ts, seed_pc_ts);
+    if (rec_ts.kind == RecordKind::Inst) {
+        auto inst = rec_ts.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
             config.source_regs.insert(diff.index);
@@ -1439,10 +1441,10 @@ void TuiApp::run_slice_analysis() {
 
     // Determine which register to slice from current instruction
     uint8_t target_reg = 0;
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_sl, seed_pc_sl] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_sl = reader_.record_at(offset_sl, seed_pc_sl);
+    if (rec_sl.kind == RecordKind::Inst) {
+        auto inst = rec_sl.as_inst();
         if (inst.reg_diff_count > 0) {
             target_reg = inst.reg_diff(0).index;
         }
@@ -1478,10 +1480,10 @@ void TuiApp::run_backward_taint_analysis() {
     config.max_tainted_insts = 50000;
 
     // Use current instruction's register diffs as sink registers
-    uint64_t offset = index_.offset_of(current_inst_, reader_);
-    auto rec = reader_.record_at(offset);
-    if (rec.kind == RecordKind::Inst) {
-        auto inst = rec.as_inst();
+    auto [offset_sk, seed_pc_sk] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec_sk = reader_.record_at(offset_sk, seed_pc_sk);
+    if (rec_sk.kind == RecordKind::Inst) {
+        auto inst = rec_sk.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
             config.sink_regs.insert(diff.index);
@@ -2344,9 +2346,9 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
         fmt::print("{:>8}  {:016x}  {}\n", id, row.static_pc, row.disasm);
 
         if (show_regs && row.reg_diff_count > 0) {
-            uint64_t offset = index_.offset_of(id, reader_);
-            auto rec = reader_.record_at(offset);
-            auto inst = rec.as_inst();
+            auto [offset_r, seed_pc_r] = index_.offset_of_with_pc(id, reader_);
+            auto rec_r = reader_.record_at(offset_r, seed_pc_r);
+            auto inst = rec_r.as_inst();
             fmt::print("          ");
             for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
                 auto diff = inst.reg_diff(j);
@@ -2356,9 +2358,9 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
         }
 
         if (show_mem && row.mem_access_count > 0) {
-            uint64_t offset = index_.offset_of(id, reader_);
-            auto rec = reader_.record_at(offset);
-            auto inst = rec.as_inst();
+            auto [offset_m, seed_pc_m] = index_.offset_of_with_pc(id, reader_);
+            auto rec_m = reader_.record_at(offset_m, seed_pc_m);
+            auto inst = rec_m.as_inst();
             for (uint8_t j = 0; j < inst.mem_access_count; j++) {
                 auto mem = inst.mem_access(j);
                 const char* type_str = (mem.type & 2) ? "W" : "R";
