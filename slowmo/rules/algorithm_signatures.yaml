@@ -1,0 +1,328 @@
+# Algorithm Signature Database for tenet AlgorithmSummaryPass
+# Each entry defines behavioral fingerprints for identifying cryptographic algorithms.
+#
+# Fields:
+#   name:             Human-readable algorithm name
+#   category:         Crypto category (hash, cipher, kdf, mac, signature, rng)
+#   required_constants: List of constant names that MUST be present (from known_db)
+#   optional_constants: Additional constants that strengthen confidence
+#   loop_characteristics:
+#     rounds:         Expected number of loop iterations [min, max]
+#     body_size:      Expected instructions per iteration [min, max]
+#   instruction_patterns:
+#     required:       Mnemonic patterns that must appear in the loop body
+#     characteristic: Patterns that are highly indicative but not required
+#   confidence_weights:
+#     constant_match: Weight for each constant found (0.0-1.0)
+#     round_match:    Weight for matching round count
+#     pattern_match:  Weight for matching instruction patterns
+
+algorithms:
+  # ── Block Ciphers ──────────────────────────────────────────────────────
+
+  - name: "AES-128"
+    category: cipher
+    required_constants: ["AES_RCON1"]
+    optional_constants: ["AES_RCON2", "AES_RCON3", "AES_RCON4", "AES_RCON5",
+                         "AES_RCON6", "AES_RCON7", "AES_RCON8", "AES_RCON9", "AES_RCON10"]
+    loop_characteristics:
+      rounds: [10, 10]
+      body_size: [30, 200]
+    instruction_patterns:
+      required: ["EOR"]
+      characteristic: ["AESE", "AESMC", "TBL"]  # ARM crypto extension or table lookup
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "AES-256"
+    category: cipher
+    required_constants: ["AES_RCON1"]
+    optional_constants: ["AES_RCON2", "AES_RCON3", "AES_RCON4", "AES_RCON5",
+                         "AES_RCON6", "AES_RCON7"]
+    loop_characteristics:
+      rounds: [14, 14]
+      body_size: [30, 200]
+    instruction_patterns:
+      required: ["EOR"]
+      characteristic: ["AESE", "AESMC"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "SM4"
+    category: cipher
+    required_constants: ["SM4_FK0", "SM4_FK1"]
+    optional_constants: ["SM4_FK2", "SM4_FK3", "SM4_CK0", "SM4_CK1",
+                         "SM4_CK2", "SM4_CK3"]
+    loop_characteristics:
+      rounds: [32, 32]
+      body_size: [20, 150]
+    instruction_patterns:
+      required: ["EOR", "LDR"]
+      characteristic: ["AND", "LSR", "LSL"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.3
+      pattern_match: 0.2
+
+  - name: "TEA/XTEA"
+    category: cipher
+    required_constants: ["TEA_DELTA"]
+    loop_characteristics:
+      rounds: [32, 64]
+      body_size: [8, 40]
+    instruction_patterns:
+      required: ["EOR", "ADD", "LSL", "LSR"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.25
+      pattern_match: 0.25
+
+  - name: "Blowfish"
+    category: cipher
+    required_constants: ["BF_P0", "BF_P1"]
+    optional_constants: ["BF_P2", "BF_P3"]
+    loop_characteristics:
+      rounds: [16, 16]
+      body_size: [20, 100]
+    instruction_patterns:
+      required: ["EOR", "ADD", "LDR"]
+      characteristic: ["LSR", "AND"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  # ── Stream Ciphers ─────────────────────────────────────────────────────
+
+  - name: "ChaCha20"
+    category: cipher
+    required_constants: ["CHACHA20_SIGMA0", "CHACHA20_SIGMA1"]
+    optional_constants: ["CHACHA20_SIGMA2", "CHACHA20_SIGMA3"]
+    loop_characteristics:
+      rounds: [20, 20]
+      body_size: [30, 100]
+    instruction_patterns:
+      required: ["ADD", "EOR", "ROR"]
+      characteristic: ["LSL"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "Salsa20"
+    category: cipher
+    required_constants: ["CHACHA20_SIGMA0"]  # Same sigma constants
+    loop_characteristics:
+      rounds: [20, 20]
+      body_size: [30, 100]
+    instruction_patterns:
+      required: ["ADD", "EOR", "LSL"]
+      characteristic: ["LSR"]
+    confidence_weights:
+      constant_match: 0.3
+      round_match: 0.35
+      pattern_match: 0.35
+
+  # ── Hash Functions ─────────────────────────────────────────────────────
+
+  - name: "SHA-256"
+    category: hash
+    required_constants: ["SHA256_H0", "SHA256_K0"]
+    optional_constants: ["SHA256_H1", "SHA256_H2", "SHA256_H3", "SHA256_K1",
+                         "SHA256_K2", "SHA256_K3"]
+    loop_characteristics:
+      rounds: [64, 64]
+      body_size: [20, 80]
+    instruction_patterns:
+      required: ["ADD", "EOR", "AND"]
+      characteristic: ["ROR", "LSR", "ORN", "BIC"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "SHA-1"
+    category: hash
+    required_constants: ["SHA1_H0"]
+    optional_constants: ["SHA1_H1", "SHA1_H2", "SHA1_H3", "SHA1_H4",
+                         "SHA1_K0", "SHA1_K1", "SHA1_K2", "SHA1_K3"]
+    loop_characteristics:
+      rounds: [80, 80]
+      body_size: [15, 60]
+    instruction_patterns:
+      required: ["ADD", "EOR", "ROR"]
+      characteristic: ["AND", "ORN"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "SHA-512"
+    category: hash
+    required_constants: ["SHA512_H0"]
+    optional_constants: ["SHA512_H1", "SHA512_H2", "SHA512_H3"]
+    loop_characteristics:
+      rounds: [80, 80]
+      body_size: [25, 100]
+    instruction_patterns:
+      required: ["ADD", "EOR"]
+      characteristic: ["ROR", "LSR"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "MD5"
+    category: hash
+    required_constants: ["MD5_T1", "MD5_T2"]
+    optional_constants: ["MD5_T3", "MD5_T4", "MD5_T5", "MD5_T6", "MD5_T7", "MD5_T8"]
+    loop_characteristics:
+      rounds: [64, 64]
+      body_size: [10, 50]
+    instruction_patterns:
+      required: ["ADD", "EOR"]
+      characteristic: ["AND", "ORN", "ROR"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.25
+      pattern_match: 0.25
+
+  - name: "SM3"
+    category: hash
+    required_constants: ["SM3_IV0"]
+    optional_constants: ["SM3_IV1", "SM3_IV2", "SM3_TJ_0_15", "SM3_TJ_16_63"]
+    loop_characteristics:
+      rounds: [64, 64]
+      body_size: [30, 120]
+    instruction_patterns:
+      required: ["ADD", "EOR", "ROR"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  - name: "SHA-3/Keccak"
+    category: hash
+    required_constants: ["KECCAK_RC0", "KECCAK_RC1"]
+    optional_constants: ["KECCAK_RC2", "KECCAK_RC3"]
+    loop_characteristics:
+      rounds: [24, 24]
+      body_size: [100, 500]
+    instruction_patterns:
+      required: ["EOR", "AND", "MVN"]
+      characteristic: ["ROR", "LSL"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  # ── MACs ───────────────────────────────────────────────────────────────
+
+  - name: "HMAC"
+    category: mac
+    required_constants: ["HMAC_IPAD", "HMAC_OPAD"]
+    loop_characteristics:
+      rounds: [1, 4]  # Inner hash + outer hash
+      body_size: [50, 500]
+    instruction_patterns:
+      required: ["EOR"]
+    confidence_weights:
+      constant_match: 0.6
+      round_match: 0.2
+      pattern_match: 0.2
+
+  - name: "Poly1305"
+    category: mac
+    required_constants: ["POLY1305_CLAMP"]
+    loop_characteristics:
+      rounds: [1, 1000]  # Message blocks
+      body_size: [30, 100]
+    instruction_patterns:
+      required: ["MUL", "ADD"]
+      characteristic: ["UMULH", "AND"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.2
+      pattern_match: 0.3
+
+  - name: "SipHash"
+    category: mac
+    required_constants: ["SIPHASH_IV0", "SIPHASH_IV1"]
+    optional_constants: ["SIPHASH_IV2", "SIPHASH_IV3"]
+    loop_characteristics:
+      rounds: [2, 4]  # 2-4 rounds per block
+      body_size: [10, 40]
+    instruction_patterns:
+      required: ["ADD", "EOR", "ROR"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.25
+      pattern_match: 0.25
+
+  # ── KDF ────────────────────────────────────────────────────────────────
+
+  - name: "PBKDF2"
+    category: kdf
+    required_constants: ["HMAC_IPAD", "HMAC_OPAD"]
+    loop_characteristics:
+      rounds: [1000, 1000000]  # Configurable iterations
+      body_size: [50, 500]
+    instruction_patterns:
+      required: ["EOR"]
+    confidence_weights:
+      constant_match: 0.3
+      round_match: 0.4
+      pattern_match: 0.3
+
+  # ── CRC ────────────────────────────────────────────────────────────────
+
+  - name: "CRC32"
+    category: hash
+    required_constants: ["CRC32_POLY"]
+    optional_constants: ["CRC32_POLY_NORM"]
+    loop_characteristics:
+      rounds: [8, 8]  # 8 bits per byte
+      body_size: [4, 20]
+    instruction_patterns:
+      required: ["EOR", "LSR"]
+      characteristic: ["AND", "TST"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.25
+      pattern_match: 0.25
+
+  # ── Elliptic Curves ────────────────────────────────────────────────────
+
+  - name: "Curve25519"
+    category: signature
+    required_constants: ["CURVE25519_A24"]
+    loop_characteristics:
+      rounds: [255, 255]  # Scalar multiplication iterations
+      body_size: [50, 300]
+    instruction_patterns:
+      required: ["MUL", "ADD", "SUB"]
+      characteristic: ["UMULH", "MADD"]
+    confidence_weights:
+      constant_match: 0.4
+      round_match: 0.3
+      pattern_match: 0.3
+
+  # ── GCM/GHASH ──────────────────────────────────────────────────────────
+
+  - name: "GCM/GHASH"
+    category: cipher
+    required_constants: ["GCM_POLY"]
+    loop_characteristics:
+      rounds: [1, 10000]
+      body_size: [20, 100]
+    instruction_patterns:
+      required: ["EOR"]
+      characteristic: ["PMULL", "LSL", "LSR"]
+    confidence_weights:
+      constant_match: 0.5
+      round_match: 0.2
+      pattern_match: 0.3
