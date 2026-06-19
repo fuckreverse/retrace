@@ -16,7 +16,7 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
-ROOT="$(cd "${HERE}/../../.." && pwd -P)"
+ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
 TRACE_DIR="${ROOT}/tools/qbditrace"
 BUILD="${ROOT}/build-macos"
 OUT="/tmp/qbditrace-test.bin"
@@ -38,8 +38,8 @@ clang++ -std=c++17 -O2 -g \
   -I"${BUILD}/include" \
   -I"${BUILD}/include-static" \
   "${TRACE_DIR}/QBDITrace.cpp" \
-  "${TRACE_DIR}/test/test_target.c" \
-  "${TRACE_DIR}/test/test_harness.c" \
+  "${TRACE_DIR}/tests/integration/test_target.c" \
+  "${TRACE_DIR}/tests/integration/test_harness.c" \
   ${OBJC_DEF} \
   "${BUILD}/libQBDI.a" \
   "${BUILD}/libqbdi-llvm.a" \
