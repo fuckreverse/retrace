@@ -10,6 +10,7 @@
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
+#include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
 
 #include <SDL3/SDL.h>
@@ -130,7 +131,7 @@ private:
     bool show_functions_ = true;   // IDA-style: functions panel visible by default
     bool show_analysis_ = true;
     bool show_hex_dump_ = false;
-    bool show_strings_ = false;
+    bool show_strings_ = true;   // IDA-style: Strings shares the main area with Instructions/CFG
     bool show_demo_window_ = false;
     bool show_settings_ = false;
 
@@ -254,6 +255,8 @@ private:
     char string_filter_buf_[256] = {};
     std::string string_filter_;
     size_t string_cursor_ = 0;
+    int string_min_len_ = 4;    // length filter lower bound (inclusive); 4 = MIN_STRING_LEN
+    int string_max_len_ = 256;  // length filter upper bound (inclusive); 256 = MAX_STRING_LEN
 
     // ─── Startup deep-analysis results ────────────────────────────────
     const ConstantMaterializationResult* constant_result_          = nullptr;
@@ -267,6 +270,11 @@ private:
     std::string analysis_status_;
     std::mutex analysis_mutex_;
     std::thread startup_analysis_thread_;  // background startup analysis
+
+    // ─── Layout constants (shared by render_frame / toolbar / status bar) ──
+    static constexpr float kToolbarHeight   = 30.0f;  // toolbar window height
+    static constexpr float kTimelineHeight  = 22.0f;  // execution timeline height
+    static constexpr float kStatusBarHeight = 22.0f;  // bottom status bar height
 
     // ─── Initialization ─────────────────────────────────────────────
     bool init_sdl();

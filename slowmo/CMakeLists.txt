@@ -361,6 +361,17 @@ if(TENET_ENABLE_GUI)
 add_library(tenet_gui_lib STATIC
     src/gui/gui_app.mm
     src/gui/gui_settings.cpp
+    src/gui/gui_chrome.cpp
+    src/gui/gui_colors.cpp
+    src/gui/navigation.cpp
+    src/gui/panels_instruction.cpp
+    src/gui/panels_registers.cpp
+    src/gui/panels_memory.cpp
+    src/gui/panels_callstack_funcs.cpp
+    src/gui/panels_analysis.cpp
+    src/gui/panels_cfg.cpp
+    src/gui/panels_misc.cpp
+    src/gui/popups.cpp
 )
 
     # Ensure gui_app.mm is compiled as Objective-C++ (for Metal __bridge casts)
