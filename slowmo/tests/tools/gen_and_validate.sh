@@ -13,12 +13,13 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
-ROOT="$(cd "${HERE}/../../.." && pwd -P)"
+ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
 TRACE_DIR="${ROOT}/tools/qbditrace"
-BUILD_DIR="${HERE}/build"
-TRACES_DIR="${HERE}/traces"
+TENET_DIR="${ROOT}/tools/tenet"
+BUILD_DIR="${TENET_DIR}/build"
+TRACES_DIR="${HERE}/../traces"
 GENERATOR="${BUILD_DIR}/gen_test_traces"
-DECODER="${BUILD_DIR}/trace_decode"
+DECODER="${HERE}/trace_decode"
 
 # Defaults
 SUITE="all"
@@ -37,8 +38,8 @@ while [[ $# -gt 0 ]]; do
         --no-validate) VALIDATE=0; shift ;;
         --decode-limit) DECODE_LIMIT="$2"; shift 2 ;;
         --clean)
-            echo "Cleaning generated traces and build artifacts..."
-            rm -rf "${BUILD_DIR}" "${TRACES_DIR}"
+            echo "Cleaning generated traces..."
+            rm -rf "${TRACES_DIR}"
             echo "Done."
             exit 0
             ;;
@@ -66,15 +67,10 @@ echo "════════════════════════�
 echo " Step 1: Building gen_test_traces and trace_decode"
 echo "═══════════════════════════════════════════════════════════════════════"
 
-mkdir -p "${BUILD_DIR}"
-
-# Build generator
+# Build gen_test_traces via the main CMake build (shared with unit tests)
 if [ ! -f "${GENERATOR}" ] || [ "${HERE}/gen_test_traces.cpp" -nt "${GENERATOR}" ]; then
-    echo "  Compiling gen_test_traces..."
-    clang++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
-        -I"${TRACE_DIR}" \
-        -o "${GENERATOR}" \
-        "${HERE}/gen_test_traces.cpp"
+    echo "  Building gen_test_traces via CMake..."
+    cmake --build "${BUILD_DIR}" --target gen_test_traces -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) 2>&1 | tail -3
     echo "  → ${GENERATOR}"
 else
     echo "  gen_test_traces is up to date."
@@ -101,6 +97,13 @@ if [ "${VALIDATE}" -eq 1 ]; then
         echo "  ⚠ capstone not found; decoder validation will be skipped."
         VALIDATE=0
     fi
+fi
+
+# Also check if gen_test_traces was built
+if [ ! -x "${GENERATOR}" ]; then
+    echo "  ⚠ gen_test_traces not found. Build with: cmake --build ${BUILD_DIR} --target gen_test_traces"
+    echo "  ⚠ (requires -DTENET_BUILD_TESTS=ON)"
+    exit 1
 fi
 
 echo ""
