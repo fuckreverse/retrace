@@ -41,20 +41,32 @@ const CONFIG = {
   // the executable name; for a framework use its filename.
   moduleName: null, // null => use the main executable module
 
-  // Static (file) offset of the function start within the module, i.e. the
-  // address you see in IDA minus the module's preferred base.
-  // Example: IDA shows func at 0x100A1B2C0, image base 0x100000000 => 0xA1B2C0
-  funcOffset: 0x0,
+  // ── Target function resolution ──────────────────────────────────────────
+  // You can specify the target function in one of two ways:
+  //
+  //   1. funcOffset (traditional): static file offset within the module, i.e.
+  //      the address in IDA minus the image base.
+  //      Example: IDA shows func at 0x100A1B2C0, base 0x100000000 => 0xA1B2C0
+  //
+  //   2. funcName (auto-resolve): exported symbol name. The script will use
+  //      Module.findExportByName to resolve it at runtime, computing the offset
+  //      automatically. This is simpler for exported functions.
+  //      Example: funcName: "_SecKeyRawSign"
+  //
+  // If both are set, funcName takes priority. If funcName resolution fails,
+  // the script falls back to funcOffset.
+  funcName: null,   // exported symbol name (e.g. "_CCCrypt") or null to use offset
+  funcOffset: 0xEE91EC,  // sub_100EE91EC: Q-Field top-level coordinator
 
   // Length in bytes of the address range to trace (function size, or larger to
   // cover callees within the same module). Range = [start, start+rangeSize).
-  rangeSize: 0x400,
+  rangeSize: 0x7124,  // sub_100EE91EC function size (28964 bytes)
 
   // Where to write the binary trace on the device.
   // In "multi" mode this is treated as a template: the three-digit index is
   // inserted before the last dot (e.g. "qbditrace.bin" → "qbditrace_001.bin").
   // If the path has no extension the suffix is appended directly.
-  outputPath: '/var/mobile/Documents/qbditrace.bin',
+  outputPath: '/var/mobile/Documents/qfield_trace.bin',
 
   // Record bitmask: 1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC. 31 = all.
   record: 31,
@@ -78,7 +90,8 @@ const CONFIG = {
   embedCode: true,
 
   // How many integer args the traced function takes (forwarded to QBDI).
-  argCount: 0,
+  // sub_100EE91EC takes 1 arg: NSMutableDictionary* dict (in x0)
+  argCount: 1,
 
   // ── Multi-trace mode ────────────────────────────────────────────────────
   //
@@ -97,6 +110,37 @@ const CONFIG = {
   // removed after the first capture, making subsequent calls run natively.
   // Only relevant in "multi" / N mode.
   rehook: true,
+
+  // ── GCD Block Tracing ─────────────────────────────────────────────────────
+  //
+  // When enabled, hooks dispatch_async / dispatch_after / dispatch_barrier_async
+  // to intercept ObjC/C blocks dispatched via GCD. If the block's invoke pointer
+  // falls within the traced module address range, the block is synchronously
+  // executed under QBDI on the current thread (instead of asynchronously on a
+  // GCD worker thread). Each captured block produces a separate trace file.
+  //
+  // This works because QBDI's VM is single-threaded and cannot follow execution
+  // across thread boundaries. By extracting the block's invoke function pointer
+  // (at block + 16 on arm64) and running it through qbditrace_run_call, we get
+  // a full instruction-level trace of the GCD-dispatched work.
+  //
+  // LIMITATIONS:
+  //   - Execution order/timing differs from native (block runs synchronously).
+  //   - Blocks that depend on thread-local state of the worker may behave
+  //     differently.
+  //   - Only blocks whose invoke address is within [moduleBase, moduleBase +
+  //     moduleSize) are captured; system/framework blocks are skipped.
+  //
+  // Set to true to enable. Default: false (off).
+  traceGCD: false,
+
+  // Filter: only trace GCD blocks whose invoke pointer is within the target
+  // module. Set to false to trace ALL blocks (very noisy). Default: true.
+  gcdFilterByModule: true,
+
+  // Maximum number of GCD block traces to capture (0 = unlimited).
+  // Useful to avoid flooding the filesystem when many blocks are dispatched.
+  gcdMaxCaptures: 0,
 };
 
 // ===========================================================================
@@ -113,9 +157,25 @@ function fail(msg) {
 }
 
 function loadDylib(path) {
-  // Frida's Module.load throws if it fails; that's what we want.
-  const m = Module.load(path);
-  log('loaded dylib: ' + path + ' @ ' + m.base);
+  // Use dlopen directly instead of Module.load, because Module.load crashes
+  // on some targets (null-pointer dereference inside Frida's module enumeration
+  // after dlopen returns).  dlopen + Process.findModuleByName is equivalent.
+  const dlopen = new NativeFunction(
+      Module.getGlobalExportByName('dlopen'), 'pointer', ['pointer', 'int']);
+  const dlerror = new NativeFunction(
+      Module.getGlobalExportByName('dlerror'), 'pointer', []);
+  const pathStr = Memory.allocUtf8String(path);
+  const handle = dlopen(pathStr, 2 /* RTLD_NOW */);
+  if (handle.isNull()) {
+    const err = dlerror();
+    const msg = err.isNull() ? 'unknown error' : err.readUtf8String();
+    fail('dlopen failed for ' + path + ': ' + msg);
+  }
+  const m = Process.findModuleByName(path.split('/').pop());
+  if (!m) {
+    fail('dlopen succeeded but module not found by name: ' + path);
+  }
+  log('loaded dylib: ' + path + ' @ ' + m.base + ' (via dlopen)');
   return m;
 }
 
@@ -156,7 +216,7 @@ function buildNativeFunctions(ex) {
   return {
     configure: new NativeFunction(ex.qbditrace_configure, 'int', ['pointer']),
     runCall: new NativeFunction(ex.qbditrace_run_call, 'int',
-        ['pointer', 'uint64', 'uint32', 'pointer']),
+        ['pointer', 'pointer', 'uint32', 'pointer']),
     stop: new NativeFunction(ex.qbditrace_stop, 'void', []),
     outputPath: new NativeFunction(ex.qbditrace_output_path, 'pointer', []),
   };
@@ -185,17 +245,20 @@ function buildNativeFunctions(ex) {
  */
 function buildConfigStruct(opts) {
   // Field offsets (bytes) for arm64 / LP64.
-  // 0:start 8:end 16:base 24:slide 32:name 40:out 48:record 52:anchor
-  // 56:ring_bytes 64:objc_msgSend 72:objc_msgSendSuper 80:objc_msgSendSuper2
-  // 88:objc_msgSend_stret 96:extra_range_start 104:extra_range_end
-  // 112:disable_embed_code (u32) -> struct padded to 8-byte multiple.
-  // => total 120 bytes.
-  const SIZE = 120;
+  // The struct starts with struct_size (u32) + _reserved0 (u32) = 8 bytes,
+  // followed by the original fields shifted by 8:
+  // 0:struct_size(u32) 4:_reserved0(u32) 8:start 16:end 24:base 32:slide
+  // 40:name 48:out 56:record(u32) 60:anchor(u32) 64:ring_bytes
+  // 72:objc_msgSend 80:objc_msgSendSuper 88:objc_msgSendSuper2
+  // 96:objc_msgSend_stret 104:extra_range_start 112:extra_range_end
+  // 120:disable_embed_code(u32) 124:enable_pc_delta(u32)
+  // => total 128 bytes.
+  const SIZE = 128;
   const cfg = Memory.alloc(SIZE);
   // Memory.alloc contents are undefined; zero the struct so any field we don't
   // explicitly set (incl. padding and the inverted-sense disable_embed_code)
   // defaults to 0 -> code embedding stays on.
-  for (let i = 0; i < SIZE; i += 8) cfg.add(i).writeU64(0);
+  for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
   const moduleNameStr = opts.moduleName
       ? Memory.allocUtf8String(opts.moduleName) : NULL;
@@ -204,28 +267,32 @@ function buildConfigStruct(opts) {
   // Keep references alive on the struct object so GC doesn't free them.
   cfg._keep = [moduleNameStr, outputPathStr];
 
-  cfg.add(0).writeU64(opts.traceStart);
-  cfg.add(8).writeU64(opts.traceEnd);
-  cfg.add(16).writeU64(opts.moduleBase);
-  cfg.add(24).writeU64(opts.moduleSlide);
-  cfg.add(32).writePointer(moduleNameStr);
-  cfg.add(40).writePointer(outputPathStr);
-  cfg.add(48).writeU32(opts.record >>> 0);
-  cfg.add(52).writeU32(opts.anchorInterval >>> 0);
-  cfg.add(56).writeU64(opts.ringBytes);
+  // struct_size: ABI forward-compatibility field (must be set to sizeof).
+  cfg.add(0).writeU32(SIZE);
+  // _reserved0 stays 0 (already zeroed).
+  cfg.add(8).writePointer(opts.traceStart);
+  cfg.add(16).writePointer(opts.traceEnd);
+  cfg.add(24).writePointer(opts.moduleBase);
+  cfg.add(32).writePointer(opts.moduleSlide);
+  cfg.add(40).writePointer(moduleNameStr);
+  cfg.add(48).writePointer(outputPathStr);
+  cfg.add(56).writeU32(opts.record >>> 0);
+  cfg.add(60).writeU32(opts.anchorInterval >>> 0);
+  cfg.add(64).writePointer(ptr(opts.ringBytes));
   // The objc fields are uint64 in C but we hold them as NativePointers; write
   // them as pointers (NULL when unresolved => 0, which the tracer ignores).
-  cfg.add(64).writePointer(opts.objcMsgSend || NULL);
-  cfg.add(72).writePointer(opts.objcMsgSendSuper || NULL);
-  cfg.add(80).writePointer(opts.objcMsgSendSuper2 || NULL);
-  cfg.add(88).writePointer(opts.objcMsgSendStret || NULL);
+  cfg.add(72).writePointer(opts.objcMsgSend || NULL);
+  cfg.add(80).writePointer(opts.objcMsgSendSuper || NULL);
+  cfg.add(88).writePointer(opts.objcMsgSendSuper2 || NULL);
+  cfg.add(96).writePointer(opts.objcMsgSendStret || NULL);
   // Optional second instrumented range (e.g. the module's __auth_stubs/__stubs
   // so objc_msgSend dispatch is observed with its real target). NULL => unused.
-  cfg.add(96).writePointer(opts.extraRangeStart || NULL);
-  cfg.add(104).writePointer(opts.extraRangeEnd || NULL);
+  cfg.add(104).writePointer(opts.extraRangeStart || NULL);
+  cfg.add(112).writePointer(opts.extraRangeEnd || NULL);
   // Inverted sense: 0 keeps the default-on embedded code table. Pass
   // opts.embedCode === false to turn it off.
-  cfg.add(112).writeU32(opts.embedCode === false ? 1 : 0);
+  cfg.add(120).writeU32(opts.embedCode === false ? 1 : 0);
+  // enable_pc_delta stays 0 unless explicitly requested.
   return cfg;
 }
 
@@ -249,12 +316,12 @@ function resolveObjcDispatchers() {
   for (const key in map) {
     let p = null;
     try {
-      p = Module.findExportByName('libobjc.A.dylib', map[key]);
+      p = Process.getModuleByName('libobjc.A.dylib').findExportByName(map[key]);
     } catch (e) {
       p = null;
     }
     if (!p) {
-      try { p = Module.findExportByName(null, map[key]); } catch (e) { p = null; }
+      try { p = Module.getGlobalExportByName(map[key]); } catch (e) { p = null; }
     }
     if (p && !p.isNull()) {
       out[key] = p;
@@ -281,15 +348,180 @@ function buildIndexedOutputPath(template, index) {
   return template + suffix;
 }
 
+// ---------------------------------------------------------------------------
+// GCD Block Tracing
+//
+// ObjC Block memory layout (arm64):
+//   +0   isa pointer        (always _NSConcreteStackBlock or similar)
+//   +8   flags (int32) + reserved (int32)
+//   +16  invoke pointer     (void (*)(block_self, ...))   <-- this is what we want
+//   +24  descriptor pointer
+//   +32… captured variables
+//
+// dispatch_async(queue, block) submits the block to be invoked on a worker
+// thread. We intercept the submission, read block+16 (the invoke function),
+// and if it falls within our target module, immediately run it through QBDI
+// on the calling thread.
+// ---------------------------------------------------------------------------
+
+function installGCDHooks(opts) {
+  const { fn, mod, baseOpts, makeGCDOutputPath } = opts;
+  const moduleStart = mod.base;
+  const moduleEnd = mod.base.add(mod.size);
+  const filterByModule = CONFIG.gcdFilterByModule !== false;
+  const maxCaptures = CONFIG.gcdMaxCaptures || 0; // 0 = unlimited
+
+  let gcdTraceCount = 0;
+  let gcdInTrace = false;
+  const gcdRetOut = Memory.alloc(8);
+  const gcdArgv = Memory.alloc(8); // block invoke takes 1 arg: the block itself
+
+  function isInModule(addr) {
+    return addr.compare(moduleStart) >= 0 && addr.compare(moduleEnd) < 0;
+  }
+
+  function traceBlockIfNeeded(block, dispatcherName) {
+    if (gcdInTrace) return; // avoid re-entrancy
+    if (block.isNull()) return;
+
+    // Read the invoke function pointer at offset +16.
+    let invoke;
+    try {
+      invoke = block.add(16).readPointer();
+    } catch (e) {
+      return; // unreadable memory, skip silently
+    }
+    if (invoke.isNull()) return;
+
+    // Filter: only trace if invoke is within the target module.
+    if (filterByModule && !isInModule(invoke)) return;
+
+    // Check capture limit.
+    if (maxCaptures > 0 && gcdTraceCount >= maxCaptures) return;
+
+    gcdInTrace = true;
+    gcdTraceCount++;
+    const idx = gcdTraceCount;
+
+    log('[GCD] ' + dispatcherName + ': block invoke @ ' + invoke +
+        ' (offset 0x' + invoke.sub(moduleStart).toString(16) +
+        ') -> tracing as GCD capture #' + idx);
+
+    // Configure a new trace file for this block.
+    const outPath = makeGCDOutputPath(idx);
+    const cfgOpts = Object.assign({}, baseOpts, {
+      outputPath: outPath,
+      // Widen the trace range to cover the block's invoke function.
+      // Use the full module as the range so intra-module calls are followed.
+      traceStart: moduleStart,
+      traceEnd: moduleEnd,
+    });
+    const cfg = buildConfigStruct(cfgOpts);
+    const rc = fn.configure(cfg);
+    if (rc !== 0) {
+      log('[GCD] WARNING: configure failed for GCD block #' + idx + ', rc=' + rc);
+      gcdInTrace = false;
+      return;
+    }
+
+    // Execute the block under QBDI: invoke(block)
+    gcdArgv.writePointer(block);
+    const r = fn.runCall(gcdRetOut, invoke, 1, gcdArgv);
+    if (r !== 0) {
+      log('[GCD] WARNING: run_call failed for GCD block #' + idx + ', rc=' + r);
+    }
+    fn.stop();
+
+    log('[GCD] capture #' + idx + ' done. output = ' +
+        fn.outputPath().readUtf8String());
+
+    gcdInTrace = false;
+  }
+
+  // Hook the GCD dispatch family.
+  const dispatchers = [
+    'dispatch_async',
+    'dispatch_after',  // dispatch_after(when, queue, block)
+    'dispatch_barrier_async',
+  ];
+
+  let hookedCount = 0;
+  for (const name of dispatchers) {
+    let addr = null;
+    try {
+      addr = Process.getModuleByName('libdispatch.dylib').findExportByName(name);
+    } catch (e) { /* module not found or no export */ }
+    if (!addr) {
+      try {
+        addr = Process.getModuleByName('libSystem.B.dylib').findExportByName(name);
+      } catch (e) { /* fallback */ }
+    }
+    if (!addr) {
+      try { addr = Module.getGlobalExportByName(name); } catch (e) { /* give up */ }
+    }
+    if (!addr || addr.isNull()) {
+      log('[GCD] WARNING: could not resolve ' + name + ', skipping');
+      continue;
+    }
+
+    // dispatch_async(queue, block):         block is arg[1]
+    // dispatch_barrier_async(queue, block): block is arg[1]
+    // dispatch_after(when, queue, block):   block is arg[2]
+    const blockArgIndex = (name === 'dispatch_after') ? 2 : 1;
+
+    Interceptor.attach(addr, {
+      onEnter(args) {
+        const block = args[blockArgIndex];
+        traceBlockIfNeeded(block, name);
+      }
+    });
+    hookedCount++;
+    log('[GCD] hooked ' + name + ' @ ' + addr +
+        ' (block arg index = ' + blockArgIndex + ')');
+  }
+
+  if (hookedCount === 0) {
+    log('[GCD] WARNING: no GCD dispatchers could be hooked!');
+  } else {
+    log('[GCD] ' + hookedCount + ' dispatcher(s) hooked. ' +
+        'Blocks within ' + mod.name + ' will be traced.' +
+        (maxCaptures > 0 ? ' (max ' + maxCaptures + ' captures)' : ''));
+  }
+}
+
 function main() {
   const dylib = loadDylib(CONFIG.dylibPath);
   const ex = resolveExports(dylib);
   const fn = buildNativeFunctions(ex);
   const mod = resolveTargetModule();
 
-  // Compute runtime addresses from static offset.
+  // Compute runtime addresses from static offset or symbol name.
   const moduleBase = mod.base; // NativePointer
-  const funcStart = moduleBase.add(CONFIG.funcOffset);
+  let funcStart;
+  if (CONFIG.funcName) {
+    // Auto-resolve by exported symbol name.
+    let resolved = null;
+    try {
+      if (CONFIG.moduleName) {
+        resolved = Process.getModuleByName(CONFIG.moduleName).findExportByName(CONFIG.funcName);
+      } else {
+        resolved = Module.getGlobalExportByName(CONFIG.funcName);
+      }
+    } catch (e) {
+      resolved = null;
+    }
+    if (resolved && !resolved.isNull()) {
+      funcStart = resolved;
+      log('resolved funcName "' + CONFIG.funcName + '" @ ' + funcStart +
+          ' (offset = 0x' + funcStart.sub(moduleBase).toString(16) + ')');
+    } else {
+      log('WARNING: funcName "' + CONFIG.funcName +
+          '" not found, falling back to funcOffset');
+      funcStart = moduleBase.add(CONFIG.funcOffset);
+    }
+  } else {
+    funcStart = moduleBase.add(CONFIG.funcOffset);
+  }
   const funcEnd = funcStart.add(CONFIG.rangeSize);
 
   // ASLR slide: difference between runtime base and the image's preferred base.
@@ -399,7 +631,7 @@ function main() {
         }
         const r = fn.runCall(retOut, funcStart, argc, argv);
         installHook(); // re-arm
-        return retOut.readU64();
+        return retOut.readPointer();
       }
 
       // --- Capture this invocation ---
@@ -422,7 +654,7 @@ function main() {
       if (r !== 0) {
         log('qbditrace_run_call returned error rc=' + r);
       }
-      const ret = retOut.readU64();
+      const ret = retOut.readPointer();
 
       // Flush this trace to disk.
       fn.stop();
@@ -446,7 +678,7 @@ function main() {
       // If wantMore but rehook===false, we simply leave the hook reverted.
 
       return ret;
-    }, 'uint64', buildArgTypes(argc)));
+    }, 'pointer', buildArgTypes(argc)));
   }
 
   installHook();
@@ -456,6 +688,27 @@ function main() {
         ', max=' + maxTraces + '). Trigger the function to trace.');
   } else {
     log('hook installed on ' + funcStart + '. Trigger the function to trace.');
+  }
+
+  // --- Optional: GCD block tracing ---
+  if (CONFIG.traceGCD) {
+    // GCD trace files use a separate naming scheme: "..._gcd_001.bin"
+    function makeGCDOutputPath(gcdIndex) {
+      const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
+      const base = CONFIG.outputPath;
+      const dot = base.lastIndexOf('.');
+      if (dot > 0 && dot > base.lastIndexOf('/')) {
+        return base.slice(0, dot) + suffix + base.slice(dot);
+      }
+      return base + suffix;
+    }
+
+    installGCDHooks({
+      fn: fn,
+      mod: mod,
+      baseOpts: baseOpts,
+      makeGCDOutputPath: makeGCDOutputPath,
+    });
   }
 }
 

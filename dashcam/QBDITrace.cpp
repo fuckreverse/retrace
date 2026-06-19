@@ -843,6 +843,41 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   return QBDI::CONTINUE;
 }
 
+/* Serialize the regdiff + memacc payload that is common to both v4 and v5
+ * instruction records.  Returns the pointer past the last byte written.
+ * This avoids duplicating the loop + safeRead logic in two code paths. */
+static inline uint8_t *serializeInstPayload(
+    uint8_t *p,
+    const qbditrace_regdiff_t *regbuf, uint8_t regbuf_n,
+    const QBDI::MemoryAccess *macc, uint8_t n_mem) {
+  for (uint8_t k = 0; k < regbuf_n; ++k) {
+    std::memcpy(p, &regbuf[k], sizeof(qbditrace_regdiff_t));
+    p += sizeof(qbditrace_regdiff_t);
+  }
+  for (uint8_t k = 0; k < n_mem; ++k) {
+    const QBDI::MemoryAccess &m = macc[k];
+    qbditrace_memacc_t mr;
+    mr.mem_type = (uint8_t)m.type;
+    mr.mem_flags = (uint8_t)m.flags;
+    mr.size = m.size;
+    mr.addr = m.accessAddress;
+    mr.value = m.value;
+    mr.value_hi = 0;
+    if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
+        (m.type & QBDI::MEMORY_WRITE) && m.size > 0 && m.size <= 16) {
+      uint8_t bytes[16] = {0};
+      if (safeRead(m.accessAddress, bytes, m.size)) {
+        std::memcpy(&mr.value, bytes, 8);
+        std::memcpy(&mr.value_hi, bytes + 8, 8);
+        mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
+      }
+    }
+    std::memcpy(p, &mr, sizeof(mr));
+    p += sizeof(mr);
+  }
+  return p;
+}
+
 QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
                           QBDI::FPRState * /*fpr*/, void * /*data*/) {
   ThreadCtx *c = g_tctx ? g_tctx : ensureThreadCtx();
@@ -904,7 +939,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   uint8_t n_mem = macc.size() > 255 ? 255 : (uint8_t)macc.size();
 
   /* --- assemble + emit one packed record ---
-   * v4: qbditrace_inst_head_t (12 bytes) with absolute pc
+   * v4: qbditrace_inst_head_t (16 bytes) with absolute pc
    * v5: qbditrace_inst_head_v5_t (6 bytes) with int16 pc_delta
    *     If delta overflows int16, emit an ANCHOR first then use delta=0. */
   const size_t payload_tail = (size_t)regbuf_n * sizeof(qbditrace_regdiff_t) +
@@ -942,34 +977,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     std::memcpy(p, &ih5, sizeof(ih5));
     p += sizeof(ih5);
 
-    // Write reg diffs
-    for (uint8_t k = 0; k < regbuf_n; ++k) {
-      std::memcpy(p, &regbuf[k], sizeof(qbditrace_regdiff_t));
-      p += sizeof(qbditrace_regdiff_t);
-    }
-
-    // Write memory accesses
-    for (uint8_t k = 0; k < n_mem; ++k) {
-      const QBDI::MemoryAccess &m = macc[k];
-      qbditrace_memacc_t mr;
-      mr.mem_type = (uint8_t)m.type;
-      mr.mem_flags = (uint8_t)m.flags;
-      mr.size = m.size;
-      mr.addr = m.accessAddress;
-      mr.value = m.value;
-      mr.value_hi = 0;
-      if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-          (m.type & QBDI::MEMORY_WRITE) && m.size > 0 && m.size <= 16) {
-        uint8_t bytes[16] = {0};
-        if (safeRead(m.accessAddress, bytes, m.size)) {
-          std::memcpy(&mr.value, bytes, 8);
-          std::memcpy(&mr.value_hi, bytes + 8, 8);
-          mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
-        }
-      }
-      std::memcpy(p, &mr, sizeof(mr));
-      p += sizeof(mr);
-    }
+    serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem);
 
     c->last_emitted_pc = exec_pc;
     ++c->inst_count;
@@ -992,39 +1000,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   std::memcpy(p, &ih, sizeof(ih));
   p += sizeof(ih);
 
-  for (uint8_t k = 0; k < regbuf_n; ++k) {
-    std::memcpy(p, &regbuf[k], sizeof(qbditrace_regdiff_t));
-    p += sizeof(qbditrace_regdiff_t);
-  }
-
-  for (uint8_t k = 0; k < n_mem; ++k) {
-    const QBDI::MemoryAccess &m = macc[k];
-    qbditrace_memacc_t mr;
-    mr.mem_type = (uint8_t)m.type;
-    mr.mem_flags = (uint8_t)m.flags;
-    mr.size = m.size;
-    mr.addr = m.accessAddress;
-    mr.value = m.value;
-    mr.value_hi = 0;
-    /* Recover unknown store values by re-reading the destination (the store has
-     * already executed at POSTINST, so the bytes are in memory). QBDI's own
-     * `value` field only holds up to 8 bytes, so for stp/NEON stores (9..16B)
-     * we re-read the full width into value (low 8B) + value_hi (high bytes). */
-    if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-        (m.type & QBDI::MEMORY_WRITE) && m.size > 0 && m.size <= 16) {
-      uint8_t bytes[16] = {0};
-      /* Fault-tolerant read: the destination may be a guard page, MMIO, or a
-       * region unmapped right after the store. A plain memcpy here would crash
-       * the whole process; safeRead leaves the value unknown instead. */
-      if (safeRead(m.accessAddress, bytes, m.size)) {
-        std::memcpy(&mr.value, bytes, 8);
-        std::memcpy(&mr.value_hi, bytes + 8, 8);
-        mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
-      }
-    }
-    std::memcpy(p, &mr, sizeof(mr));
-    p += sizeof(mr);
-  }
+  serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem);
 
   ++c->inst_count;
   ++c->since_anchor;
@@ -1415,6 +1391,14 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   if (!in || in->trace_end <= in->trace_start) {
     return -1;
   }
+  /* ABI forward-compatibility: if struct_size is 0 (legacy caller that doesn't
+   * know about the field) we accept the whole struct as-is. If struct_size is
+   * set but smaller than the current sizeof, fields beyond that offset are
+   * treated as zero (the caller zero-initialized everything). If struct_size is
+   * larger than ours (future caller, library is older), we only read what we
+   * understand. Either way, all new fields are appended at the end and default
+   * to 0, so this is safe. */
+  (void)in->struct_size; /* acknowledged; no action needed for current fields */
   Config cfg;
   cfg.trace_start = in->trace_start;
   cfg.trace_end = in->trace_end;

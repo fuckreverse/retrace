@@ -38,14 +38,17 @@
 #       -framework Foundation -framework CoreFoundation -o libqbditrace.dylib
 
 cmake_minimum_required(VERSION 3.16)
-project(qbditrace CXX)
+project(qbditrace C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(QBDITRACE_BUILD_DYLIB "Build the tracer dylib" ON)
 option(QBDITRACE_BUILD_DECODER "Build the offline decoder (host tool)" ON)
+option(QBDITRACE_BUILD_TESTS "Build unit tests (host)" ON)
 
 # ---------------------------------------------------------------------------
 # Tracer dylib (target build)
@@ -109,4 +112,31 @@ if(QBDITRACE_BUILD_DECODER)
       "qbditrace decoder: Capstone not found; will emit raw opcode words only. "
       "Install capstone (brew install capstone) for full disassembly.")
   endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Unit tests (host build)
+# ---------------------------------------------------------------------------
+# These are lightweight, self-contained tests that do NOT require QBDI or
+# Frida — they validate the on-disk trace format layout (static_asserts +
+# runtime field checks) and the RingBuffer producer/consumer round-trip.
+#
+#   ctest --test-dir <build> --output-on-failure
+# ---------------------------------------------------------------------------
+if(QBDITRACE_BUILD_TESTS)
+  enable_testing()
+
+  # test_trace_format: pure C, validates struct sizes / magic / field offsets.
+  # All checks are _Static_assert (compile-time) plus a few runtime asserts.
+  add_executable(test_trace_format tests/unit/test_trace_format.c)
+  target_include_directories(test_trace_format PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME trace_format COMMAND test_trace_format)
+
+  # test_ring_buffer: C++, exercises BackgroundWriter + ThreadBuffer round-trip,
+  # chunk rotation, header-first ordering, and multi-thread buffer correctness.
+  add_executable(test_ring_buffer tests/unit/test_ring_buffer.cpp)
+  target_include_directories(test_ring_buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_ring_buffer PRIVATE Threads::Threads)
+  add_test(NAME ring_buffer COMMAND test_ring_buffer)
 endif()

@@ -30,7 +30,25 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 #include <vector>
+
+/* Minimal async-signal-safe stderr logger for IO errors. We avoid fprintf
+ * because the writer thread may encounter errors while the process is in an
+ * arbitrary state. write(2) to fd 2 is safe from any context. */
+namespace qbditrace {
+namespace detail {
+inline void logIOError(const char *msg) {
+  /* Format: "[qbditrace] IO ERROR: <msg>\n" */
+  static const char prefix[] = "[qbditrace] IO ERROR: ";
+  (void)::write(2, prefix, sizeof(prefix) - 1);
+  size_t len = 0;
+  while (msg[len]) ++len;
+  (void)::write(2, msg, len);
+  (void)::write(2, "\n", 1);
+}
+} // namespace detail
+} // namespace qbditrace
 
 namespace qbditrace {
 
@@ -104,7 +122,10 @@ inline void BackgroundWriter::writeHeaderRaw(const void *buf, size_t len) {
    * under the lock to keep ordering simple and correct. */
   std::lock_guard<std::mutex> lk(mtx_);
   if (file_ && !header_written_) {
-    std::fwrite(buf, 1, len, file_);
+    size_t written = std::fwrite(buf, 1, len, file_);
+    if (written != len || std::ferror(file_)) {
+      detail::logIOError("failed to write file header (disk full?)");
+    }
     std::fflush(file_);
     header_written_ = true;
   }
@@ -162,6 +183,9 @@ inline void BackgroundWriter::recycle(uint8_t *mem) {
 }
 
 inline void BackgroundWriter::loop() {
+  /* Track whether we have already reported an IO error to avoid flooding
+   * stderr with repeated messages for the same disk-full condition. */
+  bool io_error_reported = false;
   for (;;) {
     Chunk c;
     {
@@ -177,7 +201,11 @@ inline void BackgroundWriter::loop() {
       queue_.pop_front();
     }
     if (file_ && c.data && c.used) {
-      std::fwrite(c.data, 1, c.used, file_);
+      size_t written = std::fwrite(c.data, 1, c.used, file_);
+      if ((written != c.used || std::ferror(file_)) && !io_error_reported) {
+        detail::logIOError("fwrite failed in writer thread (disk full?)");
+        io_error_reported = true;
+      }
     }
     recycle(c.data);
   }
@@ -202,7 +230,10 @@ inline void BackgroundWriter::stop() {
     while (!queue_.empty()) {
       Chunk &c = queue_.front();
       if (file_ && c.data && c.used) {
-        std::fwrite(c.data, 1, c.used, file_);
+        size_t written = std::fwrite(c.data, 1, c.used, file_);
+        if (written != c.used || std::ferror(file_)) {
+          detail::logIOError("fwrite failed during drain (disk full?)");
+        }
       }
       if (c.data) {
         std::free(c.data);

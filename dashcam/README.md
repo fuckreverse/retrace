@@ -434,7 +434,7 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
 
 `TraceFormat.h` 是唯一的格式契约（writer 与 decoder 共用，保证 ABI 一致）。
 
-- 512 字节文件头：magic `"QBDT"`、version、arch、num_gpr、module_base、
+- 536 字节文件头：magic `"QBDT"`、version、arch、num_gpr、module_base、
   module_slide、trace 区间、flags、module_name。flags 标记内容特性：
   `HAS_MEM`、`HAS_NZCV`、`REG_DIFF`、`HAS_CODE`（内嵌码表存在）。
 - 记录流由变长记录组成，首字节为 `kind`：

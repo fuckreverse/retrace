@@ -81,7 +81,7 @@ typedef struct {
   uint64_t trace_end;    /* runtime end address (excluded) of the traced range */
   uint64_t flags;        /* qbditrace_header_flags */
   char module_name[256]; /* NUL-terminated, best-effort module path */
-  uint8_t reserved[224]; /* pad header to 512 bytes for easy hex inspection */
+  uint8_t reserved[224]; /* pad header to 536 bytes for easy hex inspection */
 } qbditrace_file_header_t;
 
 typedef enum {
@@ -147,8 +147,8 @@ typedef struct {
 
 /* v5 variant (HF_PC_DELTA): identical to qbditrace_inst_head_t except the
  * 8-byte absolute `pc` is replaced by a 2-byte signed `pc_delta` (LE int16).
- * Record size: 6 bytes (vs 12 bytes for v4), reducing the INST record header
- * size by 50% for sequential code (delta = +4 every instruction).
+ * Record size: 6 bytes (vs 16 bytes for v4), reducing the INST record header
+ * size by over 60% for sequential code (delta = +4 every instruction).
  *
  * The decoder maintains a `running_pc` state variable:
  *   running_pc += pc_delta   after reading each REC_INST
@@ -312,6 +312,37 @@ typedef struct {
 #define QBDITRACE_AARCH64_IDX_SP 31
 #define QBDITRACE_AARCH64_IDX_NZCV 32
 #define QBDITRACE_AARCH64_IDX_PC 33
+
+/* --- Compile-time layout assertions ---
+ * These ensure the on-disk struct sizes match the decoder's expectations across
+ * different compilers and platforms. If any of these fire, it means a compiler
+ * inserted unexpected padding or a field type change broke the layout. The
+ * decoder relies on sizeof() for record parsing (as documented above), so any
+ * mismatch would silently corrupt the decode. */
+#ifdef __cplusplus
+static_assert(sizeof(qbditrace_file_header_t) == 536,
+              "file header must be exactly 536 bytes");
+static_assert(sizeof(qbditrace_inst_head_t) == 16,
+              "v4 INST header must be 16 bytes (4B fields + 4B pad + 8B pc)");
+static_assert(sizeof(qbditrace_inst_head_v5_t) == 6,
+              "v5 INST header must be 6 bytes (4B fields + 2B pc_delta)");
+static_assert(sizeof(qbditrace_regdiff_t) == 16,
+              "regdiff must be 16 bytes (1B index + 7B pad + 8B value)");
+static_assert(sizeof(qbditrace_memacc_t) == 32,
+              "memacc must be 32 bytes (4B fields + 4B pad + 3x8B)");
+static_assert(sizeof(qbditrace_anchor_head_t) == 16,
+              "anchor head must be 16 bytes (4B kind+reserved + 4B pad + 8B pc)");
+static_assert(sizeof(qbditrace_thread_head_t) == 16,
+              "thread head must be 16 bytes (4B kind+reserved + 4B pad + 8B tid)");
+static_assert(sizeof(qbditrace_event_head_t) == 24,
+              "event head must be 24 bytes (4B kind+event+reserved + 4B pad + 2x8B)");
+static_assert(sizeof(qbditrace_svc_head_t) == 72,
+              "svc head must be 72 bytes (4B + 4B pad + 8B pc + 8B no + 6x8B args)");
+static_assert(sizeof(qbditrace_objc_head_t) == 80,
+              "objc head must be 80 bytes (4B + 4B pad + 3x8B + 48B cls)");
+static_assert(sizeof(qbditrace_code_head_t) == 16,
+              "code head must be 16 bytes (4B kind+size+reserved + 4B pad + 8B pc)");
+#endif
 
 #ifdef __cplusplus
 } /* namespace qbditrace */

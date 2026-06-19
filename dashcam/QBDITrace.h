@@ -41,8 +41,17 @@ enum {
  * Tracer configuration. All addresses are *runtime* addresses (already slid by
  * ASLR). The loader is responsible for resolving them, typically via
  * Module.findBaseAddress(name) + static_offset.
+ *
+ * ABI forward-compatibility: callers MUST set `struct_size = sizeof(qbditrace_config_t)`
+ * before passing the struct to qbditrace_configure(). This allows the library to
+ * detect older callers that have a shorter struct (missing newly-added fields at the
+ * end) and safely default those fields to zero. Callers that zero-initialize the
+ * struct (memset 0 + set struct_size) are guaranteed forward-compatible with any
+ * future field additions.
  */
 typedef struct {
+  uint32_t struct_size;  /* MUST be set to sizeof(qbditrace_config_t) by caller */
+  uint32_t _reserved0;   /* padding for 8-byte alignment */
   uint64_t trace_start;  /* runtime start address of the range to trace */
   uint64_t trace_end;    /* runtime end address (excluded) */
   uint64_t module_base;  /* runtime base of the traced module (for ASLR norm) */
@@ -149,6 +158,17 @@ void qbditrace_stop(void);
  * if none configured yet). The returned pointer is owned by the library.
  */
 const char *qbditrace_output_path(void);
+
+/*
+ * Diagnostic: dump the crash-locating PC ring window to `path` (appended), or
+ * to stderr when path is null/empty. Intended to be called from the Frida side
+ * after Frida's own exception handler intercepts a fault inside the
+ * qbditrace_run_call NativeFunction trampoline (where our SIGSEGV handler
+ * never runs). The ring contains the last N executed PCs leading up to the
+ * crash, enabling post-mortem identification of the faulting instruction.
+ * Returns the number of PC entries written.
+ */
+int qbditrace_dump_pcring(const char *path);
 
 #ifdef __cplusplus
 } /* extern "C" */

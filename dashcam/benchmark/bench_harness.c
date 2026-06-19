@@ -7,9 +7,11 @@
  *
  * Usage:
  *   bench_harness [--seed <hex>] [--filter <name>] [--output-dir <dir>]
+ *                 [--repeat <N>] [--csv]
  *
  * Each target produces a separate trace file: <output-dir>/<target_name>.bin
  * Results are printed as a table and optionally as CSV.
+ * With --repeat N (N>1), runs each target N times and reports the median.
  */
 
 #include <dlfcn.h>
@@ -32,6 +34,20 @@ static double now_sec(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+}
+
+/* ---------- Statistics ----------------------------------------------------- */
+
+static int cmp_double(const void *a, const void *b) {
+  double da = *(const double *)a;
+  double db = *(const double *)b;
+  return (da > db) - (da < db);
+}
+
+static double median(double *arr, int n) {
+  qsort(arr, (size_t)n, sizeof(double), cmp_double);
+  if (n % 2 == 1) return arr[n / 2];
+  return (arr[n / 2 - 1] + arr[n / 2]) / 2.0;
 }
 
 /* ---------- Target registry ----------------------------------------------- */
@@ -139,6 +155,7 @@ int main(int argc, char **argv) {
   const char *filter = NULL;
   const char *outdir = "/tmp/qbditrace-bench";
   int csv = 0;
+  int repeat = 1;
 
   /* Parse args */
   for (int i = 1; i < argc; i++) {
@@ -148,11 +165,14 @@ int main(int argc, char **argv) {
       filter = argv[++i];
     } else if (strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
       outdir = argv[++i];
+    } else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
+      repeat = atoi(argv[++i]);
+      if (repeat < 1) repeat = 1;
     } else if (strcmp(argv[i], "--csv") == 0) {
       csv = 1;
     } else if (strcmp(argv[i], "--help") == 0) {
       printf("Usage: %s [--seed <hex>] [--filter <name>] "
-             "[--output-dir <dir>] [--csv]\n",
+             "[--output-dir <dir>] [--repeat <N>] [--csv]\n",
              argv[0]);
       return 0;
     }
@@ -166,6 +186,7 @@ int main(int argc, char **argv) {
   printf("=== qbditrace benchmark ===\n");
   printf("seed       = 0x%" PRIx64 "\n", seed);
   printf("output_dir = %s\n", outdir);
+  printf("repeat     = %d\n", repeat);
   printf("targets    = %zu\n", NUM_TARGETS);
   if (filter) printf("filter     = %s\n", filter);
   printf("\n");
@@ -205,53 +226,82 @@ int main(int argc, char **argv) {
     }
     total++;
 
-    /* --- Native reference --- */
+    /* --- Native reference (single run for correctness check) --- */
     double t0 = now_sec();
     uint64_t ref = t->fn(seed);
-    double native_us = (now_sec() - t0) * 1e6;
+    double single_native_us = (now_sec() - t0) * 1e6;
 
-    /* --- Configure tracer for this target --- */
+    /* --- Configure + run tracer (potentially multiple times) --- */
     char outpath[1024];
     snprintf(outpath, sizeof(outpath), "%s/%s.bin", outdir, t->name);
 
-    qbditrace_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.trace_start = range_start;
-    cfg.trace_end = range_end;
-    cfg.module_base = range_start;
-    cfg.module_slide = 0;
-    cfg.module_name = "benchmark";
-    cfg.output_path = outpath;
-    cfg.record = QBDITRACE_REC_DEFAULT;
-    cfg.anchor_interval = 0; /* default */
-    cfg.ring_bytes = 0;
-    cfg.extra_range_start = stub_s;
-    cfg.extra_range_end = stub_e;
-
-    if (qbditrace_configure(&cfg) != 0) {
-      fprintf(stderr, "[FAIL] %s: configure failed\n", t->name);
-      failed++;
-      continue;
-    }
-
-    /* --- Instrumented run --- */
+    double *native_samples = (double *)malloc(sizeof(double) * (size_t)repeat);
+    double *trace_samples = (double *)malloc(sizeof(double) * (size_t)repeat);
+    int run_ok = 1;
     uint64_t ret = 0;
-    uint64_t args[1] = {seed};
-    double t1 = now_sec();
-    int rc = qbditrace_run_call(&ret, (uint64_t)(uintptr_t)t->fn, 1, args);
-    double trace_us = (now_sec() - t1) * 1e6;
-    qbditrace_stop();
 
-    if (rc != 0) {
-      fprintf(stderr, "[FAIL] %s: run_call returned %d\n", t->name, rc);
+    for (int r = 0; r < repeat; r++) {
+      /* Native timing */
+      double tn0 = now_sec();
+      (void)t->fn(seed);
+      native_samples[r] = (now_sec() - tn0) * 1e6;
+
+      /* Traced timing */
+      qbditrace_config_t cfg;
+      memset(&cfg, 0, sizeof(cfg));
+      cfg.struct_size = sizeof(cfg);
+      cfg.trace_start = range_start;
+      cfg.trace_end = range_end;
+      cfg.module_base = range_start;
+      cfg.module_slide = 0;
+      cfg.module_name = "benchmark";
+      cfg.output_path = outpath;
+      cfg.record = QBDITRACE_REC_DEFAULT;
+      cfg.anchor_interval = 0; /* default */
+      cfg.ring_bytes = 0;
+      cfg.extra_range_start = stub_s;
+      cfg.extra_range_end = stub_e;
+
+      if (qbditrace_configure(&cfg) != 0) {
+        fprintf(stderr, "[FAIL] %s: configure failed (repeat %d)\n",
+                t->name, r);
+        run_ok = 0;
+        break;
+      }
+
+      uint64_t args[1] = {seed};
+      double t1 = now_sec();
+      int rc = qbditrace_run_call(&ret, (uint64_t)(uintptr_t)t->fn, 1, args);
+      trace_samples[r] = (now_sec() - t1) * 1e6;
+      qbditrace_stop();
+
+      if (rc != 0) {
+        fprintf(stderr, "[FAIL] %s: run_call returned %d (repeat %d)\n",
+                t->name, rc, r);
+        run_ok = 0;
+        break;
+      }
+    }
+
+    if (!run_ok) {
+      free(native_samples);
+      free(trace_samples);
       failed++;
       continue;
     }
 
-    /* --- Verify --- */
+    /* --- Verify (use last run's return value) --- */
     int correct = (ret == ref);
     long bytes = file_size(outpath);
+
+    /* Use median for stable results (or single sample if repeat==1) */
+    double native_us = (repeat == 1) ? single_native_us
+                                     : median(native_samples, repeat);
+    double trace_us = median(trace_samples, repeat);
     double overhead = (native_us > 0.01) ? (trace_us / native_us) : 0.0;
+
+    free(native_samples);
+    free(trace_samples);
 
     if (correct) {
       passed++;
