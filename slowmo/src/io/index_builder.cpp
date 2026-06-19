@@ -10,6 +10,12 @@
 
 namespace tenet {
 
+// Schema version for the RocksDB index cache.
+// Bump this whenever TraceFormat struct sizes change, column families are
+// added/removed, or the encoding of keys/values in the DB changes.
+// This ensures stale caches from older builds are invalidated automatically.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 2;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 namespace {
@@ -100,7 +106,17 @@ rocksdb::ColumnFamilyHandle* TraceIndex::get_cf(const char* name) const {
 }
 
 bool TraceIndex::is_valid_for(const TraceReader& reader) const {
-    // Simple validation: check stored file size matches
+    // Check schema version: if the index was built by a different version of
+    // the code (different struct sizes, different CF layout), it's invalid.
+    std::string schema_val;
+    auto sv = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
+                       "schema_version", &schema_val);
+    if (!sv.ok() || schema_val.size() < 4) return false;
+    uint32_t stored_schema = 0;
+    std::memcpy(&stored_schema, schema_val.data(), 4);
+    if (stored_schema != INDEX_SCHEMA_VERSION) return false;
+
+    // Check stored file size matches
     std::string value;
     auto s = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                       "file_size", &value);
@@ -140,12 +156,22 @@ Result<TraceIndex> TraceIndex::open_or_build(
         if (s.ok()) {
             idx.db_ = std::unique_ptr<rocksdb::DB>(raw_db);
             if (idx.is_valid_for(reader)) {
-                // Load stats
-                std::string val;
-                if (idx.db_->Get(rocksdb::ReadOptions(), idx.get_cf(cf::META),
-                                 "inst_count", &val).ok() && val.size() == 8) {
-                    std::memcpy(&idx.stats_.inst_count, val.data(), 8);
-                }
+                // Load stats from the META column family. inst_count and
+                // file_size are always present (written by build()). The
+                // record/anchor/code/event counts were added later, so read
+                // them defensively (an older cache may lack some keys).
+                auto* meta_cf = idx.get_cf(cf::META);
+                auto load_u64 = [&](const char* key, uint64_t& out) {
+                    std::string v;
+                    if (idx.db_->Get(rocksdb::ReadOptions(), meta_cf, key, &v).ok() &&
+                        v.size() == 8) {
+                        std::memcpy(&out, v.data(), 8);
+                    }
+                };
+                load_u64("inst_count", idx.stats_.inst_count);
+                load_u64("total_records", idx.stats_.total_records);
+                load_u64("code_count", idx.stats_.code_count);
+                load_u64("event_count", idx.stats_.event_count);
 
                 // Load anchor table into memory
                 auto* anchor_cf = idx.get_cf(cf::ANCHOR);
@@ -162,6 +188,10 @@ Result<TraceIndex> TraceIndex::open_or_build(
                           [](const auto& a, const auto& b) {
                               return a.inst_id < b.inst_id;
                           });
+                // Derive anchor_count from the loaded vector so the stat is
+                // always consistent with the in-memory table (and the display
+                // shows the real count instead of 0 when loading from cache).
+                idx.stats_.anchor_count = idx.anchors_.size();
 
                 return idx;
             }
@@ -352,11 +382,23 @@ Result<TraceIndex> TraceIndex::build(
     // Write metadata
     auto* meta_cf = idx.get_cf(cf::META);
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "version", "1");
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "schema_version",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&INDEX_SCHEMA_VERSION), 4));
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "inst_count",
                  rocksdb::Slice(reinterpret_cast<const char*>(&inst_id), 8));
     uint64_t fsize = reader.file_size();
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "file_size",
                  rocksdb::Slice(reinterpret_cast<const char*>(&fsize), 8));
+    // Persist the remaining counters so open_or_build can restore them on a
+    // cache hit instead of reporting 0 for everything except inst_count.
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "total_records",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&total_records), 8));
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "anchor_count",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.anchor_count), 8));
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "code_count",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.code_count), 8));
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "event_count",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.event_count), 8));
 
     auto t1 = std::chrono::steady_clock::now();
     idx.stats_.build_seconds =

@@ -14,7 +14,7 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 
 ```
 ┌──────────────────────────────────────────┐
-│ File Header (512 bytes, aligned)         │  ← qbditrace_file_header_t
+│ File Header (536 bytes, aligned)         │  ← qbditrace_file_header_t
 ├──────────────────────────────────────────┤
 │ Record 0 (variable length)              │
 │ Record 1                                 │
@@ -27,7 +27,7 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 
 ---
 
-## File Header — `qbditrace_file_header_t` (512 字节)
+## File Header — `qbditrace_file_header_t` (536 字节)
 
 | 偏移 | 大小 | 字段 | 值/说明 |
 |------|------|------|---------|
@@ -41,7 +41,7 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 | 0x28 | 8 | trace_end | 追踪范围结束地址（excluded） |
 | 0x30 | 8 | flags | `qbditrace_header_flags` 位组合 |
 | 0x38 | 256 | module_name | NUL 终止的模块路径 |
-| 0x138 | 224 | reserved | 填充至 512 字节 |
+| 0x138 | 224 | reserved | 填充至 536 字节 |
 
 **Header Flags**：
 
@@ -113,6 +113,11 @@ struct RegState {
 | OBJC | 5 | `qbditrace_objc_head_t` | ObjC 消息发送 |
 | CODE | 6 | `qbditrace_code_head_t` + bytes[] | 指令原始字节 |
 
+> **磁盘布局说明**：所有记录以 C struct 自然对齐方式存储（writer 用 `memcpy(p, &struct, sizeof)`），
+> 磁盘大小 = `sizeof(struct)`，**含对齐 padding**。下方各记录的 “Total” 均为 sizeof 口径，
+> 与 `TraceFormat.h` 的 `static_assert` 一致。解析时必须用 `sizeof()` 推进，不能按字段裸和计算
+> （例如 `qbditrace_inst_head_t` 逻辑字段 12 字节，但 sizeof = 16 字节，含 4 字节 padding）。
+
 ---
 
 ## REC_INST — 指令增量记录
@@ -125,10 +130,10 @@ struct RegState {
 │ u8  n_mem        ← 几次内存访问                                │
 │ u64 pc           ← 指令的运行时地址                            │
 ├────────────────────────────────────────────────────────────────┤
-│ n_regdiff × { u8 reg_index; u64 value; }  (各 9 字节)         │
+│ n_regdiff × { u8 reg_index; u64 value; }  (各 16 字节)        │
 ├────────────────────────────────────────────────────────────────┤
 │ n_mem × { u8 mem_type; u8 mem_flags; u16 size;                │
-│           u64 addr; u64 value; u64 value_hi; }  (各 26 字节)  │
+│           u64 addr; u64 value; u64 value_hi; }  (各 32 字节)  │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -142,7 +147,7 @@ struct RegState {
 - `size`：访问大小（字节）
 - `value`/`value_hi`：访问的数据。≤8B 时 `value` 即全部；9-16B 时低 8B 在 `value`，高字节在 `value_hi`
 
-**记录大小**：4 + 8 + n_regdiff×9 + n_mem×26 字节。典型指令 ~20-40 字节。
+**记录大小**：16 + n_regdiff×16 + n_mem×32 字节（= `sizeof(qbditrace_inst_head_t)` + n_regdiff×`sizeof(qbditrace_regdiff_t)` + n_mem×`sizeof(qbditrace_memacc_t)`，含对齐 padding）。典型指令 ~30-60 字节。
 
 ---
 
@@ -155,7 +160,7 @@ struct RegState {
 │ u64 pc              ← 快照时的 PC                              │
 │ u64 regs[num_gpr]   ← 34 × 8 = 272 字节的完整 GPR 快照       │
 └────────────────────────────────────────────────────────────────┘
-Total: 4 + 8 + 272 = 284 字节
+Total: 16 + 272 = 288 字节 (`sizeof(qbditrace_anchor_head_t)` + num_gpr×8，含对齐 padding)
 ```
 
 **语义**：在该 ANCHOR 之后的第一条 INST 执行**前**，CPU 的完整寄存器状态。
@@ -175,7 +180,7 @@ Total: 4 + 8 + 272 = 284 字节
 │ u8  reserved[3]                                                │
 │ u64 thread_id                                                  │
 └────────────────────────────────────────────────────────────────┘
-Total: 12 字节
+Total: 16 字节 (`sizeof(qbditrace_thread_head_t)`，含对齐 padding)
 ```
 
 标记后续记录属于哪个线程。tenet 当前假设单线程（忽略 THREAD 记录），未来扩展多线程支持。
@@ -192,7 +197,7 @@ Total: 12 字节
 │ u64 addr           ← 目标地址                                  │
 │ u64 site           ← 调用者 PC（仅 XFER_CALL 时有意义）       │
 └────────────────────────────────────────────────────────────────┘
-Total: 20 字节
+Total: 24 字节 (`sizeof(qbditrace_event_head_t)`，含对齐 padding)
 ```
 
 **Event 类型**：
@@ -220,7 +225,7 @@ Total: 20 字节
 │ u64 syscall_no      ← x16 (Darwin arm64 syscall selector)     │
 │ u64 args[6]         ← x0-x5                                   │
 └────────────────────────────────────────────────────────────────┘
-Total: 60 字节
+Total: 72 字节 (`sizeof(qbditrace_svc_head_t)`，含对齐 padding)
 ```
 
 ---
@@ -237,7 +242,7 @@ Total: 60 字节
 │ u64 sel             ← x1 (selector ptr)                       │
 │ char cls[48]        ← 运行时类名（NUL 终止）                   │
 └────────────────────────────────────────────────────────────────┘
-Total: 76 字节
+Total: 80 字节 (`sizeof(qbditrace_objc_head_t)`，含对齐 padding)
 ```
 
 ObjC Variant：MSGSEND(0), MSGSEND_SUPER(1), MSGSEND_SUPER2(2), MSGSEND_STRET(3)
@@ -258,7 +263,7 @@ ObjC Variant：MSGSEND(0), MSGSEND_SUPER(1), MSGSEND_SUPER2(2), MSGSEND_STRET(3)
 │ u64 pc              ← 运行时地址                               │
 │ u8  bytes[size]     ← 原始机器码                               │
 └────────────────────────────────────────────────────────────────┘
-Total: 12 + size 字节 (AArch64: 16 字节)
+Total: 16 + size 字节 (`sizeof(qbditrace_code_head_t)` + size，含对齐 padding；AArch64 size=4 即 20 字节)
 ```
 
 **语义**：每个 distinct PC 只记录一次（首次出现时写入）。
@@ -287,7 +292,7 @@ runtime_address = static_address + module_slide
 
 | # | 假设 | 违反时处理 |
 |---|------|-----------|
-| 1 | Header 为 512 字节，magic = "QBDT" | 拒绝打开 |
+| 1 | Header 为 536 字节，magic = "QBDT" | 拒绝打开 |
 | 2 | version = 4 | < 4 拒绝；> 4 跳过未知记录 |
 | 3 | flags 包含 REG_DIFF | 不含则不支持（v1/v2 格式） |
 | 4 | flags 包含 HAS_CODE | 不含则需要外部 image |

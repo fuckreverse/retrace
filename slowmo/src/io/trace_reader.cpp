@@ -28,7 +28,7 @@ InstView RecordView::as_inst() const {
         v.is_v5 = true;
         return v;
     }
-    // v4: header is qbditrace_inst_head_t (12 bytes)
+    // v4: header is qbditrace_inst_head_t (16 bytes)
     const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(raw_ptr);
     InstView v;
     v.pc = hdr->pc;
@@ -343,7 +343,7 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
 }
 
 TraceReader::Iterator TraceReader::begin() const {
-    // Records start after the 512-byte file header
+    // Records start after the 536-byte file header
     return Iterator(this, sizeof(qbditrace::qbditrace_file_header_t));
 }
 
