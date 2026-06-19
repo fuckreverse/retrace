@@ -407,7 +407,6 @@ if(TENET_BUILD_TESTS)
     )
     FetchContent_MakeAvailable(Catch2)
 
-    # Tests will be added as they are written
-    # add_executable(tenet_tests tests/unit/test_trace_reader.cpp)
-    # target_link_libraries(tenet_tests PRIVATE tenet_lib Catch2::Catch2WithMain)
+    enable_testing()
+    add_subdirectory(tests)
 endif()

@@ -140,6 +140,16 @@ private:
     std::vector<std::string> available_fonts_;  // Cached list
     std::string imgui_ini_path_;          // Persistent path for io.IniFilename
 
+    // ─── Font settings preview (pending until user clicks Save) ───
+    struct PendingFontSettings {
+        std::string font_path;
+        float font_size = 14.0f;
+        int oversample_h = 2;
+        bool pixel_snap = true;
+        bool initialized = false;  // set to true when settings window opens
+    };
+    PendingFontSettings pending_font_;
+
     // ─── Cached row data ────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{4096};
 
@@ -212,14 +222,12 @@ private:
     bool show_minimap_ = true;       // show minimap panel
 
     // ─── CFG view state ───────────────────────────────────────────────
-    const CFGResult*       cfg_result_        = nullptr;
-    const CFGLayoutResult* cfg_layout_result_ = nullptr;
+    const CFGResult*       cfg_result_        = nullptr;   // Full-trace CFG (all functions)
+    const CFGLayoutResult* cfg_layout_result_ = nullptr;   // Current function's layout
     bool   show_cfg_        = true;   // IDA-style: CFG tab visible by default
     // Pan/zoom for CFG canvas
     ImVec2 cfg_scroll_      = {0.0f, 0.0f};  // pan offset in pixels
     float  cfg_zoom_        = 1.0f;          // zoom factor
-    // Which block is highlighted (current PC)
-    uint64_t cfg_highlight_pc_ = 0;
     // Heatmap cache: max execution count across all blocks (for normalisation)
     uint64_t cfg_max_exec_count_  = 1;
     // Max taken_count across all edges (for edge width normalisation)
@@ -228,6 +236,14 @@ private:
     uint64_t cfg_selected_block_  = 0;
     // Cursor into the inst_ids list of cfg_selected_block_
     size_t   cfg_block_cursor_    = 0;
+    // ── Per-function CFG ─────────────────────────────────────────────
+    // When non-zero, CFG panel shows only this function's sub-graph.
+    uint64_t cfg_current_func_pc_ = 0;
+    // Owned copies of the per-function sub-graph and its layout
+    std::unique_ptr<CFGResult>       cfg_func_result_;
+    std::unique_ptr<CFGLayoutResult> cfg_func_layout_;
+    /// Rebuild per-function CFG layout for the function at `func_entry_pc`.
+    void rebuild_cfg_for_function(uint64_t func_entry_pc);
 
     // ─── Thread analysis state ─────────────────────────────────────
     const ThreadResult* thread_result_ = nullptr;

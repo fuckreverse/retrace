@@ -440,7 +440,7 @@ static TraceBenchResult benchmark_trace(const fs::path& trace_path,
 
         // Taint pass (forward, from X0 at inst 0)
         TaintConfig taint_cfg;
-        taint_cfg.source_regs.insert(0);  // X0
+        taint_cfg.add_source_reg(0);  // X0
         taint_cfg.source_inst_id = 0;
         taint_cfg.propagate_through_calls = true;
         taint_cfg.use_xref_acceleration = true;

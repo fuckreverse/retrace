@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
     {
         BackwardTaintConfig bt_cfg;
         bt_cfg.sink_inst_id = std::min(uint64_t(100), index.inst_count() - 1);
-        bt_cfg.sink_regs.insert(0);  // X0
+        bt_cfg.add_sink_reg(0);  // X0
         bt_cfg.max_steps = 10000;
         pm.register_pass(std::make_unique<BackwardTaintPass>(std::move(bt_cfg)));
     }
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
     pm.register_pass(std::make_unique<CFGLayoutPass>());
     {
         TaintConfig taint_cfg;
-        taint_cfg.source_regs.insert(0);  // X0
+        taint_cfg.add_source_reg(0);  // X0
         taint_cfg.source_inst_id = 0;
         taint_cfg.propagate_through_calls = true;
         taint_cfg.use_xref_acceleration = true;

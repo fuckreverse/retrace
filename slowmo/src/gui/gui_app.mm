@@ -399,11 +399,10 @@ void GuiApp::apply_settings() {
 
     style.ScaleAllSizes(dpi_scale_);
 
-    // Rebuild fonts if dirty
-    if (settings_font_dirty_) {
-        rebuild_fonts();
-        settings_font_dirty_ = false;
-    }
+    // NOTE: Font rebuild is intentionally NOT done here.
+    // It is deferred to the start of the next frame (before ImGui::NewFrame())
+    // because rebuilding fonts mid-frame invalidates the current ImFont pointer,
+    // causing crashes in any subsequent ImGui text rendering calls within this frame.
 }
 
 // ─── Main Run Loop ──────────────────────────────────────────────────────────
@@ -447,6 +446,15 @@ int GuiApp::run() {
             id<MTLCommandBuffer> commandBuffer = [metal_command_queue_ commandBuffer];
             id<MTLRenderCommandEncoder> renderEncoder =
                 [commandBuffer renderCommandEncoderWithDescriptor:metal_render_pass_desc_];
+
+            // ─── 2.5. Rebuild fonts if needed (must happen before NewFrame) ──
+            // Font rebuilding is deferred here from render_settings_window()
+            // because calling rebuild_fonts() mid-frame destroys the active ImFont,
+            // causing SIGSEGV in subsequent ImGui text rendering calls.
+            if (settings_font_dirty_) {
+                rebuild_fonts();
+                settings_font_dirty_ = false;
+            }
 
             // ─── 3. Start ImGui frame ────────────────────────────────
             ImGui_ImplMetal_NewFrame(metal_render_pass_desc_);
@@ -639,6 +647,7 @@ void GuiApp::render_frame() {
         // (Cmd+,: settings)
         if ((super || ctrl) && ImGui::IsKeyPressed(ImGuiKey_Comma)) {
             show_settings_ = !show_settings_;
+            if (!show_settings_) pending_font_.initialized = false;
         }
 
         // ── Non-text-input shortcuts ──────────────────────────────────────
@@ -2962,7 +2971,7 @@ InstructionRow GuiApp::fetch_row(uint64_t inst_id) {
 
     auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
     // Pass seed_pc: record_at(offset, seed_pc) sets resolved_pc so as_inst()
-    // uses the correct 6-byte v5 header layout (vs 12-byte v4) when needed.
+    // uses the correct 6-byte v5 header layout (vs 16-byte v4) when needed.
     auto rec = reader_.record_at(offset, seed_pc);
     if (rec.kind != RecordKind::Inst) {
         row.disasm = "<not an instruction>";
@@ -3249,7 +3258,7 @@ void GuiApp::run_taint_analysis() {
         auto inst = rec_ts.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
-            config.source_regs.insert(diff.index);
+            config.add_source_reg(diff.index);
         }
     }
 
@@ -3280,13 +3289,13 @@ void GuiApp::run_backward_taint_analysis() {
         auto inst = rec_sk.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
-            config.sink_regs.insert(diff.index);
+            config.add_sink_reg(diff.index);
         }
     }
 
-    if (config.sink_regs.empty()) {
+    if (config.sink_regs == 0) {
         // No reg diffs at this instruction - default to X0
-        config.sink_regs.insert(0);
+        config.add_sink_reg(0);
     }
 
     pass_manager_->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
@@ -3919,6 +3928,9 @@ void GuiApp::clear_analysis() {
     thread_result_ = nullptr;
     cfg_result_        = nullptr;
     cfg_layout_result_ = nullptr;
+    cfg_func_result_.reset();
+    cfg_func_layout_.reset();
+    cfg_current_func_pc_ = 0;
     constant_result_          = nullptr;
     pattern_result_           = nullptr;
     loop_semantics_result_    = nullptr;
@@ -4279,8 +4291,21 @@ void GuiApp::render_inst_context_menu_contents() {
 
     // ── CFG ───────────────────────────────────────────────────────────
     if (show_cfg_ && cfg_result_) {
-        if (ImGui::MenuItem("Highlight Block in CFG")) {
-            cfg_highlight_pc_ = ctx_inst_pc_;
+        if (ImGui::MenuItem("Show Block in CFG")) {
+            // Select the block in CFG and center on it
+            const CFGResult* acfg = cfg_func_result_ ? cfg_func_result_.get() : cfg_result_;
+            auto* blk = acfg->block_containing(ctx_inst_pc_);
+            if (blk && cfg_layout_result_) {
+                cfg_selected_block_ = blk->start_pc;
+                cfg_block_cursor_ = 0;
+                auto it = cfg_layout_result_->block_layouts.find(blk->start_pc);
+                if (it != cfg_layout_result_->block_layouts.end()) {
+                    const auto& lo = it->second;
+                    // Approximate centering (actual window size may differ)
+                    cfg_scroll_.x = 300.0f - (lo.x + lo.width  * 0.5f) * cfg_zoom_;
+                    cfg_scroll_.y = 200.0f - (lo.y + lo.height * 0.5f) * cfg_zoom_;
+                }
+            }
         }
     }
 }
@@ -4441,11 +4466,26 @@ void GuiApp::render_settings_window() {
     ImGui::SetNextWindowSize(ImVec2(550, 600), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Settings", &show_settings_)) {
         ImGui::End();
+        if (!show_settings_) pending_font_.initialized = false;
+        return;
+    }
+    // If user clicked the X button, show_settings_ is now false
+    if (!show_settings_) {
+        pending_font_.initialized = false;
+        ImGui::End();
         return;
     }
 
     bool changed = false;
-    bool font_changed = false;
+
+    // Initialize pending font settings when window first opens
+    if (!pending_font_.initialized) {
+        pending_font_.font_path = settings_.font_path;
+        pending_font_.font_size = settings_.font_size;
+        pending_font_.oversample_h = settings_.oversample_h;
+        pending_font_.pixel_snap = settings_.pixel_snap;
+        pending_font_.initialized = true;
+    }
 
     if (ImGui::BeginTabBar("SettingsTabs")) {
 
@@ -4453,28 +4493,23 @@ void GuiApp::render_settings_window() {
         if (ImGui::BeginTabItem("Font")) {
             ImGui::SeparatorText("Font Selection");
 
-            // Font path combo
+            // Font path combo (operates on pending settings)
             {
-                // Current display name
-                std::string current_name = settings_.font_path.empty()
+                std::string current_name = pending_font_.font_path.empty()
                     ? "Auto (system default)"
-                    : settings_.font_path.substr(settings_.font_path.rfind('/') + 1);
+                    : pending_font_.font_path.substr(pending_font_.font_path.rfind('/') + 1);
 
                 if (ImGui::BeginCombo("Font", current_name.c_str())) {
-                    // Auto option
-                    if (ImGui::Selectable("Auto (system default)", settings_.font_path.empty())) {
-                        settings_.font_path.clear();
-                        font_changed = true;
+                    if (ImGui::Selectable("Auto (system default)", pending_font_.font_path.empty())) {
+                        pending_font_.font_path.clear();
                     }
                     ImGui::Separator();
 
-                    // Available fonts
                     for (const auto& path : available_fonts_) {
                         std::string name = path.substr(path.rfind('/') + 1);
-                        bool selected = (path == settings_.font_path);
+                        bool selected = (path == pending_font_.font_path);
                         if (ImGui::Selectable(name.c_str(), selected)) {
-                            settings_.font_path = path;
-                            font_changed = true;
+                            pending_font_.font_path = path;
                         }
                         if (ImGui::IsItemHovered()) {
                             ImGui::SetTooltip("%s", path.c_str());
@@ -4484,44 +4519,76 @@ void GuiApp::render_settings_window() {
                 }
             }
 
-            // Font size slider
-            if (ImGui::SliderFloat("Size", &settings_.font_size, 9.0f, 24.0f, "%.1f pt")) {
-                font_changed = true;
-            }
+            // Font size slider (operates on pending)
+            ImGui::SliderFloat("Size", &pending_font_.font_size, 9.0f, 24.0f, "%.1f pt");
 
             // Oversampling
-            if (ImGui::SliderInt("Oversampling H", &settings_.oversample_h, 1, 3)) {
-                font_changed = true;
-            }
+            ImGui::SliderInt("Oversampling H", &pending_font_.oversample_h, 1, 3);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Higher = smoother text, more VRAM");
             }
 
             // Pixel snap
-            if (ImGui::Checkbox("Pixel Snap", &settings_.pixel_snap)) {
-                font_changed = true;
-            }
+            ImGui::Checkbox("Pixel Snap", &pending_font_.pixel_snap);
 
             // Custom font path input
             ImGui::SeparatorText("Custom Font Path");
             static char custom_path_buf[512] = {};
-            if (custom_path_buf[0] == '\0' && !settings_.font_path.empty()) {
-                strncpy(custom_path_buf, settings_.font_path.c_str(), sizeof(custom_path_buf) - 1);
+            if (custom_path_buf[0] == '\0' && !pending_font_.font_path.empty()) {
+                strncpy(custom_path_buf, pending_font_.font_path.c_str(), sizeof(custom_path_buf) - 1);
             }
             ImGui::SetNextItemWidth(-80.0f);
             ImGui::InputText("##CustomPath", custom_path_buf, sizeof(custom_path_buf));
             ImGui::SameLine();
-            if (ImGui::Button("Apply##font")) {
-                settings_.font_path = custom_path_buf;
-                font_changed = true;
+            if (ImGui::Button("Apply##font_path")) {
+                pending_font_.font_path = custom_path_buf;
             }
             ImGui::TextDisabled("Enter full path to .ttf/.otf file");
 
-            // Preview
+            // ─── Preview area ────────────────────────────────────────────
             ImGui::SeparatorText("Preview");
+            // Use font scale to simulate the pending font size relative to current
+            float preview_scale = pending_font_.font_size / settings_.font_size;
+            ImGui::BeginChild("FontPreview", ImVec2(0, 100), ImGuiChildFlags_Borders);
+            ImGui::SetWindowFontScale(preview_scale);
             ImGui::Text("AaBbCcDd 0123456789");
             ImGui::Text("mov x0, #0x1234; ldr x1, [sp, #0x10]");
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "x0 x1 sp lr fp pc");
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::EndChild();
+
+            // ─── Save / Cancel buttons for font changes ──────────────────
+            ImGui::Spacing();
+            bool font_differs = (pending_font_.font_path != settings_.font_path ||
+                                 pending_font_.font_size != settings_.font_size ||
+                                 pending_font_.oversample_h != settings_.oversample_h ||
+                                 pending_font_.pixel_snap != settings_.pixel_snap);
+
+            ImGui::BeginDisabled(!font_differs);
+            if (ImGui::Button("Save Font Settings")) {
+                settings_.font_path = pending_font_.font_path;
+                settings_.font_size = pending_font_.font_size;
+                settings_.oversample_h = pending_font_.oversample_h;
+                settings_.pixel_snap = pending_font_.pixel_snap;
+                settings_font_dirty_ = true;
+                settings_.save(GuiSettings::default_path());
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!font_differs);
+            if (ImGui::Button("Cancel##font")) {
+                pending_font_.font_path = settings_.font_path;
+                pending_font_.font_size = settings_.font_size;
+                pending_font_.oversample_h = settings_.oversample_h;
+                pending_font_.pixel_snap = settings_.pixel_snap;
+            }
+            ImGui::EndDisabled();
+
+            if (font_differs) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(unsaved changes)");
+            }
 
             ImGui::EndTabItem();
         }
@@ -4591,18 +4658,11 @@ void GuiApp::render_settings_window() {
 
     ImGui::Separator();
 
-    // ─── Bottom buttons ────────────────────────────────────────────────
-    if (font_changed) {
-        settings_font_dirty_ = true;
-        changed = true;
-    }
-
+    // ─── Apply non-font settings immediately ────────────────────────────
     if (changed) {
         apply_settings();
         settings_.save(GuiSettings::default_path());
     }
-
-    ImGui::TextDisabled("Settings saved to: %s", GuiSettings::default_path().c_str());
 
     ImGui::End();
 }
@@ -5168,12 +5228,11 @@ void GuiApp::render_minimap_panel() {
 void GuiApp::run_cfg_layout() {
     ensure_pass_manager();
 
-    // CFGLayoutPass depends on cfg which depends on xref
+    // Build full-trace CFG (needed by other passes: loop, loop_semantics, etc.)
     pass_manager_->register_pass(std::make_unique<XrefPass>());
     pass_manager_->register_pass(std::make_unique<CFGPass>());
-    pass_manager_->register_pass(std::make_unique<CFGLayoutPass>());
 
-    // Also cache xref result so the CFG panel can use inst_ids_at() for jump navigation
+    // Cache xref result so the CFG panel can use inst_ids_at() for jump navigation
     auto& xref_res = pass_manager_->require("xref");
     if (xref_res.ok()) {
         xref_result_ = &xref_res.get<XrefResult>();
@@ -5184,29 +5243,137 @@ void GuiApp::run_cfg_layout() {
         cfg_result_ = &cfg_res.get<CFGResult>();
     }
 
-    auto& layout_res = pass_manager_->require("cfg_layout");
-    if (layout_res.ok()) {
-        cfg_layout_result_ = &layout_res.get<CFGLayoutResult>();
-        show_cfg_ = true;
-        // Reset pan/zoom and selection
-        cfg_scroll_ = ImVec2(0.0f, 0.0f);
-        cfg_zoom_   = 1.0f;
-        cfg_selected_block_ = 0;
-        cfg_block_cursor_   = 0;
+    show_cfg_ = true;
 
-        // Pre-compute max execution_count for heatmap normalisation
-        cfg_max_exec_count_ = 1;
-        cfg_max_edge_count_ = 1;
-        if (cfg_result_) {
-            for (const auto& [pc, blk] : cfg_result_->blocks) {
-                if (blk.execution_count > cfg_max_exec_count_)
-                    cfg_max_exec_count_ = blk.execution_count;
-            }
-            for (const auto& edge : cfg_result_->edges) {
-                if (edge.taken_count > cfg_max_edge_count_)
-                    cfg_max_edge_count_ = edge.taken_count;
-            }
+    // Force per-function CFG rebuild on next render frame
+    // by resetting the tracked function PC.
+    cfg_current_func_pc_ = 0;
+    cfg_func_result_.reset();
+    cfg_func_layout_.reset();
+    cfg_layout_result_ = nullptr;
+}
+
+// ─── Per-function CFG rebuild ─────────────────────────────────────────────────
+// Extract the sub-CFG for `func_entry_pc` from the full-trace CFG, compute
+// layout with GraphGridLayout, and store owned copies in cfg_func_result_ /
+// cfg_func_layout_.  The render_cfg_panel reads from these instead of the
+// full-trace layout.
+
+void GuiApp::rebuild_cfg_for_function(uint64_t func_entry_pc) {
+    if (!cfg_result_ || func_entry_pc == 0) {
+        cfg_func_result_.reset();
+        cfg_func_layout_.reset();
+        cfg_layout_result_ = nullptr;
+        cfg_current_func_pc_ = 0;
+        return;
+    }
+
+    // Extract function sub-graph
+    auto sub = cfg_result_->extract_function(func_entry_pc);
+    if (sub.blocks.empty()) {
+        cfg_func_result_.reset();
+        cfg_func_layout_.reset();
+        cfg_layout_result_ = nullptr;
+        cfg_current_func_pc_ = func_entry_pc;
+        return;
+    }
+
+    cfg_func_result_ = std::make_unique<CFGResult>(std::move(sub));
+
+    // Run GraphGridLayout directly (no PassManager needed)
+    constexpr size_t LARGE_CFG_THRESHOLD = 2000;
+    const size_t num_blocks = cfg_func_result_->blocks.size();
+
+    Graph layout_graph;
+    layout_graph.reserve(num_blocks);
+    const int insn_height = 14;
+    const int default_block_width = 200;
+    const int default_block_height = 24;
+
+    for (const auto& [pc, block] : cfg_func_result_->blocks) {
+        GraphBlock gb;
+        gb.entry  = pc;
+        gb.width  = default_block_width;
+        gb.height = insn_height * static_cast<int>(block.instructions.size() + 1);
+        gb.height = std::max(gb.height, default_block_height);
+        layout_graph[pc] = gb;
+    }
+    for (const auto& edge : cfg_func_result_->edges) {
+        auto it = layout_graph.find(edge.from_block);
+        if (it != layout_graph.end()) {
+            it->second.edges.emplace_back(GraphEdge(edge.to_block));
         }
+    }
+
+    uint64_t entry = func_entry_pc;
+    // If entry block not present, fallback to first block
+    if (layout_graph.find(entry) == layout_graph.end()) {
+        entry = cfg_func_result_->blocks.begin()->first;
+    }
+
+    auto lt = (num_blocks > LARGE_CFG_THRESHOLD)
+        ? GraphGridLayout::LayoutType::Narrow
+        : GraphGridLayout::LayoutType::Medium;
+    GraphGridLayout layout_algo(lt);
+    if (num_blocks > LARGE_CFG_THRESHOLD) {
+        layout_algo.setLayoutOptimization(false);
+    }
+
+    auto func_layout = std::make_unique<CFGLayoutResult>();
+    layout_algo.calculateLayout(layout_graph, entry,
+                                func_layout->canvas_width, func_layout->canvas_height);
+
+    for (const auto& [pc, gb] : layout_graph) {
+        BlockLayout bl;
+        bl.x = gb.x; bl.y = gb.y; bl.width = gb.width; bl.height = gb.height;
+        func_layout->block_layouts[pc] = bl;
+    }
+    func_layout->edge_layouts.reserve(cfg_func_result_->edges.size());
+    for (const auto& [pc, gb] : layout_graph) {
+        for (const auto& ge : gb.edges) {
+            EdgeLayout el;
+            el.from_block = pc;
+            el.to_block   = ge.target;
+            el.polyline   = ge.polyline;
+            el.arrow      = ge.arrow;
+            func_layout->edge_layouts.push_back(std::move(el));
+        }
+    }
+
+    cfg_func_layout_ = std::move(func_layout);
+    cfg_layout_result_ = cfg_func_layout_.get();
+    cfg_current_func_pc_ = func_entry_pc;
+
+    // Reset pan/zoom and selection
+    cfg_scroll_ = ImVec2(0.0f, 0.0f);
+    cfg_zoom_   = 1.0f;
+    cfg_selected_block_ = 0;
+    cfg_block_cursor_   = 0;
+
+    // Recompute heatmap max for this sub-graph
+    cfg_max_exec_count_ = 1;
+    cfg_max_edge_count_ = 1;
+    for (const auto& [pc, blk] : cfg_func_result_->blocks) {
+        if (blk.execution_count > cfg_max_exec_count_)
+            cfg_max_exec_count_ = blk.execution_count;
+    }
+    for (const auto& edge : cfg_func_result_->edges) {
+        if (edge.taken_count > cfg_max_edge_count_)
+            cfg_max_edge_count_ = edge.taken_count;
+    }
+
+    // Auto-fit the graph into the available space
+    // (will be applied on next render frame since we don't know avail size here;
+    //  zoom=1 + scroll centered on entry block is a good default)
+    if (!cfg_func_layout_->block_layouts.empty()) {
+        auto it = cfg_func_layout_->block_layouts.find(func_entry_pc);
+        if (it == cfg_func_layout_->block_layouts.end()) {
+            it = cfg_func_layout_->block_layouts.begin();
+        }
+        const auto& lo = it->second;
+        // Center on entry block (approximate — real centering happens in render)
+        cfg_scroll_.x = 200.0f - lo.x * cfg_zoom_;
+        cfg_scroll_.y = 40.0f  - lo.y * cfg_zoom_;
     }
 }
 
@@ -5220,6 +5387,21 @@ void GuiApp::render_cfg_panel() {
         ImGui::End();
         return;
     }
+
+    // ── Auto-detect function change and rebuild per-function CFG ──────
+    // When full-trace CFG data is available, track which function the
+    // current instruction belongs to.  If it changed, extract that
+    // function's sub-graph and re-layout automatically.
+    if (cfg_result_ && function_result_ && total_inst_ > 0) {
+        const FunctionInfo* cur_func = function_result_->function_at(current_inst_);
+        uint64_t wanted_pc = cur_func ? cur_func->entry_pc : 0;
+        if (wanted_pc != cfg_current_func_pc_) {
+            rebuild_cfg_for_function(wanted_pc);
+        }
+    }
+
+    // Effective CFG data: use per-function sub-graph when available, else full-trace
+    const CFGResult* active_cfg = cfg_func_result_ ? cfg_func_result_.get() : cfg_result_;
 
     // ── Toolbar row 1: controls ───────────────────────────────────────
     if (ImGui::Button("Run CFG Layout")) {
@@ -5235,10 +5417,10 @@ void GuiApp::render_cfg_panel() {
     }
     ImGui::SameLine();
     // "Center on current block" button
-    if (ImGui::Button("Center Here") && cfg_result_ && cfg_layout_result_) {
+    if (ImGui::Button("Center Here") && active_cfg && cfg_layout_result_) {
         uint64_t cur_pc2 = 0;
         if (total_inst_ > 0) cur_pc2 = fetch_row(current_inst_).pc;
-        auto* blk2 = cfg_result_->block_containing(cur_pc2);
+        auto* blk2 = active_cfg->block_containing(cur_pc2);
         if (blk2) {
             auto it2 = cfg_layout_result_->block_layouts.find(blk2->start_pc);
             if (it2 != cfg_layout_result_->block_layouts.end()) {
@@ -5250,13 +5432,24 @@ void GuiApp::render_cfg_panel() {
         }
     }
 
-    // ── Toolbar row 2: stats + selected-block jump controls ──────────
+    // ── Toolbar row 2: stats + current function name ───────────────────
     if (cfg_layout_result_) {
+        // Show current function name if available
+        if (cfg_current_func_pc_ != 0 && function_result_) {
+            auto fit = function_result_->functions.find(cfg_current_func_pc_);
+            if (fit != function_result_->functions.end()) {
+                ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.6f, 1.0f),
+                    "%s", fit->second.name.c_str());
+                ImGui::SameLine();
+            }
+        }
         ImGui::TextDisabled("%zu blocks, %zu edges",
             cfg_layout_result_->block_layouts.size(),
             cfg_layout_result_->edge_layouts.size());
+    } else if (!cfg_result_) {
+        ImGui::TextDisabled("(no CFG data — run Analysis > CFG Layout)");
     } else {
-        ImGui::TextDisabled("(no layout — run Analysis > CFG Layout)");
+        ImGui::TextDisabled("(waiting for function data...)");
     }
 
     // Jump controls for selected block
@@ -5387,8 +5580,8 @@ void GuiApp::render_cfg_panel() {
     }
     // Find block containing cur_pc
     uint64_t highlight_block_pc = 0;
-    if (cfg_result_) {
-        auto* blk = cfg_result_->block_containing(cur_pc);
+    if (active_cfg) {
+        auto* blk = active_cfg->block_containing(cur_pc);
         if (blk) highlight_block_pc = blk->start_pc;
     }
 
@@ -5447,8 +5640,8 @@ void GuiApp::render_cfg_panel() {
         ImU32 edge_color = IM_COL32(70, 75, 100, 180);
         float  edge_width = 1.0f;
 
-        if (cfg_result_) {
-            for (const auto& cfg_edge : cfg_result_->edges) {
+        if (active_cfg) {
+            for (const auto& cfg_edge : active_cfg->edges) {
                 if (cfg_edge.from_block == edge.from_block &&
                     cfg_edge.to_block   == edge.to_block) {
                     // Width proportional to taken_count (log scale, 1..4px)
@@ -5524,9 +5717,9 @@ void GuiApp::render_cfg_panel() {
         // ── Compute heatmap intensity ─────────────────────────────────
         float heat = 0.0f;
         uint64_t exec_count = 0;
-        if (cfg_result_) {
-            auto it_blk = cfg_result_->blocks.find(block_pc);
-            if (it_blk != cfg_result_->blocks.end()) {
+        if (active_cfg) {
+            auto it_blk = active_cfg->blocks.find(block_pc);
+            if (it_blk != active_cfg->blocks.end()) {
                 exec_count = it_blk->second.execution_count;
                 if (cfg_max_exec_count_ > 0)
                     heat = static_cast<float>(exec_count) / static_cast<float>(cfg_max_exec_count_);
@@ -5602,9 +5795,9 @@ void GuiApp::render_cfg_panel() {
                 addr_buf);
 
             // Instruction body
-            if (cfg_result_) {
-                auto it = cfg_result_->blocks.find(block_pc);
-                if (it != cfg_result_->blocks.end()) {
+            if (active_cfg) {
+                auto it = active_cfg->blocks.find(block_pc);
+                if (it != active_cfg->blocks.end()) {
                     const auto& blk = it->second;
                     float text_y = tl.y + header_h + 2.0f * cfg_zoom_;
 
@@ -5672,9 +5865,9 @@ void GuiApp::render_cfg_panel() {
                 "0x{:016x}\n{} executions\n",
                 (unsigned long long)block_pc,
                 (unsigned long long)exec_count);
-            if (cfg_result_) {
-                auto it = cfg_result_->blocks.find(block_pc);
-                if (it != cfg_result_->blocks.end()) {
+            if (active_cfg) {
+                auto it = active_cfg->blocks.find(block_pc);
+                if (it != active_cfg->blocks.end()) {
                     tip += fmt::format("{} instructions in block\n", it->second.instructions.size());
                 }
             }
@@ -5695,9 +5888,9 @@ void GuiApp::render_cfg_panel() {
     // ── CFG right-click context menu ─────────────────────────────────
     if (ImGui::BeginPopup("##cfg_ctx")) {
         ImGui::TextDisabled("Block: 0x%llx", (unsigned long long)ctx_inst_static_pc_);
-        if (cfg_result_) {
-            auto it = cfg_result_->blocks.find(ctx_inst_pc_);
-            if (it != cfg_result_->blocks.end()) {
+        if (active_cfg) {
+            auto it = active_cfg->blocks.find(ctx_inst_pc_);
+            if (it != active_cfg->blocks.end()) {
                 ImGui::TextDisabled("%zu instructions, %llu executions",
                     it->second.instructions.size(),
                     (unsigned long long)it->second.execution_count);

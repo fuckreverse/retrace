@@ -77,7 +77,7 @@ InstructionRow TuiApp::fetch_row(uint64_t inst_id) {
 
     auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
     // Pass seed_pc: record_at(offset, seed_pc) sets resolved_pc so as_inst()
-    // uses the correct 6-byte v5 header layout (vs 12-byte v4) when needed.
+    // uses the correct 6-byte v5 header layout (vs 16-byte v4) when needed.
     auto rec = reader_.record_at(offset, seed_pc);
     if (rec.kind != RecordKind::Inst) {
         row.disasm = "<not an instruction>";
@@ -1418,7 +1418,7 @@ void TuiApp::run_taint_analysis() {
         auto inst = rec_ts.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
-            config.source_regs.insert(diff.index);
+            config.add_source_reg(diff.index);
         }
     }
 
@@ -1486,13 +1486,13 @@ void TuiApp::run_backward_taint_analysis() {
         auto inst = rec_sk.as_inst();
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
-            config.sink_regs.insert(diff.index);
+            config.add_sink_reg(diff.index);
         }
     }
 
-    if (config.sink_regs.empty()) {
+    if (config.sink_regs == 0) {
         // No reg diffs at this instruction — default to X0
-        config.sink_regs.insert(0);
+        config.add_sink_reg(0);
     }
 
     pass_manager_->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));

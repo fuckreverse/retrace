@@ -5,6 +5,7 @@
 
 #include <capstone/capstone.h>
 #include <array>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -55,6 +56,7 @@ public:
     std::string format(uint64_t pc, uint32_t opcode);
 
 private:
+    mutable std::mutex mutex_;   // protects handle_ + cache_ from concurrent access
     csh handle_ = 0;
     bool initialized_ = false;
     LRUCache<uint64_t, DecodedInst> cache_{16384};

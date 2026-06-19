@@ -77,13 +77,11 @@ echo "  ✓ bench_tenet built"
 echo ""
 echo "[2/3] Generating perf traces (scale=${SCALE})..."
 
-# Build gen_test_traces if not already built
-TESTS_BUILD="${TESTS_DIR}/build"
+# Build gen_test_traces via the main CMake build (shared with unit tests)
+TESTS_BUILD="${BUILD_DIR}"
 if [[ ! -x "${TESTS_BUILD}/gen_test_traces" ]]; then
     echo "  Building gen_test_traces..."
-    mkdir -p "$TESTS_BUILD"
-    (cd "$TESTS_BUILD" && cmake .. -DCMAKE_BUILD_TYPE=Release 2>/dev/null && \
-     cmake --build . --target gen_test_traces -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) 2>/dev/null)
+    cmake --build "${TESTS_BUILD}" --target gen_test_traces -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) 2>&1 | tail -3
 fi
 
 mkdir -p "$TRACES_DIR"

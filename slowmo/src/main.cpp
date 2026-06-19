@@ -193,10 +193,15 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
         output["stop_reason"] = result.stop_reason;
     }
 
-    // tainted_regs_final (sorted)
-    std::vector<uint8_t> tainted(result.tainted_regs.begin(),
-                                 result.tainted_regs.end());
-    std::sort(tainted.begin(), tainted.end());
+    // tainted_regs_final (sorted, extracted from bitmask)
+    std::vector<uint8_t> tainted;
+    {
+        uint64_t remaining = result.tainted_regs;
+        while (remaining) {
+            tainted.push_back(static_cast<uint8_t>(__builtin_ctzll(remaining)));
+            remaining &= remaining - 1;
+        }
+    }
     output["tainted_regs_final"] = tainted;
 
     // Propagation steps (detailed, limit to 1000)
@@ -420,9 +425,14 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
     output["max_depth"] = result.max_depth;
 
     // All involved registers
-    std::vector<uint8_t> involved(result.all_involved_regs.begin(),
-                                  result.all_involved_regs.end());
-    std::sort(involved.begin(), involved.end());
+    std::vector<uint8_t> involved;
+    {
+        uint64_t remaining = result.all_involved_regs;
+        while (remaining) {
+            involved.push_back(static_cast<uint8_t>(__builtin_ctzll(remaining)));
+            remaining &= remaining - 1;
+        }
+    }
     output["involved_regs"] = involved;
 
     // Events (limit to first 500 for JSON output readability)
@@ -500,6 +510,7 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --dataflow-graph-output <file> Export dataflow graph (.dot or .json)\n");
     fmt::print(stderr, "  --algorithm-summary           Generate algorithm summary report\n");
     fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
+fmt::print(stderr, "  --objc-class <name>           Filter ObjC messages by class name\n");
     fmt::print(stderr, "\nQuery options (JSON output):\n");
     fmt::print(stderr, "  --memread <addr> <size> <inst_id> Read memory at a point in time\n");
     fmt::print(stderr, "  --mem-history <addr> <size>       List all writes to an address\n");
@@ -560,6 +571,7 @@ int main(int argc, char** argv) {
     std::string dataflow_output_path;
     bool opt_algorithm_summary = false;
     bool opt_objc = false;
+    std::string objc_class_filter;  // --objc-class <ClassName>
 
     // Query options
     bool opt_memread = false;
@@ -604,6 +616,8 @@ int main(int argc, char** argv) {
     bool opt_literal_search = false;
     uint64_t literal_search_value = 0;
     uint64_t literal_search_start = 0, literal_search_end = 0;
+
+    bool opt_no_parallel_scan = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -688,6 +702,9 @@ int main(int argc, char** argv) {
             opt_algorithm_summary = true;
         } else if (arg == "--objc") {
             opt_objc = true;
+        } else if (arg == "--objc-class" && i + 1 < argc) {
+            opt_objc = true;
+            objc_class_filter = argv[++i];
         } else if (arg == "--memread" && i + 3 < argc) {
             opt_memread = true;
             memread_addr = std::stoull(argv[++i], nullptr, 16);
@@ -746,6 +763,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--literal-search-range" && i + 2 < argc) {
             literal_search_start = std::stoull(argv[++i]);
             literal_search_end = std::stoull(argv[++i]);
+        } else if (arg == "--no-parallel-scan") {
+            opt_no_parallel_scan = true;
         } else if (arg[0] != '-') {
             trace_path = arg;
         }
@@ -886,6 +905,7 @@ int main(int argc, char** argv) {
         pm.set_regfile(&regfile);
         pm.set_memory(&memory);
         pm.set_decoder(&decoder);
+        pm.set_no_parallel_scan(opt_no_parallel_scan);
 
         // Register passes needed by the requested options
         // --export-cfg needs xref -> cfg -> cfg_layout
@@ -898,16 +918,14 @@ int main(int argc, char** argv) {
         // --taint needs TaintPass with configured source reg + new options
         if (opt_taint) {
             TaintConfig taint_cfg;
-            taint_cfg.source_regs.insert(taint_reg_index);
+            taint_cfg.add_source_reg(taint_reg_index);
             taint_cfg.source_inst_id = taint_source_inst_id;
             taint_cfg.source_mem_addrs = taint_source_mem_addrs;
             taint_cfg.max_taint_width = taint_max_width;
             taint_cfg.propagate_through_calls = !taint_no_calls;
             taint_cfg.use_xref_acceleration = !taint_no_xref;
             taint_cfg.emit_kill_events = !taint_no_kills;
-            for (uint64_t pc : taint_stop_pcs) {
-                taint_cfg.stop_pcs.insert(pc);
-            }
+            taint_cfg.stop_pcs = taint_stop_pcs;
             // XRef acceleration requires xref pass
             if (taint_cfg.use_xref_acceleration) {
                 pm.register_pass(std::make_unique<XrefPass>());
@@ -942,7 +960,7 @@ int main(int argc, char** argv) {
         if (opt_backward_taint || opt_critical_path) {
             BackwardTaintConfig bt_cfg;
             bt_cfg.sink_inst_id = backward_taint_sink_id;
-            bt_cfg.sink_regs.insert(backward_taint_reg);
+            bt_cfg.add_sink_reg(backward_taint_reg);
             bt_cfg.propagate_through_memory = true;
             bt_cfg.build_dataflow_graph = !backward_taint_graph_path.empty();
             bt_cfg.per_sink_tags = true;
@@ -1006,13 +1024,17 @@ int main(int argc, char** argv) {
 
         // --objc
         if (opt_objc) {
-            pm.register_pass(std::make_unique<ObjcPass>());
+            auto objc_pass = std::make_unique<ObjcPass>();
+            if (!objc_class_filter.empty()) {
+                objc_pass->set_class_filter(objc_class_filter);
+            }
+            pm.register_pass(std::move(objc_pass));
         }
 
         // --critical-path also needs forward taint
         if (opt_critical_path && !opt_taint) {
             TaintConfig taint_cfg;
-            taint_cfg.source_regs.insert(backward_taint_reg);
+            taint_cfg.add_source_reg(backward_taint_reg);
             taint_cfg.source_inst_id = taint_source_inst_id;
             taint_cfg.propagate_through_calls = !taint_no_calls;
             taint_cfg.use_xref_acceleration = !taint_no_xref;

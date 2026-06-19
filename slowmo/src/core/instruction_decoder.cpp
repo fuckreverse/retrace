@@ -3,6 +3,7 @@
 #include <capstone/capstone.h>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
 
 namespace tenet {
 
@@ -74,6 +75,7 @@ bool InstructionDecoder::init() {
 }
 
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opcode) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return std::nullopt;
 
     // Check cache
@@ -161,10 +163,13 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, const CodeTable& code_table) {
     auto opcode = code_table.opcode_at(pc);
     if (!opcode) return std::nullopt;
+    // Note: the lock is acquired inside decode(pc, opcode), not here,
+    // because opcode_at() is a read-only query on CodeTable (which has its own thread safety).
     return decode(pc, *opcode);
 }
 
 std::string InstructionDecoder::format(uint64_t pc, uint32_t opcode) {
+    // decode() already acquires the lock internally
     auto d = decode(pc, opcode);
     if (!d) return "<unknown>";
 
