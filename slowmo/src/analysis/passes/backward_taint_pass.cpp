@@ -94,14 +94,19 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     // Initialize per-sink tags
     PropagationState state;
     uint8_t tag_idx = 0;
-    for (uint8_t r : config.sink_regs) {
-        if (should_exclude_reg(r, config)) continue;
-        SinkTag tag;
-        tag.kind = SinkTag::Register;
-        tag.reg_id = r;
-        result.sink_tags.push_back(tag);
-        state.add_reg(r, {tag_idx});
-        tag_idx++;
+    {
+        uint64_t remaining = config.sink_regs;
+        while (remaining) {
+            uint8_t r = static_cast<uint8_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            if (should_exclude_reg(r, config)) continue;
+            SinkTag tag;
+            tag.kind = SinkTag::Register;
+            tag.reg_id = r;
+            result.sink_tags.push_back(tag);
+            state.add_reg(r, {tag_idx});
+            tag_idx++;
+        }
     }
     for (uint64_t addr : config.sink_mem_addrs) {
         SinkTag tag;
@@ -239,7 +244,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
                 }
 
                 state.remove_reg(ra.reg_id);
-                result.all_involved_regs.insert(ra.reg_id);
+                result.all_involved_regs |= (1ULL << ra.reg_id);
             }
         }
 
@@ -254,7 +259,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
 
                 event.src_regs.push_back(src_ra.reg_id);
                 state.add_reg(src_ra.reg_id, resolved_tags);
-                result.all_involved_regs.insert(src_ra.reg_id);
+                result.all_involved_regs |= (1ULL << src_ra.reg_id);
             }
 
             if (config.propagate_through_memory) {
@@ -304,7 +309,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
                                 event.src_regs.push_back(src_ra.reg_id);
                             }
                             state.add_reg(src_ra.reg_id, resolved_tags);
-                            result.all_involved_regs.insert(src_ra.reg_id);
+                            result.all_involved_regs |= (1ULL << src_ra.reg_id);
                         }
 
                         result.involved_mem_addrs.add(mem.addr);
@@ -377,7 +382,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
         "{} idx-jumps, {} idx-skipped, {} regs, {} edges",
         result.contributing_inst_ids.cardinality(), steps,
         index_jumps, index_skipped,
-        result.all_involved_regs.size(), result.dataflow_edges.size()));
+        result.involved_reg_count(), result.dataflow_edges.size()));
 
     return PassResult::success(std::move(result));
 }
@@ -393,14 +398,19 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
 
     PropagationState state;
     uint8_t tag_idx = 0;
-    for (uint8_t r : config.sink_regs) {
-        if (should_exclude_reg(r, config)) continue;
-        SinkTag tag;
-        tag.kind = SinkTag::Register;
-        tag.reg_id = r;
-        result.sink_tags.push_back(tag);
-        state.add_reg(r, {tag_idx});
-        tag_idx++;
+    {
+        uint64_t remaining = config.sink_regs;
+        while (remaining) {
+            uint8_t r = static_cast<uint8_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            if (should_exclude_reg(r, config)) continue;
+            SinkTag tag;
+            tag.kind = SinkTag::Register;
+            tag.reg_id = r;
+            result.sink_tags.push_back(tag);
+            state.add_reg(r, {tag_idx});
+            tag_idx++;
+        }
     }
     for (uint64_t addr : config.sink_mem_addrs) {
         SinkTag tag;
@@ -499,7 +509,7 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
                 }
 
                 state.remove_reg(diff.index);
-                result.all_involved_regs.insert(diff.index);
+                result.all_involved_regs |= (1ULL << diff.index);
             }
         }
 
@@ -515,7 +525,7 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
 
                 event.src_regs.push_back(diff.index);
                 state.add_reg(diff.index, resolved_tags);
-                result.all_involved_regs.insert(diff.index);
+                result.all_involved_regs |= (1ULL << diff.index);
             }
 
             if (config.propagate_through_memory) {
@@ -567,7 +577,7 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
                                 event.src_regs.push_back(diff.index);
                             }
                             state.add_reg(diff.index, resolved_tags);
-                            result.all_involved_regs.insert(diff.index);
+                            result.all_involved_regs |= (1ULL << diff.index);
                         }
 
                         result.involved_mem_addrs.add(mem.addr);
@@ -646,7 +656,7 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
 // --- BackwardTaintPass dispatch --------------------------------------------
 
 PassResult BackwardTaintPass::run(PassContext& ctx) {
-    if (config_.sink_inst_id == 0 && config_.sink_regs.empty() && config_.sink_mem_addrs.empty()) {
+    if (config_.sink_inst_id == 0 && config_.sink_regs == 0 && config_.sink_mem_addrs.empty()) {
         return PassResult::failed("BackwardTaintPass: no sink specified");
     }
 

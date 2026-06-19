@@ -6,6 +6,9 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace tenet {
 
@@ -13,63 +16,6 @@ namespace tenet {
 
 static bool is_printable(uint8_t c) {
     return (c >= 0x20 && c <= 0x7E) || c == '\t' || c == '\n' || c == '\r';
-}
-
-/// Try to read a contiguous printable ASCII string starting at `addr`.
-/// Returns the string content (without NUL terminator) or nullopt if the
-/// sequence is shorter than MIN_STRING_LEN.
-static std::optional<std::string> probe_ascii(
-    MemoryModel& mem, uint64_t addr, uint64_t at_inst_id)
-{
-    std::string result;
-    result.reserve(StringResult::MIN_STRING_LEN + 16);
-
-    for (size_t i = 0; i < StringResult::MAX_STRING_LEN; ++i) {
-        auto byte = mem.byte_at(addr + i, at_inst_id);
-        if (!byte.has_value()) break;          // Unknown byte — stop
-
-        uint8_t c = *byte;
-        if (c == 0) break;                     // NUL terminator — end of string
-        if (!is_printable(c)) break;           // Non-printable — not a string
-
-        result.push_back(static_cast<char>(c));
-    }
-
-    if (result.size() < StringResult::MIN_STRING_LEN) return std::nullopt;
-    return result;
-}
-
-/// Try to read a contiguous printable UTF-16LE string starting at `addr`.
-/// UTF-16LE pattern: every odd byte is 0x00, every even byte is printable ASCII.
-/// Returns the decoded ASCII content or nullopt if too short.
-static std::optional<std::string> probe_utf16le(
-    MemoryModel& mem, uint64_t addr, uint64_t at_inst_id)
-{
-    std::string result;
-    result.reserve(StringResult::MIN_STRING_LEN + 16);
-
-    for (size_t i = 0; i < StringResult::MAX_STRING_LEN; ++i) {
-        uint64_t off = i * 2;
-        auto lo = mem.byte_at(addr + off, at_inst_id);
-        auto hi = mem.byte_at(addr + off + 1, at_inst_id);
-
-        if (!lo.has_value() || !hi.has_value()) break;
-
-        uint8_t lo_byte = *lo;
-        uint8_t hi_byte = *hi;
-
-        // NUL terminator: both bytes are 0
-        if (lo_byte == 0 && hi_byte == 0) break;
-
-        // UTF-16LE: high byte should be 0 for basic ASCII range
-        if (hi_byte != 0) break;
-        if (!is_printable(lo_byte)) break;
-
-        result.push_back(static_cast<char>(lo_byte));
-    }
-
-    if (result.size() < StringResult::MIN_STRING_LEN) return std::nullopt;
-    return result;
 }
 
 /// Case-insensitive substring search.
@@ -99,12 +45,101 @@ std::vector<const StringRef*> StringResult::search(const std::string& pattern) c
     return hits;
 }
 
+// ─── Byte cache: collects memory content from both reads and writes ──────
+
+/// A simple page-indexed byte cache that records bytes seen in trace memory events.
+/// This allows probing string content that was only *read* (from read-only segments)
+/// and never written during the trace, which the MemoryModel cannot provide.
+class ReadByteCache {
+public:
+    /// Record bytes from a memory access event (read or write).
+    void record(uint64_t addr, uint16_t size, uint64_t value, uint64_t value_hi) {
+        uint8_t buf[16];
+        std::memcpy(buf, &value, 8);
+        std::memcpy(buf + 8, &value_hi, 8);
+        uint16_t actual_size = std::min<uint16_t>(size, 16);
+        for (uint16_t i = 0; i < actual_size; ++i) {
+            bytes_[addr + i] = buf[i];
+        }
+    }
+
+    /// Get a byte at the given address, or nullopt if never seen.
+    std::optional<uint8_t> get(uint64_t addr) const {
+        auto it = bytes_.find(addr);
+        if (it != bytes_.end()) return it->second;
+        return std::nullopt;
+    }
+
+    /// Direct access to underlying map (for iteration/sorting).
+    const std::unordered_map<uint64_t, uint8_t>& raw_map() const { return bytes_; }
+
+    size_t size() const { return bytes_.size(); }
+
+private:
+    std::unordered_map<uint64_t, uint8_t> bytes_;
+};
+
+/// Fast byte access that returns 0xFF for unknown bytes (used in linear scan).
+static uint8_t cache_get_fast(const ReadByteCache& cache, uint64_t addr) {
+    auto val = cache.get(addr);
+    return val.has_value() ? *val : 0xFF;
+}
+
+/// Try to read a contiguous printable ASCII string from the byte cache.
+static std::optional<std::string> probe_ascii_from_cache(
+    const ReadByteCache& cache, uint64_t addr)
+{
+    std::string result;
+    result.reserve(StringResult::MIN_STRING_LEN + 16);
+
+    for (size_t i = 0; i < StringResult::MAX_STRING_LEN; ++i) {
+        auto byte = cache.get(addr + i);
+        if (!byte.has_value()) break;          // Unknown byte — stop
+
+        uint8_t c = *byte;
+        if (c == 0) break;                     // NUL terminator — end of string
+        if (!is_printable(c)) break;           // Non-printable — not a string
+
+        result.push_back(static_cast<char>(c));
+    }
+
+    if (result.size() < StringResult::MIN_STRING_LEN) return std::nullopt;
+    return result;
+}
+
+/// Try to read a contiguous printable UTF-16LE string from the byte cache.
+static std::optional<std::string> probe_utf16le_from_cache(
+    const ReadByteCache& cache, uint64_t addr)
+{
+    std::string result;
+    result.reserve(StringResult::MIN_STRING_LEN + 16);
+
+    for (size_t i = 0; i < StringResult::MAX_STRING_LEN; ++i) {
+        uint64_t off = i * 2;
+        auto lo = cache.get(addr + off);
+        auto hi = cache.get(addr + off + 1);
+
+        if (!lo.has_value() || !hi.has_value()) break;
+
+        uint8_t lo_byte = *lo;
+        uint8_t hi_byte = *hi;
+
+        if (lo_byte == 0 && hi_byte == 0) break;
+        if (hi_byte != 0) break;
+        if (!is_printable(lo_byte)) break;
+
+        result.push_back(static_cast<char>(lo_byte));
+    }
+
+    if (result.size() < StringResult::MIN_STRING_LEN) return std::nullopt;
+    return result;
+}
+
 // ─── StringPass::run ─────────────────────────────────────────────────────
 
 PassResult StringPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
     auto& index  = ctx.index();
-    auto& memory = ctx.memory();
     const auto& range = ctx.range();
 
     uint64_t start = range.start_inst_id;
@@ -112,10 +147,14 @@ PassResult StringPass::run(PassContext& ctx) {
     if (end == 0) end = index.inst_count();
 
     StringResult result;
+    ReadByteCache byte_cache;
 
+    // ─── Phase 1: Collect all memory bytes from read and write events ─────
     uint64_t inst_id   = 0;
-    uint64_t processed = 0;
     uint64_t total     = end - start;
+
+    // Also track: for each address, which inst_id first touched it
+    std::unordered_map<uint64_t, uint64_t> addr_first_inst;
 
     for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
@@ -128,79 +167,119 @@ PassResult StringPass::run(PassContext& ctx) {
 
         auto inst = rec.as_inst();
 
-        // Examine every memory access on this instruction.
         for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
             auto mem = inst.mem_access(m);
+            if (mem.addr == 0) continue;
 
-            // Only interested in read accesses (bit 0 = read)
-            if ((mem.type & 0x01) == 0) continue;
+            // Record bytes into byte cache
+            byte_cache.record(mem.addr, mem.size, mem.value, mem.value_hi);
 
-            uint64_t read_addr = mem.addr;
-
-            // Skip address 0 — never a valid string pointer
-            if (read_addr == 0) continue;
-
-            // Check if we already probed this address
-            auto probe_it = result.addr_to_index.find(read_addr);
-            if (probe_it != result.addr_to_index.end()) {
-                // Already known — just add a reference if it's a real string
-                if (probe_it->second != StringResult::NOT_STRING) {
-                    auto& ref = result.strings[probe_it->second];
-                    ref.references.push_back({inst_id, inst.pc});
-                    result.inst_to_strings[inst_id].push_back(probe_it->second);
+            // Track first instruction that touched each byte address
+            uint16_t actual_size = std::min<uint16_t>(mem.size, 16);
+            for (uint16_t i = 0; i < actual_size; ++i) {
+                uint64_t a = mem.addr + i;
+                if (addr_first_inst.find(a) == addr_first_inst.end()) {
+                    addr_first_inst[a] = inst_id;
                 }
-                continue;
             }
-
-            // Try ASCII first (most common case).
-            auto ascii_str = probe_ascii(memory, read_addr, inst_id);
-            if (ascii_str.has_value()) {
-                size_t idx = result.strings.size();
-                StringRef ref;
-                ref.addr          = read_addr;
-                ref.discovered_at = inst_id;
-                ref.content       = std::move(*ascii_str);
-                ref.encoding      = StringRef::ASCII;
-                ref.references.push_back({inst_id, inst.pc});
-                result.strings.push_back(std::move(ref));
-                result.addr_to_index[read_addr] = idx;
-                result.inst_to_strings[inst_id].push_back(idx);
-                continue;
-            }
-
-            // Try UTF-16LE.
-            auto utf16_str = probe_utf16le(memory, read_addr, inst_id);
-            if (utf16_str.has_value()) {
-                size_t idx = result.strings.size();
-                StringRef ref;
-                ref.addr          = read_addr;
-                ref.discovered_at = inst_id;
-                ref.content       = std::move(*utf16_str);
-                ref.encoding      = StringRef::UTF16LE;
-                ref.references.push_back({inst_id, inst.pc});
-                result.strings.push_back(std::move(ref));
-                result.addr_to_index[read_addr] = idx;
-                result.inst_to_strings[inst_id].push_back(idx);
-                continue;
-            }
-
-            // Not a string — mark as probed-but-empty to avoid re-probing.
-            result.addr_to_index[read_addr] = StringResult::NOT_STRING;
         }
 
         inst_id++;
-        processed++;
 
-        if (processed % 50000 == 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+        if ((inst_id - start) % 500000 == 0) {
+            ctx.progress(0.4f * static_cast<float>(inst_id - start) / static_cast<float>(total),
+                         "Collecting memory bytes...");
             if (ctx.cancelled()) {
                 return PassResult::failed("cancelled by user");
             }
         }
     }
 
-    ctx.progress(1.0f, fmt::format("Strings: {} discovered, {} unique addresses probed",
-                                    result.total(), result.addr_to_index.size()));
+    ctx.progress(0.4f, fmt::format("Collected {} unique byte addresses from trace",
+                                    byte_cache.size()));
+
+    // ─── Phase 2: Linear scan of byte cache for strings ───────────────────
+    // Sort all cached addresses and scan for contiguous printable regions.
+    // This is much more thorough than probing only at event start addresses —
+    // it finds strings at ANY position in observed memory.
+
+    std::vector<uint64_t> all_addrs;
+    all_addrs.reserve(byte_cache.size());
+    for (const auto& [addr, _] : byte_cache.raw_map()) {
+        all_addrs.push_back(addr);
+    }
+    std::sort(all_addrs.begin(), all_addrs.end());
+
+    ctx.progress(0.5f, fmt::format("Sorted {} addresses, scanning for strings...",
+                                    all_addrs.size()));
+
+    // Scan: walk through sorted addresses, find contiguous printable runs
+    size_t i = 0;
+    size_t n = all_addrs.size();
+    uint64_t strings_found = 0;
+
+    while (i < n) {
+        uint64_t run_start = all_addrs[i];
+        std::string run_content;
+        run_content.reserve(64);
+
+        // Extend while consecutive and printable
+        size_t j = i;
+        while (j < n) {
+            uint64_t expected_addr = run_start + (j - i);
+            if (all_addrs[j] != expected_addr) break;  // Non-contiguous
+
+            auto byte = cache_get_fast(byte_cache, all_addrs[j]);
+            if (byte == 0) {
+                // NUL terminator — end of potential string
+                j++;
+                break;
+            }
+            if (!is_printable(byte)) break;  // Non-printable
+
+            run_content.push_back(static_cast<char>(byte));
+            j++;
+
+            if (run_content.size() >= StringResult::MAX_STRING_LEN) break;
+        }
+
+        // If we got a valid string, register it
+        if (run_content.size() >= StringResult::MIN_STRING_LEN) {
+            uint64_t str_addr = run_start;
+            // Find the inst_id that first referenced this string
+            auto first_it = addr_first_inst.find(str_addr);
+            uint64_t disc_inst = (first_it != addr_first_inst.end()) ? first_it->second : 0;
+
+            size_t idx = result.strings.size();
+            StringRef ref;
+            ref.addr          = str_addr;
+            ref.discovered_at = disc_inst;
+            ref.content       = std::move(run_content);
+            ref.encoding      = StringRef::ASCII;
+            ref.references.push_back({disc_inst, 0});
+            result.strings.push_back(std::move(ref));
+            result.addr_to_index[str_addr] = idx;
+            strings_found++;
+        }
+
+        // Advance: skip past this run (whether it was a string or not)
+        if (j > i) {
+            i = j;
+        } else {
+            i++;
+        }
+
+        if (strings_found % 1000 == 0 && strings_found > 0) {
+            ctx.progress(0.5f + 0.5f * static_cast<float>(i) / static_cast<float>(n),
+                         fmt::format("Scanning... {} strings found", strings_found));
+            if (ctx.cancelled()) {
+                return PassResult::failed("cancelled by user");
+            }
+        }
+    }
+
+    ctx.progress(1.0f, fmt::format("Strings: {} discovered from {} byte addresses",
+                                    result.total(), byte_cache.size()));
     return PassResult::success(std::move(result));
 }
 

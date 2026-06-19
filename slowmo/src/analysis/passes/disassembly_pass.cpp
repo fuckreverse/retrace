@@ -21,7 +21,7 @@ inline bool sw(std::string_view s, std::string_view prefix) {
 /// Classify a mnemonic into instruction category flags on a PCDisasmEntry.
 inline void classify_mnemonic(std::string_view m, PCDisasmEntry& info) {
     // Branch
-    if (m.size() >= 2) {
+    if (!m.empty()) {
         if (m[0] == 'b') {
             if (m.size() == 1 || m[1] == '.' || m[1] == ' ') {
                 info.is_branch = true;

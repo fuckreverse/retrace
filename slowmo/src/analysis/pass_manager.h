@@ -105,6 +105,9 @@ public:
     /// Access the shared trace scan engine (for passes that want to run collectors).
     TraceScanEngine* scan_engine();
 
+    /// Whether parallel trace scanning is disabled at runtime.
+    bool no_parallel_scan() const;
+
 private:
     PassManager& manager_;
     AnalysisRange range_;
@@ -171,6 +174,10 @@ public:
     /// Set the shared trace scan engine.
     void set_scan_engine(TraceScanEngine* e) { scan_engine_ = e; }
     TraceScanEngine* scan_engine() { return scan_engine_; }
+
+    /// Disable parallel trace scanning within individual passes.
+    void set_no_parallel_scan(bool v) { no_parallel_scan_ = v; }
+    bool no_parallel_scan() const { return no_parallel_scan_; }
 
     // ─── Memory pressure management ────────────────────────────────────
 
@@ -241,6 +248,7 @@ private:
     MemoryModel* memory_ = nullptr;
     InstructionDecoder* decoder_ = nullptr;
     TraceScanEngine* scan_engine_ = nullptr;
+    bool no_parallel_scan_ = false;
 
     AnalysisRange range_;
     double rss_limit_mb_ = 0.0;  // 0 = no limit (default)

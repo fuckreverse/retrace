@@ -2,6 +2,7 @@
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "core/memory_model.h"
+#include "core/register_file.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -48,6 +49,48 @@ static std::string extract_class_name(const char* cls_buf) {
     return name;
 }
 
+/// Count the number of colons in a selector name to determine arg count.
+static uint8_t count_selector_args(const std::string& sel_name) {
+    uint8_t count = 0;
+    for (char c : sel_name) {
+        if (c == ':') count++;
+    }
+    return count;
+}
+
+/// Try to dereference a pointer value as a C string from memory.
+/// Returns nullopt if the address looks like a small integer or can't be read.
+static std::optional<std::string> try_deref_string(
+    MemoryModel& mem, uint64_t addr, uint64_t at_inst_id)
+{
+    // Heuristic: skip values that look like small integers or NULL
+    if (addr < 0x1000) return std::nullopt;
+    // Skip values that look like tagged pointers (odd address on ARM64)
+    // but allow them since ObjC uses tagged pointers for NSString etc.
+
+    std::string result;
+    result.reserve(32);
+
+    for (size_t i = 0; i < 256; ++i) {
+        auto byte = mem.byte_at(addr + i, at_inst_id);
+        if (!byte.has_value()) break;
+
+        uint8_t c = *byte;
+        if (c == 0) break;  // NUL terminator
+        if (c < 0x20 || c > 0x7E) {
+            // Non-printable — this probably isn't a string
+            if (i == 0) return std::nullopt;
+            break;
+        }
+
+        result.push_back(static_cast<char>(c));
+    }
+
+    // Require at least 2 chars to consider it a meaningful string
+    if (result.size() < 2) return std::nullopt;
+    return result;
+}
+
 // ─── ObjcResult::to_json ─────────────────────────────────────────────────
 
 nlohmann::json ObjcResult::to_json() const {
@@ -68,6 +111,33 @@ nlohmann::json ObjcResult::to_json() const {
         m["class_name"] = msg.class_name;
         m["selector_name"] = msg.selector_name;
         m["variant"] = msg.variant;
+
+        // Arguments
+        if (msg.arg_count > 0) {
+            json args_arr = json::array();
+            uint8_t n = std::min(msg.arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
+            for (uint8_t k = 0; k < n; ++k) {
+                json a;
+                a["reg"] = fmt::format("x{}", k + 2);
+                a["value"] = fmt::format("0x{:x}", msg.args[k].value);
+                if (msg.args[k].deref_str.has_value()) {
+                    a["string"] = *msg.args[k].deref_str;
+                }
+                args_arr.push_back(std::move(a));
+            }
+            m["arguments"] = std::move(args_arr);
+        }
+
+        // Return value
+        if (msg.has_return) {
+            json ret;
+            ret["value"] = fmt::format("0x{:x}", msg.return_value);
+            if (msg.return_deref_str.has_value()) {
+                ret["string"] = *msg.return_deref_str;
+            }
+            m["return"] = std::move(ret);
+        }
+
         msgs.push_back(std::move(m));
     }
     j["messages"] = std::move(msgs);
@@ -102,6 +172,7 @@ PassResult ObjcPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
     auto& index  = ctx.index();
     auto& memory = ctx.memory();
+    auto& regfile = ctx.regfile();
     const auto& range = ctx.range();
 
     uint64_t start = range.start_inst_id;
@@ -139,18 +210,51 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
             auto objc = rec.as_objc();
 
+            // Extract class name early for filtering
+            std::string cls_name = extract_class_name(objc.cls);
+
+            // Apply class filter if set
+            if (!class_filter_.empty() && cls_name != class_filter_) {
+                continue;
+            }
+
             ObjcMessage msg;
             msg.inst_id   = inst_id;
             msg.pc        = objc.pc;
             msg.receiver  = objc.recv;
             msg.selector  = objc.sel;
             msg.variant   = objc.variant;
-
-            // Extract class name from the 48-byte buffer
-            msg.class_name = extract_class_name(objc.cls);
+            msg.class_name = std::move(cls_name);
 
             // Attempt to read selector name from memory
             msg.selector_name = read_cstring_from_memory(memory, objc.sel, inst_id);
+
+            // ─── Extract method arguments (x2-x7) ────────────────────────
+            // The OBJC record is emitted right before the objc_msgSend call.
+            // At this inst_id, x0=receiver, x1=SEL, x2-x7=first 6 args.
+            //
+            // Determine arg count from selector colons. If selector couldn't
+            // be resolved (memory model has no record of it), we still extract
+            // all 6 potential args — the user can decide which are meaningful.
+            uint8_t sel_arg_count = count_selector_args(msg.selector_name);
+            if (sel_arg_count == 0 && msg.selector_name.find("0x") == 0) {
+                // Selector unresolved — extract all 6 args by default
+                sel_arg_count = OBJC_MAX_ARGS;
+            }
+            msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
+
+            if (msg.arg_count > 0) {
+                // Use RegisterFile to reconstruct register state at this point
+                const auto& regs = regfile.state_before(inst_id);
+
+                for (uint8_t k = 0; k < msg.arg_count; ++k) {
+                    uint64_t val = regs.gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
+                    msg.args[k].value = val;
+
+                    // Attempt to dereference as C string
+                    msg.args[k].deref_str = try_deref_string(memory, val, inst_id);
+                }
+            }
 
             // Record message index
             size_t msg_idx = result.messages.size();
@@ -175,6 +279,34 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
             // Store message
             result.messages.push_back(std::move(msg));
+        }
+    }
+
+    // ─── Second pass: fill in return values ─────────────────────────────
+    // For each message at inst_id N, the return value is x0 at the time the
+    // next message fires (inst_id M). At that point the previous call has
+    // already returned and x0 holds the return value (unless it was clobbered
+    // by intermediate code — but typically the caller uses it immediately).
+    //
+    // For the last message, we read x0 a fixed offset after the call.
+    if (!result.messages.empty()) {
+        for (size_t i = 0; i + 1 < result.messages.size(); ++i) {
+            uint64_t next_id = result.messages[i + 1].inst_id;
+            // Read x0 just before the next objc_msgSend fires
+            const auto& regs = regfile.state_before(next_id);
+            result.messages[i].return_value = regs.gpr[0];
+            result.messages[i].return_deref_str = try_deref_string(memory, regs.gpr[0], next_id);
+            result.messages[i].has_return = true;
+        }
+
+        // Last message: try reading x0 a short distance after
+        auto& last_msg = result.messages.back();
+        uint64_t probe_id = last_msg.inst_id + 5000;
+        if (probe_id < end) {
+            const auto& regs = regfile.state_before(probe_id);
+            last_msg.return_value = regs.gpr[0];
+            last_msg.return_deref_str = try_deref_string(memory, regs.gpr[0], probe_id);
+            last_msg.has_return = true;
         }
     }
 

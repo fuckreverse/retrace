@@ -3,7 +3,6 @@
 #include "analysis/pass_manager.h"
 #include <cstdint>
 #include <vector>
-#include <unordered_set>
 #include <string>
 
 #include <ankerl/unordered_dense.h>
@@ -66,7 +65,12 @@ struct TaintConfig {
     // ─── Source specification ─────────────────────────────────────────
 
     /// Initial taint sources: register indices that start tainted.
-    std::unordered_set<uint8_t> source_regs;
+    /// Stored as a bitmask: bit N set means register N is a source.
+    uint64_t source_regs = 0;
+
+    /// Convenience: add a source register.
+    void add_source_reg(uint8_t reg) { source_regs |= (1ULL << reg); }
+    bool has_source_reg(uint8_t reg) const { return (source_regs >> reg) & 1; }
 
     /// Source instruction ID: start taint propagation from this instruction.
     /// If 0, starts from the beginning of the analysis range.
@@ -108,7 +112,7 @@ struct TaintConfig {
     uint32_t max_taint_width = 0;
 
     /// Stop when reaching any of these PCs (e.g., known sanitizers).
-    std::unordered_set<uint64_t> stop_pcs;
+    std::vector<uint64_t> stop_pcs;
 
     // ─── XRef acceleration ────────────────────────────────────────────
 
@@ -149,7 +153,8 @@ struct TaintResult {
     std::vector<PropagationStep> steps;
 
     /// Current taint state at the end of analysis: which regs are tainted.
-    std::unordered_set<uint8_t> tainted_regs;
+    /// Bitmask: bit N set means register N is tainted.
+    uint64_t tainted_regs = 0;
 
     /// Memory addresses that are currently tainted.
     roaring::Roaring64Map tainted_memory;
@@ -172,7 +177,12 @@ struct TaintResult {
     std::string stop_reason;
 
     bool is_tainted(uint8_t reg) const {
-        return tainted_regs.count(reg) > 0;
+        return (tainted_regs >> reg) & 1;
+    }
+
+    /// Number of currently tainted registers.
+    uint32_t tainted_reg_count() const {
+        return static_cast<uint32_t>(__builtin_popcountll(tainted_regs));
     }
 
     bool is_memory_addr_tainted(uint64_t addr) const {

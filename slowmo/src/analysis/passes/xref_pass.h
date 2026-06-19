@@ -90,6 +90,24 @@ public:
         result.unique_pc_count = result.pc_exec_count.size();
     }
 
+    // ─── Parallel scanning support ───────────────────────────────────────
+    bool supports_parallel() const override { return true; }
+
+    std::unique_ptr<TraceCollector> clone() const override {
+        return std::make_unique<XrefCollector>();
+    }
+
+    void merge(TraceCollector& shard) override {
+        auto& other = static_cast<XrefCollector&>(shard);
+        for (auto& [pc, bitmap] : other.result.pc_to_inst_ids) {
+            result.pc_to_inst_ids[pc] |= bitmap;
+        }
+        for (const auto& [pc, count] : other.result.pc_exec_count) {
+            result.pc_exec_count[pc] += count;
+        }
+        result.total_indexed += other.result.total_indexed;
+    }
+
     XrefResult result;
 };
 

@@ -7,10 +7,21 @@
 #include <unordered_map>
 #include <algorithm>
 #include <nlohmann/json.hpp>
+#include <array>
+#include <optional>
 
 namespace tenet {
 
 // ─── ObjC message record ──────────────────────────────────────────────────
+
+/// Maximum number of method arguments captured (x2-x7 on AArch64).
+static constexpr size_t OBJC_MAX_ARGS = 6;
+
+/// A single method argument with optional string dereference.
+struct ObjcArg {
+    uint64_t value = 0;                     // raw register value
+    std::optional<std::string> deref_str;   // dereferenced C-string if pointer
+};
 
 /// A single Objective-C message send captured from the trace.
 struct ObjcMessage {
@@ -21,6 +32,16 @@ struct ObjcMessage {
     std::string class_name;     // resolved class name (from trace data)
     std::string selector_name;  // selector name (from memory or hex fallback)
     uint8_t variant;            // 0=msgSend, 1=stret, 2=super, etc.
+
+    /// Method arguments (x2-x7). Only populated when register state is available.
+    std::array<ObjcArg, OBJC_MAX_ARGS> args{};
+    uint8_t arg_count = 0;      // number of args based on selector colon count
+
+    /// Return value (x0 after the method returns).
+    /// Populated by looking at the register state at the next OBJC call or end of trace.
+    uint64_t return_value = 0;
+    std::optional<std::string> return_deref_str;  // dereferenced if pointer
+    bool has_return = false;
 };
 
 // ─── ObjC class info ──────────────────────────────────────────────────────
@@ -93,6 +114,9 @@ struct ObjcResult {
 /// Builds a map of ObjC method calls, call counts, class hierarchies seen
 /// at runtime, and selector frequency.  Critical for iOS reverse engineering.
 ///
+/// When register state is available, also extracts method arguments (x2-x7)
+/// and attempts to dereference pointer arguments as C strings.
+///
 /// Result type: ObjcResult
 class ObjcPass final : public AnalysisPass {
 public:
@@ -105,8 +129,14 @@ public:
         return {};  // No dependencies — iterates raw trace records
     }
 
+    /// Optional: filter results to only include messages for this class.
+    void set_class_filter(const std::string& cls) { class_filter_ = cls; }
+
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 4.0f; }
+
+private:
+    std::string class_filter_;  // empty = no filter
 };
 
 }  // namespace tenet

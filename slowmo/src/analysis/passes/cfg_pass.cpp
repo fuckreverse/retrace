@@ -1,5 +1,6 @@
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/xref_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -223,6 +224,8 @@ PassResult CFGPass::run(PassContext& ctx) {
     // For each consecutive pair of instructions in the trace, if they belong
     // to different blocks, create an edge from the source block to the
     // destination block.
+    //
+    // Uses TraceScanEngine::run_parallel() for multi-threaded scanning.
 
     uint64_t start = range.start_inst_id;
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
@@ -244,48 +247,58 @@ PassResult CFGPass::run(PassContext& ctx) {
         }
     };
 
-    std::unordered_map<EdgeKey, uint64_t, EdgeKeyHash> edge_counts;
+    using EdgeCountMap = std::unordered_map<EdgeKey, uint64_t, EdgeKeyHash>;
 
-    uint64_t inst_id = 0;
-    uint64_t processed = 0;
-    uint64_t total = end - start;
-    uint64_t prev_block_start = UINT64_MAX;  // Invalid sentinel
+    /// Collector that accumulates CFG edge counts during trace scan.
+    /// Supports parallel sharding: each shard independently tracks block
+    /// transitions, then merge() sums edge counts.
+    struct CFGEdgeCollector final : public TraceCollector {
+        const CFGResult* cfg;       // Shared (read-only) block map
+        EdgeCountMap edge_counts;
+        uint64_t prev_block_start = UINT64_MAX;
 
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
+        explicit CFGEdgeCollector(const CFGResult* c) : cfg(c) {}
 
-        if (inst_id < start) {
-            inst_id++;
-            continue;
+        std::string_view name() const override { return "cfg_edge_collector"; }
+        bool supports_parallel() const override { return true; }
+
+        std::unique_ptr<TraceCollector> clone() const override {
+            return std::make_unique<CFGEdgeCollector>(cfg);
         }
 
-        auto inst = rec.as_inst();
-        uint64_t pc = inst.pc;
-
-        // Find which block this PC belongs to
-        const BasicBlock* cur_block = result.block_containing(pc);
-        uint64_t cur_block_start = cur_block ? cur_block->start_pc : UINT64_MAX;
-
-        // If we have a previous instruction and it belongs to a different block,
-        // record an edge
-        if (prev_block_start != UINT64_MAX && cur_block_start != UINT64_MAX &&
-            prev_block_start != cur_block_start) {
-            EdgeKey key{prev_block_start, cur_block_start};
-            edge_counts[key]++;
-        }
-
-        prev_block_start = cur_block_start;
-        inst_id++;
-        processed++;
-
-        if (processed % 50000 == 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-            if (ctx.cancelled()) {
-                return PassResult::failed("cancelled by user");
+        void merge(TraceCollector& shard) override {
+            auto& other = static_cast<CFGEdgeCollector&>(shard);
+            for (const auto& [key, count] : other.edge_counts) {
+                edge_counts[key] += count;
             }
         }
+
+        void on_inst(uint64_t /*inst_id*/, const InstView& inst) override {
+            const BasicBlock* cur_block = cfg->block_containing(inst.pc);
+            uint64_t cur_block_start = cur_block ? cur_block->start_pc : UINT64_MAX;
+
+            if (prev_block_start != UINT64_MAX && cur_block_start != UINT64_MAX &&
+                prev_block_start != cur_block_start) {
+                edge_counts[EdgeKey{prev_block_start, cur_block_start}]++;
+            }
+            prev_block_start = cur_block_start;
+        }
+    };
+
+    CFGEdgeCollector collector(&result);
+    TraceScanEngine engine(reader, index.inst_count(), &index);
+    engine.add_collector(&collector);
+    engine.set_progress([&](uint64_t processed, uint64_t total) {
+        ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+    });
+    engine.set_cancel_check([&]() { return ctx.cancelled(); });
+    if (ctx.no_parallel_scan()) {
+        engine.run(start, end);
+    } else {
+        engine.run_parallel(start, end);
     }
+
+    auto& edge_counts = collector.edge_counts;
 
     // ── Phase 5: Build final edge list ───────────────────────────────────
     result.edges.reserve(edge_counts.size());

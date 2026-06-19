@@ -3,7 +3,6 @@
 #include "analysis/pass_manager.h"
 #include <cstdint>
 #include <vector>
-#include <unordered_set>
 #include <string>
 
 #include <ankerl/unordered_dense.h>
@@ -82,7 +81,11 @@ struct BackwardTaintConfig {
     uint64_t sink_inst_id = 0;
 
     /// The sink register(s): which register values at the sink to trace back.
-    std::unordered_set<uint8_t> sink_regs;
+    /// Bitmask: bit i is set if register i is a sink (AArch64 has 34 GPRs, fits in 64 bits).
+    uint64_t sink_regs = 0;
+
+    void add_sink_reg(uint8_t reg) { sink_regs |= (1ULL << reg); }
+    bool has_sink_reg(uint8_t reg) const { return (sink_regs >> reg) & 1; }
 
     /// Optionally: sink memory address(es) to trace back.
     std::vector<uint64_t> sink_mem_addrs;
@@ -132,7 +135,11 @@ struct BackwardTaintResult {
     roaring::Roaring64Map contributing_inst_ids;
 
     /// All registers that were part of the backward dependency chain at any point.
-    std::unordered_set<uint8_t> all_involved_regs;
+    /// Bitmask: bit i is set if register i was involved.
+    uint64_t all_involved_regs = 0;
+
+    /// Count of involved registers.
+    int involved_reg_count() const { return __builtin_popcountll(all_involved_regs); }
 
     /// All memory addresses that were part of load-store chains.
     roaring::Roaring64Map involved_mem_addrs;

@@ -31,6 +31,7 @@ void PassContext::progress(float /*pct*/) {}
 void PassContext::progress(float /*pct*/, std::string_view /*msg*/) {}
 
 TraceScanEngine* PassContext::scan_engine() { return manager_.scan_engine(); }
+bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan(); }
 
 // ─── PassManager ──────────────────────────────────────────────────────────
 

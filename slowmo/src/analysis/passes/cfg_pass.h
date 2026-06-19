@@ -85,6 +85,70 @@ struct CFGResult {
         return result;
     }
 
+    /// Extract a sub-CFG containing only blocks whose start_pc falls within [lo, hi).
+    /// Edges are kept only when both endpoints are in the sub-graph.
+    CFGResult extract_range(uint64_t lo, uint64_t hi) const {
+        CFGResult sub;
+        for (auto it = blocks.lower_bound(lo); it != blocks.end() && it->first < hi; ++it) {
+            sub.blocks.emplace(it->first, it->second);
+        }
+        for (const auto& e : edges) {
+            if (sub.blocks.count(e.from_block) && sub.blocks.count(e.to_block)) {
+                sub.edges.push_back(e);
+            }
+        }
+        return sub;
+    }
+
+    /// Extract a sub-CFG for a single function by walking reachable blocks
+    /// from `entry_pc` through edges (forward + backward).
+    /// This captures the complete intra-procedural CFG even when blocks
+    /// are not contiguous in address space.
+    CFGResult extract_function(uint64_t entry_pc) const {
+        CFGResult sub;
+        if (blocks.find(entry_pc) == blocks.end()) return sub;
+
+        // BFS/DFS from entry_pc through all edges
+        std::unordered_set<uint64_t> visited;
+        std::vector<uint64_t> worklist = {entry_pc};
+
+        // Build adjacency: forward + backward
+        std::unordered_map<uint64_t, std::vector<uint64_t>> fwd, bwd;
+        for (const auto& e : edges) {
+            // Skip call edges — they leave the function
+            auto src_it = blocks.find(e.from_block);
+            if (src_it != blocks.end() &&
+                src_it->second.terminator == TerminatorKind::Call) {
+                // A call edge goes to a different function; skip it for
+                // intra-procedural reachability.  But keep fallthrough
+                // edges from call blocks (return to next instruction).
+                if (!e.is_fallthrough) continue;
+            }
+            fwd[e.from_block].push_back(e.to_block);
+            bwd[e.to_block].push_back(e.from_block);
+        }
+
+        while (!worklist.empty()) {
+            uint64_t pc = worklist.back();
+            worklist.pop_back();
+            if (!visited.insert(pc).second) continue;
+            if (blocks.find(pc) == blocks.end()) continue;
+            for (uint64_t next : fwd[pc]) worklist.push_back(next);
+            for (uint64_t prev : bwd[pc]) worklist.push_back(prev);
+        }
+
+        for (uint64_t pc : visited) {
+            auto it = blocks.find(pc);
+            if (it != blocks.end()) sub.blocks.emplace(it->first, it->second);
+        }
+        for (const auto& e : edges) {
+            if (visited.count(e.from_block) && visited.count(e.to_block)) {
+                sub.edges.push_back(e);
+            }
+        }
+        return sub;
+    }
+
     /// Total number of basic blocks.
     size_t block_count() const { return blocks.size(); }
 
