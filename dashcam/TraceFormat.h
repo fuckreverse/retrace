@@ -24,6 +24,15 @@ namespace qbditrace {
 #endif
 
 /* Bump whenever the on-disk layout changes incompatibly.
+ * v6 changes vs v5 (backward-incompatible, gated by HF_OLD_VALUE flag):
+ *   - qbditrace_memacc_t gains two new fields: `old_value` and `old_value_hi`.
+ *     When HF_OLD_VALUE is set in the file header, every WRITE memory access
+ *     carries the bytes that were in memory BEFORE the write executed.
+ *     This enables true time-travel: the decoder can "undo" any write by
+ *     restoring the old value, enabling reverse-execution queries without
+ *     rescanning from the start.
+ *     The struct grows from 32 bytes to 48 bytes (two extra 8-byte fields).
+ *     Readers that do not recognise HF_OLD_VALUE must reject or ignore the file.
  * v5 changes vs v4 (backward-incompatible, gated by HF_PC_DELTA flag):
  *   - REC_INST uses qbditrace_inst_head_v5_t: the 8-byte absolute `pc` field
  *     is replaced by a 2-byte signed `pc_delta` (little-endian int16).
@@ -53,6 +62,7 @@ namespace qbditrace {
 #define QBDITRACE_MAGIC 0x51424454u /* "QBDT" */
 #define QBDITRACE_VERSION 4u  /* writer still produces v4 unless HF_PC_DELTA is set */
 #define QBDITRACE_VERSION_V5_PC_DELTA 5u  /* version tag written when HF_PC_DELTA is used */
+#define QBDITRACE_VERSION_V6_OLD_VALUE 6u /* version tag written when HF_OLD_VALUE is used */
 
 /* Architecture tags (kept independent of QBDI enums for decoder portability). */
 typedef enum {
@@ -96,6 +106,14 @@ typedef enum {
    * and resume from delta = 0 after it.
    * Incompatible with v4 readers — check this flag before parsing. */
   QBDITRACE_HF_PC_DELTA = 1u << 4,
+  /* v6: qbditrace_memacc_v6_t extends the memory access record with two
+   * additional 8-byte fields (old_value, old_value_hi) that capture the bytes
+   * in memory BEFORE the write was performed. The struct grows from 32 bytes to
+   * 48 bytes; only WRITE accesses carry old values (READ accesses leave these
+   * fields zeroed). When this flag is set, sizeof(qbditrace_memacc_t) == 48 in
+   * the on-disk layout; readers that don't support v6 must reject the file.
+   * Enabling this flag also bumps the file version to QBDITRACE_VERSION_V6_OLD_VALUE. */
+  QBDITRACE_HF_OLD_VALUE = 1u << 5,
 } qbditrace_header_flags;
 
 /*
@@ -179,6 +197,30 @@ typedef struct {
   uint64_t value;    /* low 8 bytes (for size<=8 this is the whole value) */
   uint64_t value_hi; /* high bytes for 9..16 byte stores; 0 otherwise */
 } qbditrace_memacc_t;
+
+/* v6 extension of qbditrace_memacc_t (HF_OLD_VALUE).
+ * When HF_OLD_VALUE is set in the file header, every memory access record is
+ * this larger struct (48 bytes) instead of qbditrace_memacc_t (32 bytes).
+ * The old_value / old_value_hi fields capture the memory content BEFORE the
+ * write was performed (time-travel: "what was here before?").
+ * For READ accesses: old_value and old_value_hi are zero (reads don't overwrite).
+ * For WRITE accesses: old_value[_hi] = bytes at addr before the instruction ran.
+ * If the pre-write read fails (guard page, unmapped): both fields stay zero and
+ * QBDITRACE_MF_OLD_UNKNOWN is set in mem_flags. */
+typedef struct {
+  uint8_t mem_type;
+  uint8_t mem_flags;
+  uint16_t size;
+  uint64_t addr;
+  uint64_t value;        /* new value low  8 bytes */
+  uint64_t value_hi;     /* new value high 8 bytes (9..16 byte stores) */
+  uint64_t old_value;    /* old value low  8 bytes (writes only; 0 for reads) */
+  uint64_t old_value_hi; /* old value high 8 bytes (writes only; 0 for reads) */
+} qbditrace_memacc_v6_t;
+
+/* mem_flags extension for v6: set when old_value could not be captured.
+ * Fits in the existing mem_flags byte (bits 0-2 used by QBDI MemoryAccessFlags). */
+#define QBDITRACE_MF_OLD_UNKNOWN (1u << 3) /* old value unavailable (guard page etc.) */
 
 /* ---- QBDITRACE_REC_ANCHOR ----
  * Layout:
@@ -330,6 +372,8 @@ static_assert(sizeof(qbditrace_regdiff_t) == 16,
               "regdiff must be 16 bytes (1B index + 7B pad + 8B value)");
 static_assert(sizeof(qbditrace_memacc_t) == 32,
               "memacc must be 32 bytes (4B fields + 4B pad + 3x8B)");
+static_assert(sizeof(qbditrace_memacc_v6_t) == 48,
+              "memacc_v6 must be 48 bytes (4B fields + 4B pad + 5x8B)");
 static_assert(sizeof(qbditrace_anchor_head_t) == 16,
               "anchor head must be 16 bytes (4B kind+reserved + 4B pad + 8B pc)");
 static_assert(sizeof(qbditrace_thread_head_t) == 16,

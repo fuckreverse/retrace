@@ -101,7 +101,29 @@ typedef struct {
    * that check for version==4 will reject the file gracefully.
    * Zero (the default) keeps the original v4 layout for full compatibility. */
   uint32_t enable_pc_delta;
+
+  /* v6 old-value capture.  Set to non-zero to record the memory content BEFORE
+   * each write, enabling true time-travel: the decoder can undo any store by
+   * restoring the captured old bytes without rescanning from the start.
+   * Each memory access record grows from 32 bytes to 48 bytes (two extra 8-byte
+   * fields: old_value + old_value_hi).  For reads the extra fields are zero.
+   * For writes, the tracer calls safeRead() on the target address immediately
+   * before the write executes (in preInstCB); if the read fails (guard page,
+   * unmapped), the fields stay zero and QBDITRACE_MF_OLD_UNKNOWN is set.
+   * The file header version is bumped to 6 and HF_OLD_VALUE is set.
+   * Zero (the default) keeps the v4/v5 layout unchanged. */
+  uint32_t enable_old_value;
 } qbditrace_config_t;
+
+/*
+ * Insert a full-register ANCHOR snapshot at the current execution point.
+ * Can be called from a Frida script (or any external thread) while a
+ * qbditrace_run_* is in progress to force an exact checkpoint at an
+ * interesting moment (e.g. just before a critical function call).
+ * Thread-safe; the anchor is written to the calling thread's buffer.
+ * Returns 0 on success, negative if the tracer is not running.
+ */
+int qbditrace_force_anchor(void);
 
 /*
  * Configure the tracer. Must be called before any qbditrace_run_*.
