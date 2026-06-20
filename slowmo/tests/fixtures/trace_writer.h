@@ -175,6 +175,18 @@ struct TraceWriter {
     struct RegDiff { uint8_t index; uint64_t value; };
     struct MemAcc { uint8_t type; uint16_t size; uint64_t addr; uint64_t value; };
 
+    // v6 extended memory access (with old_value pre-write capture)
+    struct MemAccV6 {
+        uint8_t  type;          // QBDI::MEMORY_READ=1, WRITE=2
+        uint16_t size;          // in bytes
+        uint64_t addr;
+        uint64_t value;         // new value (post-write)
+        uint64_t value_hi;      // high bytes for >8-byte stores
+        uint64_t old_value;     // pre-write value (WRITE only; 0 for READ)
+        uint64_t old_value_hi;  // pre-write high bytes (>8-byte stores)
+        bool     old_unknown;   // set QBDITRACE_MF_OLD_UNKNOWN in flags
+    };
+
     bool open(const char* path) { fp = fopen(path, "wb"); return fp != nullptr; }
     void close() { if (fp) fclose(fp); fp = nullptr; }
     uint64_t rt(uint64_t static_pc) { return static_pc + module_slide; }
@@ -191,6 +203,26 @@ struct TraceWriter {
         hdr.trace_end = module_base + module_slide + code_size;
         hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
                     QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
+    /// Write a v6 (HF_OLD_VALUE) header.  Version is bumped to
+    /// QBDITRACE_VERSION_V6_OLD_VALUE and the HF_OLD_VALUE flag is set so that
+    /// tenet's TraceReader recognises v6 mode and uses qbditrace_memacc_v6_t.
+    void write_header_v6(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V6_OLD_VALUE;   // #define macro (not qualified)
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_OLD_VALUE;
         strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
         fwrite(&hdr, sizeof(hdr), 1, fp);
     }
@@ -274,6 +306,53 @@ struct TraceWriter {
             ma.addr = m.addr;
             ma.value = m.value;
             ma.value_hi = 0;
+            fwrite(&ma, sizeof(ma), 1, fp);
+        }
+        inst_count++;
+    }
+
+    /// Emit a v6 INST record (48-byte memacc with old_value fields).
+    /// Must be called after write_header_v6().  `mems_v6` provides both the
+    /// new value and the pre-write old value for each memory access.
+    void emit_v6(MachineState& ms, uint64_t spc, uint32_t opcode,
+                 std::vector<RegDiff> diffs, std::vector<MemAccV6> mems_v6,
+                 uint8_t nzcv = 0) {
+        uint64_t rpc = rt(spc);
+        for (auto& d : diffs) ms.gpr[d.index] = d.value;
+        ms.nzcv() = nzcv;
+        ms.pc() = rpc;
+
+        // Auto-anchor
+        if (inst_count % anchor_interval == 0) emit_anchor(ms);
+
+        // Emit code
+        emit_code(rpc, opcode);
+
+        // Emit v4-format INST head (same header for v4/v5/v6 — only payload changes)
+        qbditrace::qbditrace_inst_head_t ih = {};
+        ih.kind = QBDITRACE_REC_INST;
+        ih.nzcv = nzcv;
+        ih.n_regdiff = (uint8_t)diffs.size();
+        ih.n_mem = (uint8_t)mems_v6.size();
+        ih.pc = rpc;
+        fwrite(&ih, sizeof(ih), 1, fp);
+
+        for (auto& d : diffs) {
+            qbditrace::qbditrace_regdiff_t rd = {};
+            rd.reg_index = d.index;
+            rd.value = d.value;
+            fwrite(&rd, sizeof(rd), 1, fp);
+        }
+        for (auto& m : mems_v6) {
+            qbditrace::qbditrace_memacc_v6_t ma = {};
+            ma.mem_type  = m.type;
+            ma.mem_flags = m.old_unknown ? QBDITRACE_MF_OLD_UNKNOWN : 0;
+            ma.size      = m.size;
+            ma.addr      = m.addr;
+            ma.value     = m.value;
+            ma.value_hi  = m.value_hi;
+            ma.old_value     = m.old_value;
+            ma.old_value_hi  = m.old_value_hi;
             fwrite(&ma, sizeof(ma), 1, fp);
         }
         inst_count++;

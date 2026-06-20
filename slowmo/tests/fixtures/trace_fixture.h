@@ -134,7 +134,13 @@ inline std::unique_ptr<TraceEnv> make_env(
 
     // ── Create RegisterFile + MemoryModel ───────────────────────────────
     env->regfile = std::make_unique<RegisterFile>(*env->reader, *env->index);
-    env->memory  = std::make_unique<MemoryModel>(*env->reader, *env->index);
+    // Use RocksDB-backed MemoryModel so WatchBreakpoint and mem_write CF
+    // queries work correctly in tests.  The DB is owned by TraceIndex.
+    env->memory  = std::make_unique<MemoryModel>(
+        *env->reader, *env->index,
+        env->index->raw_db(),
+        env->index->mem_write_cf(),
+        env->index->mem_read_cf());
 
     return env;
 }

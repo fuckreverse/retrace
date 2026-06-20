@@ -38,8 +38,11 @@ endfunction()
 # ─── Unit tests: core layer ─────────────────────────────────────────────────
 tenet_add_test(test_common_lru_cache       unit/test_common_lru_cache.cpp)
 tenet_add_test(test_io_trace_reader        unit/test_io_trace_reader.cpp)
+tenet_add_test(test_io_trace_reader_v6     unit/test_io_trace_reader_v6.cpp)
 tenet_add_test(test_core_register_file     unit/test_core_register_file.cpp)
 tenet_add_test(test_core_instruction_decoder unit/test_core_instruction_decoder.cpp)
+tenet_add_test(test_core_memory_model      unit/test_core_memory_model.cpp)
+tenet_add_test(test_core_breakpoint_engine unit/test_core_breakpoint_engine.cpp)
 
 # ─── Unit tests: analysis passes ────────────────────────────────────────────
 tenet_add_test(test_pass_xref              unit/test_pass_xref.cpp)
