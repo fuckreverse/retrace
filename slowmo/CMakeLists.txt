@@ -271,6 +271,7 @@ add_library(tenet_lib STATIC
     src/core/register_file.cpp
     src/core/instruction_decoder.cpp
     src/core/memory_model.cpp
+    src/core/breakpoint_engine.cpp
     src/core/triton_bridge.cpp
     src/analysis/pass_manager.cpp
     src/analysis/trace_collector.cpp
@@ -294,6 +295,7 @@ add_library(tenet_lib STATIC
     src/analysis/passes/trace_diff_pass.cpp
     src/analysis/passes/symbol_annotation_pass.cpp
     src/analysis/passes/memory_snapshot_pass.cpp
+    src/analysis/passes/memory_string_pass.cpp
     src/analysis/passes/dataflow_graph_pass.cpp
     src/analysis/passes/objc_pass.cpp
     src/analysis/passes/thread_pass.cpp

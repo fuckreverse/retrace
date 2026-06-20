@@ -8,6 +8,7 @@
 #include "core/register_file.h"
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
+#include "core/breakpoint_engine.h"
 #include "tui/hex_dump_view.h"
 #include "analysis/pass_manager.h"
 
@@ -237,6 +238,32 @@ private:
     void open_string_search_dialog();
     void close_string_search_dialog();
     void execute_string_search();
+
+    // ─── Breakpoint Engine ────────────────────────────────────────────
+    std::unique_ptr<BreakpointEngine> bp_engine_;
+    void ensure_bp_engine();
+
+    // Command-mode dialog (":"-prefixed commands like "b 0x1234", "w 0xaddr 8")
+    bool show_cmd_dialog_ = false;
+    std::string cmd_input_;
+    std::string cmd_error_;       ///< last command error (shown in status bar)
+    std::string bp_status_msg_;   ///< last breakpoint hit / status message
+    void open_cmd_dialog();
+    void close_cmd_dialog();
+    void execute_cmd();           ///< parse and execute the command in cmd_input_
+
+    // Internal breakpoint operations (called by execute_cmd)
+    void cmd_run_forward();       ///< continue forward until next breakpoint
+    void cmd_run_backward();      ///< continue backward until previous breakpoint
+    void cmd_list_breakpoints();  ///< refresh bp_status_msg_ with active BPs
+    void cmd_delete_breakpoint(uint32_t id);  ///< remove breakpoint by id
+
+    // Breakpoint list panel
+    bool show_bp_panel_ = false;
+    size_t bp_panel_cursor_ = 0;
+    bool bp_panel_focused_ = false;
+    ftxui::Element render_bp_panel();
+    bool handle_bp_panel_event(ftxui::Event event);
 
     // ─── Unified event dispatch (eliminates duplication between components) ──
     /// Returns true if the event was consumed.

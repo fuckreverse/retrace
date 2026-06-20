@@ -24,6 +24,7 @@
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/symbol_annotation_pass.h"
 #include "analysis/passes/memory_snapshot_pass.h"
+#include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/objc_pass.h"
@@ -506,11 +507,17 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --symbol-annotation           Generate symbol annotations for all PCs\n");
     fmt::print(stderr, "  --memory-snapshot <inst_id>    Capture memory snapshot (repeatable)\n");
     fmt::print(stderr, "  --memory-snapshot-size <N>     Bytes per region in snapshot (default: 64)\n");
+    fmt::print(stderr, "  --memory-strings              Time-aware string discovery at call sites\n");
+    fmt::print(stderr, "  --memory-strings-max-sites <N> Max call sites to scan (default: unlimited)\n");
+    fmt::print(stderr, "  --memory-strings-scan-size <N> Bytes to scan per pointer (default: 256)\n");
     fmt::print(stderr, "  --dataflow-graph <start> <end> Build dataflow graph for instruction range\n");
     fmt::print(stderr, "  --dataflow-graph-output <file> Export dataflow graph (.dot or .json)\n");
     fmt::print(stderr, "  --algorithm-summary           Generate algorithm summary report\n");
     fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
-fmt::print(stderr, "  --objc-class <name>           Filter ObjC messages by class name\n");
+    fmt::print(stderr, "  --objc-class <name>           Filter ObjC messages by class name\n");
+    fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
+    fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
+    fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
     fmt::print(stderr, "\nQuery options (JSON output):\n");
     fmt::print(stderr, "  --memread <addr> <size> <inst_id> Read memory at a point in time\n");
     fmt::print(stderr, "  --mem-history <addr> <size>       List all writes to an address\n");
@@ -566,6 +573,9 @@ int main(int argc, char** argv) {
     bool opt_memory_snapshot = false;
     std::vector<uint64_t> memory_snapshot_ids;
     uint32_t memory_snapshot_size = 64;
+    bool opt_memory_strings = false;
+    size_t memory_strings_max_sites = 0;  // 0 = unlimited
+    size_t memory_strings_scan_size = 256;
     bool opt_dataflow_graph = false;
     uint64_t dataflow_start = 0, dataflow_end = 0;
     std::string dataflow_output_path;
@@ -618,6 +628,13 @@ int main(int argc, char** argv) {
     uint64_t literal_search_start = 0, literal_search_end = 0;
 
     bool opt_no_parallel_scan = false;
+
+    // Image fallback and memory access dump
+    std::string image_path;          // --image <path>
+    bool opt_dump_memaccess = false;  // --dump-memaccess <start> <count>
+    uint64_t dump_ma_start = 0;
+    uint64_t dump_ma_count = 0;
+    bool dump_ma_strings = false;     // --dump-ma-strings
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -692,6 +709,12 @@ int main(int argc, char** argv) {
             memory_snapshot_ids.push_back(std::stoull(argv[++i]));
         } else if (arg == "--memory-snapshot-size" && i + 1 < argc) {
             memory_snapshot_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--memory-strings") {
+            opt_memory_strings = true;
+        } else if (arg == "--memory-strings-max-sites" && i + 1 < argc) {
+            memory_strings_max_sites = std::stoull(argv[++i]);
+        } else if (arg == "--memory-strings-scan-size" && i + 1 < argc) {
+            memory_strings_scan_size = std::stoull(argv[++i]);
         } else if (arg == "--dataflow-graph" && i + 2 < argc) {
             opt_dataflow_graph = true;
             dataflow_start = std::stoull(argv[++i]);
@@ -765,6 +788,14 @@ int main(int argc, char** argv) {
             literal_search_end = std::stoull(argv[++i]);
         } else if (arg == "--no-parallel-scan") {
             opt_no_parallel_scan = true;
+        } else if (arg == "--image" && i + 1 < argc) {
+            image_path = argv[++i];
+        } else if (arg == "--dump-memaccess" && i + 2 < argc) {
+            opt_dump_memaccess = true;
+            dump_ma_start = std::stoull(argv[++i]);
+            dump_ma_count = std::stoull(argv[++i]);
+        } else if (arg == "--dump-ma-strings") {
+            dump_ma_strings = true;
         } else if (arg[0] != '-') {
             trace_path = arg;
         }
@@ -786,14 +817,15 @@ int main(int argc, char** argv) {
                                !call_graph_path.empty() ||
                                opt_backward_taint || opt_critical_path ||
                                opt_trace_diff || opt_loop_semantics ||
-                               opt_symbol_annotation || opt_memory_snapshot ||
+                               opt_symbol_annotation || opt_memory_snapshot || opt_memory_strings ||
                                opt_dataflow_graph || opt_algorithm_summary ||
                                opt_objc ||
                                opt_memread || opt_mem_history || opt_search_pc ||
                                opt_trace_fold || opt_reg_timeline ||
                                opt_mem_search || opt_call_context ||
                                opt_producer_chain || opt_window_stats ||
-                               opt_entropy || opt_literal_search;
+                               opt_entropy || opt_literal_search ||
+                               opt_dump_memaccess;
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
@@ -880,6 +912,18 @@ int main(int argc, char** argv) {
     fmt::print("  Loaded {} distinct PCs\n\n", code_table.size());
     LOG_DEBUG("code table: {} distinct PCs", code_table.size());
 
+    // ─── Load image fallback (optional) ─────────────────────────────
+    if (!image_path.empty()) {
+        auto img = std::make_shared<ImageFallback>();
+        if (img->load(image_path, hdr.module_base)) {
+            code_table.set_image_fallback(img);
+            fmt::print("  Image fallback: {} segments loaded from {}\n",
+                       img->segment_count(), image_path);
+        } else {
+            fmt::print(stderr, "  Warning: failed to load image fallback: {}\n", image_path);
+        }
+    }
+
     // ─── Initialize decoder ─────────────────────────────────────────────
     InstructionDecoder decoder;
     {
@@ -893,7 +937,11 @@ int main(int argc, char** argv) {
 
     // ─── Initialize RegisterFile and MemoryModel ──────────────────────────
     RegisterFile regfile(reader, index);
-    MemoryModel memory(reader, index);
+    // Use RocksDB-backed MemoryModel for full memory read/write indexing.
+    // This enables resolving pointer dereferences (e.g. ObjC selector strings,
+    // NSData bytes) that were written by uninstrumented shared-cache code.
+    MemoryModel memory(reader, index,
+                       index.raw_db(), index.mem_write_cf(), index.mem_read_cf());
     LOG_DEBUG("RegisterFile + MemoryModel ready");
 
     // ─── Run analysis options (batch mode) ─────────────────────────────────
@@ -1001,6 +1049,14 @@ int main(int argc, char** argv) {
             ms_cfg.snapshot_inst_ids = memory_snapshot_ids;
             ms_cfg.snapshot_size = memory_snapshot_size;
             pm.register_pass(std::make_unique<MemorySnapshotPass>(std::move(ms_cfg)));
+        }
+
+        // --memory-strings
+        if (opt_memory_strings) {
+            MemoryStringConfig mstr_cfg;
+            mstr_cfg.max_call_sites = memory_strings_max_sites;
+            mstr_cfg.scan_size = memory_strings_scan_size;
+            pm.register_pass(std::make_unique<MemoryStringPass>(std::move(mstr_cfg)));
         }
 
         // --dataflow-graph
@@ -1296,6 +1352,47 @@ int main(int argc, char** argv) {
             }
         }
 
+        // --memory-strings
+        if (opt_memory_strings) {
+            const auto& mstr_raw = pm.require("memory_strings");
+            if (!mstr_raw.ok()) {
+                fmt::print(stderr, "[memory-strings] Pass failed: {}\n", mstr_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& mstr_result = mstr_raw.get<MemoryStringResult>();
+                fmt::print(stderr, "[memory-strings] {} strings ({} unique content)\n",
+                           mstr_result.total(), mstr_result.unique_count());
+
+                json mstr_json;
+                json strings_arr = json::array();
+                for (const auto& s : mstr_result.strings) {
+                    json entry;
+                    entry["addr"] = fmt::format("0x{:X}", s.addr);
+                    entry["content"] = s.content;
+                    entry["length"] = s.content.size();
+                    entry["discovered_at"] = s.discovered_at;
+                    entry["call_site_inst_id"] = s.call_site_inst_id;
+                    entry["call_site_pc"] = fmt::format("0x{:X}", s.call_site_pc);
+                    entry["encoding"] = (s.encoding == MemoryString::ASCII ? "ascii" :
+                                         s.encoding == MemoryString::UTF8 ? "utf8" : "utf16le");
+                    entry["source"] = (s.source == MemoryString::RegPointer ? "reg_pointer" :
+                                       s.source == MemoryString::StackLocal ? "stack_local" :
+                                       s.source == MemoryString::DeepProbe ? "deep_probe" :
+                                       "page_scan");
+                    if (s.source_reg < 8) {
+                        entry["source_reg"] = fmt::format("x{}", s.source_reg);
+                    } else if (s.source_reg == 31) {
+                        entry["source_reg"] = "sp";
+                    }
+                    strings_arr.push_back(std::move(entry));
+                }
+                mstr_json["strings"] = std::move(strings_arr);
+                mstr_json["total"] = mstr_result.total();
+                mstr_json["unique_count"] = mstr_result.unique_count();
+                fmt::print("{}\n", mstr_json.dump(2));
+            }
+        }
+
         // --dataflow-graph
         if (opt_dataflow_graph) {
             const auto& dg_raw = pm.require("dataflow_graph");
@@ -1446,6 +1543,205 @@ int main(int argc, char** argv) {
             output["instruction_ids"] = std::move(ids_arr);
             if (inst_ids.size() >= search_pc_limit) {
                 output["limit_reached"] = true;
+            }
+            fmt::print("{}\n", output.dump(2));
+        }
+
+        // --dump-memaccess: dump memory reads/writes + register ASCII in inst_id range
+        //
+        // Scans trace INST and ANCHOR records in [start, start+count) and extracts:
+        // 1. Every memory access (read/write) with its data bytes
+        // 2. Every register value that decodes as ASCII (≥4 printable chars)
+        //
+        // Key design: register state is tracked CONTINUOUSLY from the beginning
+        // of the trace (not just within the range). ANCHOR records provide full
+        // GPR snapshots when returning from uninstrumented code (shared cache),
+        // and reg_diffs provide deltas. This captures ASCII fragments set by
+        // shared-cache code (e.g. ObjC method return values, JSON fragments in
+        // argument registers) even when the ANCHOR appears before the range.
+        if (opt_dump_memaccess) {
+            uint64_t ma_end = dump_ma_start + dump_ma_count;
+            json output;
+            output["start_inst"] = dump_ma_start;
+            output["end_inst"] = ma_end;
+
+            struct MemAccEntry {
+                uint64_t inst_id;
+                uint64_t addr;
+                uint16_t size;
+                uint8_t  type;
+                uint8_t  data[16];
+            };
+            std::vector<MemAccEntry> entries;
+
+            struct RegStrEntry {
+                uint64_t inst_id;
+                uint8_t  reg_index;
+                uint64_t value;
+                std::string str;
+            };
+            std::vector<RegStrEntry> reg_strings;
+
+            // Continuous register state tracker
+            constexpr uint32_t MAX_REGS = 34;
+            uint64_t tracked_regs[MAX_REGS] = {};
+            bool regs_valid = false;
+            uint64_t last_emitted_val[MAX_REGS] = {};
+            bool last_emitted_ok[MAX_REGS] = {};
+
+            auto try_decode_ascii = [](uint64_t value) -> std::optional<std::string> {
+                uint8_t bytes[8];
+                std::memcpy(bytes, &value, 8);
+                std::string str;
+                for (int b = 0; b < 8; b++) {
+                    if (bytes[b] >= 0x20 && bytes[b] <= 0x7e)
+                        str.push_back(static_cast<char>(bytes[b]));
+                    else if (bytes[b] == 0) break;
+                    else break;
+                }
+                if (str.size() < 4) return std::nullopt;
+                return str;
+            };
+
+            auto emit_if_ascii = [&](uint64_t inst, uint8_t idx, uint64_t val) {
+                if (idx >= 32) return;
+                if (last_emitted_ok[idx] && last_emitted_val[idx] == val) return;
+                auto s = try_decode_ascii(val);
+                if (s) {
+                    reg_strings.push_back({inst, idx, val, *s});
+                    last_emitted_val[idx] = val;
+                    last_emitted_ok[idx] = true;
+                }
+            };
+
+            uint64_t cur_inst = 0;
+            reader.advise_sequential();
+            for (auto it = reader.begin(); it != reader.end(); ++it) {
+                auto rec = *it;
+                if (rec.kind == RecordKind::Inst) {
+                    if (cur_inst >= ma_end) break;
+                    auto inst = rec.as_inst();
+
+                    // Apply reg_diffs to tracked state (always)
+                    for (uint8_t r = 0; r < inst.reg_diff_count; r++) {
+                        auto rd = inst.reg_diff(r);
+                        if (rd.index < MAX_REGS) tracked_regs[rd.index] = rd.value;
+                    }
+                    regs_valid = true;
+
+                    if (cur_inst >= dump_ma_start) {
+                        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                            auto ma = inst.mem_access(m);
+                            if (ma.flags & 0x4) continue;
+                            MemAccEntry e;
+                            e.inst_id = cur_inst;
+                            e.addr = ma.addr;
+                            e.size = ma.size;
+                            e.type = ma.type;
+                            uint16_t csz = std::min((uint16_t)16, ma.size);
+                            std::memcpy(e.data, &ma.value, std::min((uint16_t)8, csz));
+                            if (csz > 8) std::memcpy(e.data + 8, &ma.value_hi, csz - 8);
+                            entries.push_back(e);
+                        }
+                        if (regs_valid) {
+                            for (uint32_t g = 0; g < 32 && g < hdr.num_gpr; g++)
+                                emit_if_ascii(cur_inst, (uint8_t)g, tracked_regs[g]);
+                        }
+                    }
+                    cur_inst++;
+                } else if (rec.kind == RecordKind::Anchor) {
+                    auto anchor = rec.as_anchor(hdr.num_gpr);
+                    for (uint32_t g = 0; g < anchor.num_gpr && g < MAX_REGS; g++)
+                        tracked_regs[g] = anchor.gpr_values[g];
+                    regs_valid = true;
+                    if (cur_inst >= dump_ma_start && cur_inst < ma_end && regs_valid) {
+                        for (uint32_t g = 0; g < 32 && g < hdr.num_gpr; g++)
+                            emit_if_ascii(cur_inst, (uint8_t)g, tracked_regs[g]);
+                    }
+                }
+            }
+            reader.advise_random();
+
+            output["access_count"] = entries.size();
+
+            // Build memory snapshot from writes, overlay reads
+            std::map<uint64_t, uint8_t> mem_snap;
+            for (auto& e : entries) {
+                bool is_w = (e.type & 0x2), is_r = (e.type & 0x1);
+                if (!is_w && !is_r) continue;
+                for (uint16_t i = 0; i < e.size && i < 16; i++) {
+                    if (is_w) mem_snap[e.addr + i] = e.data[i];
+                    else if (is_r && mem_snap.find(e.addr + i) == mem_snap.end())
+                        mem_snap[e.addr + i] = e.data[i];
+                }
+            }
+
+            // Extract contiguous regions and decode strings
+            json regions_arr = json::array();
+            if (!mem_snap.empty()) {
+                auto it = mem_snap.begin();
+                while (it != mem_snap.end()) {
+                    uint64_t start = it->first;
+                    std::vector<uint8_t> data;
+                    data.push_back(it->second);
+                    ++it;
+                    while (it != mem_snap.end() && it->first == start + data.size()) {
+                        data.push_back(it->second);
+                        ++it;
+                    }
+                    if (data.size() < 4) continue;
+                    json r;
+                    r["addr"] = fmt::format("0x{:X}", start);
+                    r["size"] = data.size();
+                    std::string hex;
+                    for (uint8_t b : data) hex += fmt::format("{:02x}", b);
+                    r["hex"] = hex;
+                    std::string ascii;
+                    bool ok = true;
+                    int pc = 0;
+                    for (uint8_t b : data) {
+                        if (b >= 0x20 && b <= 0x7e) { ascii.push_back((char)b); pc++; }
+                        else if (b == 0) break;
+                        else { ok = false; break; }
+                    }
+                    if (ok && pc >= 4) r["string"] = ascii;
+                    regions_arr.push_back(std::move(r));
+                }
+            }
+
+            if (dump_ma_strings) {
+                json sa = json::array();
+                for (auto& r : regions_arr) if (r.contains("string")) sa.push_back(r);
+                json ra = json::array();
+                for (auto& rs : reg_strings) {
+                    ra.push_back({{"inst_id", rs.inst_id},
+                                  {"reg", fmt::format("x{}", rs.reg_index)},
+                                  {"value", fmt::format("0x{:x}", rs.value)},
+                                  {"string", rs.str}});
+                }
+                output["mem_strings"] = std::move(sa);
+                output["mem_string_count"] = output["mem_strings"].size();
+                output["reg_strings"] = std::move(ra);
+                output["reg_string_count"] = output["reg_strings"].size();
+            } else {
+                json aa = json::array();
+                for (auto& e : entries) {
+                    json a;
+                    a["inst_id"] = e.inst_id;
+                    a["addr"] = fmt::format("0x{:X}", e.addr);
+                    a["size"] = e.size;
+                    std::string ts;
+                    if (e.type & 0x1) ts += "R";
+                    if (e.type & 0x2) ts += "W";
+                    a["type"] = ts;
+                    std::string hex;
+                    for (uint16_t i = 0; i < e.size && i < 16; i++)
+                        hex += fmt::format("{:02x}", e.data[i]);
+                    a["hex"] = hex;
+                    aa.push_back(std::move(a));
+                }
+                output["accesses"] = std::move(aa);
+                output["regions"] = std::move(regions_arr);
             }
             fmt::print("{}\n", output.dump(2));
         }

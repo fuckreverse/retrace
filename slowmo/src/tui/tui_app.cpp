@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 
 namespace tenet {
@@ -472,35 +473,58 @@ bool TuiApp::handle_memory_panel_event(Event event) {
 
 Element TuiApp::render_status_bar() {
     std::string mode_str;
-    if (show_goto_dialog_) mode_str = " GOTO ";
-    else if (show_search_dialog_) mode_str = " SEARCH ";
-    else if (show_string_search_dialog_) mode_str = " STR-FILTER ";
-    else if (show_function_filter_dialog_) mode_str = " FUNC-FILTER ";
-    else if (callstack_panel_focused_) mode_str = " CALLSTACK ";
-    else if (memory_panel_focused_) mode_str = " MEMORY ";
-    else if (string_panel_focused_) mode_str = " STRINGS ";
-    else if (function_panel_focused_) mode_str = " FUNCTIONS ";
-    else if (hex_dump_focused_) mode_str = " HEX-DUMP ";
-    else if (search_active_) mode_str = fmt::format(" SEARCH [{}/{}] ", search_current_ + 1, search_results_.size());
-    else if (show_backward_taint_) {
+    Color mode_color = Color::Blue;
+
+    if (show_cmd_dialog_) {
+        mode_str = " CMD ";
+        mode_color = Color::RGB(200, 100, 0);  // orange for command mode
+    } else if (show_goto_dialog_) {
+        mode_str = " GOTO ";
+    } else if (show_search_dialog_) {
+        mode_str = " SEARCH ";
+    } else if (show_string_search_dialog_) {
+        mode_str = " STR-FILTER ";
+    } else if (show_function_filter_dialog_) {
+        mode_str = " FUNC-FILTER ";
+    } else if (bp_panel_focused_ && show_bp_panel_) {
+        mode_str = " BREAKPOINTS ";
+        mode_color = Color::Red;
+    } else if (callstack_panel_focused_) {
+        mode_str = " CALLSTACK ";
+    } else if (memory_panel_focused_) {
+        mode_str = " MEMORY ";
+    } else if (string_panel_focused_) {
+        mode_str = " STRINGS ";
+    } else if (function_panel_focused_) {
+        mode_str = " FUNCTIONS ";
+    } else if (hex_dump_focused_) {
+        mode_str = " HEX-DUMP ";
+    } else if (search_active_) {
+        mode_str = fmt::format(" SEARCH [{}/{}] ", search_current_ + 1, search_results_.size());
+    } else if (show_backward_taint_) {
         if (!taint_jump_list_.empty())
             mode_str = fmt::format(" BACK-TAINT [{}/{}] ", taint_jump_cursor_ + 1, taint_jump_list_.size());
         else
             mode_str = " BACK-TAINT ";
-    }
-    else if (show_taint_) {
+    } else if (show_taint_) {
         if (!taint_jump_list_.empty())
             mode_str = fmt::format(" TAINT [{}/{}] ", taint_jump_cursor_ + 1, taint_jump_list_.size());
         else
             mode_str = " TAINT ";
-    }
-    else if (show_slice_) {
+    } else if (show_slice_) {
         if (!taint_jump_list_.empty())
             mode_str = fmt::format(" SLICE [{}/{}] ", taint_jump_cursor_ + 1, taint_jump_list_.size());
         else
             mode_str = " SLICE ";
+    } else {
+        // Show breakpoint count if any are set
+        if (bp_engine_ && bp_engine_->has_breakpoints()) {
+            mode_str = fmt::format(" NORMAL [{}bp] ", bp_engine_->entries().size());
+            mode_color = Color::RGB(180, 50, 50);
+        } else {
+            mode_str = " NORMAL ";
+        }
     }
-    else mode_str = " NORMAL ";
 
     // Navigation history indicator: [pos/total]
     std::string nav_str;
@@ -509,7 +533,7 @@ Element TuiApp::render_status_bar() {
     }
 
     auto left = hbox({
-        text(mode_str) | bgcolor(Color::Blue) | color(Color::White),
+        text(mode_str) | bgcolor(mode_color) | color(Color::White),
         text(fmt::format("  inst {:>8} / {:<8}  pc={:016x}{}",
                          current_inst_, total_inst_,
                          fetch_row(current_inst_).static_pc,
@@ -518,9 +542,32 @@ Element TuiApp::render_status_bar() {
     });
 
     // Compact help line — shows the most important new bindings
-    auto right = text("j/k:nav g:goto /:srch b:bkm t/S/B/C:analysis  "
-                      "[/]:taint {/}:hist p:mem P:stk  f/F/e/x L I O V H q")
+    auto right = text("j/k:nav g:goto /:srch b:bkm  \":\"cmd(:b/:w/:rc/:rb)  "
+                      "t/S/B/C:analysis [/]:taint {/}:hist p:mem P:stk f/F L I O V H q")
         | color(Color::GrayLight);
+
+    // If there is a bp_status_msg_, show it as a second info line
+    if (!bp_status_msg_.empty()) {
+        auto msg_line = hbox({
+            text(" ► ") | color(Color::Red) | bold,
+            text(bp_status_msg_) | color(Color::Yellow),
+        }) | bgcolor(Color::RGB(30, 10, 10)) | size(HEIGHT, EQUAL, 1);
+        return vbox({
+            hbox({left | flex, right}) | bgcolor(Color::Black) | size(HEIGHT, EQUAL, 1),
+            msg_line,
+        });
+    }
+
+    if (!cmd_error_.empty()) {
+        auto err_line = hbox({
+            text(" ! ") | color(Color::White) | bold | bgcolor(Color::Red),
+            text(" " + cmd_error_) | color(Color::Red),
+        }) | bgcolor(Color::RGB(30, 0, 0)) | size(HEIGHT, EQUAL, 1);
+        return vbox({
+            hbox({left | flex, right}) | bgcolor(Color::Black) | size(HEIGHT, EQUAL, 1),
+            err_line,
+        });
+    }
 
     return hbox({left | flex, right}) | bgcolor(Color::Black) | size(HEIGHT, EQUAL, 1);
 }
@@ -565,6 +612,9 @@ Element TuiApp::render_main_layout() {
     }
     if (show_threads_) {
         right_panels.push_back(render_thread_panel());
+    }
+    if (show_bp_panel_) {
+        right_panels.push_back(render_bp_panel());
     }
 
     // Build center content: instruction list with optional minimap on the left
@@ -714,6 +764,291 @@ void TuiApp::toggle_bookmark() {
     }
     // Invalidate cache for this row
     row_cache_.put(current_inst_, fetch_row(current_inst_));
+}
+
+// ─── Breakpoint Engine ──────────────────────────────────────────────────────
+
+void TuiApp::ensure_bp_engine() {
+    if (!bp_engine_) {
+        bp_engine_ = std::make_unique<BreakpointEngine>(reader_, index_, regfile_, memory_);
+    }
+}
+
+// ─── Command-mode dialog (':', like vim ex-commands) ─────────────────────────
+// Supported commands:
+//   b <addr>          — set PC breakpoint at <addr>
+//   w <addr> [size]   — set write watchpoint at <addr> (size 1-64, 0=whole page)
+//   d <id>            — delete breakpoint by id
+//   bl                — list all active breakpoints
+//   rc                — run (continue) forward to next breakpoint
+//   rb                — run backward to previous breakpoint
+//   bc                — clear all breakpoints
+
+void TuiApp::open_cmd_dialog() {
+    show_cmd_dialog_ = true;
+    cmd_input_.clear();
+    cmd_error_.clear();
+}
+
+void TuiApp::close_cmd_dialog() {
+    show_cmd_dialog_ = false;
+    cmd_input_.clear();
+}
+
+void TuiApp::execute_cmd() {
+    cmd_error_.clear();
+
+    // Trim leading whitespace
+    size_t start = cmd_input_.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        close_cmd_dialog();
+        return;
+    }
+    std::string trimmed = cmd_input_.substr(start);
+
+    // Multi-letter commands (must check before single-letter)
+    if (trimmed == "rc") {
+        close_cmd_dialog();
+        cmd_run_forward();
+        return;
+    }
+    if (trimmed == "rb") {
+        close_cmd_dialog();
+        cmd_run_backward();
+        return;
+    }
+    if (trimmed == "bl") {
+        cmd_list_breakpoints();
+        close_cmd_dialog();
+        return;
+    }
+    if (trimmed == "bc") {
+        ensure_bp_engine();
+        bp_engine_->clear_breakpoints();
+        bp_status_msg_ = "All breakpoints cleared.";
+        close_cmd_dialog();
+        return;
+    }
+
+    // Single-letter commands with argument
+    char cmd_char = trimmed[0];
+
+    if (cmd_char == 'd' || cmd_char == 'D') {
+        // Delete breakpoint: "d <id>"
+        std::string_view sv(trimmed.c_str() + 1);
+        while (!sv.empty() && (sv[0] == ' ' || sv[0] == '\t')) sv.remove_prefix(1);
+        uint64_t id = 0;
+        auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), id);
+        if (ec != std::errc{}) {
+            cmd_error_ = fmt::format("invalid breakpoint id '{}'", std::string(sv));
+            return;
+        }
+        cmd_delete_breakpoint(static_cast<uint32_t>(id));
+        close_cmd_dialog();
+        return;
+    }
+
+    // Delegate to parse_breakpoint_cmd for 'b' and 'w'
+    std::string parse_err;
+    auto spec = parse_breakpoint_cmd(trimmed, &parse_err);
+    if (!spec) {
+        cmd_error_ = parse_err.empty() ? "unknown command" : parse_err;
+        return;
+    }
+    ensure_bp_engine();
+    BreakpointId id = bp_engine_->add_breakpoint(std::move(*spec));
+
+    // Build confirmation message
+    std::visit([&](const auto& s) {
+        using T = std::decay_t<decltype(s)>;
+        if constexpr (std::is_same_v<T, PcBreakpoint>) {
+            bp_status_msg_ = fmt::format("BP#{} set: PC=0x{:x}", id, s.address);
+        } else if constexpr (std::is_same_v<T, WatchBreakpoint>) {
+            if (s.size == 0)
+                bp_status_msg_ = fmt::format("BP#{} set: watch 0x{:x} (whole page)", id, s.address);
+            else
+                bp_status_msg_ = fmt::format("BP#{} set: watch 0x{:x}+{}", id, s.address, s.size);
+        } else {
+            bp_status_msg_ = fmt::format("BP#{} set", id);
+        }
+    }, *spec);
+
+    close_cmd_dialog();
+}
+
+void TuiApp::cmd_run_forward() {
+    ensure_bp_engine();
+    if (!bp_engine_->has_breakpoints()) {
+        bp_status_msg_ = "No breakpoints set. Use ':b <addr>' or ':w <addr> [size]'.";
+        return;
+    }
+    auto hit = bp_engine_->run_forward(current_inst_);
+    if (hit) {
+        bp_status_msg_ = hit->description;
+        navigate_to(hit->inst_id);
+    } else {
+        bp_status_msg_ = "No breakpoint hit forward from inst #" + std::to_string(current_inst_);
+    }
+}
+
+void TuiApp::cmd_run_backward() {
+    ensure_bp_engine();
+    if (!bp_engine_->has_breakpoints()) {
+        bp_status_msg_ = "No breakpoints set. Use ':b <addr>' or ':w <addr> [size]'.";
+        return;
+    }
+    auto hit = bp_engine_->run_backward(current_inst_);
+    if (hit) {
+        bp_status_msg_ = hit->description;
+        navigate_to(hit->inst_id);
+    } else {
+        bp_status_msg_ = "No breakpoint hit backward from inst #" + std::to_string(current_inst_);
+    }
+}
+
+void TuiApp::cmd_list_breakpoints() {
+    ensure_bp_engine();
+    const auto& entries = bp_engine_->entries();
+    if (entries.empty()) {
+        bp_status_msg_ = "No active breakpoints.";
+        return;
+    }
+    std::string msg;
+    for (const auto& e : entries) {
+        std::visit([&](const auto& s) {
+            using T = std::decay_t<decltype(s)>;
+            if constexpr (std::is_same_v<T, PcBreakpoint>) {
+                msg += fmt::format("  BP#{} PC=0x{:x}\n", e.id, s.address);
+            } else if constexpr (std::is_same_v<T, WatchBreakpoint>) {
+                if (s.size == 0)
+                    msg += fmt::format("  BP#{} watch 0x{:x} (page)\n", e.id, s.address);
+                else
+                    msg += fmt::format("  BP#{} watch 0x{:x}+{}\n", e.id, s.address, s.size);
+            } else if constexpr (std::is_same_v<T, ConditionalBreakpoint>) {
+                msg += fmt::format("  BP#{} cond '{}'\n", e.id, s.description);
+            }
+        }, e.spec);
+    }
+    bp_status_msg_ = msg.empty() ? "No active breakpoints." : msg;
+    show_bp_panel_ = true;
+}
+
+void TuiApp::cmd_delete_breakpoint(uint32_t id) {
+    ensure_bp_engine();
+    if (bp_engine_->remove_breakpoint(id)) {
+        bp_status_msg_ = fmt::format("BP#{} removed.", id);
+        // Adjust panel cursor
+        if (bp_panel_cursor_ > 0) bp_panel_cursor_--;
+    } else {
+        bp_status_msg_ = fmt::format("No breakpoint with id {}.", id);
+    }
+}
+
+// ─── Breakpoint list panel ─────────────────────────────────────────────────
+
+ftxui::Element TuiApp::render_bp_panel() {
+    using namespace ftxui;
+    Elements lines;
+    lines.push_back(text(" Breakpoints ") | bold | color(Color::Yellow) | center);
+    lines.push_back(separator());
+
+    ensure_bp_engine();
+    const auto& entries = bp_engine_->entries();
+    if (entries.empty()) {
+        lines.push_back(text(" (none) ") | color(Color::GrayDark) | center);
+    } else {
+        for (size_t i = 0; i < entries.size(); i++) {
+            const auto& e = entries[i];
+            bool is_cursor = (i == bp_panel_cursor_);
+            std::string label;
+            std::visit([&](const auto& s) {
+                using T = std::decay_t<decltype(s)>;
+                if constexpr (std::is_same_v<T, PcBreakpoint>) {
+                    label = fmt::format("#{} PC=0x{:x}", e.id, s.address);
+                } else if constexpr (std::is_same_v<T, WatchBreakpoint>) {
+                    if (s.size == 0)
+                        label = fmt::format("#{} W 0x{:x} (pg)", e.id, s.address);
+                    else
+                        label = fmt::format("#{} W 0x{:x}+{}", e.id, s.address, s.size);
+                } else if constexpr (std::is_same_v<T, ConditionalBreakpoint>) {
+                    label = fmt::format("#{} cond:{}", e.id, s.description.substr(0, 12));
+                }
+            }, e.spec);
+            auto row = hbox({
+                text(is_cursor ? ">" : " ") | color(Color::Yellow),
+                text(e.enabled ? " ● " : " ○ ") | color(e.enabled ? Color::Red : Color::GrayDark),
+                text(label) | color(is_cursor ? Color::White : Color::GrayLight),
+            });
+            if (is_cursor && bp_panel_focused_) {
+                row = row | bgcolor(Color::GrayDark);
+            }
+            lines.push_back(row);
+        }
+    }
+
+    lines.push_back(separator());
+    if (bp_panel_focused_) {
+        lines.push_back(text("j/k:nav d:delete c:clear Esc:unfocus") | color(Color::GrayDark));
+    } else {
+        lines.push_back(text("W:toggle-panel  :rc/:rb continue") | color(Color::GrayDark));
+    }
+
+    return vbox(lines) | size(WIDTH, GREATER_THAN, 28) | border;
+}
+
+bool TuiApp::handle_bp_panel_event(ftxui::Event event) {
+    ensure_bp_engine();
+    const auto& entries = bp_engine_->entries();
+
+    if (event == Event::Escape) {
+        bp_panel_focused_ = false;
+        return true;
+    }
+    if (event == Event::Character('j') || event == Event::ArrowDown) {
+        if (!entries.empty()) {
+            bp_panel_cursor_ = (bp_panel_cursor_ + 1) % entries.size();
+        }
+        return true;
+    }
+    if (event == Event::Character('k') || event == Event::ArrowUp) {
+        if (!entries.empty()) {
+            bp_panel_cursor_ = (bp_panel_cursor_ + entries.size() - 1) % entries.size();
+        }
+        return true;
+    }
+    if (event == Event::Character('d') || event == Event::Character('x')) {
+        if (!entries.empty() && bp_panel_cursor_ < entries.size()) {
+            uint32_t id = entries[bp_panel_cursor_].id;
+            cmd_delete_breakpoint(id);
+        }
+        return true;
+    }
+    if (event == Event::Character('c')) {
+        bp_engine_->clear_breakpoints();
+        bp_panel_cursor_ = 0;
+        bp_status_msg_ = "All breakpoints cleared.";
+        return true;
+    }
+     // Enter: run forward (or backward if nothing forward) to the selected breakpoint
+    if (event == Event::Return) {
+        if (!entries.empty() && bp_panel_cursor_ < entries.size()) {
+            BreakpointId target_id = entries[bp_panel_cursor_].id;
+            // Create a temporary single-BP engine to find the nearest occurrence
+            BreakpointEngine temp(reader_, index_, regfile_, memory_);
+            temp.add_breakpoint(entries[bp_panel_cursor_].spec);
+            auto hit = temp.run_forward(current_inst_);
+            if (!hit) hit = temp.run_backward(current_inst_);
+            if (hit) {
+                bp_status_msg_ = fmt::format("Jumped to BP#{} @ inst #{}", target_id, hit->inst_id);
+                navigate_to(hit->inst_id);
+                bp_panel_focused_ = false;
+            } else {
+                bp_status_msg_ = fmt::format("BP#{} has no occurrences in trace.", target_id);
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 // ─── Dialogs ────────────────────────────────────────────────────────────────
@@ -911,6 +1246,11 @@ bool TuiApp::handle_event(Event event) {
         return handle_hex_dump_event(event);
     }
 
+    // Breakpoint panel focused mode — intercept first
+    if (bp_panel_focused_ && show_bp_panel_) {
+        return handle_bp_panel_event(event);
+    }
+
     // Normal mode keybindings
     if (event == Event::Character('q') || event == Event::Character('Q')) {
         screen_.ExitLoopClosure()();
@@ -922,6 +1262,14 @@ bool TuiApp::handle_event(Event event) {
     }
     if (event == Event::Character('k') || event == Event::ArrowUp) {
         navigate_relative(-1);
+        return true;
+    }
+    // Reverse single-step: K (Shift+k)
+    if (event == Event::Character('K')) {
+        // Step backward by 1 instruction (no-op at position 0)
+        if (current_inst_ > 0) {
+            navigate_to(current_inst_ - 1);
+        }
         return true;
     }
     if (event == Event::Character('g')) {
@@ -1157,6 +1505,35 @@ bool TuiApp::handle_event(Event event) {
     if (event == Event::Character('V')) {
         show_minimap_ = !show_minimap_;
         return true;
+    }
+
+    // ─── Breakpoint panel toggle (W) ─────────────────────────────────────────
+    if (event == Event::Character('W')) {
+        if (show_bp_panel_) {
+            bp_panel_focused_ = !bp_panel_focused_;
+        } else {
+            show_bp_panel_ = true;
+            bp_panel_focused_ = true;
+        }
+        return true;
+    }
+
+    // ─── Command mode (':' key, vim-style) ───────────────────────────────────
+    // ':' opens the command dialog for breakpoint commands.
+    // Clear bp_status_msg_ / cmd_error_ on next navigation (any movement key
+    // already consumed above will return before reaching here).
+    if (event == Event::Character(':')) {
+        open_cmd_dialog();
+        return true;
+    }
+
+    // Dismiss status messages on Escape in normal mode
+    if (event == Event::Escape) {
+        if (!bp_status_msg_.empty() || !cmd_error_.empty()) {
+            bp_status_msg_.clear();
+            cmd_error_.clear();
+            return true;
+        }
     }
 
     return false;
@@ -2242,11 +2619,15 @@ int TuiApp::run() {
     // Use a vertical container so we always have a focusable component
     auto function_filter_input = Input(&function_filter_input_, "filter");
 
+    // Command-mode input (': b 0x1234', etc.)
+    auto cmd_input = Input(&cmd_input_, "b 0xaddr / w 0xaddr [size] / rc / rb / bl / bc");
+
     auto input_container = Container::Stacked({
         goto_input,
         search_input,
         string_search_input,
         function_filter_input,
+        cmd_input,
     });
 
     auto app = Renderer(input_container, [&] {
@@ -2262,6 +2643,20 @@ int TuiApp::run() {
             document = dbox({document, dialog});
         } else if (show_function_filter_dialog_) {
             auto dialog = window(text(" Filter Functions "), function_filter_input->Render()) | center;
+            document = dbox({document, dialog});
+        } else if (show_cmd_dialog_) {
+            // Command mode dialog: show command prompt with optional error hint
+            Element input_elem = cmd_input->Render();
+            if (!cmd_error_.empty()) {
+                input_elem = vbox({
+                    input_elem,
+                    text(" Error: " + cmd_error_) | color(Color::Red) | bold,
+                });
+            }
+            auto dialog = window(
+                hbox({text(" : ") | bold | color(Color::Yellow), text("Command ")}),
+                input_elem
+            ) | size(WIDTH, GREATER_THAN, 55) | center;
             document = dbox({document, dialog});
         }
         return document;
@@ -2309,6 +2704,19 @@ int TuiApp::run() {
             }
             if (event == Event::Escape) {
                 close_function_filter_dialog();
+                return true;
+            }
+            return false;  // Let input component handle typing
+        }
+        if (show_cmd_dialog_) {
+            if (event == Event::Return) {
+                execute_cmd();
+                // If there's an error, keep the dialog open (don't close)
+                // execute_cmd() calls close_cmd_dialog() internally on success
+                return true;
+            }
+            if (event == Event::Escape) {
+                close_cmd_dialog();
                 return true;
             }
             return false;  // Let input component handle typing

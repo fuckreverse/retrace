@@ -1,6 +1,7 @@
 #include "analysis/passes/objc_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
 
@@ -89,6 +90,29 @@ static std::optional<std::string> try_deref_string(
     // Require at least 2 chars to consider it a meaningful string
     if (result.size() < 2) return std::nullopt;
     return result;
+}
+
+/// Try to decode a 64-bit register value as a little-endian ASCII string.
+/// On ARM64, ObjC methods in the shared cache often leave string fragments
+/// in argument registers (x0-x7) when they return. For example, a JSON
+/// serialization method may leave the last 8 bytes of the JSON string in x6.
+/// This function extracts such fragments without any memory access.
+/// Returns nullopt if fewer than 4 bytes are printable.
+static std::optional<std::string> try_decode_reg_ascii(uint64_t value) {
+    uint8_t bytes[8];
+    std::memcpy(bytes, &value, 8);
+    std::string str;
+    for (int b = 0; b < 8; b++) {
+        if (bytes[b] >= 0x20 && bytes[b] <= 0x7e) {
+            str.push_back(static_cast<char>(bytes[b]));
+        } else if (bytes[b] == 0) {
+            break;  // NUL terminator
+        } else {
+            break;  // Non-printable
+        }
+    }
+    if (str.size() < 4) return std::nullopt;
+    return str;
 }
 
 // ─── ObjcResult::to_json ─────────────────────────────────────────────────
@@ -227,11 +251,39 @@ PassResult ObjcPass::run(PassContext& ctx) {
             msg.class_name = std::move(cls_name);
 
             // Attempt to read selector name from memory
-            msg.selector_name = read_cstring_from_memory(memory, objc.sel, inst_id);
+            // Use inst_id-1 (pre-call state) for memory reads too: the method
+            // may have clobbered memory by the time we reach inst_id (return).
+            uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
+            msg.selector_name = read_cstring_from_memory(memory, objc.sel, pre_inst_id);
+
+            // If the memory model couldn't resolve the selector (returns hex
+            // fallback), try reading it from the binary image. Selector strings
+            // live in the binary's __TEXT,__objc_methname section but are
+            // typically read by objc_msgSend in the shared cache
+            // (uninstrumented), so the memory model has no record of them.
+            // The --image fallback loads the binary and can read the string
+            // directly from the on-disk bytes.
+            if (msg.selector_name.find("0x") == 0) {
+                auto img_str = ctx.code_table().image_read_cstring(objc.sel);
+                if (img_str.has_value()) {
+                    msg.selector_name = *img_str;
+                }
+            }
 
             // ─── Extract method arguments (x2-x7) ────────────────────────
-            // The OBJC record is emitted right before the objc_msgSend call.
-            // At this inst_id, x0=receiver, x1=SEL, x2-x7=first 6 args.
+            // The OBJC record is emitted at the objc_msgSend dispatch point
+            // (the `br x16` in the stub). The inst_id counter at that moment
+            // equals the RETURN point (the instruction after the method finishes
+            // executing in uninstrumented code — typically the shared cache).
+            //
+            //   state_before(inst_id)   = POST-call state (x0=return value,
+            //                             x2-x7 clobbered by the method)
+            //   state_before(inst_id-1) = PRE-call state (x0=receiver, x1=SEL,
+            //                             x2-x7=actual method arguments)
+            //
+            // The stub (adrp/ldr x1; adrp/ldr x16; br x16) only modifies x1
+            // (selector) and x16 (target), so x0 and x2-x7 are intact at
+            // inst_id-1. We use the pre-call state for argument extraction.
             //
             // Determine arg count from selector colons. If selector couldn't
             // be resolved (memory model has no record of it), we still extract
@@ -244,16 +296,40 @@ PassResult ObjcPass::run(PassContext& ctx) {
             msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
 
             if (msg.arg_count > 0) {
-                // Use RegisterFile to reconstruct register state at this point
-                const auto& regs = regfile.state_before(inst_id);
+                // Use PRE-call register state (before the dispatch instruction)
+                const auto& regs = regfile.state_before(pre_inst_id);
 
                 for (uint8_t k = 0; k < msg.arg_count; ++k) {
                     uint64_t val = regs.gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
                     msg.args[k].value = val;
 
-                    // Attempt to dereference as C string
-                    msg.args[k].deref_str = try_deref_string(memory, val, inst_id);
+                    // Attempt to dereference as C string (pre-call memory state)
+                    msg.args[k].deref_str = try_deref_string(memory, val, pre_inst_id);
+
+                    // If dereference failed, try to decode the register value
+                    // itself as a little-endian ASCII string fragment. ObjC
+                    // methods in the shared cache may leave string data in
+                    // registers (e.g. JSON fragments in x6 after stringWithFormat:).
+                    if (!msg.args[k].deref_str.has_value()) {
+                        msg.args[k].deref_str = try_decode_reg_ascii(val);
+                    }
                 }
+            }
+
+            // ─── Extract return value (x0 after the method returns) ──────
+            // state_before(inst_id) is the POST-call state: x0 holds the
+            // method's return value. (The return-point instruction, typically
+            // `mov x29, x29`, does not modify x0.)
+            {
+                const auto& ret_regs = regfile.state_before(inst_id);
+                msg.return_value = ret_regs.gpr[0];
+                msg.return_deref_str = try_deref_string(memory, ret_regs.gpr[0], inst_id);
+                // Also try register-value ASCII decode for return value
+                auto reg_str = try_decode_reg_ascii(ret_regs.gpr[0]);
+                if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
+                    msg.return_deref_str = std::move(reg_str);
+                }
+                msg.has_return = true;
             }
 
             // Record message index
@@ -282,33 +358,11 @@ PassResult ObjcPass::run(PassContext& ctx) {
         }
     }
 
-    // ─── Second pass: fill in return values ─────────────────────────────
-    // For each message at inst_id N, the return value is x0 at the time the
-    // next message fires (inst_id M). At that point the previous call has
-    // already returned and x0 holds the return value (unless it was clobbered
-    // by intermediate code — but typically the caller uses it immediately).
-    //
-    // For the last message, we read x0 a fixed offset after the call.
-    if (!result.messages.empty()) {
-        for (size_t i = 0; i + 1 < result.messages.size(); ++i) {
-            uint64_t next_id = result.messages[i + 1].inst_id;
-            // Read x0 just before the next objc_msgSend fires
-            const auto& regs = regfile.state_before(next_id);
-            result.messages[i].return_value = regs.gpr[0];
-            result.messages[i].return_deref_str = try_deref_string(memory, regs.gpr[0], next_id);
-            result.messages[i].has_return = true;
-        }
-
-        // Last message: try reading x0 a short distance after
-        auto& last_msg = result.messages.back();
-        uint64_t probe_id = last_msg.inst_id + 5000;
-        if (probe_id < end) {
-            const auto& regs = regfile.state_before(probe_id);
-            last_msg.return_value = regs.gpr[0];
-            last_msg.return_deref_str = try_deref_string(memory, regs.gpr[0], probe_id);
-            last_msg.has_return = true;
-        }
-    }
+    // ─── Return values are already populated in the first pass ─────────
+    // (state_before(inst_id) gives the POST-call x0 = return value).
+    // The old second-pass approach read x0 at the NEXT message's inst_id,
+    // which actually gave the NEXT method's return value — a bug.
+    // Nothing to do here anymore.
 
     ctx.progress(1.0f, fmt::format("ObjC: {} messages, {} unique classes",
                                     result.total_messages(),
