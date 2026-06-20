@@ -14,7 +14,7 @@ namespace tenet {
 // Bump this whenever TraceFormat struct sizes change, column families are
 // added/removed, or the encoding of keys/values in the DB changes.
 // This ensures stale caches from older builds are invalidated automatically.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 2;
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 4;  // v4: mem CF prefix extractor 10→8, dedicated block cache
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -95,13 +95,14 @@ TraceIndex& TraceIndex::operator=(TraceIndex&& other) noexcept {
 }
 
 rocksdb::ColumnFamilyHandle* TraceIndex::get_cf(const char* name) const {
-    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), reg_writes(5)
+    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), mem_read(5), reg_writes(6)
     if (std::strcmp(name, "default") == 0)     return cf_handles_[0];
     if (std::strcmp(name, cf::META) == 0)      return cf_handles_[1];
     if (std::strcmp(name, cf::OFFSET) == 0)    return cf_handles_[2];
     if (std::strcmp(name, cf::ANCHOR) == 0)    return cf_handles_[3];
     if (std::strcmp(name, cf::MEM_WRITE) == 0  && cf_handles_.size() > 4) return cf_handles_[4];
-    if (std::strcmp(name, cf::REG_WRITES) == 0 && cf_handles_.size() > 5) return cf_handles_[5];
+    if (std::strcmp(name, cf::MEM_READ) == 0   && cf_handles_.size() > 5) return cf_handles_[5];
+    if (std::strcmp(name, cf::REG_WRITES) == 0 && cf_handles_.size() > 6) return cf_handles_[6];
     return nullptr;
 }
 
@@ -141,12 +142,29 @@ Result<TraceIndex> TraceIndex::open_or_build(
         rocksdb::Options opts;
         opts.create_if_missing = false;
 
+        // MEM_WRITE/MEM_READ CF options must match build-time settings
+        // (prefix extractor, block cache, bloom filter) for correct operation.
+        auto make_mem_cf_opts = []() {
+            rocksdb::ColumnFamilyOptions o;
+            o.compression = rocksdb::kLZ4Compression;
+            o.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
+                rocksdb::NewFixedPrefixTransform(8));  // page(8) only
+            rocksdb::BlockBasedTableOptions tbl;
+            tbl.block_size = 4 * 1024;
+            tbl.block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
+            tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+            tbl.whole_key_filtering = false;
+            o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
+            return o;
+        };
+
         std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
             {"default", rocksdb::ColumnFamilyOptions()},
             {cf::META, rocksdb::ColumnFamilyOptions()},
             {cf::OFFSET, rocksdb::ColumnFamilyOptions()},
             {cf::ANCHOR, rocksdb::ColumnFamilyOptions()},
-            {cf::MEM_WRITE, [](){ rocksdb::ColumnFamilyOptions o; o.compression = rocksdb::kLZ4Compression; return o; }()},
+            {cf::MEM_WRITE, make_mem_cf_opts()},
+            {cf::MEM_READ,  make_mem_cf_opts()},
             {cf::REG_WRITES, rocksdb::ColumnFamilyOptions()},
         };
 
@@ -234,13 +252,19 @@ Result<TraceIndex> TraceIndex::build(
     rocksdb::ColumnFamilyOptions mem_write_cf_opts;
     mem_write_cf_opts.compression = rocksdb::kLZ4Compression;
     // mem_write CF uses SeekForPrev on [page(8B)|offset(2B)|inst_id(8B)] keys.
-    // Prefix bloom on the first 10 bytes (page+offset) dramatically speeds up
-    // seeks for cold pages by skipping SST files entirely.
+    // Prefix bloom on the first 8 bytes (page only) is better suited to the
+    // SeekForPrev access pattern: queries scan backwards across multiple offsets
+    // within a page, so page-level bloom lets RocksDB skip entire SST files for
+    // pages that don't exist, while offset-level bloom would miss adjacent offsets.
     mem_write_cf_opts.prefix_extractor =
         std::shared_ptr<const rocksdb::SliceTransform>(
-            rocksdb::NewFixedPrefixTransform(10));  // page(8) + offset(2)
+            rocksdb::NewFixedPrefixTransform(8));  // page(8) only — optimal for SeekForPrev
     rocksdb::BlockBasedTableOptions mem_table_opts;
     mem_table_opts.block_size = 4 * 1024;
+    // Dedicated 512MB block cache for mem_write/mem_read CFs.
+    // These CFs are the hottest during analysis passes (string scan, taint, etc.)
+    // and benefit from not sharing cache space with offset/anchor CFs.
+    mem_table_opts.block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
     mem_table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
     mem_table_opts.whole_key_filtering = false;  // use prefix bloom only
     mem_write_cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(mem_table_opts));
@@ -259,6 +283,7 @@ Result<TraceIndex> TraceIndex::build(
         {cf::OFFSET, rocksdb::ColumnFamilyOptions()},
         {cf::ANCHOR, rocksdb::ColumnFamilyOptions()},
         {cf::MEM_WRITE, mem_write_cf_opts},
+        {cf::MEM_READ,  mem_write_cf_opts},  // same prefix-extractor/table config as mem_write
         {cf::REG_WRITES, reg_writes_cf_opts},
     };
 
@@ -495,17 +520,17 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
             }
             if (current_id == inst_id) {
                 // seed_pc is only meaningful for v5 traces:
-                // - v5: return running_pc so callers can pass it to record_at(offset, seed_pc)
-                //   to enable as_inst() to reconstruct the absolute PC via resolved_pc != 0.
-                // - v4: return 0 so as_inst() stays in the v4 code path (resolved_pc == 0
-                //   means "v4 layout; read pc directly from the record header").
+                // - v5: return running_pc so callers can pass it to record_at(offset, seed_pc),
+                //   which sets RecordView::is_v5 = true so as_inst() uses the 6-byte v5 layout.
+                // - v4: return 0; record_at(offset, 0) is the 1-arg overload leaving is_v5=false,
+                //   so as_inst() uses the 16-byte v4 layout and reads pc from the raw struct.
                 uint64_t seed = is_v5 ? running_pc : 0;
                 return {current_offset, seed};
             }
             current_id++;
             // Compute record size directly from raw bytes, respecting v4/v5 layout.
-            // Note: rec.byte_size() uses resolved_pc==0 to detect v5, which is wrong
-            // here because record_at() never sets resolved_pc.
+            // (RecordView::byte_size() now uses the is_v5 flag; however this hot path
+            //  avoids constructing a RecordView at all for speed.)
             size_t hdr_size = is_v5
                 ? sizeof(qbditrace::qbditrace_inst_head_v5_t)   // 6 bytes
                 : sizeof(qbditrace::qbditrace_inst_head_t);     // 16 bytes (with padding)

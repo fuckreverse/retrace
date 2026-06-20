@@ -20,8 +20,11 @@ struct MemAccessView {
     uint8_t flags;
     uint16_t size;
     uint64_t addr;
-    uint64_t value;
-    uint64_t value_hi;
+    uint64_t value;        // new value (post-write)
+    uint64_t value_hi;     // new value high bytes (9-16 byte stores)
+    uint64_t old_value;    // v6: pre-write value (0 if v4/v5 or read access)
+    uint64_t old_value_hi; // v6: pre-write high bytes
+    bool has_old_value;    // true if this record carries valid old_value data
 };
 
 struct InstView {
@@ -31,7 +34,8 @@ struct InstView {
     uint8_t mem_access_count;
     const uint8_t* raw_diffs;   // points into mmap region
     const uint8_t* raw_mems;    // points into mmap region
-    bool is_v5 = false;         // true when record uses v5 (pc_delta) layout
+    bool is_v5 = false;  // true when record uses v5 (pc_delta) layout
+    bool is_v6 = false;  // true when record uses v6 (old_value) layout
 
     RegDiffView reg_diff(uint8_t i) const {
         // qbditrace_regdiff_t: u8 reg_index @0, pad[7], u64 value @8
@@ -45,17 +49,39 @@ struct InstView {
     }
 
     MemAccessView mem_access(uint8_t i) const {
-        // qbditrace_memacc_t: u8+u8+u16 @0-3, pad[4], u64 addr @8, u64 value @16, u64 value_hi @24
-        // stride = sizeof(qbditrace_memacc_t) (includes padding)
-        const uint8_t* p = raw_mems + i * sizeof(qbditrace::qbditrace_memacc_t);
-        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_memacc_t*>(p);
         MemAccessView m;
-        m.type = hdr->mem_type;
-        m.flags = hdr->mem_flags;
-        m.size = hdr->size;
-        m.addr = hdr->addr;
-        m.value = hdr->value;
-        m.value_hi = hdr->value_hi;
+        m.old_value     = 0;
+        m.old_value_hi  = 0;
+        m.has_old_value = false;
+        if (is_v6) {
+            // v6: qbditrace_memacc_v6_t (48 bytes)
+            const uint8_t* p = raw_mems + i * sizeof(qbditrace::qbditrace_memacc_v6_t);
+            const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_memacc_v6_t*>(p);
+            m.type      = hdr->mem_type;
+            m.flags     = hdr->mem_flags;
+            m.size      = hdr->size;
+            m.addr      = hdr->addr;
+            m.value     = hdr->value;
+            m.value_hi  = hdr->value_hi;
+            // old_value is valid for WRITE accesses when MF_OLD_UNKNOWN is not set.
+            // Note: QBDITRACE_MF_OLD_UNKNOWN is a #define (not a namespace member).
+            if ((hdr->mem_type & 0x02) &&  // MEMORY_WRITE bit
+                !(hdr->mem_flags & QBDITRACE_MF_OLD_UNKNOWN)) {
+                m.old_value     = hdr->old_value;
+                m.old_value_hi  = hdr->old_value_hi;
+                m.has_old_value = true;
+            }
+        } else {
+            // v4/v5: qbditrace_memacc_t (32 bytes)
+            const uint8_t* p = raw_mems + i * sizeof(qbditrace::qbditrace_memacc_t);
+            const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_memacc_t*>(p);
+            m.type      = hdr->mem_type;
+            m.flags     = hdr->mem_flags;
+            m.size      = hdr->size;
+            m.addr      = hdr->addr;
+            m.value     = hdr->value;
+            m.value_hi  = hdr->value_hi;
+        }
         return m;
     }
 
@@ -65,11 +91,15 @@ struct InstView {
             ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
             : sizeof(qbditrace::qbditrace_inst_head_t);
         // Use sizeof() to respect struct alignment padding in the on-disk layout.
-        // qbditrace_regdiff_t: reg_index(u8) + pad(7) + value(u64) = 16 bytes
-        // qbditrace_memacc_t:  type+flags+size(4) + pad(4) + addr+value+value_hi = 32 bytes
+        // qbditrace_regdiff_t:    reg_index(u8) + pad(7) + value(u64) = 16 bytes
+        // qbditrace_memacc_t:     type+flags+size(4) + pad(4) + addr+value+value_hi = 32 bytes
+        // qbditrace_memacc_v6_t:  same + old_value+old_value_hi = 48 bytes
+        size_t memacc_sz = is_v6
+            ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+            : sizeof(qbditrace::qbditrace_memacc_t);
         return hdr
             + reg_diff_count  * sizeof(qbditrace::qbditrace_regdiff_t)
-            + mem_access_count * sizeof(qbditrace::qbditrace_memacc_t);
+            + mem_access_count * memacc_sz;
     }
 };
 
@@ -139,11 +169,17 @@ struct RecordView {
     uint64_t file_offset;
     const uint8_t* raw_ptr;  // start of record in mmap
 
-    // When HF_PC_DELTA is active, the Iterator reconstructs the absolute PC
-    // and stores it here so callers always get the resolved address.
-    // In v4 mode this field is unused (as_inst() reads pc directly from raw_ptr).
-    // For random-access via record_at(offset, seed_pc), the caller supplies seed_pc.
-    uint64_t resolved_pc = 0;  // filled by Iterator in v5 mode, or by record_at(offset, seed_pc)
+    // Resolved absolute PC for this record.
+    // - v5 (HF_PC_DELTA): Iterator reconstructs it from pc_delta chain and stores it here;
+    //   record_at(offset, seed_pc) stores seed_pc (as computed by offset_of_with_pc).
+    // - v4: Iterator and record_at() both leave this 0; as_inst() reads pc from raw_ptr.
+    uint64_t resolved_pc = 0;
+    // is_v5: true when the INST record uses the 6-byte qbditrace_inst_head_v5_t layout
+    //        (HF_PC_DELTA). Set symmetrically with is_v6 by Iterator and record_at().
+    bool is_v5 = false;
+    // is_v6: true when memory access records use the 48-byte qbditrace_memacc_v6_t layout
+    //        (HF_OLD_VALUE). Set by Iterator and record_at().
+    bool is_v6 = false;
 
     // Parse helpers (caller checks kind first)
     InstView as_inst() const;
@@ -172,10 +208,11 @@ struct FileHeader {
     uint64_t flags;
     std::string module_name;
 
-    bool has_mem() const  { return flags & qbditrace::QBDITRACE_HF_HAS_MEM; }
-    bool has_nzcv() const { return flags & qbditrace::QBDITRACE_HF_HAS_NZCV; }
-    bool has_code() const { return flags & qbditrace::QBDITRACE_HF_HAS_CODE; }
-    bool reg_diff() const { return flags & qbditrace::QBDITRACE_HF_REG_DIFF; }
+    bool has_mem() const       { return flags & qbditrace::QBDITRACE_HF_HAS_MEM; }
+    bool has_nzcv() const      { return flags & qbditrace::QBDITRACE_HF_HAS_NZCV; }
+    bool has_code() const      { return flags & qbditrace::QBDITRACE_HF_HAS_CODE; }
+    bool reg_diff() const      { return flags & qbditrace::QBDITRACE_HF_REG_DIFF; }
+    bool has_old_value() const { return flags & qbditrace::QBDITRACE_HF_OLD_VALUE; }
 };
 
 // ─── TraceReader ──────────────────────────────────────────────────────────
@@ -212,9 +249,12 @@ public:
     /// Use this for v5 (HF_PC_DELTA) traces when calling as_inst() on a record
     /// obtained via random access (not Iterator). `seed_pc` is the absolute PC of
     /// the instruction at `offset`, as computed by offset_of_with_pc().
+    /// Sets is_v5 and is_v6 from the file header so as_inst() uses the correct layout.
     RecordView record_at(uint64_t offset, uint64_t seed_pc) const {
         RecordView rv = record_at(offset);
         rv.resolved_pc = seed_pc;
+        rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+        rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
         return rv;
     }
 

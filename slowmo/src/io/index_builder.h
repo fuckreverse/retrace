@@ -33,6 +33,13 @@ namespace cf {
     constexpr const char* OFFSET     = "offset";     // sparse inst_id → file_offset
     constexpr const char* ANCHOR     = "anchor";     // anchor sequential id → file_offset
     constexpr const char* MEM_WRITE  = "mem_write";  // [page|byte_off|inst_id] → byte_val
+    // MEM_READ: mirrors MEM_WRITE but for memory READS. A read access carries
+    // the value that was in memory at that instant, so when an address was
+    // never WRITTEN by traced code (e.g. a buffer prepared by uninstrumented
+    // code that the traced function then loads), the decoder can still recover
+    // the value from the most recent read at or before the query inst_id.
+    // Key/value encoding is identical to MEM_WRITE.
+    constexpr const char* MEM_READ   = "mem_read";   // [page|byte_off|inst_id] → byte_val
     // REG_WRITES: inverted index for fast "find last writer of register R before inst_id".
     // Key format (10 bytes, big-endian for correct sort order):
     //   u16 reg_index (0..33)  +  u64 inst_id
@@ -137,6 +144,7 @@ private:
 public:
     rocksdb::DB* raw_db() const { return db_.get(); }
     rocksdb::ColumnFamilyHandle* mem_write_cf() const { return get_cf(cf::MEM_WRITE); }
+    rocksdb::ColumnFamilyHandle* mem_read_cf() const { return get_cf(cf::MEM_READ); }
 };
 
 }  // namespace tenet
