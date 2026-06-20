@@ -2,12 +2,18 @@
 
 #include <rocksdb/write_batch.h>
 #include <rocksdb/options.h>
+#include <rocksdb/table.h>
+#include <rocksdb/filter_policy.h>
+#include <rocksdb/cache.h>
 
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
 
 namespace tenet {
+
+// ─── Static thread_local definition ───────────────────────────────────────
+thread_local MemoryModel::IteratorPair MemoryModel::tl_iterators_;
 
 // ─── Key encoding ─────────────────────────────────────────────────────────
 // Key = [page_addr BE(8)] [page_offset BE(2)] [inst_id BE(8)] = 18 bytes
@@ -55,12 +61,84 @@ void MemoryModel::decode_key(const rocksdb::Slice& key,
 // ─── Constructors ─────────────────────────────────────────────────────────
 
 MemoryModel::MemoryModel(const TraceReader& reader, const TraceIndex& index,
-                          rocksdb::DB* db, rocksdb::ColumnFamilyHandle* mem_cf)
+                          rocksdb::DB* db, rocksdb::ColumnFamilyHandle* mem_cf,
+                          rocksdb::ColumnFamilyHandle* mem_read_cf)
     : reader_(reader), index_(index), db_(db), mem_cf_(mem_cf),
+      mem_read_cf_(mem_read_cf),
       has_rocksdb_(db != nullptr && mem_cf != nullptr) {}
 
 MemoryModel::MemoryModel(const TraceReader& reader, const TraceIndex& index)
     : reader_(reader), index_(index) {}
+
+MemoryModel::~MemoryModel() {
+    // If this thread's cached iterators belong to our DB, invalidate them now.
+    // This prevents a use-after-free when the DB is closed (e.g., between tests):
+    // the next MemoryModel that happens to get the same DB pointer would otherwise
+    // reuse stale iterators that belong to the now-closed DB.
+    if (has_rocksdb_ && db_ != nullptr) {
+        auto& pair = tl_iterators_;
+        if (pair.owner_db == db_) {
+            pair.write_iter.reset();
+            pair.read_iter.reset();
+            pair.owner_db = nullptr;
+        }
+    }
+}
+
+// ─── Sentinel / persistence detection ─────────────────────────────────────
+
+static constexpr const char* SENTINEL_KEY = "__mem_model_built__";
+
+std::string MemoryModel::compute_trace_fingerprint() const {
+    // Fingerprint = file_size (8 bytes LE) + inst_count from index (8 bytes LE)
+    // This is sufficient to detect whether the trace file has changed.
+    uint64_t fsize = reader_.file_size();
+    uint64_t icount = index_.inst_count();
+    char fp[16];
+    std::memcpy(fp, &fsize, 8);
+    std::memcpy(fp + 8, &icount, 8);
+    return std::string(fp, 16);
+}
+
+bool MemoryModel::check_persisted_sentinel() const {
+    if (!has_rocksdb_ || !db_) return false;
+
+    // Read sentinel from default CF (cf_handles_[0], accessible via db_ directly)
+    std::string stored_value;
+    auto s = db_->Get(rocksdb::ReadOptions(), SENTINEL_KEY, &stored_value);
+    if (!s.ok()) return false;
+
+    auto expected = compute_trace_fingerprint();
+    return stored_value == expected;
+}
+
+void MemoryModel::write_persisted_sentinel() {
+    if (!has_rocksdb_ || !db_) return;
+
+    auto fp = compute_trace_fingerprint();
+    rocksdb::WriteOptions wo;
+    wo.disableWAL = true;
+    db_->Put(wo, SENTINEL_KEY, fp);
+}
+
+// ─── Thread-local iterator pool ───────────────────────────────────────────
+
+MemoryModel::IteratorPair& MemoryModel::get_thread_iterators() {
+    auto& pair = tl_iterators_;
+    // Re-create iterators if they belong to a different DB (or haven't been created yet)
+    if (pair.owner_db != db_ && has_rocksdb_) {
+        rocksdb::ReadOptions ro;
+        ro.fill_cache = true;
+        pair.write_iter.reset(db_->NewIterator(ro, mem_cf_));
+        if (mem_read_cf_) {
+            pair.read_iter.reset(db_->NewIterator(ro, mem_read_cf_));
+        } else {
+            pair.read_iter.reset();
+        }
+        pair.owner_db = db_;
+    }
+    return pair;
+}
 
 // ─── Build (persist writes to RocksDB) ────────────────────────────────────
 
@@ -73,6 +151,15 @@ void MemoryModel::ensure_built() {
 
 void MemoryModel::build() {
     if (built_) return;
+
+    // ─── Opt #1: Check if already persisted from a previous session ──────
+    if (has_rocksdb_ && check_persisted_sentinel()) {
+        // Data already in RocksDB from last run. Just load page activity cache.
+        // We still need to scan the CF for page activity (or load from a cached key).
+        // For now, mark built and let active_pages() do lazy scan if needed.
+        built_ = true;
+        return;
+    }
 
     if (!has_rocksdb_) {
         // Fallback: in-memory only. Build LRU cache from trace.
@@ -113,8 +200,23 @@ void MemoryModel::build() {
                       [](const MemWrite& a, const MemWrite& b) {
                           return a.inst_id < b.inst_id;
                       });
+            // Populate page_activity_cache_ so active_pages() works in-memory too
+            {
+                PageActivity pa;
+                pa.page_addr = page << PAGE_SHIFT;
+                pa.first_inst_id = writes.front().inst_id;
+                pa.last_inst_id  = writes.back().inst_id;
+                pa.write_count   = static_cast<uint32_t>(writes.size());
+                pa.read_count    = 0;
+                page_activity_cache_.push_back(pa);
+            }
             page_cache_.put(page, std::move(writes));
         }
+        std::sort(page_activity_cache_.begin(), page_activity_cache_.end(),
+                  [](const PageActivity& a, const PageActivity& b) {
+                      return a.page_addr < b.page_addr;
+                  });
+        page_activity_cached_ = true;
 
         built_ = true;
         return;
@@ -125,6 +227,9 @@ void MemoryModel::build() {
     // Value: [write_size(1)] [raw_data(write_size)]
     //
     // Cross-page writes are split into two KV pairs at the page boundary.
+
+    // Opt #4: Collect page activity data during build to avoid later full scan
+    std::unordered_map<uint64_t, PageActivity> build_page_map;
 
     rocksdb::WriteBatch batch;
     uint64_t inst_id = 0;
@@ -139,7 +244,10 @@ void MemoryModel::build() {
             auto inst = rec.as_inst();
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
-                if (!(mem.type & 0x02)) continue;  // writes only
+                bool is_write = (mem.type & 0x02) != 0;
+                // Route writes to mem_write CF, reads to mem_read CF.
+                rocksdb::ColumnFamilyHandle* target_cf = is_write ? mem_cf_ : mem_read_cf_;
+                if (!target_cf) continue;  // skip reads when mem_read CF absent
 
                 uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
 
@@ -152,16 +260,16 @@ void MemoryModel::build() {
                                 std::min<uint8_t>(total_size - 8, 8));
                 }
 
-                uint64_t write_addr = mem.addr;
-                uint16_t first_page_offset = static_cast<uint16_t>(write_addr & (PAGE_SIZE - 1));
+                uint64_t acc_addr = mem.addr;
+                uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (PAGE_SIZE - 1));
 
-                // Check if write crosses a page boundary
+                // Check if access crosses a page boundary
                 uint16_t bytes_in_first_page = static_cast<uint16_t>(
                     std::min<uint64_t>(PAGE_SIZE - first_page_offset, total_size));
 
                 // First (possibly only) KV pair: bytes in the first page
                 {
-                    uint64_t page = page_of(write_addr);
+                    uint64_t page = page_of(acc_addr);
                     char key_buf[KEY_SIZE];
                     auto key = encode_key_to(page, first_page_offset, inst_id, key_buf);
 
@@ -170,16 +278,30 @@ void MemoryModel::build() {
                     val_buf[0] = bytes_in_first_page;
                     std::memcpy(val_buf + 1, all_data, bytes_in_first_page);
 
-                    batch.Put(mem_cf_, key,
+                    batch.Put(target_cf, key,
                               rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
                                              1 + bytes_in_first_page));
                     batch_count++;
+
+                    // Opt #4: track page activity
+                    auto& pa = build_page_map[page];
+                    if (pa.page_addr == 0) {
+                        pa.page_addr = page << PAGE_SHIFT;
+                        pa.first_inst_id = inst_id;
+                        pa.last_inst_id = inst_id;
+                        pa.write_count = 0;
+                        pa.read_count = 0;
+                    }
+                    pa.first_inst_id = std::min(pa.first_inst_id, inst_id);
+                    pa.last_inst_id = std::max(pa.last_inst_id, inst_id);
+                    if (is_write) pa.write_count++;
+                    else pa.read_count++;
                 }
 
-                // Second KV pair (if write crosses page boundary)
+                // Second KV pair (if access crosses page boundary)
                 if (bytes_in_first_page < total_size) {
                     uint8_t remaining = total_size - bytes_in_first_page;
-                    uint64_t second_page_addr = write_addr + bytes_in_first_page;
+                    uint64_t second_page_addr = acc_addr + bytes_in_first_page;
                     uint64_t second_page = page_of(second_page_addr);
                     uint16_t second_offset = 0; // starts at beginning of next page
 
@@ -190,13 +312,29 @@ void MemoryModel::build() {
                     val_buf[0] = remaining;
                     std::memcpy(val_buf + 1, all_data + bytes_in_first_page, remaining);
 
-                    batch.Put(mem_cf_, key2,
+                    batch.Put(target_cf, key2,
                               rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
                                              1 + remaining));
                     batch_count++;
+
+                    // Opt #4: track page activity for second page
+                    auto& pa2 = build_page_map[second_page];
+                    if (pa2.page_addr == 0) {
+                        pa2.page_addr = second_page << PAGE_SHIFT;
+                        pa2.first_inst_id = inst_id;
+                        pa2.last_inst_id = inst_id;
+                        pa2.write_count = 0;
+                        pa2.read_count = 0;
+                    }
+                    pa2.first_inst_id = std::min(pa2.first_inst_id, inst_id);
+                    pa2.last_inst_id = std::max(pa2.last_inst_id, inst_id);
+                    if (is_write) pa2.write_count++;
+                    else pa2.read_count++;
                 }
 
-                stats_.total_writes_persisted.fetch_add(1, std::memory_order_relaxed);
+                if (is_write) {
+                    stats_.total_writes_persisted.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
             // Flush batch periodically (every ~100K entries)
@@ -215,6 +353,20 @@ void MemoryModel::build() {
         db_->Write(wo, &batch);
     }
 
+    // Opt #4: Store page activity cache
+    page_activity_cache_.reserve(build_page_map.size());
+    for (auto& [_, pa] : build_page_map) {
+        page_activity_cache_.push_back(pa);
+    }
+    std::sort(page_activity_cache_.begin(), page_activity_cache_.end(),
+              [](const PageActivity& a, const PageActivity& b) {
+                  return a.page_addr < b.page_addr;
+              });
+    page_activity_cached_ = true;
+
+    // Opt #1: Write sentinel so next session skips rebuild
+    write_persisted_sentinel();
+
     built_ = true;
 }
 
@@ -224,22 +376,6 @@ void MemoryModel::find_covering_write(rocksdb::Iterator* iter,
                                        uint64_t page, uint16_t target_offset,
                                        uint64_t at_inst_id,
                                        MemReadResult& out, uint8_t result_index) {
-    // We want the most recent write (highest inst_id <= at_inst_id) whose range
-    // covers target_offset. A write stored at page_offset X with size S covers
-    // bytes [X, X+S-1]. So we need X <= target_offset <= X+S-1, i.e. X >= target_offset - (S-1).
-    // Since max S = 16, the earliest possible X is target_offset - 15.
-    //
-    // Strategy: SeekForPrev to [page | target_offset | at_inst_id].
-    // Then scan backwards. Stop when:
-    //   - page changes (no more candidates)
-    //   - page_offset < target_offset - 15 (no write can reach target)
-    //
-    // For each candidate entry at (page, entry_offset, entry_inst_id):
-    //   - If entry_inst_id > at_inst_id: skip (too new)
-    //   - Parse value to get write_size
-    //   - If entry_offset + write_size > target_offset: this write covers our byte!
-    //     (i.e., entry_offset <= target_offset && entry_offset + write_size - 1 >= target_offset)
-
     char seek_key_buf[KEY_SIZE];
     auto seek_key = encode_key_to(page, target_offset, at_inst_id, seek_key_buf);
     iter->SeekForPrev(seek_key);
@@ -263,8 +399,6 @@ void MemoryModel::find_covering_write(rocksdb::Iterator* iter,
         if (found_offset < min_offset) break;
 
         // Skip entries with inst_id > at_inst_id
-        // (This can happen when SeekForPrev lands on the same page_offset
-        //  but a future instruction)
         if (found_inst_id > at_inst_id) {
             iter->Prev();
             continue;
@@ -279,7 +413,6 @@ void MemoryModel::find_covering_write(rocksdb::Iterator* iter,
         uint8_t write_size = static_cast<uint8_t>(val.data()[0]);
 
         // Check if this write covers target_offset
-        // Write covers [found_offset, found_offset + write_size - 1]
         if (found_offset <= target_offset &&
             static_cast<uint16_t>(found_offset + write_size) > target_offset) {
             // Found it! Extract the byte value.
@@ -307,12 +440,21 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
     ensure_built();
 
+    // at_inst_id is exclusive: find the most recent write with inst_id < at_inst_id.
+    // This matches the "state before instruction at_inst_id executes" semantics used
+    // everywhere in tenet (state_before, last_writer, etc.).
+    // When at_inst_id == 0, no writes have occurred yet → result is all-unknown.
+    if (at_inst_id == 0) return result;
+
     if (has_rocksdb_) {
-        // RocksDB iterators are thread-safe per-iterator (each thread gets its own).
-        // No mutex needed here since we create a fresh iterator.
-        rocksdb::ReadOptions ro;
-        ro.fill_cache = true;
-        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, mem_cf_));
+        // Opt #3: Use thread-local iterators instead of creating new ones each call.
+        auto& iters = get_thread_iterators();
+        auto* iter = iters.write_iter.get();
+        auto* read_iter = iters.read_iter.get();
+
+        // Use at_inst_id - 1 as the inclusive upper bound so that inst_id == at_inst_id
+        // is excluded (exclusive semantics: "state before at_inst_id executes").
+        const uint64_t search_id = at_inst_id - 1;
 
         for (uint8_t i = 0; i < size; ) {
             uint64_t byte_addr = addr + i;
@@ -321,7 +463,7 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
             // Seek once for this byte
             char seek_key_buf[KEY_SIZE];
-            auto seek_key = encode_key_to(page, page_offset, at_inst_id, seek_key_buf);
+            auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
             iter->SeekForPrev(seek_key);
 
             uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
@@ -339,7 +481,7 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
                 if (found_page != page) break;
                 if (found_offset < min_offset) break;
-                if (found_inst_id > at_inst_id) {
+                if (found_inst_id > search_id) {
                     iter->Prev();
                     continue;
                 }
@@ -384,6 +526,79 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
             i++;
             while (i < size && result.known[i]) i++;
         }
+
+        // ── Phase 2: read-fallback for unresolved bytes ──────────────────
+        if (read_iter) {
+            for (uint8_t i = 0; i < size; ) {
+                if (result.known[i]) { i++; continue; }
+
+                uint64_t byte_addr = addr + i;
+                uint64_t page = page_of(byte_addr);
+                uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+
+                char seek_key_buf[KEY_SIZE];
+                auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
+                read_iter->SeekForPrev(seek_key);
+
+                uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
+                                          ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
+                                          : 0;
+
+                bool found = false;
+                while (read_iter->Valid()) {
+                    if (read_iter->key().size() != KEY_SIZE) break;
+
+                    uint64_t found_page;
+                    uint16_t found_offset;
+                    uint64_t found_inst_id;
+                    decode_key(read_iter->key(), found_page, found_offset, found_inst_id);
+
+                    if (found_page != page) break;
+                    if (found_offset < min_offset) break;
+                    if (found_inst_id > search_id) {
+                        read_iter->Prev();
+                        continue;
+                    }
+
+                    auto val = read_iter->value();
+                    if (val.size() < 1) { read_iter->Prev(); continue; }
+                    uint8_t read_size = static_cast<uint8_t>(val.data()[0]);
+
+                    // Check if this read covers our target byte
+                    if (found_offset <= page_offset &&
+                        static_cast<uint16_t>(found_offset + read_size) > page_offset) {
+                        // Extract as many consecutive bytes as this read covers.
+                        uint16_t read_end = static_cast<uint16_t>(found_offset + read_size);
+                        for (uint8_t j = i; j < size; j++) {
+                            uint64_t baddr = addr + j;
+                            if (page_of(baddr) != page) break;
+                            uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
+                            if (boff >= read_end) break;
+                            if (boff < found_offset) break;
+
+                            uint8_t idx_in_read = static_cast<uint8_t>(boff - found_offset);
+                            if (val.size() >= static_cast<size_t>(1 + idx_in_read + 1)) {
+                                result.data[j] = static_cast<uint8_t>(val.data()[1 + idx_in_read]);
+                                result.known[j] = true;
+                                result.writer_id[j] = found_inst_id;
+                            }
+                        }
+                        stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                        found = true;
+                        break;
+                    }
+
+                    read_iter->Prev();
+                }
+
+                if (!found) {
+                    stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                i++;
+                while (i < size && result.known[i]) i++;
+            }
+        }
     } else {
         // In-memory fallback path — LRU cache needs mutex protection
         std::lock_guard<std::mutex> lk(cache_mutex_);
@@ -419,6 +634,327 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
     return result;
 }
 
+// ─── Extended API implementations ─────────────────────────────────────────
+
+// Opt #2: read_region with single-iterator approach for RocksDB path.
+// Instead of calling read() in a loop (which previously would create iterators
+// per call), we now create one iterator pair and reuse across all chunks.
+MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t size, uint64_t at_inst_id) {
+    RegionReadResult result;
+    result.data.resize(size, 0);
+    result.known.resize(size, false);
+    result.known_count = 0;
+
+    if (size == 0) return result;
+    ensure_built();
+
+    if (has_rocksdb_) {
+        // Use thread-local iterators — single pair for the entire region read
+        auto& iters = get_thread_iterators();
+        return read_region_impl(addr, size, at_inst_id,
+                                iters.write_iter.get(),
+                                iters.read_iter.get());
+    }
+
+    // In-memory fallback: use read() in chunks
+    constexpr size_t chunk_size = 16;
+    for (size_t off = 0; off < size; off += chunk_size) {
+        size_t remaining = size - off;
+        uint8_t read_size = static_cast<uint8_t>(std::min(remaining, chunk_size));
+
+        MemReadResult mr = read(addr + off, read_size, at_inst_id);
+
+        for (uint8_t i = 0; i < read_size; ++i) {
+            result.data[off + i] = mr.data[i];
+            result.known[off + i] = mr.known[i];
+            if (mr.known[i]) result.known_count++;
+        }
+    }
+
+    return result;
+}
+
+MemoryModel::RegionReadResult MemoryModel::read_region_impl(
+    uint64_t addr, size_t size, uint64_t at_inst_id,
+    rocksdb::Iterator* write_iter, rocksdb::Iterator* read_iter) {
+
+    RegionReadResult result;
+    result.data.resize(size, 0);
+    result.known.resize(size, false);
+    result.known_count = 0;
+
+    if (size == 0) return result;
+    // at_inst_id == 0 means before any instruction — nothing written yet.
+    if (at_inst_id == 0) return result;
+
+    // Exclusive semantics: find writes with inst_id < at_inst_id.
+    const uint64_t search_id = at_inst_id - 1;
+
+    // Process in 16-byte chunks but reuse the provided iterators
+    constexpr size_t chunk_size = 16;
+    for (size_t off = 0; off < size; off += chunk_size) {
+        size_t remaining = size - off;
+        uint8_t read_size = static_cast<uint8_t>(std::min(remaining, chunk_size));
+        uint64_t chunk_addr = addr + off;
+
+        // --- Phase 1: resolve from write CF ---
+        for (uint8_t i = 0; i < read_size; ) {
+            uint64_t byte_addr = chunk_addr + i;
+            uint64_t page = page_of(byte_addr);
+            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+
+            char seek_key_buf[KEY_SIZE];
+            auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
+            write_iter->SeekForPrev(seek_key);
+
+            uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
+                                      ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
+                                      : 0;
+
+            bool found = false;
+            while (write_iter->Valid()) {
+                if (write_iter->key().size() != KEY_SIZE) break;
+
+                uint64_t found_page;
+                uint16_t found_offset;
+                uint64_t found_inst_id;
+                decode_key(write_iter->key(), found_page, found_offset, found_inst_id);
+
+                if (found_page != page) break;
+                if (found_offset < min_offset) break;
+                if (found_inst_id > search_id) {
+                    write_iter->Prev();
+                    continue;
+                }
+
+                auto val = write_iter->value();
+                if (val.size() < 1) { write_iter->Prev(); continue; }
+                uint8_t write_size_val = static_cast<uint8_t>(val.data()[0]);
+
+                if (found_offset <= page_offset &&
+                    static_cast<uint16_t>(found_offset + write_size_val) > page_offset) {
+                    uint16_t write_end = static_cast<uint16_t>(found_offset + write_size_val);
+                    for (uint8_t j = i; j < read_size; j++) {
+                        uint64_t baddr = chunk_addr + j;
+                        if (page_of(baddr) != page) break;
+                        uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
+                        if (boff >= write_end) break;
+                        if (boff < found_offset) break;
+
+                        uint8_t idx_in_write = static_cast<uint8_t>(boff - found_offset);
+                        if (val.size() >= static_cast<size_t>(1 + idx_in_write + 1)) {
+                            result.data[off + j] = static_cast<uint8_t>(val.data()[1 + idx_in_write]);
+                            result.known[off + j] = true;
+                            result.known_count++;
+                        }
+                    }
+                    stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                    found = true;
+                    break;
+                }
+
+                write_iter->Prev();
+            }
+
+            if (!found) {
+                stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            i++;
+            while (i < read_size && result.known[off + i]) i++;
+        }
+
+        // --- Phase 2: read-fallback for unresolved bytes ---
+        if (read_iter) {
+            for (uint8_t i = 0; i < read_size; ) {
+                if (result.known[off + i]) { i++; continue; }
+
+                uint64_t byte_addr = chunk_addr + i;
+                uint64_t page = page_of(byte_addr);
+                uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+
+                char seek_key_buf[KEY_SIZE];
+                auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
+                read_iter->SeekForPrev(seek_key);
+
+                uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
+                                          ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
+                                          : 0;
+
+                bool found = false;
+                while (read_iter->Valid()) {
+                    if (read_iter->key().size() != KEY_SIZE) break;
+
+                    uint64_t found_page;
+                    uint16_t found_offset;
+                    uint64_t found_inst_id;
+                    decode_key(read_iter->key(), found_page, found_offset, found_inst_id);
+
+                    if (found_page != page) break;
+                    if (found_offset < min_offset) break;
+                    if (found_inst_id > search_id) {
+                        read_iter->Prev();
+                        continue;
+                    }
+
+                    auto val = read_iter->value();
+                    if (val.size() < 1) { read_iter->Prev(); continue; }
+                    uint8_t rd_size = static_cast<uint8_t>(val.data()[0]);
+
+                    if (found_offset <= page_offset &&
+                        static_cast<uint16_t>(found_offset + rd_size) > page_offset) {
+                        uint16_t read_end = static_cast<uint16_t>(found_offset + rd_size);
+                        for (uint8_t j = i; j < read_size; j++) {
+                            uint64_t baddr = chunk_addr + j;
+                            if (page_of(baddr) != page) break;
+                            uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
+                            if (boff >= read_end) break;
+                            if (boff < found_offset) break;
+
+                            uint8_t idx_in_read = static_cast<uint8_t>(boff - found_offset);
+                            if (val.size() >= static_cast<size_t>(1 + idx_in_read + 1)) {
+                                result.data[off + j] = static_cast<uint8_t>(val.data()[1 + idx_in_read]);
+                                result.known[off + j] = true;
+                                result.known_count++;
+                            }
+                        }
+                        stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                        found = true;
+                        break;
+                    }
+
+                    read_iter->Prev();
+                }
+
+                if (!found) {
+                    stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                i++;
+                while (i < read_size && result.known[off + i]) i++;
+            }
+        }
+    }
+
+    return result;
+}
+
+std::vector<MemoryModel::PageActivity> MemoryModel::active_pages() {
+    ensure_built();
+
+    // Return cached result if available (populated during build)
+    if (page_activity_cached_) {
+        return page_activity_cache_;
+    }
+
+    std::vector<PageActivity> pages;
+
+    if (!has_rocksdb_) {
+        // In-memory fallback: enumerate pages from the LRU page_cache_.
+        std::lock_guard<std::mutex> lk(cache_mutex_);
+        // page_cache_ maps page_number → vector<MemWrite> sorted by inst_id.
+        // We need to enumerate the keys — but LRUCache doesn't expose an
+        // iterator, so we rely on the page_activity_cache_ that was populated
+        // by build() via the page_buckets map.
+        // (build() fills page_activity_cache_ only for the RocksDB path;
+        //  for the in-memory path we reconstruct it here from the data available
+        //  in the per-page write vectors.)
+        // Since LRUCache doesn't expose keys, fall back to the page_activity_cache_
+        // that was populated by build() for all paths since PR #xxx.
+        return page_activity_cache_;
+    }
+
+    // Full scan fallback (only reached if build() didn't cache, e.g. old DB)
+    std::unordered_map<uint64_t, PageActivity> page_map;
+
+    auto scan_cf = [&](rocksdb::ColumnFamilyHandle* cf, bool is_write) {
+        if (!cf) return;
+        rocksdb::ReadOptions ro;
+        ro.fill_cache = false;
+        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, cf));
+
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+            if (iter->key().size() != KEY_SIZE) continue;
+
+            uint64_t page_addr, inst_id;
+            uint16_t page_offset;
+            decode_key(iter->key(), page_addr, page_offset, inst_id);
+
+            uint64_t full_page_addr = page_addr << PAGE_SHIFT;
+
+            auto& pa = page_map[full_page_addr];
+            if (pa.page_addr == 0) {
+                pa.page_addr = full_page_addr;
+                pa.first_inst_id = inst_id;
+                pa.last_inst_id = inst_id;
+                pa.write_count = 0;
+                pa.read_count = 0;
+            }
+            pa.first_inst_id = std::min(pa.first_inst_id, inst_id);
+            pa.last_inst_id = std::max(pa.last_inst_id, inst_id);
+            if (is_write) pa.write_count++;
+            else pa.read_count++;
+        }
+    };
+
+    scan_cf(mem_cf_, true);
+    scan_cf(mem_read_cf_, false);
+
+    pages.reserve(page_map.size());
+    for (auto& [_, pa] : page_map) {
+        pages.push_back(pa);
+    }
+    std::sort(pages.begin(), pages.end(),
+              [](const PageActivity& a, const PageActivity& b) {
+                  return a.page_addr < b.page_addr;
+              });
+
+    // Cache for future calls
+    page_activity_cache_ = pages;
+    page_activity_cached_ = true;
+
+    return pages;
+}
+
+bool MemoryModel::was_accessed(uint64_t addr) {
+    ensure_built();
+
+    if (!has_rocksdb_) {
+        std::lock_guard<std::mutex> lk(cache_mutex_);
+        uint64_t page = page_of(addr);
+        return page_cache_.get_mutable(page) != nullptr;
+    }
+
+    uint64_t page = page_of(addr);
+    uint16_t page_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
+
+    auto check_cf = [&](rocksdb::ColumnFamilyHandle* cf) -> bool {
+        if (!cf) return false;
+        rocksdb::ReadOptions ro;
+        ro.fill_cache = true;
+        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, cf));
+
+        char seek_buf[KEY_SIZE];
+        auto seek_key = encode_key_to(page, page_offset, 0, seek_buf);
+        iter->Seek(seek_key);
+
+        if (iter->Valid() && iter->key().size() == KEY_SIZE) {
+            uint64_t found_page;
+            uint16_t found_offset;
+            uint64_t found_inst_id;
+            decode_key(iter->key(), found_page, found_offset, found_inst_id);
+            if (found_page == page && found_offset == page_offset) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    return check_cf(mem_cf_) || check_cf(mem_read_cf_);
+}
+
+// ─── Original query methods ───────────────────────────────────────────────────────
+
 uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_inst_id) {
     uint64_t latest_writer = 0;
     ensure_built();
@@ -427,11 +963,9 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
     uint64_t search_id = before_inst_id - 1;
 
     if (has_rocksdb_) {
-        rocksdb::ReadOptions ro;
-        ro.fill_cache = true;
-        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, mem_cf_));
+        auto& iters = get_thread_iterators();
+        auto* iter = iters.write_iter.get();
 
-        // Track which bytes we've resolved to skip redundant SeekForPrev calls
         bool resolved[16] = {};
         uint64_t writer_ids[16] = {};
 
@@ -442,7 +976,6 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
             uint64_t page = page_of(byte_addr);
             uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
 
-            // Seek once for this byte
             char seek_key_buf[KEY_SIZE];
             auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
             iter->SeekForPrev(seek_key);
@@ -471,10 +1004,8 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
                 if (val.size() < 1) { iter->Prev(); continue; }
                 uint8_t write_size = static_cast<uint8_t>(val.data()[0]);
 
-                // Check if this write covers our target byte
                 if (found_offset <= page_offset &&
                     static_cast<uint16_t>(found_offset + write_size) > page_offset) {
-                    // Found it! Mark all consecutive bytes covered by this write.
                     uint16_t write_end = static_cast<uint16_t>(found_offset + write_size);
                     for (uint8_t j = i; j < size; j++) {
                         uint64_t baddr = addr + j;
@@ -498,12 +1029,10 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
 
             stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
 
-            // Advance i past all bytes we've already resolved
             i++;
             while (i < size && resolved[i]) i++;
         }
 
-        // Compute the latest writer across all resolved bytes
         for (uint8_t i = 0; i < size; i++) {
             if (resolved[i]) {
                 latest_writer = std::max(latest_writer, writer_ids[i]);
@@ -536,9 +1065,6 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
     std::vector<uint64_t> result;
 
     if (has_rocksdb_) {
-        // RocksDB path: scan all writes that could cover addr's byte.
-        // upper_bound is a stack-local string; the Slice points into it.
-        // Both remain valid for the iterator's entire lifetime.
         uint64_t page = page_of(addr);
         uint16_t target_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
         uint16_t min_offset = (target_offset >= (MAX_WRITE_SIZE - 1))
@@ -546,12 +1072,11 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
                                   : 0;
 
         auto start_key = encode_key(page, min_offset, 0);
-        // upper_bound string lives on the stack — Slice references it safely.
         std::string end_key = encode_key(page, static_cast<uint16_t>(target_offset + 1), 0);
 
         rocksdb::ReadOptions ro;
         ro.fill_cache = true;
-        rocksdb::Slice upper(end_key);  // Slice points into end_key's buffer
+        rocksdb::Slice upper(end_key);
         ro.iterate_upper_bound = &upper;
 
         std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, mem_cf_));
@@ -567,7 +1092,6 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
             if (found_page != page) break;
             if (found_offset > target_offset) break;
 
-            // Check if this write covers the target byte
             auto val = iter->value();
             if (val.size() < 1) continue;
             uint8_t write_size = static_cast<uint8_t>(val.data()[0]);
@@ -578,7 +1102,6 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
             }
         }
     } else {
-        // In-memory path — needs cache lock
         std::lock_guard<std::mutex> lk(cache_mutex_);
         uint64_t page = page_of(addr);
         auto* writes = page_cache_.get_mutable(page);
@@ -598,23 +1121,57 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
 std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) {
     ensure_built();
 
+    // Check hot-byte cache first
     if (has_rocksdb_) {
-        rocksdb::ReadOptions ro;
-        ro.fill_cache = true;
-        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(ro, mem_cf_));
+        ByteCacheKey cache_key{addr, at_inst_id};
+        {
+            std::lock_guard<std::mutex> lk(byte_cache_mutex_);
+            auto it = byte_cache_.find(cache_key);
+            if (it != byte_cache_.end()) {
+                stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+                if (it->second.known) return it->second.value;
+                return std::nullopt;
+            }
+        }
+
+        auto& iters = get_thread_iterators();
+        auto* iter = iters.write_iter.get();
 
         uint64_t page = page_of(addr);
         uint16_t page_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
 
         MemReadResult tmp{};
-        find_covering_write(iter.get(), page, page_offset, at_inst_id, tmp, 0);
+        find_covering_write(iter, page, page_offset, at_inst_id, tmp, 0);
+
+        // Store in cache
+        {
+            std::lock_guard<std::mutex> lk(byte_cache_mutex_);
+            if (byte_cache_.size() >= BYTE_CACHE_MAX_SIZE) {
+                byte_cache_.clear();  // Simple eviction: clear all
+            }
+            byte_cache_[cache_key] = {tmp.data[0], tmp.known[0],
+                                      tmp.known[0] ? at_inst_id : 0};
+        }
+
         if (tmp.known[0]) {
             return tmp.data[0];
         }
+
+        // Try read CF fallback
+        if (iters.read_iter) {
+            MemReadResult tmp2{};
+            find_covering_write(iters.read_iter.get(), page, page_offset, at_inst_id, tmp2, 0);
+            if (tmp2.known[0]) {
+                std::lock_guard<std::mutex> lk(byte_cache_mutex_);
+                byte_cache_[cache_key] = {tmp2.data[0], true, at_inst_id};
+                return tmp2.data[0];
+            }
+        }
+
         return std::nullopt;
     }
 
-    // In-memory fallback — needs cache lock
+    // In-memory fallback
     std::lock_guard<std::mutex> lk(cache_mutex_);
     uint64_t page = page_of(addr);
     auto* writes = page_cache_.get_mutable(page);

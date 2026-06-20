@@ -5,6 +5,7 @@
 #include "io/index_builder.h"
 
 #include <rocksdb/db.h>
+#include <rocksdb/iterator.h>
 
 #include <atomic>
 #include <array>
@@ -13,6 +14,7 @@
 #include <shared_mutex>
 #include <memory>
 #include <filesystem>
+#include <unordered_map>
 
 namespace tenet {
 
@@ -59,10 +61,15 @@ public:
     /// `db` is the shared trace index DB (must outlive MemoryModel).
     /// `mem_cf` is the "mem_write" column family handle.
     MemoryModel(const TraceReader& reader, const TraceIndex& index,
-                rocksdb::DB* db, rocksdb::ColumnFamilyHandle* mem_cf);
+                rocksdb::DB* db, rocksdb::ColumnFamilyHandle* mem_write_cf,
+                rocksdb::ColumnFamilyHandle* mem_read_cf = nullptr);
 
     /// Legacy constructor (in-memory only, no RocksDB persistence).
     MemoryModel(const TraceReader& reader, const TraceIndex& index);
+
+    /// Destructor: invalidates any thread-local iterators pointing to our DB,
+    /// preventing use-after-free across test boundaries.
+    ~MemoryModel();
 
     /// Read `size` bytes at `addr` as they were at time `at_inst_id`.
     MemReadResult read(uint64_t addr, uint8_t size, uint64_t at_inst_id);
@@ -75,6 +82,36 @@ public:
 
     /// Get a single byte value at a specific time.
     std::optional<uint8_t> byte_at(uint64_t addr, uint64_t at_inst_id);
+
+    // ─── Extended API for bulk memory operations ──────────────────────────
+
+    /// Read a region of arbitrary size at a specific point in time.
+    /// Unlike read() which is limited to 16 bytes, this handles chunking internally.
+    /// Returns a byte vector and a parallel 'known' vector indicating validity.
+    struct RegionReadResult {
+        std::vector<uint8_t> data;
+        std::vector<bool> known;
+        size_t known_count = 0;  // number of bytes with known values
+    };
+    RegionReadResult read_region(uint64_t addr, size_t size, uint64_t at_inst_id);
+
+    /// Describes the activity timeline of a single memory page.
+    struct PageActivity {
+        uint64_t page_addr;        // page-aligned address (page_number << 12)
+        uint64_t first_inst_id;    // earliest inst_id that accessed this page
+        uint64_t last_inst_id;     // latest inst_id that accessed this page
+        uint32_t write_count;      // number of write events to this page
+        uint32_t read_count;       // number of read events to this page
+    };
+
+    /// Enumerate all memory pages that were accessed during the trace.
+    /// Returns a list sorted by page_addr.
+    /// This enables "what memory existed" queries without scanning each address.
+    std::vector<PageActivity> active_pages();
+
+    /// Check if a given address was ever accessed (read or written) in the trace.
+    /// Faster than active_pages() for single-address checks.
+    bool was_accessed(uint64_t addr);
 
     /// Cache statistics (atomic counters for thread-safe concurrent queries).
     struct CacheStats {
@@ -97,6 +134,8 @@ public:
 
     /// Build the mem_write column family data from trace.
     /// Performs a single sequential scan and bulk-writes all memory writes.
+    /// If the data has been persisted from a previous session (sentinel key matches),
+    /// build() returns immediately without re-scanning.
     void build();
 
     /// Check if already built (data persisted in RocksDB).
@@ -132,6 +171,21 @@ private:
                              uint64_t at_inst_id,
                              MemReadResult& out, uint8_t result_index);
 
+    /// Internal implementation of read_region that reuses a single iterator pair.
+    RegionReadResult read_region_impl(uint64_t addr, size_t size, uint64_t at_inst_id,
+                                      rocksdb::Iterator* write_iter,
+                                      rocksdb::Iterator* read_iter);
+
+    /// Check if the RocksDB already contains persisted MemoryModel data
+    /// matching the current trace file (sentinel key check).
+    bool check_persisted_sentinel() const;
+
+    /// Write the sentinel key after a successful build.
+    void write_persisted_sentinel();
+
+    /// Compute a fingerprint string for the current trace file.
+    std::string compute_trace_fingerprint() const;
+
     /// Ensure build has been performed.
     void ensure_built();
 
@@ -140,12 +194,53 @@ private:
 
     // RocksDB backing store
     rocksdb::DB* db_ = nullptr;
-    rocksdb::ColumnFamilyHandle* mem_cf_ = nullptr;
+    rocksdb::ColumnFamilyHandle* mem_cf_ = nullptr;       // mem_write
+    rocksdb::ColumnFamilyHandle* mem_read_cf_ = nullptr;  // mem_read (may be null)
     bool has_rocksdb_ = false;
+
+    // Thread-local iterator pool for avoiding repeated NewIterator() calls.
+    // Each thread gets its own cached iterator pair (write_iter, read_iter).
+    // The pool is tied to a specific DB instance via owner_db pointer.
+    struct IteratorPair {
+        std::unique_ptr<rocksdb::Iterator> write_iter;
+        std::unique_ptr<rocksdb::Iterator> read_iter;
+        rocksdb::DB* owner_db = nullptr;  // which DB these iterators belong to
+    };
+    IteratorPair& get_thread_iterators();
+    static thread_local IteratorPair tl_iterators_;
 
     // In-memory cache for recently queried writes (protected by cache_mutex_)
     LRUCache<uint64_t, std::vector<MemWrite>> page_cache_{512};
     mutable std::mutex cache_mutex_;  // protects page_cache_ for concurrent queries
+
+    // Page activity cache (populated during build, never changes after)
+    std::vector<PageActivity> page_activity_cache_;
+    bool page_activity_cached_ = false;
+
+    // Hot-byte read cache: caches recent (addr, inst_id) → byte lookups
+    // to avoid repeated RocksDB seeks for the same query.
+    struct ByteCacheKey {
+        uint64_t addr;
+        uint64_t inst_id;
+        bool operator==(const ByteCacheKey& o) const {
+            return addr == o.addr && inst_id == o.inst_id;
+        }
+    };
+    struct ByteCacheHash {
+        size_t operator()(const ByteCacheKey& k) const {
+            return std::hash<uint64_t>{}(k.addr) ^ (std::hash<uint64_t>{}(k.inst_id) << 1);
+        }
+    };
+    struct ByteCacheEntry {
+        uint8_t value;
+        bool known;
+        uint64_t writer_id;
+    };
+    // Small fixed-size LRU would be ideal, but a simple bounded unordered_map
+    // with periodic clear is good enough for typical access patterns.
+    static constexpr size_t BYTE_CACHE_MAX_SIZE = 65536;
+    std::unordered_map<ByteCacheKey, ByteCacheEntry, ByteCacheHash> byte_cache_;
+    mutable std::mutex byte_cache_mutex_;
 
     CacheStats stats_;  // atomic counters, no mutex needed
     bool built_ = false;
