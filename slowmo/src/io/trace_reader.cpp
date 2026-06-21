@@ -229,8 +229,9 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
                   (raw_hdr->flags & qbditrace::QBDITRACE_HF_OLD_VALUE));
     // v6 can also use PC-delta encoding (HF_PC_DELTA + HF_OLD_VALUE + version==6)
     if (!is_v4 && !is_v5 && !is_v6) {
+        uint32_t bad_version = raw_hdr->version;  // read before munmap
         reader.close();
-        return Error::version_mismatch(raw_hdr->version, TRACE_VERSION);
+        return Error::version_mismatch(bad_version, TRACE_VERSION);
     }
 
     reader.header_.magic = raw_hdr->magic;

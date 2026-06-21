@@ -14,15 +14,19 @@ namespace tenet {
 
 namespace {
 
-/// Compute record size from raw pointer (v4 layout only; v5 fallback to sequential).
-inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr) {
+/// Compute record size from raw pointer.
+/// is_v6: if true, INST records use 48-byte memacc structs (HF_OLD_VALUE set).
+inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr, bool is_v6 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
         uint8_t n_mem = ptr[3];
+        const size_t memacc_size = is_v6
+            ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+            : sizeof(qbditrace::qbditrace_memacc_t);
         return sizeof(qbditrace::qbditrace_inst_head_t)
             + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-            + n_mem     * sizeof(qbditrace::qbditrace_memacc_t);
+            + n_mem     * memacc_size;
     }
     case 1: // ANCHOR
         return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
@@ -59,11 +63,16 @@ struct ScanShard {
 /// Scan a shard and broadcast INST records to a set of collector clones.
 /// Only on_inst() is called; non-INST records are skipped.
 void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
+                           bool is_v6,
                            const std::vector<TraceCollector*>& clones,
                            std::atomic<uint64_t>& progress_counter) {
     const uint8_t* ptr = shard.begin;
     const uint8_t* end_ptr = shard.end;
     uint64_t inst_id = shard.start_inst_id;
+    // v6 extends memacc records from 32 to 48 bytes (adds old_value + pad fields).
+    const size_t memacc_size = is_v6
+        ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+        : sizeof(qbditrace::qbditrace_memacc_t);
 
     while (ptr < end_ptr) {
         uint8_t kind = ptr[0];
@@ -86,7 +95,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
 
             ptr += sizeof(qbditrace::qbditrace_inst_head_t)
                 + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                + hdr->n_mem     * sizeof(qbditrace::qbditrace_memacc_t);
+                + hdr->n_mem     * memacc_size;
             inst_id++;
 
             // Update shared progress counter every 64K instructions
@@ -94,8 +103,8 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 progress_counter.fetch_add(0x10000, std::memory_order_relaxed);
             }
         } else {
-            // Non-INST record: skip
-            ptr += raw_record_size(ptr, num_gpr);
+            // Non-INST record: skip (is_v6 propagated for completeness)
+            ptr += raw_record_size(ptr, num_gpr, is_v6);
         }
     }
 
@@ -131,6 +140,8 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
     uint64_t total = end - start_inst_id;
     bool cancelled = false;
 
+    const uint32_t num_gpr = reader_.header().num_gpr;
+
     for (auto it = reader_.begin(); it != reader_.end() && inst_id < end; ++it) {
         auto rec = *it;
 
@@ -153,6 +164,13 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
             inst_id++;
             break;
         }
+        case RecordKind::Anchor: {
+            auto anchor = rec.as_anchor(num_gpr);
+            for (auto* c : active) {
+                c->on_anchor(inst_id, anchor);
+            }
+            break;
+        }
         case RecordKind::Code: {
             auto code = rec.as_code();
             for (auto* c : active) {
@@ -165,6 +183,15 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
                 auto svc = rec.as_svc();
                 for (auto* c : active) {
                     c->on_svc(inst_id, svc);
+                }
+            }
+            break;
+        }
+        case RecordKind::Objc: {
+            if (inst_id >= start_inst_id) {
+                auto objc = rec.as_objc();
+                for (auto* c : active) {
+                    c->on_objc(inst_id, objc);
                 }
             }
             break;
@@ -217,6 +244,7 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     }
 
     bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+    bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
 
     // Fallback to sequential if: no parallel collectors, no index, small trace, or v5 format
     if (par_collectors.empty() || index_ == nullptr ||
@@ -300,13 +328,13 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
 
     // Launch worker threads for shards[1..N-1]
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, num_gpr, i]() {
-            scan_shard_collectors(shards[i], num_gpr, shard_clone_ptrs[i], progress_counter);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, num_gpr, is_v6, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, shard_clone_ptrs[0], progress_counter);
+    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter);
 
     // Report progress while waiting
     if (progress_fn_) {

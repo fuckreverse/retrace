@@ -28,11 +28,23 @@ public:
         (void)inst_id; (void)inst;
     }
 
+    /// Called for Anchor records (full register snapshot).
+    /// inst_id is the instruction count at the point of the anchor.
+    virtual void on_anchor(uint64_t inst_id, const AnchorView& anchor) {
+        (void)inst_id; (void)anchor;
+    }
+
     /// Called for Code records encountered during the scan.
     virtual void on_code(const CodeView& code) { (void)code; }
 
     /// Called for Svc records.
     virtual void on_svc(uint64_t inst_id, const SvcView& svc) { (void)inst_id; (void)svc; }
+
+    /// Called for Objc records (Objective-C message sends).
+    /// inst_id is the current instruction counter at the point of the record.
+    virtual void on_objc(uint64_t inst_id, const ObjcView& objc) {
+        (void)inst_id; (void)objc;
+    }
 
     /// Called for Thread records (thread context switch).
     virtual void on_thread(uint64_t inst_id, const ThreadView& thread) {
