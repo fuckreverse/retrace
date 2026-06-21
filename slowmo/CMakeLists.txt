@@ -57,6 +57,8 @@ option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint anal
 option(TENET_ENABLE_YARA "Enable YARA rule engine for pattern detection" ON)
 option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" ON)
 option(TENET_BUILD_TESTS "Build unit tests" ON)
+option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
+option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
 
 # ─── FetchContent global shared cache ──────────────────────────────────────
 # All build trees (build/, build-triton/, build-no-triton/, …) share a single
@@ -263,6 +265,18 @@ if(TENET_ENABLE_TRITON)
     message(STATUS "Triton enabled: ${TRITON_LIBRARY}")
 endif()
 
+# pybind11 (optional - for Python bindings)
+if(TENET_ENABLE_PYTHON)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG        v2.12.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(pybind11)
+    message(STATUS "Python bindings enabled")
+endif()
+
 # ─── Main library (tenet_lib) ───────────────────────────────────────────────
 add_library(tenet_lib STATIC
     src/io/trace_reader.cpp
@@ -307,6 +321,11 @@ add_library(tenet_lib STATIC
     src/analysis/passes/window_stats_pass.cpp
     src/analysis/passes/entropy_pass.cpp
     src/analysis/passes/literal_search_pass.cpp
+    src/analysis/passes/cache_sim_pass.cpp
+    src/analysis/passes/yara_mem_scan_pass.cpp
+    src/analysis/passes/thread_filter_pass.cpp
+    src/io/rpc_server.cpp
+    src/io/streaming_index.cpp
     src/tui/tui_app.cpp
     src/tui/hex_dump_view.cpp
 )
@@ -372,8 +391,11 @@ add_library(tenet_gui_lib STATIC
     src/gui/panels_callstack_funcs.cpp
     src/gui/panels_analysis.cpp
     src/gui/panels_cfg.cpp
-    src/gui/panels_misc.cpp
-    src/gui/popups.cpp
+src/gui/panels_misc.cpp
+src/gui/panels_reg_timeline.cpp
+src/gui/panels_dwarf.cpp
+src/gui/panels_trace_diff.cpp
+src/gui/popups.cpp
 )
 
     # Ensure gui_app.mm is compiled as Objective-C++ (for Metal __bridge casts)
@@ -409,6 +431,21 @@ target_link_libraries(bench_all_passes PRIVATE tenet_lib)
 
 add_executable(bench_loop_only bench/bench_loop_only.cpp)
 target_link_libraries(bench_loop_only PRIVATE tenet_lib)
+
+# ─── Python bindings (tenet._core pybind11 module) ──────────────────────────
+if(TENET_ENABLE_PYTHON)
+    pybind11_add_module(tenet_core
+        src/python/tenet_bindings.cpp
+    )
+    target_link_libraries(tenet_core PRIVATE tenet_lib)
+    target_compile_definitions(tenet_core PRIVATE TENET_HAS_PYTHON=1)
+    # Install into python/tenet/ so `import tenet` works from the build tree
+    set_target_properties(tenet_core PROPERTIES
+        OUTPUT_NAME "_core"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/tenet"
+    )
+    message(STATUS "Python bindings target: tenet_core")
+endif()
 
 # ─── Tests ──────────────────────────────────────────────────────────────────
 if(TENET_BUILD_TESTS)

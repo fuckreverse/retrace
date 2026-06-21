@@ -38,7 +38,9 @@ endfunction()
 # ─── Unit tests: core layer ─────────────────────────────────────────────────
 tenet_add_test(test_common_lru_cache       unit/test_common_lru_cache.cpp)
 tenet_add_test(test_io_trace_reader        unit/test_io_trace_reader.cpp)
+tenet_add_test(test_io_trace_reader_v5     unit/test_io_trace_reader_v5.cpp)
 tenet_add_test(test_io_trace_reader_v6     unit/test_io_trace_reader_v6.cpp)
+tenet_add_test(test_io_trace_reader_special unit/test_io_trace_reader_special.cpp)
 tenet_add_test(test_core_register_file     unit/test_core_register_file.cpp)
 tenet_add_test(test_core_instruction_decoder unit/test_core_instruction_decoder.cpp)
 tenet_add_test(test_core_memory_model      unit/test_core_memory_model.cpp)
@@ -53,6 +55,8 @@ tenet_add_test(test_pass_function          unit/test_pass_function.cpp)
 tenet_add_test(test_pass_call_graph        unit/test_pass_call_graph.cpp)
 tenet_add_test(test_pass_string            unit/test_pass_string.cpp)
 tenet_add_test(test_pass_disassembly       unit/test_pass_disassembly.cpp)
+tenet_add_test(test_pass_window_stats      unit/test_pass_window_stats.cpp)
+tenet_add_test(test_pass_objc              unit/test_pass_objc.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
