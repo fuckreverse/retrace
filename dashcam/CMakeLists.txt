@@ -123,8 +123,14 @@ endif()
 #
 #   ctest --test-dir <build> --output-on-failure
 # ---------------------------------------------------------------------------
+option(QBDITRACE_BUILD_TESTS_INTEGRATION
+    "Build the macOS in-process integration test (requires QBDI + tenet headers)"
+    OFF)
+
 if(QBDITRACE_BUILD_TESTS)
   enable_testing()
+
+  # ── Legacy standalone tests (no Catch2 dependency) ─────────────────────────
 
   # test_trace_format: pure C, validates struct sizes / magic / field offsets.
   # All checks are _Static_assert (compile-time) plus a few runtime asserts.
@@ -139,4 +145,91 @@ if(QBDITRACE_BUILD_TESTS)
   find_package(Threads REQUIRED)
   target_link_libraries(test_ring_buffer PRIVATE Threads::Threads)
   add_test(NAME ring_buffer COMMAND test_ring_buffer)
+
+  # ── Catch2 unit tests ───────────────────────────────────────────────────────
+  # These require Catch2 3.x.  If tenet is available as a sibling CMake project
+  # it already fetches Catch2 — we can borrow its target when present.
+  # Otherwise, skip silently (legacy tests above cover the same code paths).
+  if(TARGET Catch2::Catch2WithMain)
+    include(Catch)
+
+    # test_trace_format_catch2: Catch2 version of the trace-format layout tests.
+    add_executable(test_trace_format_catch2
+        tests/unit/test_trace_format_catch2.cpp)
+    target_include_directories(test_trace_format_catch2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_trace_format_catch2 PRIVATE
+        Catch2::Catch2WithMain)
+    catch_discover_tests(test_trace_format_catch2 DISCOVERY_MODE PRE_TEST)
+
+    # test_ring_buffer_catch2: Catch2 version of the RingBuffer tests.
+    add_executable(test_ring_buffer_catch2
+        tests/unit/test_ring_buffer_catch2.cpp)
+    target_include_directories(test_ring_buffer_catch2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_ring_buffer_catch2 PRIVATE
+        Catch2::Catch2WithMain Threads::Threads)
+    catch_discover_tests(test_ring_buffer_catch2 DISCOVERY_MODE PRE_TEST)
+  endif()
+
+  # ── macOS arm64 in-process integration test ─────────────────────────────────
+  # Builds only on Apple arm64 when the QBDI static libs are present.
+  # Optionally links against tenet_lib for full qbditrace+tenet joint tests
+  # (QBDITRACE_TENET_INTEGRATION=1) when tenet is configured as a sibling.
+  if(QBDITRACE_BUILD_TESTS_INTEGRATION AND APPLE AND
+     CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" AND
+     QBDI_STATIC_LIB AND EXISTS "${QBDI_STATIC_LIB}")
+
+    set(_integ_libs
+        ${QBDI_STATIC_LIB}
+        Threads::Threads)
+
+    get_filename_component(_qbdi_libdir "${QBDI_STATIC_LIB}" DIRECTORY)
+    if(EXISTS "${_qbdi_libdir}/libqbdi-llvm.a")
+      list(APPEND _integ_libs "${_qbdi_libdir}/libqbdi-llvm.a")
+    endif()
+
+    set(_integ_defs "")
+    set(_integ_include_dirs
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${QBDI_INCLUDE_DIR})
+    if(QBDI_BUILD_INCLUDE_DIR)
+      list(APPEND _integ_include_dirs ${QBDI_BUILD_INCLUDE_DIR})
+    endif()
+
+    # Optional tenet integration: link against tenet_lib if available
+    if(TARGET tenet_lib AND TARGET Catch2::Catch2WithMain)
+      list(APPEND _integ_libs tenet_lib Catch2::Catch2WithMain)
+      list(APPEND _integ_defs QBDITRACE_TENET_INTEGRATION=1)
+      # tenet source include dirs (for io/, core/, analysis/ headers)
+      get_target_property(_tenet_incs tenet_lib INCLUDE_DIRECTORIES)
+      if(_tenet_incs)
+        list(APPEND _integ_include_dirs ${_tenet_incs})
+      endif()
+    elseif(TARGET Catch2::Catch2WithMain)
+      list(APPEND _integ_libs Catch2::Catch2WithMain)
+    endif()
+
+    add_executable(test_qbditrace_macos
+        tests/integration/test_qbditrace_macos.cpp
+        QBDITrace.cpp)
+
+    target_include_directories(test_qbditrace_macos PRIVATE
+        ${_integ_include_dirs})
+    target_compile_definitions(test_qbditrace_macos PRIVATE
+        ${_integ_defs})
+    target_link_libraries(test_qbditrace_macos PRIVATE
+        ${_integ_libs}
+        "-framework Foundation" "-framework CoreFoundation")
+    target_compile_options(test_qbditrace_macos PRIVATE -O2)
+
+    if(TARGET Catch2::Catch2WithMain)
+      include(Catch)
+      catch_discover_tests(test_qbditrace_macos
+          TEST_PREFIX "qbditrace_macos::"
+          DISCOVERY_MODE PRE_TEST)
+    else()
+      add_test(NAME qbditrace_macos COMMAND test_qbditrace_macos)
+    endif()
+  endif()
 endif()
