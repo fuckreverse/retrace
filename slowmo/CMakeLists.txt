@@ -281,8 +281,9 @@ endif()
 add_library(tenet_lib STATIC
     src/io/trace_reader.cpp
     src/io/code_table.cpp
-    src/io/index_builder.cpp
-    src/core/register_file.cpp
+src/io/index_builder.cpp
+src/io/recent_files.cpp
+src/core/register_file.cpp
     src/core/instruction_decoder.cpp
     src/core/memory_model.cpp
     src/core/breakpoint_engine.cpp

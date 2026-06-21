@@ -6,12 +6,14 @@
 #include "gui/gui_app.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/loop_pass.h"
+#include "io/recent_files.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
 
 #include <fmt/core.h>
 
+#include <ctime>
 #include <string>
 
 namespace tenet {
@@ -24,6 +26,60 @@ void GuiApp::render_menu_bar() {
             if (ImGui::MenuItem("Open Trace...", "Cmd+O")) {
                 // TODO: file dialog integration
             }
+
+            // ── Recent files sub-menu ──────────────────────────────────────
+            auto recent = RecentFiles::load();
+            bool has_recent = !recent.empty();
+            if (!has_recent) ImGui::BeginDisabled();
+            if (ImGui::BeginMenu("Open Recent")) {
+                for (const auto& entry : recent.entries()) {
+                    // Format: "module_name  (N inst)  – /path/to/trace.bin"
+                    // Shorten path to last 2 components for readability
+                    std::string display;
+                    {
+                        auto p = entry.path;
+                        // Find last two path separators
+                        auto s2 = p.rfind('/');
+                        if (s2 != std::string::npos && s2 > 0) {
+                            auto s1 = p.rfind('/', s2 - 1);
+                            if (s1 != std::string::npos) {
+                                p = "\xe2\x80\xa6" + p.substr(s1);  // … + tail
+                            }
+                        }
+                        // Format timestamp as "YYYY-MM-DD HH:MM"
+                        char ts_buf[24] = {};
+                        if (entry.last_opened > 0) {
+                            time_t t = static_cast<time_t>(entry.last_opened);
+                            struct tm tm_info{};
+                            localtime_r(&t, &tm_info);
+                            strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M", &tm_info);
+                        }
+                        display = fmt::format("{}   ({} inst)  {}",
+                            entry.module_name.empty() ? p : entry.module_name,
+                            entry.inst_count, ts_buf);
+                    }
+                    if (ImGui::MenuItem(display.c_str())) {
+                        // Show the full path as tooltip even though we can't
+                        // reload in this session (trace is already open)
+                        // In a future implementation, this would re-open tenet
+                        // with the selected trace. For now, copy path to clipboard.
+                        ImGui::SetClipboardText(entry.path.c_str());
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s\n(path copied to clipboard on click)",
+                                          entry.path.c_str());
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recent Files")) {
+                    // Overwrite with empty list
+                    RecentFiles empty;
+                    empty.save();
+                }
+                ImGui::EndMenu();
+            }
+            if (!has_recent) ImGui::EndDisabled();
+
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Cmd+Q")) {
                 running_ = false;

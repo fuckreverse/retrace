@@ -39,6 +39,15 @@ GuiApp::GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     : reader_(reader), index_(index), code_table_(code_table),
       decoder_(decoder), regfile_(regfile), memory_(memory) {
     total_inst_ = index.inst_count();
+
+    // Restore bookmarks from the index (persisted in RocksDB META CF)
+    bookmarks_ = index_.load_bookmarks();
+
+    // Restore last cursor position ("continue where you left off")
+    uint64_t last = index_.load_last_inst();
+    if (last > 0 && last < total_inst_) {
+        current_inst_ = last;
+    }
 }
 
 GuiApp::~GuiApp() {
@@ -128,6 +137,10 @@ bool GuiApp::init_imgui() {
 
 void GuiApp::shutdown() {
     if (!window_) return;  // Already shut down
+
+    // Persist bookmarks and last cursor position to the index database
+    index_.save_bookmarks(bookmarks_);
+    index_.save_last_inst(current_inst_);
 
     ImGui_ImplMetal_Shutdown();
     ImGui_ImplSDL3_Shutdown();

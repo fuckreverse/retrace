@@ -65,6 +65,14 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     hex_dump_view_ = std::make_unique<HexDumpView>(memory_);
     hex_dump_view_->set_time(0);
     hex_dump_view_->set_address(0);
+
+    // Restore bookmarks and last cursor position from the index
+    bookmarks_ = index_.load_bookmarks();
+    uint64_t last = index_.load_last_inst();
+    if (last > 0 && last < total_inst_) {
+        current_inst_ = last;
+        update_viewport();
+    }
 }
 
 // ─── Row fetching ───────────────────────────────────────────────────────────
@@ -2733,6 +2741,11 @@ int TuiApp::run() {
         fmt::print(stderr, "Run with -c for batch mode if TUI is unavailable.\n");
         return 1;
     }
+
+    // Persist bookmarks and last cursor position to the index database
+    index_.save_bookmarks(bookmarks_);
+    index_.save_last_inst(current_inst_);
+
     return 0;
 }
 

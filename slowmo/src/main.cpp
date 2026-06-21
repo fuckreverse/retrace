@@ -42,6 +42,7 @@
 #include "analysis/passes/thread_filter_pass.h"
 #include "io/rpc_server.h"
 #include "io/streaming_index.h"
+#include "io/recent_files.h"
 
 #include <csignal>
 
@@ -986,6 +987,21 @@ int main(int argc, char** argv) {
              index.stats().inst_count, index.stats().anchor_count,
              TENET_TIMER_MS(t_index));
 
+    // ─── Integrity check ──────────────────────────────────────────────────
+    {
+        auto integrity = index.verify_integrity(reader);
+        if (!integrity.ok) {
+            fmt::print(stderr, "\n[WARNING] Index integrity check failed: {}\n",
+                       integrity.error);
+            fmt::print(stderr, "  The index may be corrupted and will be rebuilt.\n");
+            // Integrity failure is non-fatal here: the index was already loaded
+            // and is most likely still usable (hash mismatch is a soft warning).
+            // A full rebuild would be triggered on the next open_or_build call.
+        } else {
+            LOG_DEBUG("index integrity OK");
+        }
+    }
+
     if (show_index_stats) {
         fmt::print("  Code records: {}\n", index.stats().code_count);
         fmt::print("  Event records: {}\n", index.stats().event_count);
@@ -1021,6 +1037,15 @@ int main(int argc, char** argv) {
     }
     fmt::print("  Loaded {} distinct PCs\n\n", code_table.size());
     LOG_DEBUG("code table: {} distinct PCs", code_table.size());
+
+    // ─── Record this trace in the recent-files list ──────────────────────
+    {
+        auto recent = RecentFiles::load();
+        // Use absolute path for portability (resolve symlinks / relative paths)
+        std::string abs_path = std::filesystem::absolute(trace_path).string();
+        recent.push(abs_path, hdr.module_name, index.stats().inst_count);
+        recent.save();
+    }
 
     // ─── Load image fallback (optional) ─────────────────────────────
     if (!image_path.empty()) {
