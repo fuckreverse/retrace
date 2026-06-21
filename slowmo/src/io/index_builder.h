@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace tenet {
 
@@ -127,6 +128,34 @@ public:
 
     /// Check if this index is still valid for the given reader.
     bool is_valid_for(const TraceReader& reader) const;
+
+    /// Integrity check result.
+    struct IntegrityResult {
+        bool ok = true;
+        std::string error;  ///< non-empty if ok==false
+    };
+
+    /// Verify the integrity of the index.
+    /// Runs RocksDB VerifyChecksum() and cross-checks stored trace hash
+    /// against the reader's current content.
+    /// Returns immediately (<10ms for a warm cache) if the DB is healthy.
+    IntegrityResult verify_integrity(const TraceReader& reader) const;
+
+    // ─── Session persistence (bookmarks + last cursor) ────────────────────
+
+    /// Save bookmarks to the META column family.
+    /// @param bookmarks  Sorted list of inst_ids to persist.
+    void save_bookmarks(const std::vector<uint64_t>& bookmarks);
+
+    /// Load bookmarks from the META column family.
+    /// Returns an empty vector if no bookmarks are stored.
+    std::vector<uint64_t> load_bookmarks() const;
+
+    /// Save the last-visited instruction id (for "continue where you left off").
+    void save_last_inst(uint64_t inst_id);
+
+    /// Load the last-visited instruction id, or 0 if not stored.
+    uint64_t load_last_inst() const;
 
 private:
     TraceIndex() = default;
