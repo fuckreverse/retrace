@@ -58,6 +58,17 @@ tenet_add_test(test_pass_disassembly       unit/test_pass_disassembly.cpp)
 tenet_add_test(test_pass_window_stats      unit/test_pass_window_stats.cpp)
 tenet_add_test(test_pass_objc              unit/test_pass_objc.cpp)
 
+# ─── Unit tests: newly-added analysis passes ────────────────────────────────
+tenet_add_test(test_pass_backward_taint    unit/test_pass_backward_taint.cpp)
+tenet_add_test(test_pass_entropy           unit/test_pass_entropy.cpp)
+tenet_add_test(test_pass_reg_timeline      unit/test_pass_reg_timeline.cpp)
+tenet_add_test(test_pass_cache_sim         unit/test_pass_cache_sim.cpp)
+tenet_add_test(test_pass_memory_snapshot   unit/test_pass_memory_snapshot.cpp)
+tenet_add_test(test_pass_loop_semantics    unit/test_pass_loop_semantics.cpp)
+tenet_add_test(test_pass_pattern           unit/test_pass_pattern.cpp)
+tenet_add_test(test_pass_thread_filter     unit/test_pass_thread_filter.cpp)
+tenet_add_test(test_pass_yara_mem_scan     unit/test_pass_yara_mem_scan.cpp)
+
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
 
