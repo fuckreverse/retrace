@@ -1,4 +1,5 @@
 #include "io/index_builder.h"
+#include "io/code_table.h"
 #include <rocksdb/table.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
@@ -6,7 +7,11 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <thread>
+#include <vector>
+#include <mutex>
 
 namespace tenet {
 
@@ -14,7 +19,14 @@ namespace tenet {
 // Bump this whenever TraceFormat struct sizes change, column families are
 // added/removed, or the encoding of keys/values in the DB changes.
 // This ensures stale caches from older builds are invalidated automatically.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 4;  // v4: mem CF prefix extractor 10→8, dedicated block cache
+//
+// v5: code_bytes CF + adaptive sparse interval + parallel build
+// v6: OFFSET CF now uses correct memacc size for v6 traces (HF_OLD_VALUE).
+//     Caches built before the fix used sizeof(qbditrace_memacc_t)=32 for all
+//     traces; v6 traces need sizeof(qbditrace_memacc_v6_t)=48. Any cache
+//     built with schema v5 that covers a v6 trace has wrong OFFSET entries.
+//     Bumping to v6 invalidates all such caches globally, forcing a rebuild.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 6;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -75,7 +87,8 @@ TraceIndex::TraceIndex(TraceIndex&& other) noexcept
       cf_handles_(std::move(other.cf_handles_)),
       stats_(other.stats_),
       db_path_(std::move(other.db_path_)),
-      anchors_(std::move(other.anchors_)) {
+      anchors_(std::move(other.anchors_)),
+      sparse_interval_(other.sparse_interval_) {
     other.cf_handles_.clear();
 }
 
@@ -89,20 +102,22 @@ TraceIndex& TraceIndex::operator=(TraceIndex&& other) noexcept {
         stats_ = other.stats_;
         db_path_ = std::move(other.db_path_);
         anchors_ = std::move(other.anchors_);
+        sparse_interval_ = other.sparse_interval_;
         other.cf_handles_.clear();
     }
     return *this;
 }
 
 rocksdb::ColumnFamilyHandle* TraceIndex::get_cf(const char* name) const {
-    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), mem_read(5), reg_writes(6)
-    if (std::strcmp(name, "default") == 0)     return cf_handles_[0];
-    if (std::strcmp(name, cf::META) == 0)      return cf_handles_[1];
-    if (std::strcmp(name, cf::OFFSET) == 0)    return cf_handles_[2];
-    if (std::strcmp(name, cf::ANCHOR) == 0)    return cf_handles_[3];
-    if (std::strcmp(name, cf::MEM_WRITE) == 0  && cf_handles_.size() > 4) return cf_handles_[4];
-    if (std::strcmp(name, cf::MEM_READ) == 0   && cf_handles_.size() > 5) return cf_handles_[5];
-    if (std::strcmp(name, cf::REG_WRITES) == 0 && cf_handles_.size() > 6) return cf_handles_[6];
+    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), mem_read(5), reg_writes(6), code_bytes(7)
+    if (std::strcmp(name, "default") == 0)      return cf_handles_[0];
+    if (std::strcmp(name, cf::META) == 0)       return cf_handles_[1];
+    if (std::strcmp(name, cf::OFFSET) == 0)     return cf_handles_[2];
+    if (std::strcmp(name, cf::ANCHOR) == 0)     return cf_handles_[3];
+    if (std::strcmp(name, cf::MEM_WRITE) == 0   && cf_handles_.size() > 4) return cf_handles_[4];
+    if (std::strcmp(name, cf::MEM_READ) == 0    && cf_handles_.size() > 5) return cf_handles_[5];
+    if (std::strcmp(name, cf::REG_WRITES) == 0  && cf_handles_.size() > 6) return cf_handles_[6];
+    if (std::strcmp(name, cf::CODE_BYTES) == 0  && cf_handles_.size() > 7) return cf_handles_[7];
     return nullptr;
 }
 
@@ -166,6 +181,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
             {cf::MEM_WRITE, make_mem_cf_opts()},
             {cf::MEM_READ,  make_mem_cf_opts()},
             {cf::REG_WRITES, rocksdb::ColumnFamilyOptions()},
+            {cf::CODE_BYTES, rocksdb::ColumnFamilyOptions()},
         };
 
         rocksdb::DB* raw_db = nullptr;
@@ -190,6 +206,17 @@ Result<TraceIndex> TraceIndex::open_or_build(
                 load_u64("total_records", idx.stats_.total_records);
                 load_u64("code_count", idx.stats_.code_count);
                 load_u64("event_count", idx.stats_.event_count);
+                // Restore adaptive sparse_interval_ (written since schema v5)
+                {
+                    std::string sv;
+                    uint64_t si_val = 256;
+                    if (idx.db_->Get(rocksdb::ReadOptions(), meta_cf,
+                                     "sparse_interval", &sv).ok() && sv.size() == 8) {
+                        std::memcpy(&si_val, sv.data(), 8);
+                    }
+                    idx.sparse_interval_ = si_val;
+                    idx.stats_.sparse_interval = static_cast<uint32_t>(si_val);
+                }
 
                 // Load anchor table into memory
                 auto* anchor_cf = idx.get_cf(cf::ANCHOR);
@@ -228,6 +255,28 @@ Result<TraceIndex> TraceIndex::open_or_build(
 }
 
 // ─── Full index build ─────────────────────────────────────────────────────
+//
+// P1.5: Parallel build — the trace file is partitioned at ANCHOR record
+// boundaries. Each shard scans its slice independently, producing a private
+// WriteBatch. Shards run on separate std::threads and are committed to
+// RocksDB in order after all threads finish.
+//
+// Sharding is safe because:
+//   - ANCHOR records are always at known file offsets (built into anchors_).
+//   - Each shard owns a disjoint [start_offset, end_offset) region.
+//   - inst_id ranges are likewise disjoint and known upfront from the anchor table.
+//   - SPARSE_INTERVAL entries are globally unique (keyed by inst_id).
+//
+// P1.6: Adaptive sparse interval — we choose SPARSE_INTERVAL so the sparse
+// offset index has at most TARGET_SPARSE_ENTRIES entries, bounding the RocksDB
+// lookup + linear scan overhead regardless of trace size.
+//
+// P1.7: v6 memacc struct size — the linear scan in offset_of_with_pc and
+// xref_pass uses the correct 48-byte size when HF_OLD_VALUE is set.
+//
+// P1.9: CODE_BYTES CF — raw instruction bytes are written to a dedicated CF
+// during the same single scan, so main.cpp can call load_code_table() instead
+// of performing a second full file traversal.
 
 Result<TraceIndex> TraceIndex::build(
     const TraceReader& reader,
@@ -236,7 +285,22 @@ Result<TraceIndex> TraceIndex::build(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Create RocksDB with column families
+    // ── P1.6: Compute adaptive sparse interval ────────────────────────────
+    // First pass: count INST records by scanning just the first 4KB of each
+    // mmap page so we can determine inst_count cheaply.  Actually, we don't
+    // know inst_count before scanning; instead, use file_size as a proxy:
+    // assume ~50 bytes/record on average to estimate.  After the full build
+    // we re-snapshot the actual value.
+    // For safety, start with the default (256) and keep it if we have no hint.
+    // We will recalculate and store the actual value at the end of the build.
+    constexpr uint64_t TARGET_SPARSE_ENTRIES = 65536;
+    // Rough inst_count estimate from file size (very conservative)
+    uint64_t est_inst_count = reader.file_size() / 20;  // 20B/inst avg
+    uint64_t adaptive_interval = est_inst_count / TARGET_SPARSE_ENTRIES;
+    if (adaptive_interval < SPARSE_MIN) adaptive_interval = SPARSE_MIN;
+    if (adaptive_interval > SPARSE_MAX) adaptive_interval = SPARSE_MAX;
+
+    // ── Create RocksDB with column families ───────────────────────────────
     rocksdb::Options opts;
     opts.create_if_missing = true;
     opts.create_missing_column_families = true;
@@ -251,25 +315,16 @@ Result<TraceIndex> TraceIndex::build(
 
     rocksdb::ColumnFamilyOptions mem_write_cf_opts;
     mem_write_cf_opts.compression = rocksdb::kLZ4Compression;
-    // mem_write CF uses SeekForPrev on [page(8B)|offset(2B)|inst_id(8B)] keys.
-    // Prefix bloom on the first 8 bytes (page only) is better suited to the
-    // SeekForPrev access pattern: queries scan backwards across multiple offsets
-    // within a page, so page-level bloom lets RocksDB skip entire SST files for
-    // pages that don't exist, while offset-level bloom would miss adjacent offsets.
     mem_write_cf_opts.prefix_extractor =
         std::shared_ptr<const rocksdb::SliceTransform>(
             rocksdb::NewFixedPrefixTransform(8));  // page(8) only — optimal for SeekForPrev
     rocksdb::BlockBasedTableOptions mem_table_opts;
     mem_table_opts.block_size = 4 * 1024;
-    // Dedicated 512MB block cache for mem_write/mem_read CFs.
-    // These CFs are the hottest during analysis passes (string scan, taint, etc.)
-    // and benefit from not sharing cache space with offset/anchor CFs.
     mem_table_opts.block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
     mem_table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
-    mem_table_opts.whole_key_filtering = false;  // use prefix bloom only
+    mem_table_opts.whole_key_filtering = false;
     mem_write_cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(mem_table_opts));
 
-    // reg_writes CF: dense sequential writes (one entry per reg_diff), use larger blocks
     rocksdb::ColumnFamilyOptions reg_writes_cf_opts;
     reg_writes_cf_opts.compression = rocksdb::kNoCompression;
     rocksdb::BlockBasedTableOptions reg_writes_table_opts;
@@ -279,16 +334,18 @@ Result<TraceIndex> TraceIndex::build(
 
     std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
         {"default", rocksdb::ColumnFamilyOptions()},
-        {cf::META, rocksdb::ColumnFamilyOptions()},
-        {cf::OFFSET, rocksdb::ColumnFamilyOptions()},
-        {cf::ANCHOR, rocksdb::ColumnFamilyOptions()},
-        {cf::MEM_WRITE, mem_write_cf_opts},
-        {cf::MEM_READ,  mem_write_cf_opts},  // same prefix-extractor/table config as mem_write
+        {cf::META,       rocksdb::ColumnFamilyOptions()},
+        {cf::OFFSET,     rocksdb::ColumnFamilyOptions()},
+        {cf::ANCHOR,     rocksdb::ColumnFamilyOptions()},
+        {cf::MEM_WRITE,  mem_write_cf_opts},
+        {cf::MEM_READ,   mem_write_cf_opts},
         {cf::REG_WRITES, reg_writes_cf_opts},
+        {cf::CODE_BYTES, rocksdb::ColumnFamilyOptions()},  // P1.9: CODE records
     };
 
     TraceIndex idx;
     idx.db_path_ = db_path;
+    idx.sparse_interval_ = adaptive_interval;
 
     rocksdb::DB* raw_db = nullptr;
     auto s = rocksdb::DB::Open(opts, db_path.string(), cf_descs,
@@ -298,111 +355,343 @@ Result<TraceIndex> TraceIndex::build(
     }
     idx.db_ = std::unique_ptr<rocksdb::DB>(raw_db);
 
-    // Sequential scan
     reader.advise_sequential();
 
-    // ── Performance: disable WAL during bulk build ──────────────────────────
-    // The index is fully reconstructible from the trace file, so WAL is pure
-    // overhead (fsync + write amplification). This alone saves 20-40% build time.
     rocksdb::WriteOptions write_opts;
     write_opts.disableWAL = true;
     write_opts.sync = false;
 
-    rocksdb::WriteBatch batch(256 * 1024);  // Pre-reserve batch memory
-    uint64_t inst_id = 0;
-    uint64_t total_records = 0;
-    const uint64_t file_size = reader.file_size();
-    const uint32_t num_gpr = reader.header().num_gpr;
+    const uint64_t file_size   = reader.file_size();
+    const uint32_t num_gpr     = reader.header().num_gpr;
+    const bool     is_v5       = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
+    const bool     is_v6       = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
 
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
-        auto rec = *it;
-        total_records++;
+    // P1.7: correct memacc struct size depending on format version
+    const size_t memacc_sz = is_v6
+        ? sizeof(qbditrace::qbditrace_memacc_v6_t)   // 48 bytes
+        : sizeof(qbditrace::qbditrace_memacc_t);      // 32 bytes
+    const size_t inst_hdr_sz = is_v5
+        ? sizeof(qbditrace::qbditrace_inst_head_v5_t) // 6 bytes
+        : sizeof(qbditrace::qbditrace_inst_head_t);   // 16 bytes
 
-        switch (rec.kind) {
-        case RecordKind::Inst: {
-            // Sparse offset: every SPARSE_INTERVAL instructions
-            if (inst_id % SPARSE_INTERVAL == 0) {
-                char key_buf[8];
-                batch.Put(idx.get_cf(cf::OFFSET),
-                         encode_u64_to(inst_id, key_buf),
-                         rocksdb::Slice(reinterpret_cast<const char*>(&rec.file_offset), 8));
+    // ── P1.5: Parallel build ──────────────────────────────────────────────
+    // Strategy:
+    //   1. First pass (serial, cheap): collect all ANCHOR offsets and inst_ids.
+    //      This is the same fast raw-pointer scan used by register_file.cpp.
+    //   2. Divide anchors into N shards (N = hw_concurrency, capped at 8).
+    //      Each shard owns [anchor[i].file_offset, anchor[i+1].file_offset).
+    //   3. Each shard thread scans its slice and produces a WriteBatch.
+    //   4. Main thread commits all batches in order.
+    //
+    // Note: OFFSET entries (sparse inst_id → offset) are globally keyed by
+    // inst_id, which is unique across shards, so there are no key conflicts.
+
+    // ── Phase 0: Collect anchor positions (serial, one scan) ───────────────
+    struct ShardBoundary {
+        uint64_t file_start;  // inclusive
+        uint64_t file_end;    // exclusive
+        uint64_t inst_id_start;
+    };
+
+    std::vector<ShardBoundary> shard_bounds;
+    {
+        // Collect all anchor positions by scanning the raw mmap.
+        // We also build the in-memory anchor table here (same data needed later).
+        struct RawAnchor {
+            uint64_t inst_id;
+            uint64_t file_offset;
+            uint64_t pc;  // absolute PC stored in the anchor
+        };
+        std::vector<RawAnchor> raw_anchors;
+        raw_anchors.reserve(4096);
+
+        uint64_t scan_id = 0;
+        const uint8_t* base = reader.data();
+        const uint8_t* end  = base + file_size;
+        const uint8_t* ptr  = base + sizeof(qbditrace::qbditrace_file_header_t);
+
+        while (ptr < end) {
+            auto kind = static_cast<RecordKind>(ptr[0]);
+            size_t rec_size = 0;
+            switch (kind) {
+            case RecordKind::Inst:
+                rec_size = inst_hdr_sz
+                    + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                    + ptr[3] * memacc_sz;
+                scan_id++;
+                break;
+            case RecordKind::Anchor: {
+                rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+                uint64_t foff = static_cast<uint64_t>(ptr - base);
+                raw_anchors.push_back({scan_id, foff, ah->pc});
+                break;
             }
-
-            // REG_WRITES inverted index: one entry per reg_diff.
-            // Key (10 bytes, big-endian): [u16 reg_index][u64 inst_id]
-            // This lets ProducerChainPass find the last writer of any register
-            // in O(log N) via SeekForPrev instead of O(N) linear scan.
-            {
-                auto* rw_cf = idx.get_cf(cf::REG_WRITES);
-                if (rw_cf) {
-                    auto inst = rec.as_inst();
-                    for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-                        auto diff = inst.reg_diff(d);
-                        // Build 10-byte big-endian key: reg(2B) + inst_id(8B)
-                        char rw_key[10];
-                        rw_key[0] = 0;
-                        rw_key[1] = static_cast<char>(diff.index);
-                        for (int i = 7; i >= 0; --i) {
-                            rw_key[2 + (7 - i)] = static_cast<char>((inst_id >> (i * 8)) & 0xFF);
-                        }
-                        batch.Put(rw_cf,
-                                  rocksdb::Slice(rw_key, 10),
-                                  rocksdb::Slice());  // value is empty
-                    }
-                }
+            case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
+            case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
+            case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
+            case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
+            case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
+            default: rec_size = 1; break;
             }
-
-            inst_id++;
-            break;
-        }
-        case RecordKind::Anchor: {
-            // Store anchor: keyed by the inst_id at which it appears
-            // The anchor provides state for the NEXT instruction (inst_id at this point)
-            char anchor_key_buf[8];
-            batch.Put(idx.get_cf(cf::ANCHOR),
-                     encode_u64_to(inst_id, anchor_key_buf),
-                     rocksdb::Slice(reinterpret_cast<const char*>(&rec.file_offset), 8));
-            idx.anchors_.push_back({inst_id, rec.file_offset});
-            idx.stats_.anchor_count++;
-            break;
-        }
-        case RecordKind::Code:
-            idx.stats_.code_count++;
-            break;
-        case RecordKind::Event:
-            idx.stats_.event_count++;
-            break;
-        default:
-            break;
+            if (rec_size == 0) break;  // guard against corrupt records
+            ptr += rec_size;
         }
 
-        // ── Performance: flush every 100K records instead of 10K ─────────────
-        // Amortizes WriteBatch overhead. For a 10M-record trace:
-        //   Old: 1000 writes × WAL fsync each = ~10s overhead
-        //   New: 100 writes × no WAL = ~0.1s overhead
-        if (total_records % 100000 == 0) {
-            auto ws = idx.db_->Write(write_opts, &batch);
-            if (!ws.ok()) {
-                return Error::rocksdb_error(ws.ToString());
-            }
-            batch.Clear();
+        // Populate in-memory anchor table
+        for (const auto& a : raw_anchors) {
+            idx.anchors_.push_back({a.inst_id, a.file_offset});
+        }
+        // anchors_ will be sorted after build
 
-            if (progress) {
-                progress(rec.file_offset, file_size);
+        // P1.6 fix: recompute sparse_interval_ from the EXACT inst_count
+        // obtained by Phase 0 scanning. The initial adaptive_interval was
+        // estimated from file_size/20, which can differ significantly from
+        // the actual count. If sparse_interval_ at build time != query time,
+        // the OFFSET CF keys will be at wrong positions and offset_of() will
+        // FALLBACK for most inst_ids.
+        uint64_t exact_interval = scan_id / TARGET_SPARSE_ENTRIES;
+        if (exact_interval < SPARSE_MIN) exact_interval = SPARSE_MIN;
+        if (exact_interval > SPARSE_MAX) exact_interval = SPARSE_MAX;
+        idx.sparse_interval_ = exact_interval;
+        idx.stats_.sparse_interval = static_cast<uint32_t>(exact_interval);
+
+        // Compute shard boundaries: split anchor list evenly across threads.
+        const uint32_t hw_threads = std::min(
+            static_cast<uint32_t>(std::thread::hardware_concurrency()),
+            uint32_t(8));
+        // Use parallel only if we have enough anchors (at least 4 per shard)
+        const uint32_t num_shards = (raw_anchors.size() >= hw_threads * 4)
+            ? hw_threads : 1u;
+        idx.stats_.num_shards = num_shards;
+
+        const uint64_t records_start = sizeof(qbditrace::qbditrace_file_header_t);
+        if (num_shards == 1 || raw_anchors.empty()) {
+            shard_bounds.push_back({records_start, file_size, 0});
+        } else {
+            // Distribute anchors roughly evenly, always starting each shard at
+            // an ANCHOR boundary so the shard's first record is a full snapshot.
+            size_t anchors_per_shard = raw_anchors.size() / num_shards;
+            for (uint32_t s = 0; s < num_shards; s++) {
+                size_t anchor_idx = s * anchors_per_shard;
+                // First shard starts from beginning of records (before first anchor)
+                uint64_t fstart = (s == 0)
+                    ? records_start
+                    : raw_anchors[anchor_idx].file_offset;
+                uint64_t fend = (s + 1 < num_shards)
+                    ? raw_anchors[(s + 1) * anchors_per_shard].file_offset
+                    : file_size;
+                uint64_t id_start = (s == 0) ? 0 : raw_anchors[anchor_idx].inst_id;
+                shard_bounds.push_back({fstart, fend, id_start});
             }
         }
     }
 
-    // Final flush
-    if (batch.Count() > 0) {
-        auto ws = idx.db_->Write(write_opts, &batch);
+    // ── Phase 1: Parallel shard processing ────────────────────────────────
+    // Each shard produces one WriteBatch.  We use atomic progress counter
+    // for the progress callback.
+    const uint32_t num_shards = static_cast<uint32_t>(shard_bounds.size());
+
+    struct ShardResult {
+        rocksdb::WriteBatch batch;
+        uint64_t inst_count    = 0;  // INST records in this shard
+        uint64_t anchor_count  = 0;
+        uint64_t code_count    = 0;
+        uint64_t event_count   = 0;
+        uint64_t total_records = 0;
+        std::string error;  // non-empty on failure
+    };
+
+    std::vector<ShardResult> shard_results(num_shards);
+    std::atomic<uint64_t> progress_bytes{0};
+
+    auto process_shard = [&](uint32_t shard_idx) {
+        auto& result = shard_results[shard_idx];
+        const auto& bounds = shard_bounds[shard_idx];
+        result.batch = rocksdb::WriteBatch(256 * 1024);
+
+        auto* offset_cf   = idx.get_cf(cf::OFFSET);
+        auto* anchor_cf   = idx.get_cf(cf::ANCHOR);
+        auto* rw_cf       = idx.get_cf(cf::REG_WRITES);
+        auto* code_cf     = idx.get_cf(cf::CODE_BYTES);
+
+        const uint8_t* base = reader.data();
+        const uint8_t* ptr  = base + bounds.file_start;
+        const uint8_t* end  = base + bounds.file_end;
+
+        uint64_t inst_id = bounds.inst_id_start;
+        uint64_t batch_writes = 0;
+
+        while (ptr < end) {
+            auto kind = static_cast<RecordKind>(ptr[0]);
+            size_t rec_size = 0;
+
+            switch (kind) {
+            case RecordKind::Inst: {
+                // P1.6: Sparse offset with adaptive interval
+                if (inst_id % idx.sparse_interval_ == 0) {
+                    uint64_t foff = static_cast<uint64_t>(ptr - base);
+                    char key_buf[8];
+                    result.batch.Put(offset_cf,
+                        encode_u64_to(inst_id, key_buf),
+                        rocksdb::Slice(reinterpret_cast<const char*>(&foff), 8));
+                    batch_writes++;
+                }
+                // REG_WRITES inverted index
+                if (rw_cf) {
+                    uint8_t n_regdiff = ptr[2];
+                    const uint8_t* diffs = ptr + inst_hdr_sz;
+                    for (uint8_t d = 0; d < n_regdiff; d++) {
+                        const auto* rd = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(
+                            diffs + d * sizeof(qbditrace::qbditrace_regdiff_t));
+                        char rw_key[10];
+                        rw_key[0] = 0;
+                        rw_key[1] = static_cast<char>(rd->reg_index);
+                        for (int i = 7; i >= 0; --i)
+                            rw_key[2 + (7 - i)] = static_cast<char>((inst_id >> (i * 8)) & 0xFF);
+                        result.batch.Put(rw_cf,
+                            rocksdb::Slice(rw_key, 10),
+                            rocksdb::Slice());
+                        batch_writes++;
+                    }
+                }
+                // P1.7: use correct memacc_sz for record size
+                rec_size = inst_hdr_sz
+                    + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                    + ptr[3] * memacc_sz;
+                inst_id++;
+                result.inst_count++;
+                break;
+            }
+            case RecordKind::Anchor: {
+                rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                uint64_t foff = static_cast<uint64_t>(ptr - base);
+                char anchor_key_buf[8];
+                result.batch.Put(anchor_cf,
+                    encode_u64_to(inst_id, anchor_key_buf),
+                    rocksdb::Slice(reinterpret_cast<const char*>(&foff), 8));
+                batch_writes++;
+                result.anchor_count++;
+                break;
+            }
+            case RecordKind::Code: {
+                // P1.9: Store raw instruction bytes in CODE_BYTES CF
+                uint8_t code_size = ptr[1];
+                rec_size = sizeof(qbditrace::qbditrace_code_head_t) + code_size;
+                if (code_cf && code_size == 4) {
+                    const auto* ch = reinterpret_cast<const qbditrace::qbditrace_code_head_t*>(ptr);
+                    char key_buf[8];
+                    result.batch.Put(code_cf,
+                        encode_u64_to(ch->pc, key_buf),
+                        rocksdb::Slice(reinterpret_cast<const char*>(
+                            ptr + sizeof(qbditrace::qbditrace_code_head_t)), 4));
+                    batch_writes++;
+                }
+                result.code_count++;
+                break;
+            }
+            case RecordKind::Event:
+                rec_size = sizeof(qbditrace::qbditrace_event_head_t);
+                result.event_count++;
+                break;
+            case RecordKind::Thread:
+                rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
+                break;
+            case RecordKind::Svc:
+                rec_size = sizeof(qbditrace::qbditrace_svc_head_t);
+                break;
+            case RecordKind::Objc:
+                rec_size = sizeof(qbditrace::qbditrace_objc_head_t);
+                break;
+            default:
+                rec_size = 1;
+                break;
+            }
+
+            result.total_records++;
+
+            // Periodic intermediate flush (per-shard, to bound memory usage)
+            if (batch_writes >= 100000) {
+                // Can't write to DB from multiple threads; defer to main thread.
+                // Instead just track that we've accumulated a large batch.
+                // The main thread will commit in order after all threads finish.
+                batch_writes = 0;
+            }
+
+            if (rec_size == 0) break;
+            ptr += rec_size;
+
+            // Update shared progress counter (relaxed — just for display)
+            progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
+        }
+    };
+
+    if (num_shards == 1) {
+        // Single-threaded path (small trace or no anchors)
+        process_shard(0);
+        if (progress) progress(file_size, file_size);
+    } else {
+        std::atomic<uint32_t> workers_done{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_shards);
+        for (uint32_t s = 0; s < num_shards; s++) {
+            workers.emplace_back([&, s]() {
+                process_shard(s);
+                workers_done.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        // Progress callback on main thread while workers run.
+        // Poll every 50ms; exit once all workers have incremented workers_done.
+        if (progress) {
+            while (workers_done.load(std::memory_order_relaxed) < num_shards) {
+                uint64_t done = progress_bytes.load(std::memory_order_relaxed);
+                progress(done, file_size);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            progress(file_size, file_size);  // final 100%
+        }
+        for (auto& w : workers) w.join();
+    }
+
+    // Check for shard errors
+    for (const auto& r : shard_results) {
+        if (!r.error.empty()) {
+            return Error::rocksdb_error(r.error);
+        }
+    }
+
+    // ── Phase 2: Commit all shard batches to RocksDB (serial, in order) ───
+    // RocksDB MVCC guarantees that concurrent Puts from different batches
+    // with the same key are ordered by sequence number. Since each shard
+    // operates on disjoint inst_id ranges, there are no key conflicts and
+    // the commit order doesn't matter for correctness. We commit in shard
+    // order for reproducibility.
+    for (auto& r : shard_results) {
+        if (r.batch.Count() == 0) continue;
+        auto ws = idx.db_->Write(write_opts, &r.batch);
         if (!ws.ok()) {
             return Error::rocksdb_error(ws.ToString());
         }
     }
 
-    idx.stats_.inst_count = inst_id;
+    // ── Phase 3: Aggregate statistics ────────────────────────────────────
+    uint64_t inst_id = 0, total_records = 0;
+    for (auto& r : shard_results) {
+        inst_id       += r.inst_count;
+        total_records += r.total_records;
+        idx.stats_.anchor_count += r.anchor_count;
+        idx.stats_.code_count   += r.code_count;
+        idx.stats_.event_count  += r.event_count;
+    }
+    idx.stats_.inst_count    = inst_id;
     idx.stats_.total_records = total_records;
+
+    // P1.6: Re-compute adaptive interval from actual inst_count and persist it.
+    uint64_t actual_interval = inst_id / TARGET_SPARSE_ENTRIES;
+    if (actual_interval < SPARSE_MIN) actual_interval = SPARSE_MIN;
+    if (actual_interval > SPARSE_MAX) actual_interval = SPARSE_MAX;
+    idx.sparse_interval_ = actual_interval;
+    idx.stats_.sparse_interval = static_cast<uint32_t>(actual_interval);
 
     // Write metadata
     auto* meta_cf = idx.get_cf(cf::META);
@@ -414,8 +703,6 @@ Result<TraceIndex> TraceIndex::build(
     uint64_t fsize = reader.file_size();
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "file_size",
                  rocksdb::Slice(reinterpret_cast<const char*>(&fsize), 8));
-    // Persist the remaining counters so open_or_build can restore them on a
-    // cache hit instead of reporting 0 for everything except inst_count.
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "total_records",
                  rocksdb::Slice(reinterpret_cast<const char*>(&total_records), 8));
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "anchor_count",
@@ -424,12 +711,16 @@ Result<TraceIndex> TraceIndex::build(
                  rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.code_count), 8));
     idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "event_count",
                  rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.event_count), 8));
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "sparse_interval",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&actual_interval), 8));
+    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "num_shards",
+                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.num_shards), 4));
 
     auto t1 = std::chrono::steady_clock::now();
     idx.stats_.build_seconds =
         std::chrono::duration<double>(t1 - t0).count();
 
-    // Sort anchors
+    // Sort anchors (gathered from Phase 0 raw scan, already in order but sort for safety)
     std::sort(idx.anchors_.begin(), idx.anchors_.end(),
               [](const auto& a, const auto& b) { return a.inst_id < b.inst_id; });
 
@@ -445,14 +736,16 @@ uint64_t TraceIndex::offset_of(uint64_t inst_id, const TraceReader& reader) cons
 }
 
 TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const TraceReader& reader) const {
-    // Find the sparse entry at or before inst_id
-    uint64_t base_id = (inst_id / SPARSE_INTERVAL) * SPARSE_INTERVAL;
+    // Find the sparse entry at or before inst_id (adaptive interval)
+    const uint64_t si = sparse_interval_;
+    uint64_t base_id = (inst_id / si) * si;
 
     std::string value;
     auto s = db_->Get(rocksdb::ReadOptions(), get_cf(cf::OFFSET),
                       encode_u64(base_id), &value);
     if (!s.ok() || value.size() < 8) {
         // Fallback: start from beginning
+        // FALLBACK: no sparse entry found
         return {sizeof(qbditrace::qbditrace_file_header_t), 0};
     }
 
@@ -491,9 +784,14 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
                     std::memcpy(&delta, wp + 4, 2);  // pc_delta at byte offset 4 in v5 head
                     running_pc += static_cast<int64_t>(delta);
                     walk_id++;
+                    // P1.7: use v6-aware memacc size
+                    const bool wis_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+                    const size_t wmacc_sz = wis_v6
+                        ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+                        : sizeof(qbditrace::qbditrace_memacc_t);
                     walk_offset += sizeof(qbditrace::qbditrace_inst_head_v5_t)
                         + wp[2] * sizeof(qbditrace::qbditrace_regdiff_t)
-                        + wp[3] * sizeof(qbditrace::qbditrace_memacc_t);
+                        + wp[3] * wmacc_sz;
                 } else if (wkind == RecordKind::Anchor) {
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(wp);
                     running_pc = ah->pc;
@@ -536,9 +834,14 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
                 : sizeof(qbditrace::qbditrace_inst_head_t);     // 16 bytes (with padding)
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
+            // P1.7: use v6-aware memacc size in linear scan
+            const bool is_v6_scan = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+            const size_t macc_scan_sz = is_v6_scan
+                ? sizeof(qbditrace::qbditrace_memacc_v6_t)   // 48 bytes
+                : sizeof(qbditrace::qbditrace_memacc_t);      // 32 bytes
             current_offset += hdr_size
                 + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
-                + n_mem     * sizeof(qbditrace::qbditrace_memacc_t);   // 32 bytes each
+                + n_mem     * macc_scan_sz;
         } else {
             // For non-INST records, use the generic byte_size() helper.
             // These records (Anchor, Code, Event, etc.) have the same layout in v4/v5.
@@ -657,6 +960,37 @@ uint64_t TraceIndex::find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
         }
     }
     return last_writer_id;
+}
+
+// ─── Query: load_code_table (P1.9) ─────────────────────────────────────────
+//
+// Populate a CodeTable from the CODE_BYTES column family.
+// This replaces the second full file scan that main.cpp previously did:
+//
+//   Old flow:  build index (1 pass)  +  scan file for CODE records (2nd pass)
+//   New flow:  build index (1 pass, CODE_BYTES CF populated inline)
+//              load_code_table() reads from RocksDB  ← zero extra file I/O
+
+uint64_t TraceIndex::load_code_table(CodeTable& out) const {
+    auto* cf = get_cf(cf::CODE_BYTES);
+    if (!cf || !db_) return 0;
+
+    rocksdb::ReadOptions ro;
+    ro.fill_cache = false;  // sequential scan — avoid polluting block cache
+    std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(ro, cf));
+
+    uint64_t count = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        if (it->key().size() != 8) continue;
+        if (it->value().size() != 4) continue;
+        // Decode big-endian PC key
+        uint64_t pc = decode_u64(it->key());
+        uint32_t opcode = 0;
+        std::memcpy(&opcode, it->value().data(), 4);
+        out.insert(pc, opcode);
+        count++;
+    }
+    return count;
 }
 
 }  // namespace tenet

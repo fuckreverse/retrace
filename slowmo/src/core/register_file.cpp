@@ -106,6 +106,7 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
     RegState state{};
     const uint32_t num_gpr = reader_.header().num_gpr;
     const bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+    const bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
 
     // ── Header sizes for record byte-size calculations ──
     // v4: qbditrace_inst_head_t  (kind+nzcv+n_regdiff+n_mem=4 + pad4 + pc=8 = 16 bytes)
@@ -114,6 +115,11 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
     const size_t inst_hdr_size = is_v5
         ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
         : sizeof(qbditrace::qbditrace_inst_head_t);
+    // v6 uses extended 48-byte memory access structs (with old_value fields).
+    // v4/v5 use the original 32-byte struct.
+    const size_t memacc_size = is_v6
+        ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+        : sizeof(qbditrace::qbditrace_memacc_t);
     // anchor: kind(1)+reserved(3)+pad(4)+pc(8) = 16, then num_gpr * 8
     const size_t anchor_total =
         sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
@@ -171,10 +177,11 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
             }
 
             // Advance pointer: header + diffs + mems
-            // sizeof(qbditrace_regdiff_t) = 16, sizeof(qbditrace_memacc_t) = 32
+            // sizeof(qbditrace_regdiff_t) = 16
+            // memacc_size = 32 (v4/v5) or 48 (v6 with HF_OLD_VALUE)
             size_t rec_size = inst_hdr_size
                 + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                + n_mem     * sizeof(qbditrace::qbditrace_memacc_t);
+                + n_mem     * memacc_size;
             ptr += rec_size;
 
             // Prefetch next record header into L1

@@ -25,6 +25,8 @@ struct IndexStats {
     uint64_t event_count = 0;
     uint64_t total_records = 0;
     double build_seconds = 0.0;
+    uint32_t sparse_interval = 256;  ///< actual SPARSE_INTERVAL used (adaptive)
+    uint32_t num_shards = 1;         ///< number of parallel build shards used
 };
 
 /// Column family names used in the RocksDB index.
@@ -47,6 +49,12 @@ namespace cf {
     // SeekForPrev on key=(reg, inst_id) returns the largest entry ≤ (reg, inst_id),
     // giving the most recent write of that register in O(log N) instead of O(N).
     constexpr const char* REG_WRITES = "reg_writes"; // (reg_idx << 48 | inst_id) → ""
+    // CODE_BYTES: stores raw instruction bytes extracted from REC_CODE records.
+    // Built in the same single pass as the main index, eliminating a second
+    // full file scan for CodeTable population (P1.9 optimization).
+    // Key: u64 runtime_pc (big-endian, 8 bytes)
+    // Value: u8 opcode[4]  (AArch64 instruction, little-endian)
+    constexpr const char* CODE_BYTES = "code_bytes"; // runtime_pc → 4-byte opcode
 }
 
 /// Manages the RocksDB-based trace index.
@@ -65,6 +73,8 @@ public:
     /// Open or build the index for a given trace file.
     /// If a valid cached index exists, opens it directly (< 50ms).
     /// Otherwise, performs a full sequential build.
+    /// The build is automatically parallelised over available CPU cores using
+    /// ANCHOR record boundaries as shard boundaries (P1.5 optimisation).
     static Result<TraceIndex> open_or_build(
         const TraceReader& reader,
         ProgressCallback progress = nullptr);
@@ -104,6 +114,11 @@ public:
     uint64_t find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
                                  const TraceReader& reader) const;
 
+    /// Populate a CodeTable from the embedded CODE_BYTES column family.
+    /// Call this instead of scanning the trace file a second time.
+    /// Returns the number of distinct PCs loaded (0 if CF absent or empty).
+    uint64_t load_code_table(class CodeTable& out) const;
+
     /// Get total instruction count in the trace.
     uint64_t inst_count() const { return stats_.inst_count; }
 
@@ -134,8 +149,14 @@ private:
     };
     std::vector<AnchorEntry> anchors_;
 
-    // Sparse offset granularity
-    static constexpr uint64_t SPARSE_INTERVAL = 256;
+    // Sparse offset granularity (adaptive: set at build time based on inst_count).
+    // Default 256; for large traces (>16M inst) this is increased to keep the
+    // sparse index ≤ 65536 entries and reduce RocksDB lookup overhead.
+    uint64_t sparse_interval_ = 256;
+
+    // Minimum and maximum allowed sparse interval values.
+    static constexpr uint64_t SPARSE_MIN = 64;
+    static constexpr uint64_t SPARSE_MAX = 4096;
 
     // Helper: get column family handle by name
     rocksdb::ColumnFamilyHandle* get_cf(const char* name) const;
@@ -145,6 +166,7 @@ public:
     rocksdb::DB* raw_db() const { return db_.get(); }
     rocksdb::ColumnFamilyHandle* mem_write_cf() const { return get_cf(cf::MEM_WRITE); }
     rocksdb::ColumnFamilyHandle* mem_read_cf() const { return get_cf(cf::MEM_READ); }
+    rocksdb::ColumnFamilyHandle* code_bytes_cf() const { return get_cf(cf::CODE_BYTES); }
 };
 
 }  // namespace tenet
