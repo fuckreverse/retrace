@@ -91,6 +91,14 @@ public:
     template<typename T>
     const T& require(std::string_view pass_name);
 
+    /// Try to get a pass result without triggering execution.
+    /// Returns nullptr if the pass was not registered, did not run, or failed.
+    /// Use this for optional dependencies — call the dependency explicitly in
+    /// dependencies() if you want it to run; use try_require in run() to
+    /// consume its result when it may or may not be present.
+    template<typename T>
+    const T* try_require(std::string_view pass_name);
+
     const PassResult& require_raw(std::string_view pass_name);
 
     // Range
@@ -263,6 +271,18 @@ template<typename T>
 const T& PassContext::require(std::string_view pass_name) {
     const auto& result = require_raw(pass_name);
     return result.get<T>();
+}
+
+template<typename T>
+const T* PassContext::try_require(std::string_view pass_name) {
+    // Check state without triggering execution
+    if (manager_.state(pass_name) != PassManager::PassState::Completed) {
+        return nullptr;
+    }
+    const auto& result = require_raw(pass_name);
+    if (!result.ok() || !result.data.has_value()) return nullptr;
+    const T* p = std::any_cast<T>(&result.data);
+    return p;
 }
 
 }  // namespace tenet

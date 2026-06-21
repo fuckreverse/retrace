@@ -2,6 +2,7 @@
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "core/memory_model.h"
+#include "common/entropy.h"
 
 #include <cmath>
 #include <cstring>
@@ -9,23 +10,10 @@
 
 namespace tenet {
 
-// ─── Shannon entropy calculation ──────────────────────────────────────────
+// ─── Shannon entropy: delegated to common/entropy.h ─────────────────────
 
 float EntropyPass::compute_entropy(const uint8_t* data, size_t len) {
-    if (len == 0) return 0.0f;
-
-    uint32_t freq[256] = {};
-    for (size_t i = 0; i < len; i++) {
-        freq[data[i]]++;
-    }
-
-    float entropy = 0.0f;
-    for (int i = 0; i < 256; i++) {
-        if (freq[i] == 0) continue;
-        float p = static_cast<float>(freq[i]) / len;
-        entropy -= p * std::log2(p);
-    }
-    return entropy;
+    return tenet::shannon_entropy(data, len);
 }
 
 // ─── Batch memory read (16 bytes at a time) ───────────────────────────────

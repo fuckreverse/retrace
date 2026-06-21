@@ -1,7 +1,9 @@
 #include "analysis/passes/window_stats_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
+#include "common/aarch64_classify.h"
 
 #include <ankerl/unordered_dense.h>
 #include <algorithm>
@@ -9,27 +11,201 @@
 
 namespace tenet {
 
-namespace {
+// OpcodeInfo and classify_opcode are now provided by common/aarch64_classify.h
+using OpcodeInfo = aarch64::OpcodeInfo;
 
-// Pre-computed classification from a 4-byte AArch64 opcode.
-struct OpcodeInfo {
-    uint16_t mnemonic_id;  // top 11 bits as grouping key
-    bool is_branch;
+namespace {
+inline OpcodeInfo classify_opcode(uint32_t opcode) noexcept {
+    return aarch64::OpcodeInfo::classify(opcode);
+}
+}  // anonymous namespace
+
+// ─── WindowStatsCollector ─────────────────────────────────────────────────
+
+/// Sequential TraceCollector that accumulates per-window statistics.
+class WindowStatsCollector final : public TraceCollector {
+public:
+    WindowStatsCollector(const WindowStatsConfig& cfg,
+                         CodeTable& code_table,
+                         uint64_t total_insts)
+        : cfg_(cfg)
+        , code_table_(code_table)
+        , total_insts_(total_insts)
+    {
+        window_size_ = cfg_.window_size;
+        stride_ = (cfg_.stride > 0) ? cfg_.stride : window_size_;
+    }
+
+    std::string_view name() const override { return "WindowStatsCollector"; }
+
+    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
+        result_ = WindowStatsResult{};
+        result_.window_size = window_size_;
+        result_.total_windows = (total_insts_ + stride_ - 1) / stride_;
+        result_.windows.reserve(result_.total_windows);
+
+        // Reset per-window accumulators
+        current_window_ = WindowSnapshot{};
+        current_window_.start_inst_id = 1;
+        window_inst_count_ = 0;
+        branch_count_ = 0;
+        inst_id_ = 0;
+        pc_cache_.clear();
+        pc_cache_.reserve(4096);
+        mnemonic_counts_.clear();
+        unique_pcs_.clear();
+        unique_pcs_.reserve(std::min(window_size_, uint64_t(16384)));
+        unique_mem_addrs_.clear();
+        unique_mem_addrs_.reserve(1024);
+        return true;
+    }
+
+    void on_code(const CodeView& /*code*/) override {
+        // Code records not needed — we use code_table for opcode lookup
+    }
+
+    void on_inst(uint64_t inst_id, const InstView& inst) override {
+        inst_id_ = inst_id + 1;  // Track for window boundary detection
+        window_inst_count_++;
+
+        // Track unique PCs
+        unique_pcs_.insert(inst.pc);
+
+        // Track register writes
+        if (cfg_.track_reg_activity) {
+            for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
+                auto diff = inst.reg_diff(d);
+                if (diff.index < 34) {
+                    current_window_.reg_write_counts[diff.index]++;
+                }
+            }
+        }
+
+        // Track memory accesses
+        if (cfg_.track_mem_hotspots) {
+            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                auto mem = inst.mem_access(m);
+                if (mem.type & 0x02) {
+                    current_window_.mem_write_count++;
+                } else {
+                    current_window_.mem_read_count++;
+                }
+                unique_mem_addrs_.insert(mem.addr);
+            }
+        }
+
+        // Classify instruction via cached opcode lookup
+        auto [cache_it, inserted] = pc_cache_.try_emplace(inst.pc, OpcodeInfo{0, false});
+        if (inserted) {
+            auto opcode_opt = code_table_.opcode_at(inst.pc);
+            if (opcode_opt) {
+                cache_it->second = classify_opcode(*opcode_opt);
+            }
+        }
+        const auto& info = cache_it->second;
+        mnemonic_counts_[info.mnemonic_id]++;
+        if (info.is_branch) branch_count_++;
+
+        // Check if window is complete
+        if (window_inst_count_ >= window_size_) {
+            flush_window(inst_id_);
+        }
+    }
+
+    void end() override {
+        // Handle partial last window
+        if (window_inst_count_ > 0) {
+            flush_window(inst_id_);
+        }
+
+        // Find hottest windows
+        if (!result_.windows.empty()) {
+            for (size_t i = 0; i < result_.windows.size(); i++) {
+                if (result_.windows[i].mem_read_count + result_.windows[i].mem_write_count >
+                    result_.windows[result_.hottest_mem_window].mem_read_count +
+                    result_.windows[result_.hottest_mem_window].mem_write_count) {
+                    result_.hottest_mem_window = i;
+                }
+                if (result_.windows[i].mnemonic_entropy >
+                    result_.windows[result_.most_diverse_window].mnemonic_entropy) {
+                    result_.most_diverse_window = i;
+                }
+                if (result_.windows[i].branch_density >
+                    result_.windows[result_.densest_branch_window].branch_density) {
+                    result_.densest_branch_window = i;
+                }
+            }
+        }
+    }
+
+    WindowStatsResult take_result() { return std::move(result_); }
+
+private:
+    void flush_window(uint64_t end_inst_id) {
+        current_window_.end_inst_id = end_inst_id;
+        current_window_.instruction_count = window_inst_count_;
+        current_window_.unique_pcs = unique_pcs_.size();
+        current_window_.unique_mem_addrs = unique_mem_addrs_.size();
+        current_window_.branch_density =
+            (window_inst_count_ > 0)
+            ? static_cast<float>(branch_count_) / window_inst_count_
+            : 0.0f;
+
+        // Compute mnemonic entropy
+        float entropy = 0.0f;
+        uint64_t total_mnem = 0;
+        for (const auto& [_, cnt] : mnemonic_counts_) total_mnem += cnt;
+        if (total_mnem > 0) {
+            for (const auto& [_, cnt] : mnemonic_counts_) {
+                float p = static_cast<float>(cnt) / total_mnem;
+                if (p > 0) entropy -= p * std::log2(p);
+            }
+        }
+        current_window_.mnemonic_entropy = entropy;
+
+        // Top mnemonics
+        std::vector<std::pair<uint16_t, uint64_t>> sorted_mnems(
+            mnemonic_counts_.begin(), mnemonic_counts_.end());
+        std::sort(sorted_mnems.begin(), sorted_mnems.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (uint32_t i = 0; i < cfg_.top_mnemonics && i < sorted_mnems.size(); i++) {
+            current_window_.top_mnemonics.push_back(
+                {sorted_mnems[i].first, sorted_mnems[i].second});
+        }
+
+        result_.windows.push_back(std::move(current_window_));
+
+        // Reset for next window
+        current_window_ = WindowSnapshot{};
+        current_window_.start_inst_id = end_inst_id + 1;
+        window_inst_count_ = 0;
+        branch_count_ = 0;
+        mnemonic_counts_.clear();
+        unique_pcs_.clear();
+        unique_mem_addrs_.clear();
+    }
+
+    const WindowStatsConfig& cfg_;
+    CodeTable& code_table_;
+    uint64_t total_insts_;
+    uint64_t window_size_ = 1000;
+    uint64_t stride_ = 1000;
+
+    // Per-window state
+    WindowSnapshot current_window_;
+    uint64_t window_inst_count_ = 0;
+    uint64_t branch_count_ = 0;
+    uint64_t inst_id_ = 0;
+
+    ankerl::unordered_dense::map<uint64_t, OpcodeInfo> pc_cache_;
+    ankerl::unordered_dense::map<uint16_t, uint64_t> mnemonic_counts_;
+    ankerl::unordered_dense::set<uint64_t> unique_pcs_;
+    ankerl::unordered_dense::set<uint64_t> unique_mem_addrs_;
+
+    WindowStatsResult result_;
 };
 
-OpcodeInfo classify_opcode(uint32_t opcode) {
-    OpcodeInfo info;
-    info.mnemonic_id = static_cast<uint16_t>(opcode >> 21);
-
-    uint32_t top6 = opcode >> 26;
-    info.is_branch = (top6 == 0x05 || top6 == 0x25 ||    // B, BL
-                      (opcode & 0xFF000010u) == 0x54000000u || // B.cond
-                      (opcode & 0xFFFFFC1Fu) == 0xD65F0000u || // RET
-                      (opcode & 0xFFFFFC1Fu) == 0xD63F0000u);  // BLR
-    return info;
-}
-
-}  // anonymous namespace
+// ─── WindowStatsPass::run ─────────────────────────────────────────────────
 
 PassResult WindowStatsPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
@@ -41,170 +217,27 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
         return PassResult::failed("Empty trace");
     }
 
-    const uint64_t window_size = cfg_.window_size;
-    const uint64_t stride = (cfg_.stride > 0) ? cfg_.stride : window_size;
-
-    WindowStatsResult result;
-    result.window_size = window_size;
-    result.total_windows = (total_insts + stride - 1) / stride;
-    result.windows.reserve(result.total_windows);
-
     ctx.progress(0.0f, "WindowStats: computing sliding window metrics...");
 
-    // ── Optimization 1: pc → OpcodeInfo cache ──────────────────────────────
-    // Avoids repeated code_table.code_at() + memcpy for the same PC.
-    // In tight loops the same PC hits thousands of times.
-    ankerl::unordered_dense::map<uint64_t, OpcodeInfo> pc_cache;
-    pc_cache.reserve(4096);
+    WindowStatsCollector collector(cfg_, code_table, total_insts);
 
-    // ── Optimization 2: ankerl dense sets for unique tracking ──────────────
-    // Open-addressing → no per-node heap allocation, better cache locality.
-    ankerl::unordered_dense::set<uint64_t> unique_pcs;
-    ankerl::unordered_dense::set<uint64_t> unique_mem_addrs;
-    unique_pcs.reserve(std::min(window_size, uint64_t(16384)));
-    unique_mem_addrs.reserve(1024);
-
-    // Per-window accumulators
-    ankerl::unordered_dense::map<uint16_t, uint64_t> mnemonic_counts;
-
-    WindowSnapshot current_window;
-    current_window.start_inst_id = 1;
-    uint64_t window_inst_count = 0;
-    uint64_t inst_id = 0;
-    uint64_t branch_count = 0;
-
-    reader.advise_sequential();
-
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-
-        inst_id++;
-        window_inst_count++;
-
-        auto inst = rec.as_inst();
-
-        // Track unique PCs
-        unique_pcs.insert(inst.pc);
-
-        // Track register writes
-        if (cfg_.track_reg_activity) {
-            for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-                auto diff = inst.reg_diff(d);
-                if (diff.index < 34) {
-                    current_window.reg_write_counts[diff.index]++;
-                }
-            }
+    TraceScanEngine local_engine(reader, total_insts, &index);
+    local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+        if (total > 0) {
+            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
         }
+    });
+    local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+    local_engine.add_collector(&collector);
 
-        // Track memory accesses
-        if (cfg_.track_mem_hotspots) {
-            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                auto mem = inst.mem_access(m);
-                if (mem.type & 0x02) {
-                    current_window.mem_write_count++;
-                } else {
-                    current_window.mem_read_count++;
-                }
-                unique_mem_addrs.insert(mem.addr);
-            }
-        }
+    local_engine.run();
 
-        // ── Classify instruction via cached opcode lookup ──────────────────
-        auto [cache_it, inserted] = pc_cache.try_emplace(inst.pc, OpcodeInfo{0, false});
-        if (inserted) {
-            // First time seeing this PC — look up code table
-            auto opcode_opt = code_table.opcode_at(inst.pc);
-            if (opcode_opt) {
-                cache_it->second = classify_opcode(*opcode_opt);
-            }
-        }
-        const auto& info = cache_it->second;
-        mnemonic_counts[info.mnemonic_id]++;
-        if (info.is_branch) branch_count++;
-
-        // Check if window is complete
-        if (window_inst_count >= window_size) {
-            current_window.end_inst_id = inst_id;
-            current_window.instruction_count = window_inst_count;
-            current_window.unique_pcs = unique_pcs.size();
-            current_window.unique_mem_addrs = unique_mem_addrs.size();
-            current_window.branch_density =
-                static_cast<float>(branch_count) / window_inst_count;
-
-            // Compute mnemonic entropy
-            float entropy = 0.0f;
-            uint64_t total_mnem = 0;
-            for (const auto& [_, cnt] : mnemonic_counts) total_mnem += cnt;
-            if (total_mnem > 0) {
-                for (const auto& [_, cnt] : mnemonic_counts) {
-                    float p = static_cast<float>(cnt) / total_mnem;
-                    if (p > 0) entropy -= p * std::log2(p);
-                }
-            }
-            current_window.mnemonic_entropy = entropy;
-
-            // Top mnemonics
-            std::vector<std::pair<uint16_t, uint64_t>> sorted_mnems(
-                mnemonic_counts.begin(), mnemonic_counts.end());
-            std::sort(sorted_mnems.begin(), sorted_mnems.end(),
-                      [](const auto& a, const auto& b) { return a.second > b.second; });
-            for (uint32_t i = 0; i < cfg_.top_mnemonics && i < sorted_mnems.size(); i++) {
-                current_window.top_mnemonics.push_back(
-                    {sorted_mnems[i].first, sorted_mnems[i].second});
-            }
-
-            result.windows.push_back(std::move(current_window));
-
-            // Reset for next window
-            current_window = WindowSnapshot{};
-            current_window.start_inst_id = inst_id + 1;
-            window_inst_count = 0;
-            branch_count = 0;
-            mnemonic_counts.clear();
-            unique_pcs.clear();
-            unique_mem_addrs.clear();
-        }
-
-        if (inst_id % 10000 == 0) {
-            ctx.progress(static_cast<float>(inst_id) / total_insts);
-        }
-    }
-
-    reader.advise_random();
-
-    // Handle partial last window
-    if (window_inst_count > 0) {
-        current_window.end_inst_id = inst_id;
-        current_window.instruction_count = window_inst_count;
-        current_window.unique_pcs = unique_pcs.size();
-        current_window.unique_mem_addrs = unique_mem_addrs.size();
-        current_window.branch_density =
-            (window_inst_count > 0) ? static_cast<float>(branch_count) / window_inst_count : 0;
-        result.windows.push_back(std::move(current_window));
-    }
-
-    // Find hottest windows
-    if (!result.windows.empty()) {
-        for (size_t i = 0; i < result.windows.size(); i++) {
-            if (result.windows[i].mem_read_count + result.windows[i].mem_write_count >
-                result.windows[result.hottest_mem_window].mem_read_count +
-                result.windows[result.hottest_mem_window].mem_write_count) {
-                result.hottest_mem_window = i;
-            }
-            if (result.windows[i].mnemonic_entropy >
-                result.windows[result.most_diverse_window].mnemonic_entropy) {
-                result.most_diverse_window = i;
-            }
-            if (result.windows[i].branch_density >
-                result.windows[result.densest_branch_window].branch_density) {
-                result.densest_branch_window = i;
-            }
-        }
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
     }
 
     ctx.progress(1.0f, "WindowStats: complete");
-    return PassResult::success(std::move(result));
+    return PassResult::success(collector.take_result());
 }
 
 }  // namespace tenet

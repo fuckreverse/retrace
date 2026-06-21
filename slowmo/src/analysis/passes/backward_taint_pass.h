@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "common/dataflow_types.h"
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -62,18 +63,7 @@ struct BackwardTaintEvent {
     std::vector<uint8_t> sink_tags;  // indices into BackwardTaintResult::sink_tags
 };
 
-/// An edge in the dataflow dependency graph.
-/// Represents: instruction `from_inst_id` produces data consumed by `to_inst_id`.
-struct DataflowEdge {
-    uint64_t from_inst_id;   // producer (earlier in time)
-    uint64_t to_inst_id;     // consumer (later in time, closer to sink)
-    uint8_t via_reg;         // the register through which data flows
-    uint64_t via_mem_addr;   // non-zero if data flows through memory
-
-    DataflowEdge() : from_inst_id(0), to_inst_id(0), via_reg(0), via_mem_addr(0) {}
-    DataflowEdge(uint64_t from, uint64_t to, uint8_t reg, uint64_t mem = 0)
-        : from_inst_id(from), to_inst_id(to), via_reg(reg), via_mem_addr(mem) {}
-};
+// DataflowEdge is defined in common/dataflow_types.h (included above).
 
 /// Backward taint analysis configuration.
 struct BackwardTaintConfig {

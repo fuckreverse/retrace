@@ -321,9 +321,16 @@ PassResult PatternPass::run(PassContext& ctx) {
 #endif
 
     // Phase 3: MERGED mnemonic-based detection (single pass)
-    // Previously this was 3 separate full-trace scans. Now it's 1.
-    ctx.progress(0.6f, "Pattern: merged mnemonic detection (single pass)...");
-    detect_all_mnemonic_patterns(ctx, result);
+    // Optimisation: if ConstantMaterializationPass already ran, we skip Detector3
+    // (MOVZ/MOVK sequence detection) and instead convert its precise results
+    // directly into PatternMatch entries.  This eliminates a redundant full-trace scan.
+    const auto* constmat = ctx.try_require<ConstantMaterializationResult>("constant_materialization");
+    if (constmat) {
+        ctx.progress(0.6f, "Pattern: merged mnemonic detection (Detector3 skipped — using constmat)...");
+    } else {
+        ctx.progress(0.6f, "Pattern: merged mnemonic detection (single pass)...");
+    }
+    detect_all_mnemonic_patterns(ctx, result, constmat);
 
     // Phase 4: Build category index
     build_category_index(result);
@@ -335,7 +342,52 @@ PassResult PatternPass::run(PassContext& ctx) {
 
 // ─── Merged mnemonic detection (replaces 3 separate trace scans) ──────────
 
-void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result) {
+// ─── constmat → PatternMatch conversion ────────────────────────────────────
+
+void PatternPass::constmat_to_pattern_matches(const ConstantMaterializationResult& cm,
+                                               PatternResult& result) {
+    // Emit one PatternMatch per identified constant (known algorithm constant).
+    // For unidentified constants with enough parts, emit a generic KeySchedule match.
+    for (size_t idx : cm.identified_indices) {
+        const auto& mc = cm.constants[idx];
+        PatternMatch pm;
+        pm.pattern_name = fmt::format("Known constant: {} ({})",
+                                       mc.known_match->name, mc.known_match->algorithm);
+        pm.category = PatternCategory::KeySchedule;
+        pm.confidence = PatternConfidence::High;
+        pm.start_inst_id = mc.first_inst_id;
+        pm.end_inst_id   = mc.last_inst_id;
+        pm.anchor_pc     = mc.pc_first;
+        pm.description   = fmt::format(
+            "{} constant 0x{:x} ({}) at inst #{}-#{}, reg x{}",
+            mc.known_match->algorithm, mc.value, mc.known_match->name,
+            mc.first_inst_id, mc.last_inst_id, mc.dst_reg);
+        pm.constants_found.push_back(mc.value);
+        result.matches.push_back(std::move(pm));
+    }
+
+    // For constants with enough parts but no known match, still emit a generic match.
+    for (size_t i = 0; i < cm.constants.size(); ++i) {
+        if (cm.constants[i].known_match) continue;  // Already handled above
+        const auto& mc = cm.constants[i];
+        if (mc.num_parts < 3) continue;  // Mirrors original CONST_LOAD_THRESHOLD
+        PatternMatch pm;
+        pm.pattern_name   = "Constant loading sequence";
+        pm.category       = PatternCategory::KeySchedule;
+        pm.confidence     = PatternConfidence::Medium;
+        pm.start_inst_id  = mc.first_inst_id;
+        pm.end_inst_id    = mc.last_inst_id;
+        pm.anchor_pc      = mc.pc_first;
+        pm.description    = fmt::format(
+            "Key schedule: {} movz/movk instructions at inst #{}-#{} (value 0x{:x})",
+            mc.num_parts, mc.first_inst_id, mc.last_inst_id, mc.value);
+        pm.constants_found.push_back(mc.value);
+        result.matches.push_back(std::move(pm));
+    }
+}
+
+void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result,
+                                                const ConstantMaterializationResult* constmat) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& code_table = ctx.code_table();
@@ -402,7 +454,8 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
     uint64_t xor_loop_start = 0;
     std::vector<uint64_t> xor_loop_insts;
 
-    // Constant loading state
+    // Constant loading state (only used when constmat == nullptr)
+    const bool use_constmat_detector3 = (constmat != nullptr);
     bool in_load_seq = false;
     uint64_t load_seq_start = 0;
     std::vector<uint64_t> load_seq_insts;
@@ -477,7 +530,8 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
         }
 
         // ─── Detector 3: Constant loading (movz + movk sequences) ────────
-        {
+        // Skipped when constmat result is available (more precise, no duplication).
+        if (!use_constmat_detector3) {
             bool is_movz = (cls == MC_MOVZ);
             bool is_movk = (cls == MC_MOVK);
 
@@ -553,8 +607,8 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
         });
     }
 
-    // Flush pending constant loading
-    if (in_load_seq && load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
+    // Flush pending constant loading (only when not using constmat)
+    if (!use_constmat_detector3 && in_load_seq && load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
         add_match(result, PatternMatch{
             "Constant loading sequence",
             PatternCategory::KeySchedule,
@@ -564,6 +618,11 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
                          load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
             load_seq_insts, {},
         });
+    }
+
+    // When constmat is available, synthesise PatternMatches from its richer results.
+    if (constmat) {
+        constmat_to_pattern_matches(*constmat, result);
     }
 }
 

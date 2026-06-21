@@ -1,4 +1,5 @@
 #include "analysis/passes/objc_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -66,8 +67,6 @@ static std::optional<std::string> try_deref_string(
 {
     // Heuristic: skip values that look like small integers or NULL
     if (addr < 0x1000) return std::nullopt;
-    // Skip values that look like tagged pointers (odd address on ARM64)
-    // but allow them since ObjC uses tagged pointers for NSString etc.
 
     std::string result;
     result.reserve(32);
@@ -93,11 +92,6 @@ static std::optional<std::string> try_deref_string(
 }
 
 /// Try to decode a 64-bit register value as a little-endian ASCII string.
-/// On ARM64, ObjC methods in the shared cache often leave string fragments
-/// in argument registers (x0-x7) when they return. For example, a JSON
-/// serialization method may leave the last 8 bytes of the JSON string in x6.
-/// This function extracts such fragments without any memory access.
-/// Returns nullopt if fewer than 4 bytes are printable.
 static std::optional<std::string> try_decode_reg_ascii(uint64_t value) {
     uint8_t bytes[8];
     std::memcpy(bytes, &value, 8);
@@ -190,179 +184,173 @@ nlohmann::json ObjcResult::to_json() const {
     return j;
 }
 
+// ─── ObjcCollector ───────────────────────────────────────────────────────
+
+/// Sequential TraceCollector that processes Objc records and builds
+/// the ObjcResult. Requires MemoryModel + RegisterFile for argument extraction.
+class ObjcCollector final : public TraceCollector {
+public:
+    ObjcCollector(MemoryModel& memory, RegisterFile& regfile,
+                  CodeTable& code_table,
+                  const std::string& class_filter,
+                  uint64_t start_inst_id, uint64_t end_inst_id)
+        : memory_(memory)
+        , regfile_(regfile)
+        , code_table_(code_table)
+        , class_filter_(class_filter)
+        , range_start_(start_inst_id)
+        , range_end_(end_inst_id)
+    {}
+
+    std::string_view name() const override { return "ObjcCollector"; }
+
+    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
+        result_ = ObjcResult{};
+        processed_ = 0;
+        return true;
+    }
+
+    void on_inst(uint64_t /*inst_id*/, const InstView& /*inst*/) override {
+        processed_++;
+    }
+
+    void on_objc(uint64_t inst_id, const ObjcView& objc) override {
+        if (inst_id < range_start_ || inst_id >= range_end_) return;
+
+        // Extract class name early for filtering
+        std::string cls_name = extract_class_name(objc.cls);
+
+        // Apply class filter if set
+        if (!class_filter_.empty() && cls_name != class_filter_) {
+            return;
+        }
+
+        ObjcMessage msg;
+        msg.inst_id   = inst_id;
+        msg.pc        = objc.pc;
+        msg.receiver  = objc.recv;
+        msg.selector  = objc.sel;
+        msg.variant   = objc.variant;
+        msg.class_name = std::move(cls_name);
+
+        // Attempt to read selector name from memory
+        uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
+        msg.selector_name = read_cstring_from_memory(memory_, objc.sel, pre_inst_id);
+
+        // Try binary image fallback for selector
+        if (msg.selector_name.find("0x") == 0) {
+            auto img_str = code_table_.image_read_cstring(objc.sel);
+            if (img_str.has_value()) {
+                msg.selector_name = *img_str;
+            }
+        }
+
+        // ─── Extract method arguments (x2-x7) ────────────────────────────
+        uint8_t sel_arg_count = count_selector_args(msg.selector_name);
+        if (sel_arg_count == 0 && msg.selector_name.find("0x") == 0) {
+            sel_arg_count = OBJC_MAX_ARGS;
+        }
+        msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
+
+        if (msg.arg_count > 0) {
+            const auto& regs = regfile_.state_before(pre_inst_id);
+
+            for (uint8_t k = 0; k < msg.arg_count; ++k) {
+                uint64_t val = regs.gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
+                msg.args[k].value = val;
+
+                msg.args[k].deref_str = try_deref_string(memory_, val, pre_inst_id);
+
+                if (!msg.args[k].deref_str.has_value()) {
+                    msg.args[k].deref_str = try_decode_reg_ascii(val);
+                }
+            }
+        }
+
+        // ─── Extract return value (x0 after the method returns) ──────────
+        {
+            const auto& ret_regs = regfile_.state_before(inst_id);
+            msg.return_value = ret_regs.gpr[0];
+            msg.return_deref_str = try_deref_string(memory_, ret_regs.gpr[0], inst_id);
+            auto reg_str = try_decode_reg_ascii(ret_regs.gpr[0]);
+            if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
+                msg.return_deref_str = std::move(reg_str);
+            }
+            msg.has_return = true;
+        }
+
+        // Record message index
+        size_t msg_idx = result_.messages.size();
+
+        // Update class info
+        auto& cls_info = result_.classes[msg.class_name];
+        if (cls_info.name.empty()) {
+            cls_info.name = msg.class_name;
+        }
+        cls_info.message_count++;
+        cls_info.message_indices.push_back(msg_idx);
+
+        // Track unique selectors for this class
+        if (std::find(cls_info.selectors_seen.begin(),
+                      cls_info.selectors_seen.end(),
+                      msg.selector_name) == cls_info.selectors_seen.end()) {
+            cls_info.selectors_seen.push_back(msg.selector_name);
+        }
+
+        // Index by PC
+        result_.by_pc[msg.pc].push_back(msg_idx);
+
+        // Store message
+        result_.messages.push_back(std::move(msg));
+    }
+
+    ObjcResult take_result() { return std::move(result_); }
+    uint64_t processed() const { return processed_; }
+
+private:
+    MemoryModel& memory_;
+    RegisterFile& regfile_;
+    CodeTable& code_table_;
+    const std::string& class_filter_;
+    uint64_t range_start_;
+    uint64_t range_end_;
+
+    ObjcResult result_;
+    uint64_t processed_ = 0;
+};
+
 // ─── ObjcPass::run ───────────────────────────────────────────────────────
 
 PassResult ObjcPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
-    auto& index  = ctx.index();
-    auto& memory = ctx.memory();
+    auto& reader  = ctx.reader();
+    auto& index   = ctx.index();
+    auto& memory  = ctx.memory();
     auto& regfile = ctx.regfile();
+    auto& code_table = ctx.code_table();
     const auto& range = ctx.range();
 
     uint64_t start = range.start_inst_id;
     uint64_t end   = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
-    ObjcResult result;
+    uint64_t total = (end > start) ? (end - start) : 1;
 
-    uint64_t inst_id   = 0;
-    uint64_t processed = 0;
-    uint64_t total     = (end > start) ? (end - start) : 1;
+    ObjcCollector collector(memory, regfile, code_table, class_filter_, start, end);
 
-    // Direct iteration over all records — TraceCollector lacks on_objc callback
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
-        if (ctx.cancelled()) {
-            return PassResult::failed("cancelled by user");
-        }
+    TraceScanEngine local_engine(reader, index.inst_count(), &index);
+    local_engine.set_progress([&](uint64_t processed, uint64_t /*tot*/) {
+        ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+    });
+    local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+    local_engine.add_collector(&collector);
 
-        auto rec = *it;
+    local_engine.run(start, end);
 
-        if (rec.kind == RecordKind::Inst) {
-            if (inst_id >= end) break;
-            inst_id++;
-            processed++;
-
-            if (processed % 100000 == 0) {
-                ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-            }
-            continue;
-        }
-
-        if (rec.kind == RecordKind::Objc) {
-            // Only process if we're within the analysis range
-            if (inst_id < start || inst_id >= end) continue;
-
-            auto objc = rec.as_objc();
-
-            // Extract class name early for filtering
-            std::string cls_name = extract_class_name(objc.cls);
-
-            // Apply class filter if set
-            if (!class_filter_.empty() && cls_name != class_filter_) {
-                continue;
-            }
-
-            ObjcMessage msg;
-            msg.inst_id   = inst_id;
-            msg.pc        = objc.pc;
-            msg.receiver  = objc.recv;
-            msg.selector  = objc.sel;
-            msg.variant   = objc.variant;
-            msg.class_name = std::move(cls_name);
-
-            // Attempt to read selector name from memory
-            // Use inst_id-1 (pre-call state) for memory reads too: the method
-            // may have clobbered memory by the time we reach inst_id (return).
-            uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
-            msg.selector_name = read_cstring_from_memory(memory, objc.sel, pre_inst_id);
-
-            // If the memory model couldn't resolve the selector (returns hex
-            // fallback), try reading it from the binary image. Selector strings
-            // live in the binary's __TEXT,__objc_methname section but are
-            // typically read by objc_msgSend in the shared cache
-            // (uninstrumented), so the memory model has no record of them.
-            // The --image fallback loads the binary and can read the string
-            // directly from the on-disk bytes.
-            if (msg.selector_name.find("0x") == 0) {
-                auto img_str = ctx.code_table().image_read_cstring(objc.sel);
-                if (img_str.has_value()) {
-                    msg.selector_name = *img_str;
-                }
-            }
-
-            // ─── Extract method arguments (x2-x7) ────────────────────────
-            // The OBJC record is emitted at the objc_msgSend dispatch point
-            // (the `br x16` in the stub). The inst_id counter at that moment
-            // equals the RETURN point (the instruction after the method finishes
-            // executing in uninstrumented code — typically the shared cache).
-            //
-            //   state_before(inst_id)   = POST-call state (x0=return value,
-            //                             x2-x7 clobbered by the method)
-            //   state_before(inst_id-1) = PRE-call state (x0=receiver, x1=SEL,
-            //                             x2-x7=actual method arguments)
-            //
-            // The stub (adrp/ldr x1; adrp/ldr x16; br x16) only modifies x1
-            // (selector) and x16 (target), so x0 and x2-x7 are intact at
-            // inst_id-1. We use the pre-call state for argument extraction.
-            //
-            // Determine arg count from selector colons. If selector couldn't
-            // be resolved (memory model has no record of it), we still extract
-            // all 6 potential args — the user can decide which are meaningful.
-            uint8_t sel_arg_count = count_selector_args(msg.selector_name);
-            if (sel_arg_count == 0 && msg.selector_name.find("0x") == 0) {
-                // Selector unresolved — extract all 6 args by default
-                sel_arg_count = OBJC_MAX_ARGS;
-            }
-            msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
-
-            if (msg.arg_count > 0) {
-                // Use PRE-call register state (before the dispatch instruction)
-                const auto& regs = regfile.state_before(pre_inst_id);
-
-                for (uint8_t k = 0; k < msg.arg_count; ++k) {
-                    uint64_t val = regs.gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
-                    msg.args[k].value = val;
-
-                    // Attempt to dereference as C string (pre-call memory state)
-                    msg.args[k].deref_str = try_deref_string(memory, val, pre_inst_id);
-
-                    // If dereference failed, try to decode the register value
-                    // itself as a little-endian ASCII string fragment. ObjC
-                    // methods in the shared cache may leave string data in
-                    // registers (e.g. JSON fragments in x6 after stringWithFormat:).
-                    if (!msg.args[k].deref_str.has_value()) {
-                        msg.args[k].deref_str = try_decode_reg_ascii(val);
-                    }
-                }
-            }
-
-            // ─── Extract return value (x0 after the method returns) ──────
-            // state_before(inst_id) is the POST-call state: x0 holds the
-            // method's return value. (The return-point instruction, typically
-            // `mov x29, x29`, does not modify x0.)
-            {
-                const auto& ret_regs = regfile.state_before(inst_id);
-                msg.return_value = ret_regs.gpr[0];
-                msg.return_deref_str = try_deref_string(memory, ret_regs.gpr[0], inst_id);
-                // Also try register-value ASCII decode for return value
-                auto reg_str = try_decode_reg_ascii(ret_regs.gpr[0]);
-                if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
-                    msg.return_deref_str = std::move(reg_str);
-                }
-                msg.has_return = true;
-            }
-
-            // Record message index
-            size_t msg_idx = result.messages.size();
-
-            // Update class info
-            auto& cls_info = result.classes[msg.class_name];
-            if (cls_info.name.empty()) {
-                cls_info.name = msg.class_name;
-            }
-            cls_info.message_count++;
-            cls_info.message_indices.push_back(msg_idx);
-
-            // Track unique selectors for this class
-            if (std::find(cls_info.selectors_seen.begin(),
-                          cls_info.selectors_seen.end(),
-                          msg.selector_name) == cls_info.selectors_seen.end()) {
-                cls_info.selectors_seen.push_back(msg.selector_name);
-            }
-
-            // Index by PC
-            result.by_pc[msg.pc].push_back(msg_idx);
-
-            // Store message
-            result.messages.push_back(std::move(msg));
-        }
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
     }
 
-    // ─── Return values are already populated in the first pass ─────────
-    // (state_before(inst_id) gives the POST-call x0 = return value).
-    // The old second-pass approach read x0 at the NEXT message's inst_id,
-    // which actually gave the NEXT method's return value — a bug.
-    // Nothing to do here anymore.
+    ObjcResult result = collector.take_result();
 
     ctx.progress(1.0f, fmt::format("ObjC: {} messages, {} unique classes",
                                     result.total_messages(),

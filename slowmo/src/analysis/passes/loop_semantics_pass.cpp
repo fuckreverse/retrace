@@ -236,6 +236,76 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
 
     const auto& range = ctx.range();
 
+    // ── Step 1b: Pre-warm RegisterFile for all header inst_ids ───────────
+    //
+    // LoopSemanticsPass calls regfile.state_before() for up to
+    // MAX_SAMPLE_ITERATIONS sample points per loop.  Each call with a cold
+    // cache triggers an ANCHOR → INST replay chain (potentially hundreds of
+    // sequential record reads).
+    //
+    // By first scanning all header_inst_ids and calling warm_range() over the
+    // contiguous spans they cover, we warm the entire relevant range in a
+    // single forward sequential pass through the trace — the most cache-friendly
+    // access pattern possible.  Subsequent state_before() calls become O(1)
+    // cache hits.
+    //
+    // Implementation:
+    //   1. Collect the first MAX_SAMPLE_ITERATIONS header inst_ids per loop
+    //      into a flat sorted list.
+    //   2. Walk the sorted list and coalesce adjacent spans (gap ≤ 2 × anchor
+    //      interval, estimated at 1000 instructions).  Call warm_range() for
+    //      each coalesced span.  This avoids redundant warm_range calls when
+    //      many loops cluster in the same region of the trace.
+
+    {
+        constexpr uint64_t ANCHOR_INTERVAL_EST = 1000;  // conservative estimate
+        constexpr uint64_t COALESCE_GAP = ANCHOR_INTERVAL_EST * 2;
+
+        // Gather candidate inst_ids (same logic as the main loop below)
+        std::vector<uint64_t> warm_ids;
+        warm_ids.reserve(analyzable * MAX_SAMPLE_ITERATIONS);
+
+        for (const auto& loop : loop_result.loops) {
+            if (loop.iteration_count < 2) continue;
+            auto xr_it = xref.pc_to_inst_ids.find(loop.header_pc);
+            if (xr_it == xref.pc_to_inst_ids.end()) continue;
+            size_t collected = 0;
+            for (uint64_t iid : xr_it->second) {
+                if (iid < range.start_inst_id) continue;
+                if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
+                warm_ids.push_back(iid);
+                if (++collected >= MAX_SAMPLE_ITERATIONS) break;
+            }
+        }
+
+        if (!warm_ids.empty()) {
+            std::sort(warm_ids.begin(), warm_ids.end());
+            warm_ids.erase(std::unique(warm_ids.begin(), warm_ids.end()), warm_ids.end());
+
+            // Coalesce into contiguous spans and warm each span
+            uint64_t span_start = warm_ids[0];
+            uint64_t span_end   = warm_ids[0] + 1;
+
+            auto flush_warm = [&](uint64_t s, uint64_t e) {
+                // Expand the span to cover the full anchor→sample window
+                // (warm_range internally samples at `stride` intervals; using
+                //  the default stride=0 lets RegisterFile choose optimally).
+                regfile.warm_range(s, e, 0, nullptr);
+            };
+
+            for (size_t i = 1; i < warm_ids.size(); ++i) {
+                if (warm_ids[i] - span_end <= COALESCE_GAP) {
+                    span_end = warm_ids[i] + 1;
+                } else {
+                    flush_warm(span_start, span_end);
+                    span_start = warm_ids[i];
+                    span_end   = warm_ids[i] + 1;
+                }
+            }
+            flush_warm(span_start, span_end);
+        }
+    }
+
     size_t processed = 0;
 
     // ── Step 2: Analyze each loop ────────────────────────────────────────

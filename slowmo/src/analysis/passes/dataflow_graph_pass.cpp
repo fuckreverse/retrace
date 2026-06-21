@@ -67,7 +67,7 @@ std::string DataflowGraphResult::to_dot() const {
     for (const auto& edge : edges) {
         out += fmt::format("    n{} -> n{} [label=\"{}\"];\n",
                            edge.from_inst_id, edge.to_inst_id,
-                           reg_name(edge.reg_index));
+                           reg_name(edge.via_reg));
     }
 
     out += "}\n";
@@ -123,7 +123,7 @@ std::string DataflowGraphResult::to_json() const {
         const auto& edge = edges[i];
         out += fmt::format("    {{\"from_inst_id\": {}, \"to_inst_id\": {}, \"reg\": \"{}\"}}",
                            edge.from_inst_id, edge.to_inst_id,
-                           reg_name(edge.reg_index));
+                           reg_name(edge.via_reg));
         if (i + 1 < edges.size()) out += ",";
         out += "\n";
     }
@@ -221,7 +221,7 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
                     DFGEdge edge;
                     edge.from_inst_id = writer;
                     edge.to_inst_id   = inst_id;
-                    edge.reg_index    = reg;
+                    edge.via_reg      = reg;
                     result.edges.push_back(edge);
                 }
             }

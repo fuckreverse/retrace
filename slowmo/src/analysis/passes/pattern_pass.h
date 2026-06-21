@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/passes/constant_materialization_pass.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -98,8 +99,12 @@ public:
         return "Detect crypto, anti-debug, and obfuscation patterns via YARA rules";
     }
 
+    /// Optional soft dependency: if constant_materialization has already run,
+    /// PatternPass will use its results for Detector3 (constant loading)
+    /// instead of re-scanning the trace with the same logic.
     std::vector<std::string_view> dependencies() const override {
-        return {};  // No dependencies
+        return {};  // Hard dependencies: none. constant_materialization is consumed
+                    // opportunistically via try_require() in run().
     }
 
     PassResult run(PassContext& ctx) override;
@@ -164,7 +169,16 @@ private:
 
     /// Detect all mnemonic-based patterns (HW crypto, XOR loops, constant loading)
     /// in a single trace scan. Replaces the previous 3 separate scan functions.
-    void detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result);
+    /// When `constmat` is non-null (ConstantMaterializationPass already ran),
+    /// Detector3 (MOVZ/MOVK sequence detection) is skipped; its results are
+    /// synthesised from `constmat` instead, avoiding a redundant trace scan.
+    void detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result,
+                                       const ConstantMaterializationResult* constmat = nullptr);
+
+    /// Convert ConstantMaterializationResult entries into PatternMatch objects
+    /// and append them to result (replaces Detector3).
+    static void constmat_to_pattern_matches(const ConstantMaterializationResult& cm,
+                                             PatternResult& result);
 
     /// Build the by_category index from the matches vector.
     void build_category_index(PatternResult& result);

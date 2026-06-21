@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "common/dataflow_types.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -27,13 +28,8 @@ struct DataflowNode {
     std::vector<uint8_t> regs_written;
 };
 
-/// A directed edge in the dataflow graph: a register written by the producer
-/// instruction is subsequently read by the consumer instruction.
-struct DFGEdge {
-    uint64_t from_inst_id;  // producer (writer)
-    uint64_t to_inst_id;    // consumer (reader)
-    uint8_t reg_index;      // which register creates the dependency
-};
+// DFGEdge = DataflowEdge alias is defined in common/dataflow_types.h.
+// Use DFGEdge::via_reg (previously reg_index) to access the register field.
 
 // ─── Result ───────────────────────────────────────────────────────────────
 
