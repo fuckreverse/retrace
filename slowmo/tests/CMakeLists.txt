@@ -69,6 +69,11 @@ tenet_add_test(test_pass_pattern           unit/test_pass_pattern.cpp)
 tenet_add_test(test_pass_thread_filter     unit/test_pass_thread_filter.cpp)
 tenet_add_test(test_pass_yara_mem_scan     unit/test_pass_yara_mem_scan.cpp)
 
+# ─── Unit tests: iOS-specific analysis passes ────────────────────────────────
+tenet_add_test(test_pass_objc_crypto           unit/test_pass_objc_crypto.cpp)
+tenet_add_test(test_pass_syscall_intercept     unit/test_pass_syscall_intercept.cpp)
+tenet_add_test(test_pass_taint_source_annotation unit/test_pass_taint_source_annotation.cpp)
+
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
 
