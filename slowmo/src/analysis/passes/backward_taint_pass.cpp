@@ -263,12 +263,28 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
             }
 
             if (config.propagate_through_memory) {
+                // Use trace-recorded mem_access addresses (inst.mem_access) rather than
+                // Triton's statically-inferred addresses (sem.mem_accesses.address).
+                // Triton does NOT have register context at this point (set_register_context
+                // was removed for performance), so sem.mem_accesses.address is always 0.
+                // The actual runtime address is in the trace's mem_access records.
+                //
+                // We still use sem.mem_accesses to count how many memory reads there are
+                // (to detect whether this is a load instruction), but use inst.mem_access
+                // for the concrete address.
+                bool has_sem_read = false;
                 for (const auto& ma : sem.mem_accesses) {
-                    if (!ma.is_read) continue;
-                    event.loads_from_memory = true;
-                    event.src_mem_addrs.push_back(ma.address);
-                    state.add_mem(ma.address, ma.size, resolved_tags);
-                    result.involved_mem_addrs.add(ma.address);
+                    if (ma.is_read) { has_sem_read = true; break; }
+                }
+                if (has_sem_read) {
+                    for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                        auto mem = inst.mem_access(m);
+                        if (mem.type & 2) continue;  // Skip WRITE records; we want READs
+                        event.loads_from_memory = true;
+                        event.src_mem_addrs.push_back(mem.addr);
+                        state.add_mem(mem.addr, static_cast<uint8_t>(mem.size), resolved_tags);
+                        result.involved_mem_addrs.add(mem.addr);
+                    }
                 }
             }
         }
