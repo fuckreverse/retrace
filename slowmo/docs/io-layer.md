@@ -1,345 +1,115 @@
-# IO Layer 详细设计 (v2)
-
-## 职责
-
-IO 层负责 trace 文件的**零拷贝访问**和**高性能索引**。核心组件：
-
-1. **TraceReader** — mmap 映射 + 记录解析
-2. **RocksDBIndex** — 多维倒排索引（持久化）
-3. **CodeTable** — 可执行代码缓存
-4. **SymbolTable** — 符号/名称加载
-
-## TraceReader
-
-### 设计原则
-
-- 整个 trace 文件通过 `mmap` 映射到虚拟地址空间，由 OS 管理页面换入换出
-- 记录解析为零拷贝：返回指向 mmap 区域的指针视图，不复制数据
-- 线程安全：只读映射 + 无可变状态，多线程可并发读取
-
-### 接口
-
-```cpp
-class TraceReader {
-public:
-    // 生命周期
-    static std::expected<TraceReader, Error> open(const std::filesystem::path& path);
-    void close();
-
-    // 文件元信息
-    const FileHeader& header() const;
-    uint64_t file_size() const;
-    uint64_t record_count() const;  // 所有类型记录总数
-    uint64_t inst_count() const;    // INST 类型记录数
-
-    // 顺序遍历（最高效）
-    class Iterator {
-    public:
-        RecordView operator*() const;  // 零拷贝视图
-        Iterator& operator++();
-        bool operator==(Sentinel) const;
-    };
-    Iterator begin() const;
-    Sentinel end() const;
-
-    // 随机访问（需索引配合）
-    RecordView record_at_offset(uint64_t file_offset) const;
-
-    // 原始字节访问（给 RocksDB 索引构建用）
-    std::span<const uint8_t> raw_bytes() const;
-    std::span<const uint8_t> raw_bytes(uint64_t offset, uint64_t length) const;
-
-private:
-    int fd_ = -1;
-    void* mapped_ = nullptr;
-    uint64_t size_ = 0;
-    FileHeader header_;
-};
-```
-
-### RecordView — 零拷贝记录视图
-
-```cpp
-// 不拥有数据，指向 mmap 区域
-struct RecordView {
-    RecordKind kind;
-    uint64_t file_offset;       // 在文件中的偏移
-    std::span<const uint8_t> raw;  // 原始字节（含 kind 字节）
-
-    // 类型安全访问（按需解析）
-    std::optional<InstView> as_inst() const;
-    std::optional<AnchorView> as_anchor() const;
-    std::optional<EventView> as_event() const;
-    // ... 其他类型
-};
-
-struct InstView {
-    uint64_t pc;
-    uint8_t reg_diff_count;
-    struct RegDiff { uint8_t index; uint64_t value; };
-    std::span<const RegDiff> reg_diffs() const;  // 零拷贝
-    uint8_t mem_access_count;
-    // mem_access 因变长需逐个解析
-    MemAccessIterator mem_accesses() const;
-};
-
-struct AnchorView {
-    uint32_t inst_id;
-    std::span<const uint64_t> gpr_values() const;  // 直接指向 mmap
-};
-```
-
-### 性能特征
-
-| 操作 | 复杂度 | 说明 |
-|------|--------|------|
-| open() | O(1) | mmap 是懒加载，只映射地址空间 |
-| 顺序遍历 | ~300 MB/s | 受限于 page fault + 解析，预读友好 |
-| record_at_offset() | O(1) | 指针算术 |
-| 并发读 | 无锁 | 只读映射天然线程安全 |
-
-### mmap 策略
-
-```cpp
-// Linux/macOS 优化提示
-mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, fd, 0);
-madvise(mapped, size, MADV_SEQUENTIAL);  // 索引构建时
-madvise(mapped, size, MADV_RANDOM);      // 随机访问模式
-```
-
-对于超大 trace（>4GB），使用 `MAP_NORESERVE` 避免 commit charge。
-在索引构建阶段用 `MADV_SEQUENTIAL`（预读优化），构建完成后切换为 `MADV_RANDOM`。
-
----
-
-## RocksDBIndex — 多维倒排索引
-
-### 为什么用 RocksDB
-
-| 需求 | RocksDB 优势 |
-|------|-------------|
-| 100M+ 条目的倒排索引 | LSM-tree 设计就是为此优化 |
-| 持久化（不必每次重建） | 原生磁盘存储 |
-| 范围查询（"PC=X 的所有 inst_id"） | 有序 KV + prefix iterator |
-| 多种索引共存 | Column Family 隔离 |
-| 并发读 | 内置 MVCC |
-| 压缩 | 内置 LZ4/Zstd 块压缩 |
-
-### Column Family 设计
-
-```
-DB path: <trace_dir>/.tenet_cache/<trace_hash>/
-
-Column Families:
-┌──────────────────────────────────────────────────────────────┐
-│ CF: "meta"                                                   │
-│   Key: "version"        → Value: "2"                         │
-│   Key: "trace_hash"     → Value: sha256(header + first 4KB) │
-│   Key: "inst_count"     → Value: uint64                      │
-│   Key: "build_time"     → Value: uint64 (ns)                │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "offset"   (inst_id → file_offset 主索引)                │
-│   Key: inst_id (uint64 BE)                                   │
-│   Value: file_offset (uint64)                                │
-│   ※ 稀疏：每 256 条 INST 存一个条目                           │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "anchor"   (anchor inst_id → file_offset)                │
-│   Key: anchor_inst_id (uint64 BE)                            │
-│   Value: file_offset (uint64)                                │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "pc"       (PC → inst_id 列表，Roaring Bitmap 编码)      │
-│   Key: pc (uint64 BE)                                        │
-│   Value: Roaring Bitmap of inst_ids (序列化)                  │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "mem_write" (page_addr → 写入该页的 inst_id 列表)         │
-│   Key: page_addr = addr >> 12 (uint64 BE)                    │
-│   Value: Roaring Bitmap of inst_ids                          │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "mem_read"  (page_addr → 读取该页的 inst_id 列表)         │
-│   Key: page_addr = addr >> 12 (uint64 BE)                    │
-│   Value: Roaring Bitmap of inst_ids                          │
-├──────────────────────────────────────────────────────────────┤
-│ CF: "func"     (函数入口 PC → 相关信息)                       │
-│   Key: entry_pc (uint64 BE)                                  │
-│   Value: {call_count, first_call_inst_id, last_ret_inst_id}  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 关键设计决策
-
-**稀疏 offset 索引**：不存每条 inst_id 的偏移（100M 条 = 1.6GB），而是每 256 条存一个锚点。定位 inst_id=N 时：找到 floor(N/256)*256 的 offset，然后从该 offset 向前扫描最多 256 条记录。256 条 × ~50B/条 ≈ 12KB 顺序读，在 SSD 上 < 100μs。
-
-**Roaring Bitmap 做值列表**：对于 "PC=0x750bd554 出现在哪些 inst_id" 这类查询，结果可能是上万个 inst_id。用 Roaring Bitmap 存储比排序数组紧凑 2-5x，且支持高效的集合运算（交集、并集），直接服务于 TaintPass 的 taint set 计算。
-
-**Page 粒度内存索引**：按 4KB 页粒度（addr >> 12）建索引。查找 "谁写了 0x7fec60ebd9" 时，先查 page = 0x7fec60eb 的写入者 bitmap，再在对应指令中精确匹配字节地址。这在精度和索引大小之间取平衡。
-
-### 索引构建流程
-
-```cpp
-class IndexBuilder {
-public:
-    // 顺序扫描一遍 trace 构建所有索引
-    void build(const TraceReader& reader, rocksdb::DB* db,
-               ProgressCallback progress);
-
-    struct Stats {
-        uint64_t inst_count;
-        uint64_t anchor_count;
-        uint64_t unique_pcs;
-        uint64_t unique_mem_pages;
-        double elapsed_seconds;
-    };
-};
-```
-
-构建策略：
-
-1. 顺序遍历 trace（利用 MADV_SEQUENTIAL 预读）
-2. 使用 RocksDB `WriteBatch`，每 10000 条记录 flush 一批
-3. Roaring Bitmap 在内存中增量构建，遍历结束后一次序列化写入
-4. 内存峰值：unique_pcs × bitmap_overhead ≈ 10K PCs × 1MB = ~10GB → **分段构建**：
-   - 第一遍：构建 offset + anchor 索引（O(1) 内存）
-   - 第二遍：构建 pc 索引（按 PC 前缀分段）
-   - 第三遍：构建 mem 索引（按 page 前缀分段）
-   - 或者：如果内存充足（>4GB），单遍构建
-
-### 查询接口
-
-```cpp
-class RocksDBIndex {
-public:
-    static std::expected<RocksDBIndex, Error> open_or_build(
-        const std::filesystem::path& trace_path,
-        const TraceReader& reader);
-
-    // 主索引：inst_id → file_offset
-    uint64_t offset_of(uint64_t inst_id) const;
-
-    // Anchor 查找：找到 inst_id 之前最近的 anchor
-    std::pair<uint64_t/*anchor_inst_id*/, uint64_t/*offset*/> 
-        nearest_anchor_before(uint64_t inst_id) const;
-
-    // PC 索引：哪些 inst_id 执行了该 PC
-    roaring::Roaring64Map insts_at_pc(uint64_t pc) const;
-
-    // 内存索引：哪些 inst_id 写入/读取了该地址
-    roaring::Roaring64Map mem_writers(uint64_t addr) const;
-    roaring::Roaring64Map mem_readers(uint64_t addr) const;
-
-    // 范围查询
-    roaring::Roaring64Map mem_writers_in_range(uint64_t addr, uint64_t size) const;
-
-    // 函数相关
-    std::vector<uint64_t> all_function_entries() const;
-    FuncInfo func_info(uint64_t entry_pc) const;
-
-    // 统计
-    IndexStats stats() const;
-
-    // 缓存验证（trace 文件改变时 invalidate）
-    bool is_valid_for(const TraceReader& reader) const;
-};
-```
-
-### RocksDB 调优
-
-```cpp
-rocksdb::Options opts;
-opts.create_if_missing = true;
-opts.compression = rocksdb::kZSTD;  // Zstd 压缩
-opts.bottommost_compression = rocksdb::kZSTD;
-opts.optimize_filters_for_hits = true;
-opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory({
-    .block_cache = rocksdb::NewLRUCache(256 * 1024 * 1024),  // 256MB
-    .filter_policy = rocksdb::NewBloomFilterPolicy(10),       // Bloom filter
-    .block_size = 16 * 1024,  // 16KB blocks
-}));
-// 写入优化（构建阶段）
-opts.write_buffer_size = 64 * 1024 * 1024;
-opts.max_write_buffer_number = 3;
-opts.target_file_size_base = 256 * 1024 * 1024;
-```
-
----
-
-## CodeTable
-
-存储 trace 中出现的可执行代码字节，供 Capstone 反汇编使用。
-
-```cpp
-class CodeTable {
-public:
-    void ingest(const CodeRecord& rec);  // 从 CODE 记录导入
-
-    // 查询：获取 PC 处的机器码（AArch64 固定 4 字节）
-    std::optional<uint32_t> opcode_at(uint64_t pc) const;
-
-    // 批量查询（给 Capstone 做批量反汇编）
-    std::span<const uint8_t> code_region(uint64_t base, uint64_t size) const;
-
-    // SMC 支持：同一 PC 在不同时刻可能有不同代码
-    std::optional<uint32_t> opcode_at(uint64_t pc, uint64_t inst_id) const;
-
-    // 统计
-    size_t region_count() const;
-    size_t total_bytes() const;
-
-private:
-    // 主存储：base_addr → code_bytes
-    // 对 AArch64 定长指令，可优化为 flat_hash_map<pc, uint32_t>
-    absl::flat_hash_map<uint64_t, uint32_t> opcode_cache_;
-
-    // SMC 版本链：pc → [(inst_id_range, opcode)]
-    // 大多数 PC 无 SMC，只有少数需要版本链
-    absl::flat_hash_map<uint64_t, std::vector<VersionedOpcode>> smc_table_;
-};
-```
-
----
-
-## SymbolTable
-
-加载外部符号信息，提供地址 → 名称的映射。
-
-```cpp
-class SymbolTable {
-public:
-    // 多来源加载
-    void load_from_ida_names(const std::filesystem::path& path);   // IDA .names
-    void load_from_nm(const std::filesystem::path& path);          // nm 输出
-    void load_from_class_dump(const std::filesystem::path& path);  // ObjC headers
-    void load_from_json(const std::filesystem::path& path);        // 通用 JSON
-
-    // 查询
-    std::optional<std::string_view> name_at(uint64_t addr) const;
-    std::optional<std::string_view> name_containing(uint64_t addr) const; // 函数内
-    std::vector<uint64_t> search(std::string_view pattern) const;  // 模糊搜索
-
-    // 反向：名称 → 地址
-    std::optional<uint64_t> addr_of(std::string_view name) const;
-
-private:
-    // 按地址排序，支持 lower_bound 范围查找
-    std::vector<std::pair<uint64_t, std::string>> symbols_;  // sorted
-};
-```
-
----
-
-## 性能预算
-
-以 100M 指令 / 1.5GB trace 为基准：
-
-| 组件 | 内存占用 | 磁盘占用 |
-|------|----------|----------|
-| mmap 映射 | 虚拟 1.5GB，RSS 由 OS 管理 | — |
-| RocksDB block cache | 256MB (可配) | — |
-| RocksDB 数据文件 | — | ~200-500MB（视压缩率） |
-| offset CF (稀疏) | — | ~6MB (100M/256 × 16B) |
-| pc CF (Roaring) | — | ~50-100MB |
-| mem CF (Roaring) | — | ~100-300MB |
-| CodeTable | ~40MB (10K unique PCs × 4B + overhead) | — |
-| SymbolTable | ~5MB (典型) | — |
-| **IO 层合计** | **~300MB RSS** | **~500MB 缓存** |
-
-索引构建后持久化到磁盘，后续打开同一 trace 直接加载（< 50ms）。
+# IO 层
+
+> 职责：trace 文件的**零拷贝访问**与**持久化倒排索引**。是整个系统的只读数据底座。
+> 源码：`src/io/`。权威格式：`tools/qbditrace/TraceFormat.h`（v4），格式契约见 [trace-format.md](trace-format.md)。
+
+## 组件清单
+
+| 文件 | 类 | 职责 |
+|------|------|------|
+| trace_reader.{h,cpp} | `TraceReader` | mmap 映射 + 零拷贝记录视图 + 顺序/随机访问 |
+| index_builder.{h,cpp} | `TraceIndex` | RocksDB 多 CF 倒排索引（offset/anchor/mem/reg/code） |
+| code_table.{h,cpp} | `CodeTable` + `ImageFallback` | PC→opcode 映射 + 二进制镜像缺码回填 |
+| streaming_index.{h,cpp} | `StreamingIndex` | 实时 tail 增量索引（live trace） |
+| rpc_server.{h,cpp} | `RpcServer` + `TenetRpcService` | JSON-RPC 2.0 over Unix socket |
+| recent_files.{h,cpp} | `RecentFiles` | 最近打开文件列表（~/.config/tenet/recent.json） |
+
+## TraceReader — 零拷贝读取
+
+**设计**：整个文件 `mmap(MAP_PRIVATE)` 映射到虚拟地址空间，OS 管理页面换入。记录解析返回指向 mmap 区域的指针视图，绝不复制。只读映射 → 天然线程安全，多 Pass 并发读无锁。
+
+**文件头**：`FileHeader`（536B）封装 magic/version/arch/num_gpr/module_base/slide/flags。`has_mem()/has_code()/reg_diff()/has_old_value()` 按 flags 位判断记录布局变体。
+
+**记录视图**（零拷贝，全部指向 mmap）：
+- `RecordView`：tagged union，`kind` + `file_offset` + `raw_ptr` + 预解析的 `resolved_pc`/`is_v5`/`is_v6` 标志。
+- `InstView`：`pc`/`nzcv`/`reg_diff_count`/`mem_access_count` + `raw_diffs`/`raw_mems` 原始指针。`reg_diff(i)`/`mem_access(i)` 按结构体 stride 直接 reinterpret_cast。
+- `AnchorView`：`gpr_values` 指向 mmap 中的 num_gpr 个 uint64。
+- 还有 `CodeView`/`EventView`/`SvcView`/`ObjcView`/`ThreadView`，每个有 `byte_size()`。
+
+**v4/v5/v6 兼容**（关键复杂度）：
+- **v4**：INST 头含绝对 PC，内存访问 32B。
+- **v5**（`HF_PC_DELTA`）：INST 头只存 `pc_delta`（相对上一条），绝对 PC 需 Iterator 在遍历时累加 `current_pc_` 并写回 `RecordView.resolved_pc`。**随机访问**必须用 `offset_of_with_pc()` 获取 seed_pc，再 `record_at(offset, seed_pc)`。
+- **v6**（`HF_OLD_VALUE`）：内存访问 48B，含写前旧值（供 MemoryModel 精确回滚）。`has_old_value` 标志是否有效。
+
+**访问方式**：
+- 顺序遍历：`begin()/end()` 返回 `Iterator`，`operator++` 按 `byte_size()` 推进。v5 模式下自动维护 `current_pc_`。
+- 随机访问：`record_at(offset)` 或 `record_at(offset, seed_pc)`。
+- 原始字节：`data()/data_at(offset)` 给 IndexBuilder 用。
+
+**madvise 策略**：建索引阶段 `MADV_SEQUENTIAL`（预读），建完切 `MADV_RANDOM`。
+
+## TraceIndex — RocksDB 倒排索引
+
+**为什么 RocksDB**：100M+ 条目倒排、持久化、范围查询、多 CF 隔离、内置压缩。LSM-tree 天生为海量 KV 优化。
+
+**Column Family 设计**（`cf::` 命名空间）：
+
+| CF | Key | Value | 用途 |
+|----|-----|-------|------|
+| `meta` | 字符串 | 字符串/整型 | trace_hash/inst_count/bookmarks/last_inst 等元信息 |
+| `offset` | inst_id (u64 BE) | file_offset | **稀疏**主索引，每 N 条存一个（N 自适应 64-4096） |
+| `anchor` | anchor 序号 | file_offset | anchor 定位 |
+| `mem_write` | `[page(8)\|page_off(2)\|inst_id(8)]` BE | `[size(1)\|data]` | 内存写倒排（含跨页拆分） |
+| `mem_read` | 同上 | 同上 | 内存读倒排（回填未追踪代码写入的值） |
+| `reg_writes` | `(reg_idx<<48\|inst_id)` | 空 | 寄存器写倒排，O(log N) 找 last writer |
+| `code_bytes` | runtime_pc (u64 BE) | opcode[4] | 代码字节，单遍构建免二次扫文件 |
+
+**稀疏 offset 策略**：不存每条 inst_id（100M×16B=1.6GB），而是每 `sparse_interval_` 条存锚点。定位 inst_id=N：二分找 floor(N/interval) 的 offset，向前线性扫 ≤interval 条。`SPARSE_MIN=64`/`SPARSE_MAX=4096`，按 inst_count 自适应使索引 ≤65536 条。
+
+**并行构建**：以 ANCHOR 记录边界做分片，多核并行扫，最后合并。`IndexStats.num_shards` 记录实际分片数。
+
+**查询接口**：
+- `offset_of(inst_id)` / `offset_of_with_pc(inst_id)` →（offset, seed_pc），后者 v5 必需。
+- `nearest_anchor_before(inst_id)` → (anchor_idx, offset, inst_id)，给 RegisterFile 重建用。
+- `find_last_writer_of(reg_idx, before_id)` → inst_id，用 REG_WRITES CF 的 `SeekForPrev`，O(log N)。无该 CF 时回退线性扫。
+- `load_code_table(CodeTable&)` → 从 CODE_BYTES CF 装载，免扫文件。
+
+**持久化与校验**：`open_or_build()` 先查缓存，按 `trace_hash`（sha256(header+首4KB)）校验有效性。`verify_integrity()` 跑 RocksDB `VerifyChecksum()` + hash 交叉校验。
+
+**会话持久化**：bookmarks 和 last_inst 存在 `meta` CF，下次打开恢复光标。
+
+## CodeTable + ImageFallback
+
+**CodeTable**：`ankerl::unordered_dense::map<pc, opcode>` 存 trace 中出现的所有 PC 的 4 字节指令。从 `CODE_BYTES` CF 装载（或扫 REC_CODE 记录）。`opcode_at(pc)` 先查表，miss 则查 `ImageFallback`。
+
+**ImageFallback**：加载原始 Mach-O/ELF，解析可执行段建 `(runtime_start, runtime_end, file_offset)` 映射。**解决 LDXR/STXR 缺码问题**——qbditrace 不对临界区发 REC_CODE（会破坏 ARM 独占预留），导致 ~10-20% PC 无代码。镜像回填从磁盘字节恢复，完整保留反汇编/CFG/污点分析。还提供 `read_bytes_at()`/`image_read_cstring()` 读二进制中的数据（selector 字符串等）。
+
+## StreamingIndex — 实时增量索引
+
+**用途**：边录制边分析。后台 tail 线程轮询文件增长，每 `batch_size` 条新记录触发增量索引 flush，通过 condition variable 通知等待的消费者。
+
+**消费者 API**：`wait_for_inst(target_id, timeout_ms)` 阻塞直到至少 target_id 条指令已索引。`inst_count()` 原子读当前进度。`is_complete()` 在 STREAM_END 哨兵或空闲超时后置真。
+
+**不依赖 qbditrace 配合**：也能 tail 静态文件（退化为后台索引器 + 进度）。`YaraRuleWatcher` 是附带工具，监听目录新 `.yar` 文件自动重载规则。
+
+## RpcServer — JSON-RPC over Unix socket
+
+**协议**：每条消息是换行结尾的 JSON 串。标准 JSON-RPC 2.0 请求/响应。单连接串行处理（内部 mutex 序列化并发客户端）。
+
+**TenetRpcService** 自动装配标准方法：`ping/get_stats/get_reg/get_regs/read_mem/get_inst/get_range/get_xref/get_cfg/get_call_graph`。把 reader/index/regfile/memory/pm 引用注入即可 `start(socket_path)`。`--rpc` 启动后阻塞直到客户端断开。
+
+## RecentFiles
+
+最近打开列表，持久化到 `~/.config/tenet/recent.json`，最多 20 条。GUI 启动页用它。
+
+## 性能与内存预算
+
+| 组件 | 内存 | 磁盘 |
+|------|------|------|
+| mmap 映射 | 虚拟 1.5GB，RSS 由 OS 管 | — |
+| RocksDB block cache | 256MB（可配） | — |
+| RocksDB 数据 | — | 200-500MB（Zstd 压缩） |
+| offset CF（稀疏） | — | ~6MB |
+| mem_write CF | — | 100-300MB |
+| reg_writes CF | — | ~30MB |
+| CodeTable | ~40MB | — |
+
+索引构建后持久化，后续打开同一 trace 直接加载（<1s）。
+
+## 关键设计决策
+
+1. **零拷贝贯穿到底**：从 mmap 到 Pass 消费，数据从不复制。InstView 的 `raw_diffs` 直接指向 mmap 字节。
+2. **稀疏 + 倒排组合**：offset 稀疏（省 99% 空间），mem/reg 倒排（O(log N) 查询），code 全量但小。
+3. **单遍构建**：索引构建扫一遍 trace 同时填 offset/anchor/mem_write/mem_read/reg_writes/code_bytes 六个 CF，无二次扫描。
+4. **v5 PC 重建**：PC delta 模式省空间但牺牲随机访问——用 `offset_of_with_pc` + seed_pc 解决。
+5. **ImageFallback 补全**：承认 trace 不完整（LDXR/STXR），用二进制镜像优雅降级而非报错。

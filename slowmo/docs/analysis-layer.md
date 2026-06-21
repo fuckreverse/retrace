@@ -1,803 +1,208 @@
-# Analysis Layer 详细设计 (v2)
+# Analysis 层
 
-## 概述
-
-Analysis Layer 采用 **LLVM 风格 Pass Pipeline** 架构。每个分析能力是一个独立的 `AnalysisPass`，通过 `PassManager` 统一调度。Pass 之间通过**声明式依赖 + 类型安全结果获取**解耦。
-
-核心优势：
-- 新分析能力只需实现一个 Pass 类，注册即可用
-- 依赖自动解析，无需手动编排执行顺序
-- 无依赖冲突的 Pass 自动并行
-- 结果缓存，同一 Pass 不重复运行
-- 增量更新：trace 子范围变化时只重跑受影响的 Pass
-
----
+> 职责：LLVM 风格的 **Pass Pipeline**。每个分析能力是独立 `AnalysisPass`，声明依赖后由 `PassManager` 自动调度并行执行。
+> 源码：`src/analysis/`。核心：`pass_manager.{h,cpp}` + `trace_collector.{h,cpp}` + `passes/`（30+ Pass）。
 
 ## PassManager 框架
 
-### 核心类
+**核心三件套**（`pass_manager.h`）：
+
+- **`PassResult`**：类型擦除结果容器。`Status{Success,Failed,Skipped}` + `error_message` + `std::any data`。`success<T>(val)` / `failed(msg)` / `skipped()` 工厂。`get<T>()` 类型安全取值。
+- **`PassContext`**：Pass 执行上下文。提供 IO/Core 层访问（`reader()/index()/code_table()/regfile()/memory()/decoder()`）、Pass 间结果获取（`require<T>("name")` 触发依赖执行；`try_require<T>("name")` 不触发，返回 nullptr）、分析范围 `range()`、进度报告 `progress(pct)`、取消检查 `cancelled()`、共享扫描引擎 `scan_engine()`。
+- **`AnalysisPass`**：基类。虚接口：`name()/description()/dependencies()/run(ctx)/supports_incremental()/update(ctx,changed)/estimated_cost()`。
+
+**PassManager 调度**：
+- `register_pass(unique_ptr)` 注册（main.cpp 装配时调用）。
+- `require("name")` 按需执行：递归解析依赖链，CAS 状态机防重复执行（`NotRun→Running→Completed/Failed`），条件变量等依赖完成。**线程安全**，多线程可并发 `require`。
+- `run_all(num_threads)` 全量执行：`topological_levels()` 算 DAG 层级，同层 Pass 并发跑。
+- `invalidate("name")` / `invalidate_all()` 失效缓存。
+- 内存压力：`set_rss_limit_mb()` 超限时跳过非关键 Pass。
+
+**PassEntry 内部**：`unique_ptr<AnalysisPass> pass` + `PassResult result` + `atomic<PassState> state` + `mutex mtx`（保护 result 写）+ `condition_variable cv`（通知完成）。无锁快路径：已完成 Pass 的 `require` 直接读 result。
+
+## TraceScanEngine — 单遍广播 + 并行分片
+
+**设计**（`trace_collector.h`）：多个 Pass 经常需要扫一遍 trace，为避免每个 Pass 各扫一遍，`TraceScanEngine` 单遍顺序遍历 trace，把每条记录广播给所有注册的 `TraceCollector`。
+
+**TraceCollector 接口**：`begin(start,end)/on_inst(id,inst)/on_anchor/on_code/on_svc/on_objc/on_thread/on_event/end`。每个回调默认空实现，Collector 按需重写。
+
+**并行分片**：Collector 声明 `supports_parallel()==true` 并实现 `clone()`/`merge()`，则 Engine 以 ANCHOR 边界分片多线程扫（每分片一个 clone，扫完 `merge()` 合并）。非并行 Collector 单独顺序跑保证正确性。`run_parallel(num_threads)` 自动判断（trace <50K 或无并行 Collector 时回退顺序）。XrefCollector 是典型并行实现。
+
+**与 Pass 的关系**：Pass 在 `run()` 中可创建 Collector 注册到 `ctx.scan_engine()`，由引擎统一调度扫描。也可自己直接遍历 reader。
+
+## Pass 依赖 DAG
+
+```
+Level 0 (无依赖，可并行):
+  index_build  disassembly  xref  function  thread  backward_taint
+  string  pattern  constant_materialization  trace_diff  objc
+  memory_string  memory_snapshot  dataflow_graph  reg_timeline
+  mem_search  producer_chain  window_stats  entropy  literal_search
+  yara_mem_scan  cache_sim  syscall_intercept
+
+Level 1:
+  cfg ← xref                    call_graph ← function
+  taint ← xref                  trace_fold ← {loop, xref}
+  loop_semantics ← {loop, xref} thread_filter ← thread
+  call_context ← loop           objc_crypto ← {pattern, objc}
+  slice ← taint                 cfg_layout ← cfg
+
+Level 2:
+  loop ← cfg                    symbol_annotation ← {function, loop, constant_materialization, pattern}
+  taint_source_annotation ← {backward_taint, objc}
+
+Level 3:
+  algorithm_summary ← {pattern, constant_materialization, loop_semantics, function, call_graph}
+```
+
+> 注：`pattern` 硬依赖为空，但通过 `try_require()` 软消费 `constant_materialization` 结果（若已跑）避免重复扫描。
+
+## Pass 全目录
+
+### 基础索引与解码
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `index_build` | — | 首次加载时触发 TraceIndex 构建（若缓存有效直接跳过）。结果含 inst/anchor/code 计数、构建耗时、是否命中缓存。 |
+| `disassembly` | — | 建 PC→DecodedInst 表，按需查指令。用 InstructionDecoder + LRU 缓存。 |
+| `xref` | — | PC→inst_id 倒排（Roaring64Map bitmap）+ PC 执行计数。支持并行分片。是 CFG/Taint/Loop 等的加速基础。 |
+
+### 控制流与函数
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `cfg` | xref | 从 trace 恢复基本块 + 边。天然解决间接跳转（有实际执行目标）。基本块按分支目标/分支指令切分，边按 PC transition 累计 taken_count。`extract_function(entry_pc)` BFS 取过程内子图。 |
+| `cfg_layout` | cfg | 用 GraphGridLayout（自研，与 IDA 同源 Sugiyama 分层）算节点坐标 + 边路由，生成带注释 DOT。 |
+| `function` | — | BL/BLR→RET 配对识别函数调用，模拟调用栈。含 tail call（b/br）检测。输出 CallEvent 列表 + FunctionInfo（entry_pc/name/calls/instructions）。`call_stack_at(inst_id)` 重建任意时刻调用栈。 |
+| `call_graph` | function | 从函数分析结果建调用图（caller→callee + 调用次数）。 |
+| `loop` | cfg | 基于 CFG 支配树的循环检测（LLVM 风格）。输出 header/body/back_edge/iteration_count。 |
+
+### 污点与数据流
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `taint` | xref | **前向污点**。TaintConfig 指定源寄存器（bitmask）/内存地址/方向/停止条件。Triton 精确模式（可用时）+ 启发式 fallback。XRef 加速：跳过不读任何污染源的指令。ABI 感知跨函数传播（BL→X0-X7，RET→X0）。输出 TaintEvent + 细粒度 PropagationStep（RegToReg/RegToMem/MemToReg/.../Kill/Call/Return）。 |
+| `backward_taint` | — | **反向污点**（sink→source）。用 REG_WRITES 倒排索引 O(log N) 直接跳到 last writer，而非逐条回溯。支持跨函数（BL→callee 追 X0，RET→caller）、内存传播（load←store 链）、多 sink 归因（SinkTag）。输出 BackwardTaintEvent + DataflowEdge 图。 |
+| `slice` | taint | 程序切片：给定 (inst_id, reg) 的反向切片，只保留真正数据依赖链。 |
+| `dataflow_graph` | — | 构建指令区域的寄存器级数据流图（DataflowEdge: from_inst→to_inst via_reg）。 |
+| `producer_chain` | — | 轻量反向寄存器值溯源（无 Triton），给 GUI 高亮用。 |
+
+### 模式与算法识别
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `pattern` | — | YARA 规则匹配检测加密/反调试/混淆/网络/密钥调度模式。构造三组可扫缓冲区：寄存器值缓冲（diff 值拼接）、syscall 缓冲、代码缓冲。`rules/` 目录 6 组 `.yar` 规则。外加 mnemonic 检测（HW AES/SHA、XOR 循环、MOVZ/MOVK 常量加载）。软消费 `constant_materialization` 避免重复扫。 |
+| `constant_materialization` | — | 追踪 MOVZ+MOVK 常量构造链，匹配已知算法常量（AES S-Box、SHA-256 K 等）。 |
+| `loop_semantics` | loop, xref | 采样循环 2-3 次迭代，对比寄存器状态识别 active/invariant 寄存器 + body 特征（sbox/xor/shift/add/modular），分类为 FeistelRound/SPNRound/ARXRound/CounterLoop/Accumulator/MemcpyLike。 |
+| `algorithm_summary` | pattern, constant_materialization, loop_semantics, function, call_graph | 综合上述结果生成算法摘要报告（识别出 AES/SHA/RSA 等具体算法）。 |
+| `entropy` | — | 内存区域 Shannon 熵分析，检测密文（高熵）/明文（低熵）。 |
+
+### 字符串与内存
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `string` | — | 扫 trace 末尾时刻内存最终快照发现可打印字符串（ASCII/UTF-8/UTF-16）。自然绕过运行时解密——看到的是解密后明文。 |
+| `memory_string` | — | 时间感知：在调用点用 MemoryModel 重建当时内存，发现调用瞬间的字符串。 |
+| `memory_snapshot` | — | 在函数调用和显式 inst_id 点捕获内存快照（按区域）。 |
+| `mem_search` | — | YARA 加速的多模式搜索内存写入和寄存器值。支持 `AA BB ?? CC` 通配。 |
+| `literal_search` | — | 搜特定字面值（寄存器/内存/立即数字段）。 |
+| `yara_mem_scan` | — | YARA 规则扫内存快照（heap/stack 加密常量与模式）。支持最小熵过滤、代码缓冲扫描。 |
+
+### ObjC 与 iOS 系统调用
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `objc` | — | 解析 ObjC 消息发送记录（recv/sel/cls），按类名/选择子统计。 |
+| `objc_crypto` | pattern, objc | 关联加密模式命中与 ObjC 调用栈上下文。 |
+| `syscall_intercept` | — | 提取 iOS 系统 API 调用参数（CommonCrypto、Security.framework）。软依赖 objc 做上下文注释。捕获指针参数指向的字节。 |
+| `taint_source_annotation` | backward_taint, objc | 为反向污点的叶节点源标注 ObjC getter / 内存上下文。 |
+
+### 循环、轨迹折叠、差异
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `trace_fold` | loop, xref | 把重复循环迭代折叠成摘要（减少显示噪音）。 |
+| `trace_diff` | — | 比较两个 trace 区域（[a_start,a_end) vs [b_start,b_end)）找行为差异。直接操作 trace reader + code table。 |
+| `call_context` | loop | 给指令生成富上下文：调用栈 + 循环位置 + 邻居指令。 |
+
+### 统计与可视化辅助
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `reg_timeline` | — | 构建寄存器值时间线（所有写时刻 + 值），给 GUI sparkline。 |
+| `window_stats` | — | 滑动窗口统计：mnemonic 分布、内存热点等。用 `aarch64_classify.h` 的 OpcodeInfo 快速分类。 |
+| `symbol_annotation` | function, loop, constant_materialization, pattern | 聚合所有 Pass 的注释为统一注释层（PC→标签集合）。 |
+
+### 线程
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `thread` | — | 线程感知分析：上下文切换、每线程时间线、执行跨度。 |
+| `thread_filter` | thread | 建每线程指令 bitmap，支持多线程 trace 按线程过滤。 |
+
+### 缓存模拟
+
+| Pass | 依赖 | 说明 |
+|------|------|------|
+| `cache_sim` | — | 组相联缓存模拟（L1D/L2），输出 miss rate/hot lines/时序侧信道检测。可配 size/policy(LRU/PLRU/RAND)。软依赖 function。 |
+
+## 关键算法详解
+
+### TaintPass 前向传播（XRef 加速跳跃）
+
+核心优化：稀疏传播——只处理可能传播污点的指令。当前污点集只在 x2，而接下来 100 条都不读 x2，传统逐条遍历是浪费。用 XRef 的 `next_reader` 直接跳到下一个读 x2 的指令。使传播性能与 **tainted 指令数**成正比，而非 trace 长度。
+
+每条指令：取 `state_before` → `opcode_at(pc)` → `decoder.decode` 或 `triton.process_instruction` → 检查写寄存器是否被污染 → 记录 PropagationStep。停止条件：max_instructions/max_taint_width/stop_pcs。
+
+### BackwardTaintPass 反向传播（REG_WRITES 跳跃）
+
+从 sink 反向追：当前 needed 集合 = {x0}。用 `index.find_last_writer_of(x0, current_id)` O(log N) 直接跳到写 x0 的指令，而非逐条回退。在该指令读的寄存器加入 needed，继续追。内存传播：若指令从内存 load，追到写该内存的 store（用 mem_write CF）。跨函数：BL 处若需 X0 则进 callee 追，RET 处回到 caller。
+
+### CFGPass 从动态 trace 恢复
+
+基本块边界：分支指令的目标 + 被跳转到的地址。边：每个 PC transition (from→to) 建边，类型由 from 指令决定（FallThrough/Branch/Conditional/Call/Return/Indirect），taken_count++。`extract_function` 用 BFS 遍历可达块（跳过 Call 的非 fallthrough 边，保留过程内）。
+
+### LoopSemanticsPass 循环语义分类
+
+对每个 iteration_count≥2 的循环：用 XRef 的 PC bitmap O(K) 定位 header 的多次执行 → `regfile.state_before` 取 2-3 次迭代的寄存器状态 → 对比识别 active/invariant 寄存器 → 扫 body 指令检测特征（sbox=数据依赖索引的 LDR、xor_mix=EOR、shift_rotate=LSL/LSR/ROR、addition_chain=ADD/SUB、modular=MUL/UDIV）→ 按特征组合分类（Feistel/SPN/ARX/...）+ 置信度。
+
+### PatternPass YARA + mnemonic 双路检测
+
+构造缓冲区：寄存器值缓冲（8B LE diff 值拼接，带 offset→inst_id 映射）、syscall 缓冲（16B 条目）、代码缓冲（连续 opcode，带 offset→pc 映射）。YARA 扫描这些缓冲，命中后按 offset 反查 inst_id/pc。外加 inline mnemonic 检测（HW AES/SHA 指令、XOR 循环、MOVZ/MOVK 序列）。后者可由 `constant_materialization` 结果合成，避免重复扫。
+
+## 自定义 Pass 开发
 
 ```cpp
-// Pass 运行结果的类型擦除容器
-class PassResult {
-public:
-    enum Status { Success, Failed, Skipped };
-    Status status;
-    std::string error_message;  // 仅 Failed 时有值
-    std::any data;              // 类型安全的结果数据
-
-    template<typename T>
-    static PassResult success(T&& result) {
-        return {Success, {}, std::make_any<T>(std::forward<T>(result))};
-    }
-    static PassResult failed(std::string msg) {
-        return {Failed, std::move(msg), {}};
-    }
-};
-
-// Pass 执行上下文
-class PassContext {
-public:
-    // === IO 层访问 ===
-    TraceReader& reader();
-    RocksDBIndex& index();
-    CodeTable& code_table();
-    SymbolTable& symbols();
-
-    // === Core 层访问 ===
-    RegisterFile& regfile();
-    MemoryModel& memory();
-    TritonBridge& triton();
-    InstructionDecoder& decoder();
-
-    // === Pass 间结果获取 ===
-    // 获取已完成 Pass 的结果（类型安全）
-    template<typename T>
-    const T& require(const std::string& pass_name) {
-        // PassManager 保证该 pass 已运行完毕（否则会先触发运行）
-        return std::any_cast<const T&>(manager_.get_result(pass_name).data);
-    }
-
-    // === 分析范围 ===
-    struct Range {
-        uint64_t start_inst_id;
-        uint64_t end_inst_id;
-        bool is_full_trace() const;
-    };
-    Range range() const;
-
-    // === 进度报告 ===
-    void progress(float pct);  // 0.0 - 1.0
-    void progress(float pct, std::string_view msg);
-    bool cancelled() const;  // 用户取消
-
-private:
-    PassManager& manager_;
-    Range range_;
-};
-
-// Pass 基类
-class AnalysisPass {
-public:
-    virtual ~AnalysisPass() = default;
-
-    // === 元信息（编译期确定）===
-    virtual std::string_view name() const = 0;
-    virtual std::string_view description() const = 0;
-    virtual std::vector<std::string_view> dependencies() const { return {}; }
-
-    // === 执行 ===
-    virtual PassResult run(PassContext& ctx) = 0;
-
-    // === 可选：增量更新 ===
-    virtual bool supports_incremental() const { return false; }
-    virtual PassResult update(PassContext& ctx,
-                             const PassContext::Range& changed_range) {
-        return run(ctx);  // 默认：全量重跑
-    }
-
-    // === 可选：估算开销（用于调度优先级）===
-    virtual float estimated_cost(const PassContext& ctx) const { return 1.0f; }
-};
-
-// PassManager：注册 + 调度 + 缓存
-class PassManager {
-public:
-    // 注册 Pass（通常在 main() 中完成）
-    void register_pass(std::unique_ptr<AnalysisPass> pass);
-
-    // 按需执行：如果未运行则运行（递归解析依赖链）
-    const PassResult& require(const std::string_view pass_name);
-
-    // 并行执行所有已注册的 Pass（按 DAG 拓扑序 + 线程池）
-    void run_all(size_t num_threads = std::thread::hardware_concurrency());
-
-    // 使缓存失效（触发下次 require 时重跑）
-    void invalidate(const std::string_view pass_name);
-    void invalidate_all();
-
-    // 设置分析范围（影响所有 Pass 的 ctx.range()）
-    void set_range(uint64_t start, uint64_t end);
-
-    // 查询状态
-    enum PassState { NotRun, Running, Completed, Failed };
-    PassState state(const std::string_view pass_name) const;
-    std::vector<std::string_view> all_passes() const;
-
-private:
-    struct PassEntry {
-        std::unique_ptr<AnalysisPass> pass;
-        PassResult result;
-        PassState state = NotRun;
-    };
-    std::unordered_map<std::string_view, PassEntry> passes_;
-
-    // DAG 调度
-    std::vector<std::vector<std::string_view>> topological_levels();
-    void execute_level(std::vector<std::string_view>& level, size_t num_threads);
-};
-```
-
-### Pass 注册示例
-
-```cpp
-int main(int argc, char** argv) {
-    // ... 初始化 IO 和 Core ...
-
-    PassManager pm;
-
-    // 注册内置 Pass
-    pm.register_pass(std::make_unique<IndexBuildPass>());
-    pm.register_pass(std::make_unique<XRefPass>());
-    pm.register_pass(std::make_unique<TaintPass>());
-    pm.register_pass(std::make_unique<CFGPass>());
-    pm.register_pass(std::make_unique<CFGLayoutPass>());
-    pm.register_pass(std::make_unique<StringPass>());
-    pm.register_pass(std::make_unique<PatternPass>());
-    pm.register_pass(std::make_unique<CallGraphPass>());
-    pm.register_pass(std::make_unique<SlicePass>());
-
-    // 用户自定义 Pass（未来：从 .so 动态加载）
-    // pm.register_pass(load_plugin("my_analysis.so"));
-
-    // 按需执行
-    const auto& taint = pm.require<TaintResult>("taint");
-    // → 自动触发：IndexBuildPass → XRefPass → TaintPass
-}
-```
-
----
-
-## 内置 Pass 详细设计
-
-### IndexBuildPass
-
-**依赖**：无
-**输出**：`IndexBuildResult`（标记构建完成，RocksDB 数据通过 `ctx.index()` 访问）
-
-```cpp
-struct IndexBuildResult {
-    uint64_t inst_count;
-    uint64_t anchor_count;
-    uint64_t unique_pcs;
-    uint64_t unique_mem_pages;
-    double build_time_seconds;
-    bool was_cached;  // 是否使用了已有缓存
-};
-
-class IndexBuildPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "index_build"; }
-    std::string_view description() const override {
-        return "Build RocksDB inverted indices from raw trace";
-    }
-
-    PassResult run(PassContext& ctx) override {
-        // 如果缓存有效，直接返回
-        if (ctx.index().is_valid_for(ctx.reader())) {
-            return PassResult::success(IndexBuildResult{
-                .was_cached = true, ...
-            });
-        }
-        // 否则全量构建（顺序扫描 + batch write）
-        IndexBuilder builder;
-        builder.build(ctx.reader(), ctx.index(), [&](float pct) {
-            ctx.progress(pct);
-        });
-        return PassResult::success(IndexBuildResult{...});
-    }
-};
-```
-
----
-
-### XRefPass
-
-**依赖**：`index_build`
-**输出**：`XRefResult`
-
-XRef 提供 Use-Def / Def-Use 链。利用 Triton 语义和 RocksDB 索引加速。
-
-```cpp
-struct XRefResult {
-    // 寄存器 XRef：reg_index + inst_id → 定义/使用链
-    // 不预构建全局表（太大），而是提供按需查询接口
-
-    // 查询：inst_id 的 reg_index 来自哪里（Use-Def）
-    uint64_t reg_defined_by(uint64_t inst_id, uint8_t reg_index) const;
-
-    // 查询：inst_id 写入的 reg_index 被谁使用（Def-Use）
-    std::vector<uint64_t> reg_used_by(uint64_t inst_id, uint8_t reg_index) const;
-
-    // 内存 XRef：利用 RocksDB mem_write/mem_read 索引
-    uint64_t mem_defined_by(uint64_t addr, uint8_t size, uint64_t at_inst_id) const;
-    std::vector<uint64_t> mem_used_by(uint64_t addr, uint8_t size,
-                                       uint64_t after_inst_id) const;
-};
-
-class XRefPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "xref"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"index_build"};
-    }
-
-    PassResult run(PassContext& ctx) override {
-        // XRef 是"按需计算"模型，run() 只构建加速结构
-        // 实际查询时利用：
-        //   - 寄存器 XRef：从目标 inst 向前扫描 diff 链
-        //   - 内存 XRef：RocksDB mem_write CF 直接查
-        return PassResult::success(XRefResult{ctx.index(), ctx.regfile()});
-    }
-};
-```
-
-**寄存器 Use-Def 算法**：
-
-```
-reg_defined_by(inst_id=162718, reg=x24):
-  从 inst_id=162718 向前逐条检查 diff：
-    if inst[id-1].reg_diffs contains x24 → return id-1
-    if inst[id-2].reg_diffs contains x24 → return id-2
-    ...
-  性能：平均回溯 <100 条即命中（寄存器活跃间隔短）
-  优化：如果需要跨越 anchor 边界，用 RocksDB 加速跳转
-```
-
-**内存 Use-Def 算法**：
-
-```
-mem_defined_by(addr=0x7fec60ebd9, size=1, at_inst_id=162718):
-  1. page = addr >> 12
-  2. writers_bitmap = index.mem_writers(page)
-  3. 在 bitmap 中找 <= 162718 的最大 inst_id（Roaring 支持 rank/select）
-  4. 验证该 inst 确实写了精确地址
-  复杂度：O(1) RocksDB lookup + O(log N) bitmap rank
-```
-
----
-
-### TaintPass
-
-**依赖**：`xref`
-**输出**：`TaintResult`
-
-核心：通过 Triton TaintEngine 做精确的正向/逆向污点传播。
-
-```cpp
-struct TaintSource {
-    enum Kind { Register, Memory } kind;
-    uint64_t inst_id;       // 污点起始指令
-    uint8_t reg_index;      // kind==Register 时有效
-    uint64_t mem_addr;      // kind==Memory 时有效
-    uint8_t mem_size;
-};
-
-struct TaintConfig {
-    TaintSource source;
-    enum Direction { Forward, Backward } direction;
-    uint64_t max_steps = 1000000;
-    uint64_t max_taint_width = 64;  // 最大同时被污染的寄存器/内存数
-    bool stop_at_function_boundary = false;
-    std::vector<uint64_t> stop_pcs;   // 遇到这些 PC 停止
-    bool propagate_through_memory = true;
-    bool propagate_through_calls = true;
-};
-
-struct TaintResult {
-    roaring::Roaring64Map tainted_insts;  // 被污染的指令集合
-    struct PropagationStep {
-        uint64_t inst_id;
-        enum Event { RegToReg, RegToMem, MemToReg, MemToMem, Kill } event;
-        uint8_t src_reg;  // 源寄存器（如适用）
-        uint8_t dst_reg;  // 目标寄存器（如适用）
-        uint64_t addr;    // 涉及的内存地址（如适用）
-    };
-    std::vector<PropagationStep> propagation_log;  // 详细传播日志
-    uint64_t steps_executed;
-    bool reached_limit;
-    std::string stop_reason;
-};
-
-class TaintPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "taint"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"xref"};
-    }
-
-    // TaintPass 是"按需触发"型：用户选择 source 后才运行
-    // run() 只是标记 ready
-    PassResult run(PassContext& ctx) override;
-
-    // 实际的 taint 计算（由 UI 层触发）
-    TaintResult compute(PassContext& ctx, const TaintConfig& config);
-};
-```
-
-**正向污点传播算法**：
-
-```cpp
-TaintResult TaintPass::forward_taint(PassContext& ctx, const TaintConfig& cfg) {
-    TaintResult result;
-    auto triton_ctx = ctx.triton().acquire();
-
-    // 设置初始污点
-    if (cfg.source.kind == TaintSource::Register)
-        ctx.triton().taint_reg(triton_ctx, cfg.source.reg_index);
-    else
-        ctx.triton().taint_mem(triton_ctx, cfg.source.mem_addr, cfg.source.mem_size);
-
-    uint64_t current_id = cfg.source.inst_id;
-    uint64_t steps = 0;
-
-    while (steps < cfg.max_steps && current_id < ctx.range().end_inst_id) {
-        if (ctx.cancelled()) break;
-
-        // 获取当前指令语义
-        const auto& regs = ctx.regfile().state_before(current_id);
-        uint64_t pc = regs.pc();
-        auto opcode = ctx.code_table().opcode_at(pc);
-        if (!opcode) { ++current_id; continue; }
-
-        // 加速：通过语义缓存判断该指令是否可能传播污点
-        const auto& sem = ctx.triton().semantics(pc, *opcode);
-        if (!could_propagate(triton_ctx, sem)) {
-            // 该指令不读任何被污染的源 → 跳过 Triton replay
-            ++current_id; ++steps;
-            continue;
-        }
-
-        // Triton replay（含污点传播）
-        ctx.triton().replay(triton_ctx, pc, *opcode, regs, ctx.memory());
-
-        // 收集新被污染的目标
-        for (uint8_t reg : sem.regs_written) {
-            if (ctx.triton().is_reg_tainted(triton_ctx, reg)) {
-                result.tainted_insts.add(current_id);
-                result.propagation_log.push_back({current_id, ...});
-            }
-        }
-
-        // 检查终止条件
-        if (auto it = std::find(cfg.stop_pcs.begin(), cfg.stop_pcs.end(), pc);
-            it != cfg.stop_pcs.end()) {
-            result.stop_reason = "reached stop PC";
-            break;
-        }
-
-        ++current_id; ++steps;
-    }
-
-    result.steps_executed = steps;
-    result.reached_limit = (steps >= cfg.max_steps);
-    return result;
-}
-```
-
-**XRef 加速跳跃**：
-
-在正向传播中，如果当前污点集只在寄存器 x2 上，而接下来 100 条指令都不读 x2，传统逐条遍历是浪费的。优化方案：
-
-```
-优化：
-  current_taint_set = {x2}
-  next_use = xref.next_reader_of(current_id, x2)
-  if (next_use - current_id > 100):
-    jump to next_use directly (skip 100 instructions)
-```
-
-这使得稀疏传播的性能与 **tainted 指令数**成正比，而非与 trace 长度成正比。
-
----
-
-### CFGPass
-
-**依赖**：`index_build`
-**输出**：`CFGResult`
-
-从动态 trace 恢复函数级 CFG。天然解决间接跳转（因为有实际执行的目标地址）。
-
-```cpp
-struct BasicBlock {
-    uint64_t id;              // 块 ID
-    uint64_t start_pc;        // 块起始 PC
-    uint64_t end_pc;          // 块末尾 PC
-    uint32_t inst_count;      // 块内指令数
-    uint64_t exec_count;      // 执行次数（从 trace 统计）
-    bool is_entry;
-    bool is_exit;
-};
-
-struct Edge {
-    uint64_t from_block;
-    uint64_t to_block;
-    enum Type { FallThrough, ConditionalTrue, ConditionalFalse,
-                Unconditional, Indirect, BackEdge } type;
-    uint64_t exec_count;      // 该边的执行次数
-};
-
-struct Loop {
-    uint64_t header_block_id;
-    std::vector<uint64_t> body_block_ids;
-    uint64_t back_edge_from;
-    uint64_t iteration_count;  // 从 exec_count 推断
-};
-
-struct CFGResult {
-    struct FunctionCFG {
-        uint64_t entry_pc;
-        std::string name;  // 从 SymbolTable
-        std::vector<BasicBlock> blocks;
-        std::vector<Edge> edges;
-        std::vector<Loop> loops;
-    };
-
-    std::unordered_map<uint64_t/*entry_pc*/, FunctionCFG> functions;
-
-    // 按需构建（不预构建所有函数的 CFG）
-    const FunctionCFG& get_or_build(uint64_t func_entry_pc);
-};
-
-class CFGPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "cfg"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"index_build"};
-    }
-
-    PassResult run(PassContext& ctx) override;
-};
-```
-
-**CFG 构建算法**：
-
-```
-build_cfg(entry_pc):
-  1. 从 RocksDB "pc" CF 获取 entry_pc 的所有 inst_id
-  2. 从第一个 inst_id 开始，顺序遍历属于该函数的指令
-     （通过 CallStack 识别函数边界，或通过 return 指令判断）
-  3. 识别基本块边界：
-     - 分支/跳转指令的目标 → 新块起始
-     - 被跳转到的地址 → 新块起始
-     - 函数调用后的下一条 → 新块起始（可选）
-  4. 对每个 PC transition (from_pc → to_pc)：
-     - 确定 from_block 和 to_block
-     - 添加 Edge，类型由 from_pc 的指令类型决定
-     - exec_count++
-  5. 循环识别：Tarjan SCC 或 自然循环检测（back edge = 边的终点 dominates 起点）
-```
-
----
-
-### CFGLayoutPass
-
-**依赖**：`cfg`
-**输出**：`CFGLayoutResult`
-
-使用 **Graphviz libgvc** 做 Sugiyama 分层布局，获取每个节点的坐标。
-
-```cpp
-struct BlockLayout {
-    uint64_t block_id;
-    double x, y;             // 布局坐标
-    double width, height;    // 节点尺寸
-    uint32_t layer;          // 分层编号
-};
-
-struct EdgeRoute {
-    uint64_t from_block;
-    uint64_t to_block;
-    std::vector<std::pair<double, double>> control_points;  // 贝塞尔控制点
-};
-
-struct CFGLayoutResult {
-    std::unordered_map<uint64_t/*func_entry*/, FunctionLayout> layouts;
-
-    struct FunctionLayout {
-        std::vector<BlockLayout> blocks;
-        std::vector<EdgeRoute> edges;
-        double total_width, total_height;
-    };
-};
-
-class CFGLayoutPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "cfg_layout"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"cfg"};
-    }
-
-    PassResult run(PassContext& ctx) override {
-        const auto& cfg_result = ctx.require<CFGResult>("cfg");
-        CFGLayoutResult layout_result;
-
-        for (auto& [entry_pc, func_cfg] : cfg_result.functions) {
-            layout_result.layouts[entry_pc] = layout_function(func_cfg);
-        }
-        return PassResult::success(std::move(layout_result));
-    }
-
-private:
-    FunctionLayout layout_function(const CFGResult::FunctionCFG& cfg) {
-        // 1. 构建 Graphviz 图
-        Agraph_t* g = agopen("cfg", Agdirected, nullptr);
-        agattr(g, AGRAPH, "rankdir", "TB");  // Top-to-Bottom
-
-        // 2. 添加节点
-        for (auto& block : cfg.blocks) {
-            auto node_name = std::to_string(block.id);
-            Agnode_t* n = agnode(g, node_name.c_str(), TRUE);
-            // 节点大小基于指令数
-            auto h = std::to_string(0.3 + block.inst_count * 0.15);
-            agset(n, "height", h.c_str());
-        }
-
-        // 3. 添加边
-        for (auto& edge : cfg.edges) {
-            auto from_name = std::to_string(edge.from_block);
-            auto to_name = std::to_string(edge.to_block);
-            Agnode_t* from = agnode(g, from_name.c_str(), FALSE);
-            Agnode_t* to = agnode(g, to_name.c_str(), FALSE);
-            Agedge_t* e = agedge(g, from, to, nullptr, TRUE);
-            if (edge.type == Edge::BackEdge)
-                agset(e, "constraint", "false");  // 回边不影响层次
-        }
-
-        // 4. 运行 dot 布局
-        GVC_t* gvc = gvContext();
-        gvLayout(gvc, g, "dot");
-
-        // 5. 提取坐标
-        FunctionLayout result;
-        for (auto& block : cfg.blocks) {
-            auto* n = agnode(g, std::to_string(block.id).c_str(), FALSE);
-            auto pos = ND_coord(n);
-            result.blocks.push_back({block.id, pos.x, pos.y, ...});
-        }
-
-        // 6. 提取边路由
-        // ... 从 Graphviz spline 数据提取控制点 ...
-
-        gvFreeLayout(gvc, g);
-        agclose(g);
-        gvFreeContext(gvc);
-        return result;
-    }
-};
-```
-
-**DOT/SVG 导出**：
-
-```cpp
-// 额外功能：导出为文件（给外部工具使用）
-void export_dot(const CFGResult::FunctionCFG& cfg, const std::string& path);
-void export_svg(const CFGResult::FunctionCFG& cfg, const std::string& path);
-```
-
----
-
-### StringPass
-
-**依赖**：无（直接使用 MemoryModel）
-**输出**：`StringResult`
-
-```cpp
-struct StringRef {
-    uint64_t addr;
-    uint32_t length;
-    enum Encoding { ASCII, UTF8, UTF16LE, UTF16BE } encoding;
-    std::string value;          // 解码后的字符串
-    uint64_t first_write_id;    // 第一次写入该区域的 inst_id
-    uint64_t first_read_id;     // 第一次读取该区域的 inst_id
-};
-
-struct StringResult {
-    std::vector<StringRef> strings;  // 按 first_read_id 排序
-
-    // 搜索
-    std::vector<size_t> search(std::string_view pattern) const;
-    std::vector<size_t> search_regex(std::string_view regex) const;
-};
-
-class StringPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "string"; }
-    // 无依赖：直接使用 Core 层
-
-    PassResult run(PassContext& ctx) override {
-        // 策略：扫描 trace 末尾时刻的内存最终快照
-        // 这自然绕过了运行时解密——因为看到的是解密后的明文
-        StringResult result;
-        scan_memory_for_strings(ctx.memory(), ctx.range().end_inst_id, result);
-        return PassResult::success(std::move(result));
-    }
-};
-```
-
----
-
-### PatternPass
-
-**依赖**：`string`
-**输出**：`PatternResult`
-
-识别密码学算法、反调试模式等。内置特征库 + 可扩展规则。
-
-```cpp
-struct PatternMatch {
-    std::string pattern_name;    // e.g. "AES S-Box", "SHA-256 K constants"
-    uint64_t addr;               // 匹配到的地址
-    float confidence;            // 0.0 - 1.0
-    std::string description;
-    std::vector<uint64_t> related_insts;  // 使用该数据的指令
-};
-
-struct PatternResult {
-    std::vector<PatternMatch> matches;
-};
-
-class PatternPass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "pattern"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"string"};  // 利用 StringPass 的扫描结果
-    }
-
-    PassResult run(PassContext& ctx) override;
-
-    // 可扩展：注册自定义模式
-    void register_pattern(std::string name, std::vector<uint8_t> signature,
-                         float min_confidence);
-
-private:
-    // 内置特征库
-    struct PatternDef {
-        std::string name;
-        std::vector<uint8_t> signature;  // 特征字节
-        std::string description;
-    };
-    std::vector<PatternDef> builtin_patterns_ = {
-        {"AES S-Box", {0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, ...}, "AES SubBytes lookup table"},
-        {"SHA-256 K", {0x42, 0x8a, 0x2f, 0x98, ...}, "SHA-256 round constants"},
-        {"Base64 table", {'A','B','C','D','E','F', ...}, "Standard Base64 encoding table"},
-        // ...
-    };
-};
-```
-
----
-
-### CallGraphPass
-
-**依赖**：`cfg`
-**输出**：`CallGraphResult`
-
-```cpp
-struct CallGraphResult {
-    struct CallSite {
-        uint64_t caller_pc;     // 调用指令的 PC
-        uint64_t callee_entry;  // 被调用函数入口
-        uint64_t call_count;    // 调用次数
-        uint64_t first_call_inst_id;
-    };
-    std::vector<CallSite> call_sites;
-
-    // 查询
-    std::vector<uint64_t> callees_of(uint64_t func_entry) const;
-    std::vector<uint64_t> callers_of(uint64_t func_entry) const;
-};
-```
-
----
-
-### SlicePass
-
-**依赖**：`xref`, `taint`
-**输出**：`SliceResult`
-
-程序切片：给定一个变量（寄存器/内存位置）在某个 inst_id 的值，
-找出所有影响该值的指令（backward slice）或被该值影响的指令（forward slice）。
-
-```cpp
-struct SliceResult {
-    roaring::Roaring64Map slice_insts;  // 切片中的指令集合
-    // 切片是 taint 的"精确版"——只保留真正的数据依赖链
-};
-
-class SlicePass : public AnalysisPass {
-public:
-    std::string_view name() const override { return "slice"; }
-    std::vector<std::string_view> dependencies() const override {
-        return {"xref", "taint"};
-    }
-
-    SliceResult compute_backward_slice(PassContext& ctx,
-                                       uint64_t inst_id, uint8_t reg_index);
-    SliceResult compute_forward_slice(PassContext& ctx,
-                                      uint64_t inst_id, uint8_t reg_index);
-};
-```
-
----
-
-## Pass 并行调度
-
-```
-依赖 DAG:
-
-Level 0: [IndexBuildPass]
-Level 1: [XRefPass, CFGPass, StringPass]    ← 这三个可并行
-Level 2: [TaintPass, CFGLayoutPass, PatternPass, CallGraphPass]  ← 可并行
-Level 3: [SlicePass]
-
-执行策略：
-  thread_pool(num_threads = 4)
-  for each level:
-    submit all passes in level to thread_pool
-    wait_all()
-```
-
----
-
-## 自定义 Pass 开发指南
-
-用户编写新的分析 Pass 只需：
-
-```cpp
-#include <tenet/analysis/pass.h>
-
-class MyCustomPass : public AnalysisPass {
-public:
+#include "analysis/pass_manager.h"
+class MyPass final : public AnalysisPass {
     std::string_view name() const override { return "my_analysis"; }
-    std::string_view description() const override {
-        return "My custom analysis pass";
-    }
-    std::vector<std::string_view> dependencies() const override {
-        return {"xref"};  // 需要 XRef 结果
-    }
-
+    std::string_view description() const override { return "..."; }
+    std::vector<std::string_view> dependencies() const override { return {"xref"}; }
     PassResult run(PassContext& ctx) override {
-        const auto& xref = ctx.require<XRefResult>("xref");
-        // ... 使用 xref + ctx.regfile() + ctx.triton() 做分析 ...
+        const auto& xref = ctx.require<XrefResult>("xref");
+        // 用 ctx.regfile()/memory()/decoder() + xref 做分析
         return PassResult::success(MyResult{...});
     }
 };
-
-// 注册
-pm.register_pass(std::make_unique<MyCustomPass>());
+// main.cpp: pm.register_pass(std::make_unique<MyPass>());
 ```
 
----
+**要点**：
+- 结果类型放头文件（供其他 Pass `require<T>` 取）。
+- 长耗时操作用 `ctx.progress(pct)` 报告，定期检查 `ctx.cancelled()`。
+- 需扫 trace 时优先用 `ctx.scan_engine()` + 自定义 Collector，而非自己遍历。
+- 软依赖用 `try_require<T>`，硬依赖写进 `dependencies()`。
+- 线程安全：`run()` 中创建的 RegisterFile/Decoder 等可变对象是 Pass 私有，无需加锁；共享只读对象（reader/index）天然安全。
 
-## 性能预算
+## 性能预算（100M trace）
 
-| Pass | 100M trace 预期耗时 | 内存占用 | 说明 |
-|------|---------------------|----------|------|
-| IndexBuild | ~60s（首次）/ 0（缓存） | ~50MB 峰值 | RocksDB batch write |
-| XRef | ~0（按需） | ~10MB 缓存 | 查询时实时计算 |
-| Taint (10K steps) | ~50ms | ~5MB | Triton + Roaring |
-| CFG (单函数) | ~200ms | ~10MB | PC 索引 + 遍历 |
-| CFGLayout | ~500ms | ~20MB | Graphviz 内部分配 |
-| String | ~30s | ~100MB 峰值 | 全内存扫描 |
-| Pattern | ~5s | ~10MB | 特征匹配 |
+| Pass | 耗时 | 内存 |
+|------|------|------|
+| index_build | ~60s（首次）/ 0（缓存） | ~50MB 峰值 |
+| xref | ~5s（并行分片） | ~50MB |
+| cfg（单函数） | ~200ms | ~10MB |
+| taint（10K 步） | ~50ms | ~5MB |
+| backward_taint | ~100ms | ~10MB |
+| string | ~30s | ~100MB 峰值 |
+| pattern | ~5s | ~10MB |
+| loop_semantics | ~500ms | ~20MB |
