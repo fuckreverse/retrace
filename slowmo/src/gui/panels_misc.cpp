@@ -372,25 +372,26 @@ void GuiApp::render_string_context_menu() {
 }
 
 // ─── Progress Overlay / Timeline ──────────────────────────────────────────────
-// Redesigned as a proper Binary Ninja-style execution timeline:
-//  - Multi-lane rendering (top half: taint/BT overlay; bottom half: call events)
-//  - Gradient fill for progress
-//  - Bookmark diamonds, loop header notches, search-hit sparks
+// Multi-lane execution timeline with:
+//  - Lane 0 (top):    execution density heatmap (hot=bright, cold=dark)
+//  - Lane 1 (mid-top): taint / backward-taint overlays
+//  - Lane 2 (mid-bot): call-depth sparkline (function call stack depth over time)
+//  - Lane 3 (bottom): bookmarks, loop headers, search hits, current cursor
+//  - Memory-access activity markers (orange) for a watched address
 //  - Click + drag to seek; hover tooltip with full disasm preview
-//  - No background window border — blends cleanly into the layout
 
 void GuiApp::render_progress_overlay() {
     if (total_inst_ == 0) return;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float bar_height = 22.0f;   // slightly taller than before for more lanes
+    const float bar_height = 32.0f;   // taller: 4 lanes + depth sparkline
     const float bar_y = vp->WorkPos.y + ImGui::GetFrameHeight() * 2.2f;
     ImVec2 bar_pos(vp->WorkPos.x, bar_y);
     ImVec2 bar_size(vp->WorkSize.x, bar_height);
 
     ImGui::SetNextWindowPos(bar_pos);
     ImGui::SetNextWindowSize(bar_size);
-    ImGui::SetNextWindowBgAlpha(0.0f);  // transparent window — we draw everything manually
+    ImGui::SetNextWindowBgAlpha(0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
@@ -413,48 +414,106 @@ void GuiApp::render_progress_overlay() {
     float H = bar_height;
 
     // ── Track background ─────────────────────────────────────────────
-    // Dark navy with subtle top/bottom gradient edges
-    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H), IM_COL32(18, 20, 28, 235));
-    // Top subtle highlight line
-    draw->AddLine(p0, ImVec2(p0.x + W, p0.y),
-                  IM_COL32(80, 90, 130, 100), 1.0f);
+    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H), IM_COL32(15, 17, 24, 240));
+    draw->AddLine(p0, ImVec2(p0.x + W, p0.y), IM_COL32(60, 70, 110, 80), 1.0f);
+
+    // ── Lane layout ──────────────────────────────────────────────────
+    // Lane 0: heatmap background         [0,         H*0.30)
+    // Lane 1: taint overlays             [H*0.30,    H*0.52)
+    // Lane 2: call-depth sparkline       [H*0.52,    H*0.80)
+    // Lane 3: markers + cursor fill      [H*0.80,    H)
+    const float L0_top = 0.0f;
+    const float L0_bot = H * 0.30f;
+    const float L1_top = H * 0.30f;
+    const float L1_bot = H * 0.52f;
+    const float L2_top = H * 0.52f;
+    const float L2_bot = H * 0.80f;
+    const float L3_top = H * 0.80f;
 
     // ── Helper: inst_id → x ──────────────────────────────────────────
     auto inst_to_x = [&](uint64_t id) -> float {
         return p0.x + static_cast<float>(id) / static_cast<float>(total_inst_) * W;
     };
 
-    // ── Lane constants ───────────────────────────────────────────────
-    // Lane 0 (top):    taint / backward-taint overlays
-    // Lane 1 (middle): loop headers, call events
-    // Lane 2 (bottom): current-position fill + cursor
-    const float lane_top_h   = H * 0.40f;
-    const float lane_mid_top = H * 0.40f;
-    const float lane_mid_bot = H * 0.72f;
+    // ── LANE 0: Execution density heatmap ─────────────────────────────
+    // Sample the execution frequency per pixel column using xref exec counts.
+    // Build a per-pixel bucket map: pixel → max_exec_count in that bucket.
+    {
+        const int kPixels = static_cast<int>(W);
+        if (kPixels > 0 && xref_result_) {
+            // Find max exec count for normalization
+            uint64_t max_count = 1;
+            for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
+                if (cnt > max_count) max_count = cnt;
+            }
+            // Accumulate per-pixel max
+            std::vector<uint64_t> pixel_max(kPixels, 0);
+            for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
+                auto inst_ids = xref_result_->inst_ids_at(pc);
+                for (uint64_t id : inst_ids) {
+                    int px = static_cast<int>(
+                        static_cast<float>(id) / static_cast<float>(total_inst_) * static_cast<float>(kPixels));
+                    if (px >= 0 && px < kPixels) {
+                        if (cnt > pixel_max[px]) pixel_max[px] = cnt;
+                    }
+                }
+            }
+            // Draw heatmap: cold=dark blue, warm=cyan, hot=white
+            for (int px = 0; px < kPixels; px++) {
+                if (pixel_max[px] == 0) continue;
+                float heat = std::min(1.0f, static_cast<float>(pixel_max[px]) /
+                                           static_cast<float>(max_count));
+                // Color ramp: #121620 → #1a5f8a → #22c5ff → #ffffff
+                uint8_t r, g, b;
+                if (heat < 0.33f) {
+                    float t = heat / 0.33f;
+                    r = static_cast<uint8_t>(18 + t * (26 - 18));
+                    g = static_cast<uint8_t>(22 + t * (95 - 22));
+                    b = static_cast<uint8_t>(28 + t * (138 - 28));
+                } else if (heat < 0.67f) {
+                    float t = (heat - 0.33f) / 0.34f;
+                    r = static_cast<uint8_t>(26 + t * (34 - 26));
+                    g = static_cast<uint8_t>(95 + t * (197 - 95));
+                    b = static_cast<uint8_t>(138 + t * (255 - 138));
+                } else {
+                    float t = (heat - 0.67f) / 0.33f;
+                    r = static_cast<uint8_t>(34  + t * (255 - 34));
+                    g = static_cast<uint8_t>(197 + t * (255 - 197));
+                    b = 255;
+                }
+                uint8_t alpha = static_cast<uint8_t>(80 + heat * 155);
+                float fx = p0.x + static_cast<float>(px);
+                draw->AddLine(ImVec2(fx, p0.y + L0_top),
+                              ImVec2(fx, p0.y + L0_bot),
+                              IM_COL32(r, g, b, alpha), 1.0f);
+            }
+        } else if (!xref_result_) {
+            // Fallback: simple progress fill when xref is not available
+            float progress = (total_inst_ > 1)
+                ? static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1)
+                : 0.0f;
+            float fill_x = p0.x + progress * W;
+            draw->AddRectFilledMultiColor(
+                p0, ImVec2(fill_x, p0.y + L0_bot),
+                IM_COL32(32, 60, 115, 120), IM_COL32(42, 85, 155, 150),
+                IM_COL32(42, 85, 155, 150), IM_COL32(32, 60, 115, 120));
+        }
+    }
 
-    // ── Progress fill (gradient blue) ────────────────────────────────
-    float progress = (total_inst_ > 1)
-        ? static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1)
-        : 0.0f;
-    float fill_x = p0.x + progress * W;
+    // Subtle separator between heatmap and taint lanes
+    draw->AddLine(ImVec2(p0.x, p0.y + L0_bot),
+                  ImVec2(p0.x + W, p0.y + L0_bot),
+                  IM_COL32(40, 45, 65, 100), 1.0f);
 
-    // Two-tone gradient: left part brighter, blending right to darker
-    draw->AddRectFilledMultiColor(
-        p0, ImVec2(fill_x, p0.y + H),
-        IM_COL32(32, 60, 115, 140),   // TL
-        IM_COL32(42, 85, 155, 170),   // TR
-        IM_COL32(42, 85, 155, 170),   // BR
-        IM_COL32(32, 60, 115, 140));  // BL
-
-    // ── Taint overlays (top lane) ─────────────────────────────────────
+    // ── LANE 1: Taint overlays ────────────────────────────────────────
     if (show_taint_ && taint_result_ && !taint_sorted_ids_.empty()) {
         const size_t kMax = 3000;
         size_t step = std::max(size_t(1), taint_sorted_ids_.size() / kMax);
         for (size_t ti = 0; ti < taint_sorted_ids_.size(); ti += step) {
             float tx = inst_to_x(taint_sorted_ids_[ti]);
-            draw->AddLine(ImVec2(tx, p0.y + lane_mid_top),
-                          ImVec2(tx, p0.y + H),
-                          IM_COL32(42, 195, 82, 160), 1.0f);
+            draw->AddLine(ImVec2(tx, p0.y + L1_top),
+                          ImVec2(tx, p0.y + L1_bot),
+                          IM_COL32(42, 195, 82, 180), 1.0f);
         }
     }
     if (show_backward_taint_ && backward_taint_result_) {
@@ -462,29 +521,94 @@ void GuiApp::render_progress_overlay() {
         for (uint64_t id = 0; id < total_inst_ && shown < 3000; id++) {
             if (backward_taint_result_->is_contributing(id)) {
                 float tx = inst_to_x(id);
-                draw->AddLine(ImVec2(tx, p0.y),
-                              ImVec2(tx, p0.y + lane_top_h),
-                              IM_COL32(215, 55, 55, 165), 1.0f);
+                draw->AddLine(ImVec2(tx, p0.y + L1_top),
+                              ImVec2(tx, p0.y + L1_bot),
+                              IM_COL32(215, 55, 55, 180), 1.0f);
                 shown++;
             }
         }
     }
 
-    // ── Loop header markers (orange notches in middle lane) ───────────
+    // ── Memory-access activity for watched address (orange) ───────────
+    // If ctx_mem_addr_ is set, mark all accesses to that address in timeline
+    if (timeline_watch_addr_ != 0) {
+        auto writes = memory_.write_history(timeline_watch_addr_, 1);
+        for (uint64_t wid : writes) {
+            float wx = inst_to_x(wid);
+            draw->AddLine(ImVec2(wx, p0.y + L1_top),
+                          ImVec2(wx, p0.y + L1_bot),
+                          IM_COL32(255, 140, 30, 200), 1.5f);
+        }
+    }
+
+    // ── LANE 2: Call-depth sparkline ──────────────────────────────────
+    // Show function call stack depth as a filled area chart
+    if (function_result_ && !function_result_->call_events.empty()) {
+        const int kSamples = std::min(static_cast<int>(W), 600);
+        uint64_t sample_step = std::max(uint64_t(1), total_inst_ / static_cast<uint64_t>(kSamples));
+
+        // Find max depth for normalization
+        uint64_t max_depth = 1;
+        for (const auto& evt : function_result_->call_events) {
+            if (evt.depth + 1 > max_depth) max_depth = evt.depth + 1;
+        }
+        if (max_depth > 24) max_depth = 24;  // cap at 24 levels
+
+        const float sparkline_h = L2_bot - L2_top;
+
+        // Build sparkline points by sampling call stack depth at intervals
+        float prev_x = p0.x, prev_y = p0.y + L2_bot;
+        uint64_t prev_depth = 0;
+        for (int si = 0; si <= kSamples; si++) {
+            uint64_t sample_id = static_cast<uint64_t>(si) * sample_step;
+            if (sample_id >= total_inst_) sample_id = total_inst_ - 1;
+
+            // Get call stack depth at this point
+            auto stk = function_result_->call_stack_at(sample_id);
+            uint64_t depth = stk.size();
+            if (depth > max_depth) depth = max_depth;
+
+            float fx = inst_to_x(sample_id);
+            float fy = p0.y + L2_bot - (static_cast<float>(depth) / static_cast<float>(max_depth)) * sparkline_h;
+
+            if (si > 0 && (depth != prev_depth || si == kSamples)) {
+                // Draw filled area from baseline
+                draw->AddRectFilledMultiColor(
+                    ImVec2(prev_x, prev_y), ImVec2(fx, p0.y + L2_bot),
+                    IM_COL32(40, 100, 200, 60), IM_COL32(40, 100, 200, 60),
+                    IM_COL32(40, 100, 200, 20), IM_COL32(40, 100, 200, 20));
+                // Draw top edge line
+                draw->AddLine(ImVec2(prev_x, prev_y), ImVec2(fx, prev_y),
+                              IM_COL32(60, 140, 255, 150), 1.0f);
+            }
+            prev_x = fx;
+            prev_y = fy;
+            prev_depth = depth;
+        }
+    }
+
+    // Subtle separator between depth and marker lanes
+    draw->AddLine(ImVec2(p0.x, p0.y + L3_top),
+                  ImVec2(p0.x + W, p0.y + L3_top),
+                  IM_COL32(40, 45, 65, 80), 1.0f);
+
+    // ── LANE 3: Markers (bookmarks, loops, calls, search) ────────────
+
+    // Loop header markers (orange notches)
     if (show_loops_ && loop_result_ && xref_result_) {
         for (const auto& loop : loop_result_->loops) {
             auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
             if (!inst_ids.empty()) {
                 float lx = inst_to_x(inst_ids.front());
                 draw->AddRectFilled(
-                    ImVec2(lx - 1.5f, p0.y + lane_mid_top),
-                    ImVec2(lx + 1.5f, p0.y + lane_mid_bot),
-                    IM_COL32(255, 138, 24, 225));
+                    ImVec2(lx - 1.0f, p0.y + L3_top),
+                    ImVec2(lx + 1.0f, p0.y + H),
+                    IM_COL32(255, 138, 24, 200));
             }
         }
     }
 
-    // ── Call event markers (small blue ticks) ────────────────────────
+    // Call event markers (small blue ticks)
     if (function_result_) {
         const size_t kMaxCalls = 2000;
         size_t call_shown = 0;
@@ -492,13 +616,13 @@ void GuiApp::render_progress_overlay() {
             if (call_shown++ >= kMaxCalls) break;
             float cx = inst_to_x(evt.call_inst_id);
             draw->AddLine(
-                ImVec2(cx, p0.y + lane_mid_top),
-                ImVec2(cx, p0.y + lane_mid_bot),
-                IM_COL32(60, 145, 255, 130), 1.0f);
+                ImVec2(cx, p0.y + L3_top),
+                ImVec2(cx, p0.y + H),
+                IM_COL32(60, 145, 255, 100), 1.0f);
         }
     }
 
-    // ── Search-hit sparks (gold) ─────────────────────────────────────
+    // Search-hit sparks (gold)
     if (search_active_ && !search_results_.empty()) {
         const size_t kMaxHits = 1000;
         size_t step = std::max(size_t(1), search_results_.size() / kMaxHits);
@@ -506,38 +630,41 @@ void GuiApp::render_progress_overlay() {
             float hx = inst_to_x(search_results_[hi]);
             draw->AddLine(ImVec2(hx, p0.y),
                           ImVec2(hx, p0.y + H),
-                          IM_COL32(255, 200, 30, 200), 1.0f);
+                          IM_COL32(255, 200, 30, 180), 1.0f);
         }
     }
 
-    // ── Bookmark diamonds ────────────────────────────────────────────
+    // Bookmark diamonds (in marker lane)
     for (uint64_t bid : bookmarks_) {
         float bx = inst_to_x(bid);
-        float cy = p0.y + H * 0.5f;
-        float r  = 4.0f;
+        float cy = p0.y + L3_top + (H - L3_top) * 0.5f;
+        float r  = 3.5f;
         draw->AddQuadFilled(
-            ImVec2(bx,     cy - r),   // top
-            ImVec2(bx + r, cy),        // right
-            ImVec2(bx,     cy + r),   // bottom
-            ImVec2(bx - r, cy),        // left
+            ImVec2(bx,     cy - r),
+            ImVec2(bx + r, cy),
+            ImVec2(bx,     cy + r),
+            ImVec2(bx - r, cy),
             IM_COL32(255, 205, 45, 235));
         draw->AddQuad(
             ImVec2(bx,     cy - r),
             ImVec2(bx + r, cy),
             ImVec2(bx,     cy + r),
             ImVec2(bx - r, cy),
-            IM_COL32(255, 240, 130, 180), 1.0f);
+            IM_COL32(255, 240, 130, 160), 1.0f);
     }
 
     // ── Current position cursor ───────────────────────────────────────
-    // Bright vertical line + small top triangle marker
+    float progress = (total_inst_ > 1)
+        ? static_cast<float>(current_inst_) / static_cast<float>(total_inst_ - 1)
+        : 0.0f;
+    float fill_x = p0.x + progress * W;
+
     draw->AddLine(ImVec2(fill_x, p0.y), ImVec2(fill_x, p0.y + H),
                   IM_COL32(110, 175, 255, 255), 2.0f);
-    // Small downward-pointing triangle at top
     draw->AddTriangleFilled(
         ImVec2(fill_x - 4.0f, p0.y),
         ImVec2(fill_x + 4.0f, p0.y),
-        ImVec2(fill_x, p0.y + 6.0f),
+        ImVec2(fill_x, p0.y + 7.0f),
         IM_COL32(140, 195, 255, 230));
 
     // ── Bottom separator ─────────────────────────────────────────────
@@ -546,10 +673,9 @@ void GuiApp::render_progress_overlay() {
                   IM_COL32(50, 55, 80, 180), 1.0f);
 
     // ── Interaction: hover tooltip + click/drag to seek ──────────────
-    // Use an invisible button over the entire bar for interaction
     ImGui::SetCursorPos(ImVec2(0, 0));
     ImGui::InvisibleButton("##timeline_btn", ImVec2(W, H),
-        ImGuiButtonFlags_MouseButtonLeft);
+        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
 
     bool is_hovered = ImGui::IsItemHovered();
     bool is_active  = ImGui::IsItemActive();
@@ -564,6 +690,33 @@ void GuiApp::render_progress_overlay() {
         }
     }
 
+    // Right-click to watch/unwatch memory address
+    if (is_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        ImGui::OpenPopup("##timeline_ctx");
+    }
+    if (ImGui::BeginPopup("##timeline_ctx")) {
+        ImGui::TextDisabled("Timeline Options");
+        ImGui::Separator();
+        if (timeline_watch_addr_ != 0) {
+            ImGui::TextDisabled("Watching: 0x%llx", (unsigned long long)timeline_watch_addr_);
+            if (ImGui::MenuItem("Clear Memory Watch")) {
+                timeline_watch_addr_ = 0;
+            }
+        } else {
+            ImGui::TextDisabled("No memory address watched");
+        }
+        // Show watch from current hex dump address
+        if (ctx_mem_addr_ != 0) {
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "Watch 0x%llx in Timeline",
+                     (unsigned long long)ctx_mem_addr_);
+            if (ImGui::MenuItem(lbl)) {
+                timeline_watch_addr_ = ctx_mem_addr_;
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     if (is_hovered) {
         float mx = ImGui::GetIO().MousePos.x;
         float rel = (mx - p0.x) / W;
@@ -571,17 +724,32 @@ void GuiApp::render_progress_overlay() {
             uint64_t hover_id = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
             if (hover_id >= total_inst_) hover_id = total_inst_ - 1;
             auto hover_row = fetch_row(hover_id);
-            ImGui::SetTooltip("#%llu  0x%llx\n%s\n(click or drag to seek)",
+
+            // Show call depth in tooltip if available
+            std::string depth_info;
+            if (function_result_) {
+                auto stk = function_result_->call_stack_at(hover_id);
+                if (!stk.empty()) {
+                    depth_info = fmt::format("\nCall depth: {}", stk.size());
+                    if (!stk.empty()) {
+                        auto* func = function_result_->function_at(hover_id);
+                        if (func) depth_info += fmt::format(" ({})", func->name);
+                    }
+                }
+            }
+
+            ImGui::SetTooltip("#%llu  0x%llx\n%s%s\n(left-click/drag: seek | right-click: watch addr)",
                 (unsigned long long)hover_id,
                 (unsigned long long)hover_row.static_pc,
-                hover_row.disasm.c_str());
+                hover_row.disasm.c_str(),
+                depth_info.c_str());
         }
 
         // Vertical hover line (dim)
         float mx_screen = ImGui::GetIO().MousePos.x;
         draw->AddLine(ImVec2(mx_screen, p0.y),
                       ImVec2(mx_screen, p0.y + H),
-                      IM_COL32(200, 200, 200, 60), 1.0f);
+                      IM_COL32(200, 200, 200, 50), 1.0f);
     }
 
     ImGui::End();

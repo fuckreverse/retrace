@@ -46,6 +46,7 @@ struct PatternResult;
 struct LoopSemanticsResult;
 struct AlgorithmSummaryResult;
 struct AnnotationResult;
+struct TraceDiffResult;    // P2-14 (defined in trace_diff_pass.h)
 
 /// Main GUI Application using Dear ImGui + SDL3 + Metal
 class GuiApp {
@@ -222,6 +223,23 @@ private:
     bool show_loops_ = false;        // highlight loop instructions
     bool show_minimap_ = true;       // show minimap panel
 
+    // ─── Register Timeline (data-flow animation) ───────────────────
+    // Shows a sparkline of a selected register's value over time
+    bool show_reg_timeline_ = false;
+    uint8_t reg_timeline_reg_ = 0;         // which register is being tracked
+    bool reg_timeline_dirty_ = true;       // need to rebuild sparkline data
+    struct RegTimelinePoint { uint64_t inst_id; uint64_t value; };
+    std::vector<RegTimelinePoint> reg_timeline_data_;  // sampled timeline
+
+    // Producer chain highlight: a set of inst_ids to highlight
+    bool show_producer_chain_ = false;
+    std::vector<uint64_t> producer_chain_ids_;  // inst_ids in chain
+    uint64_t producer_chain_start_inst_ = 0;    // inst_id chain was built from
+    uint8_t producer_chain_reg_ = 0;            // register chain was built for
+
+    void rebuild_reg_timeline(uint8_t reg_idx);
+    void run_producer_chain(uint64_t inst_id, uint8_t reg_idx);
+
     // ─── CFG view state ───────────────────────────────────────────────
     const CFGResult*       cfg_result_        = nullptr;   // Full-trace CFG (all functions)
     const CFGLayoutResult* cfg_layout_result_ = nullptr;   // Current function's layout
@@ -265,6 +283,41 @@ private:
     const AlgorithmSummaryResult*        algorithm_summary_result_ = nullptr;
     const AnnotationResult*              annotation_result_        = nullptr;
 
+    // ─── Multi-trace diff state (P2-14) ────────────────────────────────
+    bool show_trace_diff_ = false;
+    // Region A and B inst_id ranges to compare
+    uint64_t diff_region_a_start_ = 0;
+    uint64_t diff_region_a_end_   = 0;
+    uint64_t diff_region_b_start_ = 0;
+    uint64_t diff_region_b_end_   = 0;
+    char diff_a_start_buf_[32] = {};
+    char diff_a_end_buf_[32]   = {};
+    char diff_b_start_buf_[32] = {};
+    char diff_b_end_buf_[32]   = {};
+    const TraceDiffResult* trace_diff_result_ = nullptr;
+    size_t diff_cursor_ = 0;
+    void run_trace_diff();
+
+    // ─── DWARF / symbol info state (P2-13) ─────────────────────────────
+    // Simple symbol table loaded from a dSYM or map file.
+    // Entry: (start_addr, end_addr, func_name, source_file, line_no)
+    struct DwarfSymbol {
+        uint64_t start;   // runtime start address (with slide applied)
+        uint64_t end;     // exclusive end address (0 = unknown)
+        std::string name; // demangled function name
+        std::string file; // source file path
+        uint32_t line;    // line number (0 = unknown)
+    };
+    std::vector<DwarfSymbol> dwarf_symbols_;
+    std::string dwarf_load_status_;
+    char dwarf_path_buf_[512] = {};
+
+    /// Look up the DWARF symbol containing `addr`. Returns nullptr if not found.
+    const DwarfSymbol* dwarf_symbol_at(uint64_t addr) const;
+    /// Load symbols from a JSON export (addr→name map) or nm-style text file.
+    void load_dwarf_symbols(const std::string& path);
+    bool show_dwarf_panel_ = false;
+
     // ─── Async analysis ─────────────────────────────────────────────
     std::atomic<bool> analysis_running_{false};
     std::string analysis_status_;
@@ -273,8 +326,13 @@ private:
 
     // ─── Layout constants (shared by render_frame / toolbar / status bar) ──
     static constexpr float kToolbarHeight   = 30.0f;  // toolbar window height
-    static constexpr float kTimelineHeight  = 22.0f;  // execution timeline height
+    static constexpr float kTimelineHeight  = 32.0f;  // execution timeline height (4-lane)
     static constexpr float kStatusBarHeight = 22.0f;  // bottom status bar height
+
+    // ─── Timeline watch address (right-click to set) ─────────────────
+    // When non-zero, memory write events at this address are shown as
+    // orange markers in the timeline's taint lane.
+    uint64_t timeline_watch_addr_ = 0;
 
     // ─── Initialization ─────────────────────────────────────────────
     bool init_sdl();
@@ -298,10 +356,13 @@ private:
     void render_analysis_panel();
     void render_hex_dump_panel();
     void render_strings_panel();
-    void render_thread_panel();       // Thread timeline / switching panel
-    void render_minimap_panel();      // Bird's-eye minimap
-    void render_cfg_panel();          // CFG graph view
-    void render_progress_overlay();  // Execution progress bar with markers
+    void render_thread_panel();          // Thread timeline / switching panel
+    void render_minimap_panel();         // Bird's-eye minimap
+    void render_cfg_panel();             // CFG graph view
+    void render_progress_overlay();      // Execution progress bar with markers
+    void render_reg_timeline_panel();    // Register value history sparkline (P2-12)
+    void render_dwarf_panel();           // DWARF / nm symbol info panel (P2-13)
+    void render_trace_diff_panel();      // Multi-trace divergence view (P2-14)
 
     // ─── Popups / Windows ───────────────────────────────────────────
     void render_goto_popup();

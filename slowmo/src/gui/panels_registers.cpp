@@ -217,6 +217,23 @@ void GuiApp::render_register_panel() {
                 snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)value);
                 ImGui::SetClipboardText(buf);
             }
+            ImGui::Separator();
+            // ── P2-12: data-flow tools ─────────────────────────────────
+            {
+                char tl_label[64];
+                snprintf(tl_label, sizeof(tl_label), "Track %s in Timeline", rname.c_str());
+                if (ImGui::MenuItem(tl_label)) {
+                    show_reg_timeline_   = true;
+                    reg_timeline_reg_    = idx;
+                    reg_timeline_dirty_  = true;
+                }
+                char pc_label[64];
+                snprintf(pc_label, sizeof(pc_label), "Trace Producer Chain for %s", rname.c_str());
+                if (ImGui::MenuItem(pc_label)) {
+                    show_reg_timeline_ = true;
+                    run_producer_chain(current_inst_, idx);
+                }
+            }
             if (idx == 30 && function_result_) {
                 ImGui::Separator();
                 if (ImGui::MenuItem("Follow LR (jump to call site)")) {

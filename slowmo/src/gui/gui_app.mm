@@ -818,6 +818,17 @@ void GuiApp::render_frame() {
         render_cfg_panel();
     }
 
+    // ─── P2 panels ──────────────────────────────────────────────────
+    if (show_reg_timeline_) {
+        render_reg_timeline_panel();
+    }
+    if (show_dwarf_panel_) {
+        render_dwarf_panel();
+    }
+    if (show_trace_diff_) {
+        render_trace_diff_panel();
+    }
+
     // ─── Status bar (always rendered at bottom) ─────────────────────
     render_status_bar();
 

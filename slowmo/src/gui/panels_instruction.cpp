@@ -118,6 +118,11 @@ void GuiApp::render_instruction_panel() {
                                     std::binary_search(search_results_.begin(),
                                                        search_results_.end(), inst_id);
 
+                // P2-12: producer chain highlight
+                bool is_producer_chain = show_producer_chain_ && !producer_chain_ids_.empty() &&
+                                         std::binary_search(producer_chain_ids_.begin(),
+                                                            producer_chain_ids_.end(), inst_id);
+
                 // Loop state
                 bool is_loop_header = show_loops_ && loop_result_ &&
                                       loop_result_->is_loop_header(row.pc);
@@ -135,6 +140,10 @@ void GuiApp::render_instruction_panel() {
                 if (is_current) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
                         IM_COL32(30, 70, 145, 175));
+                } else if (is_producer_chain) {
+                    // P2-12: producer chain — warm amber highlight
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+                        IM_COL32(120, 90, 10, 140));
                 } else if (is_back_taint) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
                         IM_COL32(110, 22, 22, 115));
@@ -426,6 +435,55 @@ void GuiApp::render_inst_context_menu_contents() {
                 if (ImGui::MenuItem("Follow Return")) {
                     navigate_to(ret->call_inst_id);
                 }
+            }
+        }
+    }
+
+    // ── P2-12: Data-flow analysis ─────────────────────────────────────
+    ImGui::Separator();
+    if (ImGui::BeginMenu("Data Flow (P2-12)")) {
+        if (ImGui::MenuItem("Trace Producer Chain for x0")) {
+            show_reg_timeline_ = true;
+            run_producer_chain(ctx_inst_id_, 0);
+        }
+        if (ImGui::MenuItem("Trace Producer Chain for x1")) {
+            show_reg_timeline_ = true;
+            run_producer_chain(ctx_inst_id_, 1);
+        }
+        static const struct { uint8_t idx; const char* name; } kAllRegs[] = {
+            {0,"x0"},{1,"x1"},{2,"x2"},{3,"x3"},{4,"x4"},{5,"x5"},
+            {6,"x6"},{7,"x7"},{29,"fp"},{30,"lr"},{31,"sp"},{33,"pc"}
+        };
+        ImGui::Separator();
+        for (const auto& reg : kAllRegs) {
+            char lbl[48];
+            snprintf(lbl, sizeof(lbl), "Producer chain for %s", reg.name);
+            if (ImGui::MenuItem(lbl)) {
+                show_reg_timeline_ = true;
+                run_producer_chain(ctx_inst_id_, reg.idx);
+            }
+        }
+        ImGui::Separator();
+        if (show_producer_chain_) {
+            if (ImGui::MenuItem("Clear Producer Chain Highlight")) {
+                show_producer_chain_ = false;
+                producer_chain_ids_.clear();
+            }
+        }
+        ImGui::EndMenu();
+    }
+
+    // ── P2-13: Symbol info ────────────────────────────────────────────
+    if (!dwarf_symbols_.empty()) {
+        const DwarfSymbol* sym = dwarf_symbol_at(ctx_inst_pc_);
+        if (sym) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.6f, 1.0f),
+                               "%s +0x%llx",
+                               sym->name.c_str(),
+                               (unsigned long long)(ctx_inst_pc_ - sym->start));
+            if (!sym->file.empty()) {
+                ImGui::TextDisabled("  %s:%u", sym->file.c_str(), sym->line);
             }
         }
     }

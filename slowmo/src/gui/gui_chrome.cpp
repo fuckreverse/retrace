@@ -52,6 +52,11 @@ void GuiApp::render_menu_bar() {
             ImGui::MenuItem("Loop Highlight", "O", &show_loops_);
             ImGui::MenuItem("CFG View", "K", &show_cfg_);
             ImGui::Separator();
+            // ── P2 panels ────────────────────────────────────────────
+            ImGui::MenuItem("Register Timeline",     nullptr, &show_reg_timeline_);
+            ImGui::MenuItem("Symbol Info (DWARF)",   nullptr, &show_dwarf_panel_);
+            ImGui::MenuItem("Trace Diff",            nullptr, &show_trace_diff_);
+            ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
             ImGui::EndMenu();
         }
@@ -148,6 +153,16 @@ void GuiApp::render_menu_bar() {
             }
             if (ImGui::MenuItem("Slice", "S")) {
                 run_slice_analysis();
+            }
+            ImGui::Separator();
+            // ── P2 data-flow tools ─────────────────────────────────
+            if (ImGui::MenuItem("Register Timeline...", nullptr)) {
+                show_reg_timeline_ = true;
+                reg_timeline_dirty_ = true;
+            }
+            if (ImGui::MenuItem("Producer Chain (current reg)")) {
+                show_reg_timeline_ = true;
+                run_producer_chain(current_inst_, reg_timeline_reg_);
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Function Analysis", "Shift+F")) {

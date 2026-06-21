@@ -1,5 +1,5 @@
 // panels_memory.cpp — memory access panel, hex dump panel, memory context menu,
-// and open_hex_dump_at helper.
+// structured memory view (C struct overlay), and open_hex_dump_at helper.
 //
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
@@ -12,6 +12,8 @@
 
 #include <cstring>
 #include <string>
+#include <sstream>
+#include <charconv>
 
 namespace tenet {
 
@@ -168,7 +170,197 @@ void GuiApp::render_memory_panel() {
     ImGui::End();
 }
 
+// ─── Struct field definition ─────────────────────────────────────────────────
+// A minimal C-style struct layout parser for field-aware hex display.
+// Supported types: u8/u16/u32/u64/i8/i16/i32/i64/char/ptr/f32/f64/bytes[N]
+
+namespace {
+
+struct StructField {
+    std::string name;
+    uint32_t offset;   // byte offset from struct start
+    uint32_t size;     // byte size
+    enum class Type { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64, Char, Ptr, Bytes } type;
+};
+
+struct StructLayout {
+    std::string name;
+    std::vector<StructField> fields;
+    uint32_t total_size = 0;
+};
+
+/// Parse a simple C-struct-like definition:
+///   struct Foo { u32 len; ptr buf; u8 flags[4]; }
+/// Returns empty layout on parse error.
+static StructLayout parse_struct_def(const std::string& text) {
+    StructLayout layout;
+    // Extract struct name
+    size_t struct_pos = text.find("struct");
+    if (struct_pos == std::string::npos) return layout;
+    size_t name_start = text.find_first_not_of(" \t", struct_pos + 6);
+    if (name_start == std::string::npos) return layout;
+    size_t name_end = text.find_first_of(" \t{", name_start);
+    if (name_end == std::string::npos) return layout;
+    layout.name = text.substr(name_start, name_end - name_start);
+
+    size_t brace_open  = text.find('{', name_end);
+    size_t brace_close = text.rfind('}');
+    if (brace_open == std::string::npos || brace_close == std::string::npos) return layout;
+
+    std::string body = text.substr(brace_open + 1, brace_close - brace_open - 1);
+    std::istringstream ss(body);
+    std::string line;
+    uint32_t offset = 0;
+
+    while (std::getline(ss, line, ';')) {
+        // Trim whitespace
+        auto trim = [](const std::string& s) {
+            size_t b = s.find_first_not_of(" \t\r\n");
+            size_t e = s.find_last_not_of(" \t\r\n");
+            return (b == std::string::npos) ? std::string{} : s.substr(b, e - b + 1);
+        };
+        line = trim(line);
+        if (line.empty()) continue;
+
+        // Parse "type name" or "type name[N]"
+        std::istringstream ls(line);
+        std::string type_str, name_str;
+        ls >> type_str >> name_str;
+        if (type_str.empty() || name_str.empty()) continue;
+
+        StructField field;
+        field.offset = offset;
+
+        // Check for array syntax: name[N]
+        uint32_t array_n = 1;
+        size_t bracket = name_str.find('[');
+        if (bracket != std::string::npos) {
+            size_t end_bracket = name_str.find(']', bracket);
+            if (end_bracket != std::string::npos) {
+                std::string n_str = name_str.substr(bracket + 1, end_bracket - bracket - 1);
+                try { array_n = static_cast<uint32_t>(std::stoul(n_str)); } catch(...) {}
+            }
+            field.name = name_str.substr(0, bracket);
+        } else {
+            field.name = name_str;
+        }
+
+        uint32_t element_size = 0;
+        if (type_str == "u8"  || type_str == "uint8_t"  || type_str == "char" || type_str == "bool")
+            { field.type = StructField::Type::U8;  element_size = 1; }
+        else if (type_str == "u16" || type_str == "uint16_t")
+            { field.type = StructField::Type::U16; element_size = 2; }
+        else if (type_str == "u32" || type_str == "uint32_t")
+            { field.type = StructField::Type::U32; element_size = 4; }
+        else if (type_str == "u64" || type_str == "uint64_t")
+            { field.type = StructField::Type::U64; element_size = 8; }
+        else if (type_str == "i8"  || type_str == "int8_t")
+            { field.type = StructField::Type::I8;  element_size = 1; }
+        else if (type_str == "i16" || type_str == "int16_t")
+            { field.type = StructField::Type::I16; element_size = 2; }
+        else if (type_str == "i32" || type_str == "int32_t" || type_str == "int")
+            { field.type = StructField::Type::I32; element_size = 4; }
+        else if (type_str == "i64" || type_str == "int64_t" || type_str == "long")
+            { field.type = StructField::Type::I64; element_size = 8; }
+        else if (type_str == "f32" || type_str == "float")
+            { field.type = StructField::Type::F32; element_size = 4; }
+        else if (type_str == "f64" || type_str == "double")
+            { field.type = StructField::Type::F64; element_size = 8; }
+        else if (type_str == "ptr" || type_str == "void*" || type_str == "uintptr_t")
+            { field.type = StructField::Type::Ptr; element_size = 8; }
+        else if (type_str == "bytes")
+            { field.type = StructField::Type::Bytes; element_size = array_n; array_n = 1; }
+        else
+            continue;  // unknown type
+
+        field.size = element_size * array_n;
+        layout.fields.push_back(field);
+        offset += field.size;
+    }
+
+    layout.total_size = offset;
+    return layout;
+}
+
+/// Get a display-friendly interpretation of field bytes
+static std::string format_field_value(const StructField& f, const uint8_t* bytes, size_t avail) {
+    if (avail < f.size) return "<?>";
+    switch (f.type) {
+        case StructField::Type::U8:  return fmt::format("{} (0x{:02x})", bytes[0], bytes[0]);
+        case StructField::Type::U16: {
+            uint16_t v; std::memcpy(&v, bytes, 2);
+            return fmt::format("{} (0x{:04x})", v, v);
+        }
+        case StructField::Type::U32: {
+            uint32_t v; std::memcpy(&v, bytes, 4);
+            return fmt::format("{} (0x{:08x})", v, v);
+        }
+        case StructField::Type::U64: {
+            uint64_t v; std::memcpy(&v, bytes, 8);
+            return fmt::format("{} (0x{:016x})", v, v);
+        }
+        case StructField::Type::I8: {
+            int8_t v = static_cast<int8_t>(bytes[0]);
+            return fmt::format("{}", v);
+        }
+        case StructField::Type::I32: {
+            int32_t v; std::memcpy(&v, bytes, 4);
+            return fmt::format("{}", v);
+        }
+        case StructField::Type::I64: {
+            int64_t v; std::memcpy(&v, bytes, 8);
+            return fmt::format("{}", v);
+        }
+        case StructField::Type::F32: {
+            float v; std::memcpy(&v, bytes, 4);
+            return fmt::format("{:.6g}", v);
+        }
+        case StructField::Type::F64: {
+            double v; std::memcpy(&v, bytes, 8);
+            return fmt::format("{:.10g}", v);
+        }
+        case StructField::Type::Ptr: {
+            uint64_t v; std::memcpy(&v, bytes, 8);
+            return fmt::format("0x{:016x}", v);
+        }
+        case StructField::Type::Char: {
+            char c = static_cast<char>(bytes[0]);
+            if (c >= 0x20 && c < 0x7F) return fmt::format("'{}'", c);
+            return fmt::format("0x{:02x}", bytes[0]);
+        }
+        default: {
+            std::string s;
+            for (size_t i = 0; i < std::min(f.size, 8u); i++) {
+                if (i) s += ' ';
+                s += fmt::format("{:02x}", bytes[i]);
+            }
+            if (f.size > 8) s += "...";
+            return s;
+        }
+    }
+}
+
+// Field color palette (cycling)
+static const ImVec4 kFieldColors[] = {
+    ImVec4(0.40f, 0.80f, 1.00f, 1.0f),   // cyan
+    ImVec4(0.40f, 1.00f, 0.55f, 1.0f),   // green
+    ImVec4(1.00f, 0.75f, 0.35f, 1.0f),   // amber
+    ImVec4(0.90f, 0.45f, 0.90f, 1.0f),   // magenta
+    ImVec4(1.00f, 0.55f, 0.45f, 1.0f),   // salmon
+    ImVec4(0.65f, 0.75f, 1.00f, 1.0f),   // periwinkle
+    ImVec4(0.50f, 1.00f, 0.90f, 1.0f),   // aqua
+    ImVec4(1.00f, 0.90f, 0.50f, 1.0f),   // gold
+};
+static constexpr int kNumFieldColors = static_cast<int>(sizeof(kFieldColors)/sizeof(kFieldColors[0]));
+
+}  // namespace
+
 // ─── Hex Dump Panel ─────────────────────────────────────────────────────────
+// Enhanced with:
+//  - Write-history heatmap: bytes that were recently written are tinted orange
+//  - Structured overlay: paste a C struct definition to get field-aware display
+//  - Per-byte write age badge (how many instructions ago was this byte written)
+//  - Struct field table below the hex dump
 
 void GuiApp::render_hex_dump_panel() {
     if (!ImGui::Begin("Hex Dump", &show_hex_dump_)) {
@@ -176,9 +368,7 @@ void GuiApp::render_hex_dump_panel() {
         return;
     }
 
-    // Determine which address to display:
-    // 1) If ctx_mem_addr_ was set (via open_hex_dump_at), use that
-    // 2) Otherwise use the first memory access of current instruction
+    // ── Address / navigation header ──────────────────────────────────
     uint64_t display_addr = 0;
     bool has_addr = false;
 
@@ -197,11 +387,10 @@ void GuiApp::render_hex_dump_panel() {
         }
     }
 
-    // Header with address input
-    ImGui::Text("Jump to Address:");
+    ImGui::Text("Address:");
     ImGui::SameLine();
     static char hex_addr_buf[32] = {};
-    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SetNextItemWidth(180.0f);
     if (ImGui::InputText("##hexaddr", hex_addr_buf, sizeof(hex_addr_buf),
             ImGuiInputTextFlags_EnterReturnsTrue |
             ImGuiInputTextFlags_CharsHexadecimal)) {
@@ -214,60 +403,138 @@ void GuiApp::render_hex_dump_panel() {
     }
     ImGui::SameLine();
     if (ImGui::Button("From Inst")) {
-        // Reset to follow current instruction's memory access
         ctx_mem_addr_ = 0;
         std::memset(hex_addr_buf, 0, sizeof(hex_addr_buf));
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Show hex dump for current instruction's memory access");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Follow current instruction's memory access");
+    ImGui::SameLine();
+    if (ImGui::Button("Watch\xf0\x9f\x94\xad##watchaddr") && has_addr) {
+        timeline_watch_addr_ = display_addr;
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show write activity for this address in the Timeline");
 
     if (!has_addr) {
         ImGui::Separator();
-        ImGui::TextDisabled("(no memory access — enter an address above, or navigate to an instruction with memory access)");
+        ImGui::TextDisabled("(no address — enter one above, or navigate to an instruction with memory access)");
         ImGui::End();
         return;
     }
 
+    ImGui::SameLine(0, 16);
+    if (timeline_watch_addr_ == display_addr) {
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), "\xe2\x97\x89 Watching in Timeline");
+    } else if (timeline_watch_addr_ != 0) {
+        ImGui::TextDisabled("(watching 0x%llx)", (unsigned long long)timeline_watch_addr_);
+    }
+
+    // ── Struct definition input ───────────────────────────────────────
+    static char struct_def_buf[1024] = {};
+    static StructLayout struct_layout;
+    static bool struct_dirty = false;
+
+    if (ImGui::CollapsingHeader("Struct Overlay (optional)")) {
+        ImGui::TextDisabled("Paste a C struct definition below for field-aware display:");
+        ImGui::TextDisabled("  e.g.  struct Foo { u32 len; ptr data; u8 flags[4]; }");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextMultiline("##structdef", struct_def_buf, sizeof(struct_def_buf),
+                ImVec2(-1, 80))) {
+            struct_dirty = true;
+        }
+        ImGui::SameLine();
+        if (struct_dirty || ImGui::Button("Apply")) {
+            struct_layout = parse_struct_def(std::string(struct_def_buf));
+            struct_dirty = false;
+        }
+        if (!struct_layout.name.empty()) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f),
+                "struct %s (%u bytes, %zu fields)",
+                struct_layout.name.c_str(), struct_layout.total_size,
+                struct_layout.fields.size());
+        }
+    }
+
     ImGui::Separator();
-    ImGui::Text("Address: 0x%016llx", (unsigned long long)display_addr);
+    ImGui::Text("0x%016llx", (unsigned long long)display_addr);
 
     uint64_t base_addr = display_addr & ~0xFULL;  // Align to 16 bytes
 
-    // Get memory bytes from MemoryModel
-    // We display 16 rows × 16 bytes
+    // Pre-fetch write history for all bytes in range (for heatmap)
+    // Fetch 256 bytes (16 rows × 16 bytes) of write ages
     const int kRows = 16;
-    ImGui::Separator();
+    const size_t kTotalBytes = kRows * 16;
+    std::vector<uint64_t> write_age(kTotalBytes, UINT64_MAX);  // dist in inst_ids from now
 
-    // Column header
-    ImGui::TextDisabled("           Address           | 00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F | ASCII");
+    // Fetch in a batch: use write_history for the range start
+    // We use a simpler heuristic: call last_writer per byte but limit to first 32 bytes
+    // to avoid performance hits on large scans
+    for (size_t bi = 0; bi < std::min(kTotalBytes, size_t(64)); bi++) {
+        uint64_t baddr = base_addr + bi;
+        uint64_t writer = memory_.last_writer(baddr, 1, current_inst_);
+        if (writer > 0 && current_inst_ >= writer) {
+            write_age[bi] = current_inst_ - writer;
+        }
+    }
+
+    // Build field-byte mapping for struct overlay
+    // field_idx_at[byte_offset_from_base] → field index (-1 if no struct)
+    std::vector<int> field_idx_at(kTotalBytes, -1);
+    if (!struct_layout.fields.empty()) {
+        uint64_t struct_base = display_addr;  // struct starts at display address
+        for (int fi = 0; fi < static_cast<int>(struct_layout.fields.size()); fi++) {
+            const auto& f = struct_layout.fields[fi];
+            uint64_t field_addr = struct_base + f.offset;
+            for (uint32_t fb = 0; fb < f.size; fb++) {
+                if (field_addr + fb >= base_addr && field_addr + fb < base_addr + kTotalBytes) {
+                    size_t idx = static_cast<size_t>(field_addr + fb - base_addr);
+                    field_idx_at[idx] = fi;
+                }
+            }
+        }
+    }
+
+    // ── Column header ─────────────────────────────────────────────────
     ImGui::Separator();
+    {
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.50f, 0.65f, 1.0f));
+        ImGui::Text("          Address          | 00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F | ASCII | Age");
+        ImGui::PopStyleColor();
+        ImVec2 sep_p = ImGui::GetCursorScreenPos();
+        draw->AddLine(sep_p, ImVec2(sep_p.x + ImGui::GetContentRegionAvail().x, sep_p.y),
+                      IM_COL32(60, 65, 90, 180), 1.0f);
+        ImGui::Dummy(ImVec2(0, 1));
+    }
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
 
     for (int row = -2; row < kRows - 2; row++) {
         uint64_t row_addr = base_addr + static_cast<uint64_t>(row) * 16;
         bool is_active_row = (display_addr >= row_addr && display_addr < row_addr + 16);
 
-        // Address
+        // Row address
         if (is_active_row) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f),
                 "0x%016llx:", (unsigned long long)row_addr);
         } else {
-            ImGui::TextDisabled("0x%016llx:", (unsigned long long)row_addr);
+            ImGui::TextColored(ImVec4(0.38f, 0.42f, 0.58f, 1.0f),
+                "0x%016llx:", (unsigned long long)row_addr);
         }
         ImGui::SameLine();
 
-        // Hex bytes — each byte is individually clickable
+        // ── Hex bytes ────────────────────────────────────────────────
+        uint64_t min_age_in_row = UINT64_MAX;
         for (int b = 0; b < 16; b++) {
             uint64_t byte_addr = row_addr + b;
-            auto byte_val = memory_.byte_at(byte_addr, current_inst_);
+            size_t buf_idx = (byte_addr >= base_addr && byte_addr < base_addr + kTotalBytes)
+                ? static_cast<size_t>(byte_addr - base_addr) : SIZE_MAX;
 
+            auto byte_val = memory_.byte_at(byte_addr, current_inst_);
             bool is_highlighted = (byte_addr == display_addr);
 
-            if (b == 8) {
-                ImGui::SameLine(0, 0);
-                ImGui::TextDisabled(" ");
-            }
-            if (b > 0) ImGui::SameLine(0, 0);
+            if (b == 8) { ImGui::SameLine(0, 0); ImGui::TextDisabled(" "); }
+            if (b > 0)    ImGui::SameLine(0, 0);
 
             char byte_str[8];
             if (byte_val.has_value()) {
@@ -276,45 +543,76 @@ void GuiApp::render_hex_dump_panel() {
                 snprintf(byte_str, sizeof(byte_str), "?? ");
             }
 
-            // Push unique ID for each byte so ImGui can track them
             ImGui::PushID(static_cast<int>(row * 16 + b));
 
+            // Determine color: struct field > highlighted > write-hot > normal
+            ImVec4 byte_color;
+            int fi = (buf_idx < kTotalBytes) ? field_idx_at[buf_idx] : -1;
+            uint64_t age = (buf_idx < kTotalBytes) ? write_age[buf_idx] : UINT64_MAX;
+            if (min_age_in_row > age && age != UINT64_MAX) min_age_in_row = age;
+
             if (is_highlighted) {
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", byte_str);
+                byte_color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
+            } else if (fi >= 0) {
+                byte_color = kFieldColors[fi % kNumFieldColors];
+                // Add subtle write-hot tint on top of field color
+                if (age != UINT64_MAX && age < 50) {
+                    byte_color.x = std::min(1.0f, byte_color.x + 0.2f);
+                    byte_color.y = std::min(1.0f, byte_color.y + 0.1f);
+                }
+            } else if (age != UINT64_MAX && age < 200) {
+                // Write-hot heatmap: recently written bytes are warm
+                float heat = 1.0f - std::min(1.0f, static_cast<float>(age) / 200.0f);
+                byte_color = ImVec4(0.3f + heat * 0.7f, 0.65f - heat * 0.35f, 0.3f, 1.0f);
             } else if (is_active_row) {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", byte_str);
+                byte_color = ImVec4(0.78f, 0.80f, 0.90f, 1.0f);
+            } else if (!byte_val.has_value()) {
+                byte_color = ImVec4(0.28f, 0.28f, 0.32f, 1.0f);
             } else {
-                ImGui::TextDisabled("%s", byte_str);
+                byte_color = ImVec4(0.55f, 0.60f, 0.72f, 1.0f);
             }
 
-            // Double-click: jump to the instruction that last wrote this byte
+            // Draw field background highlight
+            if (fi >= 0) {
+                ImVec2 bpos = ImGui::GetCursorScreenPos();
+                float bh = ImGui::GetTextLineHeight();
+                float bw = ImGui::CalcTextSize(byte_str).x;
+                ImVec4 fc = kFieldColors[fi % kNumFieldColors];
+                draw->AddRectFilled(bpos, ImVec2(bpos.x + bw, bpos.y + bh),
+                    IM_COL32(static_cast<int>(fc.x*40), static_cast<int>(fc.y*40),
+                             static_cast<int>(fc.z*40), 100));
+            }
+
+            ImGui::TextColored(byte_color, "%s", byte_str);
+
+            // Interactions
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                 uint64_t writer = memory_.last_writer(byte_addr, 1, current_inst_);
-                if (writer > 0) {
-                    navigate_to(writer);
-                }
+                if (writer > 0) navigate_to(writer);
             }
-            // Single-click: update display address to this byte
             if (ImGui::IsItemClicked()) {
                 display_addr = byte_addr;
                 ctx_mem_addr_ = byte_addr;
             }
-            // Tooltip on hover
             if (ImGui::IsItemHovered()) {
                 uint64_t writer = memory_.last_writer(byte_addr, 1, current_inst_);
-                if (writer > 0) {
-                    ImGui::SetTooltip("0x%llx: last written by inst #%llu\nDouble-click to jump",
-                        (unsigned long long)byte_addr, (unsigned long long)writer);
-                } else {
-                    ImGui::SetTooltip("0x%llx: no known writer",
-                        (unsigned long long)byte_addr);
+                std::string tip = fmt::format("0x{:016x}", byte_addr);
+                if (byte_val.has_value()) tip += fmt::format("  =  0x{:02x} ({:d})", *byte_val, *byte_val);
+                if (writer > 0) tip += fmt::format("\nLast written: inst #{} ({} ago)", writer,
+                    current_inst_ >= writer ? current_inst_ - writer : 0);
+                else tip += "\nNo known writer";
+                if (fi >= 0) {
+                    const auto& f = struct_layout.fields[fi];
+                    tip += fmt::format("\n[struct] .{} @ +{}", f.name, f.offset);
                 }
+                tip += "\nDbl-click: jump to writer";
+                ImGui::SetTooltip("%s", tip.c_str());
             }
 
             ImGui::PopID();
         }
 
-        // ASCII part
+        // ASCII column
         ImGui::SameLine();
         char ascii_part[20] = {};
         for (int b = 0; b < 16; b++) {
@@ -328,11 +626,96 @@ void GuiApp::render_hex_dump_panel() {
             }
         }
         ascii_part[16] = '\0';
-        ImGui::TextDisabled("| %s", ascii_part);
+        ImGui::TextColored(ImVec4(0.50f, 0.55f, 0.65f, 1.0f), "| %s", ascii_part);
+
+        // Age column (smallest write age in row)
+        ImGui::SameLine();
+        if (min_age_in_row == UINT64_MAX) {
+            ImGui::TextDisabled(" |  ---");
+        } else if (min_age_in_row == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), " | now");
+        } else if (min_age_in_row < 10) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), " |%+4lld", (long long)min_age_in_row);
+        } else {
+            ImGui::TextColored(ImVec4(0.50f, 0.55f, 0.65f, 1.0f), " |%+4lld", (long long)min_age_in_row);
+        }
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Click: select byte  |  Double-click: jump to writer  |  'From Inst': follow current instruction");
+
+    // ── Struct field table (when struct overlay is active) ────────────
+    if (!struct_layout.fields.empty()) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.8f, 1.0f, 1.0f),
+            "struct %s layout:", struct_layout.name.c_str());
+        ImGui::Separator();
+
+        if (ImGui::BeginTable("##structfields", 5,
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY,
+                ImVec2(0, 120))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Field",   ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableSetupColumn("+Offset", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 40.0f);
+            ImGui::TableSetupColumn("Value",   ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Writer",  ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableHeadersRow();
+
+            // Read struct bytes from memory
+            std::vector<uint8_t> struct_bytes(struct_layout.total_size, 0);
+            std::vector<bool> known(struct_layout.total_size, false);
+            for (uint32_t i = 0; i < struct_layout.total_size; i++) {
+                auto v = memory_.byte_at(display_addr + i, current_inst_);
+                if (v.has_value()) { struct_bytes[i] = *v; known[i] = true; }
+            }
+
+            for (int fi = 0; fi < static_cast<int>(struct_layout.fields.size()); fi++) {
+                const auto& f = struct_layout.fields[fi];
+                ImVec4 fc = kFieldColors[fi % kNumFieldColors];
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(fc, "%s", f.name.c_str());
+
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.75f, 1.0f), "+0x%02x", f.offset);
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextDisabled("%u", f.size);
+
+                ImGui::TableSetColumnIndex(3);
+                bool all_known = true;
+                for (uint32_t bi = 0; bi < f.size && f.offset + bi < struct_layout.total_size; bi++) {
+                    if (!known[f.offset + bi]) { all_known = false; break; }
+                }
+                if (all_known && f.offset + f.size <= struct_layout.total_size) {
+                    std::string val = format_field_value(f, struct_bytes.data() + f.offset,
+                                                        struct_layout.total_size - f.offset);
+                    ImGui::TextColored(fc, "%s", val.c_str());
+                } else {
+                    ImGui::TextDisabled("<?>");
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                uint64_t writer = (f.offset < struct_layout.total_size)
+                    ? memory_.last_writer(display_addr + f.offset, 1, current_inst_) : 0;
+                if (writer > 0) {
+                    char wlbl[32];
+                    snprintf(wlbl, sizeof(wlbl), "#%llu##fw%d", (unsigned long long)writer, fi);
+                    if (ImGui::SmallButton(wlbl)) navigate_to(writer);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to writer inst #%llu", (unsigned long long)writer);
+                } else {
+                    ImGui::TextDisabled("---");
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled(
+        "Click: select byte | Dbl-click: jump to writer | Watch\xf0\x9f\x94\xad: mark in Timeline | Struct Overlay: field-aware display");
 
     ImGui::End();
 }
