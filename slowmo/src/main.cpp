@@ -40,6 +40,9 @@
 #include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/yara_mem_scan_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
+#include "analysis/passes/objc_crypto_pass.h"
+#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/taint_source_annotation_pass.h"
 #include "io/rpc_server.h"
 #include "io/streaming_index.h"
 #include "io/recent_files.h"
@@ -523,6 +526,10 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --algorithm-summary           Generate algorithm summary report\n");
     fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
     fmt::print(stderr, "  --objc-class <name>           Filter ObjC messages by class name\n");
+    fmt::print(stderr, "  --objc-crypto                 Correlate crypto patterns with ObjC call stack\n");
+    fmt::print(stderr, "  --syscall-intercept           Extract iOS system API call params (CommonCrypto, Security.framework)\n");
+    fmt::print(stderr, "  --syscall-intercept-bytes <N> Bytes to capture per pointer arg (default: 64)\n");
+    fmt::print(stderr, "  --taint-source-annotation     Annotate backward taint leaf sources with ObjC getter context\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
     fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
     fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
@@ -605,6 +612,12 @@ int main(int argc, char** argv) {
     bool opt_algorithm_summary = false;
     bool opt_objc = false;
     std::string objc_class_filter;  // --objc-class <ClassName>
+
+    // iOS crypto analysis options
+    bool opt_objc_crypto = false;
+    bool opt_syscall_intercept = false;
+    uint32_t syscall_intercept_capture_bytes = 64;
+    bool opt_taint_source_annotation = false;
 
     // Query options
     bool opt_memread = false;
@@ -778,6 +791,15 @@ int main(int argc, char** argv) {
         } else if (arg == "--objc-class" && i + 1 < argc) {
             opt_objc = true;
             objc_class_filter = argv[++i];
+        } else if (arg == "--objc-crypto") {
+            opt_objc_crypto = true;
+            opt_objc = true;  // objc_crypto depends on objc
+        } else if (arg == "--syscall-intercept") {
+            opt_syscall_intercept = true;
+        } else if (arg == "--syscall-intercept-bytes" && i + 1 < argc) {
+            syscall_intercept_capture_bytes = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--taint-source-annotation") {
+            opt_taint_source_annotation = true;
         } else if (arg == "--memread" && i + 3 < argc) {
             opt_memread = true;
             memread_addr = std::stoull(argv[++i], nullptr, 16);
@@ -927,7 +949,9 @@ int main(int argc, char** argv) {
                                opt_dump_memaccess ||
                                // P3 options
                                opt_cache_sim || opt_yara_mem_scan || opt_thread_filter ||
-                               opt_rpc || opt_streaming || opt_stats_only;
+                               opt_rpc || opt_streaming || opt_stats_only ||
+                               opt_objc_crypto || opt_syscall_intercept ||
+                               opt_taint_source_annotation;
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
@@ -1220,6 +1244,34 @@ int main(int argc, char** argv) {
                 objc_pass->set_class_filter(objc_class_filter);
             }
             pm.register_pass(std::move(objc_pass));
+        }
+
+        // --objc-crypto: correlate Pattern hits with ObjC call stack
+        if (opt_objc_crypto) {
+            // ObjcPass is already registered above; ensure PatternPass is also registered
+            pm.register_pass(std::make_unique<ConstantMaterializationPass>());
+            pm.register_pass(std::make_unique<PatternPass>());
+            pm.register_pass(std::make_unique<ObjcCryptoPass>());
+        }
+
+        // --syscall-intercept: extract CommonCrypto / Security.framework API params
+        if (opt_syscall_intercept) {
+            SyscallInterceptConfig si_cfg;
+            si_cfg.capture_bytes = syscall_intercept_capture_bytes;
+            // Register ObjcPass for context annotation if not already registered
+            if (!opt_objc) {
+                pm.register_pass(std::make_unique<ObjcPass>());
+            }
+            pm.register_pass(std::make_unique<SyscallInterceptPass>(std::move(si_cfg)));
+        }
+
+        // --taint-source-annotation: annotate backward taint sources with ObjC context
+        if (opt_taint_source_annotation) {
+            // Needs backward_taint (already registered if --backward-taint) and objc
+            if (!opt_objc && !opt_syscall_intercept) {
+                pm.register_pass(std::make_unique<ObjcPass>());
+            }
+            pm.register_pass(std::make_unique<TaintSourceAnnotationPass>());
         }
 
         // --critical-path also needs forward taint
@@ -1582,6 +1634,52 @@ int main(int argc, char** argv) {
                 fmt::print(stderr, "[objc] {} messages, {} classes\n",
                            oc_result.total_messages(), oc_result.unique_classes());
                 fmt::print("{}\n", oc_result.to_json().dump(2));
+            }
+        }
+
+        // --objc-crypto: crypto pattern × ObjC call stack correlation
+        if (opt_objc_crypto) {
+            const auto& oc_raw = pm.require("objc_crypto");
+            if (!oc_raw.ok()) {
+                fmt::print(stderr, "[objc-crypto] Pass failed: {}\n", oc_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& oc_result = oc_raw.get<ObjcCryptoResult>();
+                fmt::print(stderr, "[objc-crypto] {} hits ({} in ObjC context, {} bare)\n",
+                           oc_result.total(), oc_result.in_objc_count(), oc_result.bare_count());
+                fmt::print("{}\n", oc_result.to_json());
+            }
+        }
+
+        // --syscall-intercept: iOS system API call parameter extraction
+        if (opt_syscall_intercept) {
+            const auto& si_raw = pm.require("syscall_intercept");
+            if (!si_raw.ok()) {
+                fmt::print(stderr, "[syscall-intercept] Pass failed: {}\n", si_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& si_result = si_raw.get<SyscallInterceptResult>();
+                fmt::print(stderr, "[syscall-intercept] {} calls intercepted ({} unique APIs)\n",
+                           si_result.total(), si_result.by_callee.size());
+                fmt::print("{}\n", si_result.to_json());
+            }
+        }
+
+        // --taint-source-annotation: backward taint source ObjC getter annotation
+        if (opt_taint_source_annotation) {
+            const auto& tsa_raw = pm.require("taint_source_annotation");
+            if (!tsa_raw.ok()) {
+                fmt::print(stderr, "[taint-source-annotation] Pass failed: {}\n", tsa_raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& tsa_result = tsa_raw.get<TaintSourceAnnotationResult>();
+                fmt::print(stderr,
+                           "[taint-source-annotation] {} sources: {} ObjC, {} constants, {} memory\n",
+                           tsa_result.total(),
+                           tsa_result.objc_source_indices.size(),
+                           tsa_result.constant_source_indices.size(),
+                           tsa_result.memory_source_indices.size());
+                fmt::print("{}\n", tsa_result.to_json());
             }
         }
 

@@ -325,6 +325,9 @@ src/core/register_file.cpp
     src/analysis/passes/cache_sim_pass.cpp
     src/analysis/passes/yara_mem_scan_pass.cpp
     src/analysis/passes/thread_filter_pass.cpp
+    src/analysis/passes/objc_crypto_pass.cpp
+    src/analysis/passes/syscall_intercept_pass.cpp
+    src/analysis/passes/taint_source_annotation_pass.cpp
     src/io/rpc_server.cpp
     src/io/streaming_index.cpp
     src/tui/tui_app.cpp
