@@ -1,4 +1,5 @@
 #include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -493,152 +494,177 @@ void ConstantMaterializationPass::flush_pending(
     pending.active = false;
 }
 
+// ─── ConstMatCollector: TraceCollector wrapper for scan fusion ─────────────
+
+/// TraceCollector that tracks movz+movk constant materialization sequences.
+///
+/// By implementing TraceCollector, this can be registered with the shared
+/// TraceScanEngine and executed in the same trace traversal as other
+/// collectors (e.g., WindowStatsCollector), halving the total trace I/O.
+///
+/// Does NOT support parallel scanning: the pending[] state is cross-instruction
+/// and order-dependent, so shard boundaries would split movz+movk sequences.
+/// The scan engine will run this in the sequential phase.
+class ConstMatCollector final : public TraceCollector {
+public:
+    ConstMatCollector(ConstantMaterializationPass& pass,
+                       CodeTable& code_table,
+                       InstructionDecoder& decoder)
+        : pass_(pass), code_table_(code_table), decoder_(decoder) {}
+
+    std::string_view name() const override { return "ConstMatCollector"; }
+
+    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
+        result_ = ConstantMaterializationResult{};
+        pending_.fill(PendingConstant{});
+        return true;
+    }
+
+    void on_inst(uint64_t inst_id, const InstView& inst) override {
+        auto opcode_opt = code_table_.opcode_at(inst.pc);
+        if (!opcode_opt) return;
+
+        uint32_t opcode = *opcode_opt;
+
+        // Check for MOVZ
+        auto movz = ConstantMaterializationPass::decode_movz(opcode);
+        if (movz && movz->rd < 31) {
+            uint8_t rd = movz->rd;
+            pass_.flush_pending(pending_[rd], result_);
+
+            auto& p = pending_[rd];
+            p.active = true;
+            p.dst_reg = rd;
+            p.value = static_cast<uint64_t>(movz->imm16) << (movz->hw * 16);
+            p.first_inst_id = inst_id;
+            p.last_inst_id = inst_id;
+            p.pc_first = inst.pc;
+            p.pc_last = inst.pc;
+            p.num_parts = 1;
+            p.shift_mask = 1u << movz->hw;
+            return;
+        }
+
+        // Check for MOVK
+        auto movk = ConstantMaterializationPass::decode_movk(opcode);
+        if (movk && movk->rd < 31) {
+            uint8_t rd = movk->rd;
+            auto& p = pending_[rd];
+            if (p.active && p.dst_reg == rd) {
+                uint8_t hw = movk->hw;
+                uint64_t slot_mask = 0xFFFFULL << (hw * 16);
+                p.value = (p.value & ~slot_mask) |
+                          (static_cast<uint64_t>(movk->imm16) << (hw * 16));
+                p.last_inst_id = inst_id;
+                p.pc_last = inst.pc;
+                p.num_parts++;
+                p.shift_mask |= 1u << hw;
+            }
+            return;
+        }
+
+        // Any other instruction: flush tracking state as needed.
+        auto decoded = decoder_.decode(inst.pc, opcode);
+        if (!decoded) return;
+
+        // Function boundary: flush ALL pending constants.
+        std::string_view mn = decoded->mnemonic_sv();
+        bool is_boundary =
+            mn == "bl"     || mn == "blr"    ||
+            mn == "blraa"  || mn == "blrab"  ||
+            mn == "blraaz" || mn == "blrabz" ||
+            mn == "ret"    || mn == "retaa"  || mn == "retab";
+
+        if (is_boundary) {
+            for (auto& p : pending_) {
+                pass_.flush_pending(p, result_);
+            }
+        } else {
+            // Non-boundary instruction that writes to a tracked register:
+            // flush only those specific slots.
+            for (uint8_t w = 0; w < decoded->regs_written_count; w++) {
+                uint8_t wr = decoded->regs_written[w];
+                if (wr < 31 && pending_[wr].active) {
+                    pass_.flush_pending(pending_[wr], result_);
+                }
+            }
+        }
+    }
+
+    void end() override {
+        // Flush any remaining pending constants
+        for (auto& p : pending_) {
+            pass_.flush_pending(p, result_);
+        }
+        // Sort by first_inst_id
+        std::sort(result_.constants.begin(), result_.constants.end(),
+                  [](const MaterializedConstant& a, const MaterializedConstant& b) {
+                      return a.first_inst_id < b.first_inst_id;
+                  });
+        pass_.build_indices(result_);
+    }
+
+    ConstantMaterializationResult take_result() { return std::move(result_); }
+
+private:
+    using PendingConstant = ConstantMaterializationPass::PendingConstant;
+
+    ConstantMaterializationPass& pass_;
+    CodeTable& code_table_;
+    InstructionDecoder& decoder_;
+    std::array<PendingConstant, 31> pending_{};
+    ConstantMaterializationResult result_;
+};
+
 // ─── Main pass execution ──────────────────────────────────────────────────
 
 PassResult ConstantMaterializationPass::run(PassContext& ctx) {
     build_known_db();
 
-    ConstantMaterializationResult result;
-
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& code_table = ctx.code_table();
+    auto& decoder = ctx.decoder();
+
+    const uint64_t total_insts = index.inst_count();
+    if (total_insts == 0) {
+        return PassResult::failed("Empty trace");
+    }
 
     const auto& range = ctx.range();
     uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
+    uint64_t end = std::min(range.end_inst_id, total_insts);
+    if (end == 0) end = total_insts;
 
     ctx.progress(0.0f, "ConstMat: scanning trace for movz+movk sequences...");
 
-    // Track pending constants per register (x0-x30, 31 registers)
-    std::array<PendingConstant, 31> pending{};
+    ConstMatCollector collector(*this, code_table, decoder);
 
-    uint64_t inst_id = 0;
-    uint64_t processed = 0;
-    const uint64_t total = end - start;
-    const uint64_t progress_interval = std::max(total / 100, uint64_t(1));
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-
-        if (opcode_opt) {
-            uint32_t opcode = *opcode_opt;
-
-            // Check for MOVZ
-            auto movz = decode_movz(opcode);
-            if (movz && movz->rd < 31) {
-                uint8_t rd = movz->rd;
-
-                // A new MOVZ on this register: flush any previous pending
-                flush_pending(pending[rd], result);
-
-                // Start a new pending constant
-                auto& p = pending[rd];
-                p.active = true;
-                p.dst_reg = rd;
-                p.value = static_cast<uint64_t>(movz->imm16) << (movz->hw * 16);
-                p.first_inst_id = inst_id;
-                p.last_inst_id = inst_id;
-                p.pc_first = inst.pc;
-                p.pc_last = inst.pc;
-                p.num_parts = 1;
-                p.shift_mask = 1u << movz->hw;
-            } else {
-                // Check for MOVK
-                auto movk = decode_movk(opcode);
-                if (movk && movk->rd < 31) {
-                    uint8_t rd = movk->rd;
-                    auto& p = pending[rd];
-
-                    if (p.active && p.dst_reg == rd) {
-                        // Continue building the constant: set this 16-bit slot
-                        uint8_t hw = movk->hw;
-                        uint64_t slot_mask = 0xFFFFULL << (hw * 16);
-                        p.value = (p.value & ~slot_mask) |
-                                  (static_cast<uint64_t>(movk->imm16) << (hw * 16));
-                        p.last_inst_id = inst_id;
-                        p.pc_last = inst.pc;
-                        p.num_parts++;
-                        p.shift_mask |= 1u << hw;
-                    }
-                    // If no active pending, this MOVK is modifying a register
-                    // loaded some other way — ignore it.
-                } else {
-                    // Any other instruction: flush tracking state as needed.
-                    auto& decoder = ctx.decoder();
-                    auto decoded = decoder.decode(inst.pc, opcode);
-                    if (decoded) {
-                        // ── Function boundary: flush ALL pending constants ────
-                        //
-                        // A BL/BLR (call) or RET (return) marks a function
-                        // boundary.  Any movz/movk sequence that spans this
-                        // boundary is NOT a valid single constant materialization:
-                        // the sequence belongs to two different execution contexts.
-                        //
-                        // Flushing all pending slots here eliminates the class of
-                        // false positives where funcA's MOVZ and funcB's MOVK are
-                        // erroneously spliced into one constant.
-                        //
-                        // We use the decoded mnemonic (already in Capstone's cache)
-                        // so there is no extra decode cost beyond what was already
-                        // needed for the regs_written check below.
-                        std::string_view mn = decoded->mnemonic_sv();
-                        bool is_boundary =
-                            mn == "bl"    || mn == "blr"   ||
-                            mn == "blraa" || mn == "blrab" ||
-                            mn == "blraaz"|| mn == "blrabz"||
-                            mn == "ret"   || mn == "retaa" || mn == "retab";
-
-                        if (is_boundary) {
-                            // Flush every active pending slot unconditionally.
-                            for (auto& p : pending) {
-                                flush_pending(p, result);
-                            }
-                        } else {
-                            // Non-boundary instruction that writes to a tracked
-                            // register: flush only those specific slots.
-                            for (uint8_t w = 0; w < decoded->regs_written_count; w++) {
-                                uint8_t wr = decoded->regs_written[w];
-                                if (wr < 31 && pending[wr].active) {
-                                    flush_pending(pending[wr], result);
-                                }
-                            }
-                        }
-                    }
-                }
+    // Use shared scan engine if available; otherwise create a local one.
+    // When the shared engine is used, other collectors registered on the same
+    // engine (e.g., WindowStatsCollector) run in the same single traversal,
+    // halving the total trace I/O.
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run(start, end);
+    } else {
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
             }
-        }
-
-        inst_id++;
-        processed++;
-        if (processed % progress_interval == 0) {
-            ctx.progress(static_cast<float>(processed) / total,
-                         fmt::format("ConstMat: {}/{} instructions, {} constants found",
-                                     processed, total, result.constants.size()));
-        }
-        if (ctx.cancelled()) break;
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run(start, end);
     }
 
-    // Flush any remaining pending constants
-    for (auto& p : pending) {
-        flush_pending(p, result);
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
     }
 
-    // Sort by first_inst_id
-    std::sort(result.constants.begin(), result.constants.end(),
-              [](const MaterializedConstant& a, const MaterializedConstant& b) {
-                  return a.first_inst_id < b.first_inst_id;
-              });
-
-    // Build indices
-    build_indices(result);
-
+    auto result = collector.take_result();
     ctx.progress(1.0f, fmt::format("ConstMat: {} constants found ({} identified as known)",
                                     result.total(), result.identified_count()));
 

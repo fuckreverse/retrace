@@ -1,13 +1,18 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <unordered_map>
+#include <array>
+#include <optional>
 
 namespace tenet {
+
+class ConstMatCollector;  // forward declaration
 
 // ─── Known constant database ──────────────────────────────────────────────
 
@@ -94,6 +99,8 @@ struct ConstantMaterializationResult {
 /// Result type: ConstantMaterializationResult
 class ConstantMaterializationPass final : public AnalysisPass {
 public:
+    friend class ConstMatCollector;
+
     ConstantMaterializationPass();
     ~ConstantMaterializationPass() override = default;
 

@@ -26,20 +26,22 @@ static std::string reg_name(uint8_t idx) {
 
 std::vector<DFGEdge> DataflowGraphResult::producers_of(uint64_t inst_id) const {
     std::vector<DFGEdge> result;
-    for (const auto& edge : edges) {
-        if (edge.to_inst_id == inst_id) {
-            result.push_back(edge);
-        }
+    auto it = incoming_edge_idx_.find(inst_id);
+    if (it == incoming_edge_idx_.end()) return result;
+    result.reserve(it->second.size());
+    for (size_t idx : it->second) {
+        result.push_back(edges[idx]);
     }
     return result;
 }
 
 std::vector<DFGEdge> DataflowGraphResult::consumers_of(uint64_t inst_id) const {
     std::vector<DFGEdge> result;
-    for (const auto& edge : edges) {
-        if (edge.from_inst_id == inst_id) {
-            result.push_back(edge);
-        }
+    auto it = outgoing_edge_idx_.find(inst_id);
+    if (it == outgoing_edge_idx_.end()) return result;
+    result.reserve(it->second.size());
+    for (size_t idx : it->second) {
+        result.push_back(edges[idx]);
     }
     return result;
 }
@@ -252,6 +254,9 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     ctx.progress(1.0f,
                  fmt::format("Dataflow graph: {} nodes, {} edges",
                              result.nodes.size(), result.edges.size()));
+
+    // Build O(1) adjacency index for producer/consumer queries.
+    result.build_adjacency();
 
     return PassResult::success(std::move(result));
 }

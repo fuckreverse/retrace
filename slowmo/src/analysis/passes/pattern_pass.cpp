@@ -47,11 +47,6 @@ enum MnemonicClass : uint8_t {
     MC_SVC          = 6,  // svc (syscall)
 };
 
-struct PCMnemonicInfo {
-    MnemonicClass cls = MC_OTHER;
-    std::string_view mnemonic;  // points into decoder cache (stable lifetime)
-};
-
 }  // anonymous namespace
 
 // ─── YARA callback context ────────────────────────────────────────────────
@@ -254,7 +249,7 @@ bool PatternPass::load_rules() {
 #endif
 }
 
-// ─── PatternPass::run (optimized: merged mnemonic detection) ──────────────
+// ─── PatternPass::run (unified single-scan architecture) ──────────────────
 
 PassResult PatternPass::run(PassContext& ctx) {
     PatternResult result;
@@ -262,12 +257,30 @@ PassResult PatternPass::run(PassContext& ctx) {
     // Phase 1: Load YARA rules
     bool has_yara = load_rules();
 
-    // Phase 2: Build scannable buffers and run YARA
+    // Phase 2: Unified trace scan — runs all mnemonic detectors in a single
+    // pass.  When YARA is active, the reg_value and syscall buffers are also
+    // built during the same scan (halving trace I/O).  When YARA is off, the
+    // buffers are not built, avoiding the regfile access that would otherwise
+    // be unnecessary.
+    const auto* constmat = ctx.try_require<ConstantMaterializationResult>("constant_materialization");
+    if (constmat) {
+        ctx.progress(0.0f, "Pattern: unified scan (constmat available, Detector3 skipped)...");
+    } else {
+        ctx.progress(0.0f, "Pattern: unified scan (mnemonic detection)...");
+    }
+
+    RegValueBuffer reg_buf;
+    SyscallBuffer sys_buf;
+    // Only build YARA buffers when YARA is actually enabled — this avoids the
+    // regfile() access (and its cost) on the common no-YARA path.
+    RegValueBuffer* reg_buf_p = has_yara ? &reg_buf : nullptr;
+    SyscallBuffer*  sys_buf_p = has_yara ? &sys_buf : nullptr;
+    scan_trace_unified(ctx, reg_buf_p, sys_buf_p, result, constmat);
+
+    // Phase 3: Run YARA on built buffers (if enabled)
 #ifdef TENET_HAS_YARA
     if (has_yara) {
-        ctx.progress(0.1f, "Pattern: scanning register values with YARA...");
-
-        auto reg_buf = build_reg_value_buffer(ctx);
+        ctx.progress(0.7f, "Pattern: scanning register values with YARA...");
         if (!reg_buf.data.empty()) {
             std::string name = "reg_value";
             YaraScanContext scan_ctx;
@@ -282,8 +295,7 @@ PassResult PatternPass::run(PassContext& ctx) {
                               0, yara_scan_callback, &scan_ctx, 0);
         }
 
-        ctx.progress(0.3f, "Pattern: scanning code bytes with YARA...");
-
+        ctx.progress(0.8f, "Pattern: scanning code bytes with YARA...");
         auto code_buf = build_code_buffer(ctx);
         if (!code_buf.data.empty()) {
             std::string name = "code";
@@ -299,9 +311,7 @@ PassResult PatternPass::run(PassContext& ctx) {
                               0, yara_scan_callback, &scan_ctx, 0);
         }
 
-        ctx.progress(0.5f, "Pattern: scanning syscalls with YARA...");
-
-        auto sys_buf = build_syscall_buffer(ctx);
+        ctx.progress(0.9f, "Pattern: scanning syscalls with YARA...");
         if (!sys_buf.data.empty()) {
             std::string name = "syscall";
             YaraScanContext scan_ctx;
@@ -320,19 +330,12 @@ PassResult PatternPass::run(PassContext& ctx) {
     (void)has_yara;
 #endif
 
-    // Phase 3: MERGED mnemonic-based detection (single pass)
-    // Optimisation: if ConstantMaterializationPass already ran, we skip Detector3
-    // (MOVZ/MOVK sequence detection) and instead convert its precise results
-    // directly into PatternMatch entries.  This eliminates a redundant full-trace scan.
-    const auto* constmat = ctx.try_require<ConstantMaterializationResult>("constant_materialization");
+    // Phase 4: Convert constmat results to PatternMatch entries
     if (constmat) {
-        ctx.progress(0.6f, "Pattern: merged mnemonic detection (Detector3 skipped — using constmat)...");
-    } else {
-        ctx.progress(0.6f, "Pattern: merged mnemonic detection (single pass)...");
+        constmat_to_pattern_matches(*constmat, result);
     }
-    detect_all_mnemonic_patterns(ctx, result, constmat);
 
-    // Phase 4: Build category index
+    // Phase 5: Build category index
     build_category_index(result);
 
     ctx.progress(1.0f, fmt::format("Pattern: {} matches found (YARA {})",
@@ -386,8 +389,11 @@ void PatternPass::constmat_to_pattern_matches(const ConstantMaterializationResul
     }
 }
 
-void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result,
-                                                const ConstantMaterializationResult* constmat) {
+void PatternPass::scan_trace_unified(PassContext& ctx,
+                            RegValueBuffer* reg_buf,
+                            SyscallBuffer* sys_buf,
+                            PatternResult& result,
+                            const ConstantMaterializationResult* constmat) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& code_table = ctx.code_table();
@@ -400,14 +406,22 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
 
     // ─── Pre-classify all unique PCs from code table ──────────────────────
     // Key optimization: decode each PC only ONCE, not once per instruction.
+    // Merged: produce both mnemonic class (for detectors) and SVC flag
+    // (for syscall buffer) in a single pass over the code table.
 
-    std::unordered_map<uint64_t, PCMnemonicInfo> pc_class;
+    struct PCInfo {
+        MnemonicClass cls = MC_OTHER;
+        char mnemonic[12]{};  // copy of decoded mnemonic (avoids dangling string_view)
+        bool is_svc = false;
+    };
+
+    std::unordered_map<uint64_t, PCInfo> pc_info;
     {
         auto all = code_table.all_entries();
-        pc_class.reserve(all.size());
+        pc_info.reserve(all.size());
 
         for (const auto& [pc, opcode] : all) {
-            PCMnemonicInfo info;
+            PCInfo info;
             auto d = decoder.decode(pc, opcode);
             if (d) {
                 std::string_view mn = d->mnemonic_sv();
@@ -427,20 +441,33 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
                     info.cls = MC_MOVK;
                 } else if (mn == "svc") {
                     info.cls = MC_SVC;
+                    info.is_svc = true;
                 }
-                info.mnemonic = mn;
+                // Copy mnemonic into fixed-size buffer (no dangling pointer)
+                auto n = std::min(mn.size(), sizeof(info.mnemonic) - 1);
+                std::memcpy(info.mnemonic, mn.data(), n);
+                info.mnemonic[n] = '\0';
             }
-            pc_class.emplace(pc, info);
+            pc_info.emplace(pc, info);
         }
     }
 
-    // ─── Single trace scan with all 3 detectors running in parallel ───────
+    // Pre-allocate reg_value buffer (only when building it for YARA)
+    const bool build_buffers = (reg_buf != nullptr);
+    if (build_buffers) {
+        reg_buf->data.reserve((end - start) * 2 * 8);
+        reg_buf->offset_to_inst_id.reserve((end - start) * 2);
+    }
+
+    // ─── Single trace scan: buffers + all 3 detectors ────────────────────
+    // This merges the former build_buffers_merged() and detect_all_mnemonic_patterns()
+    // into one pass, halving the trace I/O.
 
     // HW crypto: deduplicate by PC to avoid one match per loop iteration.
     // We accumulate per-PC execution counts and emit one match per unique PC.
     struct HWCryptoSite {
         MnemonicClass cls = MC_OTHER;
-        std::string_view mn;
+        char mn[12]{};  // copy of mnemonic (no dangling pointer)
         uint64_t exec_count   = 0;
         uint64_t first_inst_id = 0;
         uint64_t last_inst_id  = 0;
@@ -462,6 +489,7 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
     uint64_t last_movz_pc = 0;
 
     uint64_t inst_id = 0;
+    reader.advise_sequential();
 
     for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
@@ -470,13 +498,45 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
 
         auto inst = rec.as_inst();
 
-        // Look up pre-classified mnemonic (O(1) hash lookup, no Capstone call)
+        // Look up pre-classified info (O(1) hash lookup, no Capstone call)
         MnemonicClass cls = MC_OTHER;
-        std::string_view mn;
-        auto pc_it = pc_class.find(inst.pc);
-        if (pc_it != pc_class.end()) {
+        const char* mn_str = "";
+        bool is_svc = false;
+        auto pc_it = pc_info.find(inst.pc);
+        if (pc_it != pc_info.end()) {
             cls = pc_it->second.cls;
-            mn = pc_it->second.mnemonic;
+            mn_str = pc_it->second.mnemonic;
+            is_svc = pc_it->second.is_svc;
+        }
+        std::string_view mn(mn_str);
+
+        // ── Collect reg-value entries (only when building YARA buffer) ──
+        if (build_buffers) {
+            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+                auto diff = inst.reg_diff(i);
+                if (diff.index >= 31 && diff.index <= 33) continue;
+                uint64_t val = diff.value;
+                const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
+                reg_buf->data.insert(reg_buf->data.end(), bytes, bytes + 8);
+                reg_buf->offset_to_inst_id.push_back(inst_id);
+            }
+        }
+
+        // ── Collect syscall entries (only when building YARA buffer) ──
+        // SVC instructions are rare, so the regfile access here is negligible.
+        // This entire block is skipped when YARA is off (sys_buf == nullptr).
+        if (build_buffers && is_svc && sys_buf) {
+            auto& regfile = ctx.regfile();
+            auto state = regfile.state_before(inst_id);
+            uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
+            SyscallEntry entry;
+            entry.inst_id = inst_id;
+            entry.syscall_no = syscall_no;
+            sys_buf->entries.push_back(entry);
+            uint8_t record[SYSCALL_ENTRY_SIZE] = {};
+            std::memcpy(record, &inst_id, 8);
+            std::memcpy(record + 8, &syscall_no, 2);
+            sys_buf->data.insert(sys_buf->data.end(), record, record + SYSCALL_ENTRY_SIZE);
         }
 
         // ─── Detector 1: Hardware crypto (PC-deduped) ─────────────────────
@@ -486,7 +546,8 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
             auto& site = hw_sites[inst.pc];
             if (site.exec_count == 0) {
                 site.cls          = cls;
-                site.mn           = mn;
+                std::strncpy(site.mn, mn_str, sizeof(site.mn) - 1);
+                site.mn[sizeof(site.mn) - 1] = '\0';
                 site.first_inst_id = inst_id;
             }
             site.exec_count++;
@@ -577,8 +638,10 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
         }
 
         inst_id++;
-        if (ctx.cancelled()) return;
+        if (ctx.cancelled()) { reader.advise_random(); return; }
     }
+
+    reader.advise_random();
 
     // ─── Emit one match per unique HW crypto PC ──────────────────────────
     for (const auto& [pc, site] : hw_sites) {
@@ -619,112 +682,10 @@ void PatternPass::detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& 
             load_seq_insts, {},
         });
     }
-
-    // When constmat is available, synthesise PatternMatches from its richer results.
-    if (constmat) {
-        constmat_to_pattern_matches(*constmat, result);
-    }
+    // Note: constmat_to_pattern_matches() is called from run() after this scan.
 }
 
-// ─── Buffer construction ──────────────────────────────────────────────────
-
-// ── MERGED: build both reg_value and syscall buffers in a single trace scan ──
-// Previously these were 2 independent full-trace scans. For a 1GB trace with
-// 100M instructions, each scan takes ~3 seconds; merging saves ~3 seconds total.
-
-PatternPass::RegValueBuffer PatternPass::build_reg_value_buffer(PassContext& ctx) {
-    // Delegate to the merged builder
-    RegValueBuffer reg_buf;
-    SyscallBuffer sys_buf;
-    build_buffers_merged(ctx, reg_buf, sys_buf);
-    cached_syscall_buf_ = std::move(sys_buf);
-    return reg_buf;
-}
-
-PatternPass::SyscallBuffer PatternPass::build_syscall_buffer(PassContext& ctx) {
-    // If already built by the merged scan, return cached result
-    if (!cached_syscall_buf_.entries.empty() || cached_syscall_buf_built_) {
-        cached_syscall_buf_built_ = false;
-        return std::move(cached_syscall_buf_);
-    }
-    // Fallback: build standalone (shouldn't happen in normal flow)
-    RegValueBuffer dummy_reg;
-    SyscallBuffer buf;
-    build_buffers_merged(ctx, dummy_reg, buf);
-    return buf;
-}
-
-void PatternPass::build_buffers_merged(PassContext& ctx,
-                                        RegValueBuffer& reg_buf,
-                                        SyscallBuffer& sys_buf) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& regfile = ctx.regfile();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    // Pre-allocate reg_value buffer
-    reg_buf.data.reserve((end - start) * 2 * 8);
-    reg_buf.offset_to_inst_id.reserve((end - start) * 2);
-
-    // Pre-compute SVC PC set for O(1) lookup (avoids per-inst decoder.decode())
-    ankerl::unordered_dense::set<uint64_t> svc_pcs;
-    for (const auto& [pc, opcode] : code_table) {
-        auto decoded = decoder.decode(pc, opcode);
-        if (decoded && decoded->mnemonic_sv() == "svc") {
-            svc_pcs.insert(pc);
-        }
-    }
-
-    uint64_t inst_id = 0;
-    reader.advise_sequential();
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-
-        // ── Collect reg-value entries ──
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            if (diff.index >= 31 && diff.index <= 33) continue;
-
-            uint64_t val = diff.value;
-            const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
-            reg_buf.data.insert(reg_buf.data.end(), bytes, bytes + 8);
-            reg_buf.offset_to_inst_id.push_back(inst_id);
-        }
-
-        // ── Collect syscall entries (SVC instructions only) ──
-        if (svc_pcs.contains(inst.pc)) {
-            auto state = regfile.state_before(inst_id);
-            uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
-
-            SyscallEntry entry;
-            entry.inst_id = inst_id;
-            entry.syscall_no = syscall_no;
-            sys_buf.entries.push_back(entry);
-
-            uint8_t record[SYSCALL_ENTRY_SIZE] = {};
-            std::memcpy(record, &inst_id, 8);
-            std::memcpy(record + 8, &syscall_no, 2);
-            sys_buf.data.insert(sys_buf.data.end(), record, record + SYSCALL_ENTRY_SIZE);
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) break;
-    }
-
-    reader.advise_random();
-    cached_syscall_buf_built_ = true;
-}
+// ─── Code buffer construction (no trace scan needed — iterates code table) ─
 
 PatternPass::CodeBuffer PatternPass::build_code_buffer(PassContext& ctx) {
     CodeBuffer buf;

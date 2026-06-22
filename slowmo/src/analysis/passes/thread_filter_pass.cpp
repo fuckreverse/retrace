@@ -70,6 +70,28 @@ PassResult ThreadFilterPass::run(PassContext& ctx) {
         return PassResult::success(std::move(result));
     }
 
+    // ── Single-thread short circuit ─────────────────────────────────────
+    // tenet currently assumes single-thread traces (THREAD records are
+    // ignored).  When the trace has only one thread and no explicit filter
+    // is requested, the "included" set is trivially all instructions.
+    // We still build the bitmap so that contains()/cardinality() work for
+    // downstream consumers, but we skip the per-thread classification scan.
+    if (thread_result.thread_count() <= 1 && cfg_.include_thread_ids.empty()) {
+        result.is_filtered = false;
+        // Populate included_inst_ids with all inst_ids in range.
+        auto& index = ctx.index();
+        uint64_t start = ctx.range().start_inst_id;
+        uint64_t end = std::min(ctx.range().end_inst_id, index.inst_count());
+        if (end == 0) end = index.inst_count();
+        if (end > start) {
+            result.included_inst_ids.addRange(start, end);
+        }
+        ctx.progress(1.0f, fmt::format(
+            "thread_filter: single-thread, {} inst_ids included",
+            result.included_inst_ids.cardinality()));
+        return PassResult::success(std::move(result));
+    }
+
     // Build per-thread bitmaps via a single trace scan
     ThreadBitmapCollector collector(cfg_.include_thread_ids);
 

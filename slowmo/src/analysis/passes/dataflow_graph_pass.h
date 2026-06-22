@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -38,12 +39,27 @@ struct DataflowGraphResult {
     std::vector<DFGEdge> edges;
     std::unordered_map<uint64_t, size_t> inst_to_node;  // inst_id → node index
 
+    // ─── Adjacency index (built by build_adjacency()) ─────────────────
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> incoming_edge_idx_;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> outgoing_edge_idx_;
+
+    void build_adjacency() {
+        incoming_edge_idx_.clear();
+        outgoing_edge_idx_.clear();
+        for (size_t i = 0; i < edges.size(); ++i) {
+            outgoing_edge_idx_[edges[i].from_inst_id].push_back(i);
+            incoming_edge_idx_[edges[i].to_inst_id].push_back(i);
+        }
+    }
+
     // ─── Query helpers ──────────────────────────────────────────────────
 
     /// Get all incoming edges (data producers) for the given instruction.
+    /// O(1) via the adjacency index.
     std::vector<DFGEdge> producers_of(uint64_t inst_id) const;
 
     /// Get all outgoing edges (data consumers) for the given instruction.
+    /// O(1) via the adjacency index.
     std::vector<DFGEdge> consumers_of(uint64_t inst_id) const;
 
     /// Export the graph as Graphviz DOT format.

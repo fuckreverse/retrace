@@ -221,16 +221,23 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
 
     WindowStatsCollector collector(cfg_, code_table, total_insts);
 
-    TraceScanEngine local_engine(reader, total_insts, &index);
-    local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-        if (total > 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-        }
-    });
-    local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-    local_engine.add_collector(&collector);
-
-    local_engine.run();
+    // Use shared scan engine if available; otherwise create a local one.
+    // This allows future fusion with other collector-based passes.
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
+    } else {
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+            }
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run();
+    }
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");

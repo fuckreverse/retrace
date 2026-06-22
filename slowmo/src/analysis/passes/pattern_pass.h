@@ -146,17 +146,12 @@ private:
         std::vector<uint8_t> data;
         std::vector<uint64_t> offset_to_inst_id;  // one entry per 8-byte slot
     };
-    RegValueBuffer build_reg_value_buffer(PassContext& ctx);
 
     /// Build the syscall buffer from trace.
     struct SyscallBuffer {
         std::vector<uint8_t> data;
         std::vector<SyscallEntry> entries;
     };
-    SyscallBuffer build_syscall_buffer(PassContext& ctx);
-
-    /// Merged builder: constructs both reg_value and syscall buffers in one scan.
-    void build_buffers_merged(PassContext& ctx, RegValueBuffer& reg_buf, SyscallBuffer& sys_buf);
 
     /// Build the code buffer (continuous opcode bytes from code table).
     struct CodeBuffer {
@@ -165,15 +160,31 @@ private:
     };
     CodeBuffer build_code_buffer(PassContext& ctx);
 
-    // ─── Merged mnemonic-based detection (single pass) ──────────────────
+    // ─── Unified trace scan (replaces separate buffer + mnemonic scans) ──
 
-    /// Detect all mnemonic-based patterns (HW crypto, XOR loops, constant loading)
-    /// in a single trace scan. Replaces the previous 3 separate scan functions.
-    /// When `constmat` is non-null (ConstantMaterializationPass already ran),
-    /// Detector3 (MOVZ/MOVK sequence detection) is skipped; its results are
-    /// synthesised from `constmat` instead, avoiding a redundant trace scan.
-    void detect_all_mnemonic_patterns(PassContext& ctx, PatternResult& result,
-                                       const ConstantMaterializationResult* constmat = nullptr);
+    /// Single-pass scan that simultaneously:
+    ///   - Optionally builds the reg_value buffer (for YARA scanning)
+    ///   - Optionally builds the syscall buffer (for YARA scanning)
+    ///   - Runs HW crypto detection (PC-deduped)
+    ///   - Runs XOR loop detection (sliding window)
+    ///   - Runs constant loading detection (movz+movk sequences)
+    ///
+    /// When `reg_buf` / `sys_buf` are non-null, the corresponding YARA
+    /// buffer is built during the scan.  When null, buffer construction
+    /// (and the regfile access it implies) is skipped entirely — this is
+    /// the fast path when YARA is not compiled in or has no rules.
+    ///
+    /// When `constmat` is non-null, constant loading detection is skipped
+    /// (its results are synthesised from constmat after the scan).
+    ///
+    /// This replaces the previous two full-trace scans with one, halving
+    /// the trace I/O for PatternPass when YARA is active, and keeping the
+    /// no-YARA path to a single scan (same as before).
+    void scan_trace_unified(PassContext& ctx,
+                            RegValueBuffer* reg_buf,
+                            SyscallBuffer* sys_buf,
+                            PatternResult& result,
+                            const ConstantMaterializationResult* constmat);
 
     /// Convert ConstantMaterializationResult entries into PatternMatch objects
     /// and append them to result (replaces Detector3).
@@ -194,7 +205,7 @@ private:
 #endif
     bool rules_loaded_ = false;
 
-    // Cached syscall buffer from merged build (avoids redundant scan)
+    // Cached syscall buffer from unified scan (unused — kept for ABI compat)
     SyscallBuffer cached_syscall_buf_;
     bool cached_syscall_buf_built_ = false;
 };

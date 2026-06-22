@@ -68,8 +68,19 @@ PassResult TraceDiffPass::run(PassContext& ctx) {
     region_a.reserve(compare_len);
 
     {
+        // Use the sparse offset index to jump directly to a_start, avoiding
+        // an O(a_start) scan from the beginning of the trace.
         uint64_t inst_id = 0;
-        for (auto it = reader.begin(); it != reader.end() && inst_id < a_end; ++it) {
+        uint64_t start_offset = 0;
+        if (a_start > 256) {
+            start_offset = ctx.index().offset_of(a_start, reader);
+            inst_id = a_start;
+        }
+        auto it_start = (start_offset > 0)
+            ? TraceReader::Iterator(&reader, start_offset)
+            : reader.begin();
+
+        for (auto it = it_start; it != reader.end() && inst_id < a_end; ++it) {
             auto rec = *it;
             if (rec.kind != RecordKind::Inst) continue;
             if (inst_id < a_start) { inst_id++; continue; }
@@ -105,8 +116,18 @@ PassResult TraceDiffPass::run(PassContext& ctx) {
     uint64_t b_offset = 0;
 
     {
+        // Use the sparse offset index to jump directly to b_start.
         uint64_t inst_id = 0;
-        for (auto it = reader.begin(); it != reader.end() && inst_id < b_end; ++it) {
+        uint64_t start_offset = 0;
+        if (b_start > 256) {
+            start_offset = ctx.index().offset_of(b_start, reader);
+            inst_id = b_start;
+        }
+        auto it_start = (start_offset > 0)
+            ? TraceReader::Iterator(&reader, start_offset)
+            : reader.begin();
+
+        for (auto it = it_start; it != reader.end() && inst_id < b_end; ++it) {
             auto rec = *it;
             if (rec.kind != RecordKind::Inst) continue;
             if (inst_id < b_start) { inst_id++; continue; }
