@@ -104,10 +104,10 @@ public:
     // Range
     const AnalysisRange& range() const { return range_; }
 
-    // Progress
+    // Progress — writes to per-pass atomics so the UI can render live progress.
     void progress(float pct);
     void progress(float pct, std::string_view msg);
-    /// True if the user requested global cancellation.
+    /// True if the user requested cancellation (global or per-pass).
     bool cancelled() const;
     void cancel();
 
@@ -120,6 +120,14 @@ public:
 private:
     PassManager& manager_;
     AnalysisRange range_;
+
+    // Set by PassManager::execute_pass to point to this pass's progress atomics.
+    // Stored as raw pointers (non-owning) for lock-free hot-path access.
+    std::atomic<float>* progress_pct_ = nullptr;
+    std::atomic<bool>*  cancelled_flag_ = nullptr;
+    std::string_view    pass_name_;  // for progress-message lookup
+
+    friend class PassManager;
 };
 
 // ─── Analysis pass base ───────────────────────────────────────────────────
@@ -222,11 +230,28 @@ public:
     /// `PassContext::cancelled()` will abort early.  Thread-safe.
     void cancel_all() { cancelled_.store(true, std::memory_order_release); }
 
+    /// Request cancellation of a single pass by name.  Thread-safe.
+    void cancel(std::string_view pass_name);
+
+    /// Reset all cancellation flags (global + per-pass).  Call this before
+    /// starting a fresh analysis batch so previously-cancelled passes can run.
+    void reset_cancel();
+
     // ─── Query ─────────────────────────────────────────────────────────
 
     enum class PassState : int { NotRun = 0, Running = 1, Completed = 2, Failed = 3 };
     PassState state(std::string_view pass_name) const;
     std::vector<std::string_view> all_passes() const;
+
+    /// Per-pass progress in [0,1].  Returns 0 for unknown / not-yet-run passes.
+    float progress_of(std::string_view pass_name) const;
+
+    /// Per-pass progress message (e.g. "Collecting memory bytes...").
+    /// Returns empty string if pass not found or no message set.
+    std::string progress_msg_of(std::string_view pass_name) const;
+
+    /// Per-pass cancellation flag.
+    bool is_pass_cancelled(std::string_view pass_name) const;
 
     // ─── Internal (used by PassContext) ────────────────────────────────
 
@@ -251,6 +276,14 @@ private:
         // Dynamic scheduling fields (used only by run_all).
         std::atomic<size_t> pending_deps{0};   // # of deps not yet completed
         std::vector<size_t> dependents;        // indices of passes that depend on this one
+
+        // Per-pass progress + cancellation (read by UI, written by PassContext).
+        // progress_pct is a lock-free atomic for the hot path; progress_msg
+        // is mutex-protected because string writes aren't atomic.
+        std::atomic<float> progress_pct{0.0f};
+        std::atomic<bool>  cancelled{false};
+        mutable std::mutex progress_mtx;   // protects progress_msg (mutable for const queries)
+        std::string        progress_msg;
     };
 
     PassEntry* find_entry(std::string_view name);
@@ -269,6 +302,9 @@ private:
     /// Build the reverse dependency graph (dependents[] + pending_deps)
     /// on all entries.  Called once at the start of run_all_parallel.
     void build_dependency_graph();
+
+    /// Set the progress message for a pass (called by PassContext::progress).
+    void set_progress_msg(std::string_view pass_name, std::string_view msg);
 
     std::vector<std::unique_ptr<PassEntry>> entries_;
     std::unordered_map<std::string_view, PassEntry*> name_map_;
@@ -291,6 +327,8 @@ private:
     std::atomic<bool> cancelled_{false};
 
     static PassResult not_found_result_;
+
+    friend class PassContext;  // PassContext calls set_progress_msg / is_cancelled
 };
 
 // ─── Template implementations ─────────────────────────────────────────────
