@@ -167,11 +167,15 @@ static uint64_t sample_trace_hash(const TraceReader& reader) {
 // ─── TraceIndex lifecycle ─────────────────────────────────────────────────
 
 TraceIndex::~TraceIndex() {
-    for (auto* h : cf_handles_) {
-        if (h && db_) db_->DestroyColumnFamilyHandle(h);
-    }
-    cf_handles_.clear();
-    db_.reset();
+close();
+}
+
+void TraceIndex::close() {
+for (auto* h : cf_handles_) {
+if (h && db_) db_->DestroyColumnFamilyHandle(h);
+}
+cf_handles_.clear();
+db_.reset();
 }
 
 TraceIndex::TraceIndex(TraceIndex&& other) noexcept
@@ -410,6 +414,23 @@ Result<TraceIndex> TraceIndex::build(
     opts.create_missing_column_families = true;
     opts.compression = rocksdb::kNoCompression;
     opts.write_buffer_size = 256 * 1024 * 1024;  // 256MB: reduces compactions during bulk build
+    // Bulk-load optimisation: disable auto-compaction and raise L0 triggers
+    // so the initial write doesn't stall.  After build we CompactRange() once.
+    opts.disable_auto_compactions = true;
+    opts.level0_file_num_compaction_trigger = 1024;
+    opts.level0_slowdown_writes_trigger = 1024;
+    opts.level0_stop_writes_trigger = 1024;
+    opts.max_write_buffer_number = 4;
+
+    // Helper: apply bulk-load settings to a column-family options object.
+    auto apply_bulk_load_opts = [](rocksdb::ColumnFamilyOptions& o) {
+        o.disable_auto_compactions = true;
+        o.level0_file_num_compaction_trigger = 1024;
+        o.level0_slowdown_writes_trigger = 1024;
+        o.level0_stop_writes_trigger = 1024;
+        o.max_write_buffer_number = 4;
+        o.write_buffer_size = 256 * 1024 * 1024;
+    };
 
     rocksdb::BlockBasedTableOptions table_opts;
     table_opts.block_cache = rocksdb::NewLRUCache(128 * 1024 * 1024);
@@ -845,6 +866,14 @@ uint64_t TraceIndex::offset_of(uint64_t inst_id, const TraceReader& reader) cons
 }
 
 TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const TraceReader& reader) const {
+    // ── Hot offset cache: avoid RocksDB seek + linear scan for repeat queries ──
+    {
+        std::lock_guard<std::mutex> lk(offset_cache_mtx_);
+        if (auto cached = offset_cache_.get(inst_id)) {
+            return cached->get();
+        }
+    }
+
     // Find the sparse entry at or before inst_id (adaptive interval)
     const uint64_t si = sparse_interval_;
     uint64_t base_id = (inst_id / si) * si;
@@ -932,7 +961,9 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
                 // - v4: return 0; record_at(offset, 0) is the 1-arg overload leaving is_v5=false,
                 //   so as_inst() uses the 16-byte v4 layout and reads pc from the raw struct.
                 uint64_t seed = is_v5 ? running_pc : 0;
-                return {current_offset, seed};
+                OffsetResult result{current_offset, seed};
+                { std::lock_guard<std::mutex> lk(offset_cache_mtx_); offset_cache_.put(inst_id, result); }
+                return result;
             }
             current_id++;
             // Compute record size directly from raw bytes, respecting v4/v5 layout.
@@ -964,7 +995,9 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
         }
     }
 
-    return {current_offset, running_pc};
+    OffsetResult result{current_offset, running_pc};
+    { std::lock_guard<std::mutex> lk(offset_cache_mtx_); offset_cache_.put(inst_id, result); }
+    return result;
 }
 
 // ─── Query: nearest_anchor_before ─────────────────────────────────────────

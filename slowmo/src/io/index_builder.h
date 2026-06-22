@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace tenet {
@@ -64,6 +65,18 @@ namespace cf {
 class TraceIndex {
 public:
     ~TraceIndex();
+
+    /// Explicitly close the RocksDB DB and join all background threads.
+    /// Safe to call multiple times (idempotent).  After close(), the index
+    /// is no longer usable but the DB's background compaction/flush threads
+    /// are guaranteed to have exited.
+    ///
+    /// This is used to avoid a macOS-specific crash: pthread_mutex_destroy()
+    /// uses a global os_unfair_lock that can collide with RocksDB's background
+    /// threads' own pthread_mutex_destroy() calls, triggering
+    /// _os_unfair_lock_corruption_abort.  Call close() before destroying
+    /// MemoryModel (whose ~mutex() runs pthread_mutex_destroy).
+    void close();
 
     // Movable but not copyable
     TraceIndex(TraceIndex&& other) noexcept;
@@ -186,6 +199,15 @@ private:
     // Minimum and maximum allowed sparse interval values.
     static constexpr uint64_t SPARSE_MIN = 64;
     static constexpr uint64_t SPARSE_MAX = 4096;
+
+    // ─── Hot offset cache ───────────────────────────────────────────────
+    // Caches (inst_id → OffsetResult) for repeated offset_of queries.
+    // Eliminates the RocksDB seek + linear scan for hot inst_ids (e.g. when
+    // the TUI scrolls or when multiple passes query nearby inst_ids).
+    // Mutex-protected: the lock is held for ~100ns (hash + promote), which
+    // is 50× faster than the RocksDB seek it avoids.
+    mutable LRUCache<uint64_t, OffsetResult> offset_cache_{8192};
+    mutable std::mutex offset_cache_mtx_;
 
     // Helper: get column family handle by name
     rocksdb::ColumnFamilyHandle* get_cf(const char* name) const;
