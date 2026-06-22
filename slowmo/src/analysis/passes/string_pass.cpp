@@ -145,6 +145,60 @@ public:
             if (j > i) i = j;
             else        i++;
         }
+
+        // ─── UTF-16LE scan ────────────────────────────────────────────
+        // Look for sequences of [printable_byte, 0x00] pairs. The ASCII scan
+        // above breaks on 0x00, so genuine UTF-16LE strings are invisible to
+        // it; there is no overlap. We walk every observed address as a candidate
+        // start and extend while pairs remain (printable lo, 0x00 hi).
+        for (size_t k = 0; k < n; ++k) {
+            uint64_t start = all_addrs[k];
+
+            // Skip if an ASCII string was already recorded at this address —
+            // ASCII takes priority (a real ASCII run would have consumed these
+            // bytes already, so this is mostly defensive).
+            auto existing = result_.addr_to_index.find(start);
+            if (existing != result_.addr_to_index.end() &&
+                existing->second != StringResult::NOT_STRING) {
+                continue;
+            }
+
+            auto it_lo = bytes_.find(start);
+            auto it_hi = bytes_.find(start + 1);
+            if (it_lo == bytes_.end() || it_hi == bytes_.end()) continue;
+            if (it_hi->second != 0x00) continue;
+            if (!is_printable(it_lo->second)) continue;
+
+            // Extend the run of [printable, 0x00] pairs.
+            std::string run_content;
+            run_content.push_back(static_cast<char>(it_lo->second));
+            uint64_t addr = start + 2;
+            while (run_content.size() < StringResult::MAX_STRING_LEN) {
+                auto lo = bytes_.find(addr);
+                auto hi = bytes_.find(addr + 1);
+                if (lo == bytes_.end() || hi == bytes_.end()) break;
+                if (hi->second != 0x00) break;
+                if (!is_printable(lo->second)) break;
+                run_content.push_back(static_cast<char>(lo->second));
+                addr += 2;
+            }
+
+            if (run_content.size() >= StringResult::MIN_STRING_LEN) {
+                auto first_it = addr_first_inst_.find(start);
+                uint64_t disc_inst = (first_it != addr_first_inst_.end())
+                                     ? first_it->second : 0;
+
+                size_t idx = result_.strings.size();
+                StringRef ref;
+                ref.addr          = start;
+                ref.discovered_at = disc_inst;
+                ref.content       = std::move(run_content);
+                ref.encoding      = StringRef::UTF16LE;
+                ref.references.push_back({disc_inst, 0});
+                result_.strings.push_back(std::move(ref));
+                result_.addr_to_index[start] = idx;
+            }
+        }
     }
 
     StringResult take_result() { return std::move(result_); }

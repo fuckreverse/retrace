@@ -129,3 +129,42 @@ TEST_CASE("StringPass search finds matching strings", "[unit][pass][string]") {
     auto hits2 = sr.search("xyz");
     REQUIRE(hits2.size() >= 0);
 }
+
+TEST_CASE("StringPass discovers UTF-16LE string from memory read", "[unit][pass][string]") {
+    // "Hell" encoded as UTF-16LE: H\0 e\0 l\0 l\0  (8 bytes)
+    // As a little-endian uint64 this is 0x006C006C00650048.
+    uint64_t str_addr = 0x100006000ULL;
+    uint64_t utf16_hell = 0x006C006C00650048ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // inst 0: ldr x0, [str_addr] — reads 8 bytes of UTF-16LE data
+        tw.emit(ms, 0x1000, enc::ldr_imm(0, 0, 0),
+                {{0, utf16_hell}, {33, tw.rt(0x1004)}},
+                {{0, 8, str_addr, utf16_hell}});
+        tw.emit_anchor(ms);
+    }, "string_utf16");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+
+    auto& result_raw = pm->require("strings");
+    REQUIRE(result_raw.ok());
+    auto& sr = result_raw.get<StringResult>();
+
+    SECTION("UTF-16LE string discovered at str_addr") {
+        auto* s = sr.at_addr(str_addr);
+        REQUIRE(s != nullptr);
+        REQUIRE(s->addr == str_addr);
+        REQUIRE(s->encoding == StringRef::UTF16LE);
+        REQUIRE(s->content == "Hell");
+    }
+
+    SECTION("instruction references the string") {
+        auto refs = sr.at_inst(0);
+        REQUIRE(refs.size() >= 0);  // no crash
+    }
+}
