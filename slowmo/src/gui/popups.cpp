@@ -64,9 +64,13 @@ void GuiApp::rebuild_goto_candidates() {
 }
 
 /// Parse the input string and navigate:
-///   - "0x..." → treat as runtime address, find first xref
-///   - pure digits → treat as instruction ID
+///   - "0x<hex>" or bare hex (contains a-f) → treat as STATIC address (IDA address),
+///     add module_slide to get runtime address, then look up in xref index.
+///   - pure decimal digits → treat as instruction ID
 ///   - otherwise → search function names
+///
+/// Note: IDA always shows static (slide-adjusted) addresses.  Users naturally
+/// paste addresses from IDA, so we add module_slide before the xref lookup.
 void GuiApp::goto_commit(const char* buf) {
     if (!buf || buf[0] == '\0') return;
 
@@ -77,27 +81,69 @@ void GuiApp::goto_commit(const char* buf) {
     while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.pop_back();
     if (s.empty()) return;
 
-    // 1. Hex address? starts with "0x" or "0X"
+    // Helper: look up a static address → navigate to first inst at that PC.
+    // Converts static → runtime by adding module_slide, then queries xref.
+    // Falls back to the function-candidate list if xref not yet built.
+    auto goto_static_addr = [&](uint64_t static_addr) -> bool {
+        const uint64_t slide   = reader_.header().module_slide;
+        const uint64_t runtime = static_addr + slide;
+
+        // Try xref index first (exact PC hit)
+        if (xref_result_) {
+            auto ids = xref_result_->inst_ids_at(runtime);
+            if (!ids.empty()) {
+                navigate_to(ids[0]);
+                return true;
+            }
+        }
+
+        // Xref not built yet: try matching against function entry PCs
+        // (function_result_ stores runtime PCs, so compare directly)
+        if (function_result_) {
+            auto it = function_result_->functions.find(runtime);
+            if (it != function_result_->functions.end()) {
+                const auto& info = it->second;
+                if (!info.call_event_indices.empty()) {
+                    uint64_t inst_id = function_result_->call_events[
+                        info.call_event_indices[0]].call_inst_id + 1;
+                    navigate_to(inst_id);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // 1a. Explicit hex address: starts with "0x" or "0X"
     if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
         try {
             uint64_t addr = std::stoull(s.substr(2), nullptr, 16);
-            // Try xref lookup first (PC → inst_id)
-            if (xref_result_) {
-                auto ids = xref_result_->inst_ids_at(addr);
-                if (!ids.empty()) {
-                    navigate_to(ids[0]);
-                    return;
-                }
-            }
-            // Fall back: treat as instruction count / address raw
-            // Try decoding address as a static PC (add slide if known)
-            // We don't know the slide here, so just warn with a candidate search
-            // If the xref has slide info we could subtract; for now skip.
+            goto_static_addr(addr);
         } catch (...) {}
         return;
     }
 
-    // 2. Pure numeric? → instruction ID
+    // 1b. Bare hex string (no 0x prefix but contains a-f/A-F chars)?
+    //     Require at least 4 chars and all chars valid hex digits to avoid
+    //     ambiguity with short decimal numbers.
+    {
+        bool has_hex_digit = false;
+        bool all_hex       = !s.empty();
+        for (char c : s) {
+            char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if ((lc >= 'a' && lc <= 'f')) { has_hex_digit = true; }
+            else if (!((c >= '0' && c <= '9'))) { all_hex = false; break; }
+        }
+        if (all_hex && has_hex_digit && s.size() >= 4) {
+            try {
+                uint64_t addr = std::stoull(s, nullptr, 16);
+                goto_static_addr(addr);
+            } catch (...) {}
+            return;
+        }
+    }
+
+    // 2. Pure decimal digits → instruction ID
     bool all_digits = !s.empty();
     for (char c : s) {
         if (c < '0' || c > '9') { all_digits = false; break; }
@@ -170,7 +216,7 @@ void GuiApp::render_goto_popup() {
                                ImGuiWindowFlags_AlwaysAutoResize)) {
 
         // ─── Hint text ──────────────────────────────────────────────────
-        ImGui::TextDisabled("Instruction ID, 0x<address>, or function name:");
+        ImGui::TextDisabled("0x<static addr> (IDA addr), inst #<id>, or function name:");
         ImGui::Spacing();
 
         // ─── Input field ────────────────────────────────────────────────

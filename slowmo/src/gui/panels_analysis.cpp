@@ -22,6 +22,11 @@
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/symbol_annotation_pass.h"
+#include "analysis/passes/objc_crypto_pass.h"
+#include "analysis/passes/memory_string_pass.h"
+#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/cache_sim_pass.h"
+#include "analysis/passes/trace_fold_pass.h"
 
 #include <imgui.h>
 
@@ -108,11 +113,22 @@ void GuiApp::enqueue_async(std::string pass_name, std::function<void()> work) {
     active_analysis_count_.fetch_add(1, std::memory_order_acq_rel);
     analysis_running_.store(true, std::memory_order_relaxed);
 
-    {
-        std::lock_guard<std::mutex> lk(analysis_queue_mutex_);
-        analysis_queue_.push_back({std::move(pass_name), std::move(work)});
-    }
-    analysis_queue_cv_.notify_one();
+    // Launch on a dedicated detached thread instead of the single worker queue.
+    // This prevents a slow pass (e.g. ObjcPass) from blocking all subsequent
+    // manual triggers.  The worker thread is still available for other purposes
+    // (e.g. future priority tasks), but manual pass execution no longer
+    // serializes through it.
+    std::thread([this, p = std::move(pass_name), w = std::move(work)]() mutable {
+        w();
+
+        if (active_analysis_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            analysis_running_.store(false, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(analysis_mutex_);
+                analysis_status_.clear();
+            }
+        }
+    }).detach();
 }
 
 void GuiApp::post_apply(std::function<void()> fn) {
@@ -178,6 +194,8 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         show_loops_  = true;
     } else if (name == "call_graph") {
         call_graph_result_ = &raw->get<CallGraphResult>();
+        show_call_graph_   = true;
+        pending_focus_windows_.push_back("Call Graph");
     } else if (name == "cfg") {
         cfg_result_ = &raw->get<CFGResult>();
         show_cfg_   = true;
@@ -185,14 +203,25 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         // Do NOT auto-focus CFG — Instructions is the primary disasm view.
     } else if (name == "constant_materialization") {
         constant_result_ = &raw->get<ConstantMaterializationResult>();
+        show_constant_   = true;
+        pending_focus_windows_.push_back("Constants");
     } else if (name == "pattern") {
         pattern_result_ = &raw->get<PatternResult>();
+        show_pattern_   = true;
+        pending_focus_windows_.push_back("Patterns");
     } else if (name == "loop_semantics") {
         loop_semantics_result_ = &raw->get<LoopSemanticsResult>();
+        show_loop_semantics_   = true;
     } else if (name == "algorithm_summary") {
         algorithm_summary_result_ = &raw->get<AlgorithmSummaryResult>();
+        show_algorithm_summary_   = true;
+        pending_focus_windows_.push_back("Algorithm Summary");
     } else if (name == "symbol_annotation") {
         annotation_result_ = &raw->get<AnnotationResult>();
+    } else if (name == "objc") {
+        objc_result_ = &raw->get<ObjcResult>();
+        show_objc_   = true;
+        pending_focus_windows_.push_back("ObjC Messages");
     } else if (name == "taint") {
         taint_result_ = &raw->get<TaintResult>();
         show_taint_   = true;
@@ -202,6 +231,26 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
     } else if (name == "slice") {
         slice_result_ = &raw->get<SliceResult>();
         show_slice_   = true;
+    } else if (name == "objc_crypto") {
+        objc_crypto_result_ = &raw->get<ObjcCryptoResult>();
+        show_objc_crypto_   = true;
+        pending_focus_windows_.push_back("ObjC Crypto");
+    } else if (name == "memory_strings") {
+        mem_string_result_ = &raw->get<MemoryStringResult>();
+        show_mem_strings_  = true;
+        pending_focus_windows_.push_back("Memory Strings");
+    } else if (name == "syscall_intercept") {
+        syscall_result_          = &raw->get<SyscallInterceptResult>();
+        show_syscall_intercept_  = true;
+        pending_focus_windows_.push_back("API Intercepts");
+    } else if (name == "cache_sim") {
+        cache_sim_result_ = &raw->get<CacheSimResult>();
+        show_cache_sim_   = true;
+        pending_focus_windows_.push_back("Cache Sim");
+    } else if (name == "trace_fold") {
+        trace_fold_result_ = &raw->get<TraceFoldResult>();
+        show_trace_fold_   = true;
+        pending_focus_windows_.push_back("Trace Fold");
     }
 }
 
@@ -496,6 +545,45 @@ void GuiApp::run_pass_by_name(std::string_view name) {
     });
 }
 
+void GuiApp::force_rerun_pass(std::string_view name) {
+    ensure_pass_manager();
+
+    // Cancel if currently running.
+    if (pass_manager_->state(name) == PassManager::PassState::Running) {
+        pass_manager_->cancel(name);
+    }
+
+    // Wipe in-memory result + RocksDB blob so the next run does a full recompute.
+    pass_manager_->invalidate_and_clear_blob(name);
+
+    // Clear the cached result pointer on the UI side for the three cached passes.
+    if (name == "xref") {
+        xref_result_ = nullptr;
+    } else if (name == "function") {
+        function_result_ = nullptr;
+        sparkline_cache_ = {};
+    } else if (name == "constant_materialization") {
+        constant_result_ = nullptr;
+    }
+
+    // Re-register (may already be registered) and enqueue.
+    tenet::PassRunCtx ctx;
+    ctx.current_inst = current_inst_;
+    ctx.total_inst   = total_inst_;
+    tenet::register_pass_by_name(*pass_manager_, name, ctx);
+
+    std::string name_str(name);
+    enqueue_async(name_str, [this, name_str]() {
+        auto& raw = pass_manager_->require(name_str);
+        std::string summary = tenet::summarize_pass_result(name_str, raw);
+        bool ok = raw.ok();
+        post_apply([this, name_str, summary, ok]() {
+            last_pass_status_ = fmt::format("{}: {}", name_str, summary);
+            if (ok) apply_pass_result_pointers(name_str);
+        });
+    });
+}
+
 void GuiApp::clear_analysis() {
     // Cancel any in-flight analysis.
     if (pass_manager_) {
@@ -523,10 +611,47 @@ void GuiApp::clear_analysis() {
     cfg_func_layout_.reset();
     cfg_current_func_pc_ = 0;
     constant_result_          = nullptr;
+    show_constant_            = false;
+    std::memset(constant_filter_buf_, 0, sizeof(constant_filter_buf_));
+    constant_filter_.clear();
     pattern_result_           = nullptr;
+    show_pattern_             = false;
+    std::memset(pattern_filter_buf_, 0, sizeof(pattern_filter_buf_));
+    pattern_filter_.clear();
     loop_semantics_result_    = nullptr;
+    show_loop_semantics_      = false;
     algorithm_summary_result_ = nullptr;
+    show_algorithm_summary_   = false;
+    call_graph_result_        = nullptr;
+    show_call_graph_          = false;
+    std::memset(call_graph_filter_buf_, 0, sizeof(call_graph_filter_buf_));
+    call_graph_filter_.clear();
     annotation_result_        = nullptr;
+    objc_result_ = nullptr;
+    show_objc_   = false;
+    std::memset(objc_class_filter_buf_, 0, sizeof(objc_class_filter_buf_));
+    std::memset(objc_sel_filter_buf_, 0, sizeof(objc_sel_filter_buf_));
+    objc_class_filter_.clear();
+    objc_sel_filter_.clear();
+    objc_msg_cursor_ = 0;
+    objc_crypto_result_ = nullptr;
+    show_objc_crypto_   = false;
+    std::memset(objc_crypto_filter_buf_, 0, sizeof(objc_crypto_filter_buf_));
+    objc_crypto_filter_.clear();
+    objc_crypto_cursor_ = 0;
+    mem_string_result_ = nullptr;
+    show_mem_strings_  = false;
+    std::memset(mem_string_filter_buf_, 0, sizeof(mem_string_filter_buf_));
+    mem_string_filter_.clear();
+    syscall_result_         = nullptr;
+    show_syscall_intercept_ = false;
+    std::memset(syscall_filter_buf_, 0, sizeof(syscall_filter_buf_));
+    syscall_filter_.clear();
+    syscall_cursor_ = 0;
+    cache_sim_result_ = nullptr;
+    show_cache_sim_   = false;
+    trace_fold_result_ = nullptr;
+    show_trace_fold_   = false;
     show_taint_ = false;
     show_threads_ = false;
     show_slice_ = false;
@@ -788,6 +913,12 @@ void GuiApp::render_analysis_panel() {
         if (active) {
             ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
                 "\xe2\x9c\x93 %zu functions", function_result_->functions.size());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("\xe2\x86\xba##rerun_fn")) {  // ↺
+                force_rerun_pass("function");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Force re-run (discard disk cache)");
         } else {
             ImGui::TextDisabled("(not run)");
         }
@@ -830,6 +961,12 @@ void GuiApp::render_analysis_panel() {
         ImGui::SameLine();
         if (active) {
             ImGui::TextColored(ImVec4(0.65f, 0.75f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("\xe2\x86\xba##rerun_xref")) {  // ↺
+                force_rerun_pass("xref");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Force re-run (discard disk cache)");
         } else {
             ImGui::TextDisabled("(not run)");
         }
@@ -923,6 +1060,16 @@ void GuiApp::render_analysis_panel() {
                 return 6;
             };
 
+            // Passes that persist results to the RocksDB blob cache.
+            // These get an extra ↺ button to force re-computation.
+            static constexpr std::string_view kBlobCachedPasses[] = {
+                "xref", "function", "constant_materialization"
+            };
+            auto has_blob_cache = [](std::string_view name) {
+                for (auto n : kBlobCachedPasses) if (n == name) return true;
+                return false;
+            };
+
             int cur_cat = -1;
             for (const auto& e : tenet::pass_catalog()) {
                 int ci = cat_to_idx(e.category);
@@ -948,6 +1095,16 @@ void GuiApp::render_analysis_panel() {
                                       e.name.data(),
                                       e.default_for_ui == tenet::PassDefault::Yes
                                           ? ", default" : "");
+                // For blob-cached passes that completed, show a ↺ re-run button.
+                if (done && has_blob_cache(e.name)) {
+                    ImGui::SameLine(0, 2);
+                    std::string rerun_label = fmt::format("\xe2\x86\xba##rerun_cat_{}", e.name);
+                    if (ImGui::SmallButton(rerun_label.c_str())) {
+                        force_rerun_pass(e.name);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Force re-run %s (discard disk cache)", e.name.data());
+                }
                 ImGui::SameLine();
             }
             ImGui::NewLine();  // wrap last row

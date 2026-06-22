@@ -30,6 +30,45 @@ const std::vector<const CallEvent*>& GuiApp::current_call_stack() {
         }
         callstack_frame_cache_.source  = function_result_;
         callstack_frame_cache_.inst_id = current_inst_;
+
+        // Rebuild label cache: one fmt::format call per entry, but only when
+        // the stack actually changes (not every frame).
+        const auto& stk = callstack_frame_cache_.stack;
+        callstack_frame_cache_.labels.resize(stk.size());
+        const uint64_t slide = reader_.header().module_slide;
+        // Static indent buffer: max 64 levels * 2 spaces = 128 chars.
+        // Use a fixed array to avoid std::string(n, ' ') heap allocation.
+        static constexpr int kMaxIndentLevels = 64;
+        static const auto s_indent = []() {
+            std::array<std::string, kMaxIndentLevels> arr;
+            for (int j = 0; j < kMaxIndentLevels; ++j)
+                arr[j] = std::string(j * 2, ' ');
+            return arr;
+        }();
+        for (size_t i = 0; i < stk.size(); ++i) {
+            auto* evt = stk[i];
+            uint64_t static_target = evt->target_pc - slide;
+            std::string_view name;
+            std::string name_buf;
+            if (function_result_) {
+                auto it = function_result_->functions.find(evt->target_pc);
+                if (it != function_result_->functions.end()) {
+                    name = it->second.name;
+                } else {
+                    name_buf = fmt::format("sub_{:x}", static_target);
+                    name = name_buf;
+                }
+            }
+            bool is_deepest = (i == stk.size() - 1);
+            const std::string& indent = (i < kMaxIndentLevels)
+                ? s_indent[i] : s_indent[kMaxIndentLevels - 1];
+            callstack_frame_cache_.labels[i] = fmt::format("{}{} {}  @{}##frame{}",
+                indent,
+                is_deepest ? ">" : " ",
+                name,
+                evt->call_inst_id,
+                i);
+        }
     }
     return callstack_frame_cache_.stack;
 }
@@ -77,30 +116,17 @@ void GuiApp::render_callstack_panel() {
     if (stack.empty()) {
         ImGui::TextDisabled("<top-level>");
     } else {
-        // Show call stack as clickable items with right-click menu
+        // Show call stack as clickable items with right-click menu.
+        // Labels are pre-built in current_call_stack() and cached in
+        // callstack_frame_cache_.labels — no heap allocation per frame.
+        const auto& labels = callstack_frame_cache_.labels;
         for (size_t i = 0; i < stack.size(); i++) {
             auto* evt = stack[i];
-            uint64_t static_target = evt->target_pc - reader_.header().module_slide;
-            std::string label;
-
-            auto it = function_result_->functions.find(evt->target_pc);
-            if (it != function_result_->functions.end()) {
-                label = it->second.name;
-            } else {
-                label = fmt::format("sub_{:x}", static_target);
-            }
-
             bool is_deepest = (i == stack.size() - 1);
-            std::string indent(i * 2, ' ');
-            std::string selectable_label = fmt::format("{}{} {}  @{}##frame{}",
-                indent,
-                is_deepest ? ">" : " ",
-                label,
-                evt->call_inst_id,
-                i);
+            uint64_t static_target = evt->target_pc - reader_.header().module_slide;
 
             // Clickable frame
-            if (ImGui::Selectable(selectable_label.c_str(), is_deepest,
+            if (ImGui::Selectable(labels[i].c_str(), is_deepest,
                     ImGuiSelectableFlags_AllowDoubleClick)) {
                 if (ImGui::IsMouseDoubleClicked(0)) {
                     // Double-click → jump to function ENTRY (first inst in callee)
@@ -276,9 +302,10 @@ void GuiApp::render_functions_panel() {
             func_list_cache_.entries.push_back({pc, &info});
         }
 
-        // Sort once
+        // Sort once.
+        // Column UserIDs: 0=Calls, 1=Name, 3=Insts  (Addr column was removed)
         switch (function_sort_col_) {
-        case 0: // calls
+        case 0: // Calls
             std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
                 [&](const auto& a, const auto& b) {
                     return function_sort_ascending_
@@ -286,7 +313,7 @@ void GuiApp::render_functions_panel() {
                         : a.info->total_calls > b.info->total_calls;
                 });
             break;
-        case 1: // name
+        case 1: // Name
             std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
                 [&](const auto& a, const auto& b) {
                     return function_sort_ascending_
@@ -294,10 +321,12 @@ void GuiApp::render_functions_panel() {
                         : a.info->name > b.info->name;
                 });
             break;
-        case 2: // address
+        case 3: // Insts
             std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
                 [&](const auto& a, const auto& b) {
-                    return function_sort_ascending_ ? a.pc < b.pc : a.pc > b.pc;
+                    return function_sort_ascending_
+                        ? a.info->total_instructions < b.info->total_instructions
+                        : a.info->total_instructions > b.info->total_instructions;
                 });
             break;
         }
@@ -319,10 +348,9 @@ void GuiApp::render_functions_panel() {
         ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
         ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
 
-    if (ImGui::BeginTable("FunctionsTable", 4, table_flags)) {
+    if (ImGui::BeginTable("FunctionsTable", 3, table_flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, 1);
-        ImGui::TableSetupColumn("Entry PC", ImGuiTableColumnFlags_WidthFixed, 120.0f, 2);
         ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 50.0f, 0);
         ImGui::TableSetupColumn("Insts", ImGuiTableColumnFlags_WidthFixed, 60.0f, 3);
         ImGui::TableHeadersRow();
@@ -400,16 +428,12 @@ void GuiApp::render_functions_panel() {
                     ImGui::EndPopup();
                 }
 
-                // Entry PC column
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("0x%llx", (unsigned long long)static_pc);
-
                 // Calls column
-                ImGui::TableSetColumnIndex(2);
+                ImGui::TableSetColumnIndex(1);
                 ImGui::Text("%llu", (unsigned long long)info->total_calls);
 
                 // Instructions column
-                ImGui::TableSetColumnIndex(3);
+                ImGui::TableSetColumnIndex(2);
                 ImGui::Text("%llu", (unsigned long long)info->total_instructions);
             }
         }
