@@ -126,6 +126,7 @@ void GuiApp::apply_pending_results() {
         std::lock_guard<std::mutex> lk(pending_apply_mutex_);
         local.swap(pending_apply_);
     }
+    results_applied_this_frame_ = !local.empty();
     for (auto& fn : local) {
         fn();
     }
@@ -148,6 +149,12 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         show_callstack_   = true;
         show_functions_   = true;
         goto_candidates_dirty_ = true;
+        // Functions panel is the primary tab of dock_left_sidebar — it is
+        // already the active tab, so no FocusWindow needed here.
+        // CallStack is behind Analysis in dock_center_bottom; register it
+        // so we can make it visible without forcing a full focus steal.
+        // (We intentionally do NOT focus CallStack automatically — it would
+        //  be disruptive.  Functions is the primary view the user wants.)
     } else if (name == "xref") {
         xref_result_  = &raw->get<XrefResult>();
         xref_cursor_  = 0;
@@ -157,9 +164,15 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         string_cursor_  = 0;
         string_filter_.clear();
         std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
+        // Strings shares dock_center_main with Instructions (default active).
+        // Queue a FocusWindow so the Strings tab becomes visible, but only
+        // if the user has not already selected a different tab manually.
+        pending_focus_windows_.push_back("Strings");
     } else if (name == "thread") {
         thread_result_ = &raw->get<ThreadResult>();
         show_threads_  = true;
+        // Threads shares dock_left_sidebar with Functions (default active).
+        // Do NOT auto-focus Threads — Functions is the primary view.
     } else if (name == "loop") {
         loop_result_ = &raw->get<LoopResult>();
         show_loops_  = true;
@@ -168,6 +181,8 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
     } else if (name == "cfg") {
         cfg_result_ = &raw->get<CFGResult>();
         show_cfg_   = true;
+        // CFG shares dock_center_main with Instructions.
+        // Do NOT auto-focus CFG — Instructions is the primary disasm view.
     } else if (name == "constant_materialization") {
         constant_result_ = &raw->get<ConstantMaterializationResult>();
     } else if (name == "pattern") {

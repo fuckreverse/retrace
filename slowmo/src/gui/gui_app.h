@@ -13,6 +13,7 @@
 #include "analysis/pass_registry.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
+#include "analysis/passes/function_pass.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -31,6 +32,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <unordered_map>
 
 namespace tenet {
 
@@ -39,7 +41,7 @@ struct CFGResult;
 struct TaintResult;
 struct SliceResult;
 struct BackwardTaintResult;
-struct FunctionResult;
+// FunctionResult, CallEvent, FunctionInfo: defined in function_pass.h (included above)
 struct XrefResult;
 struct StringResult;
 struct CallGraphResult;
@@ -90,6 +92,7 @@ private:
     // ─── Navigation state ───────────────────────────────────────────────
     uint64_t total_inst_ = 0;
     uint64_t current_inst_ = 0;
+    bool     scroll_to_current_ = false;  // set by navigate_to(); consumed once by auto-scroll
 
     // ─── Navigation history (back / forward) ─────────────────────────
     static constexpr size_t kMaxNavHistory = 64;
@@ -169,6 +172,16 @@ private:
         std::vector<uint8_t> pixels;          // RGBA per pixel column (pre-multiplied heat)
     } heatmap_cache_;
 
+    // ─── Cached call-depth sparkline for progress overlay ───────────
+    // Computed once when function_result_ changes; reused every frame.
+    // Stores sampled call-stack depth per pixel column (max 600 samples).
+    struct SparklineCache {
+        const FunctionResult* source = nullptr;  // which function_result_ was used
+        uint64_t total_inst = 0;                  // total_inst_ at cache time
+        std::vector<uint64_t> depths;             // depth per sample point
+        uint64_t max_depth = 1;                   // normalisation ceiling
+    } sparkline_cache_;
+
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
     const TaintResult* taint_result_ = nullptr;
@@ -176,6 +189,19 @@ private:
     const BackwardTaintResult* backward_taint_result_ = nullptr;
     const FunctionResult* function_result_ = nullptr;
     const XrefResult* xref_result_ = nullptr;
+
+    // ─── Per-frame call-stack cache ───────────────────────────────────
+    // call_stack_at() is O(N) in call_events.  Multiple panels (callstack,
+    // context menu, follow-return) call it on current_inst_ every frame.
+    // Cache it here; invalidated when current_inst_ or function_result_ changes.
+    struct CallStackCache {
+        const FunctionResult* source    = nullptr;
+        uint64_t              inst_id   = UINT64_MAX;
+        std::vector<const CallEvent*> stack;
+    } callstack_frame_cache_;
+
+    /// Return the cached call stack for current_inst_.  Recomputes if stale.
+    const std::vector<const CallEvent*>& current_call_stack();
     const CallGraphResult* call_graph_result_ = nullptr;
     bool show_taint_ = false;
     bool show_slice_ = false;
@@ -232,6 +258,19 @@ private:
     int function_sort_col_ = 0;        // 0=calls, 1=name, 2=addr
     bool function_sort_ascending_ = false;
 
+    // Cached sorted+filtered function entry list.
+    // Rebuilt only when function_result_, filter, or sort params change.
+    // info_ptr is a type-erased const FunctionInfo* to avoid including function_pass.h here.
+    struct FuncListCache {
+        const FunctionResult* source         = nullptr;
+        std::string           filter;
+        int                   sort_col       = -1;   // -1 = not yet sorted
+        bool                  sort_ascending = false;
+        // Sorted entries: (pc, FunctionInfo ptr)
+        struct Entry { uint64_t pc; const FunctionInfo* info; };
+        std::vector<Entry> entries;
+    } func_list_cache_;
+
     // ─── Loop analysis state ──────────────────────────────────────
     const LoopResult* loop_result_ = nullptr;
     bool show_loops_ = false;        // highlight loop instructions
@@ -277,6 +316,35 @@ private:
     std::unique_ptr<CFGLayoutResult> cfg_func_layout_;
     /// Rebuild per-function CFG layout for the function at `func_entry_pc`.
     void rebuild_cfg_for_function(uint64_t func_entry_pc);
+
+    // ── Edge lookup cache ─────────────────────────────────────────────
+    // The edge-drawing loop used to do an O(E) linear search for every edge
+    // in edge_layouts, leading to O(E²) work per frame.  This cache maps
+    // (from_block, to_block) → index into active_cfg->edges, rebuilt whenever
+    // active_cfg changes.  Lookup is O(1) with a flat hash map.
+    const CFGResult* cfg_edge_lookup_source_ = nullptr;
+    // Key = (from_block XOR-folded with to_block); stored as index into
+    // active_cfg->edges so the pointer remains valid.
+    // We use a simple std::unordered_map with a combined uint128-style key
+    // encoded as two consecutive uint64 hashed together.
+    struct EdgeKey {
+        uint64_t from, to;
+        bool operator==(const EdgeKey& o) const noexcept {
+            return from == o.from && to == o.to;
+        }
+    };
+    struct EdgeKeyHash {
+        size_t operator()(const EdgeKey& k) const noexcept {
+            // FNV-1a-inspired mix of two 64-bit values
+            size_t h = 0xcbf29ce484222325ULL;
+            h ^= k.from; h *= 0x100000001b3ULL;
+            h ^= k.to;   h *= 0x100000001b3ULL;
+            return h;
+        }
+    };
+    std::unordered_map<EdgeKey, const CFGEdge*, EdgeKeyHash> cfg_edge_lookup_;
+    /// Rebuild cfg_edge_lookup_ for the given CFGResult.
+    void rebuild_cfg_edge_lookup(const CFGResult* cfg);
 
     // ─── Thread analysis state ─────────────────────────────────────
     const ThreadResult* thread_result_ = nullptr;
@@ -362,6 +430,18 @@ private:
     /// eliminates data races on result pointers (all writes happen on UI thread).
     std::mutex                      pending_apply_mutex_;
     std::vector<std::function<void()>> pending_apply_;
+
+    /// Set to true by apply_pending_results() when at least one lambda was
+    /// drained.  render_frame() reads this to perform a FocusWindow() call
+    /// that makes newly-populated panels visible without stealing focus from
+    /// whatever the user was doing.
+    bool results_applied_this_frame_ = false;
+
+    /// Window names that should have their dock tab made visible on the next
+    /// frame after analysis results arrive.  Only populated when a pass
+    /// produces a result whose panel is currently hidden behind another tab.
+    /// Processed and cleared at the top of render_frame().
+    std::vector<std::string> pending_focus_windows_;
 
     void analysis_worker_loop();       // runs on analysis_worker_thread_
     void enqueue_async(std::string pass_name, std::function<void()> work);

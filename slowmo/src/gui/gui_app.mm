@@ -444,7 +444,13 @@ int GuiApp::run() {
         @autoreleasepool {
             CAMetalLayer* layer = (__bridge CAMetalLayer*)SDL_GetRenderMetalLayer(renderer_);
             id<CAMetalDrawable> drawable = [layer nextDrawable];
-            if (!drawable) continue;
+            if (!drawable) {
+                // If we just applied analysis results but couldn't get a
+                // drawable, we need to render them in the next iteration.
+                // Nothing special to do — results_applied_this_frame_ will
+                // remain true and the main loop will retry immediately.
+                continue;
+            }
 
             // Configure render pass descriptor
             metal_render_pass_desc_.colorAttachments[0].texture = drawable.texture;
@@ -582,27 +588,41 @@ void GuiApp::render_frame() {
 
         // ── Assign windows to nodes ──
 
-        // Left sidebar: Functions (primary tab, shown first) + Threads
-        ImGui::DockBuilderDockWindow("Functions", dock_left_sidebar);
+        // Left sidebar: Threads first, then Functions (last = default active tab)
         ImGui::DockBuilderDockWindow("Threads",   dock_left_sidebar);
+        ImGui::DockBuilderDockWindow("Functions", dock_left_sidebar);
 
-        // Center main: Instructions (primary / default active) + CFG + Strings
-        // (IDA-style disasm/graph toggle; Strings shares the core analysis area)
-        ImGui::DockBuilderDockWindow("Instructions", dock_center_main);
+        // Center main: CFG + Strings first, then Instructions (last = default active tab)
+        // ImGui DockBuilder: the last DockBuilderDockWindow call wins as active tab.
         ImGui::DockBuilderDockWindow("CFG",          dock_center_main);
         ImGui::DockBuilderDockWindow("Strings",      dock_center_main);
+        ImGui::DockBuilderDockWindow("Instructions", dock_center_main);
 
-        // Center bottom output: Analysis (primary) + supplementary tabs
-        ImGui::DockBuilderDockWindow("Analysis",      dock_center_bottom);
+        // Center bottom output: Call Stack + Hex Dump + Minimap first,
+        // then Analysis last (default active tab)
         ImGui::DockBuilderDockWindow("Call Stack",    dock_center_bottom);
         ImGui::DockBuilderDockWindow("Hex Dump",      dock_center_bottom);
         ImGui::DockBuilderDockWindow("Minimap",       dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Analysis",      dock_center_bottom);
 
         // Right column: Registers on top (more important), Memory below
         ImGui::DockBuilderDockWindow("Registers",       dock_right_regs);
         ImGui::DockBuilderDockWindow("Memory Accesses", dock_right_mem);
 
         ImGui::DockBuilderFinish(dockspace_id);
+    }
+
+    // ─── Activate panels whose analysis results just became available ─────
+    // When apply_pass_result_pointers() enqueues a panel name in
+    // pending_focus_windows_, we call SetWindowFocus here (inside the
+    // DockSpaceHost Begin/End scope) so ImGui brings that dock tab to the
+    // front.  We only do this once per notification to avoid fighting the
+    // user's own tab selection.
+    if (!pending_focus_windows_.empty()) {
+        for (const auto& wname : pending_focus_windows_) {
+            ImGui::SetWindowFocus(wname.c_str());
+        }
+        pending_focus_windows_.clear();
     }
 
     // ─── Menu bar: rendered inside the host window ───────────────────
@@ -761,7 +781,7 @@ void GuiApp::render_frame() {
                 if (ret) {
                     navigate_to(ret->call_inst_id);
                 } else {
-                    auto stk = function_result_->call_stack_at(current_inst_);
+                    const auto& stk = current_call_stack();
                     if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
                 }
             }
