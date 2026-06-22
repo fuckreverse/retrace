@@ -197,6 +197,11 @@ public:
     /// @param out        Receives the raw bytes on success.
     bool load_pass_blob(std::string_view pass_name, std::string& out) const;
 
+    /// Delete a persisted pass-result blob, forcing re-computation on the next run.
+    /// No-op if no blob exists for this pass.
+    /// @param pass_name  Same identifier used in save_pass_blob().
+    void delete_pass_blob(std::string_view pass_name);
+
 private:
     TraceIndex() = default;
 

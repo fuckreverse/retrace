@@ -1332,4 +1332,19 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
     return true;
 }
 
+void TraceIndex::delete_pass_blob(std::string_view pass_name) {
+    if (!db_) return;
+    auto* meta_cf = get_cf(cf::META);
+    if (!meta_cf) return;
+
+    std::string key;
+    key.reserve(5 + pass_name.size());
+    key += "pass:";
+    key += pass_name;
+
+    rocksdb::WriteOptions wo;
+    wo.sync = false;
+    db_->Delete(wo, meta_cf, key);
+}
+
 }  // namespace tenet
