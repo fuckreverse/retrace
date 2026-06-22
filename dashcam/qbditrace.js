@@ -1,165 +1,61 @@
 /*
- * qbditrace - Frida bootstrap for the QBDI-based high-performance tracer.
+ * qbditrace - Frida agent for the QBDI-based high-performance tracer.
  *
  * This script is intentionally thin: it only loads the native tracer dylib,
  * resolves addresses, and diverts the target function into the QBDI VM. Every
  * per-instruction operation happens in native code, so this JS has ZERO impact
  * on tracing speed (it runs once at setup, and once per traced call).
  *
- * Usage (edit CONFIG below, then):
- *   frida -H 127.0.0.1:27042 -n "<AppName>" -l qbditrace.js
- *   # or spawn:
- *   frida -H 127.0.0.1:27042 -f <bundle.id> -l qbditrace.js --no-pause
+ * IMPORTANT: This script MUST be loaded via the Python runner (qbditrace_runner.py).
+ * Do NOT use `frida -l qbditrace.js` directly — the CONFIG is injected by the
+ * Python loader via script.post() before execution begins.
+ *
+ * Tracing semantics:
+ *   The tracer instruments the ENTIRE target module (via addInstrumentedModuleFromAddr).
+ *   The --entry function is just the trigger: tracing starts when it is called and
+ *   ends when it returns. All execution within the module during that window is
+ *   recorded; calls to system libraries run natively and are logged as transfer events.
  *
  * Workflow:
- *   1. Load libqbditrace.dylib into the target process.
- *   2. Resolve the target module base, compute the ASLR slide.
- *   3. qbditrace_configure(range = [funcStart, funcEnd), module info).
- *   4. Interceptor.replace(targetFunc) -> qbditrace_run_call(retOut, func, args)
- *      so that calling the function runs it under QBDI and traces it.
+ *   1. Python loader spawns/attaches to the target, loads this script.
+ *   2. Python sends CONFIG via script.post({ type: 'config', payload: {...} }).
+ *   3. This script receives CONFIG, loads libqbditrace.dylib, resolves addresses.
+ *   4. Interceptor.replace(entryFunc) -> qbditrace_run_call(retOut, func, args)
  *   5. After the call returns, qbditrace_stop() flushes the trace to disk.
- *
- * Multi-trace mode:
- *   Set traceMode: "multi" (or traceMode: N for exactly N captures) to record
- *   multiple invocations. Each capture is written to a separate file by
- *   appending a zero-padded index suffix before the extension:
- *     qbditrace.bin  → qbditrace_001.bin, qbditrace_002.bin, ...
- *   Between captures the tracer library is stopped and reconfigured with the
- *   new output path. The hook is kept live and re-arms itself automatically.
+ *   6. Script sends status messages back to Python via send().
  */
 
 'use strict';
 
 // ===========================================================================
-// CONFIG - edit these for your target
+// Wait for CONFIG from Python loader
 // ===========================================================================
-const CONFIG = {
-  // Absolute path of the tracer dylib on the device.
-  dylibPath: '/var/jb/usr/lib/libqbditrace.dylib',
 
-  // Module that contains the function to trace. For the main binary you can use
-  // the executable name; for a framework use its filename.
-  moduleName: null, // null => use the main executable module
-
-  // ── Target function resolution ──────────────────────────────────────────
-  // You can specify the target function in one of two ways:
-  //
-  //   1. funcOffset (traditional): static file offset within the module, i.e.
-  //      the address in IDA minus the image base.
-  //      Example: IDA shows func at 0x100A1B2C0, base 0x100000000 => 0xA1B2C0
-  //
-  //   2. funcName (auto-resolve): exported symbol name. The script will use
-  //      Module.findExportByName to resolve it at runtime, computing the offset
-  //      automatically. This is simpler for exported functions.
-  //      Example: funcName: "_SecKeyRawSign"
-  //
-  // If both are set, funcName takes priority. If funcName resolution fails,
-  // the script falls back to funcOffset.
-  funcName: null,   // exported symbol name (e.g. "_CCCrypt") or null to use offset
-  funcOffset: 0xEE91EC,  // sub_100EE91EC: Q-Field top-level coordinator
-
-  // Length in bytes of the address range to trace (function size, or larger to
-  // cover callees within the same module). Range = [start, start+rangeSize).
-  rangeSize: 0x7124,  // sub_100EE91EC function size (28964 bytes)
-
-  // Where to write the binary trace on the device.
-  // In "multi" mode this is treated as a template: the three-digit index is
-  // inserted before the last dot (e.g. "qbditrace.bin" → "qbditrace_001.bin").
-  // If the path has no extension the suffix is appended directly.
-  outputPath: '/var/mobile/Documents/qfield_trace.bin',
-
-  // Record bitmask: 1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC. 31 = all.
-  record: 31,
-
-  // Resolve the objc_msgSend family so call-site self/SEL get captured. Set to
-  // false to skip objc resolution (e.g. non-ObjC targets).
-  resolveObjc: true,
-
-  // Emit a full register resync snapshot every N instructions (0 = library
-  // default, 1024). Anchors are only resync checkpoints: register diffs store
-  // absolute values, so smaller intervals only help partial/seek reads while
-  // costing space. Leave 0 unless you need very fine-grained resync.
-  anchorInterval: 0,
-
-  // Per-thread ring buffer size in bytes (0 = default 64 MiB).
-  ringBytes: 0,
-
-  // Embed a deduplicated code table in the trace so the offline decoder can
-  // disassemble without an external --image. On by default; set false only to
-  // shave the (tiny, deduplicated) extra writes.
-  embedCode: true,
-
-  // How many integer args the traced function takes (forwarded to QBDI).
-  // sub_100EE91EC takes 1 arg: NSMutableDictionary* dict (in x0)
-  argCount: 1,
-
-  // ── Multi-trace mode ────────────────────────────────────────────────────
-  //
-  // traceMode controls how many invocations of the target function are traced:
-  //   "once"  - (default) trace only the first invocation, then revert the hook.
-  //   "multi" - trace every invocation until the script is unloaded. Each call
-  //             produces a separate numbered output file.
-  //   N       - (positive integer) trace the first N invocations, then stop.
-  //
-  // Example: traceMode: 5  → capture five traces (_001.bin … _005.bin).
-  traceMode: 'once',
-
-  // Whether to re-install the Interceptor hook between traces ("multi"/N mode).
-  // When true (the default) the trampoline is reinstalled after each capture so
-  // the next call is also intercepted. When false the trampoline is permanently
-  // removed after the first capture, making subsequent calls run natively.
-  // Only relevant in "multi" / N mode.
-  rehook: true,
-
-  // ── GCD Block Tracing ─────────────────────────────────────────────────────
-  //
-  // When enabled, hooks dispatch_async / dispatch_after / dispatch_barrier_async
-  // to intercept ObjC/C blocks dispatched via GCD. If the block's invoke pointer
-  // falls within the traced module address range, the block is synchronously
-  // executed under QBDI on the current thread (instead of asynchronously on a
-  // GCD worker thread). Each captured block produces a separate trace file.
-  //
-  // This works because QBDI's VM is single-threaded and cannot follow execution
-  // across thread boundaries. By extracting the block's invoke function pointer
-  // (at block + 16 on arm64) and running it through qbditrace_run_call, we get
-  // a full instruction-level trace of the GCD-dispatched work.
-  //
-  // LIMITATIONS:
-  //   - Execution order/timing differs from native (block runs synchronously).
-  //   - Blocks that depend on thread-local state of the worker may behave
-  //     differently.
-  //   - Only blocks whose invoke address is within [moduleBase, moduleBase +
-  //     moduleSize) are captured; system/framework blocks are skipped.
-  //
-  // Set to true to enable. Default: false (off).
-  traceGCD: false,
-
-  // Filter: only trace GCD blocks whose invoke pointer is within the target
-  // module. Set to false to trace ALL blocks (very noisy). Default: true.
-  gcdFilterByModule: true,
-
-  // Maximum number of GCD block traces to capture (0 = unlimited).
-  // Useful to avoid flooding the filesystem when many blocks are dispatched.
-  gcdMaxCaptures: 0,
-};
-
-// ===========================================================================
-// Implementation
-// ===========================================================================
+var CONFIG = null;
 
 function log(msg) {
-  console.log('[qbditrace] ' + msg);
+  send({ type: 'log', level: 'info', text: '[qbditrace] ' + msg });
+}
+
+function logError(msg) {
+  send({ type: 'log', level: 'error', text: '[qbditrace][ERROR] ' + msg });
 }
 
 function fail(msg) {
-  console.error('[qbditrace][ERROR] ' + msg);
+  logError(msg);
+  send({ type: 'error', text: msg });
   throw new Error(msg);
 }
 
+function status(event, detail) {
+  send({ type: 'status', event: event, detail: detail || {} });
+}
+
+// ---------------------------------------------------------------------------
+// Core implementation
+// ---------------------------------------------------------------------------
+
 function loadDylib(path) {
-  // Use dlopen directly instead of Module.load, because Module.load crashes
-  // on some targets (null-pointer dereference inside Frida's module enumeration
-  // after dlopen returns).  dlopen + Process.findModuleByName is equivalent.
   const dlopen = new NativeFunction(
       Module.getGlobalExportByName('dlopen'), 'pointer', ['pointer', 'int']);
   const dlerror = new NativeFunction(
@@ -205,10 +101,10 @@ function resolveTargetModule() {
       fail('module not found: ' + CONFIG.moduleName);
     }
   } else {
-    // Main executable is the first enumerated module on Darwin.
     m = Process.enumerateModules()[0];
   }
-  log('target module: ' + m.name + ' base=' + m.base + ' size=' + m.size);
+  log('target module: ' + m.name + ' base=' + m.base + ' size=0x' +
+      m.size.toString(16) + ' (' + m.size + ' bytes)');
   return m;
 }
 
@@ -222,54 +118,18 @@ function buildNativeFunctions(ex) {
   };
 }
 
-/*
- * Build the qbditrace_config_t struct in native memory matching the C layout:
- *
- *   uint64 trace_start
- *   uint64 trace_end
- *   uint64 module_base
- *   uint64 module_slide
- *   pointer module_name
- *   pointer output_path
- *   uint32 record
- *   uint32 anchor_interval
- *   uint64 ring_bytes
- *   uint64 objc_msgSend
- *   uint64 objc_msgSendSuper
- *   uint64 objc_msgSendSuper2
- *   uint64 objc_msgSend_stret
- *
- * On arm64 the struct is naturally aligned; pointers are 8 bytes. The two
- * uint32 fields (record, anchor_interval) pack into one 8-byte slot, then
- * ring_bytes and the four objc pointers follow 8-aligned.
- */
 function buildConfigStruct(opts) {
-  // Field offsets (bytes) for arm64 / LP64.
-  // The struct starts with struct_size (u32) + _reserved0 (u32) = 8 bytes,
-  // followed by the original fields shifted by 8:
-  // 0:struct_size(u32) 4:_reserved0(u32) 8:start 16:end 24:base 32:slide
-  // 40:name 48:out 56:record(u32) 60:anchor(u32) 64:ring_bytes
-  // 72:objc_msgSend 80:objc_msgSendSuper 88:objc_msgSendSuper2
-  // 96:objc_msgSend_stret 104:extra_range_start 112:extra_range_end
-  // 120:disable_embed_code(u32) 124:enable_pc_delta(u32)
-  // => total 128 bytes.
   const SIZE = 128;
   const cfg = Memory.alloc(SIZE);
-  // Memory.alloc contents are undefined; zero the struct so any field we don't
-  // explicitly set (incl. padding and the inverted-sense disable_embed_code)
-  // defaults to 0 -> code embedding stays on.
   for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
   const moduleNameStr = opts.moduleName
       ? Memory.allocUtf8String(opts.moduleName) : NULL;
   const outputPathStr = opts.outputPath
       ? Memory.allocUtf8String(opts.outputPath) : NULL;
-  // Keep references alive on the struct object so GC doesn't free them.
   cfg._keep = [moduleNameStr, outputPathStr];
 
-  // struct_size: ABI forward-compatibility field (must be set to sizeof).
   cfg.add(0).writeU32(SIZE);
-  // _reserved0 stays 0 (already zeroed).
   cfg.add(8).writePointer(opts.traceStart);
   cfg.add(16).writePointer(opts.traceEnd);
   cfg.add(24).writePointer(opts.moduleBase);
@@ -279,27 +139,16 @@ function buildConfigStruct(opts) {
   cfg.add(56).writeU32(opts.record >>> 0);
   cfg.add(60).writeU32(opts.anchorInterval >>> 0);
   cfg.add(64).writePointer(ptr(opts.ringBytes));
-  // The objc fields are uint64 in C but we hold them as NativePointers; write
-  // them as pointers (NULL when unresolved => 0, which the tracer ignores).
   cfg.add(72).writePointer(opts.objcMsgSend || NULL);
   cfg.add(80).writePointer(opts.objcMsgSendSuper || NULL);
   cfg.add(88).writePointer(opts.objcMsgSendSuper2 || NULL);
   cfg.add(96).writePointer(opts.objcMsgSendStret || NULL);
-  // Optional second instrumented range (e.g. the module's __auth_stubs/__stubs
-  // so objc_msgSend dispatch is observed with its real target). NULL => unused.
   cfg.add(104).writePointer(opts.extraRangeStart || NULL);
   cfg.add(112).writePointer(opts.extraRangeEnd || NULL);
-  // Inverted sense: 0 keeps the default-on embedded code table. Pass
-  // opts.embedCode === false to turn it off.
   cfg.add(120).writeU32(opts.embedCode === false ? 1 : 0);
-  // enable_pc_delta stays 0 unless explicitly requested.
   return cfg;
 }
 
-/*
- * Resolve the objc_msgSend family runtime addresses from libobjc. Any that
- * cannot be found are returned as NULL (the tracer treats 0 as "not set").
- */
 function resolveObjcDispatchers() {
   const out = {
     objcMsgSend: NULL,
@@ -331,14 +180,6 @@ function resolveObjcDispatchers() {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: build a numbered output path for multi-trace mode.
-//
-// Given "/var/mobile/Documents/qbditrace.bin" and index 3:
-//   → "/var/mobile/Documents/qbditrace_003.bin"
-// Given "/tmp/trace" (no extension) and index 42:
-//   → "/tmp/trace_042"
-// ---------------------------------------------------------------------------
 function buildIndexedOutputPath(template, index) {
   const suffix = '_' + String(index).padStart(3, '0');
   const dot = template.lastIndexOf('.');
@@ -350,18 +191,6 @@ function buildIndexedOutputPath(template, index) {
 
 // ---------------------------------------------------------------------------
 // GCD Block Tracing
-//
-// ObjC Block memory layout (arm64):
-//   +0   isa pointer        (always _NSConcreteStackBlock or similar)
-//   +8   flags (int32) + reserved (int32)
-//   +16  invoke pointer     (void (*)(block_self, ...))   <-- this is what we want
-//   +24  descriptor pointer
-//   +32… captured variables
-//
-// dispatch_async(queue, block) submits the block to be invoked on a worker
-// thread. We intercept the submission, read block+16 (the invoke function),
-// and if it falls within our target module, immediately run it through QBDI
-// on the calling thread.
 // ---------------------------------------------------------------------------
 
 function installGCDHooks(opts) {
@@ -369,34 +198,30 @@ function installGCDHooks(opts) {
   const moduleStart = mod.base;
   const moduleEnd = mod.base.add(mod.size);
   const filterByModule = CONFIG.gcdFilterByModule !== false;
-  const maxCaptures = CONFIG.gcdMaxCaptures || 0; // 0 = unlimited
+  const maxCaptures = CONFIG.gcdMaxCaptures || 0;
 
   let gcdTraceCount = 0;
   let gcdInTrace = false;
   const gcdRetOut = Memory.alloc(8);
-  const gcdArgv = Memory.alloc(8); // block invoke takes 1 arg: the block itself
+  const gcdArgv = Memory.alloc(8);
 
   function isInModule(addr) {
     return addr.compare(moduleStart) >= 0 && addr.compare(moduleEnd) < 0;
   }
 
   function traceBlockIfNeeded(block, dispatcherName) {
-    if (gcdInTrace) return; // avoid re-entrancy
+    if (gcdInTrace) return;
     if (block.isNull()) return;
 
-    // Read the invoke function pointer at offset +16.
     let invoke;
     try {
       invoke = block.add(16).readPointer();
     } catch (e) {
-      return; // unreadable memory, skip silently
+      return;
     }
     if (invoke.isNull()) return;
 
-    // Filter: only trace if invoke is within the target module.
     if (filterByModule && !isInModule(invoke)) return;
-
-    // Check capture limit.
     if (maxCaptures > 0 && gcdTraceCount >= maxCaptures) return;
 
     gcdInTrace = true;
@@ -407,12 +232,9 @@ function installGCDHooks(opts) {
         ' (offset 0x' + invoke.sub(moduleStart).toString(16) +
         ') -> tracing as GCD capture #' + idx);
 
-    // Configure a new trace file for this block.
     const outPath = makeGCDOutputPath(idx);
     const cfgOpts = Object.assign({}, baseOpts, {
       outputPath: outPath,
-      // Widen the trace range to cover the block's invoke function.
-      // Use the full module as the range so intra-module calls are followed.
       traceStart: moduleStart,
       traceEnd: moduleEnd,
     });
@@ -424,7 +246,6 @@ function installGCDHooks(opts) {
       return;
     }
 
-    // Execute the block under QBDI: invoke(block)
     gcdArgv.writePointer(block);
     const r = fn.runCall(gcdRetOut, invoke, 1, gcdArgv);
     if (r !== 0) {
@@ -434,14 +255,14 @@ function installGCDHooks(opts) {
 
     log('[GCD] capture #' + idx + ' done. output = ' +
         fn.outputPath().readUtf8String());
+    status('gcd_trace_done', { index: idx, path: outPath });
 
     gcdInTrace = false;
   }
 
-  // Hook the GCD dispatch family.
   const dispatchers = [
     'dispatch_async',
-    'dispatch_after',  // dispatch_after(when, queue, block)
+    'dispatch_after',
     'dispatch_barrier_async',
   ];
 
@@ -464,9 +285,6 @@ function installGCDHooks(opts) {
       continue;
     }
 
-    // dispatch_async(queue, block):         block is arg[1]
-    // dispatch_barrier_async(queue, block): block is arg[1]
-    // dispatch_after(when, queue, block):   block is arg[2]
     const blockArgIndex = (name === 'dispatch_after') ? 2 : 1;
 
     Interceptor.attach(addr, {
@@ -489,17 +307,23 @@ function installGCDHooks(opts) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Main entry point — called after CONFIG is received from Python
+// ---------------------------------------------------------------------------
+
 function main() {
+  status('initializing');
+
   const dylib = loadDylib(CONFIG.dylibPath);
   const ex = resolveExports(dylib);
   const fn = buildNativeFunctions(ex);
   const mod = resolveTargetModule();
 
-  // Compute runtime addresses from static offset or symbol name.
-  const moduleBase = mod.base; // NativePointer
+  // --- Resolve the entry function ---
+  const moduleBase = mod.base;
   let funcStart;
   if (CONFIG.funcName) {
-    // Auto-resolve by exported symbol name.
+    // Resolve by exported symbol name
     let resolved = null;
     try {
       if (CONFIG.moduleName) {
@@ -512,39 +336,50 @@ function main() {
     }
     if (resolved && !resolved.isNull()) {
       funcStart = resolved;
-      log('resolved funcName "' + CONFIG.funcName + '" @ ' + funcStart +
+      log('resolved entry "' + CONFIG.funcName + '" @ ' + funcStart +
           ' (offset = 0x' + funcStart.sub(moduleBase).toString(16) + ')');
-    } else {
-      log('WARNING: funcName "' + CONFIG.funcName +
-          '" not found, falling back to funcOffset');
+    } else if (CONFIG.funcOffset) {
+      log('WARNING: entry "' + CONFIG.funcName +
+          '" not found, falling back to offset 0x' + CONFIG.funcOffset.toString(16));
       funcStart = moduleBase.add(CONFIG.funcOffset);
+    } else {
+      fail('entry "' + CONFIG.funcName + '" not found and no offset fallback provided');
     }
   } else {
     funcStart = moduleBase.add(CONFIG.funcOffset);
+    log('entry @ offset 0x' + CONFIG.funcOffset.toString(16) + ' -> ' + funcStart);
   }
-  const funcEnd = funcStart.add(CONFIG.rangeSize);
 
-  // ASLR slide: difference between runtime base and the image's preferred base.
-  // We approximate the preferred base as 0 here and treat module_slide ==
-  // moduleBase, because the decoder normalizes via:
-  //   static = runtime - module_slide
-  // If your image's preferred base is non-zero (rare for PIE on iOS, which is
-  // 0-based), set it explicitly. For PIE Mach-O the preferred base is 0, so
-  // slide == moduleBase and static offsets map directly to funcOffset.
+  // --- Determine trace range ---
+  // The tracer uses addInstrumentedModuleFromAddr for whole-module instrumentation.
+  // traceStart/traceEnd in the config are used as fallback when module resolution
+  // fails inside the native tracer. When rangeSize is 0 (default), we use the
+  // full module size as the fallback range.
+  var rangeSize = CONFIG.rangeSize;
+  if (!rangeSize || rangeSize === 0) {
+    rangeSize = mod.size;
+    log('trace scope: entire module "' + mod.name + '" (0x' +
+        mod.size.toString(16) + ' bytes, fallback range = full module)');
+  } else {
+    log('trace scope: entire module "' + mod.name + '" (fallback range-size = 0x' +
+        rangeSize.toString(16) + ')');
+  }
+
+  // Fallback range: [funcStart, funcStart + rangeSize)
+  // The native tracer will attempt addInstrumentedModuleFromAddr first; this
+  // range is only used if that fails.
+  const funcEnd = funcStart.add(rangeSize);
+
   const moduleSlide = moduleBase;
 
-  log('func start = ' + funcStart + '  end = ' + funcEnd);
-  log('module slide = ' + moduleSlide);
+  log('entry = ' + funcStart + '  fallback end = ' + funcEnd);
+  log('module base = ' + moduleBase + '  slide = ' + moduleSlide);
 
   const objc = CONFIG.resolveObjc ? resolveObjcDispatchers() : {
     objcMsgSend: NULL, objcMsgSendSuper: NULL,
     objcMsgSendSuper2: NULL, objcMsgSendStret: NULL,
   };
 
-  // --- Determine trace limit from traceMode ---
-  // maxTraces = 1        → "once"
-  // maxTraces = Infinity → "multi"
-  // maxTraces = N        → trace N times
   let maxTraces;
   const mode = CONFIG.traceMode;
   if (mode === 'once' || mode === 1) {
@@ -554,13 +389,11 @@ function main() {
   } else if (typeof mode === 'number' && mode > 0) {
     maxTraces = Math.floor(mode);
   } else {
-    // Unknown mode: default to once.
     log('WARNING: unknown traceMode "' + mode + '", defaulting to "once"');
     maxTraces = 1;
   }
   const multiMode = maxTraces !== 1;
 
-  // Shared info used across multiple captures.
   const baseOpts = {
     traceStart: funcStart,
     traceEnd: funcEnd,
@@ -577,9 +410,6 @@ function main() {
     objcMsgSendStret: objc.objcMsgSendStret,
   };
 
-  // --- Configure and start the first trace ---
-  // In multi mode the output path gets a numeric suffix; in once mode the
-  // configured path is used verbatim for backward compatibility.
   function makeOutputPath(traceIndex) {
     if (multiMode) {
       return buildIndexedOutputPath(CONFIG.outputPath, traceIndex);
@@ -596,33 +426,26 @@ function main() {
     }
     log('configured trace #' + traceIndex +
         '. output = ' + fn.outputPath().readUtf8String());
-    return cfg; // keep alive
+    return cfg;
   }
 
-  // Configure for the first trace now so the writer is ready before the hook fires.
   let currentCfg = configureForTrace(1);
   let traceCount = 0;
-  let inTrace = false; // re-entrancy guard (shouldn't happen, but be safe)
+  let inTrace = false;
 
-  // Scratch buffers (allocated once, reused across captures).
   const retOut = Memory.alloc(8);
   const argc = CONFIG.argCount >>> 0;
   const argv = argc > 0 ? Memory.alloc(8 * argc) : NULL;
 
-  // -------------------------------------------------------------------------
-  // IMPORTANT: Interceptor.replace writes a trampoline over the first bytes of
-  // funcStart. QBDI reads instructions straight from target memory, so if the
-  // trampoline were still present QBDI would trace it instead of the real
-  // prologue. Before calling QBDI we must revert the hook to restore the
-  // genuine bytes. After QBDI returns we optionally re-arm the hook for the
-  // next capture (multi mode only).
-  // -------------------------------------------------------------------------
+  function buildArgTypes(n) {
+    const t = [];
+    for (let i = 0; i < n; i++) t.push('pointer');
+    return t;
+  }
 
   function installHook() {
     Interceptor.replace(funcStart, new NativeCallback(function () {
       if (inTrace) {
-        // Re-entrant call during tracing (should not happen in practice).
-        // Call the real function natively by reverting and re-invoking.
         log('WARNING: re-entrant call during trace, running natively');
         Interceptor.revert(funcStart);
         Interceptor.flush();
@@ -630,23 +453,21 @@ function main() {
           argv.add(i * 8).writePointer(this.context['x' + i]);
         }
         const r = fn.runCall(retOut, funcStart, argc, argv);
-        installHook(); // re-arm
+        installHook();
         return retOut.readPointer();
       }
 
-      // --- Capture this invocation ---
       inTrace = true;
       traceCount++;
       const thisTrace = traceCount;
 
-      log('-> entering traced function (trace #' + thisTrace + ') with ' + argc + ' args');
+      log('-> entering entry function (trace #' + thisTrace + ') with ' + argc + ' args');
+      status('trace_start', { index: thisTrace });
 
-      // Forward the original integer arguments (arm64 AAPCS: x0..x7).
       for (let i = 0; i < argc; i++) {
         argv.add(i * 8).writePointer(this.context['x' + i]);
       }
 
-      // Remove our trampoline so funcStart holds the genuine instructions.
       Interceptor.revert(funcStart);
       Interceptor.flush();
 
@@ -656,43 +477,46 @@ function main() {
       }
       const ret = retOut.readPointer();
 
-      // Flush this trace to disk.
       fn.stop();
-      log('<- trace #' + thisTrace + ' done, ret = ' + ret +
-          '. output = ' + fn.outputPath().readUtf8String());
+      const outFile = fn.outputPath().readUtf8String();
+      log('<- trace #' + thisTrace + ' done, ret = ' + ret + '. output = ' + outFile);
+      status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });
 
       inTrace = false;
 
-      // --- Decide whether to capture more ---
       const wantMore = (traceCount < maxTraces);
       if (wantMore && CONFIG.rehook !== false) {
-        // Configure the next trace file and re-arm the hook.
         currentCfg = configureForTrace(traceCount + 1);
         installHook();
-        log('hook re-installed for trace #' + (traceCount + 1) +
-            '. Trigger the function again to capture.');
+        log('hook re-installed for trace #' + (traceCount + 1));
       } else if (!wantMore) {
         log('all ' + traceCount + ' trace(s) captured. Hook removed.');
-        // Hook already reverted above; do not re-install.
+        status('all_done', { total: traceCount });
       }
-      // If wantMore but rehook===false, we simply leave the hook reverted.
 
       return ret;
     }, 'pointer', buildArgTypes(argc)));
   }
 
   installHook();
+  status('hook_installed', {
+    funcStart: funcStart.toString(),
+    moduleName: mod.name,
+    moduleSize: '0x' + mod.size.toString(16),
+    mode: CONFIG.traceMode,
+    maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
+  });
 
   if (multiMode) {
     log('hook installed on ' + funcStart + ' (mode=' + CONFIG.traceMode +
-        ', max=' + maxTraces + '). Trigger the function to trace.');
+        ', max=' + maxTraces + '). Trigger the entry function to trace.');
   } else {
-    log('hook installed on ' + funcStart + '. Trigger the function to trace.');
+    log('hook installed on ' + funcStart +
+        '. Trigger the entry function to trace.');
   }
 
   // --- Optional: GCD block tracing ---
   if (CONFIG.traceGCD) {
-    // GCD trace files use a separate naming scheme: "..._gcd_001.bin"
     function makeGCDOutputPath(gcdIndex) {
       const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
       const base = CONFIG.outputPath;
@@ -712,12 +536,15 @@ function main() {
   }
 }
 
-function buildArgTypes(argc) {
-  const t = [];
-  for (let i = 0; i < argc; i++) {
-    t.push('pointer');
-  }
-  return t;
-}
+// ===========================================================================
+// Message dispatcher — receives CONFIG from Python, then starts main()
+// ===========================================================================
 
-main();
+recv('config', function (message) {
+  CONFIG = message.payload;
+  log('config received from Python loader');
+  main();
+});
+
+status('agent_loaded');
+log('agent loaded, waiting for config from Python loader...');

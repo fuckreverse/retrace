@@ -132,21 +132,22 @@ QBDI 的 VM 是**单线程**的：`qbditrace_run_call` / `qbditrace_run_at` 只�
 
 ```
 tools/qbditrace/
-├── TraceFormat.h        二进制格式契约（writer 与 decoder 共用）
-├── QBDITrace.h          公共 C ABI（configure / run_call / run_at / stop / output_path / dump_pcring）
-├── RingBuffer.h         thread-local 缓冲 + 后台 writer 线程
-├── QBDITrace.cpp        核心 tracer（QBDI 回调、热路径、VM 接管、fault handler、safe ret addr）
-├── qbditrace.js         Frida 引导脚本（仅负责加载与一次性接管，与热路径无关）
+├── TraceFormat.h           二进制格式契约（writer 与 decoder 共用）
+├── QBDITrace.h            公共 C ABI（configure / run_call / run_at / stop / output_path / dump_pcring）
+├── RingBuffer.h           thread-local 缓冲 + 后台 writer 线程
+├── QBDITrace.cpp          核心 tracer（QBDI 回调、热路径、VM 接管、fault handler、safe ret addr）
+├── qbditrace_runner.py    ★ Python loader（唯一入口，管理参数/连接/生命周期）
+├── qbditrace.js           Frida agent 引擎（纯逻辑，配置由 Python 注入）
 ├── decoder/
-│   └── trace_decode.cpp 离线解码器（Capstone 反汇编 + 状态重建 + diff）
+│   └── trace_decode.cpp   离线解码器（Capstone 反汇编 + 状态重建 + diff）
 ├── benchmark/
-│   ├── bench_harness.c  基础 benchmark harness
-│   ├── run_benchmark.sh 一键运行基础 benchmark
-│   ├── targets.c/h      7 类 target
-│   └── advanced/        高级 benchmark 套件（22 target，真实加密+OLLVM 混淆）
+│   ├── bench_harness.c    基础 benchmark harness
+│   ├── run_benchmark.sh   一键运行基础 benchmark
+│   ├── targets.c/h        7 类 target
+│   └── advanced/          高级 benchmark 套件（22 target，真实加密+OLLVM 混淆）
 │       ├── run_advanced.sh
 │       └── README.md
-└── CMakeLists.txt       两个目标：dylib（iOS）+ decoder（host）
+└── CMakeLists.txt         两个目标：dylib（iOS）+ decoder（host）
 ```
 
 ## 1. 编译
@@ -205,46 +206,194 @@ c++ -std=c++17 -O2 -DQBDITRACE_HAVE_CAPSTONE=1 \
 
 ## 2. 用 Frida 注入并 trace
 
+> **⚠️ 重要：必须使用 Python loader 加载。禁止直接 `frida -l qbditrace.js`。**
+>
+> `qbditrace.js` 是纯引擎脚本，不含任何内嵌配置。所有参数由 Python loader
+> (`qbditrace_runner.py`) 通过 `script.post()` 注入。直接用 Frida CLI 加载会
+> 因缺少配置而挂起不动。
+
 Frida 只做引导，核心 trace 逻辑全在 native，与 Frida 无关。
 
-编辑 `qbditrace.js` 顶部的 `CONFIG`：
+### 2.1 Trace 语义
 
-| 字段           | 含义 |
-|----------------|------|
-| `dylibPath`    | 设备上 `libqbditrace.dylib` 的绝对路径 |
-| `moduleName`   | 目标函数所在模块名；`null` 表示主可执行文件 |
-| `funcOffset`   | 目标函数相对模块基址的**静态偏移**（= IDA 中地址 − 镜像基址） |
-| `rangeSize`    | trace 区间长度（字节）。实际上 tracer 会尝试整模块插桩（`addInstrumentedModuleFromAddr`），此字段仅作为退化时的回退窗口 |
-| `outputPath`   | 设备上 trace 二进制的输出路径 |
-| `record`       | 位掩码：1=NZCV，2=寄存器 diff，4=内存访问，8=SVC，16=objc_msgSend；31=全部 |
-| `resolveObjc`  | 是否解析 `objc_msgSend` 家族地址以捕获 self/SEL/类名（非 OC 目标可设 false） |
-| `anchorInterval` | 每 N 条指令打一次全量寄存器重同步快照（0 = 默认 1024） |
-| `ringBytes`    | 每线程 ring buffer 字节数（0 = 默认 64 MiB） |
-| `embedCode`    | 是否在 trace 里内嵌去重码表以支持离线自带反汇编（默认 `true`；设 `false` 关闭） |
-| `argCount`     | 目标函数的整型参数个数（转发给 QBDI 的 x0..x7，最大 8） |
+qbditrace 的 trace 语义是**模块级**的：
 
-`funcOffset` 怎么取：在 IDA 里看到函数地址例如 `0x100A1B2C0`，镜像基址
-`0x100000000`，则 `funcOffset = 0xA1B2C0`。脚本会自动加上运行期的 ASLR slide。
+- **`--entry`**：指定触发 trace 的入口函数（偏移或符号名）。trace 从该函数被调用
+  时开始，到它返回时结束。
+- **`--module`**：指定要 trace 的模块（默认主可执行文件）。入口函数执行期间，
+  **所有落在该模块内的代码**都会被记录。模块外的调用（系统库、runtime 等）原生
+  透传执行，不 trace，仅记录 transfer 事件。
 
-运行：
+不需要指定函数大小或地址范围——tracer 自动对整个模块插桩
+（`addInstrumentedModuleFromAddr`）。
+
+### 2.2 Python loader 使用方法
 
 ```sh
+# 基本用法：trace 主模块内某个函数（按 IDA 偏移）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xEE91EC \
+    --output /var/mobile/Documents/trace.bin
+
+# 按导出符号名 trace
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry _CCCrypt \
+    --output /var/mobile/Documents/cccrypt.bin
+
+# trace 某个 framework 模块内的函数
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --module SomeFramework \
+    --entry 0x1234 \
+    --output /var/mobile/Documents/trace.bin
+
 # attach 已运行进程
-frida -H 127.0.0.1:27042 -n "<AppName>" -l tools/qbditrace/qbditrace.js
-# 或 spawn 启动
-frida -H 127.0.0.1:27042 -f <bundle.id> -l tools/qbditrace/qbditrace.js --no-pause
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --attach \
+    --entry 0xABC \
+    --output /var/mobile/Documents/trace.bin
+
+# 多次 trace（捕获 5 次调用）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --trace-mode 5 \
+    --output /var/mobile/Documents/trace.bin
+
+# 启用 GCD block tracing
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --trace-gcd \
+    --output /var/mobile/Documents/trace.bin
+
+# 设置超时（30 秒后自动退出）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --timeout 30 \
+    --output /var/mobile/Documents/trace.bin
 ```
 
-脚本会：加载 dylib → 解析模块基址与 slide → `qbditrace_configure` 设定区间 →
-`Interceptor.replace` 接管目标函数入口。当目标函数**第一次被调用**时，脚本会先
+### 2.3 完整参数列表
+
+**连接参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--host` | `127.0.0.1:27042` | Frida remote 设备地址 |
+| `--usb` | off | 使用 USB 连接而非远程 |
+
+**目标参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--target` / `-t` | (必填) | Bundle ID（spawn）或进程名（attach） |
+| `--attach` / `-a` | off | attach 已运行进程而非 spawn |
+
+**Trace 范围：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--module` / `-m` | 主可执行文件 | 要 trace 的模块。该模块内的所有执行都会被记录 |
+| `--entry` / `-e` | (必填) | 入口点：hex 偏移（如 `0xEE91EC`）或导出符号名（如 `_CCCrypt`）。trace 从此函数调用开始，到返回结束 |
+| `--arg-count` | 1 | 入口函数的整型参数个数（x0..x7，最大 8） |
+| `--range-size` | 自动(整模块) | [高级] 模块解析失败时的回退范围（hex）。正常情况无需指定 |
+
+**录制参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--record` | 31 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC |
+| `--no-objc` | off | 关闭 ObjC msgSend 解析 |
+| `--anchor-interval` | 0 (默认1024) | 每 N 条指令打全量快照 |
+| `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
+| `--no-embed-code` | off | 关闭内嵌码表 |
+
+**Trace 模式：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--trace-mode` | `once` | `once` / `multi`（无限）/ 正整数 N |
+| `--no-rehook` | off | 多次模式下不重装 hook |
+
+**GCD 参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--trace-gcd` | off | 启用 GCD block tracing |
+| `--gcd-no-filter` | off | trace 所有 block（不限模块内） |
+| `--gcd-max` | 0 (无限) | 最大 GCD block 捕获数 |
+
+**运行控制：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--timeout` | 0 (无限) | N 秒后自动退出 |
+| `--wait-for-done` | off (once 模式自动开启) | trace 完成后自动退出 |
+| `--output` / `-o` | (必填) | 设备上 trace 文件输出路径 |
+| `--dylib` | `/var/jb/usr/lib/libqbditrace.dylib` | 设备上 dylib 路径 |
+
+### 2.4 工作原理
+
+Python loader 的执行流程：
+
+1. 解析命令行参数，构建 CONFIG 字典
+2. 连接 Frida 设备（远程或 USB）
+3. Spawn 或 attach 目标进程
+4. 加载 `qbditrace.js` agent 脚本
+5. 通过 `script.post({'type': 'config', 'payload': CONFIG})` 注入配置
+6. Resume 进程（spawn 模式）
+7. 等待 trace 完成或超时
+8. 清理退出
+
+JS agent 收到配置后：加载 dylib → 解析模块信息 → 对整个模块插桩 →
+`Interceptor.replace` 接管入口函数。当入口函数被调用时，agent 先
 `Interceptor.revert` 还原原始字节（确保 QBDI 读到真实指令而非 Frida 跳板），
-再用 QBDI 接管执行并 trace，结束后 `qbditrace_stop` 把 trace 刷盘。
+再用 QBDI 接管执行并 trace。执行期间，模块内的所有子调用、分支、循环全部被记录；
+模块外的系统库调用原生透传。入口函数返回后 `qbditrace_stop` 把 trace 刷盘。
 
 > 为什么先 revert：`Interceptor.replace` 会在函数入口写跳板，而 QBDI 直接从内存
-> 读指令执行。若不还原，QBDI 会 trace 到 Frida 跳板。一次性 trace 是逆向最常见
-> 的需求，因此回调里直接 revert 后不再重装；之后的调用原生运行、不再 trace。
+> 读指令执行。若不还原，QBDI 会 trace 到 Frida 跳板。
 
-把设备上的 `outputPath`（如 `/var/mobile/Documents/qbditrace.bin`）拷回 host。
+### 2.5 --entry 偏移怎么取
+
+在 IDA 里看到函数地址例如 `0x100A1B2C0`，镜像基址 `0x100000000`，则
+`--entry 0xA1B2C0`。loader 会自动加上运行期的 ASLR slide。
+
+如果目标是导出函数，直接用符号名更方便：`--entry _CCCrypt`。
+
+### 2.6 后台运行
+
+Python loader 天然支持后台运行（不依赖 TTY）：
+
+```sh
+# 配合 nohup 后台运行
+nohup python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --trace-mode multi \
+    --timeout 300 \
+    --output /var/mobile/Documents/trace.bin \
+    > trace_log.txt 2>&1 &
+
+# 或在 tmux/screen 中运行
+```
+
+### 2.7 为什么禁止直接用 Frida CLI
+
+1. **console.log 丢失**：Python API 的 `set_log_handler` 能正确捕获所有日志；
+   Frida CLI 在某些场景下会丢失输出。
+2. **后台运行**：Frida CLI 依赖 TTY，SSH 断开即退出；Python 可 nohup/tmux。
+3. **参数集中管理**：所有配置通过命令行参数传入，无需手动编辑 JS 文件。
+4. **状态回调**：Python 能接收结构化的 status 事件（trace 开始/完成/错误），
+   便于自动化流水线集成。
+5. **超时控制**：内置 `--timeout` 参数，避免 Frida 无限挂起。
+
+把设备上的输出文件（如 `/var/mobile/Documents/trace.bin`）拷回 host。
 
 ## 3. 离线解码与 IDA 对照
 
@@ -274,7 +423,7 @@ frida -H 127.0.0.1:27042 -f <bundle.id> -l tools/qbditrace/qbditrace.js --no-pau
 `--image` 现已**废弃（deprecated）**：内嵌码表已让离线反汇编自包含。它目前仅作为
 旧 trace 的兜底保留，**后续版本可能直接移除**。
 
-> 关闭内嵌码表：在 `qbditrace.js` 的 `CONFIG` 里设 `embedCode: false`。
+> 关闭内嵌码表：使用 `--no-embed-code` 参数。
 
 输出里每条指令的地址都是**静态地址**（已减去 module_slide），可直接和 IDA 里看到
 的地址对照。示例：
@@ -465,8 +614,8 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
 
 - write value 补读覆盖 `size <= 16` 的 store（使用 `vm_read_overwrite` 容错读取）；
   更宽的向量 store 的 value 保留 unknown 标记。
-- Frida 引导默认**只 trace 目标函数的首次调用**。如需每次都 trace，需改造为带原始
-  字节 save/restore 的重装逻辑。
+- 默认 `--trace-mode once` 只 trace 首次调用。使用 `--trace-mode multi` 或
+  `--trace-mode N` 可捕获多次调用。
 - 仅在 iOS AArch64 上验证；x86_64 写入路径未做完整适配。
 - objc 记录的 cls 字段容量 48 字节；`*Super` 变体跳过类名解析（接收者为 objc_super
   结构体指针）。选择子通常可离线还原为方法名字符串。
