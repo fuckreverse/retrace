@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <queue>
 #include <stdexcept>
 #include <unordered_set>
@@ -27,8 +28,21 @@ const PassResult& PassContext::require_raw(std::string_view pass_name) {
     return manager_.require(pass_name);
 }
 
-void PassContext::progress(float /*pct*/) {}
-void PassContext::progress(float /*pct*/, std::string_view /*msg*/) {}
+void PassContext::progress(float pct) {
+    if (::tenet::log::is_enabled(::tenet::log::Level::Debug)) {
+        ::tenet::log::detail::write(::tenet::log::Level::Debug,
+            "pass progress: {:.0f}%", pct * 100.0f);
+    }
+}
+void PassContext::progress(float pct, std::string_view msg) {
+    if (::tenet::log::is_enabled(::tenet::log::Level::Debug)) {
+        ::tenet::log::detail::write(::tenet::log::Level::Debug,
+            "pass progress: {:.0f}% — {}", pct * 100.0f, msg);
+    }
+}
+
+bool PassContext::cancelled() const { return manager_.is_cancelled(); }
+void PassContext::cancel() { manager_.cancel_all(); }
 
 TraceScanEngine* PassContext::scan_engine() { return manager_.scan_engine(); }
 bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan(); }
@@ -148,15 +162,130 @@ void PassManager::execute_pass(PassEntry* entry) {
     entry->cv.notify_all();
 }
 
-// ─── Parallel run_all using topological levels ────────────────────────────
+// ─── Parallel run_all using a dynamic ready-queue (LLVM New PM style) ─────
+//
+// Each pass has an atomic pending_deps counter initialised to the number of
+// dependencies.  When a dependency completes, it decrements the counter of
+// every pass that depends on it; the pass whose counter reaches zero is
+// pushed onto the ready queue and any idle worker picks it up.
+//
+// This eliminates the long-pole problem of level-by-level scheduling: a
+// pass at "level 2" can start as soon as *its* deps finish, without waiting
+// for the whole previous level to drain.
+
+void PassManager::build_dependency_graph() {
+    // Reset scheduling state.
+    for (auto& e : entries_) {
+        e->pending_deps.store(0, std::memory_order_relaxed);
+        e->dependents.clear();
+    }
+
+    // name → index
+    ankerl::unordered_dense::map<std::string_view, size_t> idx_of;
+    idx_of.reserve(entries_.size());
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        idx_of[entries_[i]->pass->name()] = i;
+    }
+
+    // Count pending_deps and build reverse edges.
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        for (auto dep : entries_[i]->pass->dependencies()) {
+            auto it = idx_of.find(dep);
+            if (it == idx_of.end()) continue;  // external/missing dep
+            entries_[it->second]->dependents.push_back(i);
+            entries_[i]->pending_deps.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void PassManager::run_all_parallel(size_t num_threads) {
+    build_dependency_graph();
+
+    // Ready queue: indices of passes whose deps are all satisfied.
+    std::mutex q_mtx;
+    std::condition_variable q_cv;
+    std::vector<size_t> ready;
+    ready.reserve(entries_.size());
+
+    // Seed with all zero-dep passes.
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        if (entries_[i]->pending_deps.load(std::memory_order_acquire) == 0) {
+            ready.push_back(i);
+        }
+    }
+
+    std::atomic<size_t> completed{0};
+    std::atomic<bool>   failed_dep{false};
+    const size_t total = entries_.size();
+
+    auto worker = [&]() {
+        while (true) {
+            size_t idx;
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_cv.wait(lk, [&] {
+                    return !ready.empty() || completed.load(std::memory_order_acquire) == total;
+                });
+                if (ready.empty() &&
+                    completed.load(std::memory_order_acquire) == total) {
+                    return;  // everything done
+                }
+                idx = ready.back();
+                ready.pop_back();
+            }
+
+            // Run the pass.  require() uses CAS so only one thread actually
+            // executes it; other workers that somehow picked the same idx
+            // (shouldn't happen because the queue is drained under lock)
+            // would just hit the fast path.
+            auto& entry = entries_[idx];
+            const auto& result = this->require(entry->pass->name());
+
+            // If a dependency failed, skip downstream scheduling work —
+            // require() already propagated the failure.
+            if (!result.ok()) {
+                failed_dep.store(true, std::memory_order_relaxed);
+            }
+
+            // Notify dependents.
+            for (size_t dep_idx : entry->dependents) {
+                size_t prev = entries_[dep_idx]->pending_deps.fetch_sub(
+                    1, std::memory_order_acq_rel);
+                if (prev == 1) {
+                    std::lock_guard<std::mutex> lk(q_mtx);
+                    ready.push_back(dep_idx);
+                    q_cv.notify_one();
+                }
+            }
+
+            size_t done = completed.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (done == total) {
+                std::lock_guard<std::mutex> lk(q_mtx);
+                q_cv.notify_all();  // wake any sleeping workers so they can exit
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+    for (size_t i = 0; i + 1 < num_threads; ++i) {
+        threads.emplace_back(worker);
+    }
+    worker();  // run on main thread too
+    for (auto& t : threads) t.join();
+
+    if (failed_dep.load(std::memory_order_relaxed)) {
+        LOG_WARN("PassManager::run_all: one or more passes failed (see above)");
+    }
+}
 
 void PassManager::run_all(size_t num_threads) {
     LOG_INFO("PassManager::run_all: {} passes, {} threads, RSS limit={}MB",
              entries_.size(), num_threads,
              rss_limit_mb_ > 0 ? fmt::format("{:.0f}", rss_limit_mb_) : "none");
 
-    if (num_threads <= 1) {
-        // Sequential fallback: just require each pass.
+    if (num_threads <= 1 || entries_.size() <= 1) {
+        // Sequential fallback: just require each pass in registration order.
         for (auto& entry : entries_) {
             require(entry->pass->name());
         }
@@ -164,38 +293,7 @@ void PassManager::run_all(size_t num_threads) {
         return;
     }
 
-    // Compute topological levels for true parallelism.
-    auto levels = topological_levels();
-
-    for (auto& level : levels) {
-        if (level.size() == 1) {
-            // Only one pass at this level — no need for threads.
-            require(level[0]);
-        } else {
-            // Launch threads for each pass in this level.
-            std::vector<std::thread> threads;
-            threads.reserve(level.size());
-
-            // Limit concurrency to num_threads.
-            size_t batch_start = 0;
-            while (batch_start < level.size()) {
-                size_t batch_end = std::min(batch_start + num_threads, level.size());
-                threads.clear();
-
-                for (size_t i = batch_start; i < batch_end; ++i) {
-                    threads.emplace_back([this, name = level[i]]() {
-                        this->require(name);
-                    });
-                }
-
-                for (auto& t : threads) {
-                    t.join();
-                }
-
-                batch_start = batch_end;
-            }
-        }
-    }
+    run_all_parallel(num_threads);
 
     LOG_INFO("PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
 }

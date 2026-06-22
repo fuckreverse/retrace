@@ -107,8 +107,9 @@ public:
     // Progress
     void progress(float pct);
     void progress(float pct, std::string_view msg);
-    bool cancelled() const { return cancelled_.load(); }
-    void cancel() { cancelled_.store(true); }
+    /// True if the user requested global cancellation.
+    bool cancelled() const;
+    void cancel();
 
     /// Access the shared trace scan engine (for passes that want to run collectors).
     TraceScanEngine* scan_engine();
@@ -119,7 +120,6 @@ public:
 private:
     PassManager& manager_;
     AnalysisRange range_;
-    std::atomic<bool> cancelled_{false};
 };
 
 // ─── Analysis pass base ───────────────────────────────────────────────────
@@ -203,7 +203,13 @@ public:
     const PassResult& require(std::string_view pass_name);
 
     /// Run all registered passes in dependency order with true parallelism.
-    /// Passes in the same topological level run concurrently.
+    ///
+    /// Uses a dynamic ready-queue scheduler (LLVM New PassManager style):
+    /// each pass has an atomic pending-deps counter; when it hits zero the
+    /// pass is enqueued and any idle worker picks it up.  This eliminates
+    /// the long-pole problem of level-by-level scheduling — a pass at
+    /// "level 2" can start as soon as *its* deps finish, without waiting
+    /// for the whole previous level.
     void run_all(size_t num_threads = 1);
 
     /// Invalidate a pass result (will re-run on next require).
@@ -211,6 +217,10 @@ public:
 
     /// Invalidate all results.
     void invalidate_all();
+
+    /// Request cancellation of all in-flight passes.  Passes that check
+    /// `PassContext::cancelled()` will abort early.  Thread-safe.
+    void cancel_all() { cancelled_.store(true, std::memory_order_release); }
 
     // ─── Query ─────────────────────────────────────────────────────────
 
@@ -227,6 +237,9 @@ public:
     MemoryModel* memory()  { return memory_; }
     InstructionDecoder* decoder() { return decoder_; }
 
+    /// Global cancellation flag (set by cancel_all, read by all PassContexts).
+    bool is_cancelled() const { return cancelled_.load(std::memory_order_acquire); }
+
 private:
     struct PassEntry {
         std::unique_ptr<AnalysisPass> pass;
@@ -234,16 +247,28 @@ private:
         std::atomic<PassState> state{PassState::NotRun};
         std::mutex mtx;                   // protects result write
         std::condition_variable cv;       // signals completion
+
+        // Dynamic scheduling fields (used only by run_all).
+        std::atomic<size_t> pending_deps{0};   // # of deps not yet completed
+        std::vector<size_t> dependents;        // indices of passes that depend on this one
     };
 
     PassEntry* find_entry(std::string_view name);
     const PassEntry* find_entry(std::string_view name) const;
 
     /// Compute topological execution levels from dependency DAG.
+    /// (Kept for fallback / debugging; run_all uses the dynamic scheduler.)
     std::vector<std::vector<std::string_view>> topological_levels() const;
 
     /// Internal: execute a pass (assumes we own execution via CAS).
     void execute_pass(PassEntry* entry);
+
+    /// Dynamic ready-queue scheduler used by run_all when num_threads > 1.
+    void run_all_parallel(size_t num_threads);
+
+    /// Build the reverse dependency graph (dependents[] + pending_deps)
+    /// on all entries.  Called once at the start of run_all_parallel.
+    void build_dependency_graph();
 
     std::vector<std::unique_ptr<PassEntry>> entries_;
     std::unordered_map<std::string_view, PassEntry*> name_map_;
@@ -261,6 +286,9 @@ private:
     AnalysisRange range_;
     double rss_limit_mb_ = 0.0;  // 0 = no limit (default)
     mutable std::mutex registry_mutex_;  // protects entries_/name_map_ during registration
+
+    // Global cancellation flag (set by cancel_all, read by PassContext::cancelled).
+    std::atomic<bool> cancelled_{false};
 
     static PassResult not_found_result_;
 };
