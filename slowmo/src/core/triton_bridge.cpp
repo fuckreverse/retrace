@@ -331,6 +331,17 @@ public:
         return result;
     }
 
+    /// Zero-allocation bitmask version — preferred for hot loops.
+    uint64_t get_tainted_gpr_mask() const override {
+        uint64_t mask = 0;
+        for (uint8_t i = 0; i < AARCH64_GPR_COUNT; i++) {
+            if (is_register_tainted(i)) {
+                mask |= (1ULL << i);
+            }
+        }
+        return mask;
+    }
+
     /// Direct access to the Triton context (advanced use).
     triton::Context& raw_context() { return ctx_; }
 

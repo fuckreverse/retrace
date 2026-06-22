@@ -104,6 +104,12 @@ public:
 
     /// Get all currently tainted GPR indices.
     virtual std::vector<uint8_t> get_tainted_gprs() const = 0;
+
+    /// Get the current taint state as a bitmask.
+    /// Bit N set means GPR N is tainted.  Zero heap allocation — the
+    /// preferred API for hot loops (callers can do bitwise diff instead
+    /// of O(T²) nested scans).
+    virtual uint64_t get_tainted_gpr_mask() const = 0;
 };
 
 // ─── Stub implementation ──────────────────────────────────────────────────

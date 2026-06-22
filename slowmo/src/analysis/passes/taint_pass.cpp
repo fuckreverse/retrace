@@ -40,7 +40,7 @@ static void emit_step(TaintResult& result, const TaintConfig& config,
         legacy.inst_id = step.inst_id;
         legacy.pc = step.pc;
         legacy.dst_reg = step.dst_reg;
-        legacy.src_regs = step.src_regs;
+        legacy.src_reg_mask = step.src_reg_mask;
         legacy.is_memory_source = (step.type == PropagationType::MemToReg ||
                                    step.type == PropagationType::MemToMem);
         legacy.is_memory_sink = (step.type == PropagationType::RegToMem ||
@@ -222,13 +222,13 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         // Reference: Sydr paper (Positive Technologies, 2020) reports
         // 1.2-3.5× speedup from this single optimization.
         //
-        // Note: get_tainted_gprs() is called once per instruction regardless;
-        // it is a lightweight vector copy inside Triton. We cache it in
-        // `tainted_before` and reuse for the post-instruction diff below.
-        auto tainted_before = triton->get_tainted_gprs();
+        // We use the zero-allocation bitmask API (get_tainted_gpr_mask)
+        // and compute the new/kill sets with O(1) bitwise diff instead of
+        // the previous O(T²) nested-vector scan.
+        uint64_t before_mask = triton->get_tainted_gpr_mask();
 
         // Fast path: nothing is tainted at all → no need to run Triton.
-        if (tainted_before.empty() && result.tainted_memory.isEmpty()) {
+        if (before_mask == 0 && result.tainted_memory.isEmpty()) {
             // However, if this instruction writes a register we're tracking
             // as a *source* (i.e., we just set up initial taint sources but
             // haven't processed the source instruction yet), we can't skip.
@@ -250,65 +250,58 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             continue;
         }
 
-        // Check for taint changes
-        auto tainted_after = triton->get_tainted_gprs();
+        uint64_t after_mask = triton->get_tainted_gpr_mask();
 
-        // ─── Detect newly tainted registers ───────────────────────────
-        for (uint8_t reg : tainted_after) {
-            bool was_tainted = false;
-            for (uint8_t prev : tainted_before) {
-                if (prev == reg) { was_tainted = true; break; }
+        // ─── Detect newly tainted registers (bitwise diff: O(1)) ──────
+        uint64_t new_taint = after_mask & ~before_mask;
+        while (new_taint) {
+            uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(new_taint));
+            new_taint &= new_taint - 1;  // clear lowest set bit
+
+            // Determine propagation type
+            PropagationStep step;
+            step.inst_id = inst_id;
+            step.pc = inst.pc;
+            step.dst_reg = reg;
+            step.triton_resolved = true;
+
+            // Check if source is memory
+            bool from_mem = false;
+            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                auto mem = inst.mem_access(m);
+                if ((mem.type & 2) == 0 && triton->is_memory_tainted(mem.addr, mem.size)) {
+                    from_mem = true;
+                    step.add_src_mem(mem.addr);
+                }
             }
-            if (!was_tainted) {
-                // Determine propagation type
+
+            if (from_mem) {
+                step.type = PropagationType::MemToReg;
+            } else {
+                step.type = PropagationType::RegToReg;
+            }
+
+            // Source regs: bitmask of all previously tainted regs — O(1)
+            step.src_reg_mask = before_mask;
+
+            emit_step(result, config, std::move(step));
+        }
+
+        // ─── Detect killed (untainted) registers (bitwise diff: O(1)) ──
+        if (config.emit_kill_events) {
+            uint64_t killed = before_mask & ~after_mask;
+            while (killed) {
+                uint8_t prev = static_cast<uint8_t>(__builtin_ctzll(killed));
+                killed &= killed - 1;
+
                 PropagationStep step;
                 step.inst_id = inst_id;
                 step.pc = inst.pc;
-                step.dst_reg = reg;
+                step.type = PropagationType::Kill;
+                step.dst_reg = prev;
                 step.triton_resolved = true;
-
-                // Check if source is memory
-                bool from_mem = false;
-                for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                    auto mem = inst.mem_access(m);
-                    if ((mem.type & 2) == 0 && triton->is_memory_tainted(mem.addr, mem.size)) {
-                        from_mem = true;
-                        step.src_mem_addrs.push_back(mem.addr);
-                    }
-                }
-
-                if (from_mem) {
-                    step.type = PropagationType::MemToReg;
-                } else {
-                    step.type = PropagationType::RegToReg;
-                }
-
-                // Source regs: any previously tainted reg
-                for (uint8_t prev : tainted_before) {
-                    step.src_regs.push_back(prev);
-                }
-
                 emit_step(result, config, std::move(step));
-            }
-        }
-
-        // ─── Detect killed (untainted) registers ──────────────────────
-        if (config.emit_kill_events) {
-            for (uint8_t prev : tainted_before) {
-                bool still_tainted = false;
-                for (uint8_t reg : tainted_after) {
-                    if (reg == prev) { still_tainted = true; break; }
-                }
-                if (!still_tainted) {
-                    PropagationStep step;
-                    step.inst_id = inst_id;
-                    step.pc = inst.pc;
-                    step.type = PropagationType::Kill;
-                    step.dst_reg = prev;
-                    step.triton_resolved = true;
-                    emit_step(result, config, std::move(step));
-                    result.kill_events_count++;
-                }
+                result.kill_events_count++;
             }
         }
 
@@ -327,10 +320,8 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
                         step.triton_resolved = true;
-                        // Source: tainted regs that were read
-                        for (uint8_t prev : tainted_before) {
-                            step.src_regs.push_back(prev);
-                        }
+                        // Source: bitmask of all previously tainted regs — O(1)
+                        step.src_reg_mask = before_mask;
                         emit_step(result, config, std::move(step));
                     }
                 }
@@ -358,14 +349,8 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                 // However, since we're doing forward propagation through the actual
                 // trace, the callee's reg_diffs will naturally handle this.
                 // We just emit a Call event for tracking.
-                bool any_arg_tainted = false;
-                for (uint8_t reg : tainted_after) {
-                    if (is_abi_arg_reg(reg)) {
-                        any_arg_tainted = true;
-                        break;
-                    }
-                }
-                if (any_arg_tainted) {
+                uint64_t arg_taint = after_mask & 0xFFULL;  // X0-X7 = bits 0-7
+                if (arg_taint) {
                     PropagationStep step;
                     step.inst_id = inst_id;
                     step.pc = inst.pc;
@@ -373,31 +358,25 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                     step.triton_resolved = true;
                     // The next PC (callee entry) from the trace
                     step.cross_function_pc = inst.pc;  // Will be resolved by next inst
-                    for (uint8_t reg : tainted_after) {
-                        if (is_abi_arg_reg(reg)) {
-                            step.src_regs.push_back(reg);
-                        }
-                    }
+                    step.src_reg_mask = arg_taint;  // bitmask of argument regs carrying taint
                     emit_step(result, config, std::move(step));
                     result.call_crossings++;
                 }
 
                 if (!config.propagate_through_calls) {
                     // Kill all taint at call boundary
-                    for (uint8_t reg : tainted_after) {
-                        if (is_abi_arg_reg(reg)) {
-                            triton->untaint_register(reg);
-                        }
+                    uint64_t a = arg_taint;
+                    while (a) {
+                        uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(a));
+                        a &= a - 1;
+                        triton->untaint_register(reg);
                     }
                 }
             }
         }
 
-        // Update tainted_regs bitmask from Triton state
-        result.tainted_regs = 0;
-        for (uint8_t reg : tainted_after) {
-            result.tainted_regs |= (1ULL << reg);
-        }
+        // Update tainted_regs bitmask directly from Triton state (O(1))
+        result.tainted_regs = after_mask;
 
         inst_id++;
         processed++;
@@ -662,22 +641,24 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
 
                     if (mem_source_tainted && !any_src_tainted) {
                         step.type = PropagationType::MemToReg;
-                        step.src_mem_addrs.assign(tainted_mem_sources, tainted_mem_sources + n_tainted_mem);
+                        for (uint8_t mi = 0; mi < n_tainted_mem; mi++)
+                            step.add_src_mem(tainted_mem_sources[mi]);
                     } else {
                         step.type = PropagationType::RegToReg;
-                        // Add actual tainted source regs from this instruction
+                        // Build src_reg_mask from actual tainted source regs
                         for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
                             if (i == j) continue;
                             auto src = inst.reg_diff(j);
                             if ((result.tainted_regs >> src.index) & 1) {
-                                step.src_regs.push_back(src.index);
+                                step.src_reg_mask |= (1ULL << src.index);
                             }
                         }
-                        if (step.src_regs.empty() && was_tainted) {
-                            step.src_regs.push_back(reg_idx);  // self-reference
+                        if (step.src_reg_mask == 0 && was_tainted) {
+                            step.src_reg_mask |= (1ULL << reg_idx);  // self-reference
                         }
                         if (mem_source_tainted) {
-                            step.src_mem_addrs.assign(tainted_mem_sources, tainted_mem_sources + n_tainted_mem);
+                            for (uint8_t mi = 0; mi < n_tainted_mem; mi++)
+                                step.add_src_mem(tainted_mem_sources[mi]);
                         }
                     }
 
@@ -734,7 +715,9 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                         step.type = PropagationType::RegToMem;
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
-                        step.src_regs.assign(store_sources, store_sources + n_store_sources);
+                        // Build src_reg_mask from store_sources
+                        for (uint8_t si = 0; si < n_store_sources; si++)
+                            step.src_reg_mask |= (1ULL << store_sources[si]);
                         step.triton_resolved = false;
                         emit_step(result, config, std::move(step));
                     }
@@ -755,21 +738,13 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
 
             if (is_call) {
                 // Emit Call event if any argument register is tainted
-                bool any_arg_tainted = false;
-                std::vector<uint8_t> tainted_args;
-                for (uint8_t reg = ABI_ARG_FIRST; reg <= ABI_ARG_LAST; reg++) {
-                    if ((result.tainted_regs >> reg) & 1) {
-                        any_arg_tainted = true;
-                        tainted_args.push_back(reg);
-                    }
-                }
-
-                if (any_arg_tainted) {
+                uint64_t arg_taint = result.tainted_regs & 0xFFULL;  // X0-X7 = bits 0-7
+                if (arg_taint) {
                     PropagationStep step;
                     step.inst_id = inst_id;
                     step.pc = inst.pc;
                     step.type = PropagationType::Call;
-                    step.src_regs = std::move(tainted_args);
+                    step.src_reg_mask = arg_taint;  // bitmask of arg regs carrying taint
                     step.triton_resolved = false;
                     emit_step(result, config, std::move(step));
                     result.call_crossings++;

@@ -48,9 +48,40 @@ struct PropagationStep {
     uint64_t dst_mem_addr = 0;       // 0 = not a memory destination
     uint8_t dst_mem_size = 0;
 
-    /// Source: where taint came from.
-    std::vector<uint8_t> src_regs;
-    std::vector<uint64_t> src_mem_addrs;
+    /// Source registers: bitmask where bit N = register N contributed taint.
+    /// Zero heap allocation — replaces the old std::vector<uint8_t> src_regs.
+    /// For 34 AArch64 GPRs, a single uint64_t covers all (bits 0-33).
+    uint64_t src_reg_mask = 0;
+
+    /// Source memory addresses: still a vector because memory addresses are
+    /// arbitrary 64-bit values that don't fit a bitmask.  However, most
+    /// propagation steps have 0-2 memory sources, so we use a small inline
+    /// buffer (max 4) to avoid heap allocation for the common case.
+    static constexpr uint8_t kMaxInlineMemAddrs = 4;
+    uint8_t src_mem_count = 0;
+    uint64_t src_mem_addrs[kMaxInlineMemAddrs] = {};  // inline, no heap alloc
+
+    /// Overflow: when >4 memory sources (extremely rare), stored here.
+    /// This avoids the 99.9% case of heap allocation while remaining correct.
+    std::vector<uint64_t> src_mem_addrs_overflow;
+
+    /// Add a memory source address (inline-first, overflow for rare >4 case).
+    void add_src_mem(uint64_t addr) {
+        if (src_mem_count < kMaxInlineMemAddrs) {
+            src_mem_addrs[src_mem_count++] = addr;
+        } else {
+            src_mem_addrs_overflow.push_back(addr);
+        }
+    }
+
+    /// Iterate over all source memory addresses (inline + overflow).
+    template<typename Fn>
+    void for_each_src_mem(Fn fn) const {
+        for (uint8_t i = 0; i < src_mem_count && i < kMaxInlineMemAddrs; i++)
+            fn(src_mem_addrs[i]);
+        for (uint64_t addr : src_mem_addrs_overflow)
+            fn(addr);
+    }
 
     /// For Call/Return: the callee/caller PC.
     uint64_t cross_function_pc = 0;
@@ -136,9 +167,12 @@ struct TaintEvent {
     uint64_t inst_id;
     uint64_t pc;
     uint8_t dst_reg;       // register that became tainted
-    std::vector<uint8_t> src_regs;  // registers that contributed
+    uint64_t src_reg_mask; // bitmask: bit N = register N contributed taint
     bool is_memory_source; // taint came from memory
     bool is_memory_sink;   // taint was stored to memory
+
+    /// Legacy helper: check if a specific register was a source.
+    bool has_src_reg(uint8_t reg) const { return (src_reg_mask >> reg) & 1; }
 };
 
 // ─── Taint analysis pass result ───────────────────────────────────────────

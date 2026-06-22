@@ -361,8 +361,13 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     }
 
     // --- Build dataflow edges from event chain ---
+    // O(E) via incremental address→reader index (was O(E²) nested scan).
     if (config.build_dataflow_graph && result.events.size() > 1) {
         ankerl::unordered_dense::map<uint8_t, uint64_t> reg_consumer;
+        // Maps a memory address to the list of event indices that READ from it.
+        // Built incrementally so that when processing event i, the map only
+        // contains entries from events [0, i-1].
+        ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> addr_to_readers;
 
         for (size_t i = 0; i < result.events.size(); i++) {
             const auto& ev = result.events[i];
@@ -374,19 +379,22 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
                 }
             }
             if (ev.stores_to_memory) {
-                for (size_t j = 0; j < i; j++) {
-                    for (auto a : result.events[j].src_mem_addrs) {
-                        if (a == ev.store_addr) {
-                            result.dataflow_edges.emplace_back(
-                                ev.inst_id, result.events[j].inst_id, 0, ev.store_addr);
-                            break;
-                        }
+                // O(1) lookup instead of O(i) linear scan.
+                auto rit = addr_to_readers.find(ev.store_addr);
+                if (rit != addr_to_readers.end()) {
+                    for (size_t j : rit->second) {
+                        result.dataflow_edges.emplace_back(
+                            ev.inst_id, result.events[j].inst_id, 0, ev.store_addr);
                     }
                 }
             }
 
+            // Register this event's reads for future store matching.
             for (uint8_t sr : ev.src_regs) {
                 reg_consumer[sr] = ev.inst_id;
+            }
+            for (uint64_t ma : ev.src_mem_addrs) {
+                addr_to_readers[ma].push_back(i);
             }
         }
     }
@@ -627,9 +635,14 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
         }
     }
 
-    // --- Build dataflow edges ---
+    // --- Build dataflow edges from event chain ---
+    // O(E) via incremental address→reader index (was O(E²) nested scan).
     if (config.build_dataflow_graph && result.events.size() > 1) {
         ankerl::unordered_dense::map<uint8_t, uint64_t> reg_consumer;
+        // Maps a memory address to the list of event indices that READ from it.
+        // Built incrementally so that when processing event i, the map only
+        // contains entries from events [0, i-1].
+        ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> addr_to_readers;
 
         for (size_t i = 0; i < result.events.size(); i++) {
             const auto& ev = result.events[i];
@@ -641,19 +654,22 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
                 }
             }
             if (ev.stores_to_memory) {
-                for (size_t j = 0; j < i; j++) {
-                    for (auto a : result.events[j].src_mem_addrs) {
-                        if (a == ev.store_addr) {
-                            result.dataflow_edges.emplace_back(
-                                ev.inst_id, result.events[j].inst_id, 0, ev.store_addr);
-                            break;
-                        }
+                // O(1) lookup instead of O(i) linear scan.
+                auto rit = addr_to_readers.find(ev.store_addr);
+                if (rit != addr_to_readers.end()) {
+                    for (size_t j : rit->second) {
+                        result.dataflow_edges.emplace_back(
+                            ev.inst_id, result.events[j].inst_id, 0, ev.store_addr);
                     }
                 }
             }
 
+            // Register this event's reads for future store matching.
             for (uint8_t sr : ev.src_regs) {
                 reg_consumer[sr] = ev.inst_id;
+            }
+            for (uint64_t ma : ev.src_mem_addrs) {
+                addr_to_readers[ma].push_back(i);
             }
         }
     }
