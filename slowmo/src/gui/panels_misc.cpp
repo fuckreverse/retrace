@@ -4,6 +4,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/xref_pass.h"
@@ -437,55 +438,82 @@ void GuiApp::render_progress_overlay() {
 
     // ── LANE 0: Execution density heatmap ─────────────────────────────
     // Sample the execution frequency per pixel column using xref exec counts.
-    // Build a per-pixel bucket map: pixel → max_exec_count in that bucket.
+    // The heatmap is cached because it's derived from xref_result_ (static
+    // once xref completes) — re-iterating the roaring bitmap every frame
+    // would freeze the UI on large traces (tens of millions of inst_ids).
     {
         const int kPixels = static_cast<int>(W);
         if (kPixels > 0 && xref_result_) {
-            // Find max exec count for normalization
-            uint64_t max_count = 1;
-            for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
-                if (cnt > max_count) max_count = cnt;
-            }
-            // Accumulate per-pixel max
-            std::vector<uint64_t> pixel_max(kPixels, 0);
-            for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
-                auto inst_ids = xref_result_->inst_ids_at(pc);
-                for (uint64_t id : inst_ids) {
-                    int px = static_cast<int>(
-                        static_cast<float>(id) / static_cast<float>(total_inst_) * static_cast<float>(kPixels));
-                    if (px >= 0 && px < kPixels) {
-                        if (cnt > pixel_max[px]) pixel_max[px] = cnt;
+            // Rebuild cache if xref result changed or total_inst changed
+            // or pixel count changed (window resize).
+            bool need_rebuild = false;
+            if (heatmap_cache_.source != xref_result_) need_rebuild = true;
+            if (heatmap_cache_.total_inst != static_cast<float>(total_inst_)) need_rebuild = true;
+            if (static_cast<int>(heatmap_cache_.pixels.size()) != kPixels * 4) need_rebuild = true;
+
+            if (need_rebuild) {
+                heatmap_cache_.source = xref_result_;
+                heatmap_cache_.total_inst = static_cast<float>(total_inst_);
+                heatmap_cache_.pixels.assign(kPixels * 4, 0);
+
+                // Find max exec count for normalization
+                uint64_t max_count = 1;
+                for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
+                    if (cnt > max_count) max_count = cnt;
+                }
+                // Accumulate per-pixel max
+                std::vector<uint64_t> pixel_max(kPixels, 0);
+                for (const auto& [pc, cnt] : xref_result_->pc_exec_count) {
+                    auto inst_ids = xref_result_->inst_ids_at(pc);
+                    for (uint64_t id : inst_ids) {
+                        int px = static_cast<int>(
+                            static_cast<float>(id) / static_cast<float>(total_inst_) * static_cast<float>(kPixels));
+                        if (px >= 0 && px < kPixels) {
+                            if (cnt > pixel_max[px]) pixel_max[px] = cnt;
+                        }
                     }
                 }
-            }
-            // Draw heatmap: cold=dark blue, warm=cyan, hot=white
-            for (int px = 0; px < kPixels; px++) {
-                if (pixel_max[px] == 0) continue;
-                float heat = std::min(1.0f, static_cast<float>(pixel_max[px]) /
-                                           static_cast<float>(max_count));
-                // Color ramp: #121620 → #1a5f8a → #22c5ff → #ffffff
-                uint8_t r, g, b;
-                if (heat < 0.33f) {
-                    float t = heat / 0.33f;
-                    r = static_cast<uint8_t>(18 + t * (26 - 18));
-                    g = static_cast<uint8_t>(22 + t * (95 - 22));
-                    b = static_cast<uint8_t>(28 + t * (138 - 28));
-                } else if (heat < 0.67f) {
-                    float t = (heat - 0.33f) / 0.34f;
-                    r = static_cast<uint8_t>(26 + t * (34 - 26));
-                    g = static_cast<uint8_t>(95 + t * (197 - 95));
-                    b = static_cast<uint8_t>(138 + t * (255 - 138));
-                } else {
-                    float t = (heat - 0.67f) / 0.33f;
-                    r = static_cast<uint8_t>(34  + t * (255 - 34));
-                    g = static_cast<uint8_t>(197 + t * (255 - 197));
-                    b = 255;
+                // Pre-compute RGBA colors
+                for (int px = 0; px < kPixels; px++) {
+                    if (pixel_max[px] == 0) continue;
+                    float heat = std::min(1.0f, static_cast<float>(pixel_max[px]) /
+                                               static_cast<float>(max_count));
+                    uint8_t r, g, b;
+                    if (heat < 0.33f) {
+                        float t = heat / 0.33f;
+                        r = static_cast<uint8_t>(18 + t * (26 - 18));
+                        g = static_cast<uint8_t>(22 + t * (95 - 22));
+                        b = static_cast<uint8_t>(28 + t * (138 - 28));
+                    } else if (heat < 0.67f) {
+                        float t = (heat - 0.33f) / 0.34f;
+                        r = static_cast<uint8_t>(26 + t * (34 - 26));
+                        g = static_cast<uint8_t>(95 + t * (197 - 95));
+                        b = static_cast<uint8_t>(138 + t * (255 - 138));
+                    } else {
+                        float t = (heat - 0.67f) / 0.33f;
+                        r = static_cast<uint8_t>(34  + t * (255 - 34));
+                        g = static_cast<uint8_t>(197 + t * (255 - 197));
+                        b = 255;
+                    }
+                    uint8_t alpha = static_cast<uint8_t>(80 + heat * 155);
+                    heatmap_cache_.pixels[px * 4 + 0] = r;
+                    heatmap_cache_.pixels[px * 4 + 1] = g;
+                    heatmap_cache_.pixels[px * 4 + 2] = b;
+                    heatmap_cache_.pixels[px * 4 + 3] = alpha;
                 }
-                uint8_t alpha = static_cast<uint8_t>(80 + heat * 155);
+            }
+
+            // Draw from cache
+            for (int px = 0; px < kPixels; px++) {
+                uint8_t a = heatmap_cache_.pixels[px * 4 + 3];
+                if (a == 0) continue;
+                uint8_t r = heatmap_cache_.pixels[px * 4 + 0];
+                uint8_t g = heatmap_cache_.pixels[px * 4 + 1];
+                uint8_t b = heatmap_cache_.pixels[px * 4 + 2];
                 float fx = p0.x + static_cast<float>(px);
                 draw->AddLine(ImVec2(fx, p0.y + L0_top),
                               ImVec2(fx, p0.y + L0_bot),
-                              IM_COL32(r, g, b, alpha), 1.0f);
+                              IM_COL32(r, g, b, a), 1.0f);
             }
         } else if (!xref_result_) {
             // Fallback: simple progress fill when xref is not available
@@ -1001,8 +1029,30 @@ void GuiApp::render_status_bar() {
     if (show_loops_ && loop_result_) {
         right += fmt::format("  [\xe2\x86\xba {}L]", loop_result_->loops.size());  // ↺
     }
-    if (analysis_running_.load()) {
-        right += "  \xe2\xa3\xbe Analyzing...";  // ⣾
+    if (analysis_running_.load() && pass_manager_) {
+        // Find running passes and show the first one's name + progress.
+        int running_count = 0;
+        std::string_view running_name;
+        float running_pct = 0.0f;
+        for (auto name : pass_manager_->all_passes()) {
+            if (pass_manager_->state(name) == PassManager::PassState::Running) {
+                running_count++;
+                if (running_count == 1) {
+                    running_name = name;
+                    running_pct  = pass_manager_->progress_of(name);
+                }
+            }
+        }
+        if (running_count == 1) {
+            std::string_view display = running_name;
+            if (auto* cat = tenet::find_pass_catalog_entry(running_name))
+                display = cat->display_name;
+            right += fmt::format("  \xe2\xa3\xbe {} {:d}%", display, (int)(running_pct * 100));
+        } else if (running_count > 1) {
+            right += fmt::format("  \xe2\xa3\xbe {} passes", running_count);
+        } else {
+            right += "  \xe2\xa3\xbe Analyzing...";  // still transitioning
+        }
     }
 
     // Search result position

@@ -4,6 +4,7 @@
 // for SeparatorEx/ImGuiSeparatorFlags_Vertical used by the toolbar.
 
 #include "gui/gui_app.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/loop_pass.h"
 #include "io/recent_files.h"
@@ -467,8 +468,23 @@ void GuiApp::render_toolbar() {
             };
             static int spin_frame = 0;
             spin_frame = (spin_frame + 1) % 8;
+
+            // Show the first running pass name + progress
+            std::string status_text = "Analyzing...";
+            if (pass_manager_) {
+                for (auto pname : pass_manager_->all_passes()) {
+                    if (pass_manager_->state(pname) == PassManager::PassState::Running) {
+                        float pct = pass_manager_->progress_of(pname);
+                        std::string_view display = pname;
+                        if (auto* cat = tenet::find_pass_catalog_entry(pname))
+                            display = cat->display_name;
+                        status_text = fmt::format("{} {:d}%", display, (int)(pct * 100));
+                        break;
+                    }
+                }
+            }
             ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f),
-                "%s Analyzing...", spinner[spin_frame]);
+                "%s %s", spinner[spin_frame], status_text.c_str());
         } else {
             // Show active analysis mode badges
             bool first_badge = true;

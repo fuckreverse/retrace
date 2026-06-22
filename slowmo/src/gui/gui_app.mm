@@ -136,11 +136,14 @@ bool GuiApp::init_imgui() {
 // ─── Shutdown ───────────────────────────────────────────────────────────────
 
 void GuiApp::shutdown() {
-    if (!window_) return;  // Already shut down
+if (!window_) return;  // Already shut down
 
-    // Persist bookmarks and last cursor position to the index database
-    index_.save_bookmarks(bookmarks_);
-    index_.save_last_inst(current_inst_);
+// Stop analysis worker + startup thread before destroying anything else.
+stop_analysis_worker();
+
+// Persist bookmarks and last cursor position to the index database
+index_.save_bookmarks(bookmarks_);
+index_.save_last_inst(current_inst_);
 
     ImGui_ImplMetal_Shutdown();
     ImGui_ImplSDL3_Shutdown();
@@ -409,9 +412,12 @@ int GuiApp::run() {
     if (!init_sdl()) return 1;
     if (!init_imgui()) return 1;
 
+    // Start the background analysis worker thread (processes manual triggers).
+    start_analysis_worker();
+
     // Kick off background startup analysis immediately after UI is ready.
-    // The analyses run in a detached thread; results are written atomically
-    // and the render loop will display them as they complete.
+    // The analyses run in a separate thread; results are delivered via
+    // pending_apply_ and applied on the UI thread each frame.
     run_startup_analysis();
 
     while (running_) {
@@ -428,6 +434,11 @@ int GuiApp::run() {
                 running_ = false;
             }
         }
+
+        // ─── 1.5. Apply pending analysis results on the UI thread ────
+        // Worker threads post result-pointer assignments here; draining
+        // them on the UI thread eliminates data races.
+        apply_pending_results();
 
         // ─── 2. Acquire Metal drawable and begin render pass ─────────
         @autoreleasepool {

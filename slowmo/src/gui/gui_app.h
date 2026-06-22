@@ -28,6 +28,9 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 
 namespace tenet {
 
@@ -155,6 +158,16 @@ private:
 
     // ─── Cached row data ────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{4096};
+
+    // ─── Cached heatmap data for progress overlay ───────────────────
+    // The execution-density heatmap is derived from xref_result_ and is
+    // static once xref completes. Caching it avoids re-iterating the entire
+    // roaring bitmap (tens of millions of entries) every frame.
+    struct HeatmapCache {
+        const XrefResult* source = nullptr;   // which xref_result_ was used
+        float total_inst = 0.0f;              // total_inst_ at cache time
+        std::vector<uint8_t> pixels;          // RGBA per pixel column (pre-multiplied heat)
+    } heatmap_cache_;
 
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
@@ -324,6 +337,43 @@ private:
     std::string analysis_status_;
     std::mutex analysis_mutex_;
     std::thread startup_analysis_thread_;  // background startup analysis
+
+    // ─── Async analysis infrastructure ──────────────────────────────
+    // A single worker thread processes a queue of analysis tasks so the
+    // UI never blocks on `require()`.  Startup analysis runs on its own
+    // thread (startup_analysis_thread_) and calls run_all(N) for parallelism;
+    // manual triggers are enqueued here and run concurrently with startup.
+    struct AnalysisTask {
+        std::string pass_name;           // for display / dedup
+        std::function<void()> work;      // runs on worker thread
+    };
+    std::mutex              analysis_queue_mutex_;
+    std::condition_variable analysis_queue_cv_;
+    std::deque<AnalysisTask> analysis_queue_;
+    std::thread             analysis_worker_thread_;
+    std::atomic<bool>       analysis_worker_stop_{false};
+
+    /// Active analysis counter (startup + manual).  When it hits 0,
+    /// analysis_running_ is cleared.
+    std::atomic<int> active_analysis_count_{0};
+
+    /// Results pending UI-thread application.  Worker threads post lambdas
+    /// here; the UI thread drains them at the start of each frame.  This
+    /// eliminates data races on result pointers (all writes happen on UI thread).
+    std::mutex                      pending_apply_mutex_;
+    std::vector<std::function<void()>> pending_apply_;
+
+    void analysis_worker_loop();       // runs on analysis_worker_thread_
+    void enqueue_async(std::string pass_name, std::function<void()> work);
+    void post_apply(std::function<void()> fn);   // thread-safe: queue for UI thread
+    void apply_pending_results();                // call on UI thread each frame
+    void start_analysis_worker();               // call once at startup
+    void stop_analysis_worker();                // call on shutdown (joins worker)
+
+    /// Helper: safely get a completed pass result pointer, or nullptr.
+    const PassResult* completed_result(std::string_view name);
+    /// Apply UI-side result pointers for a completed pass (function, xref, etc.).
+    void apply_pass_result_pointers(std::string_view name);
 
     // ─── Layout constants (shared by render_frame / toolbar / status bar) ──
     static constexpr float kToolbarHeight   = 30.0f;  // toolbar window height
