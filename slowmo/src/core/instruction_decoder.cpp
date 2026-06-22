@@ -97,7 +97,7 @@ bool InstructionDecoder::init() {
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opcode) {
     if (!initialized_) return std::nullopt;
 
-    // ── Opcode-keyed cache ────────────────────────────────────────────────
+    // ── Opcode-keyed cache (thread-safe under run_all parallelism) ────────
     // AArch64 is fixed-length; the opcode word fully determines the mnemonic,
     // register access sets, and (for non-PC-relative instructions) the operand
     // string.  Cache by opcode for maximum reuse across PCs.
@@ -105,13 +105,20 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
     // PC-relative instructions (b, bl, b.cond, cbz, cbnz, tbz, tbnz, adr,
     // adrp) have op_str that depends on the execution PC, so they bypass the
     // cache and are always decoded with the actual PC.
-    if (auto cached = opcode_cache_.get(opcode)) {
-        DecodedInst d = cached->get();
-        if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
-            d.pc = pc;  // override PC for the caller
-            return d;
+    //
+    // Note: we use a unique_lock (exclusive) for both get() and put() because
+    // LRU get() mutates the linked list (promote).  The cache is small (4096
+    // slots, ~2K distinct AArch64 encodings) so contention is negligible.
+    {
+        std::unique_lock<std::shared_mutex> lk(opcode_cache_mtx_);
+        if (auto cached = opcode_cache_.get(opcode)) {
+            DecodedInst d = cached->get();
+            if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
+                d.pc = pc;  // override PC for the caller
+                return d;
+            }
+            // PC-relative: fall through to re-decode with actual PC
         }
-        // PC-relative: fall through to re-decode with actual PC
     }
 
     csh& handle = tls_handle();
@@ -135,7 +142,10 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
         d.mnemonic[sizeof(d.mnemonic) - 1] = '\0';
         std::snprintf(d.op_str, sizeof(d.op_str), "0x%x", opcode);
         d.size = 4;
-        opcode_cache_.put(opcode, d);
+        {
+            std::unique_lock<std::shared_mutex> lk(opcode_cache_mtx_);
+            opcode_cache_.put(opcode, d);
+        }
         return d;
     }
 
@@ -189,6 +199,7 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
 
     // Cache only non-PC-relative instructions (PC-relative op_str depends on PC)
     if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
+        std::unique_lock<std::shared_mutex> lk(opcode_cache_mtx_);
         opcode_cache_.put(opcode, d);
     }
 

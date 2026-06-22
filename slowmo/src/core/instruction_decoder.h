@@ -5,6 +5,7 @@
 
 #include <capstone/capstone.h>
 #include <array>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -41,9 +42,9 @@ struct DecodedInst {
 ///
 /// Thread safety: each thread gets its own Capstone handle (thread_local),
 /// eliminating the global mutex that was the bottleneck under concurrent
-/// decode workloads.  The opcode cache itself is per-InstructionDecoder
-/// instance with no locking needed — each InstructionDecoder is used from
-/// a single thread.
+/// decode workloads.  The opcode cache is protected by a shared_mutex
+/// (reader-writer lock) so multiple passes can call decode() concurrently
+/// from different threads under run_all(N) parallelism.
 class InstructionDecoder {
 public:
     InstructionDecoder();
@@ -71,9 +72,12 @@ private:
     /// No mutex needed — each thread has its own copy.
     static csh& tls_handle();
 
-    /// Opcode-keyed decode cache (no mutex needed: per-instance, single-threaded use).
+    /// Opcode-keyed decode cache, protected by a reader-writer lock.
     /// AArch64 has ~2K distinct encodings, so 4096 slots is generous.
+    /// The shared_mutex allows multiple concurrent readers (cache hits)
+    /// while serializing writers (cache misses that insert new entries).
     LRUCache<uint32_t, DecodedInst> opcode_cache_{4096};
+    mutable std::shared_mutex opcode_cache_mtx_;
 
     bool initialized_ = false;
 };
