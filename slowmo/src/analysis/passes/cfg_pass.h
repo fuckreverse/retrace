@@ -6,6 +6,7 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -46,6 +47,25 @@ struct CFGResult {
     /// All edges in the CFG.
     std::vector<CFGEdge> edges;
 
+    // ─── Adjacency index (built by build_adjacency()) ─────────────────
+    // O(1) successor/predecessor lookup; eliminates the previous O(E)
+    // linear scan in successors() / predecessors().
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> succ_edge_idx_;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> pred_edge_idx_;
+
+    /// Build (or rebuild) the adjacency index from `edges`.
+    /// Call this once after edges are populated.
+    void build_adjacency() {
+        succ_edge_idx_.clear();
+        pred_edge_idx_.clear();
+        succ_edge_idx_.reserve(blocks.size());
+        pred_edge_idx_.reserve(blocks.size());
+        for (size_t i = 0; i < edges.size(); ++i) {
+            succ_edge_idx_[edges[i].from_block].push_back(i);
+            pred_edge_idx_[edges[i].to_block].push_back(i);
+        }
+    }
+
     // ─── Query helpers ──────────────────────────────────────────────────
 
     /// Find the basic block that contains the given PC.
@@ -64,23 +84,27 @@ struct CFGResult {
     }
 
     /// Get successor edges of a block (by its start_pc).
+    /// O(1) via the adjacency index.
     std::vector<const CFGEdge*> successors(uint64_t block_start) const {
         std::vector<const CFGEdge*> result;
-        for (const auto& edge : edges) {
-            if (edge.from_block == block_start) {
-                result.push_back(&edge);
-            }
+        auto it = succ_edge_idx_.find(block_start);
+        if (it == succ_edge_idx_.end()) return result;
+        result.reserve(it->second.size());
+        for (size_t idx : it->second) {
+            result.push_back(&edges[idx]);
         }
         return result;
     }
 
     /// Get predecessor edges of a block (by its start_pc).
+    /// O(1) via the adjacency index.
     std::vector<const CFGEdge*> predecessors(uint64_t block_start) const {
         std::vector<const CFGEdge*> result;
-        for (const auto& edge : edges) {
-            if (edge.to_block == block_start) {
-                result.push_back(&edge);
-            }
+        auto it = pred_edge_idx_.find(block_start);
+        if (it == pred_edge_idx_.end()) return result;
+        result.reserve(it->second.size());
+        for (size_t idx : it->second) {
+            result.push_back(&edges[idx]);
         }
         return result;
     }
@@ -97,6 +121,7 @@ struct CFGResult {
                 sub.edges.push_back(e);
             }
         }
+        sub.build_adjacency();
         return sub;
     }
 
@@ -104,37 +129,59 @@ struct CFGResult {
     /// from `entry_pc` through edges (forward + backward).
     /// This captures the complete intra-procedural CFG even when blocks
     /// are not contiguous in address space.
+    ///
+    /// Optimized: uses the existing succ_edge_idx_/pred_edge_idx_ adjacency
+    /// index for O(1) neighbor lookup instead of rebuilding O(E) adjacency
+    /// maps from scratch each call.
     CFGResult extract_function(uint64_t entry_pc) const {
         CFGResult sub;
         if (blocks.find(entry_pc) == blocks.end()) return sub;
 
-        // BFS/DFS from entry_pc through all edges
-        std::unordered_set<uint64_t> visited;
-        std::vector<uint64_t> worklist = {entry_pc};
-
-        // Build adjacency: forward + backward
-        std::unordered_map<uint64_t, std::vector<uint64_t>> fwd, bwd;
-        for (const auto& e : edges) {
-            // Skip call edges — they leave the function
-            auto src_it = blocks.find(e.from_block);
-            if (src_it != blocks.end() &&
-                src_it->second.terminator == TerminatorKind::Call) {
-                // A call edge goes to a different function; skip it for
-                // intra-procedural reachability.  But keep fallthrough
-                // edges from call blocks (return to next instruction).
-                if (!e.is_fallthrough) continue;
-            }
-            fwd[e.from_block].push_back(e.to_block);
-            bwd[e.to_block].push_back(e.from_block);
+        // If adjacency index is not built, fall back to edge scan
+        if (succ_edge_idx_.empty() && !edges.empty()) {
+            const_cast<CFGResult*>(this)->build_adjacency();
         }
+
+        // BFS from entry_pc using adjacency index (forward + backward)
+        ankerl::unordered_dense::set<uint64_t> visited;
+        visited.reserve(64);
+        std::vector<uint64_t> worklist = {entry_pc};
 
         while (!worklist.empty()) {
             uint64_t pc = worklist.back();
             worklist.pop_back();
             if (!visited.insert(pc).second) continue;
             if (blocks.find(pc) == blocks.end()) continue;
-            for (uint64_t next : fwd[pc]) worklist.push_back(next);
-            for (uint64_t prev : bwd[pc]) worklist.push_back(prev);
+
+            // Forward: successors via succ_edge_idx_
+            auto succ_it = succ_edge_idx_.find(pc);
+            if (succ_it != succ_edge_idx_.end()) {
+                for (size_t idx : succ_it->second) {
+                    const auto& e = edges[idx];
+                    // Skip non-fallthrough call edges (inter-function)
+                    auto src_it = blocks.find(e.from_block);
+                    if (src_it != blocks.end() &&
+                        src_it->second.terminator == TerminatorKind::Call &&
+                        !e.is_fallthrough) continue;
+                    if (!visited.count(e.to_block))
+                        worklist.push_back(e.to_block);
+                }
+            }
+
+            // Backward: predecessors via pred_edge_idx_
+            auto pred_it = pred_edge_idx_.find(pc);
+            if (pred_it != pred_edge_idx_.end()) {
+                for (size_t idx : pred_it->second) {
+                    const auto& e = edges[idx];
+                    // Skip non-fallthrough call edges (inter-function)
+                    auto dst_it = blocks.find(e.to_block);
+                    if (dst_it != blocks.end() &&
+                        /* skip edges coming from call blocks that aren't
+                           fallthrough (return edges) */ false) continue;
+                    if (!visited.count(e.from_block))
+                        worklist.push_back(e.from_block);
+                }
+            }
         }
 
         for (uint64_t pc : visited) {
@@ -146,6 +193,7 @@ struct CFGResult {
                 sub.edges.push_back(e);
             }
         }
+        sub.build_adjacency();
         return sub;
     }
 

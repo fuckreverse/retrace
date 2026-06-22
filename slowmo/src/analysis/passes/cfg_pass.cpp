@@ -256,6 +256,7 @@ PassResult CFGPass::run(PassContext& ctx) {
         const CFGResult* cfg;       // Shared (read-only) block map
         EdgeCountMap edge_counts;
         uint64_t prev_block_start = UINT64_MAX;
+        uint64_t prev_pc = UINT64_MAX;  // PC of the previous instruction
 
         explicit CFGEdgeCollector(const CFGResult* c) : cfg(c) {}
 
@@ -277,11 +278,32 @@ PassResult CFGPass::run(PassContext& ctx) {
             const BasicBlock* cur_block = cfg->block_containing(inst.pc);
             uint64_t cur_block_start = cur_block ? cur_block->start_pc : UINT64_MAX;
 
+            // 1. Inter-block edge: previous instruction was in a different block.
             if (prev_block_start != UINT64_MAX && cur_block_start != UINT64_MAX &&
                 prev_block_start != cur_block_start) {
                 edge_counts[EdgeKey{prev_block_start, cur_block_start}]++;
             }
+
+            // 2. Self-loop back edge: a backward branch landed on the start of
+            //    the *same* block we were already in.  Without this, loops whose
+            //    body is a single basic block (e.g.  add; cmp; b.lt back) would
+            //    have no back edge, and LoopPass would fail to detect them.
+            //
+            //    Detection: prev and current are in the same block, the current
+            //    instruction is the block's start_pc, and the previous PC was
+            //    not the block's start_pc (i.e. we branched back from deeper in
+            //    the block, not fell through from above).
+            if (prev_block_start != UINT64_MAX &&
+                prev_block_start == cur_block_start &&
+                cur_block_start != UINT64_MAX &&
+                inst.pc == cur_block_start &&
+                prev_pc != cur_block_start &&
+                prev_pc != UINT64_MAX) {
+                edge_counts[EdgeKey{cur_block_start, cur_block_start}]++;
+            }
+
             prev_block_start = cur_block_start;
+            prev_pc = inst.pc;
         }
     };
 
@@ -342,7 +364,11 @@ PassResult CFGPass::run(PassContext& ctx) {
     }
 
     ctx.progress(1.0f, fmt::format("CFG: {} blocks, {} edges",
-                                    result.block_count(), result.edge_count()));
+                             result.block_count(), result.edge_count()));
+
+    // Build O(1) adjacency index for successor/predecessor queries.
+    result.build_adjacency();
+
     return PassResult::success(std::move(result));
 }
 
