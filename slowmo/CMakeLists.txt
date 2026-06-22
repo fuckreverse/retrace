@@ -308,6 +308,7 @@ src/core/register_file.cpp
     src/core/breakpoint_engine.cpp
     src/core/triton_bridge.cpp
     src/analysis/pass_manager.cpp
+    src/analysis/pass_registry.cpp
     src/analysis/trace_collector.cpp
     src/analysis/passes/index_build_pass.cpp
     src/analysis/passes/disassembly_pass.cpp
