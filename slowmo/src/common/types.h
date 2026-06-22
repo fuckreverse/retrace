@@ -150,7 +150,7 @@ struct RegState {
 /// a contiguous array of nodes. Each node contains prev/next indices forming
 /// a doubly-linked list. This eliminates pointer chasing and reduces cache
 /// misses on the hot path (InstructionDecoder decode loop).
-template<typename Key, typename Value>
+template<typename Key, typename Value, typename Hash = ankerl::unordered_dense::hash<Key>>
 class LRUCache {
 public:
     explicit LRUCache(size_t capacity) : capacity_(capacity) {
@@ -302,7 +302,7 @@ private:
     uint32_t head_ = NIL;
     uint32_t tail_ = NIL;
     std::vector<Node> nodes_;
-    ankerl::unordered_dense::map<Key, uint32_t> map_;
+    ankerl::unordered_dense::map<Key, uint32_t, Hash> map_;
 };
 
 }  // namespace tenet

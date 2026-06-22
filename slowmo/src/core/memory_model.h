@@ -14,7 +14,6 @@
 #include <shared_mutex>
 #include <memory>
 #include <filesystem>
-#include <unordered_map>
 
 namespace tenet {
 
@@ -141,6 +140,15 @@ public:
     /// Check if already built (data persisted in RocksDB).
     bool is_built() const { return built_; }
 
+    /// Invalidate this thread's cached RocksDB iterators if they belong to
+    /// our DB.  Call this BEFORE closing the DB so that the thread-local
+    /// IteratorPair does not hold dangling iterators.
+    ///
+    /// This is invoked automatically by the destructor, but callers that
+    /// need to close the DB before destroying the MemoryModel should call
+    /// this first.
+    void invalidate_thread_iterators();
+
 private:
     static constexpr uint64_t PAGE_SHIFT = 12;
     static constexpr uint64_t PAGE_SIZE = 1ULL << PAGE_SHIFT;
@@ -236,10 +244,10 @@ private:
         bool known;
         uint64_t writer_id;
     };
-    // Small fixed-size LRU would be ideal, but a simple bounded unordered_map
-    // with periodic clear is good enough for typical access patterns.
-    static constexpr size_t BYTE_CACHE_MAX_SIZE = 65536;
-    std::unordered_map<ByteCacheKey, ByteCacheEntry, ByteCacheHash> byte_cache_;
+    // True LRU cache: per-entry eviction (O(1)) instead of the previous
+    // "clear all when full" strategy that caused periodic latency spikes.
+    // 65536 slots — same capacity as before, but with proper LRU eviction.
+    LRUCache<ByteCacheKey, ByteCacheEntry, ByteCacheHash> byte_cache_{65536};
     mutable std::mutex byte_cache_mutex_;
 
     CacheStats stats_;  // atomic counters, no mutex needed

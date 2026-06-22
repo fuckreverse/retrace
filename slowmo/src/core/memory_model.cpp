@@ -70,19 +70,23 @@ MemoryModel::MemoryModel(const TraceReader& reader, const TraceIndex& index,
 MemoryModel::MemoryModel(const TraceReader& reader, const TraceIndex& index)
     : reader_(reader), index_(index) {}
 
+void MemoryModel::invalidate_thread_iterators() {
+// If this thread's cached iterators belong to our DB, invalidate them now.
+// This prevents a use-after-free when the DB is closed (e.g., between tests):
+// the next MemoryModel that happens to get the same DB pointer would otherwise
+// reuse stale iterators that belong to the now-closed DB.
+if (has_rocksdb_ && db_ != nullptr) {
+auto& pair = tl_iterators_;
+if (pair.owner_db == db_) {
+pair.write_iter.reset();
+pair.read_iter.reset();
+pair.owner_db = nullptr;
+}
+}
+}
+
 MemoryModel::~MemoryModel() {
-    // If this thread's cached iterators belong to our DB, invalidate them now.
-    // This prevents a use-after-free when the DB is closed (e.g., between tests):
-    // the next MemoryModel that happens to get the same DB pointer would otherwise
-    // reuse stale iterators that belong to the now-closed DB.
-    if (has_rocksdb_ && db_ != nullptr) {
-        auto& pair = tl_iterators_;
-        if (pair.owner_db == db_) {
-            pair.write_iter.reset();
-            pair.read_iter.reset();
-            pair.owner_db = nullptr;
-        }
-    }
+invalidate_thread_iterators();
 }
 
 // ─── Sentinel / persistence detection ─────────────────────────────────────
@@ -1126,10 +1130,10 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
         ByteCacheKey cache_key{addr, at_inst_id};
         {
             std::lock_guard<std::mutex> lk(byte_cache_mutex_);
-            auto it = byte_cache_.find(cache_key);
-            if (it != byte_cache_.end()) {
+            auto cached = byte_cache_.get(cache_key);
+            if (cached) {
                 stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
-                if (it->second.known) return it->second.value;
+                if (cached->get().known) return cached->get().value;
                 return std::nullopt;
             }
         }
@@ -1143,14 +1147,11 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
         MemReadResult tmp{};
         find_covering_write(iter, page, page_offset, at_inst_id, tmp, 0);
 
-        // Store in cache
+        // Store in cache (LRUCache handles eviction automatically)
         {
             std::lock_guard<std::mutex> lk(byte_cache_mutex_);
-            if (byte_cache_.size() >= BYTE_CACHE_MAX_SIZE) {
-                byte_cache_.clear();  // Simple eviction: clear all
-            }
-            byte_cache_[cache_key] = {tmp.data[0], tmp.known[0],
-                                      tmp.known[0] ? at_inst_id : 0};
+            byte_cache_.put(cache_key, {tmp.data[0], tmp.known[0],
+                                        tmp.known[0] ? at_inst_id : 0});
         }
 
         if (tmp.known[0]) {
@@ -1163,7 +1164,7 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
             find_covering_write(iters.read_iter.get(), page, page_offset, at_inst_id, tmp2, 0);
             if (tmp2.known[0]) {
                 std::lock_guard<std::mutex> lk(byte_cache_mutex_);
-                byte_cache_[cache_key] = {tmp2.data[0], true, at_inst_id};
+                byte_cache_.put(cache_key, {tmp2.data[0], true, at_inst_id});
                 return tmp2.data[0];
             }
         }
