@@ -33,7 +33,7 @@ void GuiApp::render_thread_panel() {
 
     if (!thread_result_) {
         if (ImGui::Button("Run Thread Analysis")) {
-            run_thread_analysis();
+            run_pass_by_name("thread");
         }
         ImGui::End();
         return;
@@ -147,7 +147,7 @@ void GuiApp::render_strings_panel() {
     } else {
         ImGui::TextDisabled("No string analysis performed.");
         if (ImGui::Button("Run String Analysis")) {
-            run_string_analysis();
+            run_pass_by_name("strings");
         }
         ImGui::End();
         return;

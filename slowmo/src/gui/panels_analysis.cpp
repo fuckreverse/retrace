@@ -5,6 +5,7 @@
 // translation unit that pulls in every analysis pass header.
 
 #include "gui/gui_app.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/slice_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
@@ -300,80 +301,15 @@ void GuiApp::run_slice_analysis() {
     }
 }
 
-void GuiApp::run_function_analysis() {
-    ensure_pass_manager();
-
-    pass_manager_->register_pass(std::make_unique<FunctionPass>());
-    auto& result = pass_manager_->require("function");
-    if (result.ok()) {
-        function_result_ = &result.get<FunctionResult>();
-        show_callstack_ = true;
-        goto_candidates_dirty_ = true;  // Rebuild goto autocomplete on next open
-    }
-}
-
-void GuiApp::run_xref_analysis() {
-    ensure_pass_manager();
-
-    pass_manager_->register_pass(std::make_unique<XrefPass>());
-    auto& result = pass_manager_->require("xref");
-    if (result.ok()) {
-        xref_result_ = &result.get<XrefResult>();
-        xref_cursor_ = 0;
-    }
-}
-
-void GuiApp::run_string_analysis() {
-    ensure_pass_manager();
-
-    pass_manager_->register_pass(std::make_unique<StringPass>());
-    auto& result = pass_manager_->require("strings");
-    if (result.ok()) {
-        string_result_ = &result.get<StringResult>();
-        show_strings_ = true;
-        string_cursor_ = 0;
-        string_filter_.clear();
-        std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
-    }
-}
-
-void GuiApp::run_thread_analysis() {
-    ensure_pass_manager();
-
-    pass_manager_->register_pass(std::make_unique<ThreadPass>());
-    auto& result = pass_manager_->require("thread");
-    if (result.ok()) {
-        thread_result_ = &result.get<ThreadResult>();
-        show_threads_ = true;
-    }
-}
-
 void GuiApp::run_call_graph_analysis() {
     ensure_pass_manager();
 
     // CallGraphPass depends on function pass, ensure it's run first
     if (!function_result_) {
-        run_function_analysis();
+        run_pass_by_name("function");
     }
 
-    pass_manager_->register_pass(std::make_unique<CallGraphPass>());
-    auto& result = pass_manager_->require("call_graph");
-    if (result.ok()) {
-        call_graph_result_ = &result.get<CallGraphResult>();
-    }
-}
-
-// ─── Loop Analysis ──────────────────────────────────────────────────────────
-
-void GuiApp::run_loop_analysis() {
-    ensure_pass_manager();
-
-    pass_manager_->register_pass(std::make_unique<LoopPass>());
-    auto& result = pass_manager_->require("loop");
-    if (result.ok()) {
-        loop_result_ = &result.get<LoopResult>();
-        show_loops_ = true;
-    }
+    run_pass_by_name("call_graph");
 }
 
 // ─── CFG Layout Analysis ─────────────────────────────────────────────────────
@@ -404,6 +340,70 @@ void GuiApp::run_cfg_layout() {
     cfg_func_result_.reset();
     cfg_func_layout_.reset();
     cfg_layout_result_ = nullptr;
+}
+
+// ─── Generic pass runner ───────────────────────────────────────────────────
+// Runs any catalog pass by name, deriving a config from the current cursor.
+// Used by the "All Passes" section of the Analysis panel so that every pass
+// is reachable from the GUI — even those without a dedicated button.
+
+void GuiApp::run_pass_by_name(std::string_view name) {
+    ensure_pass_manager();
+    if (!tenet::is_known_pass(name)) {
+        last_pass_status_ = fmt::format("unknown pass '{}'", name);
+        return;
+    }
+
+    // Build a PassRunCtx from the current cursor.
+    tenet::PassRunCtx ctx;
+    ctx.current_inst = current_inst_;
+    ctx.total_inst   = total_inst_;
+    // Derive a "current register" from the first reg diff at the cursor,
+    // so taint/slice/producer_chain/etc. have a sensible default target.
+    auto [offset, seed_pc] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec = reader_.record_at(offset, seed_pc);
+    if (rec.kind == RecordKind::Inst) {
+        auto inst = rec.as_inst();
+        ctx.current_reg = (inst.reg_diff_count > 0) ? inst.reg_diff(0).index : 0;
+    }
+
+    if (!tenet::register_pass_by_name(*pass_manager_, name, ctx)) {
+        last_pass_status_ = fmt::format("'{}' could not be registered", name);
+        return;
+    }
+
+    auto& raw = pass_manager_->require(name);
+    last_pass_status_ = fmt::format("{}: {}", name,
+                                    tenet::summarize_pass_result(name, raw));
+
+    // ── Wire up UI result pointers for passes with dedicated panels ──
+    // This centralises the post-run side-effects that the old per-pass
+    // run_xxx_analysis() methods used to do individually.
+    if (!raw.ok()) return;
+    if (name == "function") {
+        function_result_ = &raw.get<FunctionResult>();
+        show_callstack_ = true;
+        goto_candidates_dirty_ = true;
+    } else if (name == "xref") {
+        xref_result_ = &raw.get<XrefResult>();
+        xref_cursor_ = 0;
+    } else if (name == "strings") {
+        string_result_ = &raw.get<StringResult>();
+        show_strings_ = true;
+        string_cursor_ = 0;
+        string_filter_.clear();
+        std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
+    } else if (name == "thread") {
+        thread_result_ = &raw.get<ThreadResult>();
+        show_threads_ = true;
+    } else if (name == "loop") {
+        loop_result_ = &raw.get<LoopResult>();
+        show_loops_ = true;
+    } else if (name == "call_graph") {
+        call_graph_result_ = &raw.get<CallGraphResult>();
+    } else if (name == "cfg") {
+        cfg_result_ = &raw.get<CFGResult>();
+    }
 }
 
 void GuiApp::clear_analysis() {
@@ -603,7 +603,7 @@ void GuiApp::render_analysis_panel() {
     {
         bool active = (function_result_ != nullptr);
         if (ImGui::Button("Run Functions##fn")) {
-            run_function_analysis();
+            run_pass_by_name("function");
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Discover call/return pairs, build function list");
@@ -625,7 +625,7 @@ void GuiApp::render_analysis_panel() {
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.30f, 0.04f, 1.0f));
         }
         if (ImGui::Button("Run Loops##lp")) {
-            run_loop_analysis();
+            run_pass_by_name("loop");
         }
         if (active) ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered())
@@ -646,7 +646,7 @@ void GuiApp::render_analysis_panel() {
     {
         bool active = (xref_result_ != nullptr);
         if (ImGui::Button("Run XRef##xref")) {
-            run_xref_analysis();
+            run_pass_by_name("xref");
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Build cross-reference index (PC → inst_ids)");
@@ -682,7 +682,7 @@ void GuiApp::render_analysis_panel() {
     {
         bool has_str = (string_result_ != nullptr);
         if (ImGui::Button("Run Strings##str")) {
-            run_string_analysis();
+            run_pass_by_name("strings");
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Find string accesses in the trace");
@@ -706,6 +706,74 @@ void GuiApp::render_analysis_panel() {
             ImGui::TextColored(ImVec4(0.78f, 0.62f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
         } else {
             ImGui::TextDisabled("(not run)");
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 6));
+
+    // ── GROUP 4: All Passes (full catalog) ─────────────────────────────
+    // Every pass in the registry is reachable here, so nothing is
+    // "GUI-only" or hidden. Default passes show ✓ once run at startup.
+    section_header("  All Passes", ImVec4(0.55f, 0.55f, 0.62f, 1.0f));
+    {
+        static bool show_all = false;
+        ImGui::Checkbox("Show full catalog", &show_all);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Expand to run any of the %d passes (incl. those without a dedicated button).",
+                              (int)tenet::pass_catalog().size());
+
+        if (!last_pass_status_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+            ImGui::TextWrapped("%s", last_pass_status_.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        if (show_all) {
+            const char* cat_names[] = {
+                "Structure", "Taint", "Crypto/Pattern", "Memory/String",
+                "ObjC/Syscall", "Profile/Trace", "Misc"
+            };
+            auto cat_to_idx = [](tenet::PassCategory c) -> int {
+                switch (c) {
+                    case tenet::PassCategory::Structure:  return 0;
+                    case tenet::PassCategory::Taint:      return 1;
+                    case tenet::PassCategory::Crypto:     return 2;
+                    case tenet::PassCategory::Memory:     return 3;
+                    case tenet::PassCategory::ObjcSyscall:return 4;
+                    case tenet::PassCategory::Profile:    return 5;
+                    case tenet::PassCategory::Misc:       return 6;
+                }
+                return 6;
+            };
+
+            int cur_cat = -1;
+            for (const auto& e : tenet::pass_catalog()) {
+                int ci = cat_to_idx(e.category);
+                if (ci != cur_cat) {
+                    cur_cat = ci;
+                    ImGui::Dummy(ImVec2(0, 2));
+                    ImGui::TextDisabled("%s", cat_names[ci]);
+                }
+                // Status indicator: ✓ if completed, · if not run.
+                bool done = pass_manager_ &&
+                            pass_manager_->state(e.name) ==
+                                PassManager::PassState::Completed;
+                std::string label = fmt::format("{}##cat", e.display_name);
+                if (done) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.30f, 0.16f, 1.0f));
+                }
+                if (ImGui::SmallButton(label.c_str())) {
+                    run_pass_by_name(e.name);
+                }
+                if (done) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s\n(pass: %s%s)", e.description.data(),
+                                      e.name.data(),
+                                      e.default_for_ui == tenet::PassDefault::Yes
+                                          ? ", default" : "");
+                ImGui::SameLine();
+            }
+            ImGui::NewLine();  // wrap last row
         }
     }
 

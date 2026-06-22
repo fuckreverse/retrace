@@ -10,6 +10,7 @@
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
 
@@ -382,14 +383,16 @@ private:
     void run_taint_analysis();
     void run_backward_taint_analysis();
     void run_slice_analysis();
-    void run_function_analysis();
-    void run_xref_analysis();
-    void run_string_analysis();
     void run_call_graph_analysis();
-    void run_thread_analysis();
-    void run_loop_analysis();
     void run_cfg_layout();
     void clear_analysis();
+
+    /// Run any catalog pass by name, deriving config from the current cursor.
+    /// Stores a one-line summary in last_pass_status_.
+    void run_pass_by_name(std::string_view name);
+
+    /// Last generic pass run summary (shown in the All Passes section).
+    std::string last_pass_status_;
 
     // ─── Rendering helpers ─────────────────────────────────────────
     void render_operands_highlighted(const std::string& operands);

@@ -29,7 +29,7 @@ void GuiApp::render_callstack_panel() {
     if (!function_result_) {
         ImGui::TextDisabled("(not computed - use Analysis > Function Analysis)");
         if (ImGui::Button("Run Function Analysis")) {
-            run_function_analysis();
+            run_pass_by_name("function");
         }
         ImGui::End();
         return;
@@ -185,7 +185,7 @@ void GuiApp::render_callstack_context_menu() {
                 navigate_to(evt->call_inst_id + 1);
             }
             if (ImGui::MenuItem("Run Xref on Target")) {
-                if (!xref_result_) run_xref_analysis();
+                if (!xref_result_) run_pass_by_name("xref");
                 if (xref_result_) {
                     auto xrefs = xref_result_->inst_ids_at(evt->target_pc);
                     if (!xrefs.empty()) {
@@ -210,7 +210,7 @@ void GuiApp::render_functions_panel() {
     if (!function_result_) {
         ImGui::TextDisabled("No function analysis performed.");
         if (ImGui::Button("Run Function Analysis")) {
-            run_function_analysis();
+            run_pass_by_name("function");
         }
         ImGui::End();
         return;
@@ -522,7 +522,7 @@ void GuiApp::render_func_context_menu() {
         ImGui::Separator();
 
         if (ImGui::MenuItem("Run Xref on this Function")) {
-            if (!xref_result_) run_xref_analysis();
+            if (!xref_result_) run_pass_by_name("xref");
             if (xref_result_) {
                 auto xrefs = xref_result_->inst_ids_at(ctx_func_pc_);
                 if (!xrefs.empty()) {

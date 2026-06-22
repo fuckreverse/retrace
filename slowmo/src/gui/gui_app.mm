@@ -773,7 +773,7 @@ void GuiApp::render_frame() {
 
             // X → run xref analysis
             if (ImGui::IsKeyPressed(ImGuiKey_X) && !ctrl) {
-                if (!xref_result_) run_xref_analysis();
+                if (!xref_result_) run_pass_by_name("xref");
                 else {
                     // cycle through xrefs at current PC
                     auto row = fetch_row(current_inst_);

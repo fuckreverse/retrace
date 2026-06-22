@@ -222,22 +222,22 @@ void GuiApp::render_menu_bar() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Function Analysis", "Shift+F")) {
-                run_function_analysis();
+                run_pass_by_name("function");
             }
             if (ImGui::MenuItem("Xref Analysis", "X")) {
-                run_xref_analysis();
+                run_pass_by_name("xref");
             }
             if (ImGui::MenuItem("String Analysis", "I")) {
-                run_string_analysis();
+                run_pass_by_name("strings");
             }
             if (ImGui::MenuItem("Thread Analysis", "T")) {
-                run_thread_analysis();
+                run_pass_by_name("thread");
             }
             if (ImGui::MenuItem("Call Graph Analysis")) {
                 run_call_graph_analysis();
             }
             if (ImGui::MenuItem("Loop Analysis", "O")) {
-                run_loop_analysis();
+                run_pass_by_name("loop");
             }
             if (ImGui::MenuItem("CFG Layout", "K")) {
                 run_cfg_layout();

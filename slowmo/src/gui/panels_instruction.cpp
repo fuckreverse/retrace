@@ -380,7 +380,7 @@ void GuiApp::render_inst_context_menu_contents() {
     if (ImGui::BeginMenu("Xrefs")) {
         if (!xref_result_) {
             if (ImGui::MenuItem("Run Xref Analysis first")) {
-                run_xref_analysis();
+                run_pass_by_name("xref");
             }
         } else {
             auto xrefs = xref_result_->inst_ids_at(ctx_inst_pc_);
