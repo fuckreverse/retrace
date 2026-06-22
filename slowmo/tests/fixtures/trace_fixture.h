@@ -60,11 +60,23 @@ struct TraceEnv {
     std::unique_ptr<MemoryModel>    memory;
 
     ~TraceEnv() {
-        // Destruction order: memory → regfile → decoder → code_table → index → reader
-        // (regfile/memory hold references to reader+index, so must die first)
-        memory.reset();
+        // Destruction order rationale:
+        //
+        // On macOS, pthread_mutex_destroy() uses a global os_unfair_lock.
+        // RocksDB's background compaction/flush threads also call
+        // pthread_mutex_destroy() (when tearing down per-compaction mutexes).
+        // If ~MemoryModel() runs while RocksDB BG threads are still alive,
+        // the concurrent pthread_mutex_destroy() calls collide on the global
+        // lock and trigger _os_unfair_lock_corruption_abort (SIGKILL).
+        //
+        // Fix: invalidate MemoryModel's thread-local iterators (which reference
+        // the DB) FIRST, then close the DB (which joins all BG threads), then
+        // destroy MemoryModel.  With RocksDB BG threads gone, the
+        // pthread_mutex_destroy() inside ~MemoryModel() runs uncontested.
+        if (memory) memory->invalidate_thread_iterators();
         regfile.reset();
-        index.reset();
+        index.reset();      // closes RocksDB DB, joins BG threads
+        memory.reset();     // now safe: mutexes destroyed without contention
         reader.reset();
         std::filesystem::remove_all(temp_dir);
     }

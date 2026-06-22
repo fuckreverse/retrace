@@ -235,12 +235,17 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
                 step_json["dst_mem"] = fmt::format("0x{:X}", s.dst_mem_addr);
                 step_json["dst_mem_size"] = s.dst_mem_size;
             }
-            if (!s.src_regs.empty()) {
-                step_json["src_regs"] = s.src_regs;
+            if (s.src_reg_mask != 0) {
+                json src_arr = json::array();
+                for (uint64_t m = s.src_reg_mask; m; m &= m - 1)
+                    src_arr.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+                step_json["src_regs"] = std::move(src_arr);
             }
-            if (!s.src_mem_addrs.empty()) {
+            if (s.src_mem_count > 0 || !s.src_mem_addrs_overflow.empty()) {
                 json addrs = json::array();
-                for (auto a : s.src_mem_addrs) addrs.push_back(fmt::format("0x{:X}", a));
+                s.for_each_src_mem([&](uint64_t a) {
+                    addrs.push_back(fmt::format("0x{:X}", a));
+                });
                 step_json["src_mem_addrs"] = std::move(addrs);
             }
             if (s.cross_function_pc != 0) {
@@ -260,12 +265,18 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
     size_t ev_limit = std::min(result.events.size(), size_t(500));
     for (size_t i = 0; i < ev_limit; i++) {
         const auto& ev = result.events[i];
-        events_arr.push_back({
+        json ev_json = {
             {"inst_id", ev.inst_id},
             {"pc", fmt::format("0x{:X}", ev.pc)},
-            {"dst_reg", ev.dst_reg},
-            {"src_regs", ev.src_regs}
-        });
+            {"dst_reg", ev.dst_reg}
+        };
+        if (ev.src_reg_mask != 0) {
+            json src_arr = json::array();
+            for (uint64_t m = ev.src_reg_mask; m; m &= m - 1)
+                src_arr.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+            ev_json["src_regs"] = std::move(src_arr);
+        }
+        events_arr.push_back(std::move(ev_json));
     }
     output["events"] = std::move(events_arr);
     if (result.events.size() > 500) {
@@ -1102,6 +1113,26 @@ int main(int argc, char** argv) {
     MemoryModel memory(reader, index,
                        index.raw_db(), index.mem_write_cf(), index.mem_read_cf());
     LOG_DEBUG("RegisterFile + MemoryModel ready");
+
+    // RAII guard: on scope exit, invalidate MemoryModel's thread-local
+    // iterators and close the RocksDB DB (joining all background compaction
+    // threads) BEFORE MemoryModel's mutexes are destroyed.
+    //
+    // Without this, ~MemoryModel()'s pthread_mutex_destroy() can collide with
+    // RocksDB BG threads' own pthread_mutex_destroy() calls on macOS's global
+    // os_unfair_lock, triggering _os_unfair_lock_corruption_abort (SIGKILL).
+    //
+    // Destruction order at function exit: guard → memory → regfile → ...
+    // → index_result.  guard runs first, closing RocksDB; then memory's
+    // mutexes are destroyed with no BG threads running.
+    struct RocksDbShutdownGuard {
+        MemoryModel* memory;
+        TraceIndex* index;
+        ~RocksDbShutdownGuard() {
+            if (memory) memory->invalidate_thread_iterators();
+            if (index) index->close();
+        }
+    } shutdown_guard{&memory, &index};
 
     // ─── Run analysis options (batch mode) ─────────────────────────────────
     if (has_analysis_option) {
