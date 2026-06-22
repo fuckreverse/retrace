@@ -226,6 +226,12 @@ public:
     /// Invalidate all results.
     void invalidate_all();
 
+    /// Invalidate a pass result AND delete its persisted RocksDB blob so that
+    /// the next run performs a full re-computation instead of loading from cache.
+    /// Only meaningful for passes that use save_pass_blob (xref, function,
+    /// constant_materialization).  Safe to call for any pass name.
+    void invalidate_and_clear_blob(std::string_view pass_name);
+
     /// Request cancellation of all in-flight passes.  Passes that check
     /// `PassContext::cancelled()` will abort early.  Thread-safe.
     void cancel_all() { cancelled_.store(true, std::memory_order_release); }

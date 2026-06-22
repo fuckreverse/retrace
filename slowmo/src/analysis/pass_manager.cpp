@@ -1,6 +1,7 @@
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
 #include "common/logger.h"
+#include "io/index_builder.h"
 
 #include <algorithm>
 #include <cassert>
@@ -338,6 +339,15 @@ void PassManager::invalidate_all() {
         entry->cancelled.store(false, std::memory_order_release);
     }
     cancelled_.store(false, std::memory_order_release);
+}
+
+void PassManager::invalidate_and_clear_blob(std::string_view pass_name) {
+    // Reset in-memory state so the pass re-runs on next require().
+    invalidate(pass_name);
+    // Delete the persisted RocksDB blob so the pass doesn't reload from cache.
+    if (index_) {
+        index_->delete_pass_blob(pass_name);
+    }
 }
 
 // ─── Per-pass cancellation ────────────────────────────────────────────────

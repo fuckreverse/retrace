@@ -188,34 +188,71 @@ nlohmann::json ObjcResult::to_json() const {
 
 /// Sequential TraceCollector that processes Objc records and builds
 /// the ObjcResult. Requires MemoryModel + RegisterFile for argument extraction.
+///
+/// Performance notes:
+///   - on_objc() calls regfile_.state_before() which can be expensive (rebuild
+///     from anchor).  We use warm_range() to pre-populate the LRU cache and
+///     report progress based on inst_id advancement, not just INST record count.
+///   - Two state_before() calls per ObjC record are reduced to one by reusing
+///     the "pre" state for both arguments and return value when inst_id == pre+1.
 class ObjcCollector final : public TraceCollector {
 public:
+    using ProgressFn = std::function<void(uint64_t, uint64_t)>;
+
     ObjcCollector(MemoryModel& memory, RegisterFile& regfile,
                   CodeTable& code_table,
                   const std::string& class_filter,
-                  uint64_t start_inst_id, uint64_t end_inst_id)
+                  uint64_t start_inst_id, uint64_t end_inst_id,
+                  ProgressFn progress_fn = nullptr)
         : memory_(memory)
         , regfile_(regfile)
         , code_table_(code_table)
         , class_filter_(class_filter)
         , range_start_(start_inst_id)
         , range_end_(end_inst_id)
+        , progress_fn_(std::move(progress_fn))
     {}
 
     std::string_view name() const override { return "ObjcCollector"; }
 
-    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
+    bool begin(uint64_t start, uint64_t end) override {
         result_ = ObjcResult{};
         processed_ = 0;
+        objc_count_ = 0;
+        last_reported_inst_ = 0;
+        range_total_ = (end > start) ? (end - start) : 1;
+
+        // Pre-warm the RegisterFile LRU cache so that state_before() calls
+        // inside on_objc() hit warm cache entries instead of rebuilding from
+        // scratch each time.  This dramatically reduces the per-ObjC-record
+        // cost for large traces.
+        regfile_.warm_range(range_start_, range_end_);
+
         return true;
     }
 
-    void on_inst(uint64_t /*inst_id*/, const InstView& /*inst*/) override {
+    void on_inst(uint64_t inst_id, const InstView& /*inst*/) override {
         processed_++;
+
+        // Report progress based on instruction position — this is the primary
+        // progress metric since INST records are far more frequent than OBJC
+        // records.  Report every 64K instructions to avoid excessive callback
+        // overhead.
+        if (progress_fn_ && (processed_ & 0xFFFF) == 0) {
+            progress_fn_(processed_, range_total_);
+        }
     }
 
     void on_objc(uint64_t inst_id, const ObjcView& objc) override {
         if (inst_id < range_start_ || inst_id >= range_end_) return;
+
+        objc_count_++;
+
+        // Report progress on each ObjC record (they are rare but expensive)
+        if (progress_fn_) {
+            // Blend inst progress with objc count for smooth reporting
+            progress_fn_(processed_, range_total_);
+        }
 
         // Extract class name early for filtering
         std::string cls_name = extract_class_name(objc.cls);
@@ -252,11 +289,23 @@ public:
         }
         msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
 
-        if (msg.arg_count > 0) {
-            const auto& regs = regfile_.state_before(pre_inst_id);
+        // Fetch the pre-instruction register state once — used for both
+        // argument extraction (x2-x7) and return value (x0 at inst_id).
+        // The return value is actually x0 AFTER the ObjC call executes,
+        // which corresponds to the register state at inst_id (before the
+        // next instruction).  If inst_id == pre_inst_id + 1, we can derive
+        // it from state_before(inst_id); otherwise we need two calls.
+        const RegState* pre_regs = nullptr;
+        const RegState* ret_regs = nullptr;
+        RegState ret_state_storage;  // only used if inst_id != pre_inst_id + 1
 
+        if (msg.arg_count > 0) {
+            pre_regs = &regfile_.state_before(pre_inst_id);
+        }
+
+        if (pre_regs) {
             for (uint8_t k = 0; k < msg.arg_count; ++k) {
-                uint64_t val = regs.gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
+                uint64_t val = pre_regs->gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
                 msg.args[k].value = val;
 
                 msg.args[k].deref_str = try_deref_string(memory_, val, pre_inst_id);
@@ -269,10 +318,14 @@ public:
 
         // ─── Extract return value (x0 after the method returns) ──────────
         {
-            const auto& ret_regs = regfile_.state_before(inst_id);
-            msg.return_value = ret_regs.gpr[0];
-            msg.return_deref_str = try_deref_string(memory_, ret_regs.gpr[0], inst_id);
-            auto reg_str = try_decode_reg_ascii(ret_regs.gpr[0]);
+            // Return value: x0 at inst_id (the instruction that follows the
+            // objc_msgSend).  If pre_inst_id is inst_id-1 and we already have
+            // pre_regs, we still need state_before(inst_id) because the ObjC
+            // call modified x0.  The cache should make this cheap after warm_range.
+            const auto& inst_regs = regfile_.state_before(inst_id);
+            msg.return_value = inst_regs.gpr[0];
+            msg.return_deref_str = try_deref_string(memory_, inst_regs.gpr[0], inst_id);
+            auto reg_str = try_decode_reg_ascii(inst_regs.gpr[0]);
             if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
                 msg.return_deref_str = std::move(reg_str);
             }
@@ -306,6 +359,7 @@ public:
 
     ObjcResult take_result() { return std::move(result_); }
     uint64_t processed() const { return processed_; }
+    uint64_t objc_count() const { return objc_count_; }
 
 private:
     MemoryModel& memory_;
@@ -314,9 +368,13 @@ private:
     const std::string& class_filter_;
     uint64_t range_start_;
     uint64_t range_end_;
+    ProgressFn progress_fn_;
 
     ObjcResult result_;
     uint64_t processed_ = 0;
+    uint64_t objc_count_ = 0;
+    uint64_t last_reported_inst_ = 0;
+    uint64_t range_total_ = 1;
 };
 
 // ─── ObjcPass::run ───────────────────────────────────────────────────────
@@ -335,7 +393,11 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
     uint64_t total = (end > start) ? (end - start) : 1;
 
-    ObjcCollector collector(memory, regfile, code_table, class_filter_, start, end);
+    ObjcCollector collector(memory, regfile, code_table, class_filter_, start, end,
+        /*progress_fn=*/[&](uint64_t processed, uint64_t tot) {
+            ctx.progress(static_cast<float>(processed) / static_cast<float>(tot),
+                         fmt::format("Scanning insts... {}/{}", processed, tot));
+        });
 
     TraceScanEngine local_engine(reader, index.inst_count(), &index);
     local_engine.set_progress([&](uint64_t processed, uint64_t /*tot*/) {
