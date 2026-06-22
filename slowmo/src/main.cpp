@@ -9,6 +9,7 @@
 #include "gui/gui_app.h"
 #endif
 #include "analysis/pass_manager.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/xref_pass.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
@@ -43,6 +44,8 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
+#include "analysis/passes/disassembly_pass.h"
+#include "analysis/passes/index_build_pass.h"
 #include "io/rpc_server.h"
 #include "io/streaming_index.h"
 #include "io/recent_files.h"
@@ -506,6 +509,10 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  -i                     Show index build statistics\n");
     fmt::print(stderr, "  -h                     Show this help\n");
     fmt::print(stderr, "\nAnalysis options (batch mode, suppress interactive):\n");
+    fmt::print(stderr, "  --run-pass <name>         Run any catalog pass (repeatable). Names: see --list-passes\n");
+    fmt::print(stderr, "  --list-passes             List all available pass names and exit\n");
+    fmt::print(stderr, "  --disassembly             Build PC-indexed disassembly table\n");
+    fmt::print(stderr, "  --index-build             (Re)build the RocksDB trace index\n");
     fmt::print(stderr, "  --export-cfg <file.dot>   Export annotated CFG as Graphviz DOT\n");
     fmt::print(stderr, "  --taint <reg_index>       Run taint analysis from register index\n");
     fmt::print(stderr, "  --taint-inst <inst_id>    Start taint from specific instruction ID\n");
@@ -699,6 +706,13 @@ int main(int argc, char** argv) {
     // P3: Thread filter
     bool opt_thread_filter = false;
     std::vector<uint64_t> thread_filter_ids;
+
+    // Generic pass runner: --run-pass <name> (repeatable). Runs any catalog
+    // pass with default config and prints a one-line summary. Makes every
+    // pass available headless without a dedicated flag.
+    bool opt_disassembly = false;
+    bool opt_index_build = false;
+    std::vector<std::string> run_pass_names;
 
     // P3: RPC server mode
     bool opt_rpc = false;
@@ -918,6 +932,30 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        } else if (arg == "--disassembly") {
+            opt_disassembly = true;
+        } else if (arg == "--index-build") {
+            opt_index_build = true;
+        } else if (arg == "--run-pass" && i + 1 < argc) {
+            run_pass_names.push_back(argv[++i]);
+        } else if (arg == "--list-passes") {
+            fmt::print("Available passes (for --run-pass <name>):\n");
+            for (const auto& e : tenet::pass_catalog()) {
+                const char* cat = "Misc";
+                switch (e.category) {
+                    case tenet::PassCategory::Structure:  cat = "Structure"; break;
+                    case tenet::PassCategory::Taint:      cat = "Taint";     break;
+                    case tenet::PassCategory::Crypto:     cat = "Crypto";    break;
+                    case tenet::PassCategory::Memory:     cat = "Memory";    break;
+                    case tenet::PassCategory::ObjcSyscall:cat = "ObjC/Sys";  break;
+                    case tenet::PassCategory::Profile:    cat = "Profile";   break;
+                    case tenet::PassCategory::Misc:       cat = "Misc";      break;
+                }
+                fmt::print("  {:<24} [{:<10}] {}{}\n", e.name, cat,
+                           e.description,
+                           e.default_for_ui == tenet::PassDefault::Yes ? "  (default)" : "");
+            }
+            return 0;
         } else if (arg == "--rpc") {
             opt_rpc = true;
             // Optional: --rpc /tmp/my.sock
@@ -962,7 +1000,9 @@ int main(int argc, char** argv) {
                                opt_cache_sim || opt_yara_mem_scan || opt_thread_filter ||
                                opt_rpc || opt_streaming || opt_stats_only ||
                                opt_objc_crypto || opt_syscall_intercept ||
-                               opt_taint_source_annotation;
+                               opt_taint_source_annotation ||
+                               opt_disassembly || opt_index_build ||
+                               !run_pass_names.empty();
 
     // ─── Open trace file ────────────────────────────────────────────────
     fmt::print("Opening trace: {}\n", trace_path);
@@ -2474,6 +2514,60 @@ int main(int argc, char** argv) {
                 }
                 tf_json["threads"] = std::move(threads_arr);
                 fmt::print("{}\n", tf_json.dump(2));
+            }
+        }
+
+        // ── --disassembly: build PC-indexed disassembly table ─────────────
+        if (opt_disassembly) {
+            pm.register_pass(std::make_unique<DisassemblyPass>());
+            const auto& raw = pm.require("disassembly");
+            if (!raw.ok()) {
+                fmt::print(stderr, "[disassembly] Pass failed: {}\n", raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& tbl = raw.get<DisasmTable>();
+                fmt::print(stderr, "[disassembly] {} unique PCs, {} instructions indexed\n",
+                           tbl.unique_pc_count(), tbl.inst_count());
+            }
+        }
+
+        // ── --index-build: (re)build the RocksDB trace index ──────────────
+        if (opt_index_build) {
+            pm.register_pass(std::make_unique<IndexBuildPass>());
+            const auto& raw = pm.require("index_build");
+            if (!raw.ok()) {
+                fmt::print(stderr, "[index-build] Pass failed: {}\n", raw.error_message);
+                rc |= 1;
+            } else {
+                const auto& stats = raw.get<IndexStats>();
+                fmt::print(stderr, "[index-build] {} insts, {} anchors, {} code, built in {:.1f}s\n",
+                           stats.inst_count, stats.anchor_count,
+                           stats.code_count, stats.build_seconds);
+            }
+        }
+
+        // ── --run-pass <name>: generic pass runner ────────────────────────
+        // Runs any catalog pass with a default PassRunCtx and prints a
+        // one-line summary. Repeatable. Unknown names are reported.
+        if (!run_pass_names.empty()) {
+            tenet::PassRunCtx pctx;
+            pctx.current_inst = 0;
+            pctx.total_inst = index.inst_count();
+            for (const auto& pname : run_pass_names) {
+                if (!tenet::is_known_pass(pname)) {
+                    fmt::print(stderr, "[run-pass] unknown pass '{}'\n", pname);
+                    rc |= 1;
+                    continue;
+                }
+                if (!tenet::register_pass_by_name(pm, pname, pctx)) {
+                    fmt::print(stderr, "[run-pass] '{}' could not be registered\n", pname);
+                    rc |= 1;
+                    continue;
+                }
+                const auto& raw = pm.require(pname);
+                std::string summary = tenet::summarize_pass_result(pname, raw);
+                fmt::print(stderr, "[run-pass] {}: {}\n", pname, summary);
+                if (!raw.ok()) rc |= 1;
             }
         }
 
