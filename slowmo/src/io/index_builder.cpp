@@ -1293,4 +1293,43 @@ uint64_t TraceIndex::load_last_inst() const {
     return id;
 }
 
+// ─── Generic pass-result blob cache ───────────────────────────────────────
+
+void TraceIndex::save_pass_blob(std::string_view pass_name,
+                                const void* data, size_t size) {
+    if (!db_ || !data || size == 0) return;
+    auto* meta_cf = get_cf(cf::META);
+    if (!meta_cf) return;
+
+    // Key: "pass:<name>" to avoid collisions with other META keys.
+    std::string key;
+    key.reserve(5 + pass_name.size());
+    key += "pass:";
+    key += pass_name;
+
+    rocksdb::WriteOptions wo;
+    wo.sync = false;
+    db_->Put(wo, meta_cf, key,
+             rocksdb::Slice(static_cast<const char*>(data), size));
+}
+
+bool TraceIndex::load_pass_blob(std::string_view pass_name,
+                                std::string& out) const {
+    if (!db_) return false;
+    auto* meta_cf = get_cf(cf::META);
+    if (!meta_cf) return false;
+
+    std::string key;
+    key.reserve(5 + pass_name.size());
+    key += "pass:";
+    key += pass_name;
+
+    std::string value;
+    auto s = db_->Get(rocksdb::ReadOptions(), meta_cf, key, &value);
+    if (!s.ok() || value.empty()) return false;
+
+    out = std::move(value);
+    return true;
+}
+
 }  // namespace tenet

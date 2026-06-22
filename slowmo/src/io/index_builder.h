@@ -170,6 +170,33 @@ public:
     /// Load the last-visited instruction id, or 0 if not stored.
     uint64_t load_last_inst() const;
 
+    // ─── Generic pass-result blob cache ──────────────────────────────────
+    //
+    // Passes can persist their serialized results into the META column family
+    // under a key of the form "pass:<name>".  On the next open, the pass
+    // reads back the blob and skips the expensive trace scan entirely.
+    //
+    // The blob is opaque from TraceIndex's perspective — each pass owns its
+    // own serialisation format.  TraceIndex merely stores and retrieves bytes.
+    //
+    // Cache validity: the index is already tied to a specific trace file via
+    // the schema_version + file_size + trace_hash triple checked in
+    // is_valid_for().  When any of those change the whole DB is rebuilt, which
+    // automatically invalidates all cached pass blobs as well.
+
+    /// Persist a pass-result blob.  Overwrites any previously saved value.
+    /// @param pass_name  Unique pass identifier (e.g. "xref", "function").
+    /// @param data       Pointer to serialized bytes.
+    /// @param size       Byte count.
+    void save_pass_blob(std::string_view pass_name,
+                        const void* data, size_t size);
+
+    /// Load a previously persisted pass-result blob.
+    /// Returns false (and leaves `out` unchanged) if no blob exists for this pass.
+    /// @param pass_name  Same identifier used in save_pass_blob().
+    /// @param out        Receives the raw bytes on success.
+    bool load_pass_blob(std::string_view pass_name, std::string& out) const;
+
 private:
     TraceIndex() = default;
 
