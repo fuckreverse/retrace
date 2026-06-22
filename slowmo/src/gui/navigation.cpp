@@ -109,6 +109,8 @@ void GuiApp::navigate_to(uint64_t inst_id) {
     if (inst_id >= total_inst_) inst_id = total_inst_ > 0 ? total_inst_ - 1 : 0;
     nav_push(inst_id);
     current_inst_ = inst_id;
+    // Request auto-scroll so the instruction panel brings this row into view
+    scroll_to_current_ = true;
     // Mark taint sorted list dirty so next jump recomputes
     taint_sorted_ids_dirty_ = true;
 }

@@ -202,7 +202,14 @@ void GuiApp::render_instruction_panel() {
                     ImGui::PopStyleColor(3);
 
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                        navigate_to(inst_id);
+                        // Select without triggering auto-scroll — the user
+                        // already sees the row they clicked, so keep the
+                        // viewport where it is.
+                        if (inst_id >= total_inst_)
+                            inst_id = total_inst_ > 0 ? total_inst_ - 1 : 0;
+                        nav_push(inst_id);
+                        current_inst_ = inst_id;
+                        taint_sorted_ids_dirty_ = true;
                     }
                     if (ImGui::IsItemHovered()) {
                         std::string tip;
@@ -262,11 +269,11 @@ void GuiApp::render_instruction_panel() {
         }
         clipper.End();
 
-        // ── Auto-scroll: keep current instruction centered ────────────
-        // Only scroll if the current instruction changed this frame
-        static uint64_t last_scrolled_inst = UINT64_MAX;
-        if (current_inst_ != last_scrolled_inst && current_inst_ < total_inst_) {
-            last_scrolled_inst = current_inst_;
+        // ── Auto-scroll: bring current instruction into view ─────────
+        // Only triggered by explicit navigation (navigate_to), not by mouse
+        // clicks on a visible row (which leave the viewport unchanged).
+        if (scroll_to_current_ && current_inst_ < total_inst_) {
+            scroll_to_current_ = false;
             float item_h    = ImGui::GetTextLineHeightWithSpacing();
             float panel_h   = ImGui::GetWindowHeight();
             float target_y  = static_cast<float>(current_inst_) * item_h - panel_h * 0.45f;

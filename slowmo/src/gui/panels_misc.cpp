@@ -570,42 +570,58 @@ void GuiApp::render_progress_overlay() {
     }
 
     // ── LANE 2: Call-depth sparkline ──────────────────────────────────
-    // Show function call stack depth as a filled area chart
+    // Show function call stack depth as a filled area chart.
+    // The sparkline data is pre-computed and cached in sparkline_cache_ to
+    // avoid calling call_stack_at() ~600 times per frame (each O(N) scan).
     if (function_result_ && !function_result_->call_events.empty()) {
-        const int kSamples = std::min(static_cast<int>(W), 600);
-        uint64_t sample_step = std::max(uint64_t(1), total_inst_ / static_cast<uint64_t>(kSamples));
+        // ── Rebuild cache if stale ────────────────────────────────────
+        if (sparkline_cache_.source != function_result_ ||
+            sparkline_cache_.total_inst != total_inst_) {
+            const int kSamples = std::min(static_cast<int>(W), 600);
+            uint64_t sample_step = std::max(uint64_t(1),
+                total_inst_ / static_cast<uint64_t>(kSamples));
 
-        // Find max depth for normalization
-        uint64_t max_depth = 1;
-        for (const auto& evt : function_result_->call_events) {
-            if (evt.depth + 1 > max_depth) max_depth = evt.depth + 1;
+            sparkline_cache_.depths.resize(static_cast<size_t>(kSamples + 1));
+            sparkline_cache_.max_depth = 1;
+
+            for (int si = 0; si <= kSamples; si++) {
+                uint64_t sample_id = static_cast<uint64_t>(si) * sample_step;
+                if (sample_id >= total_inst_) sample_id = total_inst_ - 1;
+                // depth_at is O(log N) via binary search on depth_table_
+                uint64_t d = function_result_->depth_at(sample_id);
+                sparkline_cache_.depths[static_cast<size_t>(si)] = d;
+                if (d > sparkline_cache_.max_depth) sparkline_cache_.max_depth = d;
+            }
+            if (sparkline_cache_.max_depth > 24) sparkline_cache_.max_depth = 24;
+
+            sparkline_cache_.source     = function_result_;
+            sparkline_cache_.total_inst = total_inst_;
         }
-        if (max_depth > 24) max_depth = 24;  // cap at 24 levels
 
+        // ── Render from cache ─────────────────────────────────────────
+        const int kSamples = static_cast<int>(sparkline_cache_.depths.size()) - 1;
+        uint64_t sample_step = std::max(uint64_t(1),
+            total_inst_ / static_cast<uint64_t>(kSamples));
+        const uint64_t max_depth = sparkline_cache_.max_depth;
         const float sparkline_h = L2_bot - L2_top;
 
-        // Build sparkline points by sampling call stack depth at intervals
         float prev_x = p0.x, prev_y = p0.y + L2_bot;
         uint64_t prev_depth = 0;
         for (int si = 0; si <= kSamples; si++) {
             uint64_t sample_id = static_cast<uint64_t>(si) * sample_step;
             if (sample_id >= total_inst_) sample_id = total_inst_ - 1;
 
-            // Get call stack depth at this point
-            auto stk = function_result_->call_stack_at(sample_id);
-            uint64_t depth = stk.size();
+            uint64_t depth = sparkline_cache_.depths[static_cast<size_t>(si)];
             if (depth > max_depth) depth = max_depth;
 
             float fx = inst_to_x(sample_id);
             float fy = p0.y + L2_bot - (static_cast<float>(depth) / static_cast<float>(max_depth)) * sparkline_h;
 
             if (si > 0 && (depth != prev_depth || si == kSamples)) {
-                // Draw filled area from baseline
                 draw->AddRectFilledMultiColor(
                     ImVec2(prev_x, prev_y), ImVec2(fx, p0.y + L2_bot),
                     IM_COL32(40, 100, 200, 60), IM_COL32(40, 100, 200, 60),
                     IM_COL32(40, 100, 200, 20), IM_COL32(40, 100, 200, 20));
-                // Draw top edge line
                 draw->AddLine(ImVec2(prev_x, prev_y), ImVec2(fx, prev_y),
                               IM_COL32(60, 140, 255, 150), 1.0f);
             }

@@ -173,7 +173,7 @@ void GuiApp::render_menu_bar() {
                     if (evt) {
                         navigate_to(evt->call_inst_id);
                     } else {
-                        auto stk = function_result_->call_stack_at(current_inst_);
+                        const auto& stk = current_call_stack();
                         if (!stk.empty()) {
                             navigate_to(stk.back()->call_inst_id);
                         }
@@ -357,7 +357,7 @@ void GuiApp::render_toolbar() {
     if (function_result_) {
         bool has_call = (function_result_->call_at(current_inst_) != nullptr);
         bool has_ret  = (function_result_->return_at(current_inst_) != nullptr ||
-                         !function_result_->call_stack_at(current_inst_).empty());
+                         !current_call_stack().empty());
 
         if (!has_call) ImGui::BeginDisabled();
         if (ImGui::Button("\xe2\x86\xb3 Enter", ImVec2(0, btn_h))) {  // ↳
@@ -377,7 +377,7 @@ void GuiApp::render_toolbar() {
             if (evt) {
                 navigate_to(evt->call_inst_id);
             } else {
-                auto stk = function_result_->call_stack_at(current_inst_);
+                const auto& stk = current_call_stack();
                 if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
             }
         }

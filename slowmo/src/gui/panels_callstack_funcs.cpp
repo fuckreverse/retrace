@@ -18,6 +18,22 @@
 
 namespace tenet {
 
+// ─── Per-frame call-stack cache ──────────────────────────────────────────────
+
+const std::vector<const CallEvent*>& GuiApp::current_call_stack() {
+    if (callstack_frame_cache_.source  != function_result_ ||
+        callstack_frame_cache_.inst_id != current_inst_) {
+        if (function_result_) {
+            callstack_frame_cache_.stack = function_result_->call_stack_at(current_inst_);
+        } else {
+            callstack_frame_cache_.stack.clear();
+        }
+        callstack_frame_cache_.source  = function_result_;
+        callstack_frame_cache_.inst_id = current_inst_;
+    }
+    return callstack_frame_cache_.stack;
+}
+
 // ─── Call Stack Panel ───────────────────────────────────────────────────────
 
 void GuiApp::render_callstack_panel() {
@@ -48,7 +64,7 @@ void GuiApp::render_callstack_panel() {
         if (evt) {
             navigate_to(evt->call_inst_id);
         } else {
-            auto stack = function_result_->call_stack_at(current_inst_);
+            const auto& stack = current_call_stack();
             if (!stack.empty()) {
                 navigate_to(stack.back()->call_inst_id);
             }
@@ -57,7 +73,7 @@ void GuiApp::render_callstack_panel() {
 
     ImGui::Separator();
 
-    auto stack = function_result_->call_stack_at(current_inst_);
+    const auto& stack = current_call_stack();
     if (stack.empty()) {
         ImGui::TextDisabled("<top-level>");
     } else {
@@ -171,7 +187,7 @@ void GuiApp::render_callstack_context_menu() {
         return;
     }
 
-    auto stack = function_result_->call_stack_at(current_inst_);
+    const auto& stack = current_call_stack();
     if (ImGui::BeginPopup("##cs_ctx")) {
         if (ctx_callstack_frame_ < stack.size()) {
             auto* evt = stack[ctx_callstack_frame_];
@@ -237,48 +253,63 @@ void GuiApp::render_functions_panel() {
 
     ImGui::Separator();
 
-    // Build display list (filter + sort)
-    struct FuncEntry {
-        uint64_t pc;
-        const FunctionInfo* info;
-    };
-    std::vector<FuncEntry> entries;
-    entries.reserve(function_result_->functions.size());
+    // Build display list (filter + sort) — cached; rebuilt only when data/params change.
+    // Use FuncListCache so we don't sort O(N log N) every frame.
+    bool cache_stale = (func_list_cache_.source         != function_result_ ||
+                        func_list_cache_.filter          != function_filter_ ||
+                        func_list_cache_.sort_col        != function_sort_col_ ||
+                        func_list_cache_.sort_ascending  != function_sort_ascending_);
 
-    std::string lower_filter = function_filter_;
-    std::transform(lower_filter.begin(), lower_filter.end(), lower_filter.begin(), ::tolower);
+    if (cache_stale) {
+        func_list_cache_.entries.clear();
+        func_list_cache_.entries.reserve(function_result_->functions.size());
 
-    for (const auto& [pc, info] : function_result_->functions) {
-        if (!function_filter_.empty()) {
-            std::string lower_name = info.name;
-            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-            if (lower_name.find(lower_filter) == std::string::npos) continue;
+        std::string lower_filter = function_filter_;
+        std::transform(lower_filter.begin(), lower_filter.end(), lower_filter.begin(), ::tolower);
+
+        for (const auto& [pc, info] : function_result_->functions) {
+            if (!function_filter_.empty()) {
+                std::string lower_name = info.name;
+                std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+                if (lower_name.find(lower_filter) == std::string::npos) continue;
+            }
+            func_list_cache_.entries.push_back({pc, &info});
         }
-        entries.push_back({pc, &info});
+
+        // Sort once
+        switch (function_sort_col_) {
+        case 0: // calls
+            std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
+                [&](const auto& a, const auto& b) {
+                    return function_sort_ascending_
+                        ? a.info->total_calls < b.info->total_calls
+                        : a.info->total_calls > b.info->total_calls;
+                });
+            break;
+        case 1: // name
+            std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
+                [&](const auto& a, const auto& b) {
+                    return function_sort_ascending_
+                        ? a.info->name < b.info->name
+                        : a.info->name > b.info->name;
+                });
+            break;
+        case 2: // address
+            std::sort(func_list_cache_.entries.begin(), func_list_cache_.entries.end(),
+                [&](const auto& a, const auto& b) {
+                    return function_sort_ascending_ ? a.pc < b.pc : a.pc > b.pc;
+                });
+            break;
+        }
+
+        func_list_cache_.source        = function_result_;
+        func_list_cache_.filter        = function_filter_;
+        func_list_cache_.sort_col      = function_sort_col_;
+        func_list_cache_.sort_ascending = function_sort_ascending_;
     }
 
-    // Sort
-    switch (function_sort_col_) {
-    case 0: // calls
-        std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-            return function_sort_ascending_
-                ? a.info->total_calls < b.info->total_calls
-                : a.info->total_calls > b.info->total_calls;
-        });
-        break;
-    case 1: // name
-        std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-            return function_sort_ascending_
-                ? a.info->name < b.info->name
-                : a.info->name > b.info->name;
-        });
-        break;
-    case 2: // address
-        std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-            return function_sort_ascending_ ? a.pc < b.pc : a.pc > b.pc;
-        });
-        break;
-    }
+    // Use a local alias for cleaner code below
+    const auto& entries = func_list_cache_.entries;
 
     ImGui::Text("Showing: %zu", entries.size());
     ImGui::Separator();
@@ -296,42 +327,15 @@ void GuiApp::render_functions_panel() {
         ImGui::TableSetupColumn("Insts", ImGuiTableColumnFlags_WidthFixed, 60.0f, 3);
         ImGui::TableHeadersRow();
 
-        // Handle sort specs
+        // Handle sort specs: update parameters and invalidate cache for next frame rebuild.
         if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
             if (sort_specs->SpecsDirty && sort_specs->SpecsCount > 0) {
                 auto& spec = sort_specs->Specs[0];
                 function_sort_ascending_ = (spec.SortDirection == ImGuiSortDirection_Ascending);
                 function_sort_col_ = static_cast<int>(spec.ColumnUserID);
                 sort_specs->SpecsDirty = false;
-                // Re-sort entries
-                switch (function_sort_col_) {
-                case 0:
-                    std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-                        return function_sort_ascending_
-                            ? a.info->total_calls < b.info->total_calls
-                            : a.info->total_calls > b.info->total_calls;
-                    });
-                    break;
-                case 1:
-                    std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-                        return function_sort_ascending_
-                            ? a.info->name < b.info->name
-                            : a.info->name > b.info->name;
-                    });
-                    break;
-                case 2:
-                    std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-                        return function_sort_ascending_ ? a.pc < b.pc : a.pc > b.pc;
-                    });
-                    break;
-                case 3:
-                    std::sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
-                        return function_sort_ascending_
-                            ? a.info->total_instructions < b.info->total_instructions
-                            : a.info->total_instructions > b.info->total_instructions;
-                    });
-                    break;
-                }
+                // Invalidate cache — will be rebuilt before rendering (see cache_stale above).
+                func_list_cache_.sort_col = -1;
             }
         }
 
@@ -341,6 +345,7 @@ void GuiApp::render_functions_panel() {
         while (clipper.Step()) {
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
                 const auto& entry = entries[i];
+                const auto* info = entry.info;
                 uint64_t static_pc = entry.pc - reader_.header().module_slide;
 
                 ImGui::TableNextRow();
@@ -348,19 +353,19 @@ void GuiApp::render_functions_panel() {
                 // Name column (clickable)
                 ImGui::TableSetColumnIndex(0);
                 char label[256];
-                snprintf(label, sizeof(label), "%s##func%d", entry.info->name.c_str(), i);
+                snprintf(label, sizeof(label), "%s##func%d", info->name.c_str(), i);
                 if (ImGui::Selectable(label, false, ImGuiSelectableFlags_SpanAllColumns)) {
                     // Jump to first invocation
-                    if (!entry.info->call_event_indices.empty()) {
-                        const auto& evt = function_result_->call_events[entry.info->call_event_indices[0]];
+                    if (!info->call_event_indices.empty()) {
+                        const auto& evt = function_result_->call_events[info->call_event_indices[0]];
                         navigate_to(evt.call_inst_id + 1);
                     }
                 }
                 if (ImGui::IsItemHovered()) {
                     std::string tip = fmt::format("{}\n0x{:016x}\ncalls: {}, insts: {}",
-                        entry.info->name, static_pc,
-                        (unsigned long long)entry.info->total_calls,
-                        (unsigned long long)entry.info->total_instructions);
+                        info->name, static_pc,
+                        (unsigned long long)info->total_calls,
+                        (unsigned long long)info->total_instructions);
                     if (call_graph_result_) {
                         auto* node = call_graph_result_->node_at(entry.pc);
                         if (node) {
@@ -373,14 +378,14 @@ void GuiApp::render_functions_panel() {
                 }
                 if (ImGui::BeginPopupContextItem(nullptr)) {
                     ctx_func_pc_   = entry.pc;
-                    ctx_func_name_ = entry.info->name;
+                    ctx_func_name_ = info->name;
                     uint64_t s_pc  = entry.pc - reader_.header().module_slide;
                     ImGui::TextDisabled("%s", ctx_func_name_.c_str());
                     ImGui::TextDisabled("0x%llx", (unsigned long long)s_pc);
                     ImGui::Separator();
                     if (ImGui::MenuItem("Jump to First Call")) {
-                        if (!entry.info->call_event_indices.empty()) {
-                            const auto& evt = function_result_->call_events[entry.info->call_event_indices[0]];
+                        if (!info->call_event_indices.empty()) {
+                            const auto& evt = function_result_->call_events[info->call_event_indices[0]];
                             navigate_to(evt.call_inst_id + 1);
                         }
                     }
@@ -401,11 +406,11 @@ void GuiApp::render_functions_panel() {
 
                 // Calls column
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%llu", (unsigned long long)entry.info->total_calls);
+                ImGui::Text("%llu", (unsigned long long)info->total_calls);
 
                 // Instructions column
                 ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%llu", (unsigned long long)entry.info->total_instructions);
+                ImGui::Text("%llu", (unsigned long long)info->total_instructions);
             }
         }
         clipper.End();

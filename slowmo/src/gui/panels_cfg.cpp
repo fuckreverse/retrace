@@ -145,6 +145,21 @@ void GuiApp::rebuild_cfg_for_function(uint64_t func_entry_pc) {
     }
 }
 
+// ─── Edge lookup cache ───────────────────────────────────────────────────────
+// Builds an O(1) (from_block, to_block) → CFGEdge* map so that the edge
+// drawing loop doesn't need an O(E) inner scan per edge.
+// Called once per function change; cost is O(E) and amortised over many frames.
+
+void GuiApp::rebuild_cfg_edge_lookup(const CFGResult* cfg) {
+    cfg_edge_lookup_.clear();
+    cfg_edge_lookup_source_ = cfg;
+    if (!cfg) return;
+    cfg_edge_lookup_.reserve(cfg->edges.size() * 2);
+    for (const auto& edge : cfg->edges) {
+        cfg_edge_lookup_[{edge.from_block, edge.to_block}] = &edge;
+    }
+}
+
 // ─── CFG Panel ───────────────────────────────────────────────────────────────
 // An interactive, pannable, zoomable CFG view.
 // Blocks are drawn as rounded rectangles with instruction text.
@@ -170,6 +185,12 @@ void GuiApp::render_cfg_panel() {
 
     // Effective CFG data: use per-function sub-graph when available, else full-trace
     const CFGResult* active_cfg = cfg_func_result_ ? cfg_func_result_.get() : cfg_result_;
+
+    // Rebuild edge lookup cache if active_cfg changed.
+    // This is O(E) but happens only on function switch, not every frame.
+    if (active_cfg != cfg_edge_lookup_source_) {
+        rebuild_cfg_edge_lookup(active_cfg);
+    }
 
     // ── Toolbar row 1: controls ───────────────────────────────────────
     if (ImGui::Button("Run CFG Layout")) {
@@ -409,32 +430,31 @@ void GuiApp::render_cfg_panel() {
         float  edge_width = 1.0f;
 
         if (active_cfg) {
-            for (const auto& cfg_edge : active_cfg->edges) {
-                if (cfg_edge.from_block == edge.from_block &&
-                    cfg_edge.to_block   == edge.to_block) {
-                    // Width proportional to taken_count (log scale, 1..4px)
-                    float t_edge = (cfg_max_edge_count_ > 1)
-                        ? static_cast<float>(cfg_edge.taken_count) / static_cast<float>(cfg_max_edge_count_)
-                        : 0.0f;
-                    edge_width = 1.0f + t_edge * 3.0f;
+            // O(1) lookup via prebuilt hash map (was O(E) linear scan each edge)
+            auto lit = cfg_edge_lookup_.find({edge.from_block, edge.to_block});
+            if (lit != cfg_edge_lookup_.end()) {
+                const CFGEdge& cfg_edge = *lit->second;
+                // Width proportional to taken_count (log scale, 1..4px)
+                float t_edge = (cfg_max_edge_count_ > 1)
+                    ? static_cast<float>(cfg_edge.taken_count) / static_cast<float>(cfg_max_edge_count_)
+                    : 0.0f;
+                edge_width = 1.0f + t_edge * 3.0f;
 
-                    // Hue: fallthrough = green tint, branch = orange/red tint, scaled by hotness
-                    if (cfg_edge.is_fallthrough) {
-                        uint8_t g_val = static_cast<uint8_t>(100 + t_edge * 155);
-                        edge_color = IM_COL32(40, g_val, 60, 200);
-                    } else {
-                        uint8_t r_val = static_cast<uint8_t>(120 + t_edge * 135);
-                        edge_color = IM_COL32(r_val, static_cast<uint8_t>(80 - t_edge * 40), 40, 200);
-                    }
+                // Hue: fallthrough = green tint, branch = orange/red tint, scaled by hotness
+                if (cfg_edge.is_fallthrough) {
+                    uint8_t g_val = static_cast<uint8_t>(100 + t_edge * 155);
+                    edge_color = IM_COL32(40, g_val, 60, 200);
+                } else {
+                    uint8_t r_val = static_cast<uint8_t>(120 + t_edge * 135);
+                    edge_color = IM_COL32(r_val, static_cast<uint8_t>(80 - t_edge * 40), 40, 200);
+                }
 
-                    // Extra highlight if this edge connects to/from current block
-                    bool is_active_edge = (cfg_edge.from_block == highlight_block_pc ||
-                                           cfg_edge.to_block   == highlight_block_pc);
-                    if (is_active_edge) {
-                        edge_color = IM_COL32(100, 200, 255, 255);
-                        edge_width = std::max(edge_width, 2.0f);
-                    }
-                    break;
+                // Extra highlight if this edge connects to/from current block
+                bool is_active_edge = (cfg_edge.from_block == highlight_block_pc ||
+                                       cfg_edge.to_block   == highlight_block_pc);
+                if (is_active_edge) {
+                    edge_color = IM_COL32(100, 200, 255, 255);
+                    edge_width = std::max(edge_width, 2.0f);
                 }
             }
         }

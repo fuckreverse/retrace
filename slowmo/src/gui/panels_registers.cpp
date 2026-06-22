@@ -237,7 +237,7 @@ void GuiApp::render_register_panel() {
             if (idx == 30 && function_result_) {
                 ImGui::Separator();
                 if (ImGui::MenuItem("Follow LR (jump to call site)")) {
-                    auto stack = function_result_->call_stack_at(current_inst_);
+                    const auto& stack = current_call_stack();
                     if (!stack.empty()) navigate_to(stack.back()->call_inst_id);
                 }
             }
