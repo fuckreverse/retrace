@@ -5,14 +5,30 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ─── Default build type: Debug for fast iterative development ───────────────
+# Unless explicitly specified, build in Debug mode which skips heavy
+# optimizations (ThinLTO / -O3 / -mcpu) so incremental builds stay fast —
+# important because the test suite has 37+ executables that all link tenet_lib.
+# Pass -DCMAKE_BUILD_TYPE=Release for a fully-optimized build.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING
+        "Build type (Debug/Release/RelWithDebInfo/MinSizeRel)" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
 # ─── Performance: LTO, PGO, and architecture-specific tuning ────────────────
-include(CheckIPOSupported)
-check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
-if(_ipo_supported)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-    message(STATUS "ThinLTO enabled (interprocedural optimization)")
-else()
-    message(STATUS "LTO not supported: ${_ipo_error}")
+# ThinLTO only applies to non-Debug builds; Debug keeps the compiler/linker
+# fast for tight edit-compile-test loops (a single LTO link costs ~13s, and
+# the default `ninja` target rebuilds 41 executables on any tenet_lib change).
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
+    if(_ipo_supported)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        message(STATUS "ThinLTO enabled (interprocedural optimization)")
+    else()
+        message(STATUS "LTO not supported: ${_ipo_error}")
+    endif()
 endif()
 
 # ─── PGO (Profile-Guided Optimization) ─────────────────────────────────────
@@ -43,11 +59,14 @@ elseif(TENET_PGO_MODE STREQUAL "use")
 endif()
 
 # Target Apple Silicon (M1+) for NEON auto-vectorization and LSE atomics.
-# Only set for native builds; cross-compilation should specify its own -mcpu.
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND NOT CMAKE_CROSSCOMPILING)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-m1")
-    message(STATUS "Targeting Apple M1+ (NEON + LSE atomics)")
+# Only set for native, non-Debug builds; cross-compilation should specify its
+# own -mcpu.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND NOT CMAKE_CROSSCOMPILING)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-m1")
+        message(STATUS "Targeting Apple M1+ (NEON + LSE atomics)")
+    endif()
 endif()
 
 # ─── Options ────────────────────────────────────────────────────────────────

@@ -29,6 +29,14 @@ function(tenet_add_test target_name source_file)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE tenet_lib Catch2::Catch2WithMain)
     target_include_directories(${target_name} PRIVATE ${TENET_TEST_INCLUDES})
+    # Tests prioritize build speed over runtime speed:
+    #  - Never use LTO (each test links ~10x faster without it).
+    #  - Cap optimization at -O1 in non-Debug configs; -O3 is pointless for
+    #    unit tests and significantly slows compilation.
+    set_target_properties(${target_name} PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_compile_options(${target_name} PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:-O1>)
     # Catch2 test discovery: registers each TEST_CASE as a CTest entry.
     # PRE_TEST mode defers discovery to ctest run-time so configure-stage
     # doesn't need the binary to already be built (avoids _NOT_BUILT entries).
@@ -90,3 +98,6 @@ tenet_add_test(test_perf_passes           perf/test_perf_passes.cpp)
 add_executable(gen_test_traces tools/gen_test_traces.cpp)
 target_link_libraries(gen_test_traces PRIVATE tenet_lib)
 target_include_directories(gen_test_traces PRIVATE ${TENET_TEST_INCLUDES})
+# Same fast-build treatment as the test targets above.
+set_target_properties(gen_test_traces PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+target_compile_options(gen_test_traces PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O1>)
