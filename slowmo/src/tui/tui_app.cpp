@@ -1,5 +1,6 @@
 #include "tui/tui_app.h"
 #include "analysis/pass_manager.h"
+#include "analysis/pass_registry.h"
 #include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/slice_pass.h"
@@ -838,6 +839,40 @@ void TuiApp::execute_cmd() {
         return;
     }
 
+    // ── Pass commands: ':pass <name>', ':passes', ':analyze' ──────────
+    // These make every catalog pass reachable from the TUI.
+    if (trimmed.rfind("pass ", 0) == 0) {
+        std::string pname = trimmed.substr(5);
+        // trim
+        auto e = pname.find_last_not_of(" \t");
+        if (e != std::string::npos) pname.erase(e + 1);
+        auto s = pname.find_first_not_of(" \t");
+        if (s != std::string::npos) pname.erase(0, s); else pname.clear();
+        if (pname.empty()) {
+            cmd_error_ = "usage: pass <name>  (use ':passes' to list)";
+        } else {
+            run_pass_by_name(pname);
+            bp_status_msg_ = last_pass_status_;
+        }
+        close_cmd_dialog();
+        return;
+    }
+    if (trimmed == "passes") {
+        std::string msg = "Available passes (use ':pass <name>'):";
+        for (const auto& e : tenet::pass_catalog()) {
+            msg += fmt::format("\n  {:<24} {}", e.name, e.description);
+        }
+        bp_status_msg_ = msg;
+        close_cmd_dialog();
+        return;
+    }
+    if (trimmed == "analyze") {
+        run_default_analysis();
+        bp_status_msg_ = last_pass_status_;
+        close_cmd_dialog();
+        return;
+    }
+
     // Single-letter commands with argument
     char cmd_char = trimmed[0];
 
@@ -1376,7 +1411,7 @@ bool TuiApp::handle_event(Event event) {
     }
     if (event == Event::Character('f')) {
         if (!function_result_) {
-            run_function_analysis();
+            run_pass_by_name("function");
         } else {
             show_callstack_ = !show_callstack_;
         }
@@ -1400,7 +1435,7 @@ bool TuiApp::handle_event(Event event) {
     }
     if (event == Event::Character('I')) {
         if (!string_result_) {
-            run_string_analysis();
+            run_pass_by_name("strings");
             string_panel_focused_ = true;
         } else if (!show_strings_) {
             show_strings_ = true;
@@ -1413,7 +1448,7 @@ bool TuiApp::handle_event(Event event) {
     }
     if (event == Event::Character('L')) {
         if (!function_result_) {
-            run_function_analysis();
+            run_pass_by_name("function");
         }
         if (function_result_) {
             if (!show_functions_) {
@@ -1430,7 +1465,7 @@ bool TuiApp::handle_event(Event event) {
     // ─── Thread analysis (t = toggle panel, T = jump to next switch) ─────────
     if (event == Event::Character('t')) {
         if (!thread_result_) {
-            run_thread_analysis();
+            run_pass_by_name("thread");
             thread_panel_focused_ = true;
         } else if (!show_threads_) {
             show_threads_ = true;
@@ -1441,7 +1476,7 @@ bool TuiApp::handle_event(Event event) {
         return true;
     }
     if (event == Event::Character('T')) {
-        if (!thread_result_) run_thread_analysis();
+        if (!thread_result_) run_pass_by_name("thread");
         goto_next_thread_switch();
         return true;
     }
@@ -1471,7 +1506,7 @@ bool TuiApp::handle_event(Event event) {
         if (show_callstack_ && function_result_) {
             callstack_panel_focused_ = !callstack_panel_focused_;
         } else if (!function_result_) {
-            run_function_analysis();
+            run_pass_by_name("function");
             show_callstack_ = true;
             callstack_panel_focused_ = true;
         }
@@ -1495,16 +1530,7 @@ bool TuiApp::handle_event(Event event) {
     if (event == Event::Character('O')) {
         // Run loop analysis (first time) or toggle highlight
         if (!loop_result_) {
-            if (!pass_manager_) {
-                pass_manager_ = std::make_unique<PassManager>();
-                pass_manager_->set_reader(&reader_);
-                pass_manager_->set_index(&index_);
-                pass_manager_->set_code_table(&code_table_);
-                pass_manager_->set_decoder(&decoder_);
-                pass_manager_->set_regfile(&regfile_);
-                pass_manager_->set_memory(&memory_);
-            }
-            run_loop_analysis();
+            run_pass_by_name("loop");
         } else {
             show_loops_ = !show_loops_;
         }
@@ -1605,16 +1631,6 @@ Component TuiApp::make_main_component() {
 // ─── Taint jump helpers ─────────────────────────────────────────────────────
 
 // ─── Loop Analysis ───────────────────────────────────────────────────────────
-
-void TuiApp::run_loop_analysis() {
-    if (!pass_manager_) return;
-    pass_manager_->register_pass(std::make_unique<LoopPass>());
-    auto& result = pass_manager_->require("loop");
-    if (result.ok()) {
-        loop_result_ = &result.get<LoopResult>();
-        show_loops_ = true;
-    }
-}
 
 // ─── Minimap Column ──────────────────────────────────────────────────────────
 // A narrow (3-char wide) vertical strip that summarizes the full trace.
@@ -1931,7 +1947,12 @@ void TuiApp::clear_analysis() {
     }
 }
 
-void TuiApp::run_function_analysis() {
+// ─── Generic pass runner ───────────────────────────────────────────────────
+// Lets the TUI run any catalog pass via ':pass <name>'. The default pass set
+// is runnable via ':analyze'. This guarantees every pass is reachable from
+// the TUI, mirroring the GUI "All Passes" section and the CLI --run-pass flag.
+
+void TuiApp::run_pass_by_name(std::string_view name) {
     if (!pass_manager_) {
         pass_manager_ = std::make_unique<PassManager>();
         pass_manager_->set_reader(&reader_);
@@ -1942,15 +1963,63 @@ void TuiApp::run_function_analysis() {
         pass_manager_->set_memory(&memory_);
     }
 
-    pass_manager_->register_pass(std::make_unique<FunctionPass>());
-    auto& result = pass_manager_->require("function");
-    if (result.ok()) {
-        function_result_ = &result.get<FunctionResult>();
+    if (!tenet::is_known_pass(name)) {
+        last_pass_status_ = fmt::format("unknown pass '{}'", name);
+        return;
+    }
+
+    tenet::PassRunCtx ctx;
+    ctx.current_inst = current_inst_;
+    ctx.total_inst   = total_inst_;
+    // Derive a target register from the first reg diff at the cursor.
+    auto [offset, seed_pc] = index_.offset_of_with_pc(current_inst_, reader_);
+    auto rec = reader_.record_at(offset, seed_pc);
+    if (rec.kind == RecordKind::Inst) {
+        auto inst = rec.as_inst();
+        ctx.current_reg = (inst.reg_diff_count > 0) ? inst.reg_diff(0).index : 0;
+    }
+
+    if (!tenet::register_pass_by_name(*pass_manager_, name, ctx)) {
+        last_pass_status_ = fmt::format("'{}' could not be registered", name);
+        return;
+    }
+
+    auto& raw = pass_manager_->require(name);
+    last_pass_status_ = fmt::format("{}: {}", name,
+                                    tenet::summarize_pass_result(name, raw));
+
+    // Wire up result pointers for passes that have dedicated TUI panels, so
+    // running them through ':pass' also updates the overlays.
+    if (name == "function" && raw.ok()) {
+        function_result_ = &raw.get<FunctionResult>();
         show_callstack_ = true;
+    } else if (name == "xref" && raw.ok()) {
+        xref_result_ = &raw.get<XrefResult>();
+        xref_cursor_ = 0;
+    } else if (name == "loop" && raw.ok()) {
+        loop_result_ = &raw.get<LoopResult>();
+        show_loops_ = true;
+    } else if (name == "strings" && raw.ok()) {
+        string_result_ = &raw.get<StringResult>();
+        show_strings_ = true;
+        string_cursor_ = 0;
+        update_string_filter();
+    } else if (name == "thread" && raw.ok()) {
+        thread_result_ = &raw.get<ThreadResult>();
+        show_threads_ = true;
+    } else if (name == "call_graph" && raw.ok()) {
+        call_graph_result_ = &raw.get<CallGraphResult>();
+    } else if (name == "taint" && raw.ok()) {
+        taint_result_ = &raw.get<TaintResult>();
+        show_taint_ = true;
+        taint_jump_list_.clear();
+    } else if (name == "backward_taint" && raw.ok()) {
+        backward_taint_result_ = &raw.get<BackwardTaintResult>();
+        show_backward_taint_ = true;
     }
 }
 
-void TuiApp::run_xref_analysis() {
+void TuiApp::run_default_analysis() {
     if (!pass_manager_) {
         pass_manager_ = std::make_unique<PassManager>();
         pass_manager_->set_reader(&reader_);
@@ -1961,12 +2030,29 @@ void TuiApp::run_xref_analysis() {
         pass_manager_->set_memory(&memory_);
     }
 
-    pass_manager_->register_pass(std::make_unique<XrefPass>());
-    auto& result = pass_manager_->require("xref");
-    if (result.ok()) {
-        xref_result_ = &result.get<XrefResult>();
-        xref_cursor_ = 0;
+    tenet::register_default_passes(*pass_manager_);
+    // Run them and wire up the common display pointers.
+    for (auto name : tenet::default_ui_pass_names()) {
+        auto& raw = pass_manager_->require(name);
+        if (!raw.ok()) continue;
+        if (name == "function") {
+            function_result_ = &raw.get<FunctionResult>();
+            show_callstack_ = true;
+        } else if (name == "xref") {
+            xref_result_ = &raw.get<XrefResult>();
+        } else if (name == "loop") {
+            loop_result_ = &raw.get<LoopResult>();
+            show_loops_ = true;
+        } else if (name == "strings") {
+            string_result_ = &raw.get<StringResult>();
+            show_strings_ = true;
+        } else if (name == "thread") {
+            thread_result_ = &raw.get<ThreadResult>();
+            show_threads_ = true;
+        }
     }
+    last_pass_status_ = fmt::format("ran {} default passes",
+                                    tenet::default_ui_pass_names().size());
 }
 
 Element TuiApp::render_callstack_panel() {
@@ -2144,7 +2230,7 @@ void TuiApp::follow_return() {
 
 void TuiApp::goto_xref_next() {
     if (!xref_result_) {
-        run_xref_analysis();
+        run_pass_by_name("xref");
         if (!xref_result_) return;
     }
 
@@ -2160,7 +2246,7 @@ void TuiApp::goto_xref_next() {
 
 void TuiApp::goto_xref_prev() {
     if (!xref_result_) {
-        run_xref_analysis();
+        run_pass_by_name("xref");
         if (!xref_result_) return;
     }
 
@@ -2177,24 +2263,6 @@ void TuiApp::goto_xref_prev() {
 }
 
 // ─── Function list panel ──────────────────────────────────────────────────────
-
-void TuiApp::run_call_graph_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
-
-    pass_manager_->register_pass(std::make_unique<CallGraphPass>());
-    auto& result = pass_manager_->require("call_graph");
-    if (result.ok()) {
-        call_graph_result_ = &result.get<CallGraphResult>();
-    }
-}
 
 void TuiApp::update_function_list() {
     if (!function_result_) return;
@@ -2476,27 +2544,6 @@ Element TuiApp::render_functions_panel() {
 }
 
 // ─── String analysis ────────────────────────────────────────────────────────
-
-void TuiApp::run_string_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
-
-    pass_manager_->register_pass(std::make_unique<StringPass>());
-    auto& result = pass_manager_->require("strings");
-    if (result.ok()) {
-        string_result_ = &result.get<StringResult>();
-        show_strings_ = true;
-        string_cursor_ = 0;
-        update_string_filter();
-    }
-}
 
 void TuiApp::update_string_filter() {
     filtered_string_indices_.clear();
@@ -2813,25 +2860,6 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
 }
 
 // ─── Thread analysis ─────────────────────────────────────────────────────────
-
-void TuiApp::run_thread_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
-
-    pass_manager_->register_pass(std::make_unique<ThreadPass>());
-    auto& result = pass_manager_->require("thread");
-    if (result.ok()) {
-        thread_result_ = &result.get<ThreadResult>();
-        show_threads_ = true;
-    }
-}
 
 Element TuiApp::render_thread_panel() {
     using namespace ftxui;

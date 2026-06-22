@@ -143,9 +143,17 @@ private:
     void run_taint_analysis();
     void run_slice_analysis();
     void run_backward_taint_analysis();
-    void run_function_analysis();
-    void run_xref_analysis();
     void clear_analysis();
+
+    /// Run any catalog pass by name, deriving config from the current cursor.
+    /// Stores a one-line summary in last_pass_status_.
+    void run_pass_by_name(std::string_view name);
+
+    /// Register & run the default-for-UI pass set (used by ':analyze').
+    void run_default_analysis();
+
+    /// Last generic pass run summary (shown in the status bar).
+    std::string last_pass_status_;
 
     // ─── Function/Xref state ──────────────────────────────────────────
     const FunctionResult* function_result_ = nullptr;
@@ -186,7 +194,6 @@ private:
     std::vector<size_t> filtered_function_indices_; // Indices into sorted_function_pcs_ after filter
     int function_sort_mode_ = 0; // 0=by calls desc, 1=by name, 2=by entry_pc
 
-    void run_call_graph_analysis();
     void update_function_list();   // Sort and filter the function list
     void update_function_filter();
     ftxui::Element render_functions_panel();
@@ -205,7 +212,6 @@ private:
     bool thread_panel_focused_ = false;
     size_t thread_cursor_ = 0;  // Selected thread in thread list
 
-    void run_thread_analysis();
     ftxui::Element render_thread_panel();
     bool handle_thread_panel_event(ftxui::Event event);
     void goto_next_thread_switch();
@@ -216,7 +222,6 @@ private:
     bool show_loops_ = false;        // highlight loop instructions in list
     bool show_minimap_ = true;       // show vertical minimap on left side
 
-    void run_loop_analysis();
     ftxui::Element render_minimap_column();  // narrow vertical minimap strip
 
     // ─── String analysis state ──────────────────────────────────────────
@@ -227,7 +232,6 @@ private:
     std::string string_filter_;         // Filter/search pattern for strings
     std::vector<size_t> filtered_string_indices_;  // Indices into StringResult::strings after filter
 
-    void run_string_analysis();
     void update_string_filter();
     ftxui::Element render_strings_panel();
     bool handle_string_panel_event(ftxui::Event event);
