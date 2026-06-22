@@ -3,7 +3,6 @@
 #include <capstone/capstone.h>
 #include <cstring>
 #include <cstdio>
-#include <mutex>
 
 namespace tenet {
 
@@ -32,7 +31,6 @@ static uint8_t cs_reg_to_index(arm64_reg reg) {
 // Helper: add a register index to the fixed-size read array with dedup and bounds check.
 static inline void add_reg_read(DecodedInst& d, uint8_t idx) {
     if (idx == 0xFF) return;
-    // Avoid duplicates
     for (uint8_t i = 0; i < d.regs_read_count; i++) {
         if (d.regs_read[i] == idx) return;
     }
@@ -44,7 +42,6 @@ static inline void add_reg_read(DecodedInst& d, uint8_t idx) {
 // Helper: add a register index to the fixed-size written array with dedup and bounds check.
 static inline void add_reg_written(DecodedInst& d, uint8_t idx) {
     if (idx == 0xFF) return;
-    // Avoid duplicates
     for (uint8_t i = 0; i < d.regs_written_count; i++) {
         if (d.regs_written[i] == idx) return;
     }
@@ -53,60 +50,95 @@ static inline void add_reg_written(DecodedInst& d, uint8_t idx) {
     }
 }
 
+// ─── PC-relative instruction detection ─────────────────────────────────────
+// AArch64 PC-relative instructions have operand strings that depend on the
+// execution PC (e.g. "b #0x100c" where 0x100c = pc + offset).  These cannot
+// be cached by opcode alone because the same opcode at different PCs produces
+// different op_str.  We detect them by mnemonic and bypass the cache.
+
+static bool is_pc_relative_mnemonic(std::string_view mn) {
+    if (mn == "b" || mn == "bl") return true;
+    if (mn.size() > 2 && mn[0] == 'b' && mn[1] == '.') return true;  // b.cond
+    if (mn == "cbz" || mn == "cbnz") return true;
+    if (mn == "tbz" || mn == "tbnz") return true;
+    if (mn == "adr" || mn == "adrp") return true;
+    return false;
+}
+
+// ─── Thread-local Capstone handle ──────────────────────────────────────────
+// Each thread gets its own Capstone handle, eliminating the global mutex that
+// was the bottleneck under concurrent decode workloads.
+
+csh& InstructionDecoder::tls_handle() {
+    thread_local csh handle = 0;
+    thread_local bool initialized = false;
+    if (!initialized) {
+        cs_err err = cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &handle);
+        if (err == CS_ERR_OK) {
+            cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+            initialized = true;
+        }
+    }
+    return handle;
+}
+
 InstructionDecoder::InstructionDecoder() = default;
 
-InstructionDecoder::~InstructionDecoder() {
-    if (initialized_) {
-        cs_close(&handle_);
-    }
-}
+InstructionDecoder::~InstructionDecoder() = default;
 
 bool InstructionDecoder::init() {
     if (initialized_) return true;
-
-    cs_err err = cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &handle_);
-    if (err != CS_ERR_OK) return false;
-
-    // Enable detail mode for register access info (useful later for XRef)
-    cs_option(handle_, CS_OPT_DETAIL, CS_OPT_ON);
-
+    csh& handle = tls_handle();
+    if (handle == 0) return false;
     initialized_ = true;
     return true;
 }
 
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opcode) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return std::nullopt;
 
-    // Check cache
-    if (auto cached = cache_.get(pc)) {
-        return cached->get();
+    // ── Opcode-keyed cache ────────────────────────────────────────────────
+    // AArch64 is fixed-length; the opcode word fully determines the mnemonic,
+    // register access sets, and (for non-PC-relative instructions) the operand
+    // string.  Cache by opcode for maximum reuse across PCs.
+    //
+    // PC-relative instructions (b, bl, b.cond, cbz, cbnz, tbz, tbnz, adr,
+    // adrp) have op_str that depends on the execution PC, so they bypass the
+    // cache and are always decoded with the actual PC.
+    if (auto cached = opcode_cache_.get(opcode)) {
+        DecodedInst d = cached->get();
+        if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
+            d.pc = pc;  // override PC for the caller
+            return d;
+        }
+        // PC-relative: fall through to re-decode with actual PC
     }
 
-    // Decode with Capstone
+    csh& handle = tls_handle();
+    if (handle == 0) return std::nullopt;
+
+    // Decode with Capstone using the actual PC (needed for PC-relative
+    // instructions to resolve branch targets correctly)
     const uint8_t* code = reinterpret_cast<const uint8_t*>(&opcode);
     size_t code_size = 4;
-    uint64_t addr = pc;
 
     cs_insn* insn = nullptr;
-    size_t count = cs_disasm(handle_, code, code_size, addr, 1, &insn);
-
-    if (count == 0) {
-        // Failed to decode - store a placeholder
-        DecodedInst d{};
-        d.pc = pc;
-        d.opcode = opcode;
-        std::strncpy(d.mnemonic, ".word", sizeof(d.mnemonic) - 1);
-        d.mnemonic[sizeof(d.mnemonic) - 1] = '\0';
-        std::snprintf(d.op_str, sizeof(d.op_str), "0x%x", opcode);
-        d.size = 4;
-        cache_.put(pc, d);
-        return d;
-    }
+    size_t count = cs_disasm(handle, code, code_size, pc, 1, &insn);
 
     DecodedInst d{};
     d.pc = pc;
     d.opcode = opcode;
+
+    if (count == 0) {
+        // Failed to decode - store a placeholder
+        std::strncpy(d.mnemonic, ".word", sizeof(d.mnemonic) - 1);
+        d.mnemonic[sizeof(d.mnemonic) - 1] = '\0';
+        std::snprintf(d.op_str, sizeof(d.op_str), "0x%x", opcode);
+        d.size = 4;
+        opcode_cache_.put(opcode, d);
+        return d;
+    }
+
     std::strncpy(d.mnemonic, insn[0].mnemonic, sizeof(d.mnemonic) - 1);
     d.mnemonic[sizeof(d.mnemonic) - 1] = '\0';
     std::strncpy(d.op_str, insn[0].op_str, sizeof(d.op_str) - 1);
@@ -140,7 +172,6 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
                         add_reg_written(d, idx);
                     }
                 } else if (op.type == ARM64_OP_MEM) {
-                    // Base and index registers are read
                     if (op.mem.base != ARM64_REG_INVALID) {
                         uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(op.mem.base));
                         add_reg_read(d, idx);
@@ -156,20 +187,21 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
 
     cs_free(insn, count);
 
-    cache_.put(pc, d);
+    // Cache only non-PC-relative instructions (PC-relative op_str depends on PC)
+    if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
+        opcode_cache_.put(opcode, d);
+    }
+
     return d;
 }
 
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, const CodeTable& code_table) {
     auto opcode = code_table.opcode_at(pc);
     if (!opcode) return std::nullopt;
-    // Note: the lock is acquired inside decode(pc, opcode), not here,
-    // because opcode_at() is a read-only query on CodeTable (which has its own thread safety).
     return decode(pc, *opcode);
 }
 
 std::string InstructionDecoder::format(uint64_t pc, uint32_t opcode) {
-    // decode() already acquires the lock internally
     auto d = decode(pc, opcode);
     if (!d) return "<unknown>";
 

@@ -5,7 +5,6 @@
 
 #include <capstone/capstone.h>
 #include <array>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -32,7 +31,19 @@ struct DecodedInst {
     std::string_view op_str_sv() const { return std::string_view(op_str); }
 };
 
-/// Wraps Capstone for AArch64 disassembly with a decode cache.
+/// Wraps Capstone for AArch64 disassembly with a per-thread decode cache.
+///
+/// Key optimization: cache by **opcode** instead of PC.
+/// AArch64 is a fixed-length instruction set (4 bytes), so the opcode word
+/// fully determines the disassembly result (mnemonic, operands, register
+/// access sets).  Different PCs executing the same opcode share one cache
+/// entry, yielding far higher hit rates than a PC-indexed cache.
+///
+/// Thread safety: each thread gets its own Capstone handle (thread_local),
+/// eliminating the global mutex that was the bottleneck under concurrent
+/// decode workloads.  The opcode cache itself is per-InstructionDecoder
+/// instance with no locking needed — each InstructionDecoder is used from
+/// a single thread.
 class InstructionDecoder {
 public:
     InstructionDecoder();
@@ -42,7 +53,7 @@ public:
     InstructionDecoder(const InstructionDecoder&) = delete;
     InstructionDecoder& operator=(const InstructionDecoder&) = delete;
 
-    /// Initialize Capstone. Returns false on failure.
+    /// Initialize the thread-local Capstone handle. Returns false on failure.
     bool init();
 
     /// Decode a single instruction at the given PC with the given opcode bytes.
@@ -56,10 +67,15 @@ public:
     std::string format(uint64_t pc, uint32_t opcode);
 
 private:
-    mutable std::mutex mutex_;   // protects handle_ + cache_ from concurrent access
-    csh handle_ = 0;
+    /// Per-thread Capstone handle (lazily initialized).
+    /// No mutex needed — each thread has its own copy.
+    static csh& tls_handle();
+
+    /// Opcode-keyed decode cache (no mutex needed: per-instance, single-threaded use).
+    /// AArch64 has ~2K distinct encodings, so 4096 slots is generous.
+    LRUCache<uint32_t, DecodedInst> opcode_cache_{4096};
+
     bool initialized_ = false;
-    LRUCache<uint64_t, DecodedInst> cache_{16384};
 };
 
 }  // namespace tenet
