@@ -616,6 +616,89 @@ private:
     ConstantMaterializationResult result_;
 };
 
+// ─── ConstantMaterializationResult serialization helpers ─────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x434D4154 ("CMAT")
+//   u32  version = 1
+//   u64  num_constants
+//   for each MaterializedConstant:
+//     u64  value
+//     u64  first_inst_id
+//     u64  last_inst_id
+//     u64  pc_first
+//     u64  pc_last
+//     u8   dst_reg
+//     u8   num_parts
+//     u8   pad[6]
+//   (known_match, identified_indices, by_algorithm rebuilt on deserialise)
+
+static constexpr uint32_t CMAT_BLOB_MAGIC   = 0x434D4154u;  // "CMAT"
+static constexpr uint32_t CMAT_BLOB_VERSION = 1u;
+
+static std::string constmat_serialize(const ConstantMaterializationResult& res) {
+    size_t total = 4 + 4 + 8 + res.constants.size() * (8*5 + 8);
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(CMAT_BLOB_MAGIC);
+    write_u32(CMAT_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.constants.size()));
+
+    for (const auto& c : res.constants) {
+        write_u64(c.value);
+        write_u64(c.first_inst_id);
+        write_u64(c.last_inst_id);
+        write_u64(c.pc_first);
+        write_u64(c.pc_last);
+        write_u8(c.dst_reg);
+        write_u8(c.num_parts);
+        p += 6;  // padding
+    }
+
+    return buf;
+}
+
+static bool constmat_deserialize(const std::string& blob,
+                                 ConstantMaterializationResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != CMAT_BLOB_MAGIC)   return false;
+    if (read_u32() != CMAT_BLOB_VERSION) return false;
+
+    uint64_t n = read_u64();
+    out.constants.reserve(static_cast<size_t>(n));
+
+    constexpr size_t ENTRY_SIZE = 8*5 + 8;  // 5×u64 + 2×u8 + 6-byte pad
+    if (p + n * ENTRY_SIZE > end) return false;
+
+    for (uint64_t i = 0; i < n; i++) {
+        MaterializedConstant c;
+        c.value         = read_u64();
+        c.first_inst_id = read_u64();
+        c.last_inst_id  = read_u64();
+        c.pc_first      = read_u64();
+        c.pc_last       = read_u64();
+        c.dst_reg       = read_u8();
+        c.num_parts     = read_u8();
+        p += 6;  // skip padding
+        c.known_match   = nullptr;  // rebuilt below
+        out.constants.push_back(c);
+    }
+
+    return true;
+}
+
 // ─── Main pass execution ──────────────────────────────────────────────────
 
 PassResult ConstantMaterializationPass::run(PassContext& ctx) {
@@ -632,6 +715,26 @@ PassResult ConstantMaterializationPass::run(PassContext& ctx) {
     }
 
     const auto& range = ctx.range();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("constant_materialization", blob)) {
+            ConstantMaterializationResult cached;
+            if (constmat_deserialize(blob, cached)) {
+                // Rebuild known_match pointers and derived indices
+                for (auto& c : cached.constants) {
+                    c.known_match = lookup(c.value);
+                }
+                build_indices(cached);
+                ctx.progress(1.0f, fmt::format(
+                    "ConstMat: {} constants ({} identified) (from cache)",
+                    cached.total(), cached.identified_count()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     uint64_t start = range.start_inst_id;
     uint64_t end = std::min(range.end_inst_id, total_insts);
     if (end == 0) end = total_insts;
@@ -665,6 +768,15 @@ PassResult ConstantMaterializationPass::run(PassContext& ctx) {
     }
 
     auto result = collector.take_result();
+
+    // ─── Persist result for future sessions ───────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob = constmat_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("constant_materialization", blob.data(), blob.size());
+        }
+    }
+
     ctx.progress(1.0f, fmt::format("ConstMat: {} constants found ({} identified as known)",
                                     result.total(), result.identified_count()));
 

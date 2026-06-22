@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>  // std::upper_bound, std::lower_bound
 
 namespace tenet {
 
@@ -38,8 +39,16 @@ struct FunctionResult {
     std::unordered_map<uint64_t, FunctionInfo> functions;
 
     /// Call stack at a given instruction ID.
-    /// Returns vector of (call_event_index, depth) pairs from bottom to top.
+    /// Returns vector of call event pointers from outermost to innermost.
+    /// O(N) worst case — suitable for interactive UI at the current position.
+    /// For bulk queries (e.g. sparkline with 600 samples), use depth_at().
     std::vector<const CallEvent*> call_stack_at(uint64_t inst_id) const;
+
+    /// Fast O(log N) depth query at inst_id.
+    /// Uses the pre-built depth_table_ sorted by inst_id to binary-search the
+    /// last depth-change event before inst_id.  Falls back to full scan if the
+    /// table has not been built yet.
+    uint64_t depth_at(uint64_t inst_id) const;
 
     /// Which function contains inst_id? (by checking which call is active)
     const FunctionInfo* function_at(uint64_t inst_id) const;
@@ -58,9 +67,22 @@ struct FunctionResult {
         return &call_events[it->second];
     }
 
+    /// Build the depth_table_ for fast depth_at() queries.
+    /// Called once after the pass completes (or after deserialization).
+    void build_depth_table();
+
     // Internal lookup maps (populated during pass)
     std::unordered_map<uint64_t, size_t> call_site_map_;   // call_inst_id → index
     std::unordered_map<uint64_t, size_t> return_site_map_; // return_inst_id → index
+
+    // Depth-table for fast bulk depth queries.
+    // Sorted by inst_id; each entry is the depth AFTER that inst_id fires.
+    // Built by build_depth_table(); empty until then.
+    struct DepthEntry {
+        uint64_t inst_id;  // call_inst_id (or return_inst_id) that caused a change
+        uint64_t depth;    // stack depth immediately after this event
+    };
+    std::vector<DepthEntry> depth_table_;
 };
 
 // ─── Function analysis pass ───────────────────────────────────────────────
