@@ -29,6 +29,7 @@
 // Metal/ObjC interop (this file is compiled as Objective-C++)
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AppKit/AppKit.h>     // NSMenu, NSMenuItem, NSMenuDelegate, NSApp
 
 namespace tenet {
 
@@ -310,9 +311,11 @@ void GuiApp::setup_fonts() {
     // If no font specified in settings, auto-detect
     if (font_to_load.empty()) {
         static const char* auto_paths[] = {
+            "/System/Library/Fonts/SFNSMono.ttf",       // macOS 11+ SF Mono
             "/System/Library/Fonts/SFMono-Regular.otf",
             "/Library/Fonts/SF-Mono-Regular.otf",
             "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
             "/System/Library/Fonts/Monaco.dfont",
             nullptr
         };
@@ -342,6 +345,42 @@ void GuiApp::setup_fonts() {
         ImFontConfig config;
         config.SizePixels = font_size;
         io.Fonts->AddFontDefault(&config);
+    }
+
+    // ── Merge Unicode symbol ranges from Apple Symbols ───────────────────
+    // The primary monospace font (SF Mono / Menlo) only covers ASCII + Latin-1.
+    // UI chrome uses Unicode glyphs: arrows (←→▲▼↺↳↵⇆), geometric shapes
+    // (▶▷◁▸), stars (★☆), dingbats (⚠✂), punctuation (…—) etc.
+    // We merge these ranges from Apple Symbols so they render correctly.
+    static const char* symbol_font = "/System/Library/Fonts/Apple Symbols.ttf";
+    if (FILE* sf = fopen(symbol_font, "rb")) {
+        fclose(sf);
+
+        // Custom glyph range table covering all UI symbols used in tenet:
+        //   U+00D7        × (multiplication sign, used for close button)
+        //   U+2013–U+2026 General Punctuation (—, …)
+        //   U+2190–U+21FF Arrows (←→↑↓↺↳↵⇆ and friends)
+        //   U+2395        ⌕ (APL search icon)
+        //   U+25A0–U+25FF Geometric Shapes (▶▷◁▲▼▸ etc.)
+        //   U+2600–U+26FF Misc Symbols (★☆⚠ etc.)
+        //   U+2700–U+27BF Dingbats (✂ etc.)
+        static const ImWchar symbol_ranges[] = {
+            0x00D7, 0x00D7,   // ×
+            0x2013, 0x2026,   // —…
+            0x2190, 0x21FF,   // Arrows
+            0x2395, 0x2395,   // ⌕
+            0x25A0, 0x25FF,   // Geometric Shapes
+            0x2600, 0x26FF,   // Misc Symbols
+            0x2700, 0x27BF,   // Dingbats
+            0,
+        };
+
+        ImFontConfig sym_cfg;
+        sym_cfg.MergeMode   = true;   // merge into the already-loaded font
+        sym_cfg.OversampleH = 1;      // symbols don't need sub-pixel AA
+        sym_cfg.OversampleV = 1;
+        sym_cfg.GlyphOffset = ImVec2(0.0f, 1.0f);  // minor baseline alignment
+        io.Fonts->AddFontFromFileTTF(symbol_font, font_size, &sym_cfg, symbol_ranges);
     }
 
     io.FontGlobalScale = 1.0f;
@@ -406,11 +445,403 @@ void GuiApp::apply_settings() {
     // causing crashes in any subsequent ImGui text rendering calls within this frame.
 }
 
+}  // namespace tenet  (temporarily close to allow ObjC class definitions below)
+
+// ─── Native macOS Menu Bar ───────────────────────────────────────────────────
+//
+// Placed OUTSIDE namespace tenet because Objective-C @interface / @implementation
+// declarations must appear at global (file) scope.  The C++ member functions
+// (GuiApp::_post_native_action etc.) are defined with full tenet:: qualification.
+//
+// Architecture:
+//  • TenetMenuTarget    — NSObject action target; each NSMenuItem fires menuAction:
+//                         which calls GuiApp::_post_native_action(tag).
+//  • TenetMenuDelegate  — NSMenuDelegate; -menuNeedsUpdate: fires just before the
+//                         menu opens and calls GuiApp::_update_native_menu(menu)
+//                         to refresh enabled/checkmark state.
+//  • GuiApp::_post_native_action — posts a lambda into pending_native_actions_.
+//  • GuiApp::consume_native_actions — drained at the top of every render frame.
+//  • GuiApp::setup_native_menu — builds the NSMenu tree and calls [NSApp setMainMenu:].
+
+// ── Integer tag for each menu item (visible to both ObjC and C++) ────────────
+enum MenuTag : NSInteger {
+    kTagFileQuit          = 100,
+    kTagEditSettings      = 200,
+    kTagViewRegisters     = 300,
+    kTagViewMemory        = 301,
+    kTagViewCallStack     = 302,
+    kTagViewAnalysis      = 303,
+    kTagViewHexDump       = 304,
+    kTagViewStrings       = 305,
+    kTagViewFunctions     = 306,
+    kTagViewThreads       = 307,
+    kTagViewMinimap       = 310,
+    kTagViewLoops         = 311,
+    kTagViewCFG           = 312,
+    kTagViewObjC          = 320,
+    kTagViewLoopSemantics = 321,
+    kTagViewPatterns      = 322,
+    kTagViewConstants     = 323,
+    kTagViewAlgoSummary   = 324,
+    kTagViewCallGraph          = 325,
+    kTagViewObjCCrypto        = 326,
+    kTagViewMemStrings        = 327,
+    kTagViewSyscallIntercept  = 328,
+    kTagViewCacheSim          = 329,
+    kTagViewRegTimeline       = 330,
+    kTagViewDwarf             = 331,
+    kTagViewTraceDiff         = 332,
+    kTagViewTraceFold         = 333,
+    kTagNavGoto           = 400,
+    kTagNavSearch         = 401,
+    kTagNavBack           = 402,
+    kTagNavForward        = 403,
+    kTagNavFirst          = 404,
+    kTagNavLast           = 405,
+    kTagNavBookmark       = 406,
+    kTagNavFollowCall     = 407,
+    kTagNavFollowReturn   = 408,
+    kTagAnaTaint          = 500,
+    kTagAnaBackTaint      = 501,
+    kTagAnaSlice          = 502,
+    kTagAnaFunction       = 510,
+    kTagAnaXref           = 511,
+    kTagAnaStrings        = 512,
+    kTagAnaThread         = 513,
+    kTagAnaCallGraph      = 514,
+    kTagAnaLoop           = 515,
+    kTagAnaCFG            = 516,
+    kTagAnaClear          = 520,
+};
+
+// ── ObjC action target ────────────────────────────────────────────────────────
+@interface TenetMenuTarget : NSObject
+@property (assign, nonatomic) tenet::GuiApp* app;
+- (void)menuAction:(NSMenuItem*)sender;
+@end
+
+@implementation TenetMenuTarget
+- (void)menuAction:(NSMenuItem*)sender {
+    if (!self.app) return;
+    self.app->_post_native_action(static_cast<long>(sender.tag));
+}
+@end
+
+// ── ObjC delegate: update enabled/checkmarks before menu opens ───────────────
+@interface TenetMenuDelegate : NSObject <NSMenuDelegate>
+@property (assign, nonatomic) tenet::GuiApp* app;
+@end
+
+@implementation TenetMenuDelegate
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+    if (!self.app) return;
+    self.app->_update_native_menu((__bridge void*)menu);
+}
+@end
+
+// ── Static helper: make a tagged menu item ───────────────────────────────────
+static NSMenuItem* tenet_make_item(NSString* title, NSString* key,
+                                    NSUInteger mods, NSInteger tag,
+                                    TenetMenuTarget* target) {
+    NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:title
+                                                action:@selector(menuAction:)
+                                         keyEquivalent:key];
+    it.keyEquivalentModifierMask = mods;
+    it.tag    = tag;
+    it.target = target;
+    return it;
+}
+
+// ── Static helper: make a submenu with delegate ───────────────────────────────
+static NSMenu* tenet_make_submenu(NSString* title, TenetMenuDelegate* delegate) {
+    NSMenu* m = [[NSMenu alloc] initWithTitle:title];
+    m.autoenablesItems = NO;
+    m.delegate = delegate;
+    return m;
+}
+
+// ── C++ member-function implementations ──────────────────────────────────────
+
+void tenet::GuiApp::_post_native_action(long tag) {
+    std::function<void()> action;
+    switch (static_cast<MenuTag>(tag)) {
+        case kTagFileQuit:          action = [this]{ running_ = false; }; break;
+        case kTagEditSettings:      action = [this]{ show_settings_ = true; }; break;
+
+        case kTagViewRegisters:     action = [this]{ show_registers_         = !show_registers_;         }; break;
+        case kTagViewMemory:        action = [this]{ show_memory_             = !show_memory_;             }; break;
+        case kTagViewCallStack:     action = [this]{ show_callstack_          = !show_callstack_;          }; break;
+        case kTagViewAnalysis:      action = [this]{ show_analysis_           = !show_analysis_;           }; break;
+        case kTagViewHexDump:       action = [this]{ show_hex_dump_           = !show_hex_dump_;           }; break;
+        case kTagViewStrings:       action = [this]{ show_strings_            = !show_strings_;            }; break;
+        case kTagViewFunctions:     action = [this]{ show_functions_          = !show_functions_;          }; break;
+        case kTagViewThreads:       action = [this]{ show_threads_            = !show_threads_;            }; break;
+        case kTagViewMinimap:       action = [this]{ show_minimap_            = !show_minimap_;            }; break;
+        case kTagViewLoops:         action = [this]{ show_loops_              = !show_loops_;              }; break;
+        case kTagViewCFG:           action = [this]{ show_cfg_                = !show_cfg_;                }; break;
+        case kTagViewObjC:          action = [this]{ show_objc_               = !show_objc_;               }; break;
+        case kTagViewLoopSemantics: action = [this]{ show_loop_semantics_     = !show_loop_semantics_;     }; break;
+        case kTagViewPatterns:      action = [this]{ show_pattern_            = !show_pattern_;            }; break;
+        case kTagViewConstants:     action = [this]{ show_constant_           = !show_constant_;           }; break;
+        case kTagViewAlgoSummary:   action = [this]{ show_algorithm_summary_  = !show_algorithm_summary_;  }; break;
+        case kTagViewCallGraph:          action = [this]{ show_call_graph_         = !show_call_graph_;         }; break;
+        case kTagViewObjCCrypto:       action = [this]{ show_objc_crypto_        = !show_objc_crypto_;        }; break;
+        case kTagViewMemStrings:       action = [this]{ show_mem_strings_        = !show_mem_strings_;        }; break;
+        case kTagViewSyscallIntercept: action = [this]{ show_syscall_intercept_  = !show_syscall_intercept_;  }; break;
+        case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show_cache_sim_;          }; break;
+        case kTagViewTraceFold:        action = [this]{ show_trace_fold_         = !show_trace_fold_;         }; break;
+        case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
+        case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
+        case kTagViewTraceDiff:     action = [this]{ show_trace_diff_         = !show_trace_diff_;         }; break;
+
+        case kTagNavGoto:           action = [this]{ show_goto_popup_   = true; }; break;
+        case kTagNavSearch:         action = [this]{ show_search_popup_ = true; }; break;
+        case kTagNavBack:           action = [this]{ nav_back();   }; break;
+        case kTagNavForward:        action = [this]{ nav_forward(); }; break;
+        case kTagNavFirst:          action = [this]{ navigate_to(0); }; break;
+        case kTagNavLast:           action = [this]{ navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0); }; break;
+        case kTagNavBookmark:       action = [this]{ toggle_bookmark(); }; break;
+        case kTagNavFollowCall:
+            action = [this]{
+                if (function_result_) {
+                    auto* evt = function_result_->call_at(current_inst_);
+                    if (evt && evt->call_inst_id + 1 < total_inst_)
+                        navigate_to(evt->call_inst_id + 1);
+                }
+            };
+            break;
+        case kTagNavFollowReturn:
+            action = [this]{
+                if (function_result_) {
+                    auto* evt = function_result_->return_at(current_inst_);
+                    if (evt) {
+                        navigate_to(evt->call_inst_id);
+                    } else {
+                        const auto& stk = current_call_stack();
+                        if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
+                    }
+                }
+            };
+            break;
+
+        case kTagAnaTaint:          action = [this]{ run_taint_analysis(); }; break;
+        case kTagAnaBackTaint:      action = [this]{ run_backward_taint_analysis(); }; break;
+        case kTagAnaSlice:          action = [this]{ run_slice_analysis(); }; break;
+        case kTagAnaFunction:       action = [this]{ run_pass_by_name("function"); }; break;
+        case kTagAnaXref:           action = [this]{ run_pass_by_name("xref"); }; break;
+        case kTagAnaStrings:        action = [this]{ run_pass_by_name("strings"); }; break;
+        case kTagAnaThread:         action = [this]{ run_pass_by_name("thread"); }; break;
+        case kTagAnaCallGraph:      action = [this]{ run_call_graph_analysis(); }; break;
+        case kTagAnaLoop:           action = [this]{ run_pass_by_name("loop"); }; break;
+        case kTagAnaCFG:            action = [this]{ run_cfg_layout(); }; break;
+        case kTagAnaClear:          action = [this]{ clear_analysis(); }; break;
+
+        default: return;
+    }
+    if (action) {
+        std::lock_guard<std::mutex> lk(native_action_mutex_);
+        pending_native_actions_.push_back(std::move(action));
+    }
+}
+
+void tenet::GuiApp::_update_native_menu(void* menuPtr) {
+    NSMenu* menu = (__bridge NSMenu*)menuPtr;
+    for (NSMenuItem* it in menu.itemArray) {
+        switch (static_cast<MenuTag>(it.tag)) {
+            case kTagNavBack:
+                it.enabled = can_nav_back(); break;
+            case kTagNavForward:
+                it.enabled = can_nav_forward(); break;
+            case kTagNavFollowCall:
+                it.enabled = (function_result_ != nullptr &&
+                               function_result_->call_at(current_inst_) != nullptr); break;
+            case kTagNavFollowReturn:
+                it.enabled = (function_result_ != nullptr &&
+                               (function_result_->return_at(current_inst_) != nullptr ||
+                                !current_call_stack().empty())); break;
+
+            case kTagViewRegisters:     it.state = show_registers_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewMemory:        it.state = show_memory_             ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCallStack:     it.state = show_callstack_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewAnalysis:      it.state = show_analysis_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewHexDump:       it.state = show_hex_dump_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewStrings:       it.state = show_strings_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewFunctions:     it.state = show_functions_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewThreads:       it.state = show_threads_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewMinimap:       it.state = show_minimap_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLoops:         it.state = show_loops_              ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCFG:           it.state = show_cfg_                ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewObjC:          it.state = show_objc_               ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLoopSemantics: it.state = show_loop_semantics_     ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewPatterns:      it.state = show_pattern_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewConstants:     it.state = show_constant_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewAlgoSummary:   it.state = show_algorithm_summary_  ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCallGraph:          it.state = show_call_graph_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewObjCCrypto:       it.state = show_objc_crypto_        ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewMemStrings:       it.state = show_mem_strings_        ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewDwarf:         it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewTraceDiff:     it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            default: break;
+        }
+    }
+}
+
+void tenet::GuiApp::consume_native_actions() {
+    std::vector<std::function<void()>> local;
+    {
+        std::lock_guard<std::mutex> lk(native_action_mutex_);
+        local.swap(pending_native_actions_);
+    }
+    for (auto& fn : local) fn();
+}
+
+void tenet::GuiApp::setup_native_menu() {
+    TenetMenuTarget*   target   = [[TenetMenuTarget alloc] init];
+    target.app = this;
+    TenetMenuDelegate* delegate = [[TenetMenuDelegate alloc] init];
+    delegate.app = this;
+
+    const NSUInteger Cmd   = NSEventModifierFlagCommand;
+    const NSUInteger Shift = NSEventModifierFlagShift;
+
+    auto mk = [&](NSString* title, NSString* key, NSUInteger mods, NSInteger tag) -> NSMenuItem* {
+        return tenet_make_item(title, key, mods, tag, target);
+    };
+    auto sep = []() -> NSMenuItem* { return [NSMenuItem separatorItem]; };
+    auto sub = [&](NSString* title) -> NSMenu* {
+        return tenet_make_submenu(title, delegate);
+    };
+
+    NSMenu* bar = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+
+    // ── App menu ────────────────────────────────────────────────────
+    {
+        NSMenuItem* appItem = [[NSMenuItem alloc] initWithTitle:@"Tenet" action:nil keyEquivalent:@""];
+        NSMenu* appMenu = sub(@"Tenet");
+        NSMenuItem* about = [[NSMenuItem alloc] initWithTitle:@"About Tenet"
+                                                       action:@selector(orderFrontStandardAboutPanel:)
+                                                keyEquivalent:@""];
+        about.target = NSApp;
+        [appMenu addItem:about];
+        [appMenu addItem:sep()];
+        [appMenu addItem:mk(@"Settings\u2026", @",", Cmd, kTagEditSettings)];
+        [appMenu addItem:sep()];
+        [appMenu addItem:mk(@"Quit Tenet", @"q", Cmd, kTagFileQuit)];
+        appItem.submenu = appMenu;
+        [bar addItem:appItem];
+    }
+
+    // ── File menu ────────────────────────────────────────────────────
+    {
+        NSMenuItem* fileItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
+        NSMenu* fileMenu = sub(@"File");
+        NSMenuItem* openItem = [[NSMenuItem alloc] initWithTitle:@"Open Trace\u2026"
+                                                          action:nil
+                                                   keyEquivalent:@"o"];
+        openItem.keyEquivalentModifierMask = Cmd;
+        openItem.enabled = NO;
+        [fileMenu addItem:openItem];
+        fileItem.submenu = fileMenu;
+        [bar addItem:fileItem];
+    }
+
+    // ── View menu ────────────────────────────────────────────────────
+    {
+        NSMenuItem* viewItem = [[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""];
+        NSMenu* viewMenu = sub(@"View");
+        [viewMenu addItem:mk(@"Registers",            @"r", Cmd, kTagViewRegisters)];
+        [viewMenu addItem:mk(@"Memory",               @"m", Cmd, kTagViewMemory)];
+        [viewMenu addItem:mk(@"Call Stack",           @"",  0,   kTagViewCallStack)];
+        [viewMenu addItem:mk(@"Analysis",             @"",  0,   kTagViewAnalysis)];
+        [viewMenu addItem:mk(@"Hex Dump",             @"",  0,   kTagViewHexDump)];
+        [viewMenu addItem:mk(@"Strings",              @"",  0,   kTagViewStrings)];
+        [viewMenu addItem:mk(@"Functions",            @"",  0,   kTagViewFunctions)];
+        [viewMenu addItem:mk(@"Threads",              @"",  0,   kTagViewThreads)];
+        [viewMenu addItem:sep()];
+        [viewMenu addItem:mk(@"Minimap",              @"",  0,   kTagViewMinimap)];
+        [viewMenu addItem:mk(@"Loop Highlight",       @"",  0,   kTagViewLoops)];
+        [viewMenu addItem:mk(@"CFG View",             @"",  0,   kTagViewCFG)];
+        [viewMenu addItem:sep()];
+        [viewMenu addItem:mk(@"ObjC Messages",        @"",  0,   kTagViewObjC)];
+        [viewMenu addItem:mk(@"Loop Semantics",       @"",  0,   kTagViewLoopSemantics)];
+        [viewMenu addItem:mk(@"Patterns",             @"",  0,   kTagViewPatterns)];
+        [viewMenu addItem:mk(@"Constants",            @"",  0,   kTagViewConstants)];
+        [viewMenu addItem:mk(@"Algorithm Summary",    @"",  0,   kTagViewAlgoSummary)];
+        [viewMenu addItem:mk(@"Call Graph",           @"",  0,   kTagViewCallGraph)];
+        [viewMenu addItem:mk(@"ObjC Crypto",          @"",  0,   kTagViewObjCCrypto)];
+        [viewMenu addItem:mk(@"Memory Strings",       @"",  0,   kTagViewMemStrings)];
+        [viewMenu addItem:mk(@"API Intercepts",       @"",  0,   kTagViewSyscallIntercept)];
+        [viewMenu addItem:mk(@"Cache Sim",            @"",  0,   kTagViewCacheSim)];
+        [viewMenu addItem:mk(@"Trace Fold",           @"",  0,   kTagViewTraceFold)];
+        [viewMenu addItem:sep()];
+        [viewMenu addItem:mk(@"Register Timeline",    @"",  0,   kTagViewRegTimeline)];
+        [viewMenu addItem:mk(@"Symbol Info (DWARF)",  @"",  0,   kTagViewDwarf)];
+        [viewMenu addItem:mk(@"Trace Diff",           @"",  0,   kTagViewTraceDiff)];
+        viewItem.submenu = viewMenu;
+        [bar addItem:viewItem];
+    }
+
+    // ── Navigate menu ────────────────────────────────────────────────
+    {
+        NSMenuItem* navItem = [[NSMenuItem alloc] initWithTitle:@"Navigate" action:nil keyEquivalent:@""];
+        NSMenu* navMenu = sub(@"Navigate");
+        [navMenu addItem:mk(@"Go to Instruction\u2026", @"g", Cmd, kTagNavGoto)];
+        [navMenu addItem:mk(@"Search\u2026",            @"f", Cmd, kTagNavSearch)];
+        [navMenu addItem:sep()];
+        [navMenu addItem:mk(@"Back",               @"[", Cmd, kTagNavBack)];
+        [navMenu addItem:mk(@"Forward",            @"]", Cmd, kTagNavForward)];
+        [navMenu addItem:sep()];
+        [navMenu addItem:mk(@"First Instruction",  @"",  0,   kTagNavFirst)];
+        [navMenu addItem:mk(@"Last Instruction",   @"",  0,   kTagNavLast)];
+        [navMenu addItem:sep()];
+        [navMenu addItem:mk(@"Toggle Bookmark",    @"b", Cmd, kTagNavBookmark)];
+        [navMenu addItem:sep()];
+        [navMenu addItem:mk(@"Follow Call",        @"",  0,   kTagNavFollowCall)];
+        [navMenu addItem:mk(@"Follow Return",      @"",  0,   kTagNavFollowReturn)];
+        navItem.submenu = navMenu;
+        [bar addItem:navItem];
+    }
+
+    // ── Analysis menu ────────────────────────────────────────────────
+    {
+        NSMenuItem* anaItem = [[NSMenuItem alloc] initWithTitle:@"Analysis" action:nil keyEquivalent:@""];
+        NSMenu* anaMenu = sub(@"Analysis");
+        [anaMenu addItem:mk(@"Forward Taint",    @"t", Cmd,         kTagAnaTaint)];
+        [anaMenu addItem:mk(@"Backward Taint",   @"t", Cmd | Shift, kTagAnaBackTaint)];
+        [anaMenu addItem:mk(@"Slice",            @"s", Cmd,         kTagAnaSlice)];
+        [anaMenu addItem:sep()];
+        [anaMenu addItem:mk(@"Function Analysis",  @"", 0, kTagAnaFunction)];
+        [anaMenu addItem:mk(@"Xref Analysis",      @"", 0, kTagAnaXref)];
+        [anaMenu addItem:mk(@"String Analysis",    @"", 0, kTagAnaStrings)];
+        [anaMenu addItem:mk(@"Thread Analysis",    @"", 0, kTagAnaThread)];
+        [anaMenu addItem:mk(@"Call Graph",         @"", 0, kTagAnaCallGraph)];
+        [anaMenu addItem:mk(@"Loop Analysis",      @"", 0, kTagAnaLoop)];
+        [anaMenu addItem:mk(@"CFG Layout",         @"", 0, kTagAnaCFG)];
+        [anaMenu addItem:sep()];
+        [anaMenu addItem:mk(@"Clear All Analysis", @"", 0, kTagAnaClear)];
+        anaItem.submenu = anaMenu;
+        [bar addItem:anaItem];
+    }
+
+    [NSApp setMainMenu:bar];
+}
+
+// Re-open namespace for the rest of the file (run loop, render_frame, etc.)
+namespace tenet {
+
 // ─── Main Run Loop ──────────────────────────────────────────────────────────
 
 int GuiApp::run() {
     if (!init_sdl()) return 1;
     if (!init_imgui()) return 1;
+
+    // Build native macOS menu bar and assign to [NSApp mainMenu].
+    // Must be called after SDL/ImGui are initialised (NSApp is ready).
+    setup_native_menu();
 
     // Start the background analysis worker thread (processes manual triggers).
     start_analysis_worker();
@@ -518,6 +949,10 @@ int GuiApp::run() {
 //  and status bar translation units.)
 
 void GuiApp::render_frame() {
+    // Drain any menu-item actions posted by the native macOS menu bar callbacks.
+    // Must happen before any ImGui calls to avoid state corruption.
+    consume_native_actions();
+
     ImGuiViewport* viewport = ImGui::GetMainViewport();
 
     // ─── Toolbar (fixed at top, above dockspace) ─────────────────────
@@ -630,24 +1065,11 @@ void GuiApp::render_frame() {
     //       the menu bar separately as a standalone menu bar window.
     ImGui::End();
 
-    // ─── Actual menu bar (rendered as top-most, full-width strip) ────
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, 0.0f));  // auto-height
-    ImGui::SetNextWindowViewport(viewport->ID);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::Begin("##MainMenuBar", nullptr,
-        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_MenuBar |
-        ImGuiWindowFlags_NoSavedSettings);
-    ImGui::PopStyleVar(3);
-    render_menu_bar();
-    ImGui::End();
-
     // ─── Toolbar ────────────────────────────────────────────────────
+    // Note: the application menu bar is now the native macOS NSMenu
+    // (set up in setup_native_menu()). The ImGui ##MainMenuBar window
+    // has been removed. Toolbar is now pinned at the very top of the
+    // SDL window area (WorkPos.y).
     render_toolbar();
 
     // ─── Global keyboard shortcuts ───────────────────────────────────
@@ -860,6 +1282,22 @@ void GuiApp::render_frame() {
     }
     if (show_cfg_) {
         render_cfg_panel();
+    }
+
+    if (show_mem_strings_) {
+        render_memory_strings_panel();
+    }
+    if (show_syscall_intercept_) {
+        render_syscall_intercept_panel();
+    }
+    if (show_objc_crypto_) {
+        render_objc_crypto_panel();
+    }
+    if (show_cache_sim_) {
+        render_cache_sim_panel();
+    }
+    if (show_trace_fold_) {
+        render_trace_fold_panel();
     }
 
     // ─── P2 panels ──────────────────────────────────────────────────

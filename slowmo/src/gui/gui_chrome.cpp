@@ -109,6 +109,18 @@ void GuiApp::render_menu_bar() {
             ImGui::MenuItem("Loop Highlight", "O", &show_loops_);
             ImGui::MenuItem("CFG View", "K", &show_cfg_);
             ImGui::Separator();
+            ImGui::MenuItem("ObjC Messages",         nullptr, &show_objc_);
+            ImGui::MenuItem("ObjC Crypto",           nullptr, &show_objc_crypto_);
+            ImGui::MenuItem("Loop Semantics",        nullptr, &show_loop_semantics_);
+            ImGui::MenuItem("Patterns",              nullptr, &show_pattern_);
+            ImGui::MenuItem("Constants",             nullptr, &show_constant_);
+            ImGui::MenuItem("Algorithm Summary",     nullptr, &show_algorithm_summary_);
+            ImGui::MenuItem("Call Graph",            nullptr, &show_call_graph_);
+            ImGui::MenuItem("Memory Strings",        nullptr, &show_mem_strings_);
+            ImGui::MenuItem("API Intercepts",        nullptr, &show_syscall_intercept_);
+            ImGui::MenuItem("Cache Sim",             nullptr, &show_cache_sim_);
+            ImGui::MenuItem("Trace Fold",            nullptr, &show_trace_fold_);
+            ImGui::Separator();
             // ── P2 panels ────────────────────────────────────────────
             ImGui::MenuItem("Register Timeline",     nullptr, &show_reg_timeline_);
             ImGui::MenuItem("Symbol Info (DWARF)",   nullptr, &show_dwarf_panel_);
@@ -267,11 +279,12 @@ void GuiApp::render_menu_bar() {
 // status badges on the right (Binary Ninja / IDA style)
 
 void GuiApp::render_toolbar() {
-    // ── Fixed position: pinned below menu bar, full width ─────────────
+    // ── Fixed position: pinned at the very top of the window area ─────
+    // The application menu bar is now the native macOS NSMenu (screen top).
+    // The ImGui menu bar window has been removed, so the toolbar starts
+    // directly at WorkPos.y (the top of the SDL window client area).
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    // Menu bar auto-height: use GetFrameHeight (approx) + padding
-    const float menu_h = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
-    const float toolbar_y = vp->WorkPos.y + menu_h;
+    const float toolbar_y = vp->WorkPos.y;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbar_y));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, kToolbarHeight));
     ImGui::SetNextWindowViewport(vp->ID);

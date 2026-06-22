@@ -14,6 +14,10 @@
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/function_pass.h"
+#include "analysis/passes/objc_pass.h"
+#include "analysis/passes/objc_crypto_pass.h"
+#include "analysis/passes/memory_string_pass.h"
+#include "analysis/passes/trace_fold_pass.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -52,7 +56,11 @@ struct PatternResult;
 struct LoopSemanticsResult;
 struct AlgorithmSummaryResult;
 struct AnnotationResult;
-struct TraceDiffResult;    // P2-14 (defined in trace_diff_pass.h)
+struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
+struct CacheSimResult;           // defined in cache_sim_pass.h
+struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
+// ObjcResult is defined in objc_pass.h (already included)
+// MemoryStringResult is defined in memory_string_pass.h (already included)
 
 /// Main GUI Application using Dear ImGui + SDL3 + Metal
 class GuiApp {
@@ -190,19 +198,28 @@ private:
     const FunctionResult* function_result_ = nullptr;
     const XrefResult* xref_result_ = nullptr;
 
-    // ─── Per-frame call-stack cache ───────────────────────────────────
-    // call_stack_at() is O(N) in call_events.  Multiple panels (callstack,
-    // context menu, follow-return) call it on current_inst_ every frame.
-    // Cache it here; invalidated when current_inst_ or function_result_ changes.
-    struct CallStackCache {
-        const FunctionResult* source    = nullptr;
-        uint64_t              inst_id   = UINT64_MAX;
-        std::vector<const CallEvent*> stack;
-    } callstack_frame_cache_;
+// ─── Per-frame call-stack cache ───────────────────────────────────
+// call_stack_at() is O(N) in call_events.  Multiple panels (callstack,
+// context menu, follow-return) call it on current_inst_ every frame.
+// Cache it here; invalidated when current_inst_ or function_result_ changes.
+// labels: pre-built ImGui Selectable labels for each frame — rebuilt only
+// when the stack itself changes (avoids per-frame fmt::format + heap alloc).
+struct CallStackCache {
+const FunctionResult* source    = nullptr;
+uint64_t              inst_id   = UINT64_MAX;
+std::vector<const CallEvent*> stack;
+std::vector<std::string>      labels;  // one per stack entry, stable across frames
+} callstack_frame_cache_;
 
     /// Return the cached call stack for current_inst_.  Recomputes if stale.
     const std::vector<const CallEvent*>& current_call_stack();
     const CallGraphResult* call_graph_result_ = nullptr;
+    bool show_call_graph_ = false;
+    int  call_graph_view_mode_ = 0;    // 0=Hot Callees, 1=Edges
+    char call_graph_filter_buf_[128] = {};
+    std::string call_graph_filter_;
+    uint64_t call_graph_selected_pc_ = 0;
+
     bool show_taint_ = false;
     bool show_slice_ = false;
     bool show_backward_taint_ = false;
@@ -365,6 +382,70 @@ private:
     const AlgorithmSummaryResult*        algorithm_summary_result_ = nullptr;
     const AnnotationResult*              annotation_result_        = nullptr;
 
+    // ─── Constant materialization analysis state ─────────────────────
+    bool show_constant_ = false;
+    int  constant_view_mode_ = 0;   // 0=All, 1=Identified Only
+    char constant_filter_buf_[128] = {};
+    std::string constant_filter_;
+
+    // ─── Pattern analysis state ────────────────────────────────────────
+    bool show_pattern_ = false;
+    int pattern_view_mode_ = 0;  // 0=All, 1=Crypto, 2=AntiDebug, 3=Other
+    char pattern_filter_buf_[128] = {};
+    std::string pattern_filter_;
+    size_t pattern_cursor_ = 0;
+
+    // ─── Loop Semantics analysis state ────────────────────────────────
+    bool show_loop_semantics_ = false;
+
+    // ─── Algorithm Summary analysis state ─────────────────────────────────
+    bool show_algorithm_summary_ = false;
+    int  algorithm_view_mode_    = 0;  // 0=Candidates, 1=Summary Text
+
+    // ─── Memory String analysis state ──────────────────────────────────
+    const MemoryStringResult* mem_string_result_ = nullptr;
+    bool show_mem_strings_ = false;
+    char mem_string_filter_buf_[256] = {};
+    std::string mem_string_filter_;
+    int mem_string_view_mode_ = 0;   // 0=All, 1=RegPointer, 2=StackLocal
+
+    // ─── Cache simulation analysis state ──────────────────────────────
+    const CacheSimResult* cache_sim_result_ = nullptr;
+    bool show_cache_sim_ = false;
+    int  cache_sim_view_mode_ = 0;  // 0=Overview, 1=Functions, 2=SideChannels, 3=HotLines
+
+    // ─── Syscall / API intercept analysis state ─────────────────────
+    const SyscallInterceptResult* syscall_result_ = nullptr;
+    bool show_syscall_intercept_ = false;
+    char syscall_filter_buf_[128] = {};
+    std::string syscall_filter_;
+    int  syscall_view_mode_ = 0;    // 0=All, 1=Crypto Only
+    size_t syscall_cursor_ = 0;
+
+    // ─── ObjC analysis state ───────────────────────────────────────────
+    const ObjcResult* objc_result_ = nullptr;
+    bool show_objc_ = false;
+
+    // ObjC panel filter / cursor state
+    char objc_class_filter_buf_[128] = {};
+    std::string objc_class_filter_;
+    char objc_sel_filter_buf_[128] = {};
+    std::string objc_sel_filter_;
+    size_t objc_msg_cursor_ = 0;       // selected row in message table
+    int objc_view_mode_ = 0;           // 0 = Messages, 1 = Classes
+
+    // ─── ObjC Crypto analysis state ────────────────────────────────────────
+    const ObjcCryptoResult* objc_crypto_result_ = nullptr;
+    bool show_objc_crypto_ = false;
+    int  objc_crypto_view_mode_ = 0;   // 0=All, 1=In ObjC, 2=Bare
+    char objc_crypto_filter_buf_[128] = {};
+    std::string objc_crypto_filter_;
+    size_t objc_crypto_cursor_ = 0;
+
+    // ─── Trace Fold analysis state ─────────────────────────────────────────
+    const TraceFoldResult* trace_fold_result_ = nullptr;
+    bool show_trace_fold_ = false;
+
     // ─── Multi-trace diff state (P2-14) ────────────────────────────────
     bool show_trace_diff_ = false;
     // Region A and B inst_id ranges to compare
@@ -450,6 +531,28 @@ private:
     void start_analysis_worker();               // call once at startup
     void stop_analysis_worker();                // call on shutdown (joins worker)
 
+    // ─── Native macOS menu bar ───────────────────────────────────────
+    // NSMenu action callbacks run on the main thread (same as the render loop),
+    // but they fire *outside* an ImGui frame.  To avoid corrupting ImGui state,
+    // callbacks post lambdas into pending_native_actions_; render_frame() drains
+    // them at the very start of each frame, before any ImGui calls.
+    std::mutex                         native_action_mutex_;
+    std::vector<std::function<void()>> pending_native_actions_;
+
+    /// Called once after init_sdl() / init_imgui() to build the NSMenu tree.
+    void setup_native_menu();
+    /// Drain pending_native_actions_ on the UI/render thread (called every frame).
+    void consume_native_actions();
+
+    // Internal callbacks invoked by ObjC TenetMenuTarget / TenetMenuDelegate.
+    // Declared public so the ObjC glue objects (defined in gui_app.mm, outside
+    // namespace tenet) can call them without friendship hacks.
+    // Uses long / void* to keep ObjC types out of this header.
+public:
+    void _post_native_action(long tag);      // called by TenetMenuTarget on menu click
+    void _update_native_menu(void* nsMenu);  // called by TenetMenuDelegate before menu opens
+private:
+
     /// Helper: safely get a completed pass result pointer, or nullptr.
     const PassResult* completed_result(std::string_view name);
     /// Apply UI-side result pointers for a completed pass (function, xref, etc.).
@@ -494,6 +597,17 @@ private:
     void render_reg_timeline_panel();    // Register value history sparkline (P2-12)
     void render_dwarf_panel();           // DWARF / nm symbol info panel (P2-13)
     void render_trace_diff_panel();      // Multi-trace divergence view (P2-14)
+    void render_pattern_panel();          // Pattern recognition (crypto/anti-debug)
+    void render_constant_panel();         // Constant materialization / algorithm constant identification
+    void render_cache_sim_panel();               // Cache simulation / side-channel
+    void render_objc_panel();                  // Objective-C message analysis
+    void render_objc_crypto_panel();           // ObjC x Crypto correlation
+    void render_call_graph_panel();            // Call graph analysis
+    void render_loop_semantics_panel();        // Loop semantic classification
+    void render_algorithm_summary_panel();     // Algorithm identification summary
+    void render_memory_strings_panel();          // Time-aware memory string discovery
+    void render_trace_fold_panel();              // Trace fold (loop-compressed) view
+    void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
 
     // ─── Popups / Windows ───────────────────────────────────────────
     void render_goto_popup();
@@ -520,6 +634,11 @@ private:
     /// Run any catalog pass by name, deriving config from the current cursor.
     /// Stores a one-line summary in last_pass_status_.
     void run_pass_by_name(std::string_view name);
+
+    /// Force re-run a pass by invalidating both its in-memory result and its
+    /// persisted RocksDB blob, then enqueue it for execution.
+    /// Use for passes that have disk caches (xref, function, constant_materialization).
+    void force_rerun_pass(std::string_view name);
 
     /// Last generic pass run summary (shown in the All Passes section).
     std::string last_pass_status_;

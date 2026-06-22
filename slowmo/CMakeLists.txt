@@ -419,6 +419,18 @@ src/gui/panels_misc.cpp
 src/gui/panels_reg_timeline.cpp
 src/gui/panels_dwarf.cpp
 src/gui/panels_trace_diff.cpp
+src/gui/panels_objc.cpp
+src/gui/panels_objc_crypto.cpp
+src/gui/panels_call_graph.cpp
+src/gui/panels_loop_semantics.cpp
+src/gui/panels_pattern.cpp
+src/gui/panels_constant.cpp
+src/gui/panels_algorithm_summary.cpp
+src/gui/panels_cache_sim.cpp
+src/gui/panels_trace_fold.cpp
+src/gui/panels_memory_strings.cpp
+src/gui/panels_syscall_intercept.cpp
+src/gui/panels_objc_crypto.cpp
 src/gui/popups.cpp
 )
 
