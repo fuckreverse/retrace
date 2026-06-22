@@ -12,37 +12,56 @@ namespace tenet {
 // ─── RecordView implementation ────────────────────────────────────────────
 
 InstView RecordView::as_inst() const {
-    // is_v5 / is_v6 are set by Iterator::operator*() or record_at(offset, seed_pc).
-    // They select the correct on-disk struct layout:
-    //   is_v5 == true  → qbditrace_inst_head_v5_t (6 bytes); pc from resolved_pc
-    //   is_v5 == false → qbditrace_inst_head_t    (16 bytes); pc from raw struct
-    //   is_v6 == true  → qbditrace_memacc_v6_t (48 bytes) stride in mem_access()
-    //   is_v6 == false → qbditrace_memacc_t    (32 bytes) stride
-    if (is_v5) {
-        // v5 (or v5+v6): header is qbditrace_inst_head_v5_t (6 bytes)
-        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(raw_ptr);
-        InstView v;
-        v.pc = resolved_pc;  // set by Iterator or record_at(offset, seed_pc)
+    // is_v5 / is_v6 / is_v7 are set by Iterator::operator*() or record_at().
+    //   is_v7 + is_v5 → qbditrace_inst_head_v7_v5_t (8 bytes)
+    //   is_v7         → qbditrace_inst_head_v7_t    (24 bytes)
+    //   is_v5         → qbditrace_inst_head_v5_t    (6 bytes)
+    //   else          → qbditrace_inst_head_t       (16 bytes)
+    //   is_v6 == true → qbditrace_memacc_v6_t (48 bytes) stride in mem_access()
+    //   is_v7 == true → FPR diff section between GPR diffs and mems
+    InstView v;
+    v.is_v5 = is_v5;
+    v.is_v6 = is_v6;
+    v.is_v7 = is_v7;
+    v.fpr_diff_count = 0;
+    v.raw_fprdiffs = nullptr;
+
+    if (is_v7 && is_v5) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_v5_t*>(raw_ptr);
+        v.pc = resolved_pc;
         v.nzcv = hdr->nzcv;
-        v.reg_diff_count = hdr->n_regdiff;
+        v.reg_diff_count  = hdr->n_regdiff;
+        v.fpr_diff_count  = hdr->n_fprdiff;
+        v.mem_access_count = hdr->n_mem;
+        v.raw_diffs = raw_ptr + sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+    } else if (is_v7) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_t*>(raw_ptr);
+        v.pc = hdr->pc;
+        v.nzcv = hdr->nzcv;
+        v.reg_diff_count  = hdr->n_regdiff;
+        v.fpr_diff_count  = hdr->n_fprdiff;
+        v.mem_access_count = hdr->n_mem;
+        v.raw_diffs = raw_ptr + sizeof(qbditrace::qbditrace_inst_head_v7_t);
+    } else if (is_v5) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(raw_ptr);
+        v.pc = resolved_pc;
+        v.nzcv = hdr->nzcv;
+        v.reg_diff_count  = hdr->n_regdiff;
         v.mem_access_count = hdr->n_mem;
         v.raw_diffs = raw_ptr + sizeof(qbditrace::qbditrace_inst_head_v5_t);
-        v.raw_mems = v.raw_diffs + v.reg_diff_count * sizeof(qbditrace::qbditrace_regdiff_t);
-        v.is_v5 = true;
-        v.is_v6 = is_v6;
-        return v;
+    } else {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(raw_ptr);
+        v.pc = hdr->pc;
+        v.nzcv = hdr->nzcv;
+        v.reg_diff_count  = hdr->n_regdiff;
+        v.mem_access_count = hdr->n_mem;
+        v.raw_diffs = raw_ptr + sizeof(qbditrace::qbditrace_inst_head_t);
     }
-    // v4 (or v4+v6): header is qbditrace_inst_head_t (16 bytes)
-    const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(raw_ptr);
-    InstView v;
-    v.pc = hdr->pc;
-    v.nzcv = hdr->nzcv;
-    v.reg_diff_count = hdr->n_regdiff;
-    v.mem_access_count = hdr->n_mem;
-    v.raw_diffs = raw_ptr + sizeof(qbditrace::qbditrace_inst_head_t);
-    v.raw_mems = v.raw_diffs + v.reg_diff_count * sizeof(qbditrace::qbditrace_regdiff_t);
-    v.is_v5 = false;
-    v.is_v6 = is_v6;
+
+    // FPR diffs (v7 only) come right after the GPR diff section.
+    v.raw_fprdiffs = v.raw_diffs + v.reg_diff_count * sizeof(qbditrace::qbditrace_regdiff_t);
+    // Memory accesses come after the FPR diff section.
+    v.raw_mems = v.raw_fprdiffs + v.fpr_diff_count * sizeof(qbditrace::qbditrace_fprdiff_t);
     return v;
 }
 
@@ -51,7 +70,16 @@ AnchorView RecordView::as_anchor(uint32_t num_gpr) const {
     AnchorView v;
     v.pc = hdr->pc;
     v.num_gpr = num_gpr;
-    v.gpr_values = reinterpret_cast<const uint64_t*>(raw_ptr + sizeof(qbditrace::qbditrace_anchor_head_t));
+    const uint8_t* gpr_start = raw_ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
+    v.gpr_values = reinterpret_cast<const uint64_t*>(gpr_start);
+    // v7: FPR snapshot appended after GPR block.
+    // Layout: 32 × lo (u64) followed by 32 × hi (u64).
+    if (is_v7) {
+        const uint8_t* fpr_start = gpr_start + num_gpr * 8;
+        v.fpr_lo  = reinterpret_cast<const uint64_t*>(fpr_start);
+        v.fpr_hi  = v.fpr_lo + QBDITRACE_AARCH64_NUM_FPR;
+        v.has_fpr = true;
+    }
     return v;
 }
 
@@ -103,30 +131,39 @@ ThreadView RecordView::as_thread() const {
 size_t RecordView::byte_size(uint32_t num_gpr) const {
     switch (kind) {
     case RecordKind::Inst: {
-        // is_v5 / is_v6 select the correct header and memacc struct sizes.
+        // is_v5 / is_v6 / is_v7 select the correct header and struct sizes.
         const uint8_t* p = raw_ptr;
-        size_t hdr_size = is_v5
-            ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
-            : sizeof(qbditrace::qbditrace_inst_head_t);
+        size_t hdr_size;
+        uint8_t n_regdiff, n_fprdiff = 0, n_mem;
+        if (is_v7 && is_v5) {
+            hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_v5_t*>(p);
+            n_regdiff = h->n_regdiff; n_fprdiff = h->n_fprdiff; n_mem = h->n_mem;
+        } else if (is_v7) {
+            hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_t*>(p);
+            n_regdiff = h->n_regdiff; n_fprdiff = h->n_fprdiff; n_mem = h->n_mem;
+        } else if (is_v5) {
+            hdr_size = sizeof(qbditrace::qbditrace_inst_head_v5_t);
+            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(p);
+            n_regdiff = h->n_regdiff; n_mem = h->n_mem;
+        } else {
+            hdr_size = sizeof(qbditrace::qbditrace_inst_head_t);
+            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(p);
+            n_regdiff = h->n_regdiff; n_mem = h->n_mem;
+        }
         size_t memacc_sz = is_v6
             ? sizeof(qbditrace::qbditrace_memacc_v6_t)
             : sizeof(qbditrace::qbditrace_memacc_t);
-        uint8_t n_regdiff, n_mem;
-        if (is_v5) {
-            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(p);
-            n_regdiff = h->n_regdiff;
-            n_mem = h->n_mem;
-        } else {
-            const auto* h = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(p);
-            n_regdiff = h->n_regdiff;
-            n_mem = h->n_mem;
-        }
         return hdr_size
-            + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-            + n_mem     * memacc_sz;
+            + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)
+            + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)
+            + n_mem      * memacc_sz;
     }
-    case RecordKind::Anchor:
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+    case RecordKind::Anchor: {
+        size_t fpr_bytes = is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + fpr_bytes;
+    }
     case RecordKind::Thread:
         return sizeof(qbditrace::qbditrace_thread_head_t);
     case RecordKind::Event:
@@ -215,23 +252,28 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
         return Error::invalid_magic();
     }
 
-    // Accept v4, v5 (PC-delta), and v6 (old-value) trace files.
+    // Accept v4, v5 (PC-delta), v6 (old-value), and v7 (FPR) trace files.
     // v5 is identified by version == QBDITRACE_VERSION_V5_PC_DELTA (5) and HF_PC_DELTA.
     // v6 is identified by version == QBDITRACE_VERSION_V6_OLD_VALUE (6) and HF_OLD_VALUE.
-    // v6 may also combine with PC-delta encoding (both flags set).
+    // v7 is identified by version == QBDITRACE_VERSION_V7_HAS_FPR (7) and HF_HAS_FPR.
+    // Any version may combine PC-delta (HF_PC_DELTA) with its primary flag.
     // Any other version is rejected.
-    bool is_v4 = (raw_hdr->version == TRACE_VERSION);
-    // Note: QBDITRACE_VERSION_V5_PC_DELTA and QBDITRACE_VERSION_V6_OLD_VALUE are
-    // #define macros (not namespace members), so they must not be qualified.
-    bool is_v5 = (raw_hdr->version == QBDITRACE_VERSION_V5_PC_DELTA &&
-                  (raw_hdr->flags & qbditrace::QBDITRACE_HF_PC_DELTA));
-    bool is_v6 = (raw_hdr->version == QBDITRACE_VERSION_V6_OLD_VALUE &&
-                  (raw_hdr->flags & qbditrace::QBDITRACE_HF_OLD_VALUE));
-    // v6 can also use PC-delta encoding (HF_PC_DELTA + HF_OLD_VALUE + version==6)
-    if (!is_v4 && !is_v5 && !is_v6) {
+    // Note: QBDITRACE_VERSION_* are #define macros, not namespace members.
+    const uint32_t ver = raw_hdr->version;
+    const uint64_t flg = raw_hdr->flags;
+    bool version_ok = false;
+    if (ver == TRACE_VERSION)
+        version_ok = true;  // v4 baseline
+    if (ver == QBDITRACE_VERSION_V5_PC_DELTA && (flg & qbditrace::QBDITRACE_HF_PC_DELTA))
+        version_ok = true;
+    if (ver == QBDITRACE_VERSION_V6_OLD_VALUE && (flg & qbditrace::QBDITRACE_HF_OLD_VALUE))
+        version_ok = true;
+    if (ver == QBDITRACE_VERSION_V7_HAS_FPR  && (flg & qbditrace::QBDITRACE_HF_HAS_FPR))
+        version_ok = true;
+    if (!version_ok) {
         uint32_t bad_version = raw_hdr->version;  // read before munmap
         reader.close();
-        return Error::version_mismatch(bad_version, TRACE_VERSION);
+        return Error::version_mismatch(bad_version, TRACE_VERSION_MAX);
     }
 
     reader.header_.magic = raw_hdr->magic;
@@ -275,13 +317,17 @@ RecordView TraceReader::Iterator::operator*() const {
     const uint64_t flags = reader_->header_.flags;
     const bool use_pc_delta  = (flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool use_old_value = (flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool use_fpr       = (flags & qbditrace::QBDITRACE_HF_HAS_FPR)   != 0;
 
-    // Propagate is_v5 / is_v6 so as_inst() and mem_access() use the right struct layout.
+    // Propagate is_v5 / is_v6 / is_v7 so as_inst() and mem_access() use
+    // the right struct layout.
     rv.is_v5 = use_pc_delta;
     rv.is_v6 = use_old_value;
+    rv.is_v7 = use_fpr;
 
     if (rv.kind == RecordKind::Inst && use_pc_delta) {
-        // v5/v6+v5: reconstruct absolute PC from pc_delta.
+        // v5/v6+v5/v7+v5: reconstruct absolute PC from pc_delta.
+        // The pc_delta field is at the same offset in v5, v7+v5 headers.
         const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(rv.raw_ptr);
         int16_t delta;
         std::memcpy(&delta, &hdr->pc_delta, sizeof(delta));  // LE decode
@@ -318,18 +364,28 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
         const uint64_t flags = reader_->header_.flags;
         const bool use_pc_delta  = (flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
         const bool use_old_value = (flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
-        // v6 uses the 48-byte memacc_v6_t; v4/v5 use the 32-byte memacc_t.
+        const bool use_fpr       = (flags & qbditrace::QBDITRACE_HF_HAS_FPR)   != 0;
         size_t memacc_sz = use_old_value
             ? sizeof(qbditrace::qbditrace_memacc_v6_t)
             : sizeof(qbditrace::qbditrace_memacc_t);
-        if (use_pc_delta) {
-            // v5/v6+v5: inst_head_v5 + reg_diffs + mem_accesses
+        if (use_fpr && use_pc_delta) {
+            const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_v5_t*>(ptr);
+            rec_size = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)
+                + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + hdr->n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t)
+                + hdr->n_mem * memacc_sz;
+        } else if (use_fpr) {
+            const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_t*>(ptr);
+            rec_size = sizeof(qbditrace::qbditrace_inst_head_v7_t)
+                + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + hdr->n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t)
+                + hdr->n_mem * memacc_sz;
+        } else if (use_pc_delta) {
             const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(ptr);
             rec_size = sizeof(qbditrace::qbditrace_inst_head_v5_t)
                 + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
                 + hdr->n_mem * memacc_sz;
         } else {
-            // v4/v6: inst_head + reg_diffs + mem_accesses
             const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
             rec_size = sizeof(qbditrace::qbditrace_inst_head_t)
                 + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
@@ -337,10 +393,14 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
         }
         break;
     }
-    case RecordKind::Anchor:
+    case RecordKind::Anchor: {
+        const bool use_fpr = (reader_->header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+        size_t fpr_bytes = use_fpr ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
         rec_size = sizeof(qbditrace::qbditrace_anchor_head_t)
-            + reader_->header_.num_gpr * sizeof(uint64_t);
+            + reader_->header_.num_gpr * sizeof(uint64_t)
+            + fpr_bytes;
         break;
+    }
     case RecordKind::Thread:
         rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
         break;

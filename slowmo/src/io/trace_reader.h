@@ -15,6 +15,12 @@ struct RegDiffView {
     uint64_t value;
 };
 
+struct FprDiffView {
+    uint8_t index;   // 0..31 = v0..v31
+    uint64_t lo;     // bits  63:0
+    uint64_t hi;     // bits 127:64
+};
+
 struct MemAccessView {
     uint8_t type;
     uint8_t flags;
@@ -31,11 +37,14 @@ struct InstView {
     uint64_t pc;
     uint8_t nzcv;
     uint8_t reg_diff_count;
+    uint8_t fpr_diff_count;  // v7 only; 0 for v4/v5/v6
     uint8_t mem_access_count;
-    const uint8_t* raw_diffs;   // points into mmap region
-    const uint8_t* raw_mems;    // points into mmap region
+    const uint8_t* raw_diffs;    // points into mmap region (GPR diffs)
+    const uint8_t* raw_fprdiffs; // points into mmap region (FPR diffs, v7)
+    const uint8_t* raw_mems;     // points into mmap region
     bool is_v5 = false;  // true when record uses v5 (pc_delta) layout
     bool is_v6 = false;  // true when record uses v6 (old_value) layout
+    bool is_v7 = false;  // true when record uses v7 (HF_HAS_FPR) layout
 
     RegDiffView reg_diff(uint8_t i) const {
         // qbditrace_regdiff_t: u8 reg_index @0, pad[7], u64 value @8
@@ -45,6 +54,17 @@ struct InstView {
         RegDiffView d;
         d.index = hdr->reg_index;
         d.value = hdr->value;
+        return d;
+    }
+
+    FprDiffView fpr_diff(uint8_t i) const {
+        // qbditrace_fprdiff_t: u8 fpr_index @0, pad[7], u64 lo @8, u64 hi @16
+        const uint8_t* p = raw_fprdiffs + i * sizeof(qbditrace::qbditrace_fprdiff_t);
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_fprdiff_t*>(p);
+        FprDiffView d;
+        d.index = hdr->fpr_index;
+        d.lo    = hdr->lo;
+        d.hi    = hdr->hi;
         return d;
     }
 
@@ -87,11 +107,18 @@ struct InstView {
 
     // Total byte size of this INST record
     size_t byte_size() const {
-        size_t hdr = is_v5
-            ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
-            : sizeof(qbditrace::qbditrace_inst_head_t);
+        size_t hdr;
+        if (is_v7 && is_v5)
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+        else if (is_v7)
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+        else if (is_v5)
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v5_t);
+        else
+            hdr = sizeof(qbditrace::qbditrace_inst_head_t);
         // Use sizeof() to respect struct alignment padding in the on-disk layout.
         // qbditrace_regdiff_t:    reg_index(u8) + pad(7) + value(u64) = 16 bytes
+        // qbditrace_fprdiff_t:    fpr_index(u8) + pad(7) + lo(u64) + hi(u64) = 24 bytes
         // qbditrace_memacc_t:     type+flags+size(4) + pad(4) + addr+value+value_hi = 32 bytes
         // qbditrace_memacc_v6_t:  same + old_value+old_value_hi = 48 bytes
         size_t memacc_sz = is_v6
@@ -99,6 +126,7 @@ struct InstView {
             : sizeof(qbditrace::qbditrace_memacc_t);
         return hdr
             + reg_diff_count  * sizeof(qbditrace::qbditrace_regdiff_t)
+            + fpr_diff_count  * sizeof(qbditrace::qbditrace_fprdiff_t)
             + mem_access_count * memacc_sz;
     }
 };
@@ -107,9 +135,15 @@ struct AnchorView {
     uint64_t pc;
     const uint64_t* gpr_values;  // points to num_gpr uint64_t values in mmap
     uint32_t num_gpr;
+    // FPR snapshot (v7 only): when has_fpr is true, fpr_lo and fpr_hi each
+    // point to an array of 32 uint64_t values in the mmap region.
+    const uint64_t* fpr_lo = nullptr;  // bits  63:0  for v0..v31
+    const uint64_t* fpr_hi = nullptr;  // bits 127:64 for v0..v31
+    bool has_fpr = false;
 
     size_t byte_size() const {
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+        size_t fpr_bytes = has_fpr ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + fpr_bytes;
     }
 };
 
@@ -175,11 +209,14 @@ struct RecordView {
     // - v4: Iterator and record_at() both leave this 0; as_inst() reads pc from raw_ptr.
     uint64_t resolved_pc = 0;
     // is_v5: true when the INST record uses the 6-byte qbditrace_inst_head_v5_t layout
-    //        (HF_PC_DELTA). Set symmetrically with is_v6 by Iterator and record_at().
+    //        (HF_PC_DELTA). Set symmetrically with is_v6/is_v7 by Iterator and record_at().
     bool is_v5 = false;
     // is_v6: true when memory access records use the 48-byte qbditrace_memacc_v6_t layout
     //        (HF_OLD_VALUE). Set by Iterator and record_at().
     bool is_v6 = false;
+    // is_v7: true when INST records carry FPR diffs and ANCHOR records carry FPR
+    //        snapshots (HF_HAS_FPR). Set by Iterator and record_at().
+    bool is_v7 = false;
 
     // Parse helpers (caller checks kind first)
     InstView as_inst() const;
@@ -213,6 +250,7 @@ struct FileHeader {
     bool has_code() const      { return flags & qbditrace::QBDITRACE_HF_HAS_CODE; }
     bool reg_diff() const      { return flags & qbditrace::QBDITRACE_HF_REG_DIFF; }
     bool has_old_value() const { return flags & qbditrace::QBDITRACE_HF_OLD_VALUE; }
+    bool has_fpr() const       { return flags & qbditrace::QBDITRACE_HF_HAS_FPR; }
 };
 
 // ─── TraceReader ──────────────────────────────────────────────────────────
@@ -255,6 +293,7 @@ public:
         rv.resolved_pc = seed_pc;
         rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
         rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+        rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
         return rv;
     }
 

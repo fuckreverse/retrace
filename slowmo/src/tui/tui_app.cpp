@@ -327,6 +327,49 @@ Element TuiApp::render_register_panel() {
         }));
     }
 
+    // FPR / NEON section (v7 traces only, shown when show_fpr_ is true)
+    if (reader_.header().has_fpr()) {
+        reg_lines.push_back(separator());
+        // Toggle header: press 'V' to collapse/expand (handled in event loop)
+        if (show_fpr_) {
+            reg_lines.push_back(hbox({
+                text("NEON v0\xe2\x80\x93v31") | bold | color(Color::Magenta),
+                text("  (V to hide)") | color(Color::GrayLight),
+            }));
+            reg_lines.push_back(separator());
+            for (uint8_t vi = 0; vi < AARCH64_FPR_COUNT; ++vi) {
+                const FprValue& fval = state.fpr[vi];
+                // Determine if this FPR was written by the current instruction
+                // (v7: check fpr_diff list for the current record)
+                bool fpr_written = false;
+                {
+                    auto [off, spc] = index_.offset_of_with_pc(current_inst_, reader_);
+                    auto frec = reader_.record_at(off, spc);
+                    if (frec.kind == RecordKind::Inst) {
+                        auto fi = frec.as_inst();
+                        for (uint8_t fd = 0; fd < fi.fpr_diff_count; fd++) {
+                            if (fi.fpr_diff(fd).index == vi) { fpr_written = true; break; }
+                        }
+                    }
+                }
+                Color vname_col = fpr_written ? Color::RedLight : Color::Magenta;
+                Color val_col   = fpr_written ? Color::RedLight : Color::White;
+                auto fpr_line = hbox({
+                    text(fmt::format("v{:<2}=", vi)) | color(vname_col),
+                    text(fmt::format("{:016x}", fval.hi)) | color(val_col),
+                    text(":") | color(Color::GrayLight),
+                    text(fmt::format("{:016x}", fval.lo)) | color(val_col),
+                });
+                reg_lines.push_back(fpr_line);
+            }
+        } else {
+            reg_lines.push_back(hbox({
+                text("NEON v0\xe2\x80\x93v31") | bold | color(Color::GrayDark),
+                text("  (V to show)") | color(Color::GrayLight),
+            }));
+        }
+    }
+
     // Cache stats
     reg_lines.push_back(separator());
     auto stats = regfile_.cache_stats();
@@ -1387,6 +1430,10 @@ bool TuiApp::handle_event(Event event) {
     }
     if (event == Event::Character('z')) {
         show_nzcv_ = !show_nzcv_;
+        return true;
+    }
+    if (event == Event::Character('V')) {
+        show_fpr_ = !show_fpr_;
         return true;
     }
     if (event == Event::Character('R')) {

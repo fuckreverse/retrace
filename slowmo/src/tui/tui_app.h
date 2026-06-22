@@ -83,6 +83,7 @@ private:
     bool show_nzcv_ = true;
     bool show_hex_dump_ = false;
     bool hex_dump_focused_ = false;
+    bool show_fpr_ = false;        // NEON/FPR section in register panel (V to toggle)
 
     // ─── Cached rows ──────────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{1024};

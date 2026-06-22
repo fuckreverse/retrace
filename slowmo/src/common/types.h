@@ -103,8 +103,10 @@ public:
 
 constexpr uint32_t TRACE_MAGIC = 0x51424454u;  // "QBDT"
 constexpr uint32_t TRACE_VERSION = 4u;
+constexpr uint32_t TRACE_VERSION_MAX = 7u;  // highest supported version
 
 constexpr uint8_t AARCH64_GPR_COUNT = 34;  // x0-x28, fp(x29), lr(x30), sp, nzcv, pc
+constexpr uint8_t AARCH64_FPR_COUNT = 32;  // v0-v31 (128-bit each)
 constexpr uint8_t IDX_FP   = 29;
 constexpr uint8_t IDX_LR   = 30;
 constexpr uint8_t IDX_SP   = 31;
@@ -123,10 +125,21 @@ enum class RecordKind : uint8_t {
     Code   = 6,
 };
 
+// ─── FPR value (128-bit vector register) ─────────────────────────────────
+
+struct FprValue {
+    uint64_t lo = 0;  // bits  63:0
+    uint64_t hi = 0;  // bits 127:64
+
+    bool operator==(const FprValue& o) const { return lo == o.lo && hi == o.hi; }
+    bool operator!=(const FprValue& o) const { return !(*this == o); }
+};
+
 // ─── Register state ────────────────────────────────────────────────────────
 
 struct RegState {
-    uint64_t gpr[AARCH64_GPR_COUNT]{};  // 272 bytes
+    uint64_t gpr[AARCH64_GPR_COUNT]{};        // 272 bytes — x0..x28, fp, lr, sp, nzcv, pc
+    FprValue fpr[AARCH64_FPR_COUNT]{};        // 512 bytes — v0..v31 (128-bit each)
 
     uint64_t pc()   const { return gpr[IDX_PC]; }
     uint64_t sp()   const { return gpr[IDX_SP]; }

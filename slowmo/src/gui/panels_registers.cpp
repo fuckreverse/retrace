@@ -351,6 +351,41 @@ void GuiApp::render_register_panel() {
 
     ImGui::PopStyleVar(2);
 
+    // ── FPR / NEON section (v7 traces only, collapsible) ───────────
+    if (reader_.header().has_fpr()) {
+        ImGui::Dummy(ImVec2(0, 4));
+        ImVec2 fpr_p0 = ImGui::GetCursorScreenPos();
+        draw->AddLine(fpr_p0, ImVec2(fpr_p0.x + ImGui::GetContentRegionAvail().x, fpr_p0.y),
+                      IM_COL32(70, 78, 110, 200), 1.0f);
+        ImGui::Dummy(ImVec2(0, 2));
+
+        // TreeNode acts as the collapse toggle
+        if (ImGui::TreeNodeEx("NEON (v0\xe2\x80\x93v31)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4, 1));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(4, 1));
+            // Show one FPR per row: name + 128-bit value as two 64-bit words
+            for (uint8_t vi = 0; vi < AARCH64_FPR_COUNT; ++vi) {
+                const FprValue& fval  = state.fpr[vi];
+                const FprValue& pfval = has_prev ? prev_state.fpr[vi] : FprValue{};
+                bool changed = has_prev && (fval != pfval);
+                char vname[8];
+                snprintf(vname, sizeof(vname), "v%-2d", vi);
+                ImVec4 col = changed
+                    ? ImVec4(0.85f, 0.75f, 0.40f, 1.0f)  // yellow = changed
+                    : ImVec4(0.55f, 0.62f, 0.80f, 1.0f); // default blue-ish
+                ImGui::TextColored(col, "%s", vname);
+                ImGui::SameLine(0, 4);
+                // Show as 16-byte hex (lo then hi, each 8 bytes in hex)
+                ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f),
+                    "%016llx:%016llx",
+                    (unsigned long long)fval.hi,
+                    (unsigned long long)fval.lo);
+            }
+            ImGui::PopStyleVar(2);
+            ImGui::TreePop();
+        }
+    }
+
     // Render register context menu
     render_reg_context_menu();
 

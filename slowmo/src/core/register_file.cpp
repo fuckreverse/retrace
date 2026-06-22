@@ -36,11 +36,19 @@ RegState RegisterFile::state_after(uint64_t inst_id) {
     auto rec = reader_.record_at(offset, seed_pc);
     if (rec.kind == RecordKind::Inst) {
         auto inst = rec.as_inst();
-        // Apply register diffs
+        // Apply GPR diffs
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             auto diff = inst.reg_diff(i);
             if (diff.index < AARCH64_GPR_COUNT) {
                 state.gpr[diff.index] = diff.value;
+            }
+        }
+        // Apply FPR diffs (v7 only)
+        for (uint8_t i = 0; i < inst.fpr_diff_count; i++) {
+            auto diff = inst.fpr_diff(i);
+            if (diff.index < AARCH64_FPR_COUNT) {
+                state.fpr[diff.index].lo = diff.lo;
+                state.fpr[diff.index].hi = diff.hi;
             }
         }
         // Update NZCV if captured
@@ -107,22 +115,26 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
     const uint32_t num_gpr = reader_.header().num_gpr;
     const bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     const bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool is_v7 = (reader_.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
 
     // ── Header sizes for record byte-size calculations ──
-    // v4: qbditrace_inst_head_t  (kind+nzcv+n_regdiff+n_mem=4 + pad4 + pc=8 = 16 bytes)
-    // v5: qbditrace_inst_head_v5_t (kind+nzcv+n_regdiff+n_mem=4 + pc_delta=2 = 6 bytes)
-    // Sizes include compiler alignment padding; always use sizeof() to stay in sync.
-    const size_t inst_hdr_size = is_v5
-        ? sizeof(qbditrace::qbditrace_inst_head_v5_t)
-        : sizeof(qbditrace::qbditrace_inst_head_t);
-    // v6 uses extended 48-byte memory access structs (with old_value fields).
-    // v4/v5 use the original 32-byte struct.
+    // v4:    qbditrace_inst_head_t       (16 bytes)
+    // v5:    qbditrace_inst_head_v5_t    (6 bytes)
+    // v7:    qbditrace_inst_head_v7_t    (24 bytes)
+    // v7+v5: qbditrace_inst_head_v7_v5_t (8 bytes)
+    size_t inst_hdr_size;
+    if (is_v7 && is_v5)      inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+    else if (is_v7)           inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+    else if (is_v5)           inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v5_t);
+    else                      inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_t);
+
     const size_t memacc_size = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)
         : sizeof(qbditrace::qbditrace_memacc_t);
-    // anchor: kind(1)+reserved(3)+pad(4)+pc(8) = 16, then num_gpr * 8
+    // anchor: kind(1)+reserved(3)+pad(4)+pc(8) = 16, then num_gpr*8 + [fpr 512B if v7]
     const size_t anchor_total =
-        sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+        sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8
+        + (is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0);
 
     // Find nearest anchor before target_id
     auto anchor_info = index_.nearest_anchor_before(target_id);
@@ -134,11 +146,19 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
 
     // Load anchor's full register snapshot directly from raw bytes
     if (ptr < end_ptr && ptr[0] == qbditrace::QBDITRACE_REC_ANCHOR) {
-        // GPR values start after the anchor header (sizeof = 16 due to alignment padding)
-        const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(
-            ptr + sizeof(qbditrace::qbditrace_anchor_head_t));
+        const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
+        const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
         uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr);
         std::memcpy(state.gpr, gpr_ptr, count * 8);
+        // v7: load FPR snapshot (32 × lo + 32 × hi appended after GPR block)
+        if (is_v7) {
+            const uint64_t* fpr_lo = reinterpret_cast<const uint64_t*>(gpr_start + num_gpr * 8);
+            const uint64_t* fpr_hi = fpr_lo + AARCH64_FPR_COUNT;
+            for (uint8_t i = 0; i < AARCH64_FPR_COUNT; ++i) {
+                state.fpr[i].lo = fpr_lo[i];
+                state.fpr[i].hi = fpr_hi[i];
+            }
+        }
         ptr += anchor_total;
     }
 
@@ -153,16 +173,24 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
 
         if (kind == qbditrace::QBDITRACE_REC_INST) {
             // ptr layout: [kind(1), nzcv(1), n_regdiff(1), n_mem(1), ...]
-            const uint8_t nzcv = ptr[1];
+            const uint8_t nzcv      = ptr[1];
             const uint8_t n_regdiff = ptr[2];
-            const uint8_t n_mem = ptr[3];
+            const uint8_t n_mem     = ptr[3];
+            // n_fprdiff: only present in v7 headers; read from the correct offset.
+            uint8_t n_fprdiff = 0;
+            if (is_v7 && is_v5) {
+                // qbditrace_inst_head_v7_v5_t: [kind,nzcv,n_regdiff,n_mem,delta_lo,delta_hi,n_fprdiff,reserved]
+                n_fprdiff = ptr[6];
+            } else if (is_v7) {
+                // qbditrace_inst_head_v7_t: [kind,nzcv,n_regdiff,n_mem, pad4, pc8, n_fprdiff, ...]
+                // n_fprdiff is at offset sizeof(qbditrace_inst_head_t) = 16
+                n_fprdiff = ptr[16];
+            }
 
-            // reg_diffs start right after the header
+            // GPR diffs start right after the header
             const uint8_t* diffs = ptr + inst_hdr_size;
 
-            // Apply register diffs directly from mmap bytes.
-            // qbditrace_regdiff_t layout: reg_index(u8) @0 + pad(7) + value(u64) @8
-            // stride = sizeof(qbditrace_regdiff_t) = 16 bytes
+            // Apply GPR diffs
             for (uint8_t i = 0; i < n_regdiff; i++) {
                 const auto* d = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(
                     diffs + i * sizeof(qbditrace::qbditrace_regdiff_t));
@@ -171,17 +199,29 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
                 }
             }
 
+            // Apply FPR diffs (v7 only)
+            if (is_v7 && n_fprdiff > 0) {
+                const uint8_t* fpr_diffs = diffs +
+                    n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t);
+                for (uint8_t i = 0; i < n_fprdiff; i++) {
+                    const auto* d = reinterpret_cast<const qbditrace::qbditrace_fprdiff_t*>(
+                        fpr_diffs + i * sizeof(qbditrace::qbditrace_fprdiff_t));
+                    if (d->fpr_index < AARCH64_FPR_COUNT) {
+                        state.fpr[d->fpr_index].lo = d->lo;
+                        state.fpr[d->fpr_index].hi = d->hi;
+                    }
+                }
+            }
+
             // Update NZCV
             if (nzcv != 0) {
                 state.gpr[IDX_NZCV] = nzcv & 0xF;
             }
 
-            // Advance pointer: header + diffs + mems
-            // sizeof(qbditrace_regdiff_t) = 16
-            // memacc_size = 32 (v4/v5) or 48 (v6 with HF_OLD_VALUE)
             size_t rec_size = inst_hdr_size
-                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                + n_mem     * memacc_size;
+                + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)
+                + n_mem      * memacc_size;
             ptr += rec_size;
 
             // Prefetch next record header into L1
@@ -191,16 +231,24 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
 
         } else if (kind == qbditrace::QBDITRACE_REC_ANCHOR) {
             // Fresh anchor — overwrite state entirely
-            const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(
-                ptr + sizeof(qbditrace::qbditrace_anchor_head_t));
+            const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
+            const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
             uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr);
             std::memcpy(state.gpr, gpr_ptr, count * 8);
+            if (is_v7) {
+                const uint64_t* fpr_lo = reinterpret_cast<const uint64_t*>(gpr_start + num_gpr * 8);
+                const uint64_t* fpr_hi = fpr_lo + AARCH64_FPR_COUNT;
+                for (uint8_t i = 0; i < AARCH64_FPR_COUNT; ++i) {
+                    state.fpr[i].lo = fpr_lo[i];
+                    state.fpr[i].hi = fpr_hi[i];
+                }
+            }
             ptr += anchor_total;
 
         } else {
             // Skip non-INST/non-ANCHOR records (THREAD, EVENT, SVC, OBJC, CODE)
-            // We need to compute byte_size for the unknown record type.
             auto rec = reader_.record_at(static_cast<uint64_t>(ptr - base));
+            rec.is_v7 = is_v7;  // needed for anchor byte_size()
             ptr += rec.byte_size(num_gpr);
         }
     }
