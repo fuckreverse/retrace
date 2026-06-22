@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -633,7 +634,9 @@ Result<TraceIndex> TraceIndex::build(
     auto process_shard = [&](uint32_t shard_idx) {
         auto& result = shard_results[shard_idx];
         const auto& bounds = shard_bounds[shard_idx];
-        result.batch = rocksdb::WriteBatch(256 * 1024);
+        // Start with a modest batch; we flush periodically to keep memory
+        // bounded and overlap scanning with RocksDB writes.
+        result.batch = rocksdb::WriteBatch(64 * 1024);
 
         auto* offset_cf   = idx.get_cf(cf::OFFSET);
         auto* anchor_cf   = idx.get_cf(cf::ANCHOR);
@@ -646,6 +649,20 @@ Result<TraceIndex> TraceIndex::build(
 
         uint64_t inst_id = bounds.inst_id_start;
         uint64_t batch_writes = 0;
+
+        // Flush threshold: write to RocksDB every N entries to bound memory
+        // and overlap I/O with scanning. 50K entries per flush keeps each
+        // WriteBatch around 2-5MB (keys+values), fast for MemTable insertion.
+        constexpr uint64_t FLUSH_THRESHOLD = 50000;
+        auto flush_batch = [&]() {
+            if (batch_writes == 0) return;
+            auto ws = idx.db_->Write(write_opts, &result.batch);
+            if (!ws.ok()) {
+                result.error = ws.ToString();
+            }
+            result.batch.Clear();
+            batch_writes = 0;
+        };
 
         while (ptr < end) {
             auto kind = static_cast<RecordKind>(ptr[0]);
@@ -735,12 +752,13 @@ Result<TraceIndex> TraceIndex::build(
 
             result.total_records++;
 
-            // Periodic intermediate flush (per-shard, to bound memory usage)
-            if (batch_writes >= 100000) {
-                // Can't write to DB from multiple threads; defer to main thread.
-                // Instead just track that we've accumulated a large batch.
-                // The main thread will commit in order after all threads finish.
-                batch_writes = 0;
+            // Periodic flush: write the accumulated batch to RocksDB so
+            // memory stays bounded and writes overlap with scanning.
+            // RocksDB::Write() is thread-safe — multiple shards flush
+            // concurrently, and the MemTable's skip list handles parallel
+            // inserts (with internal locking).
+            if (batch_writes >= FLUSH_THRESHOLD) {
+                flush_batch();
             }
 
             if (rec_size == 0) break;
@@ -749,6 +767,9 @@ Result<TraceIndex> TraceIndex::build(
             // Update shared progress counter (relaxed — just for display)
             progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
         }
+
+        // Final flush for any remaining entries in this shard's batch.
+        flush_batch();
     };
 
     if (num_shards == 1) {
@@ -785,19 +806,32 @@ Result<TraceIndex> TraceIndex::build(
         }
     }
 
-    // ── Phase 2: Commit all shard batches to RocksDB (serial, in order) ───
-    // RocksDB MVCC guarantees that concurrent Puts from different batches
-    // with the same key are ordered by sequence number. Since each shard
-    // operates on disjoint inst_id ranges, there are no key conflicts and
-    // the commit order doesn't matter for correctness. We commit in shard
-    // order for reproducibility.
-    for (auto& r : shard_results) {
+    // ── Phase 2: Flush any remaining batch entries ──────────────────────
+    // With periodic flushing during Phase 1, most (or all) data is already
+    // in RocksDB by the time workers finish. This loop handles any residual
+    // entries (the final partial batch of each shard) and is typically fast.
+    {
+        uint32_t shards_to_commit = 0;
+        for (auto& r : shard_results) {
+            if (r.batch.Count() > 0) shards_to_commit++;
+        }
+        if (shards_to_commit > 0) {
+            std::fprintf(stderr, "\r  Flushing remaining index entries (%u shards)...    \n",
+                         shards_to_commit);
+            std::fflush(stderr);
+        }
+    }
+    for (size_t si = 0; si < shard_results.size(); si++) {
+        auto& r = shard_results[si];
         if (r.batch.Count() == 0) continue;
         auto ws = idx.db_->Write(write_opts, &r.batch);
         if (!ws.ok()) {
             return Error::rocksdb_error(ws.ToString());
         }
+        r.batch.Clear();
     }
+    std::fprintf(stderr, "\r                                                            \r");
+    std::fflush(stderr);
 
     // ── Phase 3: Aggregate statistics ────────────────────────────────────
     uint64_t inst_id = 0, total_records = 0;
