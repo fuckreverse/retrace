@@ -178,6 +178,12 @@ struct Config {
    * Activates QBDITRACE_HF_OLD_VALUE and bumps version to
    * QBDITRACE_VERSION_V6_OLD_VALUE. Off by default. */
   bool old_value_mode = false;
+
+  /* When set, capture 128-bit FPR (NEON v0..v31) diffs per instruction and
+   * include a 512-byte FPR snapshot in every ANCHOR.  Activates
+   * QBDITRACE_HF_HAS_FPR and bumps version to QBDITRACE_VERSION_V7_HAS_FPR.
+   * Off by default. */
+  bool fpr_mode = false;
 };
 
 /* Classify a transfer target against the configured objc_msgSend family.
@@ -202,6 +208,10 @@ struct WriteRegList {
    * inline array suffices. */
   uint8_t count = 0;
   uint8_t idx[8] = {0};
+  /* QBDI FPR indices (0..31 = v0..v31) written by an instruction.
+   * NEON instructions often write 1-2 vector registers per opcode. */
+  uint8_t fpr_count = 0;
+  uint8_t fpr_idx[8] = {0};
 };
 
 class Tracer {
@@ -328,9 +338,11 @@ private:
     qbditrace_file_header_t h;
     std::memset(&h, 0, sizeof(h));
     h.magic = QBDITRACE_MAGIC;
-    // Version selection: v6 > v5 > v4. Each bumps a version number so older
-    // readers can gracefully reject traces they cannot parse correctly.
-    if (cfg_.old_value_mode)
+    // Version selection: v7 > v6 > v5 > v4. Each bumps a version number so
+    // older readers can gracefully reject traces they cannot parse correctly.
+    if (cfg_.fpr_mode)
+      h.version = QBDITRACE_VERSION_V7_HAS_FPR;
+    else if (cfg_.old_value_mode)
       h.version = QBDITRACE_VERSION_V6_OLD_VALUE;
     else if (cfg_.pc_delta_mode)
       h.version = QBDITRACE_VERSION_V5_PC_DELTA;
@@ -360,6 +372,8 @@ private:
       h.flags |= QBDITRACE_HF_PC_DELTA;
     if (cfg_.old_value_mode)
       h.flags |= QBDITRACE_HF_OLD_VALUE;
+    if (cfg_.fpr_mode)
+      h.flags |= QBDITRACE_HF_HAS_FPR;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
     writer_.writeHeaderRaw(&h, sizeof(h));
@@ -373,26 +387,51 @@ private:
     if (a == nullptr) {
       return wl;
     }
-    for (uint8_t i = 0; i < a->numOperands && wl.count < 8; ++i) {
+    for (uint8_t i = 0; i < a->numOperands; ++i) {
       const QBDI::OperandAnalysis &op = a->operands[i];
-      if (op.type != QBDI::OPERAND_GPR) {
-        continue;
-      }
       if ((op.regAccess & QBDI::REGISTER_WRITE) == 0) {
         continue;
       }
-      if (op.regCtxIdx < 0 || op.regCtxIdx > 30) {
-        continue; /* sp/nzcv/pc captured via anchors, not the diff list */
-      }
-      bool dup = false;
-      for (uint8_t k = 0; k < wl.count; ++k) {
-        if (wl.idx[k] == static_cast<uint8_t>(op.regCtxIdx)) {
-          dup = true;
-          break;
+      if (op.type == QBDI::OPERAND_GPR) {
+        if (op.regCtxIdx < 0 || op.regCtxIdx > 30) {
+          continue; /* sp/nzcv/pc captured via anchors, not the diff list */
         }
-      }
-      if (!dup) {
-        wl.idx[wl.count++] = static_cast<uint8_t>(op.regCtxIdx);
+        if (wl.count < 8) {
+          bool dup = false;
+          for (uint8_t k = 0; k < wl.count; ++k) {
+            if (wl.idx[k] == static_cast<uint8_t>(op.regCtxIdx)) {
+              dup = true;
+              break;
+            }
+          }
+          if (!dup) {
+            wl.idx[wl.count++] = static_cast<uint8_t>(op.regCtxIdx);
+          }
+        }
+      } else if (op.type == QBDI::OPERAND_FPR) {
+        /* FPR: regCtxIdx encodes the QBDI FPR slot.  For AArch64 NEON, the
+         * 128-bit lane index is regCtxIdx >> 1 (QBDI uses one slot per 64-bit
+         * half).  We record the lane index (0..31 = v0..v31) by dividing by 2
+         * and capping at 31. */
+        if (op.regCtxIdx < 0) {
+          continue;
+        }
+        uint8_t lane = static_cast<uint8_t>(op.regCtxIdx >> 1);
+        if (lane > 31) {
+          continue;
+        }
+        if (wl.fpr_count < 8) {
+          bool dup = false;
+          for (uint8_t k = 0; k < wl.fpr_count; ++k) {
+            if (wl.fpr_idx[k] == lane) {
+              dup = true;
+              break;
+            }
+          }
+          if (!dup) {
+            wl.fpr_idx[wl.fpr_count++] = lane;
+          }
+        }
       }
     }
     return wl;
@@ -417,6 +456,7 @@ struct ThreadCtx {
   ThreadBuffer *buf = nullptr;
   uint64_t inst_count = 0;
   uint64_t cur_pc = 0;       /* executed PC carried PREINST -> POSTINST */
+  QBDI::FPRState *cur_fpr = nullptr; /* FPR pointer carried PREINST -> POSTINST */
   uint64_t prev_reg[31] = {0}; /* x0..lr snapshot for diffing */
   bool prev_valid = false;
   /* Instructions executed since the last full-register ANCHOR was written. Used
@@ -546,10 +586,13 @@ inline void prepareRecord(ThreadBuffer *buf, size_t payload) {
   }
 }
 
-inline void emitAnchor(ThreadBuffer *buf, QBDI::GPRState *gpr, uint64_t pc) {
+inline void emitAnchor(ThreadBuffer *buf, QBDI::GPRState *gpr,
+                       QBDI::FPRState *fpr, uint64_t pc) {
   const uint32_t n = QBDITRACE_AARCH64_NUM_GPR;
+  const bool fpr_mode = Tracer::get().cfg().fpr_mode;
+  const size_t fpr_bytes = fpr_mode ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
   const size_t payload =
-      sizeof(qbditrace_anchor_head_t) + (size_t)n * sizeof(uint64_t);
+      sizeof(qbditrace_anchor_head_t) + (size_t)n * sizeof(uint64_t) + fpr_bytes;
   prepareRecord(buf, payload);
   uint8_t *p = buf->reserve(payload);
   qbditrace_anchor_head_t ah;
@@ -562,6 +605,17 @@ inline void emitAnchor(ThreadBuffer *buf, QBDI::GPRState *gpr, uint64_t pc) {
     uint64_t v = QBDI_GPR_GET(gpr, i);
     std::memcpy(p, &v, sizeof(v));
     p += sizeof(v);
+  }
+  if (fpr_mode && fpr != nullptr) {
+    /* Append 32 × 128-bit FPR values: lo (bits 63:0) then hi (bits 127:64)
+     * for v0..v31, stored as pairs of uint64_t. QBDI stores each 64-bit
+     * half in a separate FPR slot: slot 2*i = v[i] lo, slot 2*i+1 = v[i] hi. */
+    for (uint32_t i = 0; i < QBDITRACE_AARCH64_NUM_FPR; ++i) {
+      uint64_t lo = QBDI_FPR_GET(fpr, 2 * i);
+      uint64_t hi = QBDI_FPR_GET(fpr, 2 * i + 1);
+      std::memcpy(p, &lo, sizeof(lo)); p += sizeof(lo);
+      std::memcpy(p, &hi, sizeof(hi)); p += sizeof(hi);
+    }
   }
 }
 
@@ -836,10 +890,14 @@ return (opcode & 0x3FC00000u) == 0x08000000u;
  * ------------------------------------------------------------------------- */
 
 QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
-                         QBDI::FPRState * /*fpr*/, void * /*data*/) {
+                         QBDI::FPRState *fpr, void * /*data*/) {
   (void)vm;
   ThreadCtx *c = ensureThreadCtx();
   const Config &cfg = Tracer::get().cfg();
+  /* Store fpr pointer so postInstCB can use it without re-fetching. QBDI
+   * guarantees the same FPRState pointer is valid through the POSTINST
+   * callback for the same instruction. */
+  c->cur_fpr = fpr;
 
   /* Diagnostic: record this PC in the crash-locating ring (cheap, no IO). */
   pcRingPush(QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_PC));
@@ -957,7 +1015,7 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    * reservation and cause the STXR to always fail (infinite retry loop). */
   if (!c->ldxr_pending &&
       (c->need_anchor || c->since_anchor >= cfg.anchor_interval)) {
-    emitAnchor(c->buf, gpr, c->cur_pc); /* handles marker/chunk atomicity */
+    emitAnchor(c->buf, gpr, fpr, c->cur_pc); /* handles marker/chunk atomicity */
     c->since_anchor = 0;
     c->need_anchor = false;
   }
@@ -997,22 +1055,45 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   return QBDI::CONTINUE;
 }
 
-/* Serialize the regdiff + memacc payload that is common to both v4 and v5
- * instruction records.  Returns the pointer past the last byte written.
- * This avoids duplicating the loop + safeRead logic in two code paths.
+/* Serialize the regdiff + [fprdiff] + memacc payload that is common to both
+ * v4 and v5 instruction records.  Returns the pointer past the last byte
+ * written.  This avoids duplicating the loop + safeRead logic in two code
+ * paths.
  *
  * v6 mode (old_value_mode): each memacc record is qbditrace_memacc_v6_t (48B)
  * instead of qbditrace_memacc_t (32B). For WRITE accesses the old_value/
  * old_value_hi fields are filled from the pre_write_snaps captured in preInstCB.
- * `snaps` and `n_snaps` may be null/0 in v4/v5 mode. */
+ * `snaps` and `n_snaps` may be null/0 in v4/v5 mode.
+ *
+ * v7 mode (fpr_mode): after the GPR diff section, emit n_fprdiff *
+ * qbditrace_fprdiff_t records (24 bytes each).  fprbuf and fprbuf_n describe
+ * which FPR indices changed; their 128-bit values are read from `fpr_state`.
+ * `fpr_state`, `fprbuf`, and `fprbuf_n` may be null/0 in v4/v5/v6 mode. */
 static inline uint8_t *serializeInstPayload(
     uint8_t *p,
     const qbditrace_regdiff_t *regbuf, uint8_t regbuf_n,
     const QBDI::MemoryAccess *macc, uint8_t n_mem,
-    const ThreadCtx::PreWriteSnap *snaps = nullptr, uint8_t n_snaps = 0) {
+    const ThreadCtx::PreWriteSnap *snaps = nullptr, uint8_t n_snaps = 0,
+    const QBDI::FPRState *fpr_state = nullptr,
+    const uint8_t *fprbuf = nullptr, uint8_t fprbuf_n = 0) {
   for (uint8_t k = 0; k < regbuf_n; ++k) {
     std::memcpy(p, &regbuf[k], sizeof(qbditrace_regdiff_t));
     p += sizeof(qbditrace_regdiff_t);
+  }
+
+  /* FPR diffs (v7 only): emit 128-bit values for each written vector register. */
+  if (fpr_state != nullptr && fprbuf != nullptr) {
+    for (uint8_t k = 0; k < fprbuf_n; ++k) {
+      qbditrace_fprdiff_t fd;
+      fd.fpr_index = fprbuf[k];
+      std::memset(fd.reserved, 0, sizeof(fd.reserved));
+      /* QBDI stores each 64-bit half in a separate FPR slot:
+       * slot 2*i = v[i] low 64 bits, slot 2*i+1 = v[i] high 64 bits. */
+      fd.lo = QBDI_FPR_GET(fpr_state, 2 * fprbuf[k]);
+      fd.hi = QBDI_FPR_GET(fpr_state, 2 * fprbuf[k] + 1);
+      std::memcpy(p, &fd, sizeof(fd));
+      p += sizeof(fd);
+    }
   }
 
   const bool v6 = (snaps != nullptr);
@@ -1031,13 +1112,17 @@ static inline uint8_t *serializeInstPayload(
       mr.old_value     = 0;
       mr.old_value_hi  = 0;
 
-      /* Recover new value if QBDI reports it as unknown (same as v4) */
-      if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-          (m.type & QBDI::MEMORY_WRITE) && m.size > 0 && m.size <= 16) {
-        uint8_t bytes[16] = {0};
-        if (safeRead(m.accessAddress, bytes, m.size)) {
-          std::memcpy(&mr.value,    bytes,     std::min((size_t)m.size, (size_t)8));
-          if (m.size > 8)
+        /* Recover value if QBDI reports it as unknown.
+         * For WRITE accesses: read the already-written memory to get new value.
+         * For READ accesses: read the memory value that was loaded (post-exec,
+         *   the bytes are still at the load address, giving the decoder the
+         *   loaded datum for load-value taint propagation). */
+        if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
+            m.size > 0 && m.size <= 16) {
+          uint8_t bytes[16] = {0};
+          if (safeRead(m.accessAddress, bytes, m.size)) {
+            std::memcpy(&mr.value,    bytes,     std::min((size_t)m.size, (size_t)8));
+            if (m.size > 8)
             std::memcpy(&mr.value_hi, bytes + 8, m.size - 8);
           mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
         }
@@ -1072,21 +1157,22 @@ static inline uint8_t *serializeInstPayload(
 
       std::memcpy(p, &mr, sizeof(mr));
       p += sizeof(mr);
-    } else {
-      /* v4/v5: original 32-byte struct */
-      qbditrace_memacc_t mr;
-      mr.mem_type  = (uint8_t)m.type;
-      mr.mem_flags = (uint8_t)m.flags;
-      mr.size      = m.size;
-      mr.addr      = m.accessAddress;
-      mr.value     = m.value;
-      mr.value_hi  = 0;
-      if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-          (m.type & QBDI::MEMORY_WRITE) && m.size > 0 && m.size <= 16) {
-        uint8_t bytes[16] = {0};
-        if (safeRead(m.accessAddress, bytes, m.size)) {
-          std::memcpy(&mr.value, bytes, 8);
-          std::memcpy(&mr.value_hi, bytes + 8, 8);
+        } else {
+          /* v4/v5: original 32-byte struct */
+          qbditrace_memacc_t mr;
+          mr.mem_type  = (uint8_t)m.type;
+          mr.mem_flags = (uint8_t)m.flags;
+          mr.size      = m.size;
+          mr.addr      = m.accessAddress;
+          mr.value     = m.value;
+          mr.value_hi  = 0;
+          /* Recover value for both READ and WRITE when QBDI reports unknown. */
+          if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
+              m.size > 0 && m.size <= 16) {
+            uint8_t bytes[16] = {0};
+            if (safeRead(m.accessAddress, bytes, m.size)) {
+              std::memcpy(&mr.value, bytes, 8);
+              std::memcpy(&mr.value_hi, bytes + 8, 8);
           mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
         }
       }
@@ -1098,11 +1184,13 @@ static inline uint8_t *serializeInstPayload(
 }
 
 QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
-                          QBDI::FPRState * /*fpr*/, void * /*data*/) {
+                          QBDI::FPRState *fpr, void * /*data*/) {
   ThreadCtx *c = g_tctx ? g_tctx : ensureThreadCtx();
   ThreadBuffer *buf = c->buf;
   const Config &cfg = Tracer::get().cfg();
   const uint64_t exec_pc = c->cur_pc;
+  /* Use the FPR pointer stashed in preInstCB (same instruction, same pointer). */
+  if (fpr == nullptr) fpr = c->cur_fpr;
 
   /* Embed the raw instruction bytes once per distinct PC so the decoder can
    * disassemble without --image. Deduplicated, so this is free in loops. The
@@ -1121,6 +1209,9 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   /* --- register diff (absolute values; decoder rebuilds prev from anchors) --- */
   uint8_t regbuf_n = 0;
   qbditrace_regdiff_t regbuf[8];
+  /* --- FPR diff (v7 only) --- */
+  uint8_t fprbuf_n = 0;
+  uint8_t fprbuf[8]; /* indices of FPRs that changed */
   if (cfg.record & QBDITRACE_REC_REGDIFF) {
     const WriteRegList *wl = Tracer::get().writeRegsFor(vm, exec_pc);
     if (wl && c->prev_valid) {
@@ -1131,6 +1222,12 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
           regbuf[regbuf_n].reg_index = idx;
           regbuf[regbuf_n].value = now;
           ++regbuf_n;
+        }
+      }
+      /* FPR diffs: collect written vector registers when fpr_mode is on. */
+      if (cfg.fpr_mode && fpr != nullptr) {
+        for (uint8_t k = 0; k < wl->fpr_count && fprbuf_n < 8; ++k) {
+          fprbuf[fprbuf_n++] = wl->fpr_idx[k];
         }
       }
     }
@@ -1165,12 +1262,17 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   const size_t memacc_stride = cfg.old_value_mode
       ? sizeof(qbditrace_memacc_v6_t)
       : sizeof(qbditrace_memacc_t);
+  const size_t fpr_diff_bytes = (size_t)fprbuf_n * sizeof(qbditrace_fprdiff_t);
   const size_t payload_tail = (size_t)regbuf_n * sizeof(qbditrace_regdiff_t) +
+                              fpr_diff_bytes +
                               (size_t)n_mem * memacc_stride;
 
   /* Convenience pointers for old-value snapshot passing */
   const ThreadCtx::PreWriteSnap *snaps = cfg.old_value_mode ? c->pre_write_snaps : nullptr;
   const uint8_t n_snaps = cfg.old_value_mode ? c->pre_write_count : 0;
+
+  /* FPR state pointer for v7 serialization */
+  const QBDI::FPRState *fpr_for_serial = (cfg.fpr_mode && fprbuf_n > 0) ? fpr : nullptr;
 
   if (cfg.pc_delta_mode) {
     // Compute delta from last emitted INST PC
@@ -1180,33 +1282,68 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     // The ANCHOR re-anchors the decoder's running PC, then delta=0.
     if (c->last_emitted_pc == 0 ||
         raw_delta < -32768 || raw_delta > 32767) {
-      // Emit a forced ANCHOR with the current GPR state.
-      // Caller's GPR state is available via `gpr` param in postInstCB.
-      // However emitAnchor needs GPRState; we have it via gpr.
-      emitAnchor(c->buf, gpr, exec_pc);
+      emitAnchor(c->buf, gpr, fpr, exec_pc);
       c->since_anchor = 0;
       c->need_anchor = false;
-      // After an ANCHOR, the decoder's running_pc = exec_pc, so delta = 0.
       raw_delta = 0;
     }
     int16_t pc_delta = static_cast<int16_t>(raw_delta);
 
-    size_t need = sizeof(qbditrace_inst_head_v5_t) + payload_tail;
-    prepareRecord(buf, need);
-    uint8_t *p = buf->reserve(need);
-
-    qbditrace_inst_head_v5_t ih5;
-    ih5.kind = QBDITRACE_REC_INST;
-    ih5.nzcv = nzcv;
-    ih5.n_regdiff = regbuf_n;
-    ih5.n_mem = n_mem;
-    std::memcpy(&ih5.pc_delta, &pc_delta, sizeof(pc_delta));  // LE write
-    std::memcpy(p, &ih5, sizeof(ih5));
-    p += sizeof(ih5);
-
-    serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem, snaps, n_snaps);
+    if (cfg.fpr_mode) {
+      /* v7 + v5: use qbditrace_inst_head_v7_v5_t (8 bytes) */
+      size_t need = sizeof(qbditrace_inst_head_v7_v5_t) + payload_tail;
+      prepareRecord(buf, need);
+      uint8_t *p = buf->reserve(need);
+      qbditrace_inst_head_v7_v5_t ih;
+      ih.kind = QBDITRACE_REC_INST;
+      ih.nzcv = nzcv;
+      ih.n_regdiff = regbuf_n;
+      ih.n_mem = n_mem;
+      std::memcpy(&ih.pc_delta, &pc_delta, sizeof(pc_delta));
+      ih.n_fprdiff = fprbuf_n;
+      ih.reserved_v7 = 0;
+      std::memcpy(p, &ih, sizeof(ih));
+      p += sizeof(ih);
+      serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem,
+                           snaps, n_snaps, fpr_for_serial, fprbuf, fprbuf_n);
+    } else {
+      size_t need = sizeof(qbditrace_inst_head_v5_t) + payload_tail;
+      prepareRecord(buf, need);
+      uint8_t *p = buf->reserve(need);
+      qbditrace_inst_head_v5_t ih5;
+      ih5.kind = QBDITRACE_REC_INST;
+      ih5.nzcv = nzcv;
+      ih5.n_regdiff = regbuf_n;
+      ih5.n_mem = n_mem;
+      std::memcpy(&ih5.pc_delta, &pc_delta, sizeof(pc_delta));
+      std::memcpy(p, &ih5, sizeof(ih5));
+      p += sizeof(ih5);
+      serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem, snaps, n_snaps);
+    }
 
     c->last_emitted_pc = exec_pc;
+    ++c->inst_count;
+    ++c->since_anchor;
+    return QBDI::CONTINUE;
+  }
+
+  if (cfg.fpr_mode) {
+    /* v7 path: use qbditrace_inst_head_v7_t (24 bytes) */
+    size_t need = sizeof(qbditrace_inst_head_v7_t) + payload_tail;
+    prepareRecord(buf, need);
+    uint8_t *p = buf->reserve(need);
+    qbditrace_inst_head_v7_t ih7;
+    ih7.kind = QBDITRACE_REC_INST;
+    ih7.nzcv = nzcv;
+    ih7.n_regdiff = regbuf_n;
+    ih7.n_mem = n_mem;
+    ih7.pc = exec_pc;
+    ih7.n_fprdiff = fprbuf_n;
+    std::memset(ih7.reserved_v7, 0, sizeof(ih7.reserved_v7));
+    std::memcpy(p, &ih7, sizeof(ih7));
+    p += sizeof(ih7);
+    serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem,
+                         snaps, n_snaps, fpr_for_serial, fprbuf, fprbuf_n);
     ++c->inst_count;
     ++c->since_anchor;
     return QBDI::CONTINUE;
@@ -1649,6 +1786,8 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   cfg.pc_delta_mode = (in->enable_pc_delta != 0);
   /* v6 old-value mode: non-zero enables capturing pre-write memory bytes. */
   cfg.old_value_mode = (in->enable_old_value != 0);
+  /* v7 FPR mode: non-zero enables NEON/vector register diff recording. */
+  cfg.fpr_mode = (in->enable_fpr != 0);
   return Tracer::get().configure(cfg) ? 0 : -2;
 }
 

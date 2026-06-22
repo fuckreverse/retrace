@@ -24,6 +24,27 @@ namespace qbditrace {
 #endif
 
 /* Bump whenever the on-disk layout changes incompatibly.
+ * v7 changes vs v6 (backward-incompatible, gated by HF_HAS_FPR flag):
+ *   - ANCHOR records optionally carry a FPR snapshot appended after the GPR
+ *     block: 32 × 16-byte values (v0..v31, each stored as two little-endian
+ *     uint64_t, lo then hi). When HF_HAS_FPR is set the anchor byte size is
+ *     sizeof(anchor_head) + num_gpr*8 + 32*16 = 16 + 272 + 512 = 800 bytes.
+ *   - REC_INST gains an optional FPR diff section interleaved between the GPR
+ *     diff section and the memory access section:
+ *       n_fprdiff × qbditrace_fprdiff_t  (24 bytes each)
+ *     The n_fprdiff count is stored in bits[7:0] of the `n_fprdiff` byte
+ *     appended to the existing 4-byte INST header fields.
+ *     For backward-compatibility this byte occupies the first reserved[0]
+ *     position; v4/v5/v6 readers that read it as reserved[0] simply see a
+ *     non-zero padding byte, which is harmless.
+ *     On-disk INST layout (v7, HF_PC_DELTA not set):
+ *       qbditrace_inst_head_v7_t  (8 bytes)
+ *       n_regdiff  × qbditrace_regdiff_t   (16 bytes each)
+ *       n_fprdiff  × qbditrace_fprdiff_t   (24 bytes each)
+ *       n_mem      × qbditrace_memacc_*    (32 or 48 bytes each)
+ *     When HF_PC_DELTA is also set, the v7 INST header is
+ *       qbditrace_inst_head_v7_v5_t (8 bytes).
+ *     Readers that do not recognise HF_HAS_FPR must reject the file.
  * v6 changes vs v5 (backward-incompatible, gated by HF_OLD_VALUE flag):
  *   - qbditrace_memacc_t gains two new fields: `old_value` and `old_value_hi`.
  *     When HF_OLD_VALUE is set in the file header, every WRITE memory access
@@ -63,6 +84,7 @@ namespace qbditrace {
 #define QBDITRACE_VERSION 4u  /* writer still produces v4 unless HF_PC_DELTA is set */
 #define QBDITRACE_VERSION_V5_PC_DELTA 5u  /* version tag written when HF_PC_DELTA is used */
 #define QBDITRACE_VERSION_V6_OLD_VALUE 6u /* version tag written when HF_OLD_VALUE is used */
+#define QBDITRACE_VERSION_V7_HAS_FPR   7u /* version tag written when HF_HAS_FPR is used */
 
 /* Architecture tags (kept independent of QBDI enums for decoder portability). */
 typedef enum {
@@ -114,6 +136,12 @@ typedef enum {
    * the on-disk layout; readers that don't support v6 must reject the file.
    * Enabling this flag also bumps the file version to QBDITRACE_VERSION_V6_OLD_VALUE. */
   QBDITRACE_HF_OLD_VALUE = 1u << 5,
+  /* v7: ANCHOR records carry a 512-byte FPR snapshot (v0..v31) appended after
+   * the GPR block, and INST records carry an FPR diff section between the GPR
+   * diffs and the memory accesses. See qbditrace_fprdiff_t and the v7 INST
+   * header types. Readers that do not support v7 must reject the file.
+   * Enabling this flag also bumps the file version to QBDITRACE_VERSION_V7_HAS_FPR. */
+  QBDITRACE_HF_HAS_FPR = 1u << 6,
 } qbditrace_header_flags;
 
 /*
@@ -184,6 +212,49 @@ typedef struct {
   int16_t  pc_delta; /* signed delta from previous instruction's PC (LE) */
 } qbditrace_inst_head_v5_t;
 
+/* v7 variant (HF_HAS_FPR, HF_PC_DELTA not set): extends the v4 header with
+ * an n_fprdiff byte and a reserved byte to keep the struct naturally aligned.
+ * On-disk layout after this header:
+ *   n_regdiff × qbditrace_regdiff_t
+ *   n_fprdiff × qbditrace_fprdiff_t
+ *   n_mem     × qbditrace_memacc_* (v4/v5/v6 size depending on other flags)
+ */
+typedef struct {
+  uint8_t  kind;
+  uint8_t  nzcv;
+  uint8_t  n_regdiff;
+  uint8_t  n_mem;
+  uint64_t pc;
+  uint8_t  n_fprdiff;
+  uint8_t  reserved_v7[7]; /* pad to keep subsequent sections 8-byte aligned */
+} qbditrace_inst_head_v7_t;
+
+/* v7 + HF_PC_DELTA variant: 6-byte base (v5 style) + n_fprdiff + reserved. */
+typedef struct {
+  uint8_t  kind;
+  uint8_t  nzcv;
+  uint8_t  n_regdiff;
+  uint8_t  n_mem;
+  int16_t  pc_delta;
+  uint8_t  n_fprdiff;
+  uint8_t  reserved_v7; /* pad to 8 bytes total */
+} qbditrace_inst_head_v7_v5_t;
+
+/* ---- qbditrace_fprdiff_t ----
+ * Records the 128-bit value of one FPR (NEON/SVE) register written by
+ * an instruction.  The register is identified by `fpr_index` (0..31 for
+ * v0..v31 on AArch64).  The full 128-bit value is stored as two 64-bit
+ * words in little-endian order: `lo` = bits[63:0], `hi` = bits[127:64].
+ *
+ * On-disk layout: 24 bytes (1B index + 7B pad + 8B lo + 8B hi).
+ */
+typedef struct {
+  uint8_t  fpr_index;  /* 0..31 (v0..v31 on AArch64) */
+  uint8_t  reserved[7];
+  uint64_t lo;         /* bits  63:0  of the vector register */
+  uint64_t hi;         /* bits 127:64 of the vector register */
+} qbditrace_fprdiff_t;
+
 typedef struct {
   uint8_t reg_index;
   uint64_t value; /* value after the instruction executed */
@@ -223,11 +294,17 @@ typedef struct {
 #define QBDITRACE_MF_OLD_UNKNOWN (1u << 3) /* old value unavailable (guard page etc.) */
 
 /* ---- QBDITRACE_REC_ANCHOR ----
- * Layout:
+ * Layout (v4/v5/v6, HF_HAS_FPR not set):
  *   u8  kind            (== QBDITRACE_REC_ANCHOR)
  *   u8  reserved[3]
  *   u64 pc              (runtime address where the snapshot was taken)
  *   u64 regs[num_gpr]   (full GPR snapshot, indexed by QBDI GPR ordering)
+ *
+ * Layout (v7, HF_HAS_FPR set): same as above, then immediately followed by:
+ *   u64 fpr_lo[32]      (bits  63:0  of v0..v31)
+ *   u64 fpr_hi[32]      (bits 127:64 of v0..v31)
+ * Total appended FPR block: 32*8 + 32*8 = 512 bytes.
+ * Total anchor size: 16 + 272 + 512 = 800 bytes.
  */
 typedef struct {
   uint8_t kind;
@@ -355,6 +432,12 @@ typedef struct {
 #define QBDITRACE_AARCH64_IDX_NZCV 32
 #define QBDITRACE_AARCH64_IDX_PC 33
 
+/* FPR (NEON) constants (AArch64). */
+#define QBDITRACE_AARCH64_NUM_FPR 32 /* v0..v31 */
+/* Byte size of the FPR snapshot block appended to each ANCHOR when HF_HAS_FPR
+ * is set: 32 registers × (lo 8B + hi 8B) = 512 bytes. */
+#define QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES (32 * 16)
+
 /* --- Compile-time layout assertions ---
  * These ensure the on-disk struct sizes match the decoder's expectations across
  * different compilers and platforms. If any of these fire, it means a compiler
@@ -368,6 +451,12 @@ static_assert(sizeof(qbditrace_inst_head_t) == 16,
               "v4 INST header must be 16 bytes (4B fields + 4B pad + 8B pc)");
 static_assert(sizeof(qbditrace_inst_head_v5_t) == 6,
               "v5 INST header must be 6 bytes (4B fields + 2B pc_delta)");
+static_assert(sizeof(qbditrace_inst_head_v7_t) == 24,
+              "v7 INST header must be 24 bytes (4B fields + 4B pad + 8B pc + 1B n_fprdiff + 7B reserved)");
+static_assert(sizeof(qbditrace_inst_head_v7_v5_t) == 8,
+              "v7+v5 INST header must be 8 bytes (4B fields + 2B pc_delta + 1B n_fprdiff + 1B reserved)");
+static_assert(sizeof(qbditrace_fprdiff_t) == 24,
+              "fprdiff must be 24 bytes (1B index + 7B pad + 8B lo + 8B hi)");
 static_assert(sizeof(qbditrace_regdiff_t) == 16,
               "regdiff must be 16 bytes (1B index + 7B pad + 8B value)");
 static_assert(sizeof(qbditrace_memacc_t) == 32,

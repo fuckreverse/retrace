@@ -113,6 +113,18 @@ typedef struct {
    * The file header version is bumped to 6 and HF_OLD_VALUE is set.
    * Zero (the default) keeps the v4/v5 layout unchanged. */
   uint32_t enable_old_value;
+
+  /* v7 FPR (NEON/vector) recording.  Set to non-zero to capture the 128-bit
+   * value of each FPR register written by an instruction (qbditrace_fprdiff_t
+   * records, 24 bytes each) and a full 512-byte FPR snapshot in every ANCHOR.
+   * This enables the offline decoder to reconstruct the complete vector
+   * register state at any instruction, which is essential for analysing
+   * NEON-accelerated algorithms (AES-NI, SHA2, etc.).
+   * The file header version is bumped to 7 and HF_HAS_FPR is set.
+   * Storage overhead: +24 B per FPR-writing instruction + 512 B per anchor.
+   * Execution overhead: ~1-2 ns per FPR-writing instruction (QBDI FPR read).
+   * Zero (the default) keeps the v4/v5/v6 layout unchanged. */
+  uint32_t enable_fpr;
 } qbditrace_config_t;
 
 /*
