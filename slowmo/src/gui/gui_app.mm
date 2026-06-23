@@ -1136,11 +1136,17 @@ void GuiApp::render_frame() {
         ImGuiDockNodeFlags_PassthruCentralNode);
 
     // ─── Default layout (first frame only) ───────────────────────────
-    // Layout proportions tuned to match IDA Pro's information density:
-//   - Left  15% : Functions/Threads sidebar (narrow, just enough for names)
-//   - Center 65%: Instructions+CFG+Strings (core analysis area, max width)
-//                  Default active tab: Instructions
-    //   - Right  20%: Registers+Memory (compact but readable)
+    // Layout proportions (IDA Pro / Binary Ninja inspired):
+    //   Left  15% : Functions / Threads / Symbol Info sidebar
+    //   Center 65%: Instructions / CFG / Strings / all analysis-result panels
+    //               (tabbed together — user switches between them)
+    //   Right  20%: Registers (top) / Memory Accesses + Register Timeline (bottom)
+    //   Bottom 22% of center: Analysis / Call Stack / Hex Dump / Minimap
+    //
+    // Every panel gets a pre-assigned dock slot so ImGui never creates a
+    // floating window on first launch.  Analysis-result panels (ObjC, Crypto,
+    // Pattern, Constants, etc.) are placed in center_main alongside Instructions
+    // so they feel like IDA's tabbed sub-views, not random pop-ups.
     if (first_frame_) {
         first_frame_ = false;
 
@@ -1153,43 +1159,62 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.15f,
                                     &dock_left_sidebar, &dock_rest);
 
-        // ── Step 2: carve off right panel (≈24% of total = 20% visible) ──
+        // ── Step 2: carve off right panel (≈24% of remaining ≈ 20% of total) ──
         ImGuiID dock_center, dock_right;
         ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Right, 0.24f,
                                     &dock_right, &dock_center);
 
-        // ── Step 3: split center vertically: main (78%) | output (22%) ──
+        // ── Step 3: split center vertically: main (78%) | bottom output (22%) ──
         ImGuiID dock_center_main, dock_center_bottom;
         ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Down, 0.22f,
                                     &dock_center_bottom, &dock_center_main);
 
-        // ── Step 4: split right vertically: registers (62%) | memory (38%) ──
-        ImGuiID dock_right_regs, dock_right_mem;
+        // ── Step 4: split right vertically: registers (62%) | right-bottom (38%) ──
+        ImGuiID dock_right_regs, dock_right_bottom;
         ImGui::DockBuilderSplitNode(dock_right, ImGuiDir_Down, 0.38f,
-                                    &dock_right_mem, &dock_right_regs);
+                                    &dock_right_bottom, &dock_right_regs);
 
-        // ── Assign windows to nodes ──
+        // ── Assign windows to nodes ──────────────────────────────────────
 
-        // Left sidebar: Threads first, then Functions (last = default active tab)
+        // Left sidebar: Symbol Info + Threads + Functions
+        // Functions is last → default active tab
+        ImGui::DockBuilderDockWindow("Symbol Info (DWARF / nm)##P213", dock_left_sidebar);
         ImGui::DockBuilderDockWindow("Threads",   dock_left_sidebar);
         ImGui::DockBuilderDockWindow("Functions", dock_left_sidebar);
 
-        // Center main: CFG + Strings first, then Instructions (last = default active tab)
-        // ImGui DockBuilder: the last DockBuilderDockWindow call wins as active tab.
-        ImGui::DockBuilderDockWindow("CFG",          dock_center_main);
-        ImGui::DockBuilderDockWindow("Strings",      dock_center_main);
-        ImGui::DockBuilderDockWindow("Instructions", dock_center_main);
+        // Center main (tabbed): all analysis-result panels + core viewers.
+        // Order matters: the LAST call is the default active tab → Instructions.
+        // Analysis-result panels (loaded lazily) are placed here so they pop up
+        // as tabs next to Instructions rather than floating windows.
+        ImGui::DockBuilderDockWindow("Trace Diff##P214",    dock_center_main);
+        ImGui::DockBuilderDockWindow("Trace Fold",          dock_center_main);
+        ImGui::DockBuilderDockWindow("Cache Sim",           dock_center_main);
+        ImGui::DockBuilderDockWindow("Loop Semantics",      dock_center_main);
+        ImGui::DockBuilderDockWindow("Algorithm Summary",   dock_center_main);
+        ImGui::DockBuilderDockWindow("Call Graph",          dock_center_main);
+        ImGui::DockBuilderDockWindow("Memory Strings",      dock_center_main);
+        ImGui::DockBuilderDockWindow("API Intercepts",      dock_center_main);
+        ImGui::DockBuilderDockWindow("ObjC Crypto",         dock_center_main);
+        ImGui::DockBuilderDockWindow("ObjC Messages",       dock_center_main);
+        ImGui::DockBuilderDockWindow("Patterns",            dock_center_main);
+        ImGui::DockBuilderDockWindow("Constants",           dock_center_main);
+        ImGui::DockBuilderDockWindow("CFG",                 dock_center_main);
+        ImGui::DockBuilderDockWindow("Strings",             dock_center_main);
+        ImGui::DockBuilderDockWindow("Instructions",        dock_center_main);  // ← default active
 
-        // Center bottom output: Call Stack + Hex Dump + Minimap first,
-        // then Analysis last (default active tab)
-        ImGui::DockBuilderDockWindow("Call Stack",    dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Hex Dump",      dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Minimap",       dock_center_bottom);
-        ImGui::DockBuilderDockWindow("Analysis",      dock_center_bottom);
+        // Center bottom: Analysis (default active) + secondary panels
+        ImGui::DockBuilderDockWindow("Call Stack",  dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Hex Dump",    dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Minimap",     dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Analysis",    dock_center_bottom);  // ← default active
 
-        // Right column: Registers on top (more important), Memory below
-        ImGui::DockBuilderDockWindow("Registers",       dock_right_regs);
-        ImGui::DockBuilderDockWindow("Memory Accesses", dock_right_mem);
+        // Right top: Registers
+        ImGui::DockBuilderDockWindow("Registers", dock_right_regs);
+
+        // Right bottom: Memory Accesses + Register Timeline
+        // Memory Accesses is last → default active tab
+        ImGui::DockBuilderDockWindow("Register Timeline##P212", dock_right_bottom);
+        ImGui::DockBuilderDockWindow("Memory Accesses",         dock_right_bottom);  // ← default active
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
