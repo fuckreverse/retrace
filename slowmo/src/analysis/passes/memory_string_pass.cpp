@@ -219,6 +219,9 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     uint64_t inst_id = 0;
     size_t call_sites_processed = 0;
 
+    // Report 0% immediately so the UI shows the pass is active.
+    ctx.progress(0.0f, "Scanning call sites for strings");
+
     for (auto it = reader.begin(); it != reader.end(); ++it) {
         if (ctx.cancelled()) break;
 
@@ -239,8 +242,9 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         if (inst_id < range.start_inst_id) continue;
         if (inst_id > end_id) break;
 
-        // Progress reporting
-        if ((inst_id & 0x3FFF) == 0) {
+        // Progress reporting — update every ~2048 instructions so the UI
+        // shows meaningful progress (0x3FFF = 16383 was too coarse).
+        if ((inst_id & 0x7FF) == 0) {
             float pct = static_cast<float>(inst_id - range.start_inst_id) /
                         static_cast<float>(end_id - range.start_inst_id + 1);
             ctx.progress(pct, "Scanning call sites for strings");
