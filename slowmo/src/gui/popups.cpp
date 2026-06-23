@@ -468,6 +468,7 @@ void GuiApp::render_settings_window() {
         pending_font_.font_path = settings_.font_path;
         pending_font_.font_size = settings_.font_size;
         pending_font_.oversample_h = settings_.oversample_h;
+        pending_font_.oversample_v = settings_.oversample_v;
         pending_font_.pixel_snap = settings_.pixel_snap;
         pending_font_.initialized = true;
     }
@@ -508,13 +509,21 @@ void GuiApp::render_settings_window() {
             ImGui::SliderFloat("Size", &pending_font_.font_size, 6.0f, 48.0f, "%.1f pt");
 
             // Oversampling
-            ImGui::SliderInt("Oversampling H", &pending_font_.oversample_h, 1, 3);
+            ImGui::SeparatorText("Anti-Aliasing");
+            ImGui::SliderInt("Oversampling H", &pending_font_.oversample_h, 1, 4);
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Higher = smoother text, more VRAM");
+                ImGui::SetTooltip("Horizontal sub-pixel AA. 3 is optimal for HiDPI Retina.\nHigher values cost more font atlas VRAM.");
+            }
+            ImGui::SliderInt("Oversampling V", &pending_font_.oversample_v, 1, 4);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Vertical sub-pixel AA. 2 eliminates vertical aliasing on Retina.\nSet to 1 only on non-HiDPI displays.");
             }
 
             // Pixel snap
             ImGui::Checkbox("Pixel Snap", &pending_font_.pixel_snap);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Snap glyphs to integer pixel boundaries.\nKeep OFF on HiDPI Retina displays for sharper text.");
+            }
 
             // Custom font path input
             ImGui::SeparatorText("Custom Font Path");
@@ -547,6 +556,7 @@ void GuiApp::render_settings_window() {
             bool font_differs = (pending_font_.font_path != settings_.font_path ||
                                  pending_font_.font_size != settings_.font_size ||
                                  pending_font_.oversample_h != settings_.oversample_h ||
+                                 pending_font_.oversample_v != settings_.oversample_v ||
                                  pending_font_.pixel_snap != settings_.pixel_snap);
 
             ImGui::BeginDisabled(!font_differs);
@@ -554,6 +564,7 @@ void GuiApp::render_settings_window() {
                 settings_.font_path = pending_font_.font_path;
                 settings_.font_size = pending_font_.font_size;
                 settings_.oversample_h = pending_font_.oversample_h;
+                settings_.oversample_v = pending_font_.oversample_v;
                 settings_.pixel_snap = pending_font_.pixel_snap;
                 settings_font_dirty_ = true;
                 settings_.save(GuiSettings::default_path());
@@ -566,6 +577,7 @@ void GuiApp::render_settings_window() {
                 pending_font_.font_path = settings_.font_path;
                 pending_font_.font_size = settings_.font_size;
                 pending_font_.oversample_h = settings_.oversample_h;
+                pending_font_.oversample_v = settings_.oversample_v;
                 pending_font_.pixel_snap = settings_.pixel_snap;
             }
             ImGui::EndDisabled();

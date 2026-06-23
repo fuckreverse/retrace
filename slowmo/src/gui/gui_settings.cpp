@@ -34,6 +34,7 @@ bool GuiSettings::load(const std::string& path) {
         if (j.contains("font_path"))    font_path = j["font_path"].get<std::string>();
         if (j.contains("font_size"))    font_size = j["font_size"].get<float>();
         if (j.contains("oversample_h")) oversample_h = j["oversample_h"].get<int>();
+        if (j.contains("oversample_v")) oversample_v = j["oversample_v"].get<int>();
         if (j.contains("pixel_snap"))   pixel_snap = j["pixel_snap"].get<bool>();
 
         if (j.contains("theme")) {
@@ -81,6 +82,7 @@ bool GuiSettings::save(const std::string& path) const {
     j["font_path"] = font_path;
     j["font_size"] = font_size;
     j["oversample_h"] = oversample_h;
+    j["oversample_v"] = oversample_v;
     j["pixel_snap"] = pixel_snap;
 
     switch (theme) {

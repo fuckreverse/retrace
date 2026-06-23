@@ -66,16 +66,37 @@ void GuiApp::start_analysis_worker() {
 }
 
 void GuiApp::stop_analysis_worker() {
-    // Signal the worker to stop and wait for it to finish.
+    // ── Step 1: cancel all in-flight passes immediately ─────────────────────
+    // This signals every PassContext::cancelled() to return true, causing
+    // long-running passes (xref, objc, etc.) to abort early rather than running
+    // to completion.  Without this the join below can block for 10+ seconds.
+    if (pass_manager_) {
+        pass_manager_->cancel_all();
+    }
+
+    // ── Step 2: stop the serial worker queue ────────────────────────────────
     analysis_worker_stop_.store(true, std::memory_order_release);
     analysis_queue_cv_.notify_all();
     if (analysis_worker_thread_.joinable()) {
         analysis_worker_thread_.join();
     }
 
-    // Also join the startup analysis thread if it's still running.
+    // ── Step 3: join the startup analysis thread ────────────────────────────
+    // startup_analysis_thread_ runs run_all(N) which itself spawns N worker
+    // threads; those threads are joined internally before run_all returns.
     if (startup_analysis_thread_.joinable()) {
         startup_analysis_thread_.join();
+    }
+
+    // ── Step 4: wait for all detached enqueue_async() threads ───────────────
+    // These are fully independent threads (detached).  We track them via
+    // detached_thread_count_; wait here until every one has exited so that
+    // no thread accesses TraceIndex / PassManager after they are destroyed.
+    {
+        std::unique_lock<std::mutex> lk(detached_thread_mutex_);
+        detached_thread_cv_.wait(lk, [this] {
+            return detached_thread_count_.load(std::memory_order_acquire) == 0;
+        });
     }
 }
 
@@ -113,6 +134,9 @@ void GuiApp::enqueue_async(std::string pass_name, std::function<void()> work) {
     active_analysis_count_.fetch_add(1, std::memory_order_acq_rel);
     analysis_running_.store(true, std::memory_order_relaxed);
 
+    // Track this detached thread so stop_analysis_worker() can wait for it.
+    detached_thread_count_.fetch_add(1, std::memory_order_acq_rel);
+
     // Launch on a dedicated detached thread instead of the single worker queue.
     // This prevents a slow pass (e.g. ObjcPass) from blocking all subsequent
     // manual triggers.  The worker thread is still available for other purposes
@@ -127,6 +151,12 @@ void GuiApp::enqueue_async(std::string pass_name, std::function<void()> work) {
                 std::lock_guard<std::mutex> lk(analysis_mutex_);
                 analysis_status_.clear();
             }
+        }
+
+        // Decrement the detached-thread counter and notify stop_analysis_worker()
+        // in case it is waiting for this thread to finish.
+        if (detached_thread_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            detached_thread_cv_.notify_all();
         }
     }).detach();
 }

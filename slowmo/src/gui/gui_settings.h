@@ -10,8 +10,9 @@ struct GuiSettings {
     // ─── Font ──────────────────────────────────────────────────────────
     std::string font_path;      // Empty = auto-detect system mono font
     float font_size = 14.0f;    // Base size before DPI scaling
-    int oversample_h = 2;       // Horizontal oversampling (1-3)
-    bool pixel_snap = true;     // Snap to pixel grid
+    int oversample_h = 3;       // Horizontal oversampling (1-4); 3 is optimal for HiDPI
+    int oversample_v = 2;       // Vertical oversampling (1-4); 2 eliminates vertical aliasing
+    bool pixel_snap = false;    // Snap to pixel grid; keep OFF on HiDPI Retina displays
 
     // ─── Theme ─────────────────────────────────────────────────────────
     enum class Theme { Dark, Light, Classic };

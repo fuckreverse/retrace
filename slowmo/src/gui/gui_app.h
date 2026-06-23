@@ -88,6 +88,28 @@ private:
     float dpi_scale_ = 1.0f;
     bool first_frame_ = true;  // Used to set up default dock layout
 
+    // ─── Graceful shutdown state ─────────────────────────────────────
+    // When the user clicks Close / Cmd+Q, we do NOT immediately stop the
+    // render loop.  Instead we:
+    //  1. Set shutdown_requested_ = true  (hides all panels, shows overlay)
+    //  2. Kick off a background thread that cancels passes and joins workers
+    //  3. When that thread finishes it sets shutdown_complete_ = true
+    //  4. The render loop sees shutdown_complete_ and sets running_ = false
+    // This keeps the window alive and animated during teardown.
+    std::atomic<bool> shutdown_requested_{false};
+    std::atomic<bool> shutdown_complete_{false};
+    std::thread       shutdown_thread_;
+
+    // Progress message updated by the shutdown thread (UI thread reads it).
+    // Protected by shutdown_msg_mutex_.
+    std::string       shutdown_msg_{"Cancelling analysis…"};
+    std::mutex        shutdown_msg_mutex_;
+
+    /// Begin the async shutdown sequence (safe to call from render loop).
+    void begin_shutdown();
+    /// Render the full-screen "Shutting down" overlay (called during teardown).
+    void render_shutdown_overlay();
+
     // ─── Metal rendering state ──────────────────────────────────────
 #ifdef __OBJC__
     id<MTLCommandQueue> metal_command_queue_ = nil;
@@ -161,8 +183,9 @@ private:
     struct PendingFontSettings {
         std::string font_path;
         float font_size = 14.0f;
-        int oversample_h = 2;
-        bool pixel_snap = true;
+        int oversample_h = 3;
+        int oversample_v = 2;
+        bool pixel_snap = false;
         bool initialized = false;  // set to true when settings window opens
     };
     PendingFontSettings pending_font_;
@@ -505,6 +528,13 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     /// Active analysis counter (startup + manual).  When it hits 0,
     /// analysis_running_ is cleared.
     std::atomic<int> active_analysis_count_{0};
+
+    /// Tracks the number of live detached threads spawned by enqueue_async().
+    /// stop_analysis_worker() waits for this to reach zero before returning,
+    /// so that no detached thread can outlive the TraceIndex / PassManager.
+    std::atomic<int>        detached_thread_count_{0};
+    std::mutex              detached_thread_mutex_;
+    std::condition_variable detached_thread_cv_;
 
     /// Results pending UI-thread application.  Worker threads post lambdas
     /// here; the UI thread drains them at the start of each frame.  This

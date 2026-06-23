@@ -134,17 +134,142 @@ bool GuiApp::init_imgui() {
     return true;
 }
 
-// ─── Shutdown ───────────────────────────────────────────────────────────────
+// ─── Graceful async shutdown ────────────────────────────────────────────────
+//
+// begin_shutdown() is called the moment the user requests close.  It sets
+// shutdown_requested_ (so render_frame switches to the overlay) and spins up
+// a background thread that does the slow work: cancel passes, join workers,
+// persist state.  When all of that is done it sets shutdown_complete_ and the
+// main render loop falls through.
+
+void GuiApp::begin_shutdown() {
+    bool expected = false;
+    if (!shutdown_requested_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;  // already shutting down
+    }
+
+    shutdown_thread_ = std::thread([this]() {
+        // Step 1 – cancel all in-flight passes so workers unblock quickly.
+        auto set_msg = [this](const char* m) {
+            std::lock_guard<std::mutex> lk(shutdown_msg_mutex_);
+            shutdown_msg_ = m;
+        };
+
+        set_msg("Cancelling analysis passes\u2026");
+        if (pass_manager_) {
+            pass_manager_->cancel_all();
+        }
+
+        // Step 2 – stop the serial worker queue.
+        set_msg("Stopping worker threads\u2026");
+        analysis_worker_stop_.store(true, std::memory_order_release);
+        analysis_queue_cv_.notify_all();
+        if (analysis_worker_thread_.joinable()) {
+            analysis_worker_thread_.join();
+        }
+
+        // Step 3 – join startup analysis thread (run_all internal threads
+        // are joined before run_all returns, so this waits for them too).
+        set_msg("Waiting for analysis to finish\u2026");
+        if (startup_analysis_thread_.joinable()) {
+            startup_analysis_thread_.join();
+        }
+
+        // Step 4 – wait for all detached enqueue_async() threads.
+        set_msg("Waiting for background tasks\u2026");
+        {
+            std::unique_lock<std::mutex> lk(detached_thread_mutex_);
+            detached_thread_cv_.wait(lk, [this] {
+                return detached_thread_count_.load(std::memory_order_acquire) == 0;
+            });
+        }
+
+        // Step 5 – persist state to RocksDB.
+        set_msg("Saving state\u2026");
+        index_.save_bookmarks(bookmarks_);
+        index_.save_last_inst(current_inst_);
+
+        // Done – signal the render loop to exit.
+        set_msg("Done");
+        shutdown_complete_.store(true, std::memory_order_release);
+    });
+}
+
+void GuiApp::render_shutdown_overlay() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 screen = io.DisplaySize;
+
+    // Full-screen semi-transparent black backdrop
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    bg->AddRectFilled(ImVec2(0, 0), screen,
+                      IM_COL32(10, 10, 16, 210));
+
+    // Centre the card
+    const float card_w = 380.0f;
+    const float card_h = 130.0f;
+    ImVec2 card_pos((screen.x - card_w) * 0.5f, (screen.y - card_h) * 0.5f);
+
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+
+    // Card background
+    fg->AddRectFilled(card_pos,
+                      ImVec2(card_pos.x + card_w, card_pos.y + card_h),
+                      IM_COL32(22, 22, 30, 245), 10.0f);
+    fg->AddRect(card_pos,
+                ImVec2(card_pos.x + card_w, card_pos.y + card_h),
+                IM_COL32(60, 90, 140, 180), 10.0f, 0, 1.5f);
+
+    // Title
+    const char* title = "Shutting down Tenet";
+    ImVec2 title_sz = ImGui::CalcTextSize(title);
+    fg->AddText(ImVec2(card_pos.x + (card_w - title_sz.x) * 0.5f,
+                       card_pos.y + 18.0f),
+                IM_COL32(220, 225, 240, 255), title);
+
+    // Spinner — a simple arc that rotates each frame
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float cx = card_pos.x + card_w * 0.5f;
+    const float cy = card_pos.y + 68.0f;
+    const float r  = 14.0f;
+    const int   seg = 32;
+    const float arc = 0.65f;   // fraction of full circle drawn
+    const float speed = 2.8f;
+    for (int i = 0; i < seg; i++) {
+        float a0 = t * speed + (float)i       / seg * IM_PI * 2.0f * arc;
+        float a1 = t * speed + (float)(i + 1) / seg * IM_PI * 2.0f * arc;
+        // Fade the tail
+        float alpha = 80.0f + 170.0f * ((float)i / seg);
+        fg->AddLine(
+            ImVec2(cx + cosf(a0) * r, cy + sinf(a0) * r),
+            ImVec2(cx + cosf(a1) * r, cy + sinf(a1) * r),
+            IM_COL32(80, 140, 230, (int)alpha), 2.5f);
+    }
+
+    // Status message
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(shutdown_msg_mutex_);
+        msg = shutdown_msg_;
+    }
+    ImVec2 msg_sz = ImGui::CalcTextSize(msg.c_str());
+    fg->AddText(ImVec2(card_pos.x + (card_w - msg_sz.x) * 0.5f,
+                       card_pos.y + card_h - 28.0f),
+                IM_COL32(130, 150, 190, 220), msg.c_str());
+}
+
+// ─── Shutdown (platform resources only) ─────────────────────────────────────
+// All thread joining and state persistence are handled by begin_shutdown().
+// By the time we reach here, shutdown_complete_ is true and no background
+// thread accesses any of these objects any more.
 
 void GuiApp::shutdown() {
-if (!window_) return;  // Already shut down
+    if (!window_) return;  // Already shut down
 
-// Stop analysis worker + startup thread before destroying anything else.
-stop_analysis_worker();
-
-// Persist bookmarks and last cursor position to the index database
-index_.save_bookmarks(bookmarks_);
-index_.save_last_inst(current_inst_);
+    // Join the shutdown coordination thread (it is very short-lived).
+    if (shutdown_thread_.joinable()) {
+        shutdown_thread_.join();
+    }
 
     ImGui_ImplMetal_Shutdown();
     ImGui_ImplSDL3_Shutdown();
@@ -333,9 +458,9 @@ void GuiApp::setup_fonts() {
         if (FILE* f = fopen(font_to_load.c_str(), "rb")) {
             fclose(f);
             ImFontConfig config;
-            config.OversampleH = settings_.oversample_h;
-            config.OversampleV = 1;
-            config.PixelSnapH = settings_.pixel_snap;
+            config.OversampleH = settings_.oversample_h;  // typically 3 for HiDPI
+            config.OversampleV = settings_.oversample_v;  // typically 2 for HiDPI
+            config.PixelSnapH  = settings_.pixel_snap;    // keep OFF on Retina
             io.Fonts->AddFontFromFileTTF(font_to_load.c_str(), font_size, &config);
             font_loaded = true;
         }
@@ -843,6 +968,12 @@ int GuiApp::run() {
     // Must be called after SDL/ImGui are initialised (NSApp is ready).
     setup_native_menu();
 
+    // Force the application to become the active (foreground) app immediately.
+    // Without this, macOS keeps showing the previously-active app's menu bar
+    // until the user clicks the window, because SDL3 does not call
+    // -activateIgnoringOtherApps: on launch.
+    [NSApp activateIgnoringOtherApps:YES];
+
     // Start the background analysis worker thread (processes manual triggers).
     start_analysis_worker();
 
@@ -855,21 +986,30 @@ int GuiApp::run() {
         // ─── 1. Poll SDL events ─────────────────────────────────────
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL3_ProcessEvent(&event);
-
-            if (event.type == SDL_EVENT_QUIT) {
-                running_ = false;
+            // During shutdown, suppress all input except the raw quit signal
+            // (which we handle ourselves below).
+            if (!shutdown_requested_.load(std::memory_order_acquire)) {
+                ImGui_ImplSDL3_ProcessEvent(&event);
             }
-            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
-                event.window.windowID == SDL_GetWindowID(window_)) {
-                running_ = false;
+
+            if (event.type == SDL_EVENT_QUIT ||
+               (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                event.window.windowID == SDL_GetWindowID(window_))) {
+                begin_shutdown();
             }
         }
 
-        // ─── 1.5. Apply pending analysis results on the UI thread ────
-        // Worker threads post result-pointer assignments here; draining
-        // them on the UI thread eliminates data races.
-        apply_pending_results();
+        // ─── 1.5. Check whether async shutdown has completed ─────────
+        if (shutdown_complete_.load(std::memory_order_acquire)) {
+            running_ = false;
+            continue;   // skip rendering and fall out of the loop
+        }
+
+        // ─── 1.6. Apply pending analysis results on the UI thread ────
+        // Skip during shutdown — workers are already being drained.
+        if (!shutdown_requested_.load(std::memory_order_acquire)) {
+            apply_pending_results();
+        }
 
         // ─── 2. Acquire Metal drawable and begin render pass ─────────
         @autoreleasepool {
@@ -949,6 +1089,13 @@ int GuiApp::run() {
 //  and status bar translation units.)
 
 void GuiApp::render_frame() {
+    // During shutdown: skip all panels/popups and just render the overlay.
+    // This keeps the window alive and animated while background threads drain.
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+        render_shutdown_overlay();
+        return;
+    }
+
     // Drain any menu-item actions posted by the native macOS menu bar callbacks.
     // Must happen before any ImGui calls to avoid state corruption.
     consume_native_actions();
@@ -1284,6 +1431,24 @@ void GuiApp::render_frame() {
         render_cfg_panel();
     }
 
+    if (show_pattern_) {
+        render_pattern_panel();
+    }
+    if (show_constant_) {
+        render_constant_panel();
+    }
+    if (show_loop_semantics_) {
+        render_loop_semantics_panel();
+    }
+    if (show_algorithm_summary_) {
+        render_algorithm_summary_panel();
+    }
+    if (show_call_graph_) {
+        render_call_graph_panel();
+    }
+    if (show_objc_) {
+        render_objc_panel();
+    }
     if (show_mem_strings_) {
         render_memory_strings_panel();
     }
