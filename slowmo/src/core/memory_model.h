@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <memory>
 #include <filesystem>
+#include <algorithm>
 
 namespace tenet {
 
@@ -184,6 +185,56 @@ private:
                                       rocksdb::Iterator* write_iter,
                                       rocksdb::Iterator* read_iter);
 
+    // ─── Per-Page Sorted Write Index ────────────────────────────────────
+    // Each entry records one write event compactly: the page-relative offset
+    // of the first byte, the write size, the inst_id, and the data bytes.
+    // Entries are stored sorted by (page_offset ASC, inst_id ASC) so that
+    // std::upper_bound can find the last write covering any byte at any time
+    // in O(log W) comparisons — eliminating the RocksDB Prev() hot loop.
+    struct PageWriteEntry {
+        uint16_t page_offset; // first byte offset within the page [0, 4095]
+        uint8_t  size;        // write size in bytes [1, 16]
+        uint8_t  _pad = 0;
+        uint64_t inst_id;     // instruction that performed the write
+        uint8_t  data[16];    // written bytes
+    };
+    static_assert(sizeof(PageWriteEntry) == 32, "PageWriteEntry must be 32 bytes");
+
+    // Comparator: sort by (page_offset, inst_id) — both ascending.
+    struct PageWriteEntryLess {
+        bool operator()(const PageWriteEntry& a, const PageWriteEntry& b) const noexcept {
+            if (a.page_offset != b.page_offset) return a.page_offset < b.page_offset;
+            return a.inst_id < b.inst_id;
+        }
+        // Heterogeneous lookup: compare (offset, inst_id) pair against an entry
+        bool operator()(const PageWriteEntry& e, std::pair<uint16_t,uint64_t> k) const noexcept {
+            if (e.page_offset != k.first) return e.page_offset < k.first;
+            return e.inst_id < k.second;
+        }
+        bool operator()(std::pair<uint16_t,uint64_t> k, const PageWriteEntry& e) const noexcept {
+            if (k.first != e.page_offset) return k.first < e.page_offset;
+            return k.second < e.inst_id;
+        }
+    };
+
+    using PageWriteIndex = std::vector<PageWriteEntry>;
+
+    /// Load all write entries for `page` from RocksDB into a sorted PageWriteIndex.
+    /// Returns nullptr on error or if RocksDB is not available.
+    /// Result is inserted into page_index_cache_ under cache_mutex_.
+    const PageWriteIndex* load_page_index(uint64_t page,
+                                           rocksdb::Iterator* write_iter,
+                                           rocksdb::Iterator* read_iter);
+
+    /// Look up a single byte in a PageWriteIndex.  Returns true and fills
+    /// `out_value` / `out_writer` if a covering write was found at or before
+    /// `search_id` (i.e. inst_id <= search_id).
+    static bool index_read_byte(const PageWriteIndex& idx,
+                                 uint16_t page_offset,
+                                 uint64_t search_id,
+                                 uint8_t& out_value,
+                                 uint64_t& out_writer) noexcept;
+
     /// Check if the RocksDB already contains persisted MemoryModel data
     /// matching the current trace file (sentinel key check).
     bool check_persisted_sentinel() const;
@@ -219,7 +270,14 @@ private:
 
     // In-memory cache for recently queried writes (protected by cache_mutex_)
     LRUCache<uint64_t, std::vector<MemWrite>> page_cache_{512};
-    mutable std::mutex cache_mutex_;  // protects page_cache_ for concurrent queries
+
+    // Per-page sorted write index — the fast query path (protected by cache_mutex_).
+    // Key: page number (addr >> PAGE_SHIFT).
+    // Value: sorted vector of PageWriteEntry (see above).
+    // Capacity: 512 pages × ~1000 entries × 32 B ≈ 16 MB worst-case.
+    LRUCache<uint64_t, PageWriteIndex> page_index_cache_{512};
+
+    mutable std::mutex cache_mutex_;  // protects page_cache_ AND page_index_cache_
 
     // Page activity cache (populated during build, never changes after)
     std::vector<PageActivity> page_activity_cache_;

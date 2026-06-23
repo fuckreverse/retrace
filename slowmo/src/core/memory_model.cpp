@@ -451,156 +451,41 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
     if (at_inst_id == 0) return result;
 
     if (has_rocksdb_) {
-        // Opt #3: Use thread-local iterators instead of creating new ones each call.
+        // Fast path: use per-page sorted write index (O(log W) per byte).
+        // Falls back to loading the page from RocksDB on the first access.
         auto& iters = get_thread_iterators();
-        auto* iter = iters.write_iter.get();
-        auto* read_iter = iters.read_iter.get();
-
-        // Use at_inst_id - 1 as the inclusive upper bound so that inst_id == at_inst_id
-        // is excluded (exclusive semantics: "state before at_inst_id executes").
         const uint64_t search_id = at_inst_id - 1;
 
-        for (uint8_t i = 0; i < size; ) {
-            uint64_t byte_addr = addr + i;
-            uint64_t page = page_of(byte_addr);
+        for (uint8_t i = 0; i < size; i++) {
+            if (result.known[i]) continue;
+
+            uint64_t byte_addr  = addr + i;
+            uint64_t page       = page_of(byte_addr);
             uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
 
-            // Seek once for this byte
-            char seek_key_buf[KEY_SIZE];
-            auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
-            iter->SeekForPrev(seek_key);
-
-            uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
-                                      ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
-                                      : 0;
-
-            bool found = false;
-            while (iter->Valid()) {
-                if (iter->key().size() != KEY_SIZE) break;
-
-                uint64_t found_page;
-                uint16_t found_offset;
-                uint64_t found_inst_id;
-                decode_key(iter->key(), found_page, found_offset, found_inst_id);
-
-                if (found_page != page) break;
-                if (found_offset < min_offset) break;
-                if (found_inst_id > search_id) {
-                    iter->Prev();
-                    continue;
-                }
-
-                auto val = iter->value();
-                if (val.size() < 1) { iter->Prev(); continue; }
-                uint8_t write_size = static_cast<uint8_t>(val.data()[0]);
-
-                // Check if this write covers our target byte
-                if (found_offset <= page_offset &&
-                    static_cast<uint16_t>(found_offset + write_size) > page_offset) {
-                    // Found it! Now extract as many consecutive bytes as this write covers.
-                    uint16_t write_end = static_cast<uint16_t>(found_offset + write_size);
-                    for (uint8_t j = i; j < size; j++) {
-                        uint64_t baddr = addr + j;
-                        // Stop if we cross a page boundary
-                        if (page_of(baddr) != page) break;
-                        uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
-                        if (boff >= write_end) break;  // beyond this write
-                        if (boff < found_offset) break; // before this write (shouldn't happen)
-
-                        uint8_t idx_in_write = static_cast<uint8_t>(boff - found_offset);
-                        if (val.size() >= static_cast<size_t>(1 + idx_in_write + 1)) {
-                            result.data[j] = static_cast<uint8_t>(val.data()[1 + idx_in_write]);
-                            result.known[j] = true;
-                            result.writer_id[j] = found_inst_id;
-                        }
-                    }
-                    stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
-                    found = true;
-                    break;
-                }
-
-                iter->Prev();
+            // Get (or load) the PageWriteIndex for this page.
+            const PageWriteIndex* idx_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(cache_mutex_);
+                idx_ptr = page_index_cache_.get_mutable(page);
+            }
+            if (!idx_ptr) {
+                idx_ptr = load_page_index(page,
+                                          iters.write_iter.get(),
+                                          iters.read_iter.get());
             }
 
-            if (!found) {
-                stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            // Advance i past all bytes we've already resolved
-            i++;
-            while (i < size && result.known[i]) i++;
-        }
-
-        // ── Phase 2: read-fallback for unresolved bytes ──────────────────
-        if (read_iter) {
-            for (uint8_t i = 0; i < size; ) {
-                if (result.known[i]) { i++; continue; }
-
-                uint64_t byte_addr = addr + i;
-                uint64_t page = page_of(byte_addr);
-                uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
-
-                char seek_key_buf[KEY_SIZE];
-                auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
-                read_iter->SeekForPrev(seek_key);
-
-                uint16_t min_offset = (page_offset >= (MAX_WRITE_SIZE - 1))
-                                          ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
-                                          : 0;
-
-                bool found = false;
-                while (read_iter->Valid()) {
-                    if (read_iter->key().size() != KEY_SIZE) break;
-
-                    uint64_t found_page;
-                    uint16_t found_offset;
-                    uint64_t found_inst_id;
-                    decode_key(read_iter->key(), found_page, found_offset, found_inst_id);
-
-                    if (found_page != page) break;
-                    if (found_offset < min_offset) break;
-                    if (found_inst_id > search_id) {
-                        read_iter->Prev();
-                        continue;
-                    }
-
-                    auto val = read_iter->value();
-                    if (val.size() < 1) { read_iter->Prev(); continue; }
-                    uint8_t read_size = static_cast<uint8_t>(val.data()[0]);
-
-                    // Check if this read covers our target byte
-                    if (found_offset <= page_offset &&
-                        static_cast<uint16_t>(found_offset + read_size) > page_offset) {
-                        // Extract as many consecutive bytes as this read covers.
-                        uint16_t read_end = static_cast<uint16_t>(found_offset + read_size);
-                        for (uint8_t j = i; j < size; j++) {
-                            uint64_t baddr = addr + j;
-                            if (page_of(baddr) != page) break;
-                            uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
-                            if (boff >= read_end) break;
-                            if (boff < found_offset) break;
-
-                            uint8_t idx_in_read = static_cast<uint8_t>(boff - found_offset);
-                            if (val.size() >= static_cast<size_t>(1 + idx_in_read + 1)) {
-                                result.data[j] = static_cast<uint8_t>(val.data()[1 + idx_in_read]);
-                                result.known[j] = true;
-                                result.writer_id[j] = found_inst_id;
-                            }
-                        }
-                        stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
-                        found = true;
-                        break;
-                    }
-
-                    read_iter->Prev();
-                }
-
-                if (!found) {
+            if (idx_ptr) {
+                uint8_t  val    = 0;
+                uint64_t writer = 0;
+                if (index_read_byte(*idx_ptr, page_offset, search_id, val, writer)) {
+                    result.data[i]      = val;
+                    result.known[i]     = true;
+                    result.writer_id[i] = writer;
+                    stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+                } else {
                     stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
                 }
-
-                i++;
-                while (i < size && result.known[i]) i++;
             }
         }
     } else {
@@ -638,11 +523,143 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
     return result;
 }
 
+// ─── Per-Page Sorted Write Index ──────────────────────────────────────────
+//
+// load_page_index() does a single forward RocksDB scan over all writes (and
+// optionally reads) for a given page, building a vector of PageWriteEntry
+// sorted by (page_offset, inst_id).  The result is inserted into the LRU
+// page_index_cache_ so subsequent queries for the same page never touch
+// RocksDB again.
+//
+// index_read_byte() uses std::upper_bound to find the last write at or before
+// search_id that covers the target byte, in O(log W) comparisons.
+
+const MemoryModel::PageWriteIndex*
+MemoryModel::load_page_index(uint64_t page,
+                              rocksdb::Iterator* write_iter,
+                              rocksdb::Iterator* read_iter) {
+    if (!has_rocksdb_ || !write_iter) return nullptr;
+
+    PageWriteIndex idx;
+
+    // Helper: forward-scan one CF from the first key on `page` to the last.
+    auto scan_cf = [&](rocksdb::Iterator* it) {
+        if (!it) return;
+
+        // Seek to the first key belonging to this page.
+        char seek_buf[KEY_SIZE];
+        auto first_key = encode_key_to(page, 0, 0, seek_buf);
+        it->Seek(first_key);
+
+        while (it->Valid()) {
+            if (it->key().size() != KEY_SIZE) break;
+
+            uint64_t found_page;
+            uint16_t found_offset;
+            uint64_t found_inst_id;
+            decode_key(it->key(), found_page, found_offset, found_inst_id);
+
+            if (found_page != page) break;  // past this page
+
+            auto val = it->value();
+            if (val.size() >= 2) {
+                PageWriteEntry e;
+                e.page_offset = found_offset;
+                e.inst_id     = found_inst_id;
+                e.size        = static_cast<uint8_t>(val.data()[0]);
+                e._pad        = 0;
+                if (e.size > 16) e.size = 16;
+                // Clamp write to page boundary: a write starting at found_offset
+                // with size e.size may not exceed PAGE_SIZE.
+                uint16_t max_size = static_cast<uint16_t>(PAGE_SIZE - found_offset);
+                if (e.size > max_size) e.size = static_cast<uint8_t>(max_size);
+                std::memset(e.data, 0, 16);
+                std::memcpy(e.data, val.data() + 1, e.size);
+                idx.push_back(e);
+            }
+
+            it->Next();
+        }
+    };
+
+    scan_cf(write_iter);
+    scan_cf(read_iter);  // read-fallback entries
+
+    // Sort by (page_offset, inst_id) ascending.
+    std::sort(idx.begin(), idx.end(), PageWriteEntryLess{});
+
+    // Store in LRU cache and return a stable pointer.
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    page_index_cache_.put(page, std::move(idx));
+    auto* cached = page_index_cache_.get_mutable(page);
+    return cached;
+}
+
+bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
+                                   uint16_t page_offset,
+                                   uint64_t search_id,
+                                   uint8_t& out_value,
+                                   uint64_t& out_writer) noexcept {
+    if (idx.empty()) return false;
+
+    // We want the last entry with (page_offset_of_write <= page_offset) AND
+    // (inst_id <= search_id) whose write covers page_offset.
+    //
+    // A write starting at `e.page_offset` with size `e.size` covers
+    // page_offset iff:
+    //   e.page_offset <= page_offset < e.page_offset + e.size
+    // i.e. page_offset - e.page_offset < e.size (unsigned)
+    //
+    // Because writes may span up to MAX_WRITE_SIZE bytes (16), we only need
+    // to look back at most 15 offsets before page_offset.
+    const uint16_t min_start = (page_offset >= (MAX_WRITE_SIZE - 1))
+                                   ? static_cast<uint16_t>(page_offset - (MAX_WRITE_SIZE - 1))
+                                   : 0;
+
+    // upper_bound for the exclusive upper limit: (page_offset, search_id+1)
+    // gives us an iterator past all entries with (page_offset <= page_offset
+    // AND inst_id <= search_id).  We then walk backwards.
+    auto end_it = std::upper_bound(idx.begin(), idx.end(),
+                                   std::make_pair(page_offset, search_id),
+                                   PageWriteEntryLess{});
+
+    // Walk backwards from end_it — we want the most-recent write that covers
+    // `page_offset`.  Because entries are sorted ascending by offset then
+    // inst_id, the highest inst_id entries come last within each offset group.
+    if (end_it == idx.begin()) return false;
+
+    auto it = end_it;
+    while (it != idx.begin()) {
+        --it;
+
+        // Stop if we've gone past the valid offset window.
+        if (it->page_offset < min_start) break;
+
+        // Skip entries whose inst_id is too new (shouldn't happen after
+        // upper_bound, but guard against floating-point / boundary issues).
+        if (it->inst_id > search_id) continue;
+
+        // Check coverage: does this write reach page_offset?
+        uint16_t end_off = static_cast<uint16_t>(it->page_offset + it->size);
+        if (it->page_offset <= page_offset && page_offset < end_off) {
+            uint8_t byte_idx = static_cast<uint8_t>(page_offset - it->page_offset);
+            out_value  = it->data[byte_idx];
+            out_writer = it->inst_id;
+            return true;
+        }
+        // If this entry's offset is already < min_start we can stop early.
+        if (it->page_offset < min_start) break;
+    }
+
+    return false;
+}
+
 // ─── Extended API implementations ─────────────────────────────────────────
 
-// Opt #2: read_region with single-iterator approach for RocksDB path.
-// Instead of calling read() in a loop (which previously would create iterators
-// per call), we now create one iterator pair and reuse across all chunks.
+// Opt #2 + PageWriteIndex fast path:
+// read_region first checks the per-page sorted-vector index (O(log W) per byte).
+// On a cache miss it loads the whole page from RocksDB in one forward scan and
+// caches it, so subsequent queries for the same page never touch RocksDB again.
 MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t size, uint64_t at_inst_id) {
     RegionReadResult result;
     result.data.resize(size, 0);
@@ -652,26 +669,72 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
     if (size == 0) return result;
     ensure_built();
 
-    if (has_rocksdb_) {
-        // Use thread-local iterators — single pair for the entire region read
-        auto& iters = get_thread_iterators();
-        return read_region_impl(addr, size, at_inst_id,
-                                iters.write_iter.get(),
-                                iters.read_iter.get());
+    if (!has_rocksdb_) {
+        // In-memory fallback: use read() in chunks
+        constexpr size_t chunk_size = 16;
+        for (size_t off = 0; off < size; off += chunk_size) {
+            size_t remaining = size - off;
+            uint8_t read_size = static_cast<uint8_t>(std::min(remaining, chunk_size));
+            MemReadResult mr = read(addr + off, read_size, at_inst_id);
+            for (uint8_t i = 0; i < read_size; ++i) {
+                result.data[off + i] = mr.data[i];
+                result.known[off + i] = mr.known[i];
+                if (mr.known[i]) result.known_count++;
+            }
+        }
+        return result;
     }
 
-    // In-memory fallback: use read() in chunks
-    constexpr size_t chunk_size = 16;
-    for (size_t off = 0; off < size; off += chunk_size) {
-        size_t remaining = size - off;
-        uint8_t read_size = static_cast<uint8_t>(std::min(remaining, chunk_size));
+    if (at_inst_id == 0) return result;
+    const uint64_t search_id = at_inst_id - 1;
 
-        MemReadResult mr = read(addr + off, read_size, at_inst_id);
+    // Get thread-local iterators (needed for load_page_index on cache miss).
+    auto& iters = get_thread_iterators();
 
-        for (uint8_t i = 0; i < read_size; ++i) {
-            result.data[off + i] = mr.data[i];
-            result.known[off + i] = mr.known[i];
-            if (mr.known[i]) result.known_count++;
+    // Process each byte via the PageWriteIndex fast path.
+    // We group consecutive bytes on the same page to avoid redundant cache
+    // lookups: load the page index once, then resolve all bytes on that page.
+    size_t off = 0;
+    while (off < size) {
+        uint64_t byte_addr = addr + off;
+        uint64_t page      = page_of(byte_addr);
+
+        // --- Get (or load) the PageWriteIndex for this page ---------------
+        const PageWriteIndex* idx_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(cache_mutex_);
+            idx_ptr = page_index_cache_.get_mutable(page);
+        }
+        if (!idx_ptr) {
+            // Cache miss: load whole page from RocksDB (one forward scan).
+            // load_page_index acquires cache_mutex_ internally.
+            idx_ptr = load_page_index(page,
+                                      iters.write_iter.get(),
+                                      iters.read_iter.get());
+        }
+
+        // Resolve all bytes on this page.
+        uint64_t page_base = page << PAGE_SHIFT;
+        uint64_t page_end  = page_base + PAGE_SIZE;
+
+        while (off < size && (addr + off) < page_end) {
+            uint64_t ba         = addr + off;
+            uint16_t page_off   = static_cast<uint16_t>(ba & (PAGE_SIZE - 1));
+
+            if (idx_ptr) {
+                uint8_t  val    = 0;
+                uint64_t writer = 0;
+                if (index_read_byte(*idx_ptr, page_off, search_id, val, writer)) {
+                    result.data[off]  = val;
+                    result.known[off] = true;
+                    result.known_count++;
+                    stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            // If idx_ptr is null (RocksDB unavailable for this page), the byte
+            // remains unknown — consistent with the previous behaviour.
+
+            ++off;
         }
     }
 
