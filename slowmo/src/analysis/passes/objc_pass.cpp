@@ -200,9 +200,12 @@ nlohmann::json ObjcResult::to_json() const {
 /// the ObjcResult. Requires MemoryModel + RegisterFile for argument extraction.
 ///
 /// Performance notes:
-///   - on_objc() calls regfile_.state_before() which can be expensive (rebuild
-///     from anchor).  We use warm_range() to pre-populate the LRU cache and
-///     report progress based on inst_id advancement, not just INST record count.
+///   - on_objc() calls regfile_.state_before() to extract arguments (x2-x7)
+///     and return value (x0).  Each EXEC_TRANSFER_CALL in qbditrace sets
+///     need_anchor=true, so an ANCHOR record is always written immediately
+///     before the instruction following an objc_msgSend.  This means
+///     nearest_anchor_before(inst_id) lands right next to the target, making
+///     rebuild() nearly free (0-few diffs to replay).  No warm_range() needed.
 ///   - Two state_before() calls per ObjC record are reduced to one by reusing
 ///     the "pre" state for both arguments and return value when inst_id == pre+1.
 class ObjcCollector final : public TraceCollector {
@@ -232,12 +235,10 @@ public:
         last_reported_inst_ = 0;
         range_total_ = (end > start) ? (end - start) : 1;
 
-        // Pre-warm the RegisterFile LRU cache so that state_before() calls
-        // inside on_objc() hit warm cache entries instead of rebuilding from
-        // scratch each time.  This dramatically reduces the per-ObjC-record
-        // cost for large traces.
-        regfile_.warm_range(range_start_, range_end_);
-
+        // No warm_range() needed: qbditrace writes an ANCHOR immediately
+        // before each objc_msgSend (EXEC_TRANSFER_CALL sets need_anchor),
+        // so state_before() rebuilds from a near-adjacent anchor with
+        // effectively zero replay cost.
         return true;
     }
 
@@ -280,16 +281,18 @@ public:
         msg.variant   = objc.variant;
         msg.class_name = std::move(cls_name);
 
-        // Attempt to read selector name from memory
+        // Attempt to read selector name.
+        // Prefer code_table (binary image read) first — ObjC selectors normally
+        // reside in the __objc_methnames section of the loaded image, so this
+        // is a cheap in-memory lookup that avoids triggering MemoryModel::build()
+        // (which lazily scans the entire trace to persist memory writes).
         uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
-        msg.selector_name = read_cstring_from_memory(memory_, objc.sel, pre_inst_id);
-
-        // Try binary image fallback for selector
-        if (msg.selector_name.find("0x") == 0) {
-            auto img_str = code_table_.image_read_cstring(objc.sel);
-            if (img_str.has_value()) {
-                msg.selector_name = *img_str;
-            }
+        auto img_str = code_table_.image_read_cstring(objc.sel);
+        if (img_str.has_value()) {
+            msg.selector_name = *img_str;
+        } else {
+            // Fallback: read from trace memory model (may trigger lazy build)
+            msg.selector_name = read_cstring_from_memory(memory_, objc.sel, pre_inst_id);
         }
 
         // ─── Extract method arguments (x2-x7) ────────────────────────────
@@ -331,7 +334,7 @@ public:
             // Return value: x0 at inst_id (the instruction that follows the
             // objc_msgSend).  If pre_inst_id is inst_id-1 and we already have
             // pre_regs, we still need state_before(inst_id) because the ObjC
-            // call modified x0.  The cache should make this cheap after warm_range.
+            // call modified x0.  rebuild() from the adjacent anchor is cheap.
             const auto& inst_regs = regfile_.state_before(inst_id);
             msg.return_value = inst_regs.gpr[0];
             msg.return_deref_str = try_deref_string(memory_, inst_regs.gpr[0], inst_id);
