@@ -1540,6 +1540,33 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     emitEvent(QBDITRACE_EV_XFER_RETURN, st->basicBlockStart, 0);
     c->need_anchor = true;
   }
+
+  /* BASIC_BLOCK_NEW fires the very first time QBDI instruments a basic block.
+   * At this precise moment the code pages are guaranteed readable (QBDI just
+   * read them for JIT patching), so we batch-emit CODE records for every
+   * instruction in the BB. This solves the execute-only page problem: by the
+   * time postInstCB's emitCodeOnce runs, the page permissions may have been
+   * restored to --x, making safeRead (vm_read_overwrite) fail.
+   *
+   * We iterate [basicBlockStart, basicBlockEnd) in 4-byte steps (AArch64 fixed
+   * width) and use a direct pointer dereference — not safeRead — because we
+   * know the page is currently mapped RX (QBDI holds it that way during
+   * instrumentation). The seen_code dedup inside emitCodeWithBytes ensures no
+   * duplicates if emitCodeOnce also succeeds later. */
+  if (st->event & QBDI::BASIC_BLOCK_NEW) {
+    const uint64_t bbStart = st->basicBlockStart;
+    const uint64_t bbEnd = st->basicBlockEnd;
+    if (bbStart != 0 && bbEnd > bbStart) {
+      const Config &cfg = Tracer::get().cfg();
+      if (cfg.embed_code) {
+        for (uint64_t pc = bbStart; pc < bbEnd; pc += 4) {
+          uint32_t opcode = *reinterpret_cast<const uint32_t *>(pc);
+          emitCodeWithBytes(c, pc, opcode);
+        }
+      }
+    }
+  }
+
   return QBDI::CONTINUE;
 }
 
@@ -1602,7 +1629,8 @@ static bool setupVM(QBDI::VM &vm) {
   vm.addCodeCB(QBDI::PREINST, preInstCB, nullptr, QBDI::PRIORITY_DEFAULT);
   vm.addCodeCB(QBDI::POSTINST, postInstCB, nullptr, QBDI::PRIORITY_DEFAULT);
   vm.addVMEventCB(QBDI::SEQUENCE_ENTRY | QBDI::SEQUENCE_EXIT |
-                      QBDI::EXEC_TRANSFER_CALL | QBDI::EXEC_TRANSFER_RETURN,
+                      QBDI::EXEC_TRANSFER_CALL | QBDI::EXEC_TRANSFER_RETURN |
+                      QBDI::BASIC_BLOCK_NEW,
                   vmEventCB, nullptr);
 
   /* Trap supervisor calls (syscalls). The mnemonic callback fires only on `svc`
