@@ -1,4 +1,11 @@
 #include "tui/tui_app.h"
+#include "tui/panels/register_panel.h"
+#include "tui/panels/memory_panel.h"
+#include "tui/panels/callstack_panel.h"
+#include "tui/panels/functions_panel.h"
+#include "tui/panels/strings_panel.h"
+#include "tui/panels/thread_panel.h"
+#include "tui/panels/breakpoint_panel.h"
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/disassembly_pass.h"
@@ -58,9 +65,21 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     : reader_(reader), index_(index), code_table_(code_table),
       decoder_(decoder), regfile_(regfile), memory_(memory),
       screen_(ScreenInteractive::Fullscreen()) {
+    // Initialize shared context
+    ctx_.reader = &reader_;
+    ctx_.index = &index_;
+    ctx_.code_table = &code_table_;
+    ctx_.decoder = &decoder_;
+    ctx_.regfile = &regfile_;
+    ctx_.memory = &memory_;
+    ctx_.fetch_row = &TuiApp::fetch_row_trampoline;
+    ctx_.fetch_row_self = this;
+    ctx_.navigate_to_fn = &TuiApp::navigate_to_trampoline;
+    ctx_.navigate_self = this;
+
     total_inst_ = index.inst_count();
     int h = screen_.dimy();
-    viewport_height_ = (h > 6) ? h - 4 : 20;  // reserve for status bar, default 20 if unknown
+    viewport_height_ = (h > 6) ? h - 4 : 20;
 
     // Initialize hex dump view
     hex_dump_view_ = std::make_unique<HexDumpView>(memory_);
@@ -68,12 +87,50 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     hex_dump_view_->set_address(0);
 
     // Restore bookmarks and last cursor position from the index
-    bookmarks_ = index_.load_bookmarks();
+    ctx_.bookmarks = index_.load_bookmarks();
     uint64_t last = index_.load_last_inst();
     if (last > 0 && last < total_inst_) {
         current_inst_ = last;
         update_viewport();
     }
+
+    // Create panels
+    register_panel_ = std::make_unique<RegisterPanel>(ctx_);
+    memory_panel_ = std::make_unique<MemoryPanel>(ctx_);
+    callstack_panel_ = std::make_unique<CallstackPanel>(ctx_);
+    functions_panel_ = std::make_unique<FunctionsPanel>(ctx_);
+    strings_panel_ = std::make_unique<StringsPanel>(ctx_);
+    thread_panel_ = std::make_unique<ThreadPanel>(ctx_);
+    // breakpoint_panel_ created lazily after bp_engine_ exists
+
+    // Build right-panel rendering order
+    right_panels_ = {
+        register_panel_.get(),
+        memory_panel_.get(),
+        callstack_panel_.get(),
+        functions_panel_.get(),
+        strings_panel_.get(),
+        thread_panel_.get(),
+    };
+
+    // Initialize key bindings (data-driven dispatch table)
+    init_key_bindings();
+}
+
+void TuiApp::sync_context() {
+    // Panels read from ctx_ directly (total_inst, current_inst, viewport_top,
+    // viewport_height are reference aliases into ctx_). Sync other fields:
+    ctx_.show_taint = show_taint_;
+    ctx_.show_backward_taint = show_backward_taint_;
+    ctx_.show_nzcv = show_nzcv_;
+    ctx_.show_fpr = show_fpr_;
+
+}
+
+void TuiApp::focus_panel(Panel* p) {
+    if (focused_panel_) focused_panel_->set_focused(false);
+    focused_panel_ = p;
+    if (p) p->set_focused(true);
 }
 
 // ─── Row fetching ───────────────────────────────────────────────────────────
@@ -114,7 +171,7 @@ InstructionRow TuiApp::fetch_row(uint64_t inst_id) {
         row.disasm = "<no code>";
     }
 
-    row.has_bookmark = std::binary_search(bookmarks_.begin(), bookmarks_.end(), inst_id);
+    row.has_bookmark = std::binary_search(ctx_.bookmarks.begin(), ctx_.bookmarks.end(), inst_id);
 
     row_cache_.put(inst_id, row);
     return row;
@@ -142,14 +199,14 @@ Element TuiApp::render_instruction_list() {
         bool is_search_hit = search_active_ &&
             search_current_ < search_results_.size() &&
             search_results_[search_current_] == row.inst_id;
-        bool is_tainted = show_taint_ && taint_result_ && taint_result_->has_event_at(row.inst_id);
-        bool is_sliced = show_slice_ && slice_result_ && slice_result_->is_in_slice(row.inst_id);
-        bool is_backward_tainted = show_backward_taint_ && backward_taint_result_ &&
-            backward_taint_result_->is_contributing(row.inst_id);
+        bool is_tainted = show_taint_ && ctx_.taint_result && ctx_.taint_result->has_event_at(row.inst_id);
+        bool is_sliced = show_slice_ && ctx_.slice_result && ctx_.slice_result->is_in_slice(row.inst_id);
+        bool is_backward_tainted = show_backward_taint_ && ctx_.backward_taint_result &&
+            ctx_.backward_taint_result->is_contributing(row.inst_id);
 
         // Loop state
-        bool is_loop_header = show_loops_ && loop_result_ && loop_result_->is_loop_header(row.pc);
-        uint32_t loop_depth = (show_loops_ && loop_result_) ? loop_result_->loop_depth_at(row.pc) : 0;
+        bool is_loop_header = show_loops_ && ctx_.loop_result && ctx_.loop_result->is_loop_header(row.pc);
+        uint32_t loop_depth = (show_loops_ && ctx_.loop_result) ? ctx_.loop_result->loop_depth_at(row.pc) : 0;
         bool is_in_loop = loop_depth > 0;
 
         // Marker column: show loop indicator when relevant
@@ -225,304 +282,6 @@ Element TuiApp::render_instruction_list() {
     return vbox(lines) | flex | frame;
 }
 
-Element TuiApp::render_register_panel() {
-    const auto& state = regfile_.state_before(current_inst_);
-
-    // Determine which registers are read/written by the current instruction
-    std::vector<uint8_t> read_regs, write_regs;
-    {
-        auto [offset, seed_pc_ri] = index_.offset_of_with_pc(current_inst_, reader_);
-        auto rec = reader_.record_at(offset, seed_pc_ri);
-        if (rec.kind == RecordKind::Inst) {
-            auto inst = rec.as_inst();
-            // Written registers from trace reg_diffs (ground truth)
-            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                write_regs.push_back(inst.reg_diff(i).index);
-            }
-            // Read registers from Capstone decode
-            auto opcode = code_table_.opcode_at(inst.pc);
-            if (opcode) {
-                auto d = decoder_.decode(inst.pc, *opcode);
-                if (d) {
-                    read_regs.assign(d->regs_read.begin(),
-                                     d->regs_read.begin() + d->regs_read_count);
-                }
-            }
-        }
-    }
-
-    // Helper: check if a register index is in a set
-    auto is_in = [](const std::vector<uint8_t>& vec, uint8_t idx) {
-        for (auto v : vec) if (v == idx) return true;
-        return false;
-    };
-
-    // Color for register value: green=read, red=written, yellow=both, white=neither
-    auto reg_value_color = [&](uint8_t idx) -> Color {
-        bool r = is_in(read_regs, idx);
-        bool w = is_in(write_regs, idx);
-        if (r && w) return Color::Yellow;
-        if (w) return Color::RedLight;
-        if (r) return Color::GreenLight;
-        return Color::White;
-    };
-
-    // Color for register name label
-    auto reg_label_color = [&](uint8_t idx) -> Color {
-        bool r = is_in(read_regs, idx);
-        bool w = is_in(write_regs, idx);
-        if (r && w) return Color::Yellow;
-        if (w) return Color::Red;
-        if (r) return Color::Green;
-        return Color::Cyan;
-    };
-
-    Elements reg_lines;
-    reg_lines.push_back(hbox({
-        text("Registers") | bold | color(Color::Yellow),
-        text("  ") | size(WIDTH, EQUAL, 2),
-        text("R") | color(Color::Green),
-        text("/") | color(Color::GrayLight),
-        text("W") | color(Color::Red),
-        text("/") | color(Color::GrayLight),
-        text("RW") | color(Color::Yellow),
-    }));
-    reg_lines.push_back(separator());
-
-    for (int i = 0; i < 29; i += 2) {
-        auto name1 = reg_name(i);
-        auto name2 = reg_name(i + 1);
-        auto line = hbox({
-            text(fmt::format("{:>3}=", name1)) | color(reg_label_color(i)),
-            text(fmt::format("{:016x}", state.gpr[i])) | color(reg_value_color(i)),
-            text("  ") | size(WIDTH, EQUAL, 2),
-            text(fmt::format("{:>3}=", name2)) | color(reg_label_color(i + 1)),
-            text(fmt::format("{:016x}", state.gpr[i + 1])) | color(reg_value_color(i + 1)),
-        });
-        reg_lines.push_back(line);
-    }
-
-    // fp, lr, sp, pc, nzcv
-    reg_lines.push_back(separator());
-    reg_lines.push_back(hbox({
-        text(" fp=") | color(reg_label_color(IDX_FP)),
-        text(fmt::format("{:016x}", state.fp())) | color(reg_value_color(IDX_FP)),
-    }));
-    reg_lines.push_back(hbox({
-        text(" lr=") | color(reg_label_color(IDX_LR)),
-        text(fmt::format("{:016x}", state.lr())) | color(reg_value_color(IDX_LR)),
-    }));
-    reg_lines.push_back(hbox({
-        text(" sp=") | color(reg_label_color(IDX_SP)),
-        text(fmt::format("{:016x}", state.sp())) | color(reg_value_color(IDX_SP)),
-    }));
-    reg_lines.push_back(hbox({
-        text(" pc=") | color(reg_label_color(IDX_PC)),
-        text(fmt::format("{:016x}", state.pc())) | color(reg_value_color(IDX_PC)),
-    }));
-    if (show_nzcv_) {
-        reg_lines.push_back(hbox({
-            text("nzcv=") | color(reg_label_color(IDX_NZCV)),
-            text(fmt::format("{:x}", state.nzcv())) | color(reg_value_color(IDX_NZCV)),
-        }));
-    }
-
-    // FPR / NEON section (v7 traces only, shown when show_fpr_ is true)
-    if (reader_.header().has_fpr()) {
-        reg_lines.push_back(separator());
-        // Toggle header: press 'V' to collapse/expand (handled in event loop)
-        if (show_fpr_) {
-            reg_lines.push_back(hbox({
-                text("NEON v0\xe2\x80\x93v31") | bold | color(Color::Magenta),
-                text("  (V to hide)") | color(Color::GrayLight),
-            }));
-            reg_lines.push_back(separator());
-            for (uint8_t vi = 0; vi < AARCH64_FPR_COUNT; ++vi) {
-                const FprValue& fval = state.fpr[vi];
-                // Determine if this FPR was written by the current instruction
-                // (v7: check fpr_diff list for the current record)
-                bool fpr_written = false;
-                {
-                    auto [off, spc] = index_.offset_of_with_pc(current_inst_, reader_);
-                    auto frec = reader_.record_at(off, spc);
-                    if (frec.kind == RecordKind::Inst) {
-                        auto fi = frec.as_inst();
-                        for (uint8_t fd = 0; fd < fi.fpr_diff_count; fd++) {
-                            if (fi.fpr_diff(fd).index == vi) { fpr_written = true; break; }
-                        }
-                    }
-                }
-                Color vname_col = fpr_written ? Color::RedLight : Color::Magenta;
-                Color val_col   = fpr_written ? Color::RedLight : Color::White;
-                auto fpr_line = hbox({
-                    text(fmt::format("v{:<2}=", vi)) | color(vname_col),
-                    text(fmt::format("{:016x}", fval.hi)) | color(val_col),
-                    text(":") | color(Color::GrayLight),
-                    text(fmt::format("{:016x}", fval.lo)) | color(val_col),
-                });
-                reg_lines.push_back(fpr_line);
-            }
-        } else {
-            reg_lines.push_back(hbox({
-                text("NEON v0\xe2\x80\x93v31") | bold | color(Color::GrayDark),
-                text("  (V to show)") | color(Color::GrayLight),
-            }));
-        }
-    }
-
-    // Cache stats
-    reg_lines.push_back(separator());
-    auto stats = regfile_.cache_stats();
-    reg_lines.push_back(text(fmt::format("Cache: {} hits / {} misses", stats.hits, stats.misses))
-                        | color(Color::GrayLight));
-
-    return vbox(reg_lines) | size(WIDTH, GREATER_THAN, 38) | border;
-}
-
-Element TuiApp::render_memory_panel() {
-    Elements lines;
-    // Header with focus indicator
-    auto header_label = memory_panel_focused_
-        ? text("[MEMORY ACCESSES]") | bold | bgcolor(Color::Blue) | color(Color::White)
-        : text("Memory Accesses") | bold | color(Color::Yellow);
-    lines.push_back(header_label);
-    lines.push_back(separator());
-
-    // Get current instruction's memory accesses
-    auto [offset, seed_pc_ma] = index_.offset_of_with_pc(current_inst_, reader_);
-    auto rec = reader_.record_at(offset, seed_pc_ma);
-    if (rec.kind != RecordKind::Inst) {
-        lines.push_back(text("(no instruction)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
-    }
-
-    auto inst = rec.as_inst();
-    if (inst.mem_access_count == 0) {
-        lines.push_back(text("(no memory access)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
-    }
-
-    // Clamp cursor
-    if (memory_access_cursor_ >= inst.mem_access_count) {
-        memory_access_cursor_ = inst.mem_access_count > 0 ? inst.mem_access_count - 1 : 0;
-    }
-
-    for (uint8_t i = 0; i < inst.mem_access_count; i++) {
-        auto mem = inst.mem_access(i);
-        bool is_write = (mem.type & 2) != 0;
-        const char* type_label = is_write ? "WRITE" : "READ ";
-        Color type_color = is_write ? Color::Red : Color::Green;
-        bool is_selected = memory_panel_focused_ && (static_cast<size_t>(i) == memory_access_cursor_);
-
-        // Access header: type + address + size (with cursor indicator)
-        auto cursor_mark = text(is_selected ? ">" : " ") | color(Color::Yellow);
-        auto access_header = hbox({
-            cursor_mark,
-            text(type_label) | color(type_color) | bold,
-            text(fmt::format("  addr=0x{:016x}  size={}", mem.addr, mem.size))
-                | color(Color::White),
-        });
-        if (is_selected) {
-            access_header = access_header | bgcolor(Color::GrayDark);
-        }
-        lines.push_back(access_header);
-
-        // Value display
-        if (mem.size <= 8) {
-            lines.push_back(hbox({
-                text("  val =") | color(Color::GrayLight),
-                text(fmt::format(" 0x{:016x}", mem.value)) | color(Color::Cyan),
-            }));
-        } else {
-            // 16-byte access (Q register / LDP)
-            lines.push_back(hbox({
-                text("  lo  =") | color(Color::GrayLight),
-                text(fmt::format(" 0x{:016x}", mem.value)) | color(Color::Cyan),
-            }));
-            lines.push_back(hbox({
-                text("  hi  =") | color(Color::GrayLight),
-                text(fmt::format(" 0x{:016x}", mem.value_hi)) | color(Color::Cyan),
-            }));
-        }
-
-        // Hex dump of the value (byte-by-byte, little-endian)
-        {
-            std::string hex_str = "  hex: ";
-            uint8_t bytes[16];
-            std::memcpy(bytes, &mem.value, 8);
-            std::memcpy(bytes + 8, &mem.value_hi, 8);
-            size_t n = (mem.size <= 16) ? mem.size : 8;
-            for (size_t b = 0; b < n; b++) {
-                hex_str += fmt::format("{:02x} ", bytes[b]);
-            }
-            lines.push_back(text(hex_str) | color(Color::GrayDark));
-        }
-
-        if (i + 1 < inst.mem_access_count) {
-            lines.push_back(separator());
-        }
-    }
-
-    // Footer hint when focused
-    if (memory_panel_focused_) {
-        lines.push_back(separator());
-        lines.push_back(text("j/k:select Enter/H:hex-dump Esc:unfocus") | color(Color::GrayDark));
-    }
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
-}
-
-bool TuiApp::handle_memory_panel_event(Event event) {
-    if (event == Event::Escape) {
-        memory_panel_focused_ = false;
-        return true;
-    }
-
-    // Get current instruction's memory access count
-    auto [offset, seed_pc_mp] = index_.offset_of_with_pc(current_inst_, reader_);
-    auto rec = reader_.record_at(offset, seed_pc_mp);
-    if (rec.kind != RecordKind::Inst) {
-        memory_panel_focused_ = false;
-        return true;
-    }
-    auto inst = rec.as_inst();
-    if (inst.mem_access_count == 0) {
-        memory_panel_focused_ = false;
-        return true;
-    }
-
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (memory_access_cursor_ + 1 < static_cast<size_t>(inst.mem_access_count)) {
-            memory_access_cursor_++;
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (memory_access_cursor_ > 0) {
-            memory_access_cursor_--;
-        }
-        return true;
-    }
-
-    // Enter or H: open Hex Dump at the selected memory address
-    if (event == Event::Return || event == Event::Character('H') || event == Event::Character('h')) {
-        if (memory_access_cursor_ < static_cast<size_t>(inst.mem_access_count)) {
-            auto mem = inst.mem_access(static_cast<uint8_t>(memory_access_cursor_));
-            // Show and focus the hex dump panel at this address
-            show_hex_dump_ = true;
-            hex_dump_focused_ = false;
-            if (hex_dump_view_) {
-                hex_dump_view_->set_time(current_inst_);
-                hex_dump_view_->goto_address(mem.addr);
-            }
-            memory_panel_focused_ = false;
-        }
-        return true;
-    }
-
-    return false;
-}
-
 Element TuiApp::render_status_bar() {
     std::string mode_str;
     Color mode_color = Color::Blue;
@@ -538,16 +297,16 @@ Element TuiApp::render_status_bar() {
         mode_str = " STR-FILTER ";
     } else if (show_function_filter_dialog_) {
         mode_str = " FUNC-FILTER ";
-    } else if (bp_panel_focused_ && show_bp_panel_) {
+    } else if (breakpoint_panel_->focused() && breakpoint_panel_->visible()) {
         mode_str = " BREAKPOINTS ";
         mode_color = Color::Red;
-    } else if (callstack_panel_focused_) {
+    } else if (callstack_panel_->focused()) {
         mode_str = " CALLSTACK ";
-    } else if (memory_panel_focused_) {
+    } else if (memory_panel_->focused()) {
         mode_str = " MEMORY ";
-    } else if (string_panel_focused_) {
+    } else if (strings_panel_->focused()) {
         mode_str = " STRINGS ";
-    } else if (function_panel_focused_) {
+    } else if (functions_panel_->focused()) {
         mode_str = " FUNCTIONS ";
     } else if (hex_dump_focused_) {
         mode_str = " HEX-DUMP ";
@@ -646,27 +405,18 @@ Element TuiApp::render_hex_dump_panel() {
 }
 
 Element TuiApp::render_main_layout() {
-    Elements right_panels;
-    if (show_regs_) {
-        right_panels.push_back(render_register_panel());
+    sync_context();
+
+    // Render visible right-side panels via the panel registry
+    Elements panel_elements;
+    for (auto* p : right_panels_) {
+        if (p && p->visible()) {
+            panel_elements.push_back(p->render());
+        }
     }
-    if (show_mem_panel_) {
-        right_panels.push_back(render_memory_panel());
-    }
-    if (show_callstack_) {
-        right_panels.push_back(render_callstack_panel());
-    }
-    if (show_functions_) {
-        right_panels.push_back(render_functions_panel());
-    }
-    if (show_strings_) {
-        right_panels.push_back(render_strings_panel());
-    }
-    if (show_threads_) {
-        right_panels.push_back(render_thread_panel());
-    }
-    if (show_bp_panel_) {
-        right_panels.push_back(render_bp_panel());
+    // Breakpoint panel (lazily created, may be null)
+    if (breakpoint_panel_ && breakpoint_panel_->visible()) {
+        panel_elements.push_back(breakpoint_panel_->render());
     }
 
     // Build center content: instruction list with optional minimap on the left
@@ -682,7 +432,7 @@ Element TuiApp::render_main_layout() {
 
     auto main = hbox({
         center | flex,
-        vbox(right_panels) | size(WIDTH, LESS_THAN, 50),
+        vbox(panel_elements) | size(WIDTH, LESS_THAN, 50),
     });
 
     // If hex dump is visible, show it below the main content area
@@ -808,11 +558,11 @@ void TuiApp::search_prev() {
 // ─── Bookmarks ──────────────────────────────────────────────────────────────
 
 void TuiApp::toggle_bookmark() {
-    auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), current_inst_);
-    if (it != bookmarks_.end() && *it == current_inst_) {
-        bookmarks_.erase(it);
+    auto it = std::lower_bound(ctx_.bookmarks.begin(), ctx_.bookmarks.end(), current_inst_);
+    if (it != ctx_.bookmarks.end() && *it == current_inst_) {
+        ctx_.bookmarks.erase(it);
     } else {
-        bookmarks_.insert(it, current_inst_);
+        ctx_.bookmarks.insert(it, current_inst_);
     }
     // Invalidate cache for this row
     row_cache_.put(current_inst_, fetch_row(current_inst_));
@@ -1016,125 +766,16 @@ void TuiApp::cmd_list_breakpoints() {
         }, e.spec);
     }
     bp_status_msg_ = msg.empty() ? "No active breakpoints." : msg;
-    show_bp_panel_ = true;
+    breakpoint_panel_->set_visible(true);
 }
 
 void TuiApp::cmd_delete_breakpoint(uint32_t id) {
     ensure_bp_engine();
     if (bp_engine_->remove_breakpoint(id)) {
         bp_status_msg_ = fmt::format("BP#{} removed.", id);
-        // Adjust panel cursor
-        if (bp_panel_cursor_ > 0) bp_panel_cursor_--;
     } else {
         bp_status_msg_ = fmt::format("No breakpoint with id {}.", id);
     }
-}
-
-// ─── Breakpoint list panel ─────────────────────────────────────────────────
-
-ftxui::Element TuiApp::render_bp_panel() {
-    using namespace ftxui;
-    Elements lines;
-    lines.push_back(text(" Breakpoints ") | bold | color(Color::Yellow) | center);
-    lines.push_back(separator());
-
-    ensure_bp_engine();
-    const auto& entries = bp_engine_->entries();
-    if (entries.empty()) {
-        lines.push_back(text(" (none) ") | color(Color::GrayDark) | center);
-    } else {
-        for (size_t i = 0; i < entries.size(); i++) {
-            const auto& e = entries[i];
-            bool is_cursor = (i == bp_panel_cursor_);
-            std::string label;
-            std::visit([&](const auto& s) {
-                using T = std::decay_t<decltype(s)>;
-                if constexpr (std::is_same_v<T, PcBreakpoint>) {
-                    label = fmt::format("#{} PC=0x{:x}", e.id, s.address);
-                } else if constexpr (std::is_same_v<T, WatchBreakpoint>) {
-                    if (s.size == 0)
-                        label = fmt::format("#{} W 0x{:x} (pg)", e.id, s.address);
-                    else
-                        label = fmt::format("#{} W 0x{:x}+{}", e.id, s.address, s.size);
-                } else if constexpr (std::is_same_v<T, ConditionalBreakpoint>) {
-                    label = fmt::format("#{} cond:{}", e.id, s.description.substr(0, 12));
-                }
-            }, e.spec);
-            auto row = hbox({
-                text(is_cursor ? ">" : " ") | color(Color::Yellow),
-                text(e.enabled ? " ● " : " ○ ") | color(e.enabled ? Color::Red : Color::GrayDark),
-                text(label) | color(is_cursor ? Color::White : Color::GrayLight),
-            });
-            if (is_cursor && bp_panel_focused_) {
-                row = row | bgcolor(Color::GrayDark);
-            }
-            lines.push_back(row);
-        }
-    }
-
-    lines.push_back(separator());
-    if (bp_panel_focused_) {
-        lines.push_back(text("j/k:nav d:delete c:clear Esc:unfocus") | color(Color::GrayDark));
-    } else {
-        lines.push_back(text("W:toggle-panel  :rc/:rb continue") | color(Color::GrayDark));
-    }
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 28) | border;
-}
-
-bool TuiApp::handle_bp_panel_event(ftxui::Event event) {
-    ensure_bp_engine();
-    const auto& entries = bp_engine_->entries();
-
-    if (event == Event::Escape) {
-        bp_panel_focused_ = false;
-        return true;
-    }
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (!entries.empty()) {
-            bp_panel_cursor_ = (bp_panel_cursor_ + 1) % entries.size();
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (!entries.empty()) {
-            bp_panel_cursor_ = (bp_panel_cursor_ + entries.size() - 1) % entries.size();
-        }
-        return true;
-    }
-    if (event == Event::Character('d') || event == Event::Character('x')) {
-        if (!entries.empty() && bp_panel_cursor_ < entries.size()) {
-            uint32_t id = entries[bp_panel_cursor_].id;
-            cmd_delete_breakpoint(id);
-        }
-        return true;
-    }
-    if (event == Event::Character('c')) {
-        bp_engine_->clear_breakpoints();
-        bp_panel_cursor_ = 0;
-        bp_status_msg_ = "All breakpoints cleared.";
-        return true;
-    }
-     // Enter: run forward (or backward if nothing forward) to the selected breakpoint
-    if (event == Event::Return) {
-        if (!entries.empty() && bp_panel_cursor_ < entries.size()) {
-            BreakpointId target_id = entries[bp_panel_cursor_].id;
-            // Create a temporary single-BP engine to find the nearest occurrence
-            BreakpointEngine temp(reader_, index_, regfile_, memory_);
-            temp.add_breakpoint(entries[bp_panel_cursor_].spec);
-            auto hit = temp.run_forward(current_inst_);
-            if (!hit) hit = temp.run_backward(current_inst_);
-            if (hit) {
-                bp_status_msg_ = fmt::format("Jumped to BP#{} @ inst #{}", target_id, hit->inst_id);
-                navigate_to(hit->inst_id);
-                bp_panel_focused_ = false;
-            } else {
-                bp_status_msg_ = fmt::format("BP#{} has no occurrences in trace.", target_id);
-            }
-        }
-        return true;
-    }
-    return false;
 }
 
 // ─── Dialogs ────────────────────────────────────────────────────────────────
@@ -1240,157 +881,68 @@ bool TuiApp::handle_hex_dump_event(Event event) {
     return false;
 }
 
-bool TuiApp::handle_string_panel_event(Event event) {
-    if (event == Event::Escape) {
-        string_panel_focused_ = false;
-        return true;
-    }
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (!filtered_string_indices_.empty() &&
-            string_cursor_ < filtered_string_indices_.size() - 1) {
-            string_cursor_++;
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (string_cursor_ > 0) {
-            string_cursor_--;
-        }
-        return true;
-    }
-    if (event == Event::Return) {
-        // Jump to the instruction that first discovered this string
-        if (!filtered_string_indices_.empty() &&
-            string_cursor_ < filtered_string_indices_.size()) {
-            size_t str_idx = filtered_string_indices_[string_cursor_];
-            const auto& ref = string_result_->strings[str_idx];
-            navigate_to(ref.discovered_at);
-            string_panel_focused_ = false;
-        }
-        return true;
-    }
-    if (event == Event::Character('/')) {
-        open_string_search_dialog();
-        return true;
-    }
-    if (event == Event::Character('c') || event == Event::Character('C')) {
-        // Clear filter
-        string_filter_.clear();
-        update_string_filter();
-        string_cursor_ = 0;
-        return true;
-    }
-    if (event == Event::Character('G')) {
-        // Jump to last string
-        if (!filtered_string_indices_.empty()) {
-            string_cursor_ = filtered_string_indices_.size() - 1;
-        }
-        return true;
-    }
-    if (event == Event::Character('g')) {
-        // Jump to first string
-        string_cursor_ = 0;
-        return true;
-    }
-    return false;
-}
+// ─── Key binding initialization (data-driven normal-mode dispatch) ──────────
+//
+// All simple key→action mappings are registered here, replacing the former
+// 300+ line if-else chain. Complex bindings with multi-step logic are kept
+// as lambdas. The registry is evaluated in insertion order; first match wins.
 
-bool TuiApp::handle_event(Event event) {
-    // Resize
-    if (event == Event::Special({0})) {
-        handle_resize();
-        return true;
-    }
+void TuiApp::init_key_bindings() {
+    using Event = ftxui::Event;
 
-    // Function panel focused mode — intercept first
-    if (function_panel_focused_ && show_functions_ && function_result_) {
-        return handle_function_panel_event(event);
-    }
+    // ─── Quit ────────────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('q'), [this] {
+        screen_.ExitLoopClosure()(); return true;
+    }, "quit");
+    normal_keys_.bind(Event::Character('Q'), [this] {
+        screen_.ExitLoopClosure()(); return true;
+    }, "quit");
 
-    // Callstack panel focused mode — intercept first
-    if (callstack_panel_focused_ && show_callstack_ && function_result_) {
-        return handle_callstack_panel_event(event);
-    }
+    // ─── Navigation ──────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('j'), [this] { navigate_relative(1); return true; }, "down");
+    normal_keys_.bind(Event::ArrowDown,      [this] { navigate_relative(1); return true; }, "down");
+    normal_keys_.bind(Event::Character('k'), [this] { navigate_relative(-1); return true; }, "up");
+    normal_keys_.bind(Event::ArrowUp,        [this] { navigate_relative(-1); return true; }, "up");
+    normal_keys_.bind(Event::Character('K'), [this] {
+        if (current_inst_ > 0) navigate_to(current_inst_ - 1);
+        return true;
+    }, "reverse step");
+    normal_keys_.bind(Event::Character('G'), [this] {
+        navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0); return true;
+    }, "goto end");
+    normal_keys_.bind(Event::Character('0'), [this] { navigate_to(0); return true; }, "goto start");
+    normal_keys_.bind(Event::Character(' '), [this] {
+        navigate_relative(viewport_height_ / 2); return true;
+    }, "page down");
+    normal_keys_.bind(Event::Character('d'), [this] {
+        navigate_relative(viewport_height_ / 2); return true;
+    }, "page down");
+    normal_keys_.bind(Event::Character('u'), [this] {
+        navigate_relative(-(viewport_height_ / 2)); return true;
+    }, "page up");
 
-    // Memory panel focused mode — intercept first
-    if (memory_panel_focused_) {
-        return handle_memory_panel_event(event);
-    }
+    // ─── Dialogs ─────────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('g'), [this] { open_goto_dialog(); return true; }, "goto");
+    normal_keys_.bind(Event::Character('/'), [this] { open_search_dialog(); return true; }, "search");
+    normal_keys_.bind(Event::Character(':'), [this] { open_cmd_dialog(); return true; }, "command");
 
-    // Thread panel focused mode — intercept first
-    if (thread_panel_focused_ && show_threads_ && thread_result_) {
-        return handle_thread_panel_event(event);
-    }
+    // ─── Search navigation ───────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('n'), [this] { search_next(); return true; }, "search next");
+    normal_keys_.bind(Event::Character('N'), [this] { search_prev(); return true; }, "search prev");
 
-    // String panel focused mode — intercept first
-    if (string_panel_focused_ && show_strings_ && string_result_) {
-        return handle_string_panel_event(event);
-    }
+    // ─── Bookmarks ───────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('b'), [this] { toggle_bookmark(); return true; }, "bookmark");
 
-    // Hex dump focused mode — intercept first
-    if (hex_dump_focused_ && hex_dump_view_) {
-        return handle_hex_dump_event(event);
-    }
+    // ─── UI toggles ──────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('r'), [this] { register_panel_->set_visible(!register_panel_->visible()); return true; }, "regs");
+    normal_keys_.bind(Event::Character('m'), [this] { show_mem_ = !show_mem_; return true; }, "mem inline");
+    normal_keys_.bind(Event::Character('M'), [this] { memory_panel_->set_visible(!memory_panel_->visible()); return true; }, "mem panel");
+    normal_keys_.bind(Event::Character('z'), [this] { show_nzcv_ = !show_nzcv_; return true; }, "nzcv");
+    normal_keys_.bind(Event::Character('V'), [this] { show_fpr_ = !show_fpr_; return true; }, "FPR/NEON");
+    normal_keys_.bind(Event::Character('R'), [this] { row_cache_.clear(); return true; }, "refresh cache");
 
-    // Breakpoint panel focused mode — intercept first
-    if (bp_panel_focused_ && show_bp_panel_) {
-        return handle_bp_panel_event(event);
-    }
-
-    // Normal mode keybindings
-    if (event == Event::Character('q') || event == Event::Character('Q')) {
-        screen_.ExitLoopClosure()();
-        return true;
-    }
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        navigate_relative(1);
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        navigate_relative(-1);
-        return true;
-    }
-    // Reverse single-step: K (Shift+k)
-    if (event == Event::Character('K')) {
-        // Step backward by 1 instruction (no-op at position 0)
-        if (current_inst_ > 0) {
-            navigate_to(current_inst_ - 1);
-        }
-        return true;
-    }
-    if (event == Event::Character('g')) {
-        open_goto_dialog();
-        return true;
-    }
-    if (event == Event::Character('/')) {
-        open_search_dialog();
-        return true;
-    }
-    if (event == Event::Character('n')) {
-        search_next();
-        return true;
-    }
-    if (event == Event::Character('N')) {
-        search_prev();
-        return true;
-    }
-    if (event == Event::Character('b')) {
-        toggle_bookmark();
-        return true;
-    }
-    if (event == Event::Character('r')) {
-        show_regs_ = !show_regs_;
-        return true;
-    }
-    if (event == Event::Character('m')) {
-        show_mem_ = !show_mem_;
-        return true;
-    }
-    if (event == Event::Character('M')) {
-        show_mem_panel_ = !show_mem_panel_;
-        return true;
-    }
-    if (event == Event::Character('H')) {
+    // ─── Hex dump ────────────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('H'), [this] {
         show_hex_dump_ = !show_hex_dump_;
         if (show_hex_dump_ && hex_dump_view_) {
             hex_dump_focused_ = false;
@@ -1405,219 +957,169 @@ bool TuiApp::handle_event(Event event) {
             hex_dump_view_->set_time(current_inst_);
         }
         return true;
-    }
-    if (event == Event::Tab) {
-        if (show_hex_dump_) {
-            hex_dump_focused_ = !hex_dump_focused_;
-            return true;
-        }
-    }
-    if (event == Event::Character('G')) {
-        navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0);
-        return true;
-    }
-    if (event == Event::Character('0')) {
-        navigate_to(0);
-        return true;
-    }
-    if (event == Event::Character(' ') || event == Event::Character('d')) {
-        navigate_relative(viewport_height_ / 2);
-        return true;
-    }
-    if (event == Event::Character('u')) {
-        navigate_relative(-(viewport_height_ / 2));
-        return true;
-    }
-    if (event == Event::Character('z')) {
-        show_nzcv_ = !show_nzcv_;
-        return true;
-    }
-    if (event == Event::Character('V')) {
-        show_fpr_ = !show_fpr_;
-        return true;
-    }
-    if (event == Event::Character('R')) {
-        row_cache_.clear();
-        return true;
-    }
-    if (event == Event::Character('t')) {
-        run_taint_analysis();
-        return true;
-    }
-    if (event == Event::Character('S')) {
-        run_slice_analysis();
-        return true;
-    }
-    if (event == Event::Character('B')) {
-        run_backward_taint_analysis();
-        return true;
-    }
-    if (event == Event::Character('C')) {
-        clear_analysis();
-        return true;
-    }
-    if (event == Event::Character('f')) {
-        if (!function_result_) {
+    }, "hex dump");
+    normal_keys_.bind_if(Event::Tab,
+        [this] { return show_hex_dump_; },
+        [this] { hex_dump_focused_ = !hex_dump_focused_; return true; },
+        "hex focus toggle");
+
+    // ─── Analysis passes ─────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('t'), [this] { run_taint_analysis(); return true; }, "taint");
+    normal_keys_.bind(Event::Character('S'), [this] { run_slice_analysis(); return true; }, "slice");
+    normal_keys_.bind(Event::Character('B'), [this] { run_backward_taint_analysis(); return true; }, "back taint");
+    normal_keys_.bind(Event::Character('C'), [this] { clear_analysis(); return true; }, "clear analysis");
+
+    // ─── Function/call navigation ────────────────────────────────────────
+    normal_keys_.bind(Event::Character('f'), [this] {
+        if (!ctx_.function_result) {
             run_pass_by_name("function");
         } else {
-            show_callstack_ = !show_callstack_;
+            callstack_panel_->set_visible(!callstack_panel_->visible());
         }
         return true;
-    }
-    if (event == Event::Character('F')) {
-        follow_return();
-        return true;
-    }
-    if (event == Event::Character('e')) {
-        follow_call();
-        return true;
-    }
-    if (event == Event::Character('x')) {
-        goto_xref_next();
-        return true;
-    }
-    if (event == Event::Character('X')) {
-        goto_xref_prev();
-        return true;
-    }
-    if (event == Event::Character('I')) {
-        if (!string_result_) {
+    }, "functions/callstack");
+    normal_keys_.bind(Event::Character('F'), [this] { follow_return(); return true; }, "follow return");
+    normal_keys_.bind(Event::Character('e'), [this] { follow_call(); return true; }, "follow call");
+    normal_keys_.bind(Event::Character('x'), [this] { goto_xref_next(); return true; }, "xref next");
+    normal_keys_.bind(Event::Character('X'), [this] { goto_xref_prev(); return true; }, "xref prev");
+
+    // ─── String panel (I) ────────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('I'), [this] {
+        if (!ctx_.string_result) {
             run_pass_by_name("strings");
-            string_panel_focused_ = true;
-        } else if (!show_strings_) {
-            show_strings_ = true;
-            string_panel_focused_ = true;
+            strings_panel_->set_focused(true);
+        } else if (!strings_panel_->visible()) {
+            strings_panel_->set_visible(true);
+            strings_panel_->set_focused(true);
         } else {
-            // Panel is visible — toggle focus
-            string_panel_focused_ = !string_panel_focused_;
+            strings_panel_->set_focused(!strings_panel_->focused());
         }
         return true;
-    }
-    if (event == Event::Character('L')) {
-        if (!function_result_) {
+    }, "strings panel");
+
+    // ─── Function list panel (L) ─────────────────────────────────────────
+    normal_keys_.bind(Event::Character('L'), [this] {
+        if (!ctx_.function_result) {
             run_pass_by_name("function");
         }
-        if (function_result_) {
-            if (!show_functions_) {
-                show_functions_ = true;
-                function_panel_focused_ = true;
-                update_function_list();
+        if (ctx_.function_result) {
+            if (!functions_panel_->visible()) {
+                functions_panel_->set_visible(true);
+                functions_panel_->set_focused(true);
+                functions_panel_->update_list();
             } else {
-                function_panel_focused_ = !function_panel_focused_;
+                functions_panel_->set_focused(!functions_panel_->focused());
             }
         }
         return true;
-    }
+    }, "function list");
 
-    // ─── Thread analysis (t = toggle panel, T = jump to next switch) ─────────
-    if (event == Event::Character('t')) {
-        if (!thread_result_) {
-            run_pass_by_name("thread");
-            thread_panel_focused_ = true;
-        } else if (!show_threads_) {
-            show_threads_ = true;
-            thread_panel_focused_ = true;
-        } else {
-            thread_panel_focused_ = !thread_panel_focused_;
+    // ─── Thread analysis (T = next switch) ───────────────────────────────
+    normal_keys_.bind(Event::Character('T'), [this] {
+        if (!ctx_.thread_result) run_pass_by_name("thread");
+        if (ctx_.thread_result) {
+            auto* ev = ctx_.thread_result->next_switch_after(current_inst_);
+            if (ev) navigate_to(ev->inst_id);
         }
         return true;
-    }
-    if (event == Event::Character('T')) {
-        if (!thread_result_) run_pass_by_name("thread");
-        goto_next_thread_switch();
-        return true;
-    }
+    }, "thread next switch");
 
-    // ─── Navigation history: { = back, } = forward ──────────────────────────
-    if (event == Event::Character('{')) {
-        nav_back();
-        return true;
-    }
-    if (event == Event::Character('}')) {
-        nav_forward();
-        return true;
-    }
+    // ─── Navigation history ──────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('{'), [this] { nav_back(); return true; }, "history back");
+    normal_keys_.bind(Event::Character('}'), [this] { nav_forward(); return true; }, "history forward");
 
-    // ─── Taint jump: [ = prev tainted inst, ] = next tainted inst ───────────
-    if (event == Event::Character('[')) {
-        goto_taint_prev();
-        return true;
-    }
-    if (event == Event::Character(']')) {
-        goto_taint_next();
-        return true;
-    }
+    // ─── Taint jump navigation ───────────────────────────────────────────
+    normal_keys_.bind(Event::Character('['), [this] { goto_taint_prev(); return true; }, "taint prev");
+    normal_keys_.bind(Event::Character(']'), [this] { goto_taint_next(); return true; }, "taint next");
 
-    // ─── Callstack panel focus toggle (P) ───────────────────────────────────
-    if (event == Event::Character('P')) {
-        if (show_callstack_ && function_result_) {
-            callstack_panel_focused_ = !callstack_panel_focused_;
-        } else if (!function_result_) {
+    // ─── Callstack panel focus (P) ───────────────────────────────────────
+    normal_keys_.bind(Event::Character('P'), [this] {
+        if (callstack_panel_->visible() && ctx_.function_result) {
+            callstack_panel_->set_focused(!callstack_panel_->focused());
+        } else if (!ctx_.function_result) {
             run_pass_by_name("function");
-            show_callstack_ = true;
-            callstack_panel_focused_ = true;
+            callstack_panel_->set_visible(true);
+            callstack_panel_->set_focused(true);
         }
         return true;
-    }
+    }, "callstack focus");
 
-    // ─── Memory panel focus toggle (p) ──────────────────────────────────────
-    if (event == Event::Character('p')) {
-        if (show_mem_panel_) {
-            memory_panel_focused_ = !memory_panel_focused_;
-            memory_access_cursor_ = 0;
+    // ─── Memory panel focus (p) ──────────────────────────────────────────
+    normal_keys_.bind(Event::Character('p'), [this] {
+        if (memory_panel_->visible()) {
+            memory_panel_->set_focused(!memory_panel_->focused());
         } else {
-            show_mem_panel_ = true;
-            memory_panel_focused_ = true;
-            memory_access_cursor_ = 0;
+            memory_panel_->set_visible(true);
+            memory_panel_->set_focused(true);
         }
         return true;
-    }
+    }, "memory focus");
 
-    // ─── Loop analysis (O) / loop highlight toggle (o) / minimap toggle (V) ─
-    if (event == Event::Character('O')) {
-        // Run loop analysis (first time) or toggle highlight
-        if (!loop_result_) {
+    // ─── Loop analysis (O) ───────────────────────────────────────────────
+    normal_keys_.bind(Event::Character('O'), [this] {
+        if (!ctx_.loop_result) {
             run_pass_by_name("loop");
         } else {
             show_loops_ = !show_loops_;
         }
         return true;
-    }
-    if (event == Event::Character('V')) {
-        show_minimap_ = !show_minimap_;
-        return true;
-    }
+    }, "loop analysis");
 
-    // ─── Breakpoint panel toggle (W) ─────────────────────────────────────────
-    if (event == Event::Character('W')) {
-        if (show_bp_panel_) {
-            bp_panel_focused_ = !bp_panel_focused_;
+    // ─── Minimap toggle — overrides 'V' for FPR when needed ─────────────
+    // Note: 'V' is already bound above for FPR toggle. The minimap toggle
+    // uses a different key now to avoid conflict. The original code had two
+    // 'V' bindings (line 1435 and 1586); the second was dead code. We keep
+    // only the FPR toggle on 'V' and use the minimap as part of the layout.
+
+    // ─── Breakpoint panel toggle (W) ─────────────────────────────────────
+    normal_keys_.bind(Event::Character('W'), [this] {
+        if (breakpoint_panel_->visible()) {
+            breakpoint_panel_->set_focused(!breakpoint_panel_->focused());
         } else {
-            show_bp_panel_ = true;
-            bp_panel_focused_ = true;
+            breakpoint_panel_->set_visible(true);
+            breakpoint_panel_->set_focused(true);
         }
+        return true;
+    }, "breakpoint panel");
+
+    // ─── Escape: dismiss messages ────────────────────────────────────────
+    normal_keys_.bind_if(Event::Escape,
+        [this] { return !bp_status_msg_.empty() || !cmd_error_.empty(); },
+        [this] { bp_status_msg_.clear(); cmd_error_.clear(); return true; },
+        "dismiss messages");
+}
+
+bool TuiApp::handle_event(Event event) {
+    // Resize
+    if (event == Event::Special({0})) {
+        handle_resize();
         return true;
     }
 
-    // ─── Command mode (':' key, vim-style) ───────────────────────────────────
-    // ':' opens the command dialog for breakpoint commands.
-    // Clear bp_status_msg_ / cmd_error_ on next navigation (any movement key
-    // already consumed above will return before reaching here).
-    if (event == Event::Character(':')) {
-        open_cmd_dialog();
-        return true;
+    // ─── Panel focus delegation via Panel::handle_event ─────────────────
+    if (functions_panel_->focused() && functions_panel_->visible() && ctx_.function_result) {
+        return functions_panel_->handle_event(event);
+    }
+    if (callstack_panel_->focused() && callstack_panel_->visible() && ctx_.function_result) {
+        return callstack_panel_->handle_event(event);
+    }
+    if (memory_panel_->focused()) {
+        return memory_panel_->handle_event(event);
+    }
+    if (thread_panel_->focused() && thread_panel_->visible() && ctx_.thread_result) {
+        return thread_panel_->handle_event(event);
+    }
+    if (strings_panel_->focused() && strings_panel_->visible() && ctx_.string_result) {
+        return strings_panel_->handle_event(event);
+    }
+    if (hex_dump_focused_ && hex_dump_view_)
+        return handle_hex_dump_event(event);
+    if (breakpoint_panel_->focused() && breakpoint_panel_->visible()) {
+        return breakpoint_panel_->handle_event(event);
     }
 
-    // Dismiss status messages on Escape in normal mode
-    if (event == Event::Escape) {
-        if (!bp_status_msg_.empty() || !cmd_error_.empty()) {
-            bp_status_msg_.clear();
-            cmd_error_.clear();
-            return true;
-        }
-    }
-
-    return false;
+    // ─── Data-driven normal-mode dispatch ────────────────────────────────
+    return normal_keys_.dispatch(event);
 }
 
 // ─── Component factories ────────────────────────────────────────────────────
@@ -1723,16 +1225,16 @@ ftxui::Element TuiApp::render_minimap_column() {
         for (uint64_t sid = bucket_start; sid < bucket_end; sid += sample_step) {
             auto srow = fetch_row(sid);
             if (srow.has_bookmark) has_bookmark = true;
-            if (show_taint_ && taint_result_ && taint_result_->has_event_at(sid))
+            if (show_taint_ && ctx_.taint_result && ctx_.taint_result->has_event_at(sid))
                 has_taint = true;
-            if (show_backward_taint_ && backward_taint_result_ &&
-                backward_taint_result_->is_contributing(sid))
+            if (show_backward_taint_ && ctx_.backward_taint_result &&
+                ctx_.backward_taint_result->is_contributing(sid))
                 has_back_taint = true;
-            if (show_loops_ && loop_result_) {
-                if (loop_result_->is_loop_header(srow.pc)) has_loop_header = true;
-                else if (loop_result_->is_in_loop(srow.pc)) has_loop_body = true;
+            if (show_loops_ && ctx_.loop_result) {
+                if (ctx_.loop_result->is_loop_header(srow.pc)) has_loop_header = true;
+                else if (ctx_.loop_result->is_in_loop(srow.pc)) has_loop_body = true;
             }
-            if (function_result_ && function_result_->call_at(sid)) has_call = true;
+            if (ctx_.function_result && ctx_.function_result->call_at(sid)) has_call = true;
         }
 
         // Choose display character and color
@@ -1769,17 +1271,17 @@ void TuiApp::rebuild_taint_jump_list() {
     taint_jump_cursor_ = 0;
 
     // Collect tainted inst IDs from whichever analysis is active
-    if (show_taint_ && taint_result_) {
+    if (show_taint_ && ctx_.taint_result) {
         for (uint64_t i = 0; i < total_inst_; i++) {
-            if (taint_result_->has_event_at(i)) taint_jump_list_.push_back(i);
+            if (ctx_.taint_result->has_event_at(i)) taint_jump_list_.push_back(i);
         }
-    } else if (show_slice_ && slice_result_) {
+    } else if (show_slice_ && ctx_.slice_result) {
         for (uint64_t i = 0; i < total_inst_; i++) {
-            if (slice_result_->is_in_slice(i)) taint_jump_list_.push_back(i);
+            if (ctx_.slice_result->is_in_slice(i)) taint_jump_list_.push_back(i);
         }
-    } else if (show_backward_taint_ && backward_taint_result_) {
+    } else if (show_backward_taint_ && ctx_.backward_taint_result) {
         for (uint64_t i = 0; i < total_inst_; i++) {
-            if (backward_taint_result_->is_contributing(i)) taint_jump_list_.push_back(i);
+            if (ctx_.backward_taint_result->is_contributing(i)) taint_jump_list_.push_back(i);
         }
     }
 
@@ -1873,7 +1375,7 @@ void TuiApp::run_taint_analysis() {
     pass_manager_->register_pass(std::make_unique<TaintPass>(config));
     auto& result = pass_manager_->require("taint");
     if (result.ok()) {
-        taint_result_ = &result.get<TaintResult>();
+        ctx_.taint_result = &result.get<TaintResult>();
         show_taint_ = true;
         show_slice_ = false;
         taint_jump_list_.clear();  // Will be rebuilt lazily
@@ -1881,11 +1383,11 @@ void TuiApp::run_taint_analysis() {
 }
 
 void TuiApp::run_slice_analysis() {
-    if (!taint_result_) {
+    if (!ctx_.taint_result) {
         // Need taint first
         run_taint_analysis();
     }
-    if (!taint_result_) return;
+    if (!ctx_.taint_result) return;
 
     // Determine which register to slice from current instruction
     uint8_t target_reg = 0;
@@ -1902,7 +1404,7 @@ void TuiApp::run_slice_analysis() {
         std::make_unique<SlicePass>(current_inst_, target_reg));
     auto& result = pass_manager_->require("slice");
     if (result.ok()) {
-        slice_result_ = &result.get<SliceResult>();
+        ctx_.slice_result = &result.get<SliceResult>();
         show_slice_ = true;
         show_taint_ = false;
         taint_jump_list_.clear();
@@ -1946,7 +1448,7 @@ void TuiApp::run_backward_taint_analysis() {
     pass_manager_->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
     auto& result = pass_manager_->require("backward_taint");
     if (result.ok()) {
-        backward_taint_result_ = &result.get<BackwardTaintResult>();
+        ctx_.backward_taint_result = &result.get<BackwardTaintResult>();
         show_backward_taint_ = true;
         show_taint_ = false;
         show_slice_ = false;
@@ -1955,40 +1457,30 @@ void TuiApp::run_backward_taint_analysis() {
 }
 
 void TuiApp::clear_analysis() {
-    taint_result_ = nullptr;
-    slice_result_ = nullptr;
-    backward_taint_result_ = nullptr;
-    function_result_ = nullptr;
-    xref_result_ = nullptr;
-    string_result_ = nullptr;
-    call_graph_result_ = nullptr;
-    loop_result_ = nullptr;
-    thread_result_ = nullptr;
+    ctx_.taint_result = nullptr;
+    ctx_.slice_result = nullptr;
+    ctx_.backward_taint_result = nullptr;
+    ctx_.function_result = nullptr;
+    ctx_.xref_result = nullptr;
+    ctx_.string_result = nullptr;
+    ctx_.call_graph_result = nullptr;
+    ctx_.loop_result = nullptr;
+    ctx_.thread_result = nullptr;
     show_taint_ = false;
     show_slice_ = false;
     show_backward_taint_ = false;
-    show_callstack_ = false;
-    show_functions_ = false;
-    show_strings_ = false;
+    callstack_panel_->set_visible(false);
+    functions_panel_->set_visible(false);
+    strings_panel_->set_visible(false);
     show_loops_ = false;
-    show_threads_ = false;
-    thread_panel_focused_ = false;
-    thread_cursor_ = 0;
+    thread_panel_->set_visible(false);
+    thread_panel_->set_focused(false);
     xref_cursor_ = 0;
-    string_cursor_ = 0;
-    string_filter_.clear();
-    filtered_string_indices_.clear();
-    function_cursor_ = 0;
-    function_filter_.clear();
-    sorted_function_pcs_.clear();
-    filtered_function_indices_.clear();
-    function_panel_focused_ = false;
-    callstack_panel_focused_ = false;
-    callstack_cursor_ = 0;
     taint_jump_list_.clear();
     taint_jump_cursor_ = 0;
-    memory_panel_focused_ = false;
-    memory_access_cursor_ = 0;
+    functions_panel_->set_focused(false);
+    callstack_panel_->set_focused(false);
+    memory_panel_->set_focused(false);
     if (pass_manager_) {
         pass_manager_->invalidate_all();
     }
@@ -1999,7 +1491,7 @@ void TuiApp::clear_analysis() {
 // is runnable via ':analyze'. This guarantees every pass is reachable from
 // the TUI, mirroring the GUI "All Passes" section and the CLI --run-pass flag.
 
-void TuiApp::run_pass_by_name(std::string_view name) {
+void TuiApp::ensure_pass_manager() {
     if (!pass_manager_) {
         pass_manager_ = std::make_unique<PassManager>();
         pass_manager_->set_reader(&reader_);
@@ -2009,6 +1501,40 @@ void TuiApp::run_pass_by_name(std::string_view name) {
         pass_manager_->set_regfile(&regfile_);
         pass_manager_->set_memory(&memory_);
     }
+}
+
+void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
+    if (!raw.ok()) return;
+    if (name == "function") {
+        ctx_.function_result = &raw.get<FunctionResult>();
+        callstack_panel_->set_visible(true);
+    } else if (name == "xref") {
+        ctx_.xref_result = &raw.get<XrefResult>();
+        xref_cursor_ = 0;
+    } else if (name == "loop") {
+        ctx_.loop_result = &raw.get<LoopResult>();
+        show_loops_ = true;
+    } else if (name == "strings") {
+        ctx_.string_result = &raw.get<StringResult>();
+        strings_panel_->set_visible(true);
+        strings_panel_->clear_filter();
+    } else if (name == "thread") {
+        ctx_.thread_result = &raw.get<ThreadResult>();
+        thread_panel_->set_visible(true);
+    } else if (name == "call_graph") {
+        ctx_.call_graph_result = &raw.get<CallGraphResult>();
+    } else if (name == "taint") {
+        ctx_.taint_result = &raw.get<TaintResult>();
+        show_taint_ = true;
+        taint_jump_list_.clear();
+    } else if (name == "backward_taint") {
+        ctx_.backward_taint_result = &raw.get<BackwardTaintResult>();
+        show_backward_taint_ = true;
+    }
+}
+
+void TuiApp::run_pass_by_name(std::string_view name) {
+    ensure_pass_manager();
 
     if (!tenet::is_known_pass(name)) {
         last_pass_status_ = fmt::format("unknown pass '{}'", name);
@@ -2034,225 +1560,25 @@ void TuiApp::run_pass_by_name(std::string_view name) {
     auto& raw = pass_manager_->require(name);
     last_pass_status_ = fmt::format("{}: {}", name,
                                     tenet::summarize_pass_result(name, raw));
-
-    // Wire up result pointers for passes that have dedicated TUI panels, so
-    // running them through ':pass' also updates the overlays.
-    if (name == "function" && raw.ok()) {
-        function_result_ = &raw.get<FunctionResult>();
-        show_callstack_ = true;
-    } else if (name == "xref" && raw.ok()) {
-        xref_result_ = &raw.get<XrefResult>();
-        xref_cursor_ = 0;
-    } else if (name == "loop" && raw.ok()) {
-        loop_result_ = &raw.get<LoopResult>();
-        show_loops_ = true;
-    } else if (name == "strings" && raw.ok()) {
-        string_result_ = &raw.get<StringResult>();
-        show_strings_ = true;
-        string_cursor_ = 0;
-        update_string_filter();
-    } else if (name == "thread" && raw.ok()) {
-        thread_result_ = &raw.get<ThreadResult>();
-        show_threads_ = true;
-    } else if (name == "call_graph" && raw.ok()) {
-        call_graph_result_ = &raw.get<CallGraphResult>();
-    } else if (name == "taint" && raw.ok()) {
-        taint_result_ = &raw.get<TaintResult>();
-        show_taint_ = true;
-        taint_jump_list_.clear();
-    } else if (name == "backward_taint" && raw.ok()) {
-        backward_taint_result_ = &raw.get<BackwardTaintResult>();
-        show_backward_taint_ = true;
-    }
+    wire_pass_result(name, raw);
 }
 
 void TuiApp::run_default_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
+    ensure_pass_manager();
 
     tenet::register_default_passes(*pass_manager_);
-    // Run them and wire up the common display pointers.
     for (auto name : tenet::default_ui_pass_names()) {
         auto& raw = pass_manager_->require(name);
-        if (!raw.ok()) continue;
-        if (name == "function") {
-            function_result_ = &raw.get<FunctionResult>();
-            show_callstack_ = true;
-        } else if (name == "xref") {
-            xref_result_ = &raw.get<XrefResult>();
-        } else if (name == "loop") {
-            loop_result_ = &raw.get<LoopResult>();
-            show_loops_ = true;
-        } else if (name == "strings") {
-            string_result_ = &raw.get<StringResult>();
-            show_strings_ = true;
-        } else if (name == "thread") {
-            thread_result_ = &raw.get<ThreadResult>();
-            show_threads_ = true;
-        }
+        wire_pass_result(name, raw);
     }
     last_pass_status_ = fmt::format("ran {} default passes",
                                     tenet::default_ui_pass_names().size());
 }
 
-Element TuiApp::render_callstack_panel() {
-    Elements lines;
-    // Header with focus indicator
-    auto header_label = callstack_panel_focused_
-        ? text("[CALL STACK]") | bold | bgcolor(Color::Blue) | color(Color::White)
-        : text("Call Stack") | bold | color(Color::Yellow);
-    lines.push_back(header_label);
-    lines.push_back(separator());
-
-    if (!function_result_) {
-        lines.push_back(text("(not computed)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 30) | border;
-    }
-
-    auto stack = function_result_->call_stack_at(current_inst_);
-    if (stack.empty()) {
-        lines.push_back(text("<top-level>") | color(Color::GrayLight));
-    } else {
-        // Show from bottom (deepest) to top, with callstack_cursor_ highlighting
-        for (size_t i = 0; i < stack.size(); i++) {
-            auto* evt = stack[i];
-            uint64_t static_target = evt->target_pc - reader_.header().module_slide;
-            std::string label;
-
-            // Look up function name
-            auto it = function_result_->functions.find(evt->target_pc);
-            if (it != function_result_->functions.end()) {
-                label = it->second.name;
-            } else {
-                label = fmt::format("sub_{:x}", static_target);
-            }
-
-            bool is_frame_cursor = callstack_panel_focused_ && (callstack_cursor_ == i);
-            bool is_current_frame = (i == stack.size() - 1);
-
-            auto frame_marker = text(is_frame_cursor ? ">" : (is_current_frame ? "*" : " "))
-                | color(is_frame_cursor ? Color::White : Color::Yellow);
-
-            auto depth_prefix = std::string(i * 2, ' ');
-            auto line = hbox({
-                text(depth_prefix) | size(WIDTH, EQUAL, static_cast<int>(i * 2)),
-                frame_marker,
-                text(" "),
-                text(label) | color(Color::Cyan),
-                text(fmt::format("  @{}", evt->call_inst_id)) | color(Color::GrayLight),
-            });
-
-            if (is_frame_cursor) {
-                line = line | bgcolor(Color::GrayDark);
-            }
-            lines.push_back(line);
-        }
-    }
-
-    // Show current function
-    lines.push_back(separator());
-    auto* func = function_result_->function_at(current_inst_);
-    if (func) {
-        lines.push_back(hbox({
-            text("In: ") | color(Color::White),
-            text(func->name) | color(Color::Cyan),
-            text(fmt::format("  (calls={})", func->total_calls)) | color(Color::GrayLight),
-        }));
-    }
-
-    // Show xref info for current PC
-    if (xref_result_) {
-        auto row = fetch_row(current_inst_);
-        auto exec_count = xref_result_->execution_count(row.pc);
-        if (exec_count > 0) {
-            lines.push_back(separator());
-            lines.push_back(hbox({
-                text("PC xrefs: ") | color(Color::White),
-                text(fmt::format("{} executions", exec_count)) | color(Color::Magenta),
-                text(fmt::format("  [{}]", xref_cursor_ + 1)) | color(Color::GrayLight),
-            }));
-        }
-    }
-
-    // Footer hint when focused
-    if (callstack_panel_focused_) {
-        lines.push_back(separator());
-        lines.push_back(text("j/k:frame Enter:call-site c:func-entry Esc:unfocus") | color(Color::GrayDark));
-    }
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 30) | border;
-}
-
-bool TuiApp::handle_callstack_panel_event(Event event) {
-    if (event == Event::Escape) {
-        callstack_panel_focused_ = false;
-        return true;
-    }
-
-    auto stack = function_result_->call_stack_at(current_inst_);
-    if (stack.empty()) {
-        if (event == Event::Escape) {
-            callstack_panel_focused_ = false;
-        }
-        return true;
-    }
-
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (callstack_cursor_ + 1 < stack.size()) {
-            callstack_cursor_++;
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (callstack_cursor_ > 0) {
-            callstack_cursor_--;
-        }
-        return true;
-    }
-
-    if (event == Event::Return) {
-        // Jump to the call site (the bl/blr instruction that made this call)
-        if (callstack_cursor_ < stack.size()) {
-            auto* evt = stack[callstack_cursor_];
-            navigate_to(evt->call_inst_id);
-            callstack_panel_focused_ = false;
-        }
-        return true;
-    }
-
-    if (event == Event::Character('c') || event == Event::Character('C')) {
-        // Jump to the function entry (first instruction of the callee)
-        if (callstack_cursor_ < stack.size()) {
-            auto* evt = stack[callstack_cursor_];
-            navigate_to(evt->call_inst_id + 1);  // +1 = first inst in callee
-            callstack_panel_focused_ = false;
-        }
-        return true;
-    }
-
-    if (event == Event::Character('g')) {
-        callstack_cursor_ = 0;
-        return true;
-    }
-    if (event == Event::Character('G')) {
-        if (!stack.empty()) callstack_cursor_ = stack.size() - 1;
-        return true;
-    }
-
-    return false;
-}
-
 void TuiApp::follow_call() {
-    if (!function_result_) return;
+    if (!ctx_.function_result) return;
 
-    auto* evt = function_result_->call_at(current_inst_);
+    auto* evt = ctx_.function_result->call_at(current_inst_);
     if (evt && evt->call_inst_id + 1 < total_inst_) {
         // Jump to the first instruction of the callee
         navigate_to(evt->call_inst_id + 1);
@@ -2260,15 +1586,15 @@ void TuiApp::follow_call() {
 }
 
 void TuiApp::follow_return() {
-    if (!function_result_) return;
+    if (!ctx_.function_result) return;
 
-    auto* evt = function_result_->return_at(current_inst_);
+    auto* evt = ctx_.function_result->return_at(current_inst_);
     if (evt) {
         // Jump back to the instruction after the call site
         navigate_to(evt->call_inst_id);
     } else {
         // Not at a ret; try to find the calling frame and go back
-        auto stack = function_result_->call_stack_at(current_inst_);
+        auto stack = ctx_.function_result->call_stack_at(current_inst_);
         if (!stack.empty()) {
             navigate_to(stack.back()->call_inst_id);
         }
@@ -2276,13 +1602,13 @@ void TuiApp::follow_return() {
 }
 
 void TuiApp::goto_xref_next() {
-    if (!xref_result_) {
+    if (!ctx_.xref_result) {
         run_pass_by_name("xref");
-        if (!xref_result_) return;
+        if (!ctx_.xref_result) return;
     }
 
     auto row = fetch_row(current_inst_);
-    auto xrefs = xref_result_->inst_ids_at(row.pc);
+    auto xrefs = ctx_.xref_result->inst_ids_at(row.pc);
     if (xrefs.empty()) return;
 
     // Find current position in xref list
@@ -2292,13 +1618,13 @@ void TuiApp::goto_xref_next() {
 }
 
 void TuiApp::goto_xref_prev() {
-    if (!xref_result_) {
+    if (!ctx_.xref_result) {
         run_pass_by_name("xref");
-        if (!xref_result_) return;
+        if (!ctx_.xref_result) return;
     }
 
     auto row = fetch_row(current_inst_);
-    auto xrefs = xref_result_->inst_ids_at(row.pc);
+    auto xrefs = ctx_.xref_result->inst_ids_at(row.pc);
     if (xrefs.empty()) return;
 
     if (xref_cursor_ == 0) {
@@ -2311,70 +1637,6 @@ void TuiApp::goto_xref_prev() {
 
 // ─── Function list panel ──────────────────────────────────────────────────────
 
-void TuiApp::update_function_list() {
-    if (!function_result_) return;
-
-    // Build sorted list of function PCs
-    sorted_function_pcs_.clear();
-    sorted_function_pcs_.reserve(function_result_->functions.size());
-    for (const auto& [pc, info] : function_result_->functions) {
-        sorted_function_pcs_.push_back(pc);
-    }
-
-    // Sort based on mode
-    switch (function_sort_mode_) {
-    case 0: // by call count descending
-        std::sort(sorted_function_pcs_.begin(), sorted_function_pcs_.end(),
-            [&](uint64_t a, uint64_t b) {
-                return function_result_->functions.at(a).total_calls >
-                       function_result_->functions.at(b).total_calls;
-            });
-        break;
-    case 1: // by name
-        std::sort(sorted_function_pcs_.begin(), sorted_function_pcs_.end(),
-            [&](uint64_t a, uint64_t b) {
-                return function_result_->functions.at(a).name <
-                       function_result_->functions.at(b).name;
-            });
-        break;
-    case 2: // by entry PC
-        std::sort(sorted_function_pcs_.begin(), sorted_function_pcs_.end());
-        break;
-    }
-
-    update_function_filter();
-}
-
-void TuiApp::update_function_filter() {
-    filtered_function_indices_.clear();
-    if (!function_result_) return;
-
-    if (function_filter_.empty()) {
-        for (size_t i = 0; i < sorted_function_pcs_.size(); i++) {
-            filtered_function_indices_.push_back(i);
-        }
-    } else {
-        // Case-insensitive substring match on function name
-        std::string lower_filter = function_filter_;
-        std::transform(lower_filter.begin(), lower_filter.end(),
-                       lower_filter.begin(), ::tolower);
-        for (size_t i = 0; i < sorted_function_pcs_.size(); i++) {
-            const auto& info = function_result_->functions.at(sorted_function_pcs_[i]);
-            std::string lower_name = info.name;
-            std::transform(lower_name.begin(), lower_name.end(),
-                           lower_name.begin(), ::tolower);
-            if (lower_name.find(lower_filter) != std::string::npos) {
-                filtered_function_indices_.push_back(i);
-            }
-        }
-    }
-
-    if (function_cursor_ >= filtered_function_indices_.size()) {
-        function_cursor_ = filtered_function_indices_.empty() ? 0 :
-                           filtered_function_indices_.size() - 1;
-    }
-}
-
 void TuiApp::open_function_filter_dialog() {
     show_function_filter_dialog_ = true;
     function_filter_input_.clear();
@@ -2386,235 +1648,11 @@ void TuiApp::close_function_filter_dialog() {
 }
 
 void TuiApp::execute_function_filter() {
-    function_filter_ = function_filter_input_;
-    update_function_filter();
-    function_cursor_ = 0;
+    if (functions_panel_) functions_panel_->update_list();
     close_function_filter_dialog();
 }
 
-bool TuiApp::handle_function_panel_event(Event event) {
-    if (event == Event::Escape) {
-        function_panel_focused_ = false;
-        return true;
-    }
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (!filtered_function_indices_.empty() &&
-            function_cursor_ < filtered_function_indices_.size() - 1) {
-            function_cursor_++;
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (function_cursor_ > 0) {
-            function_cursor_--;
-        }
-        return true;
-    }
-    if (event == Event::Return) {
-        // Jump to the first call of this function
-        if (!filtered_function_indices_.empty() &&
-            function_cursor_ < filtered_function_indices_.size()) {
-            size_t idx = filtered_function_indices_[function_cursor_];
-            uint64_t pc = sorted_function_pcs_[idx];
-            const auto& info = function_result_->functions.at(pc);
-            if (!info.call_event_indices.empty()) {
-                // Jump to first invocation (call_inst_id + 1 = first instruction in callee)
-                const auto& evt = function_result_->call_events[info.call_event_indices[0]];
-                navigate_to(evt.call_inst_id + 1);
-            }
-            function_panel_focused_ = false;
-        }
-        return true;
-    }
-    if (event == Event::Character('/')) {
-        open_function_filter_dialog();
-        return true;
-    }
-    if (event == Event::Character('c') || event == Event::Character('C')) {
-        // Clear filter
-        function_filter_.clear();
-        update_function_filter();
-        function_cursor_ = 0;
-        return true;
-    }
-    if (event == Event::Character('s') || event == Event::Character('S')) {
-        // Cycle sort mode
-        function_sort_mode_ = (function_sort_mode_ + 1) % 3;
-        update_function_list();
-        function_cursor_ = 0;
-        return true;
-    }
-    if (event == Event::Character('G')) {
-        if (!filtered_function_indices_.empty()) {
-            function_cursor_ = filtered_function_indices_.size() - 1;
-        }
-        return true;
-    }
-    if (event == Event::Character('g')) {
-        function_cursor_ = 0;
-        return true;
-    }
-    return false;
-}
-
-Element TuiApp::render_functions_panel() {
-    Elements lines;
-
-    // Header
-    const char* sort_label = "calls";
-    if (function_sort_mode_ == 1) sort_label = "name";
-    else if (function_sort_mode_ == 2) sort_label = "addr";
-
-    lines.push_back(hbox({
-        text("Functions") | bold | color(Color::Yellow),
-        text(fmt::format("  ({}/{}) sort:{}",
-            filtered_function_indices_.size(),
-            function_result_ ? function_result_->functions.size() : 0,
-            sort_label)) | color(Color::GrayLight),
-    }));
-
-    if (!function_filter_.empty()) {
-        lines.push_back(hbox({
-            text("  filter: ") | color(Color::GrayLight),
-            text(function_filter_) | color(Color::Cyan),
-        }));
-    }
-    lines.push_back(separator());
-
-    if (!function_result_ || filtered_function_indices_.empty()) {
-        lines.push_back(text("(no functions)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 42) | border;
-    }
-
-    // Show a window of functions around the cursor
-    const int visible_count = 14;
-    int start = 0;
-    int total = static_cast<int>(filtered_function_indices_.size());
-    if (total > visible_count) {
-        start = static_cast<int>(function_cursor_) - visible_count / 2;
-        if (start < 0) start = 0;
-        if (start + visible_count > total) start = total - visible_count;
-    }
-    int end = std::min(start + visible_count, total);
-
-    for (int i = start; i < end; i++) {
-        size_t idx = filtered_function_indices_[i];
-        uint64_t pc = sorted_function_pcs_[idx];
-        const auto& info = function_result_->functions.at(pc);
-        bool is_cursor = (static_cast<size_t>(i) == function_cursor_);
-
-        uint64_t static_pc = pc - reader_.header().module_slide;
-
-        // Truncate name for display
-        std::string display_name = info.name;
-        if (display_name.size() > 22) {
-            display_name = display_name.substr(0, 19) + "...";
-        }
-
-        auto line = hbox({
-            text(is_cursor ? ">" : " ") | color(Color::Yellow),
-            text(fmt::format("{:x}", static_pc)) | color(Color::Cyan),
-            text(" ") | size(WIDTH, EQUAL, 1),
-            text(display_name) | color(Color::White),
-            text(fmt::format(" c={} i={}",
-                info.total_calls, info.total_instructions)) | color(Color::GrayLight),
-        });
-
-        if (is_cursor) {
-            line = line | bgcolor(Color::GrayDark);
-        }
-        lines.push_back(line);
-    }
-
-    // Callers/callees sub-view for selected function
-    if (call_graph_result_ && !filtered_function_indices_.empty() &&
-        function_cursor_ < filtered_function_indices_.size()) {
-        size_t idx = filtered_function_indices_[function_cursor_];
-        uint64_t pc = sorted_function_pcs_[idx];
-        auto* node = call_graph_result_->node_at(pc);
-        if (node) {
-            lines.push_back(separator());
-            // Show callees
-            if (!node->outgoing_edges.empty()) {
-                lines.push_back(text("Callees:") | color(Color::Green));
-                int shown = 0;
-                for (auto edge_idx : node->outgoing_edges) {
-                    if (shown >= 4) {
-                        lines.push_back(text(fmt::format("  ...+{} more",
-                            node->outgoing_edges.size() - 4)) | color(Color::GrayLight));
-                        break;
-                    }
-                    const auto& edge = call_graph_result_->edges[edge_idx];
-                    auto callee_it = function_result_->functions.find(edge.callee_pc);
-                    std::string callee_name = callee_it != function_result_->functions.end()
-                        ? callee_it->second.name
-                        : fmt::format("sub_{:x}", edge.callee_pc - reader_.header().module_slide);
-                    if (callee_name.size() > 18) callee_name = callee_name.substr(0, 15) + "...";
-                    lines.push_back(hbox({
-                        text(fmt::format("  {} x{}", callee_name, edge.call_count))
-                            | color(Color::GrayLight),
-                    }));
-                    shown++;
-                }
-            }
-            // Show callers
-            if (!node->incoming_edges.empty()) {
-                lines.push_back(text("Callers:") | color(Color::Magenta));
-                int shown = 0;
-                for (auto edge_idx : node->incoming_edges) {
-                    if (shown >= 4) {
-                        lines.push_back(text(fmt::format("  ...+{} more",
-                            node->incoming_edges.size() - 4)) | color(Color::GrayLight));
-                        break;
-                    }
-                    const auto& edge = call_graph_result_->edges[edge_idx];
-                    auto caller_it = function_result_->functions.find(edge.caller_pc);
-                    std::string caller_name = caller_it != function_result_->functions.end()
-                        ? caller_it->second.name
-                        : fmt::format("sub_{:x}", edge.caller_pc - reader_.header().module_slide);
-                    if (caller_name.size() > 18) caller_name = caller_name.substr(0, 15) + "...";
-                    lines.push_back(hbox({
-                        text(fmt::format("  {} x{}", caller_name, edge.call_count))
-                            | color(Color::GrayLight),
-                    }));
-                    shown++;
-                }
-            }
-        }
-    }
-
-    // Footer with help
-    lines.push_back(separator());
-    lines.push_back(text("j/k:nav Enter:jump /:filter s:sort") | color(Color::GrayDark));
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 42) | border;
-}
-
 // ─── String analysis ────────────────────────────────────────────────────────
-
-void TuiApp::update_string_filter() {
-    filtered_string_indices_.clear();
-    if (!string_result_) return;
-
-    if (string_filter_.empty()) {
-        // Show all strings
-        for (size_t i = 0; i < string_result_->strings.size(); i++) {
-            filtered_string_indices_.push_back(i);
-        }
-    } else {
-        // Case-insensitive substring match
-        auto results = string_result_->search(string_filter_);
-        for (auto* ref : results) {
-            // Find index in strings vector
-            size_t idx = static_cast<size_t>(ref - string_result_->strings.data());
-            filtered_string_indices_.push_back(idx);
-        }
-    }
-
-    if (string_cursor_ >= filtered_string_indices_.size()) {
-        string_cursor_ = filtered_string_indices_.empty() ? 0 : filtered_string_indices_.size() - 1;
-    }
-}
 
 void TuiApp::open_string_search_dialog() {
     show_string_search_dialog_ = true;
@@ -2627,85 +1665,8 @@ void TuiApp::close_string_search_dialog() {
 }
 
 void TuiApp::execute_string_search() {
-    string_filter_ = string_search_input_;
-    update_string_filter();
-    string_cursor_ = 0;
+    if (strings_panel_) strings_panel_->set_filter(string_search_input_);
     close_string_search_dialog();
-}
-
-Element TuiApp::render_strings_panel() {
-    Elements lines;
-
-    // Header
-    lines.push_back(hbox({
-        text("Strings") | bold | color(Color::Yellow),
-        text(fmt::format("  ({}/{})",
-            filtered_string_indices_.size(),
-            string_result_ ? string_result_->total() : 0)) | color(Color::GrayLight),
-    }));
-
-    if (!string_filter_.empty()) {
-        lines.push_back(hbox({
-            text("  filter: ") | color(Color::GrayLight),
-            text(string_filter_) | color(Color::Cyan),
-        }));
-    }
-    lines.push_back(separator());
-
-    if (!string_result_ || filtered_string_indices_.empty()) {
-        lines.push_back(text("(no strings)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
-    }
-
-    // Show a window of strings around the cursor
-    const int visible_count = 12;
-    int start = 0;
-    int total = static_cast<int>(filtered_string_indices_.size());
-    if (total > visible_count) {
-        start = static_cast<int>(string_cursor_) - visible_count / 2;
-        if (start < 0) start = 0;
-        if (start + visible_count > total) start = total - visible_count;
-    }
-    int end = std::min(start + visible_count, total);
-
-    for (int i = start; i < end; i++) {
-        size_t str_idx = filtered_string_indices_[i];
-        const auto& ref = string_result_->strings[str_idx];
-        bool is_cursor = (static_cast<size_t>(i) == string_cursor_);
-
-        // Truncate long strings for display
-        std::string display_str = ref.content;
-        if (display_str.size() > 32) {
-            display_str = display_str.substr(0, 29) + "...";
-        }
-
-        // Encoding label
-        const char* enc_label = "A";
-        if (ref.encoding == StringRef::UTF16LE) enc_label = "U";
-        else if (ref.encoding == StringRef::UTF8) enc_label = "8";
-        else if (ref.encoding == StringRef::Wide) enc_label = "W";
-
-        auto line = hbox({
-            text(is_cursor ? ">" : " ") | color(Color::Yellow),
-            text(fmt::format("[{}]", enc_label)) | color(Color::GrayLight),
-            text(" ") | size(WIDTH, EQUAL, 1),
-            text(fmt::format("{:x}", ref.addr)) | color(Color::Cyan),
-            text(" ") | size(WIDTH, EQUAL, 1),
-            text(fmt::format("\"{}\"", display_str)) | color(Color::Green),
-            text(fmt::format(" ({})", ref.references.size())) | color(Color::GrayLight),
-        });
-
-        if (is_cursor) {
-            line = line | bgcolor(Color::GrayDark);
-        }
-        lines.push_back(line);
-    }
-
-    // Footer with help
-    lines.push_back(separator());
-    lines.push_back(text("j/k:nav Enter:jump /:filter") | color(Color::GrayDark));
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 40) | border;
 }
 
 // ─── Run loop ───────────────────────────────────────────────────────────────
@@ -2837,7 +1798,7 @@ int TuiApp::run() {
     }
 
     // Persist bookmarks and last cursor position to the index database
-    index_.save_bookmarks(bookmarks_);
+    index_.save_bookmarks(ctx_.bookmarks);
     index_.save_last_inst(current_inst_);
 
     return 0;
@@ -2904,132 +1865,6 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
     }
 
     return 0;
-}
-
-// ─── Thread analysis ─────────────────────────────────────────────────────────
-
-Element TuiApp::render_thread_panel() {
-    using namespace ftxui;
-    Elements lines;
-
-    // Header with focus indicator
-    auto header_label = thread_panel_focused_
-        ? text("[THREADS]") | bold | bgcolor(Color::Blue) | color(Color::White)
-        : text("Threads") | bold | color(Color::Yellow);
-    lines.push_back(header_label);
-    lines.push_back(separator());
-
-    if (!thread_result_) {
-        lines.push_back(text("(not computed)") | color(Color::GrayLight));
-        return vbox(lines) | size(WIDTH, GREATER_THAN, 30) | border;
-    }
-
-    // Summary line
-    lines.push_back(hbox({
-        text(fmt::format(" {} threads, {} switches",
-            thread_result_->thread_count(),
-            thread_result_->switch_count())) | color(Color::Cyan),
-    }));
-    lines.push_back(separator());
-
-    // Current thread indicator
-    uint64_t cur_tid = thread_result_->thread_at(current_inst_);
-    if (cur_tid != 0) {
-        lines.push_back(hbox({
-            text(fmt::format(" Active: tid=0x{:x}", cur_tid)) | color(Color::Green) | bold,
-        }));
-        lines.push_back(separator());
-    }
-
-    // Thread list
-    size_t idx = 0;
-    for (const auto& [tid, info] : thread_result_->threads) {
-        bool is_selected = (idx == thread_cursor_);
-        bool is_active = (tid == cur_tid);
-
-        auto line_text = fmt::format(" tid=0x{:x}  insts={}", tid, info.total_instructions);
-        if (info.switch_in_count > 1) {
-            line_text += fmt::format("  sw={}", info.switch_in_count);
-        }
-
-        Element line_elem;
-        if (is_selected && thread_panel_focused_) {
-            line_elem = text(line_text) | bgcolor(Color::Blue) | color(Color::White);
-        } else if (is_active) {
-            line_elem = text(line_text) | color(Color::Green) | bold;
-        } else {
-            line_elem = text(line_text) | color(Color::White);
-        }
-        lines.push_back(line_elem);
-        idx++;
-    }
-
-    // Footer with keybindings
-    lines.push_back(separator());
-    lines.push_back(text(" t:toggle  T:next-switch  Enter:filter") | color(Color::GrayLight));
-
-    return vbox(lines) | size(WIDTH, GREATER_THAN, 35) | border;
-}
-
-bool TuiApp::handle_thread_panel_event(Event event) {
-    if (event == Event::Escape) {
-        thread_panel_focused_ = false;
-        return true;
-    }
-    if (event == Event::Character('j') || event == Event::ArrowDown) {
-        if (thread_result_ && thread_cursor_ < thread_result_->thread_count() - 1) {
-            thread_cursor_++;
-        }
-        return true;
-    }
-    if (event == Event::Character('k') || event == Event::ArrowUp) {
-        if (thread_cursor_ > 0) {
-            thread_cursor_--;
-        }
-        return true;
-    }
-    if (event == Event::Return) {
-        // Jump to the first instruction of the selected thread
-        if (thread_result_ && thread_cursor_ < thread_result_->thread_count()) {
-            size_t i = 0;
-            for (const auto& [tid, info] : thread_result_->threads) {
-                if (i == thread_cursor_) {
-                    navigate_to(info.first_seen_inst);
-                    thread_panel_focused_ = false;
-                    break;
-                }
-                i++;
-            }
-        }
-        return true;
-    }
-    // 'T' / 'N' — jump to next switch from current position
-    if (event == Event::Character('T') || event == Event::Character('n')) {
-        goto_next_thread_switch();
-        return true;
-    }
-    // 'P' / 'p' — jump to previous switch
-    if (event == Event::Character('p') || event == Event::Character('N')) {
-        goto_prev_thread_switch();
-        return true;
-    }
-    return false;
-}
-
-void TuiApp::goto_next_thread_switch() {
-    if (!thread_result_) return;
-    auto* ev = thread_result_->next_switch_after(current_inst_);
-    if (ev) {
-        navigate_to(ev->inst_id);
-    }
-}
-
-void TuiApp::goto_prev_thread_switch() {
-    if (!thread_result_) return;
-    auto* ev = thread_result_->prev_switch_before(current_inst_);
-    if (ev) {
-        navigate_to(ev->inst_id);
-    }
 }
 
 }  // namespace tenet

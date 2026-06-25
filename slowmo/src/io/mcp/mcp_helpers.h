@@ -3,16 +3,31 @@
 // Shared helper functions and constants for MCP tool implementations.
 // This is an internal header — only included by mcp_tools_*.cpp files.
 
+#include "analysis/pass_manager.h"
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/pattern_pass.h"
 
 #include <fmt/core.h>
 
 #include <string>
+#include <string_view>
 #include <cstdint>
 #include <stdexcept>
 
 namespace tenet {
+
+// ─── Helper: require a pass and return its typed result ───────────────────
+// Throws std::runtime_error if PassManager is null or the pass fails.
+
+template<typename ResultT>
+inline const ResultT& require_pass(PassManager* pm, std::string_view pass_name,
+                                    std::string_view error_prefix) {
+    if (!pm) throw std::runtime_error("PassManager not available");
+    const auto& raw = pm->require(pass_name);
+    if (!raw.ok())
+        throw std::runtime_error(std::string(error_prefix) + ": " + raw.error_message);
+    return raw.get<ResultT>();
+}
 
 // ─── AArch64 register names ──────────────────────────────────────────────
 

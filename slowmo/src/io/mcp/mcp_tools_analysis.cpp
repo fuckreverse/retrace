@@ -60,11 +60,8 @@ void TenetMcpService::register_analysis_tools() {
          "instruction ranges.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<PatternPass>());
-            const auto& raw = pm_->require("pattern");
-            if (!raw.ok()) throw std::runtime_error("Pattern pass failed: " + raw.error_message);
-            const auto& result = raw.get<PatternResult>();
+            const auto& result = require_pass<PatternResult>(pm_, "pattern", "Pattern pass failed");
 
             json matches = json::array();
             for (const auto& m : result.matches) {
@@ -88,11 +85,8 @@ void TenetMcpService::register_analysis_tools() {
          "Discover printable strings in traced memory accesses.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<StringPass>());
-            const auto& raw = pm_->require("strings");
-            if (!raw.ok()) throw std::runtime_error("String pass failed: " + raw.error_message);
-            const auto& result = raw.get<StringResult>();
+            const auto& result = require_pass<StringResult>(pm_, "strings", "String pass failed");
 
             json strings = json::array();
             size_t limit = std::min(result.strings.size(), size_t(500));
@@ -122,13 +116,10 @@ void TenetMcpService::register_analysis_tools() {
               {"min_parts", {{"type", "integer"}, {"description", "Min movz+movk parts"}, {"default", 2}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             auto pass = std::make_unique<ConstantMaterializationPass>();
             pass->set_min_parts(args.value("min_parts", uint8_t(2)));
             pm_->register_pass(std::move(pass));
-            const auto& raw = pm_->require("constant_materialization");
-            if (!raw.ok()) throw std::runtime_error("Constants pass failed: " + raw.error_message);
-            const auto& result = raw.get<ConstantMaterializationResult>();
+            const auto& result = require_pass<ConstantMaterializationResult>(pm_, "constant_materialization", "Constants pass failed");
 
             json identified = json::array();
             for (size_t idx : result.identified_indices) {
@@ -161,12 +152,9 @@ void TenetMcpService::register_analysis_tools() {
          "Feistel rounds, SPN rounds, ARX patterns, S-box lookups, etc.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<LoopSemanticsPass>());
-            const auto& raw = pm_->require("loop_semantics");
-            if (!raw.ok()) throw std::runtime_error("Loop semantics failed: " + raw.error_message);
-            const auto& result = raw.get<LoopSemanticsResult>();
+            const auto& result = require_pass<LoopSemanticsResult>(pm_, "loop_semantics", "Loop semantics failed");
 
             json loops = json::array();
             for (const auto& l : result.loop_semantics) {
@@ -194,7 +182,6 @@ void TenetMcpService::register_analysis_tools() {
          "analysis to identify cryptographic algorithms in the trace.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<PatternPass>());
             pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
@@ -202,9 +189,7 @@ void TenetMcpService::register_analysis_tools() {
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<CallGraphPass>());
             pm_->register_pass(std::make_unique<AlgorithmSummaryPass>());
-            const auto& raw = pm_->require("algorithm_summary");
-            if (!raw.ok()) throw std::runtime_error("Algorithm summary failed: " + raw.error_message);
-            const auto& result = raw.get<AlgorithmSummaryResult>();
+            const auto& result = require_pass<AlgorithmSummaryResult>(pm_, "algorithm_summary", "Algorithm summary failed");
             return result.summary_json;
         }
     );
@@ -219,15 +204,12 @@ void TenetMcpService::register_analysis_tools() {
               {"class_filter", {{"type", "string"}, {"description", "Filter by class name (optional)"}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             auto pass = std::make_unique<ObjcPass>();
             if (args.contains("class_filter")) {
                 pass->set_class_filter(args["class_filter"].get<std::string>());
             }
             pm_->register_pass(std::move(pass));
-            const auto& raw = pm_->require("objc");
-            if (!raw.ok()) throw std::runtime_error("ObjC pass failed: " + raw.error_message);
-            const auto& result = raw.get<ObjcResult>();
+            const auto& result = require_pass<ObjcResult>(pm_, "objc", "ObjC pass failed");
             return result.to_json();
         }
     );
@@ -239,15 +221,12 @@ void TenetMcpService::register_analysis_tools() {
          "indicators, constant markers, pattern identifiers).",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
             pm_->register_pass(std::make_unique<PatternPass>());
             pm_->register_pass(std::make_unique<SymbolAnnotationPass>());
-            const auto& raw = pm_->require("symbol_annotation");
-            if (!raw.ok()) throw std::runtime_error("Annotation pass failed: " + raw.error_message);
-            const auto& result = raw.get<AnnotationResult>();
+            const auto& result = require_pass<AnnotationResult>(pm_, "symbol_annotation", "Annotation pass failed");
 
             json annotations = json::array();
             size_t count = 0;
@@ -281,16 +260,13 @@ void TenetMcpService::register_analysis_tools() {
           }},
           {"required", json::array({"inst_ids"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             MemorySnapshotConfig cfg;
             for (const auto& id : args.at("inst_ids")) {
                 cfg.snapshot_inst_ids.push_back(id.get<uint64_t>());
             }
             cfg.snapshot_size = args.value("snapshot_size", uint32_t(64));
             pm_->register_pass(std::make_unique<MemorySnapshotPass>(std::move(cfg)));
-            const auto& raw = pm_->require("memory_snapshot");
-            if (!raw.ok()) throw std::runtime_error("Memory snapshot failed: " + raw.error_message);
-            const auto& result = raw.get<MemorySnapshotResult>();
+            const auto& result = require_pass<MemorySnapshotResult>(pm_, "memory_snapshot", "Memory snapshot failed");
 
             json snapshots = json::array();
             for (const auto& region : result.snapshots) {
@@ -312,14 +288,11 @@ void TenetMcpService::register_analysis_tools() {
          "Shows which ObjC methods are active when crypto operations occur.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<ObjcPass>());
             pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
             pm_->register_pass(std::make_unique<PatternPass>());
             pm_->register_pass(std::make_unique<ObjcCryptoPass>());
-            const auto& raw = pm_->require("objc_crypto");
-            if (!raw.ok()) throw std::runtime_error("ObjC crypto failed: " + raw.error_message);
-            const auto& result = raw.get<ObjcCryptoResult>();
+            const auto& result = require_pass<ObjcCryptoResult>(pm_, "objc_crypto", "ObjC crypto failed");
             return json::parse(result.to_json());
         }
     );
@@ -335,14 +308,11 @@ void TenetMcpService::register_analysis_tools() {
               {"capture_bytes", {{"type", "integer"}, {"description", "Bytes per pointer arg"}, {"default", 64}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             SyscallInterceptConfig cfg;
             cfg.capture_bytes = args.value("capture_bytes", uint32_t(64));
             pm_->register_pass(std::make_unique<ObjcPass>());
             pm_->register_pass(std::make_unique<SyscallInterceptPass>(std::move(cfg)));
-            const auto& raw = pm_->require("syscall_intercept");
-            if (!raw.ok()) throw std::runtime_error("Syscall intercept failed: " + raw.error_message);
-            const auto& result = raw.get<SyscallInterceptResult>();
+            const auto& result = require_pass<SyscallInterceptResult>(pm_, "syscall_intercept", "Syscall intercept failed");
             return json::parse(result.to_json());
         }
     );
@@ -355,13 +325,10 @@ void TenetMcpService::register_analysis_tools() {
          "I/O, and other common source points.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<ObjcPass>());
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<TaintSourceAnnotationPass>());
-            const auto& raw = pm_->require("taint_source_annotation");
-            if (!raw.ok()) throw std::runtime_error("Taint source annotation failed: " + raw.error_message);
-            const auto& result = raw.get<TaintSourceAnnotationResult>();
+            const auto& result = require_pass<TaintSourceAnnotationResult>(pm_, "taint_source_annotation", "Taint source annotation failed");
             return json::parse(result.to_json());
         }
     );
@@ -374,12 +341,9 @@ void TenetMcpService::register_analysis_tools() {
          "repetition counts.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<TraceFoldPass>());
-            const auto& raw = pm_->require("trace_fold");
-            if (!raw.ok()) throw std::runtime_error("Trace fold failed: " + raw.error_message);
-            const auto& result = raw.get<TraceFoldResult>();
+            const auto& result = require_pass<TraceFoldResult>(pm_, "trace_fold", "Trace fold failed");
 
             json regions = json::array();
             size_t limit = std::min(result.folded_regions.size(), size_t(500));
@@ -421,8 +385,6 @@ void TenetMcpService::register_search_tools() {
               {"limit",       {{"type", "integer"}, {"description", "Max results"}, {"default", 50}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             MemSearchConfig cfg;
             if (args.contains("hex_pattern")) {
                 // Parse hex pattern string into bytes+mask
@@ -457,9 +419,7 @@ void TenetMcpService::register_search_tools() {
             cfg.max_matches = args.value("limit", uint64_t(50));
 
             pm_->register_pass(std::make_unique<MemSearchPass>(std::move(cfg)));
-            const auto& raw = pm_->require("mem_search");
-            if (!raw.ok()) throw std::runtime_error("Mem search failed: " + raw.error_message);
-            const auto& result = raw.get<MemSearchResult>();
+            const auto& result = require_pass<MemSearchResult>(pm_, "mem_search", "Mem search failed");
 
             json hits = json::array();
             for (const auto& m : result.matches) {
@@ -491,8 +451,6 @@ void TenetMcpService::register_search_tools() {
           }},
           {"required", json::array({"reg_index"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             RegTimelineConfig cfg;
             cfg.target_reg = args.at("reg_index").get<uint8_t>();
             cfg.start_inst_id = args.value("start_inst_id", uint64_t(0));
@@ -500,9 +458,7 @@ void TenetMcpService::register_search_tools() {
             cfg.max_entries = args.value("limit", uint64_t(200));
 
             pm_->register_pass(std::make_unique<RegTimelinePass>(std::move(cfg)));
-            const auto& raw = pm_->require("reg_timeline");
-            if (!raw.ok()) throw std::runtime_error("Reg timeline failed: " + raw.error_message);
-            const auto& result = raw.get<RegTimelineResult>();
+            const auto& result = require_pass<RegTimelineResult>(pm_, "reg_timeline", "Reg timeline failed");
 
             json timeline = json::array();
             for (const auto& e : result.entries) {
@@ -532,16 +488,12 @@ void TenetMcpService::register_search_tools() {
           }},
           {"required", json::array({"value"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             LiteralSearchConfig cfg;
             cfg.search_values.push_back(parse_hex(args.at("value").get<std::string>()));
             cfg.max_results = args.value("limit", uint64_t(50));
 
             pm_->register_pass(std::make_unique<LiteralSearchPass>(std::move(cfg)));
-            const auto& raw = pm_->require("literal_search");
-            if (!raw.ok()) throw std::runtime_error("Literal search failed: " + raw.error_message);
-            const auto& result = raw.get<LiteralSearchResult>();
+            const auto& result = require_pass<LiteralSearchResult>(pm_, "literal_search", "Literal search failed");
 
             json hits = json::array();
             for (const auto& h : result.hits) {
@@ -574,17 +526,13 @@ void TenetMcpService::register_search_tools() {
           }},
           {"required", json::array({"inst_id", "reg_index"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             ProducerChainConfig cfg;
             cfg.start_inst_id = args.at("inst_id").get<uint64_t>();
             cfg.start_reg = args.at("reg_index").get<uint8_t>();
             cfg.max_depth = args.value("max_depth", uint32_t(20));
 
             pm_->register_pass(std::make_unique<ProducerChainPass>(std::move(cfg)));
-            const auto& raw = pm_->require("producer_chain");
-            if (!raw.ok()) throw std::runtime_error("Producer chain failed: " + raw.error_message);
-            const auto& result = raw.get<ProducerChainResult>();
+            const auto& result = require_pass<ProducerChainResult>(pm_, "producer_chain", "Producer chain failed");
 
             json chain = json::array();
             for (const auto& link : result.chain) {
@@ -615,16 +563,12 @@ void TenetMcpService::register_search_tools() {
           }},
           {"required", json::array({"inst_id"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             CallContextConfig cfg;
             cfg.target_inst_id = args.at("inst_id").get<uint64_t>();
 
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<CallContextPass>(std::move(cfg)));
-            const auto& raw = pm_->require("call_context");
-            if (!raw.ok()) throw std::runtime_error("Call context failed: " + raw.error_message);
-            const auto& result = raw.get<CallContextResult>();
+            const auto& result = require_pass<CallContextResult>(pm_, "call_context", "Call context failed");
 
             json frames = json::array();
             for (const auto& f : result.call_stack) {
@@ -654,15 +598,11 @@ void TenetMcpService::register_search_tools() {
               {"window_size",   {{"type", "integer"}, {"description", "Sliding window size"}, {"default", 1000}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             WindowStatsConfig cfg;
             cfg.window_size = args.value("window_size", uint64_t(1000));
 
             pm_->register_pass(std::make_unique<WindowStatsPass>(std::move(cfg)));
-            const auto& raw = pm_->require("window_stats");
-            if (!raw.ok()) throw std::runtime_error("Window stats failed: " + raw.error_message);
-            const auto& result = raw.get<WindowStatsResult>();
+            const auto& result = require_pass<WindowStatsResult>(pm_, "window_stats", "Window stats failed");
 
             json windows = json::array();
             size_t limit = std::min(result.windows.size(), size_t(100));
@@ -693,11 +633,8 @@ void TenetMcpService::register_search_tools() {
          "regions often indicate encryption or compression output.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<EntropyPass>());
-            const auto& raw = pm_->require("entropy");
-            if (!raw.ok()) throw std::runtime_error("Entropy failed: " + raw.error_message);
-            const auto& result = raw.get<EntropyResult>();
+            const auto& result = require_pass<EntropyResult>(pm_, "entropy", "Entropy failed");
 
             json blocks_arr = json::array();
             size_t limit = std::min(result.blocks.size(), size_t(100));
@@ -734,14 +671,11 @@ void TenetMcpService::register_search_tools() {
           }},
           {"required", json::array({"at_inst_id"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             MemoryStringConfig cfg;
             cfg.min_string_len = args.value("min_length", size_t(4));
 
             pm_->register_pass(std::make_unique<MemoryStringPass>(std::move(cfg)));
-            const auto& raw = pm_->require("memory_string");
-            if (!raw.ok()) throw std::runtime_error("Memory strings failed: " + raw.error_message);
-            const auto& result = raw.get<MemoryStringResult>();
+            const auto& result = require_pass<MemoryStringResult>(pm_, "memory_string", "Memory strings failed");
 
             json strings = json::array();
             size_t limit = std::min(result.strings.size(), size_t(500));
@@ -775,11 +709,8 @@ void TenetMcpService::register_pass_tools() {
          "names (if available), instruction ranges, and call counts.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<FunctionPass>());
-            const auto& raw = pm_->require("functions");
-            if (!raw.ok()) throw std::runtime_error("Function pass failed: " + raw.error_message);
-            const auto& result = raw.get<FunctionResult>();
+            const auto& result = require_pass<FunctionResult>(pm_, "functions", "Function pass failed");
 
             json funcs = json::array();
             for (const auto& [pc, info] : result.functions) {
@@ -801,11 +732,8 @@ void TenetMcpService::register_pass_tools() {
          "counts, body sizes, and nesting information.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<LoopPass>());
-            const auto& raw = pm_->require("loops");
-            if (!raw.ok()) throw std::runtime_error("Loop pass failed: " + raw.error_message);
-            const auto& result = raw.get<LoopResult>();
+            const auto& result = require_pass<LoopResult>(pm_, "loops", "Loop pass failed");
 
             json loops = json::array();
             for (const auto& l : result.loops) {
@@ -833,11 +761,8 @@ void TenetMcpService::register_pass_tools() {
               {"top_n", {{"type", "integer"}, {"description", "Top N hot PCs"}, {"default", 20}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
             pm_->register_pass(std::make_unique<XrefPass>());
-            const auto& raw = pm_->require("xref");
-            if (!raw.ok()) throw std::runtime_error("XRef pass failed: " + raw.error_message);
-            const auto& xref = raw.get<XrefResult>();
+            const auto& xref = require_pass<XrefResult>(pm_, "xref", "XRef pass failed");
 
             size_t top_n = args.value("top_n", 20);
             auto hot = xref.hottest(top_n);
@@ -869,8 +794,6 @@ void TenetMcpService::register_pass_tools() {
           }},
           {"required", json::array({"range_a_start", "range_a_end", "range_b_start", "range_b_end"})}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             TraceDiffConfig cfg;
             cfg.trace_a_start = args.at("range_a_start").get<uint64_t>();
             cfg.trace_a_end   = args.at("range_a_end").get<uint64_t>();
@@ -878,9 +801,7 @@ void TenetMcpService::register_pass_tools() {
             cfg.trace_b_end   = args.at("range_b_end").get<uint64_t>();
 
             pm_->register_pass(std::make_unique<TraceDiffPass>(std::move(cfg)));
-            const auto& raw = pm_->require("trace_diff");
-            if (!raw.ok()) throw std::runtime_error("Trace diff failed: " + raw.error_message);
-            const auto& result = raw.get<TraceDiffResult>();
+            const auto& result = require_pass<TraceDiffResult>(pm_, "trace_diff", "Trace diff failed");
 
             json diffs_arr = json::array();
             size_t limit = std::min(result.diffs.size(), size_t(200));
@@ -920,13 +841,9 @@ void TenetMcpService::register_pass_tools() {
               {"limit",      {{"type", "integer"}, {"description", "Max results for name search"}, {"default", 10}}}
           }}}},
         [this](const json& args) -> json {
-            if (!pm_) throw std::runtime_error("PassManager not available");
-
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<XrefPass>());
-            const auto& fn_raw = pm_->require("functions");
-            if (!fn_raw.ok()) throw std::runtime_error("Function pass failed: " + fn_raw.error_message);
-            const auto& fn_result = fn_raw.get<FunctionResult>();
+            const auto& fn_result = require_pass<FunctionResult>(pm_, "functions", "Function pass failed");
 
             // XRef for inst_id lookup
             bool has_xref = false;

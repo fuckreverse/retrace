@@ -4,12 +4,12 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/triton_bridge.h"
-// register_file.h and memory_model.h removed: regfile no longer used in hot path
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <algorithm>
+#include <functional>
 namespace tenet {
 
 using json = nlohmann::json;
@@ -71,27 +71,70 @@ struct PropagationState {
     }
 };
 
-// --- Triton-based precise backward taint ----------------------------------
+// ═══════════════════════════════════════════════════════════════════════════
+// Instruction classification interface
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The backward traversal loop is identical for both Triton and heuristic paths.
+// The ONLY difference is how each instruction is classified:
+//   - Which registers does it WRITE? (potential definitions of needed values)
+//   - Which registers does it READ? (new dependencies to propagate)
+//   - Is it a BL (branch-and-link) site? (exclude LR from data tracking)
+//   - Does it have a memory read? (for load propagation through memory)
+//   - What are the source registers for a store instruction?
+//
+// We encode this as a lightweight struct of callbacks, instantiated per-path.
 
-static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
+/// Describes the register/memory classification of one instruction.
+struct InstructionInfo {
+    /// All registers WRITTEN by this instruction (potential definitions).
+    /// For Triton: from query_semantics.reg_accesses[is_written].
+    /// For heuristic: from inst.reg_diff entries.
+    struct WrittenReg {
+        uint8_t reg_id;
+    };
+    std::vector<WrittenReg> written_regs;
+
+    /// All registers READ by this instruction (potential sources).
+    /// For Triton: from query_semantics.reg_accesses[is_read].
+    /// For heuristic: reg_diff entries not in the dst set (overapproximation).
+    struct ReadReg {
+        uint8_t reg_id;
+    };
+    std::vector<ReadReg> read_regs;
+
+    /// Whether this instruction writes LR (i.e., is a BL call site).
+    bool is_bl_site = false;
+
+    /// Whether this instruction has semantic memory reads (for load detection).
+    /// Triton checks sem.mem_accesses; heuristic always true (relies on mem_access records).
+    bool has_memory_reads = false;
+
+    /// Valid: set to false if instruction could not be classified (e.g., no opcode).
+    bool valid = true;
+};
+
+/// Callback type: given a decoded instruction record (and its PC), produce InstructionInfo.
+/// This is the strategy injection point.
+using ClassifyFn = std::function<InstructionInfo(const InstView& inst)>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Common backward traversal framework
+// ═══════════════════════════════════════════════════════════════════════════
+
+static PassResult run_backward_taint_common(
+    PassContext& ctx,
+    const BackwardTaintConfig& config,
+    ClassifyFn classify,
+    const char* method_label)
+{
     auto& reader = ctx.reader();
     auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-
-    auto bridge_ptr = create_triton_bridge();
-    if (!bridge_ptr->is_available()) {
-        return PassResult::failed("Triton bridge not available for backward taint");
-    }
-
-    auto* triton = dynamic_cast<TritonBridgeTaint*>(bridge_ptr.get());
-    if (!triton) {
-        return PassResult::failed("Triton bridge does not support taint interface");
-    }
 
     BackwardTaintResult result;
     result.config = config;
 
-    // Initialize per-sink tags
+    // ── Initialize per-sink tags from config ─────────────────────────────
     PropagationState state;
     uint8_t tag_idx = 0;
     {
@@ -129,20 +172,12 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     uint64_t total_estimated = std::min(current_id,
         config.max_steps > 0 ? config.max_steps : current_id);
 
-    // Index-acceleration counters (for progress reporting)
     uint64_t index_jumps = 0;
     uint64_t index_skipped = 0;
 
+    // ── Main backward traversal loop ─────────────────────────────────────
     while (current_id > 0 && !state.empty()) {
         // ── REG_WRITES Index Acceleration ─────────────────────────────────
-        // When only register deps remain (no in-flight memory deps), jump
-        // directly to the most recent writer of any needed register via the
-        // REG_WRITES inverted index (O(log N) vs O(N) linear scan).
-        //
-        // This can skip millions of irrelevant instructions in a single step,
-        // making deep backward taint traces finish in <1s instead of minutes.
-        //
-        // Disabled when memory deps are present (we could miss a store).
         if (config.use_index_acceleration && state.mem_to_sinks.empty() &&
             !state.reg_to_sinks.empty()) {
             uint64_t best_jump = 0;
@@ -181,110 +216,61 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
 
         auto inst = rec.as_inst();
 
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (!opcode_opt) continue;
-
-        uint32_t opcode_val = *opcode_opt;
-        auto* opcode_bytes = reinterpret_cast<const uint8_t*>(&opcode_val);
-
-        // ── Performance: query_semantics only needs opcode bytes to determine
-        // read/write register sets via Triton's instruction decoder.
-        // Concrete register/memory values are NOT needed for this query —
-        // removing reset() + set_register_context eliminates the two most
-        // expensive calls in this loop (reset() re-initializes the entire
-        // Triton context; set_register_context issues 34 API calls each time).
-        auto sem_result = bridge_ptr->query_semantics(inst.pc, opcode_bytes, 4);
-        if (!sem_result) continue;
-
-        const auto& sem = *sem_result;
-
-        // --- Cross-function handling ---
-        // The linear backward walk through the trace naturally handles
-        // cross-function boundaries because the trace is in execution order:
-        // - BL (call): backward walk enters callee instructions naturally
-        // - RET: backward walk exits callee and continues in caller
-        // For ABI-aware tracking: if we need X0 (return value) and encounter
-        // a BL site, the callee's computation of X0 is already before us in
-        // the trace; the backward walk will pick it up automatically.
-        // We just need to avoid incorrectly attributing X30 (LR) writes at BL
-        // sites as data-producing instructions (they're control flow only).
-        bool is_bl_site = false;
-        for (const auto& ra : sem.reg_accesses) {
-            if (ra.is_written && ra.reg_id == REG_X30) {
-                // Writing LR typically means this is a BL instruction
-                is_bl_site = true;
-                break;
-            }
-        }
+        // ── Classify instruction via strategy ────────────────────────────
+        auto info = classify(inst);
+        if (!info.valid) continue;
 
         // --- Multi-definition: check ALL written registers vs needed set ---
         bool contributes = false;
         BackwardTaintEvent event;
         event.inst_id = current_id;
         event.pc = inst.pc;
-
         std::vector<uint8_t> resolved_tags;
 
-        for (const auto& ra : sem.reg_accesses) {
-            if (!ra.is_written) continue;
-            if (should_exclude_reg(ra.reg_id, config)) continue;
-
+        for (const auto& wr : info.written_regs) {
+            if (should_exclude_reg(wr.reg_id, config)) continue;
             // Skip LR write at BL sites (it's control flow, not data)
-            if (is_bl_site && ra.reg_id == REG_X30) continue;
+            if (info.is_bl_site && wr.reg_id == REG_X30) continue;
 
-            if (state.has_reg(ra.reg_id)) {
+            if (state.has_reg(wr.reg_id)) {
                 contributes = true;
-                event.dst_regs.push_back(ra.reg_id);
-                if (event.dst_reg == 0) event.dst_reg = ra.reg_id;
+                event.dst_regs.push_back(wr.reg_id);
+                if (event.dst_reg == 0) event.dst_reg = wr.reg_id;
 
-                const auto& tags = state.get_reg_tags(ra.reg_id);
+                const auto& tags = state.get_reg_tags(wr.reg_id);
                 for (auto t : tags) {
                     if (std::find(resolved_tags.begin(), resolved_tags.end(), t) == resolved_tags.end())
                         resolved_tags.push_back(t);
                 }
 
-                state.remove_reg(ra.reg_id);
-                result.all_involved_regs |= (1ULL << ra.reg_id);
+                state.remove_reg(wr.reg_id);
+                result.all_involved_regs |= (1ULL << wr.reg_id);
             }
         }
 
         if (contributes) {
             // Add all READ registers as new needed (source operands)
-            for (const auto& src_ra : sem.reg_accesses) {
-                if (!src_ra.is_read) continue;
-                if (should_exclude_reg(src_ra.reg_id, config)) continue;
+            for (const auto& sr : info.read_regs) {
+                if (should_exclude_reg(sr.reg_id, config)) continue;
+                if (info.is_bl_site && sr.reg_id == REG_X30) continue;
                 bool is_dst = std::find(event.dst_regs.begin(), event.dst_regs.end(),
-                                        src_ra.reg_id) != event.dst_regs.end();
+                                        sr.reg_id) != event.dst_regs.end();
                 if (is_dst) continue;
 
-                event.src_regs.push_back(src_ra.reg_id);
-                state.add_reg(src_ra.reg_id, resolved_tags);
-                result.all_involved_regs |= (1ULL << src_ra.reg_id);
+                event.src_regs.push_back(sr.reg_id);
+                state.add_reg(sr.reg_id, resolved_tags);
+                result.all_involved_regs |= (1ULL << sr.reg_id);
             }
 
-            if (config.propagate_through_memory) {
-                // Use trace-recorded mem_access addresses (inst.mem_access) rather than
-                // Triton's statically-inferred addresses (sem.mem_accesses.address).
-                // Triton does NOT have register context at this point (set_register_context
-                // was removed for performance), so sem.mem_accesses.address is always 0.
-                // The actual runtime address is in the trace's mem_access records.
-                //
-                // We still use sem.mem_accesses to count how many memory reads there are
-                // (to detect whether this is a load instruction), but use inst.mem_access
-                // for the concrete address.
-                bool has_sem_read = false;
-                for (const auto& ma : sem.mem_accesses) {
-                    if (ma.is_read) { has_sem_read = true; break; }
-                }
-                if (has_sem_read) {
-                    for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                        auto mem = inst.mem_access(m);
-                        if (mem.type & 2) continue;  // Skip WRITE records; we want READs
-                        event.loads_from_memory = true;
-                        event.src_mem_addrs.push_back(mem.addr);
-                        state.add_mem(mem.addr, static_cast<uint8_t>(mem.size), resolved_tags);
-                        result.involved_mem_addrs.add(mem.addr);
-                    }
+            // Memory read propagation
+            if (config.propagate_through_memory && info.has_memory_reads) {
+                for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                    auto mem = inst.mem_access(m);
+                    if (mem.type & 2) continue;  // Skip WRITE records; we want READs
+                    event.loads_from_memory = true;
+                    event.src_mem_addrs.push_back(mem.addr);
+                    state.add_mem(mem.addr, static_cast<uint8_t>(mem.size), resolved_tags);
+                    result.involved_mem_addrs.add(mem.addr);
                 }
             }
         }
@@ -317,15 +303,15 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
 
                         it = state.mem_to_sinks.erase(it);
 
-                        for (const auto& src_ra : sem.reg_accesses) {
-                            if (!src_ra.is_read) continue;
-                            if (should_exclude_reg(src_ra.reg_id, config)) continue;
+                        // Add source registers for the store instruction
+                        for (const auto& sr : info.read_regs) {
+                            if (should_exclude_reg(sr.reg_id, config)) continue;
                             if (std::find(event.src_regs.begin(), event.src_regs.end(),
-                                          src_ra.reg_id) == event.src_regs.end()) {
-                                event.src_regs.push_back(src_ra.reg_id);
+                                          sr.reg_id) == event.src_regs.end()) {
+                                event.src_regs.push_back(sr.reg_id);
                             }
-                            state.add_reg(src_ra.reg_id, resolved_tags);
-                            result.all_involved_regs |= (1ULL << src_ra.reg_id);
+                            state.add_reg(sr.reg_id, resolved_tags);
+                            result.all_involved_regs |= (1ULL << sr.reg_id);
                         }
 
                         result.involved_mem_addrs.add(mem.addr);
@@ -361,12 +347,9 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     }
 
     // --- Build dataflow edges from event chain ---
-    // O(E) via incremental address→reader index (was O(E²) nested scan).
+    // O(E) via incremental address→reader index.
     if (config.build_dataflow_graph && result.events.size() > 1) {
         ankerl::unordered_dense::map<uint8_t, uint64_t> reg_consumer;
-        // Maps a memory address to the list of event indices that READ from it.
-        // Built incrementally so that when processing event i, the map only
-        // contains entries from events [0, i-1].
         ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> addr_to_readers;
 
         for (size_t i = 0; i < result.events.size(); i++) {
@@ -379,7 +362,6 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
                 }
             }
             if (ev.stores_to_memory) {
-                // O(1) lookup instead of O(i) linear scan.
                 auto rit = addr_to_readers.find(ev.store_addr);
                 if (rit != addr_to_readers.end()) {
                     for (size_t j : rit->second) {
@@ -389,7 +371,6 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
                 }
             }
 
-            // Register this event's reads for future store matching.
             for (uint8_t sr : ev.src_regs) {
                 reg_consumer[sr] = ev.inst_id;
             }
@@ -402,287 +383,117 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
     result.max_depth = result.events.size();
 
     ctx.progress(1.0f, fmt::format(
-        "Backward taint (Triton): {} contributing, {} steps, "
-        "{} idx-jumps, {} idx-skipped, {} regs, {} edges",
-        result.contributing_inst_ids.cardinality(), steps,
-        index_jumps, index_skipped,
-        result.involved_reg_count(), result.dataflow_edges.size()));
-
-    return PassResult::success(std::move(result));
-}
-
-// --- Heuristic backward taint (fallback) ----------------------------------
-
-static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-
-    BackwardTaintResult result;
-    result.config = config;
-
-    PropagationState state;
-    uint8_t tag_idx = 0;
-    {
-        uint64_t remaining = config.sink_regs;
-        while (remaining) {
-            uint8_t r = static_cast<uint8_t>(__builtin_ctzll(remaining));
-            remaining &= remaining - 1;
-            if (should_exclude_reg(r, config)) continue;
-            SinkTag tag;
-            tag.kind = SinkTag::Register;
-            tag.reg_id = r;
-            result.sink_tags.push_back(tag);
-            state.add_reg(r, {tag_idx});
-            tag_idx++;
-        }
-    }
-    for (uint64_t addr : config.sink_mem_addrs) {
-        SinkTag tag;
-        tag.kind = SinkTag::Memory;
-        tag.mem_addr = addr;
-        result.sink_tags.push_back(tag);
-        state.add_mem(addr, 8, {tag_idx});
-        tag_idx++;
-    }
-
-    result.per_sink_inst_ids.resize(result.sink_tags.size());
-
-    if (state.empty()) {
-        ctx.progress(1.0f, "Backward taint: nothing to trace");
-        return PassResult::success(std::move(result));
-    }
-
-    uint64_t current_id = config.sink_inst_id;
-    uint64_t steps = 0;
-    uint64_t total_estimated = std::min(current_id,
-        config.max_steps > 0 ? config.max_steps : current_id);
-
-    uint64_t index_jumps = 0;
-    uint64_t index_skipped = 0;
-
-    while (current_id > 0 && !state.empty()) {
-        // ── REG_WRITES Index Acceleration (heuristic path) ────────────────
-        if (config.use_index_acceleration && state.mem_to_sinks.empty() &&
-            !state.reg_to_sinks.empty()) {
-            uint64_t best_jump = 0;
-            for (const auto& [reg, _] : state.reg_to_sinks) {
-                uint64_t writer = index.find_last_writer_of(reg, current_id, reader);
-                if (writer > best_jump) {
-                    best_jump = writer;
-                }
-            }
-
-            if (best_jump == 0) {
-                break;  // No writer found → done
-            }
-
-            if (best_jump < current_id) {
-                uint64_t skipped = current_id - best_jump - 1;
-                index_skipped += skipped;
-                index_jumps++;
-                current_id = best_jump + 1;
-            }
-        }
-
-        current_id--;
-        steps++;
-
-        if (config.max_steps > 0 && steps >= config.max_steps) break;
-        if (config.max_tainted_insts > 0 &&
-            result.contributing_inst_ids.cardinality() >= config.max_tainted_insts) break;
-        if (ctx.cancelled()) {
-            return PassResult::failed("cancelled by user");
-        }
-
-        auto [offset, seed_pc] = index.offset_of_with_pc(current_id, reader);
-        auto rec = reader.record_at(offset, seed_pc);
-        if (rec.kind != RecordKind::Inst) continue;
-
-        auto inst = rec.as_inst();
-
-        bool contributes = false;
-        BackwardTaintEvent event;
-        event.inst_id = current_id;
-        event.pc = inst.pc;
-        std::vector<uint8_t> resolved_tags;
-
-        // Cross-function heuristic: detect BL by checking if X30/LR is in reg_diff
-        bool is_bl_site = false;
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            if (inst.reg_diff(i).index == REG_X30) {
-                is_bl_site = true;
-                break;
-            }
-        }
-
-        // --- Multi-definition: check ALL reg_diffs vs needed set ---
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            if (should_exclude_reg(diff.index, config)) continue;
-            if (is_bl_site && diff.index == REG_X30) continue;
-
-            if (state.has_reg(diff.index)) {
-                contributes = true;
-                event.dst_regs.push_back(diff.index);
-                if (event.dst_reg == 0) event.dst_reg = diff.index;
-
-                const auto& tags = state.get_reg_tags(diff.index);
-                for (auto t : tags) {
-                    if (std::find(resolved_tags.begin(), resolved_tags.end(), t) == resolved_tags.end())
-                        resolved_tags.push_back(t);
-                }
-
-                state.remove_reg(diff.index);
-                result.all_involved_regs |= (1ULL << diff.index);
-            }
-        }
-
-        if (contributes) {
-            // Heuristic: reg_diffs NOT in dst_regs are potential sources
-            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                auto diff = inst.reg_diff(i);
-                if (should_exclude_reg(diff.index, config)) continue;
-                if (is_bl_site && diff.index == REG_X30) continue;
-                bool is_dst = std::find(event.dst_regs.begin(), event.dst_regs.end(),
-                                        diff.index) != event.dst_regs.end();
-                if (is_dst) continue;
-
-                event.src_regs.push_back(diff.index);
-                state.add_reg(diff.index, resolved_tags);
-                result.all_involved_regs |= (1ULL << diff.index);
-            }
-
-            if (config.propagate_through_memory) {
-                for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                    auto mem = inst.mem_access(m);
-                    if ((mem.type & 2) == 0) {
-                        event.loads_from_memory = true;
-                        event.src_mem_addrs.push_back(mem.addr);
-                        state.add_mem(mem.addr, static_cast<uint8_t>(mem.size), resolved_tags);
-                        result.involved_mem_addrs.add(mem.addr);
-                    }
-                }
-            }
-        }
-
-        // --- Check stores to needed memory ---
-        if (config.propagate_through_memory && !state.mem_to_sinks.empty()) {
-            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                auto mem = inst.mem_access(m);
-                if (!(mem.type & 2)) continue;
-
-                for (auto it = state.mem_to_sinks.begin(); it != state.mem_to_sinks.end(); ) {
-                    uint64_t needed_addr = it->first;
-                    uint8_t needed_size = it->second.size;
-
-                    uint64_t store_start = mem.addr;
-                    uint64_t store_end = mem.addr + mem.size;
-                    uint64_t need_start = needed_addr;
-                    uint64_t need_end = needed_addr + needed_size;
-
-                    if (store_start < need_end && need_start < store_end) {
-                        if (!contributes) contributes = true;
-                        event.stores_to_memory = true;
-                        event.store_addr = mem.addr;
-                        event.store_size = static_cast<uint8_t>(mem.size);
-
-                        for (auto t : it->second.sink_tags) {
-                            if (std::find(resolved_tags.begin(), resolved_tags.end(), t) == resolved_tags.end())
-                                resolved_tags.push_back(t);
-                        }
-
-                        it = state.mem_to_sinks.erase(it);
-
-                        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                            auto diff = inst.reg_diff(i);
-                            if (should_exclude_reg(diff.index, config)) continue;
-                            if (std::find(event.src_regs.begin(), event.src_regs.end(),
-                                          diff.index) == event.src_regs.end()) {
-                                event.src_regs.push_back(diff.index);
-                            }
-                            state.add_reg(diff.index, resolved_tags);
-                            result.all_involved_regs |= (1ULL << diff.index);
-                        }
-
-                        result.involved_mem_addrs.add(mem.addr);
-                        break;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-        }
-
-        if (contributes) {
-            event.sink_tags = resolved_tags;
-            result.contributing_inst_ids.add(current_id);
-            result.inst_id_to_event_[current_id] = result.events.size();
-
-            for (auto t : resolved_tags) {
-                if (t < result.per_sink_inst_ids.size()) {
-                    result.per_sink_inst_ids[t].add(current_id);
-                }
-            }
-
-            result.events.push_back(std::move(event));
-        }
-
-        if (steps % 5000 == 0) {
-            float pct = total_estimated > 0
-                ? static_cast<float>(steps) / static_cast<float>(total_estimated)
-                : 0.0f;
-            ctx.progress(std::min(pct, 0.99f));
-        }
-    }
-
-    // --- Build dataflow edges from event chain ---
-    // O(E) via incremental address→reader index (was O(E²) nested scan).
-    if (config.build_dataflow_graph && result.events.size() > 1) {
-        ankerl::unordered_dense::map<uint8_t, uint64_t> reg_consumer;
-        // Maps a memory address to the list of event indices that READ from it.
-        // Built incrementally so that when processing event i, the map only
-        // contains entries from events [0, i-1].
-        ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> addr_to_readers;
-
-        for (size_t i = 0; i < result.events.size(); i++) {
-            const auto& ev = result.events[i];
-
-            for (uint8_t dr : ev.dst_regs) {
-                auto cit = reg_consumer.find(dr);
-                if (cit != reg_consumer.end()) {
-                    result.dataflow_edges.emplace_back(ev.inst_id, cit->second, dr, 0);
-                }
-            }
-            if (ev.stores_to_memory) {
-                // O(1) lookup instead of O(i) linear scan.
-                auto rit = addr_to_readers.find(ev.store_addr);
-                if (rit != addr_to_readers.end()) {
-                    for (size_t j : rit->second) {
-                        result.dataflow_edges.emplace_back(
-                            ev.inst_id, result.events[j].inst_id, 0, ev.store_addr);
-                    }
-                }
-            }
-
-            // Register this event's reads for future store matching.
-            for (uint8_t sr : ev.src_regs) {
-                reg_consumer[sr] = ev.inst_id;
-            }
-            for (uint64_t ma : ev.src_mem_addrs) {
-                addr_to_readers[ma].push_back(i);
-            }
-        }
-    }
-
-    result.max_depth = result.events.size();
-
-    ctx.progress(1.0f, fmt::format(
-        "Backward taint (heuristic): {} contributing, {} steps, "
+        "Backward taint ({}): {} contributing, {} steps, "
         "{} idx-jumps, {} idx-skipped, {} edges",
+        method_label,
         result.contributing_inst_ids.cardinality(), steps,
         index_jumps, index_skipped, result.dataflow_edges.size()));
 
     return PassResult::success(std::move(result));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Triton-based classifier
+// ═══════════════════════════════════════════════════════════════════════════
+
+static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
+    auto& code_table = ctx.code_table();
+
+    auto bridge_ptr = create_triton_bridge();
+    if (!bridge_ptr->is_available()) {
+        return PassResult::failed("Triton bridge not available for backward taint");
+    }
+
+    auto* triton = dynamic_cast<TritonBridgeTaint*>(bridge_ptr.get());
+    if (!triton) {
+        return PassResult::failed("Triton bridge does not support taint interface");
+    }
+
+    // Capture bridge_ptr and code_table for use in the classifier lambda.
+    // The lambda is called once per instruction in the hot loop.
+    auto classify = [&bridge_ptr, &code_table](const InstView& inst) -> InstructionInfo {
+        InstructionInfo info;
+
+        auto opcode_opt = code_table.opcode_at(inst.pc);
+        if (!opcode_opt) {
+            info.valid = false;
+            return info;
+        }
+
+        uint32_t opcode_val = *opcode_opt;
+        auto* opcode_bytes = reinterpret_cast<const uint8_t*>(&opcode_val);
+
+        // query_semantics only needs opcode bytes to determine read/write register sets
+        // via Triton's instruction decoder. No register context needed.
+        auto sem_result = bridge_ptr->query_semantics(inst.pc, opcode_bytes, 4);
+        if (!sem_result) {
+            info.valid = false;
+            return info;
+        }
+
+        const auto& sem = *sem_result;
+
+        // Populate written/read registers from Triton semantics
+        for (const auto& ra : sem.reg_accesses) {
+            if (ra.is_written) {
+                info.written_regs.push_back({ra.reg_id});
+                if (ra.reg_id == REG_X30) {
+                    info.is_bl_site = true;
+                }
+            }
+            if (ra.is_read) {
+                info.read_regs.push_back({ra.reg_id});
+            }
+        }
+
+        // Check semantic memory reads (Triton provides this info)
+        for (const auto& ma : sem.mem_accesses) {
+            if (ma.is_read) {
+                info.has_memory_reads = true;
+                break;
+            }
+        }
+
+        return info;
+    };
+
+    return run_backward_taint_common(ctx, config, classify, "Triton");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Heuristic classifier (fallback)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
+    // Heuristic: uses reg_diff entries to infer written registers.
+    // All reg_diff entries are treated as writes; those not in the destination set
+    // become potential source dependencies (overapproximation).
+    auto classify = [](const InstView& inst) -> InstructionInfo {
+        InstructionInfo info;
+
+        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+            auto diff = inst.reg_diff(i);
+            info.written_regs.push_back({diff.index});
+            if (diff.index == REG_X30) {
+                info.is_bl_site = true;
+            }
+        }
+
+        // For heuristic: read_regs are the same reg_diff set minus dst_regs.
+        // This is an overapproximation: we treat all modified registers as potential
+        // sources. The traversal loop filters out actual dst_regs.
+        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+            auto diff = inst.reg_diff(i);
+            info.read_regs.push_back({diff.index});
+        }
+
+        // Heuristic always considers memory reads possible (relies on inst.mem_access)
+        info.has_memory_reads = true;
+
+        return info;
+    };
+
+    return run_backward_taint_common(ctx, config, classify, "heuristic");
 }
 
 // --- BackwardTaintPass dispatch --------------------------------------------

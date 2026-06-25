@@ -495,6 +495,34 @@ PassResult FunctionPass::run(PassContext& ctx) {
         }
     };
 
+    // ─── Shared helper: extract SP value from register diffs ───
+    // Returns {sp_value, was_updated}. Used by both scan paths.
+    auto extract_sp = [](const auto& inst) -> std::pair<uint64_t, bool> {
+        for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
+            auto diff = inst.reg_diff(d);
+            if (diff.index == IDX_SP) return {diff.value, true};
+        }
+        return {0, false};
+    };
+
+    // ─── Shared helper: fill in target_pc for the most recent call event ───
+    // Called when we land on the first instruction after a call site. This
+    // populates target_pc and registers/updates the function entry.
+    auto try_fill_call_target = [&](uint64_t cur_inst_id, uint64_t pc) {
+        if (result.call_events.empty()) return;
+        auto& last = result.call_events.back();
+        if (last.target_pc == 0 && last.call_inst_id == cur_inst_id - 1) {
+            last.target_pc = pc;
+            auto& func = result.functions[pc];
+            if (func.entry_pc == 0) {
+                func.entry_pc = pc;
+                func.name = fmt::format("sub_{:x}", pc - hdr.module_slide);
+            }
+            func.total_calls++;
+            func.call_event_indices.push_back(result.call_events.size() - 1);
+        }
+    };
+
     auto handle_inst = [&](uint64_t cur_inst_id, uint64_t pc,
                            uint64_t sp_new, bool sp_updated) {
         if (sp_updated) { current_sp = sp_new; sp_valid = true; }
@@ -507,44 +535,16 @@ PassResult FunctionPass::run(PassContext& ctx) {
             prev_was_unconditional_jump = false;
         }
 
+        // Always attempt to fill in the target PC for the preceding call.
+        try_fill_call_target(cur_inst_id, pc);
+
         auto kind_it = pc_kind.find(pc);
-        if (kind_it == pc_kind.end()) {
-            // Target PC fill-in for calls (handles call site → callee entry)
-            if (!result.call_events.empty()) {
-                auto& last = result.call_events.back();
-                if (last.target_pc == 0 && last.call_inst_id == cur_inst_id - 1) {
-                    last.target_pc = pc;
-                    auto& func = result.functions[pc];
-                    if (func.entry_pc == 0) {
-                        func.entry_pc = pc;
-                        func.name = fmt::format("sub_{:x}", pc - hdr.module_slide);
-                    }
-                    func.total_calls++;
-                    func.call_event_indices.push_back(result.call_events.size() - 1);
-                }
-            }
-            return;
-        }
+        if (kind_it == pc_kind.end()) return;
 
         uint8_t bits = kind_it->second;
         bool is_call  = (bits & KIND_CALL)   != 0;
         bool is_ret   = (bits & KIND_RET)    != 0;
         bool is_b     = (bits & KIND_BRANCH) != 0;
-
-        // Target PC fill-in
-        if (!result.call_events.empty()) {
-            auto& last = result.call_events.back();
-            if (last.target_pc == 0 && last.call_inst_id == cur_inst_id - 1) {
-                last.target_pc = pc;
-                auto& func = result.functions[pc];
-                if (func.entry_pc == 0) {
-                    func.entry_pc = pc;
-                    func.name = fmt::format("sub_{:x}", pc - hdr.module_slide);
-                }
-                func.total_calls++;
-                func.call_event_indices.push_back(result.call_events.size() - 1);
-            }
-        }
 
         if (is_call) {
             CallEvent evt;
@@ -639,14 +639,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
                 auto inst = rec.as_inst();
                 uint64_t pc = inst.pc;
 
-                // Extract SP diff from this record
-                uint64_t sp_new = 0;
-                bool sp_updated = false;
-                for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-                    auto diff = inst.reg_diff(d);
-                    if (diff.index == IDX_SP) { sp_new = diff.value; sp_updated = true; }
-                }
-
+                auto [sp_new, sp_updated] = extract_sp(inst);
                 handle_inst(cur_id, pc, sp_new, sp_updated);
                 processed++;
 
@@ -694,12 +687,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
             auto inst = rec.as_inst();
             uint64_t pc = inst.pc;
 
-            uint64_t sp_new = 0; bool sp_upd = false;
-            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                auto diff = inst.reg_diff(i);
-                if (diff.index == IDX_SP) { sp_new = diff.value; sp_upd = true; }
-            }
-
+            auto [sp_new, sp_upd] = extract_sp(inst);
             handle_inst(inst_id, pc, sp_new, sp_upd);
             inst_id++;
             processed++;

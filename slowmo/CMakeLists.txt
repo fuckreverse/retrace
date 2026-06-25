@@ -377,6 +377,13 @@ src/core/register_file.cpp
     src/io/streaming_index.cpp
     src/tui/tui_app.cpp
     src/tui/hex_dump_view.cpp
+    src/tui/panels/register_panel.cpp
+    src/tui/panels/memory_panel.cpp
+    src/tui/panels/callstack_panel.cpp
+    src/tui/panels/functions_panel.cpp
+    src/tui/panels/strings_panel.cpp
+    src/tui/panels/thread_panel.cpp
+    src/tui/panels/breakpoint_panel.cpp
 )
 
 target_include_directories(tenet_lib BEFORE PUBLIC
@@ -482,7 +489,7 @@ src/gui/popups.cpp
 endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
-add_executable(tenet src/main.cpp)
+add_executable(tenet src/main.cpp src/cli_options.cpp src/batch_analysis.cpp)
 
 if(TENET_ENABLE_GUI)
     # tenet_gui_lib already PUBLIC-links tenet_lib; no need to add tenet_lib again

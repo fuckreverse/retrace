@@ -22,6 +22,101 @@
 #include <cstring>
 #include <string>
 
+
+// ============================================================================
+// Color Constants
+// ============================================================================
+// Named constants for all inline IM_COL32 values used in the timeline, minimap,
+// and status bar. Grouped by semantic role.
+
+namespace {
+
+// -- Timeline / Progress Overlay ----------------------------------------------
+// Track background & borders
+constexpr ImU32 kTimelineBg           = IM_COL32(15, 17, 24, 240);
+constexpr ImU32 kTimelineTopBorder    = IM_COL32(60, 70, 110, 80);
+constexpr ImU32 kTimelineLaneSep      = IM_COL32(40, 45, 65, 100);
+constexpr ImU32 kTimelineLaneSepDim   = IM_COL32(40, 45, 65, 80);
+constexpr ImU32 kTimelineBottomBorder = IM_COL32(50, 55, 80, 180);
+
+// Fallback progress gradient (no xref available)
+constexpr ImU32 kFallbackGradLeft     = IM_COL32(32, 60, 115, 120);
+constexpr ImU32 kFallbackGradRight    = IM_COL32(42, 85, 155, 150);
+
+// Taint overlay (Lane 1)
+constexpr ImU32 kTaintForward         = IM_COL32(42, 195, 82, 180);
+constexpr ImU32 kTaintBackward        = IM_COL32(215, 55, 55, 180);
+
+// Memory-watch activity (orange)
+constexpr ImU32 kMemWatchMarker       = IM_COL32(255, 140, 30, 200);
+
+// Call-depth sparkline (Lane 2)
+constexpr ImU32 kSparklineFillTop     = IM_COL32(40, 100, 200, 60);
+constexpr ImU32 kSparklineFillBot     = IM_COL32(40, 100, 200, 20);
+constexpr ImU32 kSparklineLine        = IM_COL32(60, 140, 255, 150);
+
+// Markers (Lane 3)
+constexpr ImU32 kMarkerLoopHeader     = IM_COL32(255, 138, 24, 200);
+constexpr ImU32 kMarkerCallTick       = IM_COL32(60, 145, 255, 100);
+constexpr ImU32 kMarkerSearchHit      = IM_COL32(255, 200, 30, 180);
+constexpr ImU32 kBookmarkFill         = IM_COL32(255, 205, 45, 235);
+constexpr ImU32 kBookmarkOutline      = IM_COL32(255, 240, 130, 160);
+
+// Current position cursor
+constexpr ImU32 kCursorLine           = IM_COL32(110, 175, 255, 255);
+constexpr ImU32 kCursorTriangle       = IM_COL32(140, 195, 255, 230);
+
+// Hover line
+constexpr ImU32 kHoverLine            = IM_COL32(200, 200, 200, 50);
+
+// -- Minimap Panel ------------------------------------------------------------
+constexpr ImU32 kMinimapBg            = IM_COL32(18, 18, 22, 255);
+constexpr ImU32 kMinimapBookmark      = IM_COL32(255, 220, 40, 255);
+constexpr ImU32 kMinimapBackTaint     = IM_COL32(220, 60, 60, 200);
+constexpr ImU32 kMinimapTaint         = IM_COL32(40, 200, 80, 200);
+constexpr ImU32 kMinimapLoopHeader    = IM_COL32(255, 140, 30, 230);
+constexpr ImU32 kMinimapLoopBody      = IM_COL32(140, 80, 20, 180);
+constexpr ImU32 kMinimapCall          = IM_COL32(80, 140, 255, 150);
+constexpr ImU32 kMinimapBranch        = IM_COL32(200, 200, 60, 120);
+constexpr ImU32 kMinimapDefault       = IM_COL32(55, 58, 70, 255);
+constexpr ImU32 kMinimapCursorLine    = IM_COL32(255, 255, 255, 240);
+constexpr ImU32 kMinimapViewport      = IM_COL32(255, 220, 60, 160);
+
+// -- Helpers ------------------------------------------------------------------
+
+/// Draw evenly-sampled vertical marker lines for a sorted vector of inst_ids.
+/// At most `max_marks` lines are drawn between y_top and y_bot.
+static void draw_sampled_markers(ImDrawList* draw, const std::vector<uint64_t>& ids,
+                                 size_t max_marks, float p0_x, float W,
+                                 uint64_t total_inst, float y_top, float y_bot,
+                                 ImU32 color, float thickness = 1.0f) {
+    if (ids.empty()) return;
+    size_t step = std::max(size_t(1), ids.size() / max_marks);
+    for (size_t i = 0; i < ids.size(); i += step) {
+        float x = p0_x + static_cast<float>(ids[i]) / static_cast<float>(total_inst) * W;
+        draw->AddLine(ImVec2(x, y_top), ImVec2(x, y_bot), color, thickness);
+    }
+}
+
+/// Draw a diamond-shaped bookmark marker at the given x position.
+static void draw_bookmark_diamond(ImDrawList* draw, float x, float cy, float r,
+                                  ImU32 fill_col, ImU32 outline_col) {
+    draw->AddQuadFilled(
+        ImVec2(x,     cy - r),
+        ImVec2(x + r, cy),
+        ImVec2(x,     cy + r),
+        ImVec2(x - r, cy),
+        fill_col);
+    draw->AddQuad(
+        ImVec2(x,     cy - r),
+        ImVec2(x + r, cy),
+        ImVec2(x,     cy + r),
+        ImVec2(x - r, cy),
+        outline_col, 1.0f);
+}
+
+}  // anonymous namespace
+
 namespace tenet {
 
 // ─── Thread Panel ────────────────────────────────────────────────────────────
@@ -415,8 +510,8 @@ void GuiApp::render_progress_overlay() {
     float H = bar_height;
 
     // ── Track background ─────────────────────────────────────────────
-    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H), IM_COL32(15, 17, 24, 240));
-    draw->AddLine(p0, ImVec2(p0.x + W, p0.y), IM_COL32(60, 70, 110, 80), 1.0f);
+    draw->AddRectFilled(p0, ImVec2(p0.x + W, p0.y + H), kTimelineBg);
+    draw->AddLine(p0, ImVec2(p0.x + W, p0.y), kTimelineTopBorder, 1.0f);
 
     // ── Lane layout ──────────────────────────────────────────────────
     // Lane 0: heatmap background         [0,         H*0.30)
@@ -523,26 +618,21 @@ void GuiApp::render_progress_overlay() {
             float fill_x = p0.x + progress * W;
             draw->AddRectFilledMultiColor(
                 p0, ImVec2(fill_x, p0.y + L0_bot),
-                IM_COL32(32, 60, 115, 120), IM_COL32(42, 85, 155, 150),
-                IM_COL32(42, 85, 155, 150), IM_COL32(32, 60, 115, 120));
+                kFallbackGradLeft, kFallbackGradRight,
+                kFallbackGradRight, kFallbackGradLeft);
         }
     }
 
     // Subtle separator between heatmap and taint lanes
     draw->AddLine(ImVec2(p0.x, p0.y + L0_bot),
                   ImVec2(p0.x + W, p0.y + L0_bot),
-                  IM_COL32(40, 45, 65, 100), 1.0f);
+                  kTimelineLaneSep, 1.0f);
 
     // ── LANE 1: Taint overlays ────────────────────────────────────────
     if (show_taint_ && taint_result_ && !taint_sorted_ids_.empty()) {
-        const size_t kMax = 3000;
-        size_t step = std::max(size_t(1), taint_sorted_ids_.size() / kMax);
-        for (size_t ti = 0; ti < taint_sorted_ids_.size(); ti += step) {
-            float tx = inst_to_x(taint_sorted_ids_[ti]);
-            draw->AddLine(ImVec2(tx, p0.y + L1_top),
-                          ImVec2(tx, p0.y + L1_bot),
-                          IM_COL32(42, 195, 82, 180), 1.0f);
-        }
+        draw_sampled_markers(draw, taint_sorted_ids_, 3000,
+                             p0.x, W, total_inst_,
+                             p0.y + L1_top, p0.y + L1_bot, kTaintForward);
     }
     if (show_backward_taint_ && backward_taint_result_) {
         size_t shown = 0;
@@ -551,7 +641,7 @@ void GuiApp::render_progress_overlay() {
                 float tx = inst_to_x(id);
                 draw->AddLine(ImVec2(tx, p0.y + L1_top),
                               ImVec2(tx, p0.y + L1_bot),
-                              IM_COL32(215, 55, 55, 180), 1.0f);
+                              kTaintBackward, 1.0f);
                 shown++;
             }
         }
@@ -561,12 +651,9 @@ void GuiApp::render_progress_overlay() {
     // If ctx_mem_addr_ is set, mark all accesses to that address in timeline
     if (timeline_watch_addr_ != 0) {
         auto writes = memory_.write_history(timeline_watch_addr_, 1);
-        for (uint64_t wid : writes) {
-            float wx = inst_to_x(wid);
-            draw->AddLine(ImVec2(wx, p0.y + L1_top),
-                          ImVec2(wx, p0.y + L1_bot),
-                          IM_COL32(255, 140, 30, 200), 1.5f);
-        }
+        draw_sampled_markers(draw, writes, writes.size(),
+                             p0.x, W, total_inst_,
+                             p0.y + L1_top, p0.y + L1_bot, kMemWatchMarker, 1.5f);
     }
 
     // ── LANE 2: Call-depth sparkline ──────────────────────────────────
@@ -620,10 +707,10 @@ void GuiApp::render_progress_overlay() {
             if (si > 0 && (depth != prev_depth || si == kSamples)) {
                 draw->AddRectFilledMultiColor(
                     ImVec2(prev_x, prev_y), ImVec2(fx, p0.y + L2_bot),
-                    IM_COL32(40, 100, 200, 60), IM_COL32(40, 100, 200, 60),
-                    IM_COL32(40, 100, 200, 20), IM_COL32(40, 100, 200, 20));
+                    kSparklineFillTop, kSparklineFillTop,
+                    kSparklineFillBot, kSparklineFillBot);
                 draw->AddLine(ImVec2(prev_x, prev_y), ImVec2(fx, prev_y),
-                              IM_COL32(60, 140, 255, 150), 1.0f);
+                              kSparklineLine, 1.0f);
             }
             prev_x = fx;
             prev_y = fy;
@@ -634,7 +721,7 @@ void GuiApp::render_progress_overlay() {
     // Subtle separator between depth and marker lanes
     draw->AddLine(ImVec2(p0.x, p0.y + L3_top),
                   ImVec2(p0.x + W, p0.y + L3_top),
-                  IM_COL32(40, 45, 65, 80), 1.0f);
+                  kTimelineLaneSepDim, 1.0f);
 
     // ── LANE 3: Markers (bookmarks, loops, calls, search) ────────────
 
@@ -660,7 +747,7 @@ void GuiApp::render_progress_overlay() {
             draw->AddRectFilled(
                 ImVec2(lx - 1.0f, p0.y + L3_top),
                 ImVec2(lx + 1.0f, p0.y + H),
-                IM_COL32(255, 138, 24, 200));
+                kMarkerLoopHeader);
         }
     }
 
@@ -674,39 +761,22 @@ void GuiApp::render_progress_overlay() {
             draw->AddLine(
                 ImVec2(cx, p0.y + L3_top),
                 ImVec2(cx, p0.y + H),
-                IM_COL32(60, 145, 255, 100), 1.0f);
+                kMarkerCallTick, 1.0f);
         }
     }
 
     // Search-hit sparks (gold)
     if (search_active_ && !search_results_.empty()) {
-        const size_t kMaxHits = 1000;
-        size_t step = std::max(size_t(1), search_results_.size() / kMaxHits);
-        for (size_t hi = 0; hi < search_results_.size(); hi += step) {
-            float hx = inst_to_x(search_results_[hi]);
-            draw->AddLine(ImVec2(hx, p0.y),
-                          ImVec2(hx, p0.y + H),
-                          IM_COL32(255, 200, 30, 180), 1.0f);
-        }
+        draw_sampled_markers(draw, search_results_, 1000,
+                             p0.x, W, total_inst_,
+                             p0.y, p0.y + H, kMarkerSearchHit);
     }
 
     // Bookmark diamonds (in marker lane)
     for (uint64_t bid : bookmarks_) {
         float bx = inst_to_x(bid);
         float cy = p0.y + L3_top + (H - L3_top) * 0.5f;
-        float r  = 3.5f;
-        draw->AddQuadFilled(
-            ImVec2(bx,     cy - r),
-            ImVec2(bx + r, cy),
-            ImVec2(bx,     cy + r),
-            ImVec2(bx - r, cy),
-            IM_COL32(255, 205, 45, 235));
-        draw->AddQuad(
-            ImVec2(bx,     cy - r),
-            ImVec2(bx + r, cy),
-            ImVec2(bx,     cy + r),
-            ImVec2(bx - r, cy),
-            IM_COL32(255, 240, 130, 160), 1.0f);
+        draw_bookmark_diamond(draw, bx, cy, 3.5f, kBookmarkFill, kBookmarkOutline);
     }
 
     // ── Current position cursor ───────────────────────────────────────
@@ -716,17 +786,17 @@ void GuiApp::render_progress_overlay() {
     float fill_x = p0.x + progress * W;
 
     draw->AddLine(ImVec2(fill_x, p0.y), ImVec2(fill_x, p0.y + H),
-                  IM_COL32(110, 175, 255, 255), 2.0f);
+                  kCursorLine, 2.0f);
     draw->AddTriangleFilled(
         ImVec2(fill_x - 4.0f, p0.y),
         ImVec2(fill_x + 4.0f, p0.y),
         ImVec2(fill_x, p0.y + 7.0f),
-        IM_COL32(140, 195, 255, 230));
+        kCursorTriangle);
 
     // ── Bottom separator ─────────────────────────────────────────────
     draw->AddLine(ImVec2(p0.x, p0.y + H - 0.5f),
                   ImVec2(p0.x + W, p0.y + H - 0.5f),
-                  IM_COL32(50, 55, 80, 180), 1.0f);
+                  kTimelineBottomBorder, 1.0f);
 
     // ── Interaction: hover tooltip + click/drag to seek ──────────────
     ImGui::SetCursorPos(ImVec2(0, 0));
@@ -805,7 +875,7 @@ void GuiApp::render_progress_overlay() {
         float mx_screen = ImGui::GetIO().MousePos.x;
         draw->AddLine(ImVec2(mx_screen, p0.y),
                       ImVec2(mx_screen, p0.y + H),
-                      IM_COL32(200, 200, 200, 50), 1.0f);
+                      kHoverLine, 1.0f);
     }
 
     ImGui::End();
@@ -850,7 +920,7 @@ void GuiApp::render_minimap_panel() {
 
     // Background
     draw->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + panel_w, canvas_pos.y + panel_h),
-                        IM_COL32(18, 18, 22, 255));
+                        kMinimapBg);
 
     // Instructions per pixel row
     int pixel_rows = static_cast<int>(panel_h);
@@ -921,14 +991,14 @@ void GuiApp::render_minimap_panel() {
 
         // Choose color based on analysis priority
         ImU32 col;
-        if (has_bookmark)       col = IM_COL32(255, 220, 40,  255);
-        else if (has_back_taint) col = IM_COL32(220, 60,  60,  200);
-        else if (has_taint)      col = IM_COL32(40,  200, 80,  200);
-        else if (has_loop_header) col = IM_COL32(255, 140, 30, 230);
-        else if (has_loop_body)  col = IM_COL32(140, 80,  20,  180);
-        else if (has_call)       col = IM_COL32(80,  140, 255, 150);
-        else if (has_branch)     col = IM_COL32(200, 200, 60,  120);
-        else                     col = IM_COL32(55,  58,  70,  255);
+        if (has_bookmark)       col = kMinimapBookmark;
+        else if (has_back_taint) col = kMinimapBackTaint;
+        else if (has_taint)      col = kMinimapTaint;
+        else if (has_loop_header) col = kMinimapLoopHeader;
+        else if (has_loop_body)  col = kMinimapLoopBody;
+        else if (has_call)       col = kMinimapCall;
+        else if (has_branch)     col = kMinimapBranch;
+        else                     col = kMinimapDefault;
 
         draw->AddLine(ImVec2(canvas_pos.x, y0), ImVec2(canvas_pos.x + panel_w, y1), col, 1.0f);
     }
@@ -938,7 +1008,7 @@ void GuiApp::render_minimap_panel() {
         float cur_y = canvas_pos.y +
             static_cast<float>(current_inst_) / static_cast<float>(total_inst_) * panel_h;
         draw->AddLine(ImVec2(canvas_pos.x, cur_y), ImVec2(canvas_pos.x + panel_w, cur_y),
-                      IM_COL32(255, 255, 255, 240), 2.0f);
+                      kMinimapCursorLine, 2.0f);
         // Viewport window indicator (yellow bracket)
         // Estimate visible range from instruction panel scroll
         uint64_t vis_rows = 40;  // conservative estimate
@@ -950,7 +1020,7 @@ void GuiApp::render_minimap_panel() {
             static_cast<float>(total_inst_) * panel_h;
         draw->AddRect(ImVec2(canvas_pos.x, vis_start_y),
                       ImVec2(canvas_pos.x + panel_w, vis_end_y),
-                      IM_COL32(255, 220, 60, 160), 0.0f, 0, 1.5f);
+                      kMinimapViewport, 0.0f, 0, 1.5f);
     }
 
     // Handle click: navigate to clicked instruction

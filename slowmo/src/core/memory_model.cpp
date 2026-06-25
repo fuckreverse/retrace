@@ -489,35 +489,7 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
             }
         }
     } else {
-        // In-memory fallback path — LRU cache needs mutex protection
-        std::lock_guard<std::mutex> lk(cache_mutex_);
-        for (uint8_t i = 0; i < size; i++) {
-            uint64_t byte_addr = addr + i;
-            uint64_t page = page_of(byte_addr);
-
-            auto* writes = page_cache_.get_mutable(page);
-            if (!writes) continue;
-
-            stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
-
-            // Scan from newest to oldest to find last write covering this byte
-            const MemWrite* best = nullptr;
-            for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-                if (rit->inst_id > at_inst_id) continue;
-                // Check if this write covers our byte
-                if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
-                    best = &(*rit);
-                    break;
-                }
-            }
-
-            if (best) {
-                uint8_t offset_in_write = static_cast<uint8_t>(byte_addr - best->addr);
-                result.data[i] = best->data[offset_in_write];
-                result.known[i] = true;
-                result.writer_id[i] = best->inst_id;
-            }
-        }
+        return read_inmemory(addr, size, at_inst_id);
     }
 
     return result;
@@ -652,6 +624,102 @@ bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
     }
 
     return false;
+}
+
+// ─── In-memory fallback helpers ──────────────────────────────────────────
+// These methods implement the non-RocksDB query paths using page_cache_.
+// Each acquires cache_mutex_ internally, matching the original inline code.
+
+MemReadResult MemoryModel::read_inmemory(uint64_t addr, uint8_t size, uint64_t at_inst_id) {
+    MemReadResult result{};
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    for (uint8_t i = 0; i < size; i++) {
+        uint64_t byte_addr = addr + i;
+        uint64_t page = page_of(byte_addr);
+
+        auto* writes = page_cache_.get_mutable(page);
+        if (!writes) continue;
+
+        stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+
+        // Scan from newest to oldest to find last write covering this byte
+        const MemWrite* best = nullptr;
+        for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
+            if (rit->inst_id > at_inst_id) continue;
+            // Check if this write covers our byte
+            if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
+                best = &(*rit);
+                break;
+            }
+        }
+
+        if (best) {
+            uint8_t offset_in_write = static_cast<uint8_t>(byte_addr - best->addr);
+            result.data[i] = best->data[offset_in_write];
+            result.known[i] = true;
+            result.writer_id[i] = best->inst_id;
+        }
+    }
+    return result;
+}
+
+uint64_t MemoryModel::last_writer_inmemory(uint64_t addr, uint8_t size, uint64_t search_id) {
+    uint64_t latest_writer = 0;
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    for (uint8_t i = 0; i < size; i++) {
+        uint64_t byte_addr = addr + i;
+        uint64_t page = page_of(byte_addr);
+
+        auto* writes = page_cache_.get_mutable(page);
+        if (!writes) continue;
+
+        for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
+            if (rit->inst_id > search_id) continue;
+            if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
+                latest_writer = std::max(latest_writer, rit->inst_id);
+                break;
+            }
+        }
+    }
+    return latest_writer;
+}
+
+std::vector<uint64_t> MemoryModel::write_history_inmemory(uint64_t addr, uint8_t size) {
+    std::vector<uint64_t> result;
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    uint64_t page = page_of(addr);
+    auto* writes = page_cache_.get_mutable(page);
+    if (writes) {
+        for (const auto& w : *writes) {
+            if (addr >= w.addr && addr < w.addr + w.size) {
+                result.push_back(w.inst_id);
+            }
+        }
+    }
+    return result;
+}
+
+std::optional<uint8_t> MemoryModel::byte_at_inmemory(uint64_t addr, uint64_t at_inst_id) {
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    uint64_t page = page_of(addr);
+    auto* writes = page_cache_.get_mutable(page);
+    if (!writes) return std::nullopt;
+
+    for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
+        if (rit->inst_id > at_inst_id) continue;
+        if (addr >= rit->addr && addr < rit->addr + rit->size) {
+            uint8_t offset = static_cast<uint8_t>(addr - rit->addr);
+            return rit->data[offset];
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool MemoryModel::was_accessed_inmemory(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    uint64_t page = page_of(addr);
+    return page_cache_.get_mutable(page) != nullptr;
 }
 
 // ─── Extended API implementations ─────────────────────────────────────────
@@ -987,9 +1055,7 @@ bool MemoryModel::was_accessed(uint64_t addr) {
     ensure_built();
 
     if (!has_rocksdb_) {
-        std::lock_guard<std::mutex> lk(cache_mutex_);
-        uint64_t page = page_of(addr);
-        return page_cache_.get_mutable(page) != nullptr;
+        return was_accessed_inmemory(addr);
     }
 
     uint64_t page = page_of(addr);
@@ -1106,22 +1172,7 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
             }
         }
     } else {
-        std::lock_guard<std::mutex> lk(cache_mutex_);
-        for (uint8_t i = 0; i < size; i++) {
-            uint64_t byte_addr = addr + i;
-            uint64_t page = page_of(byte_addr);
-
-            auto* writes = page_cache_.get_mutable(page);
-            if (!writes) continue;
-
-            for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-                if (rit->inst_id > search_id) continue;
-                if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
-                    latest_writer = std::max(latest_writer, rit->inst_id);
-                    break;
-                }
-            }
-        }
+        return last_writer_inmemory(addr, size, search_id);
     }
 
     return latest_writer;
@@ -1169,16 +1220,7 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
             }
         }
     } else {
-        std::lock_guard<std::mutex> lk(cache_mutex_);
-        uint64_t page = page_of(addr);
-        auto* writes = page_cache_.get_mutable(page);
-        if (writes) {
-            for (const auto& w : *writes) {
-                if (addr >= w.addr && addr < w.addr + w.size) {
-                    result.push_back(w.inst_id);
-                }
-            }
-        }
+        result = write_history_inmemory(addr, size);
     }
 
     std::sort(result.begin(), result.end());
@@ -1235,21 +1277,7 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
         return std::nullopt;
     }
 
-    // In-memory fallback
-    std::lock_guard<std::mutex> lk(cache_mutex_);
-    uint64_t page = page_of(addr);
-    auto* writes = page_cache_.get_mutable(page);
-    if (!writes) return std::nullopt;
-
-    for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-        if (rit->inst_id > at_inst_id) continue;
-        if (addr >= rit->addr && addr < rit->addr + rit->size) {
-            uint8_t offset = static_cast<uint8_t>(addr - rit->addr);
-            return rit->data[offset];
-        }
-    }
-
-    return std::nullopt;
+    return byte_at_inmemory(addr, at_inst_id);
 }
 
 }  // namespace tenet

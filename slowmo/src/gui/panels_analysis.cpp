@@ -195,92 +195,129 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         show_callstack_   = true;
         show_functions_   = true;
         goto_candidates_dirty_ = true;
-        // Functions panel is the primary tab of dock_left_sidebar — it is
-        // already the active tab, so no FocusWindow needed here.
-        // CallStack is behind Analysis in dock_center_bottom; register it
-        // so we can make it visible without forcing a full focus steal.
-        // (We intentionally do NOT focus CallStack automatically — it would
-        //  be disruptive.  Functions is the primary view the user wants.)
-    } else if (name == "xref") {
+        // Functions panel is the primary tab of dock_left_sidebar — already
+        // active, so no FocusWindow needed.  CallStack is intentionally NOT
+        // auto-focused to avoid being disruptive.
+        return;
+    }
+    if (name == "xref") {
         xref_result_  = &raw->get<XrefResult>();
         xref_cursor_  = 0;
-    } else if (name == "strings") {
+        return;
+    }
+    if (name == "strings") {
         string_result_  = &raw->get<StringResult>();
         show_strings_   = true;
         string_cursor_  = 0;
         string_filter_.clear();
         std::memset(string_filter_buf_, 0, sizeof(string_filter_buf_));
         // Strings shares dock_center_main with Instructions (default active).
-        // Queue a FocusWindow so the Strings tab becomes visible, but only
-        // if the user has not already selected a different tab manually.
+        // Queue FocusWindow so Strings tab becomes visible.
         pending_focus_windows_.push_back("Strings");
-    } else if (name == "thread") {
+        return;
+    }
+    if (name == "thread") {
         thread_result_ = &raw->get<ThreadResult>();
         show_threads_  = true;
         // Threads shares dock_left_sidebar with Functions (default active).
         // Do NOT auto-focus Threads — Functions is the primary view.
-    } else if (name == "loop") {
+        return;
+    }
+    if (name == "loop") {
         loop_result_ = &raw->get<LoopResult>();
         show_loops_  = true;
-    } else if (name == "call_graph") {
+        return;
+    }
+    if (name == "call_graph") {
         call_graph_result_ = &raw->get<CallGraphResult>();
         show_call_graph_   = true;
         pending_focus_windows_.push_back("Call Graph");
-    } else if (name == "cfg") {
+        return;
+    }
+    if (name == "cfg") {
         cfg_result_ = &raw->get<CFGResult>();
         show_cfg_   = true;
         // CFG shares dock_center_main with Instructions.
-        // Do NOT auto-focus CFG — Instructions is the primary disasm view.
-    } else if (name == "constant_materialization") {
+        // Do NOT auto-focus — Instructions is the primary disasm view.
+        return;
+    }
+    if (name == "constant_materialization") {
         constant_result_ = &raw->get<ConstantMaterializationResult>();
         show_constant_   = true;
         pending_focus_windows_.push_back("Constants");
-    } else if (name == "pattern") {
+        return;
+    }
+    if (name == "pattern") {
         pattern_result_ = &raw->get<PatternResult>();
         show_pattern_   = true;
         pending_focus_windows_.push_back("Patterns");
-    } else if (name == "loop_semantics") {
+        return;
+    }
+    if (name == "loop_semantics") {
         loop_semantics_result_ = &raw->get<LoopSemanticsResult>();
         show_loop_semantics_   = true;
-    } else if (name == "algorithm_summary") {
+        return;
+    }
+    if (name == "algorithm_summary") {
         algorithm_summary_result_ = &raw->get<AlgorithmSummaryResult>();
         show_algorithm_summary_   = true;
         pending_focus_windows_.push_back("Algorithm Summary");
-    } else if (name == "symbol_annotation") {
+        return;
+    }
+    if (name == "symbol_annotation") {
         annotation_result_ = &raw->get<AnnotationResult>();
-    } else if (name == "objc") {
+        return;
+    }
+    if (name == "objc") {
         objc_result_ = &raw->get<ObjcResult>();
         show_objc_   = true;
         pending_focus_windows_.push_back("ObjC Messages");
-    } else if (name == "taint") {
+        return;
+    }
+    if (name == "taint") {
         taint_result_ = &raw->get<TaintResult>();
         show_taint_   = true;
-    } else if (name == "backward_taint") {
+        return;
+    }
+    if (name == "backward_taint") {
         backward_taint_result_ = &raw->get<BackwardTaintResult>();
         show_backward_taint_   = true;
-    } else if (name == "slice") {
+        return;
+    }
+    if (name == "slice") {
         slice_result_ = &raw->get<SliceResult>();
         show_slice_   = true;
-    } else if (name == "objc_crypto") {
+        return;
+    }
+    if (name == "objc_crypto") {
         objc_crypto_result_ = &raw->get<ObjcCryptoResult>();
         show_objc_crypto_   = true;
         pending_focus_windows_.push_back("ObjC Crypto");
-    } else if (name == "memory_strings") {
+        return;
+    }
+    if (name == "memory_strings") {
         mem_string_result_ = &raw->get<MemoryStringResult>();
         show_mem_strings_  = true;
         pending_focus_windows_.push_back("Memory Strings");
-    } else if (name == "syscall_intercept") {
+        return;
+    }
+    if (name == "syscall_intercept") {
         syscall_result_          = &raw->get<SyscallInterceptResult>();
         show_syscall_intercept_  = true;
         pending_focus_windows_.push_back("API Intercepts");
-    } else if (name == "cache_sim") {
+        return;
+    }
+    if (name == "cache_sim") {
         cache_sim_result_ = &raw->get<CacheSimResult>();
         show_cache_sim_   = true;
         pending_focus_windows_.push_back("Cache Sim");
-    } else if (name == "trace_fold") {
+        return;
+    }
+    if (name == "trace_fold") {
         trace_fold_result_ = &raw->get<TraceFoldResult>();
         show_trace_fold_   = true;
         pending_focus_windows_.push_back("Trace Fold");
+        return;
     }
 }
 

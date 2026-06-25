@@ -248,6 +248,13 @@ private:
     /// Ensure build has been performed.
     void ensure_built();
 
+    // ─── In-memory fallback helpers (used when has_rocksdb_ == false) ────
+    MemReadResult read_inmemory(uint64_t addr, uint8_t size, uint64_t at_inst_id);
+    uint64_t last_writer_inmemory(uint64_t addr, uint8_t size, uint64_t search_id);
+    std::vector<uint64_t> write_history_inmemory(uint64_t addr, uint8_t size);
+    std::optional<uint8_t> byte_at_inmemory(uint64_t addr, uint64_t at_inst_id);
+    bool was_accessed_inmemory(uint64_t addr);
+
     const TraceReader& reader_;
     const TraceIndex& index_;
 
