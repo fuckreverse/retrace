@@ -14,7 +14,7 @@
 
 **三前端支持**：GUI（Dear ImGui + SDL3 + Metal，macOS 原生 GPU 渲染）、TUI（FTXUI 终端界面）、CLI（批量分析管线）三种使用模式。
 
-**MCP 集成**：内置 MCP 服务器（21 个工具），让 AI 直接驱动 tenet 的全部分析能力。
+**MCP 集成**：内置 C++ MCP 服务器（47 个工具），让 AI 直接驱动 tenet 的全部分析能力。支持假设管理、证据验证、批量查询和纪律注入等 AI 专属功能。
 
 ## 技术栈
 
@@ -172,11 +172,19 @@ tenet 当前包含 22 个分析 Pass：
 
 ## MCP 服务器
 
-`mcp/tenet_mcp_server.py` 提供 MCP 2024-11-05 协议的服务器，通过 JSON-RPC 2.0 over stdio 与 AI 客户端通信。零外部 Python 依赖（Python 3.9+）。
+内置 C++ MCP 服务器（`src/io/mcp_server.{h,cpp}`），实现 MCP 2024-11-05 协议，通过 JSON-RPC 2.0 over stdio 与 AI 客户端通信。编译进 tenet 二进制，零外部依赖。
 
-提供 21 个工具：`trace_open`, `trace_info`, `disasm`, `taint_forward`, `taint_backward`, `cfg_export`, `call_graph`, `pattern_scan`, `strings_scan`, `constants_scan`, `regstate`, `memread`, `mem_write_history`, `critical_path`, `search_pc`, `trace_diff`, `loop_semantics`, `symbol_annotation`, `memory_snapshot`, `dataflow_graph`, `algorithm_summary`, `objc_messages`。
+提供 47 个工具，分为以下几组：
 
-配置示例见 `mcp/mcp_config_example.json`。
+- **核心分析**（21 个）：`trace_info`, `disasm`, `get_reg`, `get_regs`, `memread`, `mem_write_history`, `mem_search`, `search_pc`, `taint_forward`, `taint_backward`, `critical_path`, `cfg_export`, `call_graph`, `pattern_scan`, `strings_scan`, `constants_scan`, `loop_semantics`, `trace_diff`, `dataflow_graph`, `algorithm_summary`, `objc_messages`
+- **内存/快照**（3 个）：`memory_snapshot`, `symbol_annotation`, `get_inst`
+- **索引/函数**（6 个）：`get_stats`, `get_xref`, `get_range`, `get_cfg`, `get_call_graph`, `list_functions`
+- **假设管理**（8 个）：`hypothesis_add`, `hypothesis_activate`, `hypothesis_add_evidence`, `hypothesis_conclude`, `hypothesis_abandon`, `hypothesis_list`, `hypothesis_get`, `hypothesis_mark_reviewed`（含反幻觉保护：结论需验证证据支撑，冲突图防止矛盾）
+- **证据验证**（1 个）：`verify_evidence`（直接对 RegisterFile/MemoryModel 做寄存器/内存/指令验证）
+- **批量查询**（1 个）：`batch_query`（单次调用执行最多 20 个子工具，减少往返开销）
+- **纪律注入**（自动）：DisciplineInjector 每 5 次工具调用发送简短提醒，每 20 次发送完整规则（R1-R9），保持 AI 分析纪律
+
+通过 `--mcp` 启动：`./tenet --mcp trace.bin`。
 
 ## YARA 规则
 
@@ -224,10 +232,7 @@ tools/tenet/
 │   ├── analysis-layer.md
 │   ├── ui-layer.md
 │   └── trace-format.md
-├── mcp/                        ← MCP 服务器（AI 驱动分析）
-│   ├── tenet_mcp_server.py
-│   ├── mcp_config_example.json
-│   └── README.md
+├── (MCP 服务器已内置于 src/io/mcp_server.{h,cpp})
 ├── rules/                      ← YARA 模式规则
 │   ├── crypto.yar
 │   ├── anti_debug.yar

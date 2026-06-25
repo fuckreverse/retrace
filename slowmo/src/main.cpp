@@ -47,6 +47,7 @@
 #include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/index_build_pass.h"
 #include "io/rpc_server.h"
+#include "io/mcp/mcp_server.h"
 #include "io/streaming_index.h"
 #include "io/recent_files.h"
 
@@ -568,6 +569,13 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --thread-filter [tid1,tid2,...]   Build per-thread instruction bitmaps\n");
     fmt::print(stderr, "  --rpc [socket_path]               Start JSON-RPC server over Unix socket\n");
     fmt::print(stderr, "                                    (blocks until client disconnects)\n");
+    fmt::print(stderr, "  --mcp                             Start MCP server over stdio (JSON-RPC 2.0)\n");
+    fmt::print(stderr, "                                    (blocks until stdin closes)\n");
+    fmt::print(stderr, "  --mcp-http [host:port]            Start MCP server over HTTP + SSE\n");
+    fmt::print(stderr, "                                    Default: 127.0.0.1:7080 (blocks until SIGINT)\n");
+    fmt::print(stderr, "  --mcp-host <addr>                 Bind address for --mcp-http (e.g. 0.0.0.0)\n");
+    fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 7080)\n");
+    fmt::print(stderr, "  --mcp-auth user:pass              Enable Basic Auth for --mcp-http\n");
     fmt::print(stderr, "  --streaming                       Tail a live trace file (real-time indexing)\n");
     fmt::print(stderr, "  --stats                           Print trace statistics as JSON\n");
     fmt::print(stderr, "\nMultiple analysis options can be combined; they execute in order.\n");
@@ -717,6 +725,13 @@ int main(int argc, char** argv) {
     // P3: RPC server mode
     bool opt_rpc = false;
     std::string rpc_socket_path;
+
+    // P3: MCP server mode (stdio)
+    bool opt_mcp = false;
+
+    // P3: MCP HTTP SSE server mode
+    bool opt_mcp_http = false;
+    McpHttpConfig mcp_http_cfg;
 
     // P3: Streaming / live trace
     bool opt_streaming = false;
@@ -962,6 +977,32 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 rpc_socket_path = argv[++i];
             }
+        } else if (arg == "--mcp") {
+            opt_mcp = true;
+        } else if (arg == "--mcp-http") {
+            opt_mcp_http = true;
+            // Optional sub-options: --mcp-http [host:port] [--mcp-auth user:pass]
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string hostport = argv[++i];
+                size_t colon = hostport.rfind(':');
+                if (colon != std::string::npos) {
+                    mcp_http_cfg.host = hostport.substr(0, colon);
+                    mcp_http_cfg.port = static_cast<uint16_t>(std::stoul(hostport.substr(colon + 1)));
+                } else {
+                    mcp_http_cfg.host = hostport;
+                }
+            }
+        } else if (arg == "--mcp-host" && i + 1 < argc) {
+            mcp_http_cfg.host = argv[++i];
+        } else if (arg == "--mcp-port" && i + 1 < argc) {
+            mcp_http_cfg.port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--mcp-auth" && i + 1 < argc) {
+            std::string auth = argv[++i];
+            size_t colon = auth.find(':');
+            if (colon != std::string::npos) {
+                mcp_http_cfg.username = auth.substr(0, colon);
+                mcp_http_cfg.password = auth.substr(colon + 1);
+            }
         } else if (arg == "--streaming") {
             opt_streaming = true;
         } else if (arg == "--stats") {
@@ -971,11 +1012,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (trace_path.empty()) {
-        fmt::print(stderr, "Error: no trace file specified\n");
-        print_usage(argv[0]);
-        return 1;
+if (trace_path.empty()) {
+    fmt::print(stderr, "Error: no trace file specified\n");
+    if (opt_mcp) {
+        fmt::print(stderr, "  Hint: --mcp requires a trace file, e.g.:\n");
+        fmt::print(stderr, "    tenet --mcp trace.bin\n");
     }
+    if (opt_mcp_http) {
+        fmt::print(stderr, "  Hint: --mcp-http requires a trace file, e.g.:\n");
+        fmt::print(stderr, "    tenet --mcp-http 127.0.0.1:7080 trace.bin\n");
+    }
+    print_usage(argv[0]);
+    return 1;
+}
 
     // ─── Init logger ────────────────────────────────────────────────────
     tenet::log::init();
@@ -998,14 +1047,18 @@ int main(int argc, char** argv) {
                                opt_dump_memaccess ||
                                // P3 options
                                opt_cache_sim || opt_yara_mem_scan || opt_thread_filter ||
-                               opt_rpc || opt_streaming || opt_stats_only ||
+                               opt_rpc || opt_mcp || opt_mcp_http || opt_streaming || opt_stats_only ||
                                opt_objc_crypto || opt_syscall_intercept ||
                                opt_taint_source_annotation ||
                                opt_disassembly || opt_index_build ||
                                !run_pass_names.empty();
 
     // ─── Open trace file ────────────────────────────────────────────────
-    fmt::print("Opening trace: {}\n", trace_path);
+    // In MCP mode, stdout is reserved for JSON-RPC — all human-readable
+    // progress/info output goes to stderr instead.
+    FILE* info_out = opt_mcp ? stderr : stdout;
+
+    fmt::print(info_out, "Opening trace: {}\n", trace_path);
     LOG_INFO("opening trace: {}", trace_path);
     auto t_open = TENET_TIMER_START();
 
@@ -1020,33 +1073,33 @@ int main(int argc, char** argv) {
              reader.file_size() / (1024.0 * 1024.0));
 
     const auto& hdr = reader.header();
-    fmt::print("  Magic:     0x{:08X}\n", hdr.magic);
-    fmt::print("  Version:   {}\n", hdr.version);
-    fmt::print("  Arch:      {}\n", hdr.arch == 1 ? "AArch64" : "x86_64");
-    fmt::print("  GPR count: {}\n", hdr.num_gpr);
-    fmt::print("  Module:    {}\n", hdr.module_name);
-    fmt::print("  Base:      0x{:016X}\n", hdr.module_base);
-    fmt::print("  Slide:     0x{:016X}\n", hdr.module_slide);
-    fmt::print("  Range:     0x{:016X} - 0x{:016X}\n", hdr.trace_start, hdr.trace_end);
-    fmt::print("  File size: {:.2f} MB\n", reader.file_size() / (1024.0 * 1024.0));
-    fmt::print("  Flags:     mem={} nzcv={} diff={} code={}\n",
+    fmt::print(info_out, "  Magic:     0x{:08X}\n", hdr.magic);
+    fmt::print(info_out, "  Version:   {}\n", hdr.version);
+    fmt::print(info_out, "  Arch:      {}\n", hdr.arch == 1 ? "AArch64" : "x86_64");
+    fmt::print(info_out, "  GPR count: {}\n", hdr.num_gpr);
+    fmt::print(info_out, "  Module:    {}\n", hdr.module_name);
+    fmt::print(info_out, "  Base:      0x{:016X}\n", hdr.module_base);
+    fmt::print(info_out, "  Slide:     0x{:016X}\n", hdr.module_slide);
+    fmt::print(info_out, "  Range:     0x{:016X} - 0x{:016X}\n", hdr.trace_start, hdr.trace_end);
+    fmt::print(info_out, "  File size: {:.2f} MB\n", reader.file_size() / (1024.0 * 1024.0));
+    fmt::print(info_out, "  Flags:     mem={} nzcv={} diff={} code={}\n",
                hdr.has_mem(), hdr.has_nzcv(), hdr.reg_diff(), hdr.has_code());
-    fmt::print("\n");
+    fmt::print(info_out, "\n");
     LOG_DEBUG("trace header: arch={} gpr={} module={} slide=0x{:X}",
               hdr.arch == 1 ? "AArch64" : "x86_64",
               hdr.num_gpr, hdr.module_name, hdr.module_slide);
 
     // ─── Build/load index ───────────────────────────────────────────────
-    fmt::print("Building index...\n");
+    fmt::print(info_out, "Building index...\n");
     LOG_INFO("building/loading RocksDB index");
     auto t_index = TENET_TIMER_START();
 
     auto index_result = TraceIndex::open_or_build(reader,
-        [](uint64_t processed, uint64_t total) {
+        [info_out](uint64_t processed, uint64_t total) {
             if (total > 0) {
                 double pct = 100.0 * processed / total;
-                fmt::print("\r  Progress: {:.1f}%", pct);
-                fflush(stdout);
+                fmt::print(info_out, "\r  Progress: {:.1f}%", pct);
+                fflush(info_out);
             }
         });
 
@@ -1055,7 +1108,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     auto& index = *index_result;
-    fmt::print("\r  Done. {} instructions, {} anchors, built in {:.2f}s\n",
+    fmt::print(info_out, "\r  Done. {} instructions, {} anchors, built in {:.2f}s\n",
                index.stats().inst_count, index.stats().anchor_count,
                index.stats().build_seconds);
     LOG_INFO("index ready: {} instructions, {} anchors  ({:.1f}ms total)",
@@ -1078,10 +1131,10 @@ int main(int argc, char** argv) {
     }
 
     if (show_index_stats) {
-        fmt::print("  Code records: {}\n", index.stats().code_count);
-        fmt::print("  Event records: {}\n", index.stats().event_count);
-        fmt::print("  Total records: {}\n", index.stats().total_records);
-        fmt::print("\n");
+        fmt::print(info_out, "  Code records: {}\n", index.stats().code_count);
+        fmt::print(info_out, "  Event records: {}\n", index.stats().event_count);
+        fmt::print(info_out, "  Total records: {}\n", index.stats().total_records);
+        fmt::print(info_out, "\n");
     }
 
     // ─── Populate CodeTable from index (P1.9: zero extra file I/O) ──────
@@ -1089,14 +1142,14 @@ int main(int argc, char** argv) {
     // during the same single pass. load_code_table() reads from RocksDB instead
     // of scanning the trace file a second time.
     CodeTable code_table;
-    fmt::print("Loading code table...\n");
+    fmt::print(info_out, "Loading code table...\n");
     {
         TENET_SCOPE_TIMER("code_table_load");
         uint64_t loaded = index.load_code_table(code_table);
         if (loaded == 0) {
             // Fallback: old index (schema < v5) without CODE_BYTES CF.
             // Re-scan the trace file to populate the table.
-            fmt::print("  (index has no code_bytes CF, falling back to trace scan)\n");
+            fmt::print(info_out, "  (index has no code_bytes CF, falling back to trace scan)\n");
             for (auto it = reader.begin(); it != reader.end(); ++it) {
                 auto rec = *it;
                 if (rec.kind == RecordKind::Code) {
@@ -1110,7 +1163,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    fmt::print("  Loaded {} distinct PCs\n\n", code_table.size());
+    fmt::print(info_out, "  Loaded {} distinct PCs\n\n", code_table.size());
     LOG_DEBUG("code table: {} distinct PCs", code_table.size());
 
     // ─── Record this trace in the recent-files list ──────────────────────
@@ -1127,7 +1180,7 @@ int main(int argc, char** argv) {
         auto img = std::make_shared<ImageFallback>();
         if (img->load(image_path, hdr.module_base)) {
             code_table.set_image_fallback(img);
-            fmt::print("  Image fallback: {} segments loaded from {}\n",
+            fmt::print(info_out, "  Image fallback: {} segments loaded from {}\n",
                        img->segment_count(), image_path);
         } else {
             fmt::print(stderr, "  Warning: failed to load image fallback: {}\n", image_path);
@@ -2593,6 +2646,52 @@ int main(int argc, char** argv) {
                 std::signal(SIGTERM, old_sigterm);
                 rpc_service.stop();
                 fmt::print(stderr, "[rpc] Server stopped.\n");
+            }
+        }
+
+        // ── P3: --mcp server mode ──────────────────────────────────────────
+        // In MCP mode, run a Model Context Protocol server over stdin/stdout.
+        // The process stays resident — all 35+ analysis tools share in-memory
+        // core objects (reader, index, regfile, memory, pm), eliminating the
+        // subprocess-per-call overhead of the Python MCP bridge.
+        if (opt_mcp) {
+            TenetMcpService mcp_service(reader, index, regfile, memory,
+                                        &pm, &code_table, &decoder);
+            mcp_service.run();  // blocks until stdin EOF
+        }
+
+        // ── P3: --mcp-http server mode ─────────────────────────────────────
+        // HTTP + Server-Sent Events transport (MCP 2024-11-05 spec).
+        // Useful for connecting GUI-hosted AI clients, remote access, or when
+        // stdin/stdout are not available (e.g. when tenet itself is the GUI).
+        // Process stays resident and blocks on SIGINT/SIGTERM.
+        if (opt_mcp_http) {
+            TenetMcpService mcp_service(reader, index, regfile, memory,
+                                        &pm, &code_table, &decoder);
+            if (!mcp_service.start_http(mcp_http_cfg)) {
+                fmt::print(stderr, "[mcp-http] Failed to start HTTP SSE server on {}:{}\n",
+                           mcp_http_cfg.host, mcp_http_cfg.port);
+                rc |= 1;
+            } else {
+                fmt::print(stderr, "[mcp-http] Listening on http://{}:{}/sse\n",
+                           mcp_http_cfg.host, mcp_http_cfg.port);
+                if (!mcp_http_cfg.username.empty()) {
+                    fmt::print(stderr, "[mcp-http] Basic Auth enabled (user: {})\n",
+                               mcp_http_cfg.username);
+                }
+                fmt::print(stderr, "[mcp-http] Press Ctrl+C to stop\n");
+
+                static std::atomic<bool> mcp_http_stop{false};
+                auto old_sigint  = std::signal(SIGINT,  [](int) { mcp_http_stop.store(true); });
+                auto old_sigterm = std::signal(SIGTERM, [](int) { mcp_http_stop.store(true); });
+                while (!mcp_http_stop.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                std::signal(SIGINT,  old_sigint);
+                std::signal(SIGTERM, old_sigterm);
+
+                mcp_service.stop_http();
+                fmt::print(stderr, "[mcp-http] Server stopped.\n");
             }
         }
 

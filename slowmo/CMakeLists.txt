@@ -266,6 +266,24 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
+# Zstd - decompression for compressed traces
+# Reuses the same FetchContent source cache as qbditrace, so zstd source
+# is already available in _deps/ and won't be re-downloaded.
+FetchContent_Declare(
+    zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  build/cmake
+)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(zstd)
+
 # YARA - rule-based pattern matching (optional)
 if(TENET_ENABLE_YARA)
     find_package(PkgConfig REQUIRED)
@@ -349,6 +367,13 @@ src/core/register_file.cpp
     src/analysis/passes/syscall_intercept_pass.cpp
     src/analysis/passes/taint_source_annotation_pass.cpp
     src/io/rpc_server.cpp
+    src/io/mcp/mcp_server.cpp
+    src/io/mcp/mcp_http_sse.cpp
+    src/io/mcp/mcp_tools_core.cpp
+    src/io/mcp/mcp_tools_analysis.cpp
+    src/io/mcp/mcp_tools_ai.cpp
+    src/io/mcp/hypothesis_ledger.cpp
+    src/io/mcp/discipline_injector.cpp
     src/io/streaming_index.cpp
     src/tui/tui_app.cpp
     src/tui/hex_dump_view.cpp
@@ -394,6 +419,16 @@ if(TENET_ENABLE_TRITON)
         /opt/homebrew/include  # Z3 headers needed by Triton's z3Solver.hpp
     )
     target_link_libraries(tenet_lib PUBLIC ${TRITON_LIBRARY})
+endif()
+
+# Zstd linkage (for decompressing compressed traces)
+if(TARGET libzstd_static)
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_ZSTD=1)
+    target_link_libraries(tenet_lib PUBLIC libzstd_static)
+    message(STATUS "Zstd linked for compressed trace support")
+else()
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_ZSTD=0)
+    message(STATUS "Zstd NOT available — compressed traces will be rejected")
 endif()
 
 # Platform libraries

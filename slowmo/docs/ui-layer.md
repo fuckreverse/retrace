@@ -1,7 +1,7 @@
 # UI 层
 
 > 职责：用户交互与结果展示。UI 是**纯消费者**——所有数据来自 Core + Pass Pipeline，UI 只负责展示、导航、触发分析。
-> 源码：`src/gui/`、`src/tui/`、`src/main.cpp`（CLI）、`mcp/`（MCP）。
+> 源码：`src/gui/`、`src/tui/`、`src/main.cpp`（CLI）、`src/io/mcp_server.{h,cpp}`（MCP）。
 
 ## 设计原则
 
@@ -18,7 +18,7 @@
 | TUI | `src/tui/` | FTXUI | `--tui` 或无 GUI 时 |
 | CLI | `src/main.cpp` | 无（批处理） | `-c` 或任意 `--xxx` 分析选项 |
 | RPC | `src/io/rpc_server.cpp` | JSON-RPC over Unix socket | `--rpc [path]` |
-| MCP | `mcp/` | MCP 2024-11-05 over stdio | 外部 AI 客户端启动 |
+| MCP | `src/io/mcp_server.{h,cpp}` | MCP 2024-11-05 over stdio（C++ 内置） | `--mcp` |
 
 ## GuiApp — ImGui + SDL3 + Metal
 
@@ -103,11 +103,11 @@
 
 ## MCP — AI 驱动分析
 
-`mcp/tenet_mcp_server.py` 实现 MCP 2024-11-05 协议，JSON-RPC 2.0 over stdio 与 AI 客户端通信。**零外部 Python 依赖**（3.9+）。
+`src/io/mcp_server.{h,cpp}` 实现 MCP 2024-11-05 协议，C++ 内置于 tenet 二进制，JSON-RPC 2.0 over stdio。通过 `--mcp` 启动。
 
-**21 工具**：`trace_open/trace_info/disasm/taint_forward/taint_backward/cfg_export/call_graph/pattern_scan/strings_scan/constants_scan/regstate/memread/mem_write_history/critical_path/search_pc/trace_diff/loop_semantics/symbol_annotation/memory_snapshot/dataflow_graph/algorithm_summary/objc_messages`。
+**47 工具**，分组：核心分析（21）、内存/快照（3）、索引/函数（6）、假设管理（8）、证据验证（1）、批量查询（1）。另有 DisciplineInjector 自动纪律注入。
 
-底层通过启动 `tenet --rpc <socket>` 子进程 + JSON-RPC 通信实现。配置见 `mcp/mcp_config_example.json`。
+直接访问 Core 层（RegisterFile/MemoryModel/PassManager），无需 RPC 中间层。支持假设生命周期管理（proposed→active→concluded/abandoned）、反幻觉保护（结论需验证证据）、批量查询（单次最多 20 子调用）。
 
 ## 数据流（UI 视角）
 
@@ -134,4 +134,4 @@ navigate_to(inst_id)  ← 更新 current_inst_ + nav_push
 3. **异步分析不阻塞**：GUI 用 `startup_analysis_thread_`，CLI 串行但输出友好。长 trace 首次打开立即可交互，核心分析后台跑。
 4. **LRU row_cache**：滚动浏览时复用相邻行，避免每帧重算寄存器/解码。
 5. **断点引擎复用索引**：PC/内存断点不扫 trace，秒级定位，支撑「时空调试」体验。
-6. **MCP 复用 RPC**：AI 工具不重写分析逻辑，通过 RPC 复用 tenet 二进制的全部能力。
+6. **MCP 内置 C++**：AI 工具直接访问 Core 层，无 RPC 开销，47 个工具含假设管理/证据验证/批量查询/纪律注入。

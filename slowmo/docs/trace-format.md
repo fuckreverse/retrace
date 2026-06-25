@@ -51,6 +51,10 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 | HAS_NZCV | bit 1 | INST 记录包含 NZCV |
 | REG_DIFF | bit 2 | INST 使用 diff 模式（非全量快照） |
 | HAS_CODE | bit 3 | 流中包含 REC_CODE 记录 |
+| PC_DELTA | bit 4 | v5: INST 使用 pc_delta (int16) 代替绝对 PC |
+| OLD_VALUE | bit 5 | v6: 内存写操作记录旧值（memacc 48B） |
+| HAS_FPR | bit 6 | v7: ANCHOR/INST 包含 FPR (NEON v0-v31) |
+| COMPRESSED | bit 7 | Header 后所有数据为 zstd 压缩流（见下方"压缩格式"节） |
 
 **tenet 要求**：magic == 0x51424454, version >= 4, flags 必须包含 REG_DIFF | HAS_CODE。
 
@@ -336,6 +340,39 @@ size_t record_size(const uint8_t* ptr, uint32_t num_gpr) {
 
 ---
 
+## 压缩格式（HF_COMPRESSED）
+
+当文件头 flags 包含 `HF_COMPRESSED` (bit 7) 时，文件布局如下：
+
+```
+┌──────────────────────────────────────────┐
+│ File Header (536 bytes, 明文)             │  ← qbditrace_file_header_t
+├──────────────────────────────────────────┤
+│ Zstd Frame                               │  ← ZSTD_compressStream2 输出
+│   (解压后与未压缩格式的记录流完全相同)       │
+└──────────────────────────────────────────┘
+```
+
+**设计要点**：
+
+文件头始终不压缩，这样读取端可以先读 536 字节，检查 magic、version、flags 后再决定是否需要解压。压缩范围是文件头之后的所有字节，构成一个完整的 zstd frame（包含 content checksum）。
+
+**写入端（qbditrace）实现**：qbditrace 在 `BackgroundWriter` 中使用 `ZSTD_compressStream2` 流式压缩。写入线程从 chunk 队列取出数据后，先压缩再写磁盘。压缩等级固定为 1（最快），预期压缩比 3-4x（trace 数据中有大量重复模式：连续 pc_delta=+4、相似 reg_index 等）。
+
+**配置**：`qbditrace_config_t.disable_compress`（反转语义，0 = 压缩，默认值）。Frida 侧配置示例：
+
+```javascript
+// 默认已开启压缩，无需额外设置
+cfg.disable_compress = 0;  // 压缩（默认）
+cfg.disable_compress = 1;  // 不压缩
+```
+
+**读取端（tenet）**：`TraceReader::open()` 检测到 `HF_COMPRESSED` 后，自动通过 `ZSTD_decompressStream` 流式解压到临时文件（同目录下 `.tenet-decomp-XXXXXX`，若失败回退 `/tmp`）。临时文件的 header 中 `HF_COMPRESSED` 标志已被清除，之后正常 mmap。`TraceReader::close()` 时自动删除临时文件。
+
+构建时需要 zstd 依赖（通过 FetchContent 自动拉取，与 qbditrace 共享 `_deps/` 缓存）。若 tenet 构建时无 zstd（`TENET_HAS_ZSTD=0`），打开压缩 trace 会返回错误。
+
+---
+
 ## 未来增强方向（需 qbditrace 配合）
 
 | 编号 | 增强 | 动机 | 建议实现 |
@@ -344,7 +381,7 @@ size_t record_size(const uint8_t* ptr, uint32_t num_gpr) {
 | E2 | 文件尾部索引表 | 避免 tenet 全文件扫描建索引 | Footer: `(每N条inst的offset)[]` |
 | E3 | 浮点/向量寄存器 | 密码学分析需要 NEON | 新记录类型 REC_FPREG + header flag |
 | E4 | 内存映射信息 | mmap 区域感知 | 新记录类型 REC_MMAP |
-| E5 | 分块压缩 | 1.5GB → ~400MB | Zstd seekable format + header flag |
+| E5 | ~~分块压缩~~ ✅ 已实现 | 1.5GB → ~400MB | Zstd stream + HF_COMPRESSED flag (qbditrace 写端) |
 | E6 | inst_id 全局编号 | 当前无显式 ID，靠顺序计数 | INST 记录中可选的 4B inst_id 字段 |
 
 **优先级**：E2 > E5 > E1 > E6 > E3 > E4
