@@ -1,5 +1,6 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
+#include "common/Profiling.h"
 #include <rocksdb/table.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
@@ -256,6 +257,7 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
 
 Result<TraceIndex> TraceIndex::open_or_build(
     const TraceReader& reader, ProgressCallback progress) {
+    TENET_ZONE_NAMED("TraceIndex::open_or_build");
 
     auto db_path = index_path_for(reader);
 
@@ -392,6 +394,7 @@ Result<TraceIndex> TraceIndex::build(
     const TraceReader& reader,
     const std::filesystem::path& db_path,
     ProgressCallback progress) {
+    TENET_ZONE_NAMED("TraceIndex::build");
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -757,11 +760,14 @@ Result<TraceIndex> TraceIndex::build(
             }
 
             // Rotate: finish current file and prepare for a new one.
-            rocksdb::Status rotate_if_needed(uint64_t threshold) {
-                if (entry_count >= threshold && is_open) {
-                    return finish();
-                }
-                return rocksdb::Status::OK();
+            // Returns true on success (including no-op), false on error.
+            // The error can be retrieved via last_error.
+            rocksdb::Status last_rotate_error;
+
+            bool rotate_if_needed(uint64_t threshold) {
+                if (entry_count < threshold || !is_open) return true;
+                last_rotate_error = finish();
+                return last_rotate_error.ok();
             }
         };
 
@@ -906,15 +912,20 @@ Result<TraceIndex> TraceIndex::build(
 
             result.total_records++;
 
-            // Rotate SST files periodically to bound memory
-            {
-                auto s = offset_w.rotate_if_needed(SST_ROTATE_THRESHOLD);
-                if (s.ok()) s = anchor_w.rotate_if_needed(SST_ROTATE_THRESHOLD);
-                if (!s.ok()) { result.error = s.ToString(); return; }
-                // Per-register writers rotate independently
+            // Rotate SST files periodically to bound memory.
+            // Only check every 1024 records to avoid per-record overhead
+            // of iterating all 34 per-register writers.
+            if ((result.total_records & 0x3FF) == 0) {
+                if (!offset_w.rotate_if_needed(SST_ROTATE_THRESHOLD)) {
+                    result.error = offset_w.last_rotate_error.ToString(); return;
+                }
+                if (!anchor_w.rotate_if_needed(SST_ROTATE_THRESHOLD)) {
+                    result.error = anchor_w.last_rotate_error.ToString(); return;
+                }
                 for (auto& rw : regw_per_reg) {
-                    s = rw->rotate_if_needed(SST_ROTATE_THRESHOLD);
-                    if (!s.ok()) { result.error = s.ToString(); return; }
+                    if (!rw->rotate_if_needed(SST_ROTATE_THRESHOLD)) {
+                        result.error = rw->last_rotate_error.ToString(); return;
+                    }
                 }
             }
 
