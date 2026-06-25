@@ -251,6 +251,7 @@ struct FileHeader {
     bool reg_diff() const      { return flags & qbditrace::QBDITRACE_HF_REG_DIFF; }
     bool has_old_value() const { return flags & qbditrace::QBDITRACE_HF_OLD_VALUE; }
     bool has_fpr() const       { return flags & qbditrace::QBDITRACE_HF_HAS_FPR; }
+    bool is_compressed() const { return flags & qbditrace::QBDITRACE_HF_COMPRESSED; }
 };
 
 // ─── TraceReader ──────────────────────────────────────────────────────────
@@ -332,11 +333,22 @@ public:
 private:
     TraceReader() = default;
 
+    /// Decompress a compressed trace to a temp file.  On success, sets fd_,
+    /// mapped_, and size_ to the decompressed content (header + records).
+    /// The original fd/mmap must already be open so we can read the compressed
+    /// bytes.  `raw_fd`, `raw_mapped`, `raw_size` are the original file's
+    /// resources and will be released by this function on success or failure.
+    static Result<TraceReader> decompress_to_temp(
+        TraceReader&& reader, int raw_fd, void* raw_mapped, uint64_t raw_size);
+
     std::filesystem::path path_;
     int fd_ = -1;
     void* mapped_ = nullptr;
     uint64_t size_ = 0;
     FileHeader header_;
+    // When reading a compressed trace, the decompressed data lives in a temp
+    // file that we own.  We keep the path so the destructor can unlink it.
+    std::filesystem::path temp_path_;
 };
 
 }  // namespace tenet

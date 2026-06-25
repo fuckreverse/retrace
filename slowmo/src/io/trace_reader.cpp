@@ -6,6 +6,12 @@
 #include <sys/stat.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdio>
+#include <memory>    // std::make_unique
+
+#if TENET_HAS_ZSTD
+#include <zstd.h>
+#endif
 
 namespace tenet {
 
@@ -191,7 +197,8 @@ TraceReader::TraceReader(TraceReader&& other) noexcept
       fd_(other.fd_),
       mapped_(other.mapped_),
       size_(other.size_),
-      header_(std::move(other.header_)) {
+      header_(std::move(other.header_)),
+      temp_path_(std::move(other.temp_path_)) {
     other.fd_ = -1;
     other.mapped_ = nullptr;
     other.size_ = 0;
@@ -205,6 +212,7 @@ TraceReader& TraceReader::operator=(TraceReader&& other) noexcept {
         mapped_ = other.mapped_;
         size_ = other.size_;
         header_ = std::move(other.header_);
+        temp_path_ = std::move(other.temp_path_);
         other.fd_ = -1;
         other.mapped_ = nullptr;
         other.size_ = 0;
@@ -287,6 +295,26 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     reader.header_.flags = raw_hdr->flags;
     reader.header_.module_name = std::string(raw_hdr->module_name);
 
+    // ── Handle compressed traces ─────────────────────────────────────────
+    if (reader.header_.flags & qbditrace::QBDITRACE_HF_COMPRESSED) {
+#if TENET_HAS_ZSTD
+        // Transfer ownership of the raw mmap/fd to decompress_to_temp,
+        // which will release them and replace with the decompressed file.
+        int raw_fd = reader.fd_;
+        void* raw_mapped = reader.mapped_;
+        uint64_t raw_size = reader.size_;
+        reader.fd_ = -1;
+        reader.mapped_ = nullptr;
+        reader.size_ = 0;
+        return decompress_to_temp(std::move(reader), raw_fd, raw_mapped, raw_size);
+#else
+        reader.close();
+        return Error(ErrorCode::MmapFailed,
+                     "Compressed trace requires zstd support, but tenet was "
+                     "built without TENET_HAS_ZSTD");
+#endif
+    }
+
     return reader;
 }
 
@@ -300,7 +328,156 @@ void TraceReader::close() {
         fd_ = -1;
     }
     size_ = 0;
+    // Clean up the temp file created for decompressed traces.
+    if (!temp_path_.empty()) {
+        std::filesystem::remove(temp_path_);
+        temp_path_.clear();
+    }
 }
+
+// ─── Decompression (zstd) ─────────────────────────────────────────────────
+
+#if TENET_HAS_ZSTD
+
+Result<TraceReader> TraceReader::decompress_to_temp(
+    TraceReader&& reader, int raw_fd, void* raw_mapped, uint64_t raw_size)
+{
+    constexpr size_t kHeaderSize = sizeof(qbditrace::qbditrace_file_header_t);
+    const auto* src = static_cast<const uint8_t*>(raw_mapped);
+    const uint8_t* compressed_start = src + kHeaderSize;
+    size_t compressed_size = raw_size - kHeaderSize;
+
+    // Create a temp file for the decompressed trace.
+    // Use the original file's directory so we stay on the same filesystem
+    // (avoids cross-device issues and keeps the temp near the source).
+    auto temp_dir = reader.path_.parent_path();
+    auto temp_template = temp_dir / ".tenet-decomp-XXXXXX";
+    // mkstemp needs a mutable char buffer.
+    std::string temp_str = temp_template.string();
+    int tmp_fd = ::mkstemp(temp_str.data());
+    if (tmp_fd < 0) {
+        // Fallback: try /tmp if the source directory is read-only
+        temp_str = "/tmp/.tenet-decomp-XXXXXX";
+        tmp_fd = ::mkstemp(temp_str.data());
+    }
+    if (tmp_fd < 0) {
+        ::munmap(raw_mapped, raw_size);
+        ::close(raw_fd);
+        return Error(ErrorCode::MmapFailed,
+                     std::string("Failed to create temp file for decompression: ") +
+                     strerror(errno));
+    }
+    std::filesystem::path temp_path(temp_str);
+
+    // Write the header first (with HF_COMPRESSED flag cleared).
+    qbditrace::qbditrace_file_header_t hdr;
+    std::memcpy(&hdr, src, kHeaderSize);
+    hdr.flags &= ~static_cast<uint64_t>(qbditrace::QBDITRACE_HF_COMPRESSED);
+    if (::write(tmp_fd, &hdr, kHeaderSize) != static_cast<ssize_t>(kHeaderSize)) {
+        ::close(tmp_fd);
+        std::filesystem::remove(temp_path);
+        ::munmap(raw_mapped, raw_size);
+        ::close(raw_fd);
+        return Error(ErrorCode::MmapFailed, "Failed to write header to temp file");
+    }
+
+    // Streaming decompression using ZSTD_DCtx.
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) {
+        ::close(tmp_fd);
+        std::filesystem::remove(temp_path);
+        ::munmap(raw_mapped, raw_size);
+        ::close(raw_fd);
+        return Error(ErrorCode::MmapFailed, "ZSTD_createDCtx failed");
+    }
+
+    // Use a 256K output buffer — balances syscall overhead and memory use.
+    constexpr size_t kOutBufSize = 256 * 1024;
+    auto out_buf = std::make_unique<uint8_t[]>(kOutBufSize);
+
+    ZSTD_inBuffer in = { compressed_start, compressed_size, 0 };
+    bool ok = true;
+    std::string err_msg;
+
+    while (in.pos < in.size) {
+        ZSTD_outBuffer out = { out_buf.get(), kOutBufSize, 0 };
+        size_t ret = ZSTD_decompressStream(dctx, &out, &in);
+        if (ZSTD_isError(ret)) {
+            err_msg = std::string("zstd decompression error: ") +
+                      ZSTD_getErrorName(ret);
+            ok = false;
+            break;
+        }
+        if (out.pos > 0) {
+            ssize_t written = ::write(tmp_fd, out_buf.get(), out.pos);
+            if (written != static_cast<ssize_t>(out.pos)) {
+                err_msg = std::string("write to temp file failed: ") +
+                          strerror(errno);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    ZSTD_freeDCtx(dctx);
+
+    // Release the original compressed file resources.
+    ::munmap(raw_mapped, raw_size);
+    ::close(raw_fd);
+
+    if (!ok) {
+        ::close(tmp_fd);
+        std::filesystem::remove(temp_path);
+        return Error(ErrorCode::MmapFailed, err_msg);
+    }
+
+    // Get the decompressed file size.
+    struct stat st{};
+    if (fstat(tmp_fd, &st) < 0) {
+        ::close(tmp_fd);
+        std::filesystem::remove(temp_path);
+        return Error(ErrorCode::MmapFailed,
+                     std::string("fstat on decompressed temp file failed: ") +
+                     strerror(errno));
+    }
+    uint64_t decompressed_size = static_cast<uint64_t>(st.st_size);
+
+    // mmap the decompressed file.
+    void* mapped = ::mmap(nullptr, decompressed_size, PROT_READ,
+                          MAP_PRIVATE | MAP_NORESERVE, tmp_fd, 0);
+    if (mapped == MAP_FAILED) {
+        ::close(tmp_fd);
+        std::filesystem::remove(temp_path);
+        return Error(ErrorCode::MmapFailed,
+                     std::string("mmap decompressed temp file failed: ") +
+                     strerror(errno));
+    }
+
+    // Update the reader to point at the decompressed data.
+    reader.fd_ = tmp_fd;
+    reader.mapped_ = mapped;
+    reader.size_ = decompressed_size;
+    reader.temp_path_ = temp_path;
+    // Clear the compressed flag in the in-memory header so downstream code
+    // does not attempt to decompress again.
+    reader.header_.flags &= ~static_cast<uint64_t>(qbditrace::QBDITRACE_HF_COMPRESSED);
+
+    return std::move(reader);
+}
+
+#else  // !TENET_HAS_ZSTD
+
+Result<TraceReader> TraceReader::decompress_to_temp(
+    TraceReader&& /*reader*/, int raw_fd, void* raw_mapped, uint64_t raw_size)
+{
+    ::munmap(raw_mapped, raw_size);
+    ::close(raw_fd);
+    return Error(ErrorCode::MmapFailed,
+                 "Compressed trace requires zstd support, but tenet was "
+                 "built without TENET_HAS_ZSTD");
+}
+
+#endif  // TENET_HAS_ZSTD
 
 RecordView TraceReader::record_at(uint64_t offset) const {
     const uint8_t* ptr = data() + offset;
