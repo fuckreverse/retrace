@@ -1,6 +1,8 @@
 #include "io/trace_reader.h"
 #include "common/Profiling.h"
+#include "common/logger.h"
 
+#include <fmt/format.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -371,6 +373,10 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     }
     std::filesystem::path temp_path(temp_str);
 
+    fmt::print(stderr, "Decompressing trace to {}\n", temp_str);
+    LOG_INFO("decompressing compressed trace ({:.2f} MB) to {}",
+             raw_size / (1024.0 * 1024.0), temp_str);
+
     // Write the header first (with HF_COMPRESSED flag cleared).
     qbditrace::qbditrace_file_header_t hdr;
     std::memcpy(&hdr, src, kHeaderSize);
@@ -400,6 +406,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     ZSTD_inBuffer in = { compressed_start, compressed_size, 0 };
     bool ok = true;
     std::string err_msg;
+    uint64_t total_written = kHeaderSize;  // header already written
+    int last_pct = -1;
 
     while (in.pos < in.size) {
         ZSTD_outBuffer out = { out_buf.get(), kOutBufSize, 0 };
@@ -418,6 +426,14 @@ Result<TraceReader> TraceReader::decompress_to_temp(
                 ok = false;
                 break;
             }
+            total_written += out.pos;
+        }
+        // Progress based on compressed input consumed (reliable denominator).
+        int pct = static_cast<int>(in.pos * 100 / in.size);
+        if (pct != last_pct) {
+            last_pct = pct;
+            fmt::print(stderr, "\r  Decompressing: {:3d}%  ({:.1f} MB written)",
+                       pct, total_written / (1024.0 * 1024.0));
         }
     }
 
@@ -428,10 +444,14 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     ::close(raw_fd);
 
     if (!ok) {
+        fmt::print(stderr, "\n  Decompression failed: {}\n", err_msg);
         ::close(tmp_fd);
         std::filesystem::remove(temp_path);
         return Error(ErrorCode::MmapFailed, err_msg);
     }
+
+    fmt::print(stderr, "\r  Decompressed: {:.1f} MB  \n", total_written / (1024.0 * 1024.0));
+    LOG_INFO("decompression complete: {:.2f} MB", total_written / (1024.0 * 1024.0));
 
     // Get the decompressed file size.
     struct stat st{};
