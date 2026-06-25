@@ -31,10 +31,31 @@
 #         -DQBDITRACE_BUILD_DYLIB=OFF -DQBDITRACE_BUILD_DECODER=ON
 #   cmake --build build-trace-host
 #
-# Or skip CMake entirely (this exact command is verified to link):
+# Or skip CMake entirely.  Use the build-qbditrace-ios.sh helper script from
+# the repo root, which also cross-compiles zstd and enables compression:
+#
+#   bash tools/qbditrace/build-qbditrace-ios.sh
+#
+# Manual equivalent (without zstd — compression will be SILENTLY DISABLED):
 #   xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O2 -dynamiclib \
 #       -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static -Itools/qbditrace \
 #       tools/qbditrace/QBDITrace.cpp build-ios/libQBDI.a build-ios/libqbdi-llvm.a \
+#       -framework Foundation -framework CoreFoundation -o libqbditrace.dylib
+#
+# With zstd (recommended — adds ~1.5MB to dylib, enables ~3-10x trace compression):
+#   # First build libzstd for iOS (one-time):
+#   ZSTD_SRC=tools/tenet/_deps/zstd-src/lib
+#   xcrun --sdk iphoneos clang -arch arm64 -O2 -DZSTD_MULTITHREAD=0 \
+#       -I${ZSTD_SRC} -I${ZSTD_SRC}/common \
+#       -c ${ZSTD_SRC}/common/*.c ${ZSTD_SRC}/compress/*.c ${ZSTD_SRC}/decompress/*.c
+#   ar rcs build-ios/libzstd.a *.o && rm -f *.o
+#   # Then build dylib with zstd:
+#   xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O2 -dynamiclib \
+#       -DQBDITRACE_HAVE_ZSTD=1 \
+#       -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static \
+#       -Itools/qbditrace -I${ZSTD_SRC} \
+#       tools/qbditrace/QBDITrace.cpp build-ios/libQBDI.a build-ios/libqbdi-llvm.a \
+#       build-ios/libzstd.a \
 #       -framework Foundation -framework CoreFoundation -o libqbditrace.dylib
 
 cmake_minimum_required(VERSION 3.16)
