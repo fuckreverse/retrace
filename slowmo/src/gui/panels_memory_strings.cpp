@@ -199,10 +199,43 @@ void GuiApp::render_memory_strings_panel() {
                         tip += fmt::format("\nCall site PC: 0x{:x}",
                             ms.call_site_pc - reader_.header().module_slide);
                     }
+                    tip += "\n\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
 
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(ms.discovered_at);
+                }
+
+                // ── Right-click context menu ───────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    // Show truncated content as title
+                    if (ms.content.size() <= 40)
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                                           "\"%s\"", ms.content.c_str());
+                    else
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                                           "\"%.40s\xe2\x80\xa6\"", ms.content.c_str());
+                    ImGui::TextDisabled("inst #%llu",
+                                        (unsigned long long)ms.discovered_at);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(ms.discovered_at);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)ms.discovered_at);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy String Content")) {
+                        ImGui::SetClipboardText(ms.content.c_str());
+                    }
+                    if (ImGui::MenuItem("Copy Address")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)ms.addr);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Content — truncated to 80 chars, yellow ───────────────

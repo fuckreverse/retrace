@@ -148,9 +148,38 @@ void GuiApp::render_trace_fold_panel() {
                         }
                     }
 
+                    tip += "\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(fr.first_inst_id);
+                }
+
+                // ── Right-click context menu ───────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextDisabled("PC: 0x%llx", (unsigned long long)static_pc);
+                    ImGui::TextDisabled("×%llu iter  |  #%llu–#%llu",
+                                        (unsigned long long)fr.total_iterations,
+                                        (unsigned long long)fr.first_inst_id,
+                                        (unsigned long long)fr.last_inst_id);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(fr.first_inst_id);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)fr.first_inst_id);
+                    if (ImGui::MenuItem("Jump to End")) {
+                        navigate_to(fr.last_inst_id);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)static_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Column 1: Iterations ───────────────────────────────────

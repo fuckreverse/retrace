@@ -8,6 +8,7 @@
 #include "analysis/passes/xref_pass.h"
 
 #include <imgui.h>
+#include <fmt/core.h>
 
 #include <algorithm>
 #include <cctype>
@@ -646,6 +647,129 @@ void GuiApp::render_settings_window() {
                 settings_.colors = GuiSettings::HighlightColors{};
                 changed = true;
             }
+
+            ImGui::EndTabItem();
+        }
+
+        // ─── MCP Server Tab ────────────────────────────────────────────
+        if (ImGui::BeginTabItem("MCP Server")) {
+            bool mcp_running = mcp_service_ && mcp_service_->http_running();
+
+            // Status indicator
+            ImGui::SeparatorText("Status");
+            if (mcp_running) {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "● Running");
+                ImGui::SameLine();
+                ImGui::TextDisabled("http://%s:%d/sse", mcp_gui_.host, mcp_gui_.port);
+            } else {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "● Stopped");
+            }
+
+            if (!mcp_status_msg_.empty()) {
+                ImGui::TextWrapped("%s", mcp_status_msg_.c_str());
+            }
+
+            // Settings (disabled while running to prevent confusion)
+            ImGui::SeparatorText("Configuration");
+            ImGui::BeginDisabled(mcp_running);
+
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::InputText("Host / Interface", mcp_gui_.host, sizeof(mcp_gui_.host));
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Bind address.\n"
+                    "127.0.0.1 = localhost only (safe default)\n"
+                    "0.0.0.0   = all network interfaces");
+            }
+
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::InputInt("Port", &mcp_gui_.port);
+            mcp_gui_.port = std::max(1, std::min(65535, mcp_gui_.port));
+
+            ImGui::SeparatorText("Basic Auth (optional)");
+
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::InputText("Username", mcp_gui_.username, sizeof(mcp_gui_.username));
+
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::InputText("Password", mcp_gui_.password, sizeof(mcp_gui_.password),
+                             ImGuiInputTextFlags_Password);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Leave both empty to disable authentication.");
+            }
+
+            ImGui::EndDisabled();
+
+            // Control buttons
+            ImGui::SeparatorText("Controls");
+
+            if (!mcp_running) {
+                if (ImGui::Button("Start##mcp", ImVec2(90, 0))) {
+                    McpHttpConfig cfg;
+                    cfg.host     = mcp_gui_.host;
+                    cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
+                    cfg.username = mcp_gui_.username;
+                    cfg.password = mcp_gui_.password;
+
+                    // Ensure PassManager is available
+                    ensure_pass_manager();
+
+                    mcp_service_ = std::make_unique<TenetMcpService>(
+                        reader_, index_, regfile_, memory_,
+                        pass_manager_.get(), &code_table_, &decoder_);
+
+                    if (mcp_service_->start_http(cfg)) {
+                        mcp_status_msg_ = fmt::format(
+                            "Server started on {}:{}", cfg.host, cfg.port);
+                    } else {
+                        mcp_status_msg_ = fmt::format(
+                            "ERROR: Failed to bind {}:{} — check if port is in use.",
+                            cfg.host, cfg.port);
+                        mcp_service_.reset();
+                    }
+                }
+            } else {
+                if (ImGui::Button("Stop##mcp", ImVec2(90, 0))) {
+                    mcp_service_->stop_http();
+                    mcp_status_msg_ = "Server stopped.";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Restart##mcp", ImVec2(90, 0))) {
+                    mcp_service_->stop_http();
+
+                    McpHttpConfig cfg;
+                    cfg.host     = mcp_gui_.host;
+                    cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
+                    cfg.username = mcp_gui_.username;
+                    cfg.password = mcp_gui_.password;
+
+                    if (mcp_service_->start_http(cfg)) {
+                        mcp_status_msg_ = fmt::format(
+                            "Server restarted on {}:{}", cfg.host, cfg.port);
+                    } else {
+                        mcp_status_msg_ = fmt::format(
+                            "ERROR: Failed to restart on {}:{}", cfg.host, cfg.port);
+                    }
+                }
+            }
+
+            // Claude Desktop config hint
+            ImGui::SeparatorText("Usage");
+            ImGui::TextWrapped(
+                "Add to Claude Desktop config (claude_desktop_config.json):");
+            if (ImGui::BeginChild("McpConfigHint", ImVec2(0, 80),
+                                  ImGuiChildFlags_Borders)) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.9f, 0.7f, 1.0f));
+                ImGui::TextWrapped(
+                    "\"tenet\": {\n"
+                    "  \"command\": \"npx\",\n"
+                    "  \"args\": [\"@modelcontextprotocol/server-sse\",\n"
+                    "            \"http://%s:%d/sse\"]\n"
+                    "}",
+                    mcp_gui_.host, mcp_gui_.port);
+                ImGui::PopStyleColor();
+            }
+            ImGui::EndChild();
 
             ImGui::EndTabItem();
         }

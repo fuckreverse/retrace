@@ -102,30 +102,38 @@ void GuiApp::render_constant_panel() {
         ImGui::SetTooltip("Filter by algorithm name or constant name");
     }
 
-    // ── Build filtered row list ──────────────────────────────────────────
-    // We collect pointers to avoid copying MaterializedConstant structs.
-    std::vector<const MaterializedConstant*> rows;
-    rows.reserve(constant_result_->constants.size());
+    // ── Build filtered row list (cached) ────────────────────────────────
+    // Only rebuild when result pointer, view mode, or filter string changes.
+    // This avoids O(N) vector construction + push_back + destructor every frame.
+    if (constant_row_cache_.source  != constant_result_ ||
+        constant_row_cache_.view_mode != constant_view_mode_ ||
+        constant_row_cache_.filter  != constant_filter_) {
 
-    for (const auto& c : constant_result_->constants) {
-        // View mode filter
-        if (constant_view_mode_ == 1 && c.known_match == nullptr)
-            continue;
+        auto& rows = constant_row_cache_.rows;
+        rows.clear();
+        rows.reserve(constant_result_->constants.size());
 
-        // Text filter: match against algorithm name or known constant name
-        if (!constant_filter_.empty()) {
-            bool hit = false;
-            if (c.known_match) {
-                if (c.known_match->algorithm.find(constant_filter_) != std::string::npos)
-                    hit = true;
-                if (c.known_match->name.find(constant_filter_) != std::string::npos)
-                    hit = true;
+        for (const auto& c : constant_result_->constants) {
+            if (constant_view_mode_ == 1 && c.known_match == nullptr)
+                continue;
+            if (!constant_filter_.empty()) {
+                bool hit = false;
+                if (c.known_match) {
+                    if (c.known_match->algorithm.find(constant_filter_) != std::string::npos)
+                        hit = true;
+                    if (c.known_match->name.find(constant_filter_) != std::string::npos)
+                        hit = true;
+                }
+                if (!hit) continue;
             }
-            if (!hit) continue;
+            rows.push_back(&c);
         }
 
-        rows.push_back(&c);
+        constant_row_cache_.source    = constant_result_;
+        constant_row_cache_.view_mode = constant_view_mode_;
+        constant_row_cache_.filter    = constant_filter_;
     }
+    const auto& rows = constant_row_cache_.rows;
 
     ImGui::TextDisabled("Showing %zu / %zu",
                         rows.size(), constant_result_->constants.size());
@@ -182,7 +190,8 @@ void GuiApp::render_constant_panel() {
                             "\n"
                             "Algorithm : {}\n"
                             "Name      : {}\n"
-                            "Description: {}",
+                            "Description: {}\n"
+                            "\nRight-click for more options",
                             c.first_inst_id, c.last_inst_id,
                             c.pc_first, c.pc_last,
                             c.value,
@@ -197,7 +206,8 @@ void GuiApp::render_constant_panel() {
                             "PC: 0x{:x} – 0x{:x}\n"
                             "Value: 0x{:016x}\n"
                             "Parts: {}\n"
-                            "No known match",
+                            "No known match\n"
+                            "\nRight-click for more options",
                             c.first_inst_id, c.last_inst_id,
                             c.pc_first, c.pc_last,
                             c.value,
@@ -206,6 +216,36 @@ void GuiApp::render_constant_panel() {
                     }
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(c.first_inst_id);
+                }
+
+                // ── Right-click context menu ──────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextDisabled("0x%016llx", (unsigned long long)c.value);
+                    if (c.known_match)
+                        ImGui::TextDisabled("%s:%s", c.known_match->algorithm.c_str(),
+                                            c.known_match->name.c_str());
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(c.first_inst_id);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)c.first_inst_id);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy Value")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%016llx",
+                                 (unsigned long long)c.value);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    if (ImGui::MenuItem("Copy PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)c.pc_first);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Column 1: Value ───────────────────────────────────

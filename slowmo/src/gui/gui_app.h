@@ -18,6 +18,7 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
+#include "io/mcp/mcp_server.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -179,6 +180,22 @@ private:
     std::vector<std::string> available_fonts_;  // Cached list
     std::string imgui_ini_path_;          // Persistent path for io.IniFilename
 
+    // ─── MCP HTTP SSE server (in-GUI mode) ───────────────────────────
+    // When the user starts the MCP server from the Settings panel, the
+    // TenetMcpService is created here and runs in the background.
+    std::unique_ptr<TenetMcpService> mcp_service_;
+
+    // Pending settings (edited in UI, applied on Start/Restart)
+    struct McpGuiSettings {
+        char host[64]     = "127.0.0.1";
+        int  port         = 7080;
+        char username[64] = {};
+        char password[64] = {};
+    } mcp_gui_;
+
+    // Status string shown in the MCP panel
+    std::string mcp_status_msg_;
+
     // ─── Font settings preview (pending until user clicks Save) ───
     struct PendingFontSettings {
         std::string font_path;
@@ -212,6 +229,23 @@ private:
         std::vector<uint64_t> depths;             // depth per sample point
         uint64_t max_depth = 1;                   // normalisation ceiling
     } sparkline_cache_;
+
+    // ─── Cached loop-header first-inst-id list for progress overlay ─
+    // inst_ids_at() allocates a vector<uint64_t> + iterates Roaring64Map each call.
+    // Loop headers are static once loop/xref results are set; cache them here.
+    struct LoopHeaderCache {
+        const struct LoopResult*  loop_src = nullptr;
+        const XrefResult*         xref_src = nullptr;
+        std::vector<uint64_t>     first_inst_ids;  // one entry per loop (front inst_id)
+    } loop_header_cache_;
+
+    // ─── Cached sorted call-site inst_ids for minimap panel ─────────
+    // call_at() is unordered_map::find; minimap calls it N_buckets × 4 times/frame.
+    // Cache a sorted vector of call inst_ids; use std::binary_search for range checks.
+    struct MinimapCallCache {
+        const FunctionResult* source = nullptr;
+        std::vector<uint64_t> sorted_call_ids;  // sorted call_inst_id list
+    } minimap_call_cache_;
 
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
@@ -410,6 +444,15 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     int  constant_view_mode_ = 0;   // 0=All, 1=Identified Only
     char constant_filter_buf_[128] = {};
     std::string constant_filter_;
+
+    // Cache for filtered row list — rebuilt only when filter/mode/result changes,
+    // not every frame. This avoids O(N) vector rebuild + push_back overhead per frame.
+    struct ConstantRowCache {
+        const ConstantMaterializationResult* source = nullptr;
+        int  view_mode = -1;
+        std::string filter;
+        std::vector<const struct MaterializedConstant*> rows;
+    } constant_row_cache_;
 
     // ─── Pattern analysis state ────────────────────────────────────────
     bool show_pattern_ = false;
@@ -649,6 +692,9 @@ private:
     // ─── Data helpers ───────────────────────────────────────────────
     InstructionRow fetch_row(uint64_t inst_id);
     void navigate_to(uint64_t inst_id);
+    /// Navigate to inst_id AND bring the "Instructions" dock tab to the front.
+    /// Use this from any analysis panel's right-click "Jump to Instructions" action.
+    void navigate_to_instructions(uint64_t inst_id);
     void toggle_bookmark();
 
     // ─── Analysis helpers ───────────────────────────────────────────

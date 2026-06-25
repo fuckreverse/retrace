@@ -266,6 +266,12 @@ void GuiApp::render_shutdown_overlay() {
 void GuiApp::shutdown() {
     if (!window_) return;  // Already shut down
 
+    // Stop the in-GUI MCP HTTP SSE server if running.
+    if (mcp_service_) {
+        mcp_service_->stop_http();
+        mcp_service_.reset();
+    }
+
     // Join the shutdown coordination thread (it is very short-lived).
     if (shutdown_thread_.joinable()) {
         shutdown_thread_.join();
@@ -562,7 +568,12 @@ void GuiApp::apply_settings() {
         colors[ImGuiCol_MenuBarBg]            = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
     }
 
-    style.ScaleAllSizes(dpi_scale_);
+    // ScaleAllSizes is CUMULATIVE — calling it every time apply_settings() is
+    // invoked multiplies sizes by dpi_scale_ again and again, eventually making
+    // the UI either gigantic or invisible.  The initial call in setup_style()
+    // already scaled the style once; subsequent calls must NOT scale again.
+    // (Font size changes go through rebuild_fonts(); the style sizes are always
+    //  based on the logical unscaled values set above, scaled once at init.)
 
     // NOTE: Font rebuild is intentionally NOT done here.
     // It is deferred to the start of the next frame (before ImGui::NewFrame())
@@ -690,7 +701,7 @@ static NSMenu* tenet_make_submenu(NSString* title, TenetMenuDelegate* delegate) 
 void tenet::GuiApp::_post_native_action(long tag) {
     std::function<void()> action;
     switch (static_cast<MenuTag>(tag)) {
-        case kTagFileQuit:          action = [this]{ running_ = false; }; break;
+        case kTagFileQuit:          action = [this]{ begin_shutdown(); }; break;
         case kTagEditSettings:      action = [this]{ show_settings_ = true; }; break;
 
         case kTagViewRegisters:     action = [this]{ show_registers_         = !show_registers_;         }; break;
@@ -1265,9 +1276,11 @@ void GuiApp::render_frame() {
         }
 
         // ── Actions that should work even with keyboard focused ───────────
-        // (Cmd+Q: quit)
+        // (Cmd+Q: quit) — route through begin_shutdown() so background threads
+        // are properly joined before the window closes.  Direct running_=false
+        // would skip thread teardown and cause hangs/crashes in the destructor.
         if ((super || ctrl) && ImGui::IsKeyPressed(ImGuiKey_Q)) {
-            running_ = false;
+            begin_shutdown();
         }
         // (Cmd+,: settings)
         if ((super || ctrl) && ImGui::IsKeyPressed(ImGuiKey_Comma)) {

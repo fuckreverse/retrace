@@ -639,16 +639,28 @@ void GuiApp::render_progress_overlay() {
     // ── LANE 3: Markers (bookmarks, loops, calls, search) ────────────
 
     // Loop header markers (orange notches)
+    // inst_ids_at() allocates vector + iterates Roaring64Map per loop per frame;
+    // cache the first inst_id for each loop and only rebuild when inputs change.
     if (show_loops_ && loop_result_ && xref_result_) {
-        for (const auto& loop : loop_result_->loops) {
-            auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
-            if (!inst_ids.empty()) {
-                float lx = inst_to_x(inst_ids.front());
-                draw->AddRectFilled(
-                    ImVec2(lx - 1.0f, p0.y + L3_top),
-                    ImVec2(lx + 1.0f, p0.y + H),
-                    IM_COL32(255, 138, 24, 200));
+        if (loop_header_cache_.loop_src != loop_result_ ||
+            loop_header_cache_.xref_src != xref_result_) {
+            loop_header_cache_.first_inst_ids.clear();
+            loop_header_cache_.first_inst_ids.reserve(loop_result_->loops.size());
+            for (const auto& loop : loop_result_->loops) {
+                auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
+                loop_header_cache_.first_inst_ids.push_back(
+                    inst_ids.empty() ? UINT64_MAX : inst_ids.front());
             }
+            loop_header_cache_.loop_src = loop_result_;
+            loop_header_cache_.xref_src = xref_result_;
+        }
+        for (uint64_t fid : loop_header_cache_.first_inst_ids) {
+            if (fid == UINT64_MAX) continue;
+            float lx = inst_to_x(fid);
+            draw->AddRectFilled(
+                ImVec2(lx - 1.0f, p0.y + L3_top),
+                ImVec2(lx + 1.0f, p0.y + H),
+                IM_COL32(255, 138, 24, 200));
         }
     }
 
@@ -845,6 +857,22 @@ void GuiApp::render_minimap_panel() {
     if (pixel_rows < 1) pixel_rows = 1;
     uint64_t bucket_size = std::max(uint64_t(1), total_inst_ / static_cast<uint64_t>(pixel_rows));
 
+    // Build sorted call-site id cache once per function_result_ change.
+    // Avoids O(1) unordered_map::find × N_buckets × 4 samples = thousands of hash
+    // lookups per frame; replaced by a single lower_bound per bucket.
+    if (function_result_ &&
+        minimap_call_cache_.source != function_result_) {
+        minimap_call_cache_.sorted_call_ids.clear();
+        minimap_call_cache_.sorted_call_ids.reserve(
+            function_result_->call_events.size());
+        for (const auto& evt : function_result_->call_events) {
+            minimap_call_cache_.sorted_call_ids.push_back(evt.call_inst_id);
+        }
+        std::sort(minimap_call_cache_.sorted_call_ids.begin(),
+                  minimap_call_cache_.sorted_call_ids.end());
+        minimap_call_cache_.source = function_result_;
+    }
+
     for (int row = 0; row < pixel_rows; row++) {
         uint64_t bucket_start = static_cast<uint64_t>(row) * bucket_size;
         uint64_t bucket_end = std::min(bucket_start + bucket_size, total_inst_);
@@ -862,6 +890,15 @@ void GuiApp::render_minimap_panel() {
         bool has_call = false;
         bool has_branch = false;
 
+        // Check for call in bucket via binary search on sorted cache (O(log N) per bucket).
+        if (function_result_ && !minimap_call_cache_.sorted_call_ids.empty()) {
+            auto it = std::lower_bound(minimap_call_cache_.sorted_call_ids.begin(),
+                                       minimap_call_cache_.sorted_call_ids.end(),
+                                       bucket_start);
+            has_call = (it != minimap_call_cache_.sorted_call_ids.end() &&
+                        *it < bucket_end);
+        }
+
         // Sample up to 4 instructions per bucket for efficiency
         uint64_t sample_step = std::max(uint64_t(1), bucket_size / 4);
         for (uint64_t sid = bucket_start; sid < bucket_end; sid += sample_step) {
@@ -877,7 +914,7 @@ void GuiApp::render_minimap_panel() {
                 if (loop_result_->is_loop_header(srow.pc)) has_loop_header = true;
                 else if (loop_result_->is_in_loop(srow.pc)) has_loop_body = true;
             }
-            if (function_result_ && function_result_->call_at(sid)) has_call = true;
+            // has_call is now handled above via binary search — no call_at() here
             if (srow.disasm.size() > 0 &&
                 (srow.disasm[0] == 'b' || srow.disasm.find("bl") == 0)) has_branch = true;
         }

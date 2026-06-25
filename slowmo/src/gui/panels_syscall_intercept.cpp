@@ -251,9 +251,37 @@ void GuiApp::render_syscall_intercept_panel() {
                         tip += fmt::format("\n\nObjC: {}", *call.objc_context);
                     }
 
+                    tip += "\n\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(call.inst_id);
+                }
+
+                // ── Right-click context menu ───────────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextDisabled("%s", call.callee_name.c_str());
+                    ImGui::TextDisabled("[%s]  inst #%llu",
+                                        category_label(call.category),
+                                        (unsigned long long)call.inst_id);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(call.inst_id);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)call.inst_id);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy Call Site PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)call.call_site_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    if (ImGui::MenuItem("Copy API Name")) {
+                        ImGui::SetClipboardText(call.callee_name.c_str());
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Column 1: API name (coloured by category) ─────────────────

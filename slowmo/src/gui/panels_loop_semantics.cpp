@@ -153,7 +153,8 @@ void GuiApp::render_loop_semantics_panel() {
 
                     std::string tip = fmt::format(
                         "{}\n\nPC: 0x{:x}\nIterations: {}\nBody instructions: {}\n"
-                        "Active regs: {}\nSample range: #{}\u2013#{}",
+                        "Active regs: {}\nSample range: #{}\u2013#{}"
+                        "\n\nRight-click for more options",
                         loop.description.empty() ? loop_kind_name(loop.kind)
                                                   : loop.description,
                         loop.header_pc,
@@ -166,6 +167,30 @@ void GuiApp::render_loop_semantics_panel() {
 
                     if (ImGui::IsMouseDoubleClicked(0) && loop.sample_iter_start != 0)
                         navigate_to(loop.sample_iter_start);
+                }
+
+                // ── Right-click context menu ─────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextDisabled("PC: 0x%llx", (unsigned long long)loop.header_pc);
+                    ImGui::TextDisabled("%s  ×%llu", loop_kind_name(loop.kind),
+                                        (unsigned long long)loop.iteration_count);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions",
+                                        nullptr, false,
+                                        loop.sample_iter_start != 0)) {
+                        navigate_to_instructions(loop.sample_iter_start);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)loop.sample_iter_start);
+                    if (ImGui::MenuItem("Copy PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)loop.header_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Kind column ──────────────────────────────────────────

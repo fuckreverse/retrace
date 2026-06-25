@@ -226,9 +226,38 @@ void GuiApp::render_objc_crypto_panel() {
                     } else {
                         tip += "\n(no ObjC context — bare pattern)";
                     }
+                    tip += "\n\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(hit.pattern_start_inst);
+                }
+
+                // ── Right-click context menu ───────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextColored(category_color(hit.category),
+                                       "%s", hit.pattern_name.c_str());
+                    ImGui::TextDisabled("[%llu..%llu]",
+                                        (unsigned long long)hit.pattern_start_inst,
+                                        (unsigned long long)hit.pattern_end_inst);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(hit.pattern_start_inst);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)hit.pattern_start_inst);
+                    if (ImGui::MenuItem("Jump to End")) {
+                        navigate_to(hit.pattern_end_inst);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)hit.anchor_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Column 1: pattern name ────────────────────────────────

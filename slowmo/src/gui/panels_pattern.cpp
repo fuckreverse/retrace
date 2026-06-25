@@ -235,9 +235,37 @@ void GuiApp::render_pattern_panel() {
                                           m.related_inst_ids.size());
                     }
 
+                    tip += "\n\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
                     if (ImGui::IsMouseDoubleClicked(0))
                         navigate_to(m.start_inst_id);
+                }
+
+                // ── Right-click context menu ───────────────────────────────
+                if (ImGui::BeginPopupContextItem(nullptr)) {
+                    ImGui::TextDisabled("%s", m.pattern_name.c_str());
+                    ImGui::TextDisabled("[%llu..%llu]",
+                                        (unsigned long long)m.start_inst_id,
+                                        (unsigned long long)m.end_inst_id);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        navigate_to_instructions(m.start_inst_id);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                          "the Instructions panel to the front",
+                                          (unsigned long long)m.start_inst_id);
+                    if (ImGui::MenuItem("Jump to End")) {
+                        navigate_to(m.end_inst_id);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy PC")) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "0x%llx",
+                                 (unsigned long long)m.anchor_pc);
+                        ImGui::SetClipboardText(buf);
+                    }
+                    ImGui::EndPopup();
                 }
 
                 // ── Col 1: Category ────────────────────────────────────────

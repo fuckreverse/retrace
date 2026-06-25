@@ -181,9 +181,38 @@ void GuiApp::render_objc_panel() {
                             if (msg.return_deref_str.has_value())
                                 tip += fmt::format(" \"{}\"", *msg.return_deref_str);
                         }
+                        tip += "\n\nRight-click for more options";
                         ImGui::SetTooltip("%s", tip.c_str());
                         if (ImGui::IsMouseDoubleClicked(0))
                             navigate_to(msg.inst_id);
+                    }
+
+                    // ── Right-click context menu ───────────────────────
+                    if (ImGui::BeginPopupContextItem(nullptr)) {
+                        ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f),
+                                           "%s", msg.class_name.c_str());
+                        ImGui::TextColored(ImVec4(0.75f, 0.92f, 0.6f, 1.0f),
+                                           "%s", msg.selector_name.c_str());
+                        ImGui::TextDisabled("inst #%llu", (unsigned long long)msg.inst_id);
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                            navigate_to_instructions(msg.inst_id);
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Navigate to inst #%llu and bring\n"
+                                              "the Instructions panel to the front",
+                                              (unsigned long long)msg.inst_id);
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Copy PC")) {
+                            char buf[24];
+                            snprintf(buf, sizeof(buf), "0x%llx",
+                                     (unsigned long long)msg.pc);
+                            ImGui::SetClipboardText(buf);
+                        }
+                        if (ImGui::MenuItem("Copy Selector")) {
+                            ImGui::SetClipboardText(msg.selector_name.c_str());
+                        }
+                        ImGui::EndPopup();
                     }
 
                     // Class column

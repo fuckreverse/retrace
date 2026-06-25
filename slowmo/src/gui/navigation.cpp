@@ -115,6 +115,14 @@ void GuiApp::navigate_to(uint64_t inst_id) {
     taint_sorted_ids_dirty_ = true;
 }
 
+void GuiApp::navigate_to_instructions(uint64_t inst_id) {
+    navigate_to(inst_id);
+    // Bring the "Instructions" dock tab to the front so the user can see where
+    // we landed.  pending_focus_windows_ is processed at the top of each frame
+    // inside the DockSpaceHost scope (render_frame), which calls SetWindowFocus.
+    pending_focus_windows_.push_back("Instructions");
+}
+
 void GuiApp::toggle_bookmark() {
     auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), current_inst_);
     if (it != bookmarks_.end() && *it == current_inst_) {
