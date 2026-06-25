@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -46,26 +47,16 @@ struct DisasmEntry {
 };
 
 // ─── DisasmTable: PC-indexed table, supports lazy per-inst lookup ──────────
-//
-// Instead of materialising one DisasmEntry per instruction (O(trace) memory),
-// we store:
-//   • pc_table    : PC → PCDisasmEntry  (one entry per *unique* PC executed)
-//   • inst_to_pc  : inst_id → PC        (maps each instruction to its PC)
-//
-// Callers call lookup(inst_id) to get a lightweight DisasmEntry on the fly.
-// This reduces memory from O(N_instructions × ~120B) to O(N_unique_PCs × ~120B)
-// plus O(N_instructions × 8B) for the inst_to_pc index.
 
 struct DisasmTable {
     // PC → per-PC decoded info (deduped).
     std::unordered_map<uint64_t, PCDisasmEntry> pc_table;
 
     // inst_id → PC, stored as a flat vector indexed by (inst_id - base_inst_id).
-    // base_inst_id is the first inst_id in the range.
     uint64_t base_inst_id = 0;
-    std::vector<uint64_t> inst_to_pc;  // inst_to_pc[inst_id - base_inst_id] = pc
+    std::vector<uint64_t> inst_to_pc;
 
-    /// Look up a single instruction.  Returns nullopt if inst_id is out of range.
+    /// Look up a single instruction.
     std::optional<DisasmEntry> lookup(uint64_t inst_id) const {
         if (inst_id < base_inst_id) return std::nullopt;
         size_t idx = inst_id - base_inst_id;
@@ -111,21 +102,47 @@ struct DisasmTable {
         return (it != pc_table.end()) ? &it->second : nullptr;
     }
 
-    /// Total number of instructions indexed.
     size_t inst_count() const { return inst_to_pc.size(); }
-
-    /// Number of unique PCs.
     size_t unique_pc_count() const { return pc_table.size(); }
+};
+
+// ─── DisassemblyCollector ─────────────────────────────────────────────────
+
+/// Lightweight collector that records inst_id → PC mapping during a
+/// sequential trace scan.  Phase 1 (code_table decode) is done externally
+/// in DisassemblyPass::run(); this collector only handles Phase 2.
+class DisassemblyCollector final : public TraceCollector {
+public:
+    explicit DisassemblyCollector(uint64_t base_inst_id, uint64_t expected_count)
+        : base_inst_id_(base_inst_id), expected_count_(expected_count) {}
+
+    std::string_view name() const override { return "DisassemblyCollector"; }
+
+    bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override {
+        (void)start_inst_id; (void)end_inst_id;
+        inst_to_pc_.clear();
+        inst_to_pc_.reserve(expected_count_);
+        return true;
+    }
+
+    void on_inst(uint64_t /*inst_id*/, const InstView& inst) override {
+        inst_to_pc_.push_back(inst.pc);
+    }
+
+    /// Take the inst_to_pc vector after scan completes.
+    std::vector<uint64_t> take_inst_to_pc() { return std::move(inst_to_pc_); }
+
+    uint64_t base_inst_id() const { return base_inst_id_; }
+
+private:
+    uint64_t base_inst_id_;
+    uint64_t expected_count_;
+    std::vector<uint64_t> inst_to_pc_;
 };
 
 // ─── Disassembly pass ─────────────────────────────────────────────────────
 
 /// Builds a DisasmTable for all (or a range of) instructions.
-///
-/// The result is PC-indexed rather than instruction-indexed, so memory usage
-/// scales with the number of *unique* PCs rather than total instructions.
-/// Per-instruction DisasmEntry objects can be obtained on-demand via lookup().
-///
 /// Result type: DisasmTable
 class DisassemblyPass final : public AnalysisPass {
 public:
@@ -139,7 +156,7 @@ public:
     }
 
     PassResult run(PassContext& ctx) override;
-    float estimated_cost() const override { return 1.0f; }  // much cheaper now
+    float estimated_cost() const override { return 1.0f; }
 };
 
 }  // namespace tenet

@@ -1,4 +1,5 @@
 #include "analysis/passes/memory_string_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -10,6 +11,36 @@
 #include <cstring>
 
 namespace tenet {
+
+// ─── MemoryStringCollector ────────────────────────────────────────────────
+
+bool MemoryStringCollector::begin(uint64_t /*start_inst_id*/,
+                                   uint64_t /*end_inst_id*/) {
+    inst_id_ = 0;
+    call_sites_.clear();
+    return true;
+}
+
+void MemoryStringCollector::on_inst(uint64_t /*inst_id*/, const InstView& inst) {
+    inst_id_++;
+
+    // Detect call instructions (BL/BLR) and SVC via opcode bitmask.
+    auto opcode_opt = code_table_.opcode_at(inst.pc);
+    if (!opcode_opt) return;
+
+    uint32_t opcode = *opcode_opt;
+    bool is_bl  = (opcode & 0xFC000000u) == 0x94000000u;
+    bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
+    bool is_svc = (opcode & 0xFFE0001Fu) == 0xD4000001u;
+    bool is_call = is_bl || is_blr;
+
+    if (!is_call && !is_svc) return;
+
+    // Rate limit
+    if (config_.max_call_sites > 0 && call_sites_.size() >= config_.max_call_sites) return;
+
+    call_sites_.push_back({inst_id_, inst.pc});
+}
 
 // ─── String scanning in a byte buffer ─────────────────────────────────────
 
@@ -197,6 +228,32 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
     if (end_id == 0) end_id = index.inst_count();
 
+    ctx.progress(0.0f, "Scanning call sites for strings");
+
+    // ─── Phase 1: collect call sites via collector ─────────────────────────
+    MemoryStringCollector collector(code_table, config_);
+
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
+    } else {
+        uint64_t total_insts = index.inst_count();
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                // Phase 1 = first 30% of progress
+                ctx.progress(static_cast<float>(processed) / static_cast<float>(total) * 0.3f);
+            }
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run();
+    }
+
+    const auto& call_sites = collector.call_sites();
+
+    // ─── Phase 2: analyze each call site with regfile + memory ────────────
     MemoryStringResult result;
 
     // Helper: add a discovered string to result (with deduplication).
@@ -212,59 +269,28 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         result.strings.push_back(std::move(ms));
     };
 
-    // ─── Main scan: iterate trace looking for BL/BLR/SVC/OBJC ────────────
-    uint64_t inst_id = 0;
     size_t call_sites_processed = 0;
 
-    // Report 0% immediately so the UI shows the pass is active.
-    ctx.progress(0.0f, "Scanning call sites for strings");
-
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
+    for (size_t ci = 0; ci < call_sites.size(); ++ci) {
         if (ctx.cancelled()) break;
 
-        auto rec = *it;
+        const auto& site = call_sites[ci];
 
-        // Handle ObjC records — class/selector names are metadata strings
-        if (rec.kind == RecordKind::Objc) {
-            // ObjC records carry selector + class name implicitly at a specific inst_id
-            // (handled separately; the selector/class are in the record itself)
-            continue;
-        }
+        // Skip call sites outside the requested range.
+        if (site.inst_id < range.start_inst_id) continue;
+        if (site.inst_id > end_id) continue;
 
-        if (rec.kind != RecordKind::Inst) continue;
-
-        auto inst = rec.as_inst();
-        inst_id++;
-
-        if (inst_id < range.start_inst_id) continue;
-        if (inst_id > end_id) break;
-
-        // Progress reporting — update every ~2048 instructions so the UI
-        // shows meaningful progress (0x3FFF = 16383 was too coarse).
-        if ((inst_id & 0x7FF) == 0) {
-            float pct = static_cast<float>(inst_id - range.start_inst_id) /
-                        static_cast<float>(end_id - range.start_inst_id + 1);
-            ctx.progress(pct, "Scanning call sites for strings");
-        }
-
-        // ─── Detect call instructions (BL/BLR) and SVC via opcode bitmask ─
-        auto opcode_opt = code_table.opcode_at(inst.pc);
-        if (!opcode_opt) continue;
-
-        uint32_t opcode = *opcode_opt;
-        bool is_bl  = (opcode & 0xFC000000u) == 0x94000000u;
-        bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
-        bool is_svc = (opcode & 0xFFE0001Fu) == 0xD4000001u;
-        bool is_call = is_bl || is_blr;
-
-        if (!is_call && !is_svc) continue;
-
-        // Rate limit
-        if (config_.max_call_sites > 0 && call_sites_processed >= config_.max_call_sites) break;
         call_sites_processed++;
 
+        // Progress: Phase 2 = 30%-100%
+        if ((ci & 0xFF) == 0) {
+            float pct = 0.3f + 0.7f * static_cast<float>(ci) /
+                        static_cast<float>(call_sites.size());
+            ctx.progress(pct, "Analyzing call sites for strings");
+        }
+
         // ─── Get register state at this call site ─────────────────────────
-        const RegState& regs = regfile.state_before(inst_id);
+        const RegState& regs = regfile.state_before(site.inst_id);
 
         // ─── Scan x0-x7 for pointer-like values ──────────────────────────
         for (int r = 0; r < 8; ++r) {
@@ -272,7 +298,7 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
             if (val < config_.min_pointer_value) continue;
 
             // Read memory at this pointer
-            auto region = memory.read_region(val, config_.scan_size, inst_id);
+            auto region = memory.read_region(val, config_.scan_size, site.inst_id);
             if (region.known_count < config_.min_string_len) continue;
 
             // Scan for strings in the read region
@@ -284,18 +310,18 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
                 std::string full_content = hit.content;
                 if (config_.deep_probe && hit.offset == 0) {
                     full_content = deep_probe_string(memory, val + hit.offset,
-                                                     inst_id, hit.content);
+                                                     site.inst_id, hit.content);
                 }
 
                 MemoryString ms;
                 ms.addr = val + hit.offset;
-                ms.discovered_at = inst_id;
+                ms.discovered_at = site.inst_id;
                 ms.content = std::move(full_content);
                 ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
                 ms.source = MemoryString::RegPointer;
                 ms.source_reg = static_cast<uint8_t>(r);
-                ms.call_site_inst_id = inst_id;
-                ms.call_site_pc = inst.pc;
+                ms.call_site_inst_id = site.inst_id;
+                ms.call_site_pc = site.pc;
                 add_string(std::move(ms));
             }
         }
@@ -304,20 +330,20 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         if (config_.scan_stack) {
             uint64_t sp = regs.sp();
             if (sp >= config_.min_pointer_value) {
-                auto region = memory.read_region(sp, config_.stack_scan_size, inst_id);
+                auto region = memory.read_region(sp, config_.stack_scan_size, site.inst_id);
                 if (region.known_count >= config_.min_string_len) {
                     auto hits = scan_for_strings(region.data, region.known,
                                                   config_.min_string_len, config_.max_string_len);
                     for (auto& hit : hits) {
                         MemoryString ms;
                         ms.addr = sp + hit.offset;
-                        ms.discovered_at = inst_id;
+                        ms.discovered_at = site.inst_id;
                         ms.content = std::move(hit.content);
                         ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
                         ms.source = MemoryString::StackLocal;
                         ms.source_reg = 31;  // SP
-                        ms.call_site_inst_id = inst_id;
-                        ms.call_site_pc = inst.pc;
+                        ms.call_site_inst_id = site.inst_id;
+                        ms.call_site_pc = site.pc;
                         add_string(std::move(ms));
                     }
                 }

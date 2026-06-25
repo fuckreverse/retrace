@@ -1,4 +1,5 @@
 #include "analysis/passes/pattern_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
@@ -16,37 +17,6 @@
 
 namespace tenet {
 
-// ─── Anonymous namespace for constants ────────────────────────────────────
-
-namespace {
-
-// XOR loop detection parameters
-constexpr size_t XOR_WINDOW_SIZE = 8;
-constexpr size_t XOR_THRESHOLD  = 4;
-
-// Constant loading detection threshold
-constexpr size_t CONST_LOAD_THRESHOLD = 3;
-
-// AArch64 register index for x16 (syscall number on Darwin)
-constexpr uint8_t REG_X16 = 16;
-
-// Syscall buffer entry size: 8 (inst_id) + 2 (syscall_no) + 6 (pad) = 16
-constexpr size_t SYSCALL_ENTRY_SIZE = 16;
-
-// ─── Per-PC classification (pre-computed from code table) ─────────────────
-
-enum MnemonicClass : uint8_t {
-    MC_OTHER        = 0,
-    MC_HW_AES       = 1,  // aese, aesd, aesmc, aesimc
-    MC_HW_SHA       = 2,  // sha1*, sha256*
-    MC_EOR          = 3,  // eor (XOR)
-    MC_MOVZ         = 4,  // movz, mov
-    MC_MOVK         = 5,  // movk
-    MC_SVC          = 6,  // svc (syscall)
-};
-
-}  // anonymous namespace
-
 // ─── YARA callback context ────────────────────────────────────────────────
 
 #ifdef TENET_HAS_YARA
@@ -60,6 +30,8 @@ struct YaraScanContext {
     const std::vector<uint64_t>* offset_to_pc;
     const std::vector<PatternPass::SyscallEntry>* syscall_entries;
 };
+
+static constexpr size_t SYSCALL_ENTRY_SIZE = 16;
 
 int yara_scan_callback(YR_SCAN_CONTEXT* context, int message,
                        void* message_data, void* user_data) {
@@ -247,37 +219,334 @@ bool PatternPass::load_rules() {
 #endif
 }
 
-// ─── PatternPass::run (unified single-scan architecture) ──────────────────
+// ─── PatternCollector implementation ──────────────────────────────────────
+
+PatternCollector::PatternCollector(CodeTable& code_table,
+                                   InstructionDecoder& decoder,
+                                   RegisterFile* regfile,
+                                   bool build_yara_buffers,
+                                   const ConstantMaterializationResult* constmat)
+    : code_table_(code_table)
+    , decoder_(decoder)
+    , regfile_(regfile)
+    , build_yara_buffers_(build_yara_buffers)
+    , constmat_(constmat)
+{}
+
+bool PatternCollector::begin(uint64_t start_inst_id, uint64_t end_inst_id) {
+    result_ = PatternResult{};
+
+    // Reset all detector state
+    hw_sites_.clear();
+    std::memset(xor_ring_, 0, sizeof(xor_ring_));
+    xor_ring_pos_ = 0;
+    xor_ring_size_ = 0;
+    xor_eor_count_ = 0;
+    in_xor_loop_ = false;
+    xor_loop_start_ = 0;
+    xor_loop_insts_.clear();
+    in_load_seq_ = false;
+    load_seq_start_ = 0;
+    load_seq_insts_.clear();
+    last_movz_pc_ = 0;
+    last_pc_ = ~0ULL;
+    reg_buf_ = {};
+    sys_buf_ = {};
+
+    // Pre-classify all unique PCs from code table
+    pc_info_.clear();
+    auto all = code_table_.all_entries();
+    pc_info_.reserve(all.size());
+
+    for (const auto& [pc, opcode] : all) {
+        PCInfo info;
+        auto d = decoder_.decode(pc, opcode);
+        if (d) {
+            std::string_view mn = d->mnemonic_sv();
+            if (mn == "aese" || mn == "aesd" || mn == "aesmc" || mn == "aesimc") {
+                info.cls = MC_HW_AES;
+            } else if (mn == "sha1c" || mn == "sha1h" || mn == "sha1m" ||
+                       mn == "sha1p" || mn == "sha1su0" || mn == "sha1su1" ||
+                       mn == "sha256h" || mn == "sha256h2" ||
+                       mn == "sha256su0" || mn == "sha256su1") {
+                info.cls = MC_HW_SHA;
+            } else if (mn == "eor") {
+                info.cls = MC_EOR;
+            } else if (mn == "movz" || mn == "mov") {
+                info.cls = MC_MOVZ;
+            } else if (mn == "movk") {
+                info.cls = MC_MOVK;
+            } else if (mn == "svc") {
+                info.cls = MC_SVC;
+                info.is_svc = true;
+            }
+            auto n = std::min(mn.size(), sizeof(info.mnemonic) - 1);
+            std::memcpy(info.mnemonic, mn.data(), n);
+            info.mnemonic[n] = '\0';
+        }
+        pc_info_.emplace(pc, info);
+    }
+
+    // Pre-allocate reg_value buffer when building YARA buffers
+    if (build_yara_buffers_) {
+        uint64_t range = end_inst_id - start_inst_id;
+        reg_buf_.data.reserve(range * 2 * 8);
+        reg_buf_.offset_to_inst_id.reserve(range * 2);
+    }
+
+    return true;
+}
+
+void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
+    // Look up pre-classified info - 1-entry cache for loop locality
+    MnemonicClass cls;
+    const char* mn_str;
+    bool is_svc;
+    if (inst.pc == last_pc_) {
+        cls = last_cls_;
+        mn_str = last_mn_str_;
+        is_svc = last_is_svc_;
+    } else {
+        cls = MC_OTHER;
+        mn_str = "";
+        is_svc = false;
+        auto pc_it = pc_info_.find(inst.pc);
+        if (pc_it != pc_info_.end()) {
+            cls = pc_it->second.cls;
+            mn_str = pc_it->second.mnemonic;
+            is_svc = pc_it->second.is_svc;
+        }
+        last_pc_ = inst.pc;
+        last_cls_ = cls;
+        last_mn_str_ = mn_str;
+        last_is_svc_ = is_svc;
+    }
+
+    // ── Collect reg-value entries (only when building YARA buffer) ──
+    if (build_yara_buffers_) {
+        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+            auto diff = inst.reg_diff(i);
+            if (diff.index >= 31 && diff.index <= 33) continue;
+            uint64_t val = diff.value;
+            const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
+            reg_buf_.data.insert(reg_buf_.data.end(), bytes, bytes + 8);
+            reg_buf_.offset_to_inst_id.push_back(inst_id);
+        }
+    }
+
+    // ── Collect syscall entries (only when building YARA buffer) ──
+    if (build_yara_buffers_ && is_svc && regfile_) {
+        auto state = regfile_->state_before(inst_id);
+        uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
+        SyscallEntry entry;
+        entry.inst_id = inst_id;
+        entry.syscall_no = syscall_no;
+        sys_buf_.entries.push_back(entry);
+        uint8_t record[SYSCALL_ENTRY_SIZE] = {};
+        std::memcpy(record, &inst_id, 8);
+        std::memcpy(record + 8, &syscall_no, 2);
+        sys_buf_.data.insert(sys_buf_.data.end(), record, record + SYSCALL_ENTRY_SIZE);
+    }
+
+    // ─── Detector 1: Hardware crypto (PC-deduped) ─────────────────────
+    if (cls == MC_HW_AES || cls == MC_HW_SHA) {
+        auto& site = hw_sites_[inst.pc];
+        if (site.exec_count == 0) {
+            site.cls          = cls;
+            std::strncpy(site.mn, mn_str, sizeof(site.mn) - 1);
+            site.mn[sizeof(site.mn) - 1] = '\0';
+            site.first_inst_id = inst_id;
+        }
+        site.exec_count++;
+        site.last_inst_id = inst_id;
+    }
+
+    // ─── Detector 2: XOR loop (sliding window) ───────────────────────
+    {
+        bool is_eor = (cls == MC_EOR);
+
+        if (xor_ring_size_ >= XOR_WINDOW_SIZE) {
+            if (xor_ring_[xor_ring_pos_]) xor_eor_count_--;
+        } else {
+            xor_ring_size_++;
+        }
+        xor_ring_[xor_ring_pos_] = is_eor;
+        xor_ring_pos_ = (xor_ring_pos_ + 1) % XOR_WINDOW_SIZE;
+        if (is_eor) xor_eor_count_++;
+
+        if (xor_ring_size_ >= XOR_WINDOW_SIZE && xor_eor_count_ >= XOR_THRESHOLD) {
+            if (!in_xor_loop_) {
+                in_xor_loop_ = true;
+                xor_loop_start_ = (inst_id >= XOR_WINDOW_SIZE - 1)
+                                     ? inst_id - XOR_WINDOW_SIZE + 1 : 0;
+                xor_loop_insts_.clear();
+            }
+            xor_loop_insts_.push_back(inst_id);
+        } else {
+            if (in_xor_loop_ && !xor_loop_insts_.empty()) {
+                add_match(PatternMatch{
+                    "XOR loop",
+                    PatternCategory::Crypto,
+                    PatternConfidence::Medium,
+                    xor_loop_start_, xor_loop_insts_.back(), inst.pc,
+                    fmt::format("XOR loop: {} eor instructions at inst #{}-#{}",
+                                 xor_loop_insts_.size(), xor_loop_start_, xor_loop_insts_.back()),
+                    std::move(xor_loop_insts_), {},
+                });
+                xor_loop_insts_.clear();
+            }
+            in_xor_loop_ = false;
+        }
+    }
+
+    // ─── Detector 3: Constant loading (movz + movk sequences) ────────
+    // Skipped when constmat result is available (more precise, no duplication).
+    if (!constmat_) {
+        bool is_movz = (cls == MC_MOVZ);
+        bool is_movk = (cls == MC_MOVK);
+
+        if (is_movz) {
+            if (!in_load_seq_) {
+                in_load_seq_ = true;
+                load_seq_start_ = inst_id;
+                load_seq_insts_.clear();
+            } else {
+                if (load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
+                    add_match(PatternMatch{
+                        "Constant loading sequence",
+                        PatternCategory::KeySchedule,
+                        PatternConfidence::Medium,
+                        load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
+                        fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
+                                     load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
+                        load_seq_insts_, {},
+                    });
+                }
+                load_seq_insts_.clear();
+                load_seq_start_ = inst_id;
+            }
+            last_movz_pc_ = inst.pc;
+            load_seq_insts_.push_back(inst_id);
+        } else if (is_movk && in_load_seq_) {
+            load_seq_insts_.push_back(inst_id);
+        } else if (in_load_seq_) {
+            if (load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
+                add_match(PatternMatch{
+                    "Constant loading sequence",
+                    PatternCategory::KeySchedule,
+                    PatternConfidence::Medium,
+                    load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
+                    fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
+                                 load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
+                    load_seq_insts_, {},
+                });
+            }
+            in_load_seq_ = false;
+            load_seq_insts_.clear();
+        }
+    }
+}
+
+void PatternCollector::end() {
+    // ─── Emit one match per unique HW crypto PC ──────────────────────
+    for (const auto& [pc, site] : hw_sites_) {
+        bool is_aes = (site.cls == MC_HW_AES);
+        add_match(PatternMatch{
+            fmt::format("{} instruction ({})", is_aes ? "AES" : "SHA", site.mn),
+            PatternCategory::Crypto,
+            PatternConfidence::High,
+            site.first_inst_id, site.last_inst_id, pc,
+            fmt::format("Hardware {} instruction {} at PC 0x{:x} ({} executions)",
+                        is_aes ? "AES" : "SHA", site.mn, pc, site.exec_count),
+            {site.first_inst_id}, {},
+        });
+    }
+
+    // Flush pending XOR loop
+    if (in_xor_loop_ && !xor_loop_insts_.empty()) {
+        add_match(PatternMatch{
+            "XOR loop",
+            PatternCategory::Crypto,
+            PatternConfidence::Medium,
+            xor_loop_start_, xor_loop_insts_.back(), 0,
+            fmt::format("XOR loop: {} eor instructions at inst #{}-#{} (end of trace)",
+                         xor_loop_insts_.size(), xor_loop_start_, xor_loop_insts_.back()),
+            std::move(xor_loop_insts_), {},
+        });
+    }
+
+    // Flush pending constant loading (only when not using constmat)
+    if (!constmat_ && in_load_seq_ && load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
+        add_match(PatternMatch{
+            "Constant loading sequence",
+            PatternCategory::KeySchedule,
+            PatternConfidence::Medium,
+            load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
+            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{} (end of trace)",
+                         load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
+            load_seq_insts_, {},
+        });
+    }
+}
+
+PatternMatch& PatternCollector::add_match(PatternMatch match) {
+    result_.matches.push_back(std::move(match));
+    return result_.matches.back();
+}
+
+// ─── PatternPass::run (delegates to PatternCollector) ─────────────────────
 
 PassResult PatternPass::run(PassContext& ctx) {
-    PatternResult result;
+    auto& reader = ctx.reader();
+    auto& index = ctx.index();
+    auto& code_table = ctx.code_table();
+    auto& decoder = ctx.decoder();
+
+    const uint64_t total_insts = index.inst_count();
+    if (total_insts == 0) {
+        return PassResult::failed("Empty trace");
+    }
 
     // Phase 1: Load YARA rules
     bool has_yara = load_rules();
 
-    // Phase 2: Unified trace scan — runs all mnemonic detectors in a single
-    // pass.  When YARA is active, the reg_value and syscall buffers are also
-    // built during the same scan (halving trace I/O).  When YARA is off, the
-    // buffers are not built, avoiding the regfile access that would otherwise
-    // be unnecessary.
+    // Phase 2: Set up collector and run scan
     const auto* constmat = ctx.try_require<ConstantMaterializationResult>("constant_materialization");
-    if (constmat) {
-        ctx.progress(0.0f, "Pattern: unified scan (constmat available, Detector3 skipped)...");
+
+    ctx.progress(0.0f, "Pattern: scanning trace...");
+
+    // regfile is only needed when building YARA syscall buffers
+    RegisterFile* regfile_ptr = has_yara ? &ctx.regfile() : nullptr;
+    PatternCollector collector(code_table, decoder, regfile_ptr, has_yara, constmat);
+
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
     } else {
-        ctx.progress(0.0f, "Pattern: unified scan (mnemonic detection)...");
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                ctx.progress(static_cast<float>(processed) / static_cast<float>(total) * 0.6f);
+            }
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run();
     }
 
-    RegValueBuffer reg_buf;
-    SyscallBuffer sys_buf;
-    // Only build YARA buffers when YARA is actually enabled — this avoids the
-    // regfile() access (and its cost) on the common no-YARA path.
-    RegValueBuffer* reg_buf_p = has_yara ? &reg_buf : nullptr;
-    SyscallBuffer*  sys_buf_p = has_yara ? &sys_buf : nullptr;
-    scan_trace_unified(ctx, reg_buf_p, sys_buf_p, result, constmat);
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
+
+    auto result = collector.take_result();
 
     // Phase 3: Run YARA on built buffers (if enabled)
 #ifdef TENET_HAS_YARA
     if (has_yara) {
+        auto reg_buf = collector.take_reg_buf();
+        auto sys_buf = collector.take_sys_buf();
+
         ctx.progress(0.7f, "Pattern: scanning register values with YARA...");
         if (!reg_buf.data.empty()) {
             std::string name = "reg_value";
@@ -341,14 +610,10 @@ PassResult PatternPass::run(PassContext& ctx) {
     return PassResult::success(std::move(result));
 }
 
-// ─── Merged mnemonic detection (replaces 3 separate trace scans) ──────────
-
 // ─── constmat → PatternMatch conversion ────────────────────────────────────
 
 void PatternPass::constmat_to_pattern_matches(const ConstantMaterializationResult& cm,
                                                PatternResult& result) {
-    // Emit one PatternMatch per identified constant (known algorithm constant).
-    // For unidentified constants with enough parts, emit a generic KeySchedule match.
     for (size_t idx : cm.identified_indices) {
         const auto& mc = cm.constants[idx];
         PatternMatch pm;
@@ -367,11 +632,10 @@ void PatternPass::constmat_to_pattern_matches(const ConstantMaterializationResul
         result.matches.push_back(std::move(pm));
     }
 
-    // For constants with enough parts but no known match, still emit a generic match.
     for (size_t i = 0; i < cm.constants.size(); ++i) {
-        if (cm.constants[i].known_match) continue;  // Already handled above
+        if (cm.constants[i].known_match) continue;
         const auto& mc = cm.constants[i];
-        if (mc.num_parts < 3) continue;  // Mirrors original CONST_LOAD_THRESHOLD
+        if (mc.num_parts < 3) continue;
         PatternMatch pm;
         pm.pattern_name   = "Constant loading sequence";
         pm.category       = PatternCategory::KeySchedule;
@@ -387,326 +651,7 @@ void PatternPass::constmat_to_pattern_matches(const ConstantMaterializationResul
     }
 }
 
-void PatternPass::scan_trace_unified(PassContext& ctx,
-                            RegValueBuffer* reg_buf,
-                            SyscallBuffer* sys_buf,
-                            PatternResult& result,
-                            const ConstantMaterializationResult* constmat) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
-
-    const auto& range = ctx.range();
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    // ─── Pre-classify all unique PCs from code table ──────────────────────
-    // Key optimization: decode each PC only ONCE, not once per instruction.
-    // Merged: produce both mnemonic class (for detectors) and SVC flag
-    // (for syscall buffer) in a single pass over the code table.
-
-    struct PCInfo {
-        MnemonicClass cls = MC_OTHER;
-        char mnemonic[12]{};  // copy of decoded mnemonic (avoids dangling string_view)
-        bool is_svc = false;
-    };
-
-    ankerl::unordered_dense::map<uint64_t, PCInfo> pc_info;
-    {
-        auto all = code_table.all_entries();
-        pc_info.reserve(all.size());
-
-        for (const auto& [pc, opcode] : all) {
-            PCInfo info;
-            auto d = decoder.decode(pc, opcode);
-            if (d) {
-                std::string_view mn = d->mnemonic_sv();
-                // Classify
-                if (mn == "aese" || mn == "aesd" || mn == "aesmc" || mn == "aesimc") {
-                    info.cls = MC_HW_AES;
-                } else if (mn == "sha1c" || mn == "sha1h" || mn == "sha1m" ||
-                           mn == "sha1p" || mn == "sha1su0" || mn == "sha1su1" ||
-                           mn == "sha256h" || mn == "sha256h2" ||
-                           mn == "sha256su0" || mn == "sha256su1") {
-                    info.cls = MC_HW_SHA;
-                } else if (mn == "eor") {
-                    info.cls = MC_EOR;
-                } else if (mn == "movz" || mn == "mov") {
-                    info.cls = MC_MOVZ;
-                } else if (mn == "movk") {
-                    info.cls = MC_MOVK;
-                } else if (mn == "svc") {
-                    info.cls = MC_SVC;
-                    info.is_svc = true;
-                }
-                // Copy mnemonic into fixed-size buffer (no dangling pointer)
-                auto n = std::min(mn.size(), sizeof(info.mnemonic) - 1);
-                std::memcpy(info.mnemonic, mn.data(), n);
-                info.mnemonic[n] = '\0';
-            }
-            pc_info.emplace(pc, info);
-        }
-    }
-
-    // Pre-allocate reg_value buffer (only when building it for YARA)
-    const bool build_buffers = (reg_buf != nullptr);
-    if (build_buffers) {
-        reg_buf->data.reserve((end - start) * 2 * 8);
-        reg_buf->offset_to_inst_id.reserve((end - start) * 2);
-    }
-
-    // ─── Single trace scan: buffers + all 3 detectors ────────────────────
-    // This merges the former build_buffers_merged() and detect_all_mnemonic_patterns()
-    // into one pass, halving the trace I/O.
-
-    // HW crypto: deduplicate by PC to avoid one match per loop iteration.
-    // We accumulate per-PC execution counts and emit one match per unique PC.
-    struct HWCryptoSite {
-        MnemonicClass cls = MC_OTHER;
-        char mn[12]{};  // copy of mnemonic (no dangling pointer)
-        uint64_t exec_count   = 0;
-        uint64_t first_inst_id = 0;
-        uint64_t last_inst_id  = 0;
-    };
-    ankerl::unordered_dense::map<uint64_t, HWCryptoSite> hw_sites;  // pc → site
-
-    // XOR loop state - ring buffer replaces deque for cache locality
-    bool xor_ring[XOR_WINDOW_SIZE] = {};
-    size_t xor_ring_pos = 0;
-    size_t xor_ring_size = 0;
-    size_t xor_eor_count = 0;
-    bool in_xor_loop = false;
-    uint64_t xor_loop_start = 0;
-    std::vector<uint64_t> xor_loop_insts;
-
-    // Constant loading state (only used when constmat == nullptr)
-    const bool use_constmat_detector3 = (constmat != nullptr);
-    bool in_load_seq = false;
-    uint64_t load_seq_start = 0;
-    std::vector<uint64_t> load_seq_insts;
-    uint64_t last_movz_pc = 0;
-
-    uint64_t inst_id = 0;
-    reader.advise_sequential();
-
-    // 1-entry cache for pc_info lookup (high locality in loops)
-    uint64_t last_pc = ~0ULL;
-    MnemonicClass last_cls = MC_OTHER;
-    const char* last_mn_str = "";
-    bool last_is_svc = false;
-
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-        if (inst_id < start) { inst_id++; continue; }
-
-        auto inst = rec.as_inst();
-
-        // Look up pre-classified info - 1-entry cache for loop locality
-        MnemonicClass cls;
-        const char* mn_str;
-        bool is_svc;
-        if (inst.pc == last_pc) {
-            cls = last_cls;
-            mn_str = last_mn_str;
-            is_svc = last_is_svc;
-        } else {
-            cls = MC_OTHER;
-            mn_str = "";
-            is_svc = false;
-            auto pc_it = pc_info.find(inst.pc);
-            if (pc_it != pc_info.end()) {
-                cls = pc_it->second.cls;
-                mn_str = pc_it->second.mnemonic;
-                is_svc = pc_it->second.is_svc;
-            }
-            last_pc = inst.pc;
-            last_cls = cls;
-            last_mn_str = mn_str;
-            last_is_svc = is_svc;
-        }
-        std::string_view mn(mn_str);
-
-        // ── Collect reg-value entries (only when building YARA buffer) ──
-        if (build_buffers) {
-            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                auto diff = inst.reg_diff(i);
-                if (diff.index >= 31 && diff.index <= 33) continue;
-                uint64_t val = diff.value;
-                const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
-                reg_buf->data.insert(reg_buf->data.end(), bytes, bytes + 8);
-                reg_buf->offset_to_inst_id.push_back(inst_id);
-            }
-        }
-
-        // ── Collect syscall entries (only when building YARA buffer) ──
-        // SVC instructions are rare, so the regfile access here is negligible.
-        // This entire block is skipped when YARA is off (sys_buf == nullptr).
-        if (build_buffers && is_svc && sys_buf) {
-            auto& regfile = ctx.regfile();
-            auto state = regfile.state_before(inst_id);
-            uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
-            SyscallEntry entry;
-            entry.inst_id = inst_id;
-            entry.syscall_no = syscall_no;
-            sys_buf->entries.push_back(entry);
-            uint8_t record[SYSCALL_ENTRY_SIZE] = {};
-            std::memcpy(record, &inst_id, 8);
-            std::memcpy(record + 8, &syscall_no, 2);
-            sys_buf->data.insert(sys_buf->data.end(), record, record + SYSCALL_ENTRY_SIZE);
-        }
-
-        // ─── Detector 1: Hardware crypto (PC-deduped) ─────────────────────
-        // Do NOT add one match per execution — hot AES loops run millions of
-        // times.  Instead accumulate per-PC stats; emit matches after the scan.
-        if (cls == MC_HW_AES || cls == MC_HW_SHA) {
-            auto& site = hw_sites[inst.pc];
-            if (site.exec_count == 0) {
-                site.cls          = cls;
-                std::strncpy(site.mn, mn_str, sizeof(site.mn) - 1);
-                site.mn[sizeof(site.mn) - 1] = '\0';
-                site.first_inst_id = inst_id;
-            }
-            site.exec_count++;
-            site.last_inst_id = inst_id;
-        }
-
-        // ─── Detector 2: XOR loop (sliding window) ───────────────────────
-        {
-            bool is_eor = (cls == MC_EOR);
-
-            if (xor_ring_size >= XOR_WINDOW_SIZE) {
-                if (xor_ring[xor_ring_pos]) xor_eor_count--;
-            } else {
-                xor_ring_size++;
-            }
-            xor_ring[xor_ring_pos] = is_eor;
-            xor_ring_pos = (xor_ring_pos + 1) % XOR_WINDOW_SIZE;
-            if (is_eor) xor_eor_count++;
-
-            if (xor_ring_size >= XOR_WINDOW_SIZE && xor_eor_count >= XOR_THRESHOLD) {
-                if (!in_xor_loop) {
-                    in_xor_loop = true;
-                    xor_loop_start = (inst_id >= XOR_WINDOW_SIZE - 1)
-                                         ? inst_id - XOR_WINDOW_SIZE + 1 : 0;
-                    xor_loop_insts.clear();
-                }
-                xor_loop_insts.push_back(inst_id);
-            } else {
-                if (in_xor_loop && !xor_loop_insts.empty()) {
-                    add_match(result, PatternMatch{
-                        "XOR loop",
-                        PatternCategory::Crypto,
-                        PatternConfidence::Medium,
-                        xor_loop_start, xor_loop_insts.back(), inst.pc,
-                        fmt::format("XOR loop: {} eor instructions at inst #{}-#{}",
-                                     xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
-                        std::move(xor_loop_insts), {},
-                    });
-                    xor_loop_insts.clear();
-                }
-                in_xor_loop = false;
-            }
-        }
-
-        // ─── Detector 3: Constant loading (movz + movk sequences) ────────
-        // Skipped when constmat result is available (more precise, no duplication).
-        if (!use_constmat_detector3) {
-            bool is_movz = (cls == MC_MOVZ);
-            bool is_movk = (cls == MC_MOVK);
-
-            if (is_movz) {
-                if (!in_load_seq) {
-                    in_load_seq = true;
-                    load_seq_start = inst_id;
-                    load_seq_insts.clear();
-                } else {
-                    if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-                        add_match(result, PatternMatch{
-                            "Constant loading sequence",
-                            PatternCategory::KeySchedule,
-                            PatternConfidence::Medium,
-                            load_seq_start, load_seq_insts.back(), last_movz_pc,
-                            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                         load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-                            load_seq_insts, {},
-                        });
-                    }
-                    load_seq_insts.clear();
-                    load_seq_start = inst_id;
-                }
-                last_movz_pc = inst.pc;
-                load_seq_insts.push_back(inst_id);
-            } else if (is_movk && in_load_seq) {
-                load_seq_insts.push_back(inst_id);
-            } else if (in_load_seq) {
-                if (load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-                    add_match(result, PatternMatch{
-                        "Constant loading sequence",
-                        PatternCategory::KeySchedule,
-                        PatternConfidence::Medium,
-                        load_seq_start, load_seq_insts.back(), last_movz_pc,
-                        fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                     load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-                        load_seq_insts, {},
-                    });
-                }
-                in_load_seq = false;
-                load_seq_insts.clear();
-            }
-        }
-
-        inst_id++;
-        if (ctx.cancelled()) { reader.advise_random(); return; }
-    }
-
-    reader.advise_random();
-
-    // ─── Emit one match per unique HW crypto PC ──────────────────────────
-    for (const auto& [pc, site] : hw_sites) {
-        bool is_aes = (site.cls == MC_HW_AES);
-        add_match(result, PatternMatch{
-            fmt::format("{} instruction ({})", is_aes ? "AES" : "SHA", site.mn),
-            PatternCategory::Crypto,
-            PatternConfidence::High,
-            site.first_inst_id, site.last_inst_id, pc,
-            fmt::format("Hardware {} instruction {} at PC 0x{:x} ({} executions)",
-                        is_aes ? "AES" : "SHA", site.mn, pc, site.exec_count),
-            {site.first_inst_id}, {},
-        });
-    }
-
-    // Flush pending XOR loop
-    if (in_xor_loop && !xor_loop_insts.empty()) {
-        add_match(result, PatternMatch{
-            "XOR loop",
-            PatternCategory::Crypto,
-            PatternConfidence::Medium,
-            xor_loop_start, xor_loop_insts.back(), 0,
-            fmt::format("XOR loop: {} eor instructions at inst #{}-#{} (end of trace)",
-                         xor_loop_insts.size(), xor_loop_start, xor_loop_insts.back()),
-            std::move(xor_loop_insts), {},
-        });
-    }
-
-    // Flush pending constant loading (only when not using constmat)
-    if (!use_constmat_detector3 && in_load_seq && load_seq_insts.size() >= CONST_LOAD_THRESHOLD) {
-        add_match(result, PatternMatch{
-            "Constant loading sequence",
-            PatternCategory::KeySchedule,
-            PatternConfidence::Medium,
-            load_seq_start, load_seq_insts.back(), last_movz_pc,
-            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{} (end of trace)",
-                         load_seq_insts.size(), load_seq_start, load_seq_insts.back()),
-            load_seq_insts, {},
-        });
-    }
-    // Note: constmat_to_pattern_matches() is called from run() after this scan.
-}
-
-// ─── Code buffer construction (no trace scan needed — iterates code table) ─
+// ─── Code buffer construction ─────────────────────────────────────────────
 
 PatternPass::CodeBuffer PatternPass::build_code_buffer(PassContext& ctx) {
     CodeBuffer buf;
@@ -750,11 +695,6 @@ void PatternPass::build_category_index(PatternResult& result) {
     for (size_t i = 0; i < result.matches.size(); i++) {
         result.by_category[result.matches[i].category].push_back(i);
     }
-}
-
-PatternMatch& PatternPass::add_match(PatternResult& result, PatternMatch match) {
-    result.matches.push_back(std::move(match));
-    return result.matches.back();
 }
 
 // ─── PatternResult helpers ────────────────────────────────────────────────

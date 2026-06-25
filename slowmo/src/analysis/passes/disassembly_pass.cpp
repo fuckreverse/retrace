@@ -1,4 +1,5 @@
 #include "analysis/passes/disassembly_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -53,16 +54,6 @@ inline void classify_mnemonic(std::string_view m, PCDisasmEntry& info) {
 }  // anonymous namespace
 
 // ─── DisassemblyPass::run ────────────────────────────────────────────────
-//
-// Design: build a DisasmTable with
-//   • pc_table   — one PCDisasmEntry per *unique* PC (O(unique PCs))
-//   • inst_to_pc — flat vector mapping inst_id→PC   (O(N_instructions × 8B))
-//
-// This replaces the previous approach that materialised a full DisasmEntry
-// (with copied strings) for every instruction — O(N × ~120B).
-//
-// For a trace of 10M instructions over 5000 unique PCs the old approach
-// used ~1.2 GB; the new approach uses ~80 MB (5000 × 120B + 10M × 8B).
 
 PassResult DisassemblyPass::run(PassContext& ctx) {
     auto& reader     = ctx.reader();
@@ -77,8 +68,9 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
     uint64_t end   = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
+    const uint64_t total_insts = index.inst_count();
+
     // ─── Phase 1: Build pc_table from code table (O(unique PCs)) ─────────
-    // Decode each unique opcode exactly once.
 
     DisasmTable result;
     {
@@ -109,46 +101,35 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
 
     ctx.progress(0.1f, fmt::format("DisasmTable: {} unique PCs decoded", result.pc_table.size()));
 
-    // ─── Phase 2: Build inst_to_pc index (O(N_instructions × 8B)) ────────
-    // We only store the PC per instruction, not a full DisasmEntry.
-    // Actual DisasmEntry objects are synthesised on-demand via lookup().
+    // ─── Phase 2: Build inst_to_pc via collector ──────────────────────────
 
     const uint64_t total = (end > start) ? (end - start) : 0;
     result.base_inst_id = start;
-    result.inst_to_pc.reserve(total);
 
-    uint64_t processed = 0;
+    DisassemblyCollector collector(start, total);
 
-    // Seek directly to start position using index (avoid scanning prefix)
-    uint64_t start_offset = 0;
-    uint64_t scan_inst_id = 0;
-    if (start > 0) {
-        auto [off, pc] = index.offset_of_with_pc(start, reader);
-        start_offset = off;
-        scan_inst_id = start;
-    }
-
-    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
-    uint64_t inst_id = scan_inst_id;
-
-    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-
-        auto inst = rec.as_inst();
-        result.inst_to_pc.push_back(inst.pc);
-
-        inst_id++;
-        processed++;
-
-        if ((processed & 0x1FFFF) == 0) {  // every ~131K instructions
-            ctx.progress(0.1f + 0.9f * static_cast<float>(processed) /
-                         static_cast<float>(total > 0 ? total : 1));
-            if (ctx.cancelled()) {
-                return PassResult::failed("cancelled by user");
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
+    } else {
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total_count) {
+            if (total_count > 0) {
+                ctx.progress(0.1f + 0.9f * static_cast<float>(processed) /
+                             static_cast<float>(total_count));
             }
-        }
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run(start, end);
     }
+
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
+
+    result.inst_to_pc = collector.take_inst_to_pc();
 
     ctx.progress(1.0f, fmt::format(
         "DisasmTable: {} instructions indexed, {} unique PCs",

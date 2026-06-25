@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include "analysis/passes/constant_materialization_pass.h"
 #include <cstdint>
 #include <string>
@@ -66,21 +67,137 @@ struct PatternResult {
     size_t total() const { return matches.size(); }
 };
 
+// ─── PatternCollector ─────────────────────────────────────────────────────
+
+/// TraceCollector that runs all mnemonic-based pattern detectors in a single
+/// sequential scan: HW crypto detection, XOR loop detection, and constant
+/// loading detection.  Also optionally builds YARA reg-value and syscall
+/// buffers during the same scan.
+class PatternCollector final : public TraceCollector {
+public:
+    // ─── Public types (also used by PatternPass for YARA) ─────────────────
+
+    struct SyscallEntry {
+        uint64_t inst_id;
+        uint16_t syscall_no;
+    };
+
+    struct RegValueBuffer {
+        std::vector<uint8_t> data;
+        std::vector<uint64_t> offset_to_inst_id;  // one entry per 8-byte slot
+    };
+
+    struct SyscallBuffer {
+        std::vector<uint8_t> data;
+        std::vector<SyscallEntry> entries;
+    };
+
+    PatternCollector(CodeTable& code_table,
+                     InstructionDecoder& decoder,
+                     RegisterFile* regfile,
+                     bool build_yara_buffers,
+                     const ConstantMaterializationResult* constmat);
+
+    std::string_view name() const override { return "PatternCollector"; }
+
+    bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
+    void on_inst(uint64_t inst_id, const InstView& inst) override;
+    void end() override;
+
+    /// Take ownership of results after scan completes.
+    PatternResult take_result() { return std::move(result_); }
+    RegValueBuffer take_reg_buf() { return std::move(reg_buf_); }
+    SyscallBuffer take_sys_buf() { return std::move(sys_buf_); }
+
+private:
+    // ─── Mnemonic classification ──────────────────────────────────────────
+
+    enum MnemonicClass : uint8_t {
+        MC_OTHER        = 0,
+        MC_HW_AES       = 1,
+        MC_HW_SHA       = 2,
+        MC_EOR          = 3,
+        MC_MOVZ         = 4,
+        MC_MOVK         = 5,
+        MC_SVC          = 6,
+    };
+
+    struct PCInfo {
+        MnemonicClass cls = MC_OTHER;
+        char mnemonic[12]{};
+        bool is_svc = false;
+    };
+
+    PatternMatch& add_match(PatternMatch match);
+
+    // ─── Configuration ───────────────────────────────────────────────────
+
+    CodeTable& code_table_;
+    InstructionDecoder& decoder_;
+    RegisterFile* regfile_;          // nullable; only needed for syscall buffer
+    bool build_yara_buffers_;
+    const ConstantMaterializationResult* constmat_;
+
+    // ─── Pre-built PC classification ─────────────────────────────────────
+
+    ankerl::unordered_dense::map<uint64_t, PCInfo> pc_info_;
+
+    // 1-entry cache for pc_info lookup (high locality in loops)
+    uint64_t last_pc_ = ~0ULL;
+    MnemonicClass last_cls_ = MC_OTHER;
+    const char* last_mn_str_ = "";
+    bool last_is_svc_ = false;
+
+    // ─── HW crypto detector state ────────────────────────────────────────
+
+    struct HWCryptoSite {
+        MnemonicClass cls = MC_OTHER;
+        char mn[12]{};
+        uint64_t exec_count   = 0;
+        uint64_t first_inst_id = 0;
+        uint64_t last_inst_id  = 0;
+    };
+    ankerl::unordered_dense::map<uint64_t, HWCryptoSite> hw_sites_;
+
+    // ─── XOR loop detector state ─────────────────────────────────────────
+
+    static constexpr size_t XOR_WINDOW_SIZE = 8;
+    static constexpr size_t XOR_THRESHOLD  = 4;
+
+    bool xor_ring_[XOR_WINDOW_SIZE] = {};
+    size_t xor_ring_pos_ = 0;
+    size_t xor_ring_size_ = 0;
+    size_t xor_eor_count_ = 0;
+    bool in_xor_loop_ = false;
+    uint64_t xor_loop_start_ = 0;
+    std::vector<uint64_t> xor_loop_insts_;
+
+    // ─── Constant loading detector state ─────────────────────────────────
+
+    static constexpr size_t CONST_LOAD_THRESHOLD = 3;
+
+    bool in_load_seq_ = false;
+    uint64_t load_seq_start_ = 0;
+    std::vector<uint64_t> load_seq_insts_;
+    uint64_t last_movz_pc_ = 0;
+
+    // ─── YARA buffer state ───────────────────────────────────────────────
+
+    static constexpr uint8_t REG_X16 = 16;
+    static constexpr size_t SYSCALL_ENTRY_SIZE = 16;
+
+    RegValueBuffer reg_buf_;
+    SyscallBuffer sys_buf_;
+
+    // ─── Result ──────────────────────────────────────────────────────────
+
+    PatternResult result_;
+};
+
 // ─── Pattern analysis pass (YARA-based) ───────────────────────────────────
 
-/// Detects cryptographic algorithm usage and anti-debug/anti-tamper patterns
-/// using libyara for rule-based matching on trace data buffers.
-///
-/// The pass constructs several scannable buffers from the trace:
-///   1. Register value buffer: concatenated 8-byte LE register diff values
-///   2. Syscall buffer: 16-byte entries [inst_id(8) | syscall_no(2) | pad(6)]
-///   3. Code buffer: raw opcode bytes from the code table
-///
-/// YARA rules are loaded from the rules/ directory (configurable).
-///
-/// Additionally, mnemonic-based detection (hardware crypto, XOR loops,
-/// constant loading) is performed inline as before but can be extended
-/// via custom YARA rules over the code buffer.
+/// Detects cryptographic algorithm usage and anti-debug/anti-tamper patterns.
+/// Now delegates the trace scan to PatternCollector for scan fusion.
 ///
 /// Result type: PatternResult
 class PatternPass final : public AnalysisPass {
@@ -111,91 +228,38 @@ public:
     float estimated_cost() const override { return 10.0f; }
 
     /// Set the directory containing .yar rule files.
-    /// Must be called before run(). Defaults to "<exe_dir>/../rules/".
     void set_rules_dir(const std::filesystem::path& dir) { rules_dir_ = dir; }
-
-    // ─── Public types (needed by YARA callback in .cpp) ──────────────────
-
-    struct SyscallEntry {
-        uint64_t inst_id;
-        uint16_t syscall_no;
-    };
 
     /// Parse category string from YARA meta.
     static PatternCategory parse_category(const std::string& s);
     /// Parse confidence string from YARA meta.
     static PatternConfidence parse_confidence(const std::string& s);
 
+    // ─── Public types (needed by YARA callback in .cpp) ──────────────────
+
+    using SyscallEntry = PatternCollector::SyscallEntry;
+
 private:
     // ─── YARA integration ────────────────────────────────────────────────
 
-    /// Load and compile all .yar files from rules_dir_.
     bool load_rules();
 
-    /// Scan a buffer with YARA rules and collect matches into result.
-    /// `buffer_name` identifies which buffer (for offset→inst_id mapping).
     void yara_scan_buffer(const uint8_t* data, size_t size,
                           const std::string& buffer_name,
                           PatternResult& result);
 
-    // ─── Buffer construction ─────────────────────────────────────────────
-
-    /// Build the register-value buffer from trace.
-    /// Returns the buffer and a mapping: byte_offset → inst_id.
-    struct RegValueBuffer {
-        std::vector<uint8_t> data;
-        std::vector<uint64_t> offset_to_inst_id;  // one entry per 8-byte slot
-    };
-
-    /// Build the syscall buffer from trace.
-    struct SyscallBuffer {
-        std::vector<uint8_t> data;
-        std::vector<SyscallEntry> entries;
-    };
-
-    /// Build the code buffer (continuous opcode bytes from code table).
     struct CodeBuffer {
         std::vector<uint8_t> data;
-        std::vector<uint64_t> offset_to_pc;  // byte offset → PC
+        std::vector<uint64_t> offset_to_pc;
     };
     CodeBuffer build_code_buffer(PassContext& ctx);
 
-    // ─── Unified trace scan (replaces separate buffer + mnemonic scans) ──
-
-    /// Single-pass scan that simultaneously:
-    ///   - Optionally builds the reg_value buffer (for YARA scanning)
-    ///   - Optionally builds the syscall buffer (for YARA scanning)
-    ///   - Runs HW crypto detection (PC-deduped)
-    ///   - Runs XOR loop detection (sliding window)
-    ///   - Runs constant loading detection (movz+movk sequences)
-    ///
-    /// When `reg_buf` / `sys_buf` are non-null, the corresponding YARA
-    /// buffer is built during the scan.  When null, buffer construction
-    /// (and the regfile access it implies) is skipped entirely — this is
-    /// the fast path when YARA is not compiled in or has no rules.
-    ///
-    /// When `constmat` is non-null, constant loading detection is skipped
-    /// (its results are synthesised from constmat after the scan).
-    ///
-    /// This replaces the previous two full-trace scans with one, halving
-    /// the trace I/O for PatternPass when YARA is active, and keeping the
-    /// no-YARA path to a single scan (same as before).
-    void scan_trace_unified(PassContext& ctx,
-                            RegValueBuffer* reg_buf,
-                            SyscallBuffer* sys_buf,
-                            PatternResult& result,
-                            const ConstantMaterializationResult* constmat);
-
-    /// Convert ConstantMaterializationResult entries into PatternMatch objects
-    /// and append them to result (replaces Detector3).
+    /// Convert ConstantMaterializationResult entries into PatternMatch objects.
     static void constmat_to_pattern_matches(const ConstantMaterializationResult& cm,
                                              PatternResult& result);
 
     /// Build the by_category index from the matches vector.
     void build_category_index(PatternResult& result);
-
-    /// Add a match and return a reference to it in the result.
-    PatternMatch& add_match(PatternResult& result, PatternMatch match);
 
     // ─── State ───────────────────────────────────────────────────────────
 
@@ -204,10 +268,6 @@ private:
     YR_RULES* yr_rules_ = nullptr;
 #endif
     bool rules_loaded_ = false;
-
-    // Cached syscall buffer from unified scan (unused — kept for ABI compat)
-    SyscallBuffer cached_syscall_buf_;
-    bool cached_syscall_buf_built_ = false;
 };
 
 }  // namespace tenet

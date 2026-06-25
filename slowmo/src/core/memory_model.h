@@ -151,11 +151,11 @@ public:
     void invalidate_thread_iterators();
 
 private:
-    static constexpr uint64_t PAGE_SHIFT = 12;
-    static constexpr uint64_t PAGE_SIZE = 1ULL << PAGE_SHIFT;
+    static constexpr uint64_t kPageShift = 12;
+    static constexpr uint64_t kPageSize = 1ULL << kPageShift;
     static constexpr uint8_t MAX_WRITE_SIZE = 16;
 
-    static uint64_t page_of(uint64_t addr) { return addr >> PAGE_SHIFT; }
+    static uint64_t page_of(uint64_t addr) { return addr >> kPageShift; }
 
     // ─── RocksDB key encoding ────────────────────────────────────────────
     // Key format: [page_addr BE(8)] [page_offset BE(2)] [inst_id BE(8)]
@@ -285,7 +285,7 @@ private:
     LRUCache<uint64_t, std::vector<MemWrite>> page_cache_{512};
 
     // Per-page sorted write index — the fast query path (protected by cache_mutex_).
-    // Key: page number (addr >> PAGE_SHIFT).
+    // Key: page number (addr >> kPageShift).
     // Value: sorted vector of PageWriteEntry (see above).
     // Capacity: 512 pages × ~1000 entries × 32 B ≈ 16 MB worst-case.
     LRUCache<uint64_t, PageWriteIndex> page_index_cache_{512};

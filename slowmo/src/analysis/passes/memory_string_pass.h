@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include "analysis/passes/string_pass.h"  // reuse StringRef, StringResult types
 #include <cstdint>
 #include <string>
@@ -111,6 +112,40 @@ struct MemoryStringResult {
 
     /// Count of unique string contents.
     size_t unique_count() const { return unique_contents.size(); }
+};
+
+// ─── MemoryStringCollector ────────────────────────────────────────────────
+
+/// TraceCollector that identifies call-site instructions (BL/BLR/SVC) during
+/// a single sequential scan. Collects (inst_id, pc) pairs.
+///
+/// The heavy analysis (regfile snapshot, memory read, string scanning) is done
+/// afterwards in MemoryStringPass::run(), since it requires random-access
+/// queries to RegisterFile and MemoryModel.
+class MemoryStringCollector final : public TraceCollector {
+public:
+    struct CallSite {
+        uint64_t inst_id;
+        uint64_t pc;
+    };
+
+    explicit MemoryStringCollector(const CodeTable& code_table,
+                                    const MemoryStringConfig& config)
+        : code_table_(code_table), config_(config) {}
+
+    std::string_view name() const override { return "MemoryStringCollector"; }
+
+    bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
+    void on_inst(uint64_t inst_id, const InstView& inst) override;
+    void end() override {}
+
+    const std::vector<CallSite>& call_sites() const { return call_sites_; }
+
+private:
+    const CodeTable& code_table_;
+    const MemoryStringConfig& config_;
+    uint64_t inst_id_ = 0;
+    std::vector<CallSite> call_sites_;
 };
 
 // ─── Pass ─────────────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/objc_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/code_table.h"
 #include "core/memory_model.h"
@@ -67,7 +68,7 @@ using json = nlohmann::json;
 //       CFTypeRef *result      // x1
 //   );
 
-const std::vector<ApiSignature>& SyscallInterceptPass::known_apis() {
+const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
     static const std::vector<ApiSignature> apis = {
         // ── CommonCrypto ──────────────────────────────────────────────────
         {
@@ -217,23 +218,180 @@ const std::vector<ApiSignature>& SyscallInterceptPass::known_apis() {
     return apis;
 }
 
+// ─── SyscallInterceptCollector ────────────────────────────────────────────
+
+SyscallInterceptCollector::SyscallInterceptCollector(
+    const SyscallInterceptConfig& config,
+    const CodeTable& code_table,
+    MemoryModel& memory,
+    const ObjcResult* objc)
+    : config_(config)
+    , code_table_(code_table)
+    , memory_(memory)
+    , objc_result_(objc)
+{
+    // Build known API name → signature lookup.
+    const auto& apis = known_apis();
+    for (const auto& sig : apis) {
+        api_by_name_[sig.name] = &sig;
+    }
+    // Add user-specified extra names (matched as prefix, no decode).
+    for (const auto& extra : config_.extra_api_names) {
+        if (api_by_name_.find(extra) == api_by_name_.end()) {
+            api_by_name_[extra] = nullptr;  // nullptr = no signature
+        }
+    }
+}
+
+bool SyscallInterceptCollector::begin(uint64_t /*start_inst_id*/,
+                                       uint64_t /*end_inst_id*/) {
+    // Reset state for a fresh scan.
+    std::memset(cur_regs_, 0, sizeof(cur_regs_));
+    regs_valid_ = false;
+    cur_inst_id_ = 0;
+    last_objc_inst_id_ = 0;
+    last_objc_context_.clear();
+    result_ = {};
+    return true;
+}
+
+void SyscallInterceptCollector::on_inst(uint64_t /*inst_id*/, const InstView& inst) {
+    // Apply reg_diffs to maintain x0-x7 state.
+    for (uint8_t r = 0; r < inst.reg_diff_count; ++r) {
+        auto diff = inst.reg_diff(r);
+        if (diff.index < MAX_ARG_REGS) {
+            cur_regs_[diff.index] = diff.value;
+            regs_valid_ = true;
+        }
+    }
+    cur_inst_id_++;
+}
+
+void SyscallInterceptCollector::on_objc(uint64_t /*inst_id*/, const ObjcView& objc) {
+    // Track ObjC context for annotation.
+    last_objc_inst_id_ = cur_inst_id_;
+
+    std::string cls_name(objc.cls ? objc.cls : "");
+    // Try to resolve selector from symbol table.
+    std::string sel_name;
+    if (objc.sel != 0) {
+        auto s = code_table_.image_read_cstring(objc.sel, 128);
+        if (s) sel_name = *s;
+    }
+    if (sel_name.empty()) {
+        // Fallback: use previously resolved selector from ObjcResult.
+        if (objc_result_) {
+            for (auto rit = objc_result_->messages.rbegin();
+                 rit != objc_result_->messages.rend(); ++rit) {
+                if (rit->inst_id <= cur_inst_id_) {
+                    sel_name = rit->selector_name;
+                    if (cls_name.empty()) cls_name = rit->class_name;
+                    break;
+                }
+            }
+        }
+    }
+    if (!cls_name.empty() || !sel_name.empty()) {
+        last_objc_context_ = '[' + cls_name + ' ' + sel_name + ']';
+    }
+}
+
+void SyscallInterceptCollector::on_event(const EventView& ev) {
+    // XFER_CALL events: callee PC is outside the traced module.
+    // event type: XFER_CALL = EventKind value (check TraceFormat.h)
+    // qbditrace defines: QBDITRACE_EV_SEQ_ENTRY=0, XFER_CALL=2, XFER_RETURN=3
+    // We accept both types 2 (XFER_CALL) and 0 to catch cross-module calls.
+    if (ev.event != 2 && ev.event != 0) return;
+
+    uint64_t callee_pc = ev.addr;
+    if (callee_pc == 0) return;
+
+    // ── Resolve callee name ────────────────────────────────────────
+    std::string callee_name;
+
+    if (!code_table_.opcode_at(callee_pc).has_value()) {
+        // The callee is NOT in the traced module — it's a cross-library call.
+        auto sym = code_table_.image_read_cstring(callee_pc, 64);
+        if (sym) callee_name = *sym;
+    }
+
+    // ── Match against known APIs ──────────────────────────────────
+    const ApiSignature* sig = nullptr;
+    if (!callee_name.empty()) {
+        auto ait = api_by_name_.find(callee_name);
+        if (ait != api_by_name_.end()) {
+            sig = ait->second;
+        } else {
+            // Prefix match for user-specified extra names.
+            for (const auto& [name, s] : api_by_name_) {
+                if (callee_name.rfind(name, 0) == 0) {
+                    sig = s;
+                    callee_name = name;
+                    break;
+                }
+            }
+        }
+    }
+
+    // If we have a signature match OR user requested all unresolved.
+    if (sig == nullptr && !config_.intercept_unresolved) return;
+    if (sig == nullptr && callee_name.empty()) return;
+
+    if (!regs_valid_) return;
+
+    // ── Build the intercepted call record ─────────────────────────
+    InterceptedCall call;
+    call.inst_id       = cur_inst_id_;
+    call.call_site_pc  = ev.site;
+    call.callee_pc     = callee_pc;
+    call.callee_name   = callee_name.empty() ?
+                             fmt::format("sub_{:x}", callee_pc) : callee_name;
+    call.category      = sig ? sig->category : ApiCategory::Custom;
+    std::memcpy(call.raw_args.data(), cur_regs_, sizeof(uint64_t) * MAX_ARG_REGS);
+    call.arg_count     = sig ? sig->arg_count : MAX_ARG_REGS;
+
+    // Attach ObjC context if recent.
+    if (!last_objc_context_.empty() &&
+        cur_inst_id_ - last_objc_inst_id_ < 100000) {
+        call.objc_context = last_objc_context_;
+    }
+
+    // Decode arguments for known APIs.
+    if (sig) {
+        decode_known_api(call, *sig);
+    } else {
+        call.decoded_summary = call.callee_name +
+            fmt::format(": x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x}",
+                        cur_regs_[0], cur_regs_[1], cur_regs_[2], cur_regs_[3]);
+    }
+
+    // ── Index and store ───────────────────────────────────────────
+    size_t hit_idx = result_.calls.size();
+    result_.by_callee[call.callee_name].push_back(hit_idx);
+    result_.by_category[call.category].push_back(hit_idx);
+    result_.calls.push_back(std::move(call));
+}
+
+void SyscallInterceptCollector::end() {
+    // Nothing to finalize — results are already accumulated.
+}
+
 // ─── Memory reading helper ────────────────────────────────────────────────
 
-std::vector<uint8_t> SyscallInterceptPass::read_memory_at(
-    PassContext& ctx, uint64_t addr, uint32_t max_bytes, uint64_t at_inst_id)
+std::vector<uint8_t> SyscallInterceptCollector::read_memory_at(
+    uint64_t addr, uint32_t max_bytes, uint64_t at_inst_id)
 {
     if (addr == 0 || max_bytes == 0) return {};
 
     std::vector<uint8_t> result;
     result.reserve(max_bytes);
 
-    auto& memory = ctx.memory();
     uint64_t cur = addr;
     uint32_t remaining = max_bytes;
 
     while (remaining > 0) {
         uint8_t chunk = static_cast<uint8_t>(std::min<uint32_t>(remaining, 16));
-        auto mem_res = memory.read(cur, chunk, at_inst_id);
+        auto mem_res = memory_.read(cur, chunk, at_inst_id);
 
         bool any_known = false;
         for (uint8_t i = 0; i < chunk; ++i) {
@@ -259,9 +417,8 @@ done:
 
 // ─── Decode a known API call ──────────────────────────────────────────────
 
-void SyscallInterceptPass::decode_known_api(InterceptedCall& call,
-                                             const ApiSignature& sig,
-                                             PassContext& ctx)
+void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
+                                                  const ApiSignature& sig)
 {
     const auto* regs = call.raw_args.data();
     const uint32_t capture = config_.capture_bytes;
@@ -277,7 +434,7 @@ void SyscallInterceptPass::decode_known_api(InterceptedCall& call,
             len = regs[len_idx];
         }
         uint32_t cap = static_cast<uint32_t>(std::min<uint64_t>(len, capture));
-        return read_memory_at(ctx, ptr, cap, call.inst_id);
+        return read_memory_at(ptr, cap, call.inst_id);
     };
 
     // Extract key material.
@@ -360,197 +517,35 @@ void SyscallInterceptPass::decode_known_api(InterceptedCall& call,
 
 PassResult SyscallInterceptPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
-    const auto& hdr = reader.header();
     const auto& code_table = ctx.code_table();
 
     // Optional: get ObjC messages for context annotation.
     const ObjcResult* objc = ctx.try_require<ObjcResult>("objc");
 
-    SyscallInterceptResult result;
-
-    // ── Build known API name → signature lookup ───────────────────────────
-    const auto& apis = known_apis();
-    std::unordered_map<std::string, const ApiSignature*> api_by_name;
-    for (const auto& sig : apis) {
-        api_by_name[sig.name] = &sig;
-    }
-    // Add user-specified extra names (matched as prefix, no decode).
-    for (const auto& extra : config_.extra_api_names) {
-        if (api_by_name.find(extra) == api_by_name.end()) {
-            api_by_name[extra] = nullptr;  // nullptr = no signature
-        }
-    }
-
-    // ── Track register state with a lightweight tracker ──────────────────
-    // We maintain a rolling register state (x0-x7) by replaying reg_diffs.
-    // This is cheaper than using RegisterFile (no RocksDB, no anchor replay).
-    // We only need x0-x7 for ABI argument extraction.
-    constexpr uint32_t MAX_ARG_REGS = 8;
-    uint64_t cur_regs[MAX_ARG_REGS] = {};
-    bool regs_valid = false;
-
-    // Track last ObjC message for context annotation.
-    uint64_t last_objc_inst_id = 0;
-    std::string last_objc_context;
-
-    uint64_t cur_inst_id = 0;
-    uint64_t total_calls = 0;
-
     ctx.progress(0.01f, "syscall_intercept: scanning trace...");
 
-    reader.advise_sequential();
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
-        auto rec = *it;
+    SyscallInterceptCollector collector(config_, code_table, ctx.memory(), objc);
 
-        if (ctx.cancelled()) {
-            reader.advise_random();
-            return PassResult::failed("syscall_intercept: cancelled");
-        }
-
-        if (rec.kind == RecordKind::Inst) {
-            auto inst = rec.as_inst();
-            // Apply reg_diffs to maintain x0-x7 state.
-            for (uint8_t r = 0; r < inst.reg_diff_count; ++r) {
-                auto diff = inst.reg_diff(r);
-                if (diff.index < MAX_ARG_REGS) {
-                    cur_regs[diff.index] = diff.value;
-                    regs_valid = true;
-                }
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
+    } else {
+        auto& index = ctx.index();
+        uint64_t total_insts = index.inst_count();
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                ctx.progress(std::min(0.99f,
+                    static_cast<float>(processed) / static_cast<float>(total)));
             }
-            cur_inst_id++;
-
-        } else if (rec.kind == RecordKind::Objc) {
-            // Track ObjC context for annotation.
-            auto objc_rec = rec.as_objc();
-            last_objc_inst_id = cur_inst_id;
-
-            std::string cls_name(objc_rec.cls ? objc_rec.cls : "");
-            // Try to resolve selector from symbol table.
-            std::string sel_name;
-            if (objc_rec.sel != 0) {
-                auto s = code_table.image_read_cstring(objc_rec.sel, 128);
-                if (s) sel_name = *s;
-            }
-            if (sel_name.empty()) {
-                // Fallback: use previously resolved selector from ObjcResult.
-                if (objc) {
-                    for (auto rit = objc->messages.rbegin(); rit != objc->messages.rend(); ++rit) {
-                        if (rit->inst_id <= cur_inst_id) {
-                            sel_name = rit->selector_name;
-                            if (cls_name.empty()) cls_name = rit->class_name;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!cls_name.empty() || !sel_name.empty()) {
-                last_objc_context = '[' + cls_name + ' ' + sel_name + ']';
-            }
-
-        } else if (rec.kind == RecordKind::Event) {
-            // XFER_CALL events: callee PC is outside the traced module.
-            auto ev = rec.as_event();
-
-            // event type: XFER_CALL = EventKind value (check TraceFormat.h)
-            // qbditrace defines: QBDITRACE_EV_SEQ_ENTRY=0, XFER_CALL=2, XFER_RETURN=3
-            // We accept both types 2 (XFER_CALL) to catch cross-module calls.
-            if (ev.event != 2 && ev.event != 0) continue;
-
-            uint64_t callee_pc = ev.addr;
-            if (callee_pc == 0) continue;
-
-            // ── Resolve callee name ────────────────────────────────────────
-            // First, check if callee is inside the traced module range.
-            // If it's outside, attempt symbol name resolution.
-            // The CodeTable doesn't have external symbol names directly.
-            // We resolve by checking for known function name patterns in the
-            // callee address region (via image_read_cstring on export stub).
-            // For now: we match by comparing known API addresses if available.
-            // Without a symbol table for external dylibs, we use heuristic:
-            // look for a CODE record or function name from the code_table
-            // at the callee PC.
-            std::string callee_name;
-
-            // Try code_table image read at callee PC as a symbol (works when
-            // the ImageFallback is loaded and contains the Mach-O symbol table).
-            // Since we don't have an external dylib, this may not resolve.
-            // Fall back to checking whether callee_pc looks like it's in a
-            // known dylib range by examining if code_table has it.
-            if (!code_table.opcode_at(callee_pc).has_value()) {
-                // The callee is NOT in the traced module — it's a cross-library call.
-                // For well-known iOS APIs, the callee symbol might appear in the
-                // traced module's import stub section. Try reading a string near
-                // the call target.
-                auto sym = code_table.image_read_cstring(callee_pc, 64);
-                if (sym) callee_name = *sym;
-            }
-
-            // ── Match against known APIs ──────────────────────────────────
-            const ApiSignature* sig = nullptr;
-            if (!callee_name.empty()) {
-                auto ait = api_by_name.find(callee_name);
-                if (ait != api_by_name.end()) {
-                    sig = ait->second;
-                } else {
-                    // Prefix match for user-specified extra names.
-                    for (const auto& [name, s] : api_by_name) {
-                        if (callee_name.rfind(name, 0) == 0) {
-                            sig = s;
-                            callee_name = name;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // If we have a signature match OR user requested all unresolved.
-            if (sig == nullptr && !config_.intercept_unresolved) continue;
-            if (sig == nullptr && callee_name.empty()) continue;
-
-            if (!regs_valid) continue;
-
-            // ── Build the intercepted call record ─────────────────────────
-            InterceptedCall call;
-            call.inst_id       = cur_inst_id;
-            call.call_site_pc  = ev.site;
-            call.callee_pc     = callee_pc;
-            call.callee_name   = callee_name.empty() ?
-                                     fmt::format("sub_{:x}", callee_pc) : callee_name;
-            call.category      = sig ? sig->category : ApiCategory::Custom;
-            std::memcpy(call.raw_args.data(), cur_regs, sizeof(uint64_t) * MAX_ARG_REGS);
-            call.arg_count     = sig ? sig->arg_count : MAX_ARG_REGS;
-
-            // Attach ObjC context if recent.
-            if (!last_objc_context.empty() &&
-                cur_inst_id - last_objc_inst_id < 100000) {
-                call.objc_context = last_objc_context;
-            }
-
-            // Decode arguments for known APIs.
-            if (sig) {
-                decode_known_api(call, *sig, ctx);
-            } else {
-                call.decoded_summary = call.callee_name +
-                    fmt::format(": x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x}",
-                                cur_regs[0], cur_regs[1], cur_regs[2], cur_regs[3]);
-            }
-
-            // ── Index and store ───────────────────────────────────────────
-            size_t hit_idx = result.calls.size();
-            result.by_callee[call.callee_name].push_back(hit_idx);
-            result.by_category[call.category].push_back(hit_idx);
-            result.calls.push_back(std::move(call));
-            total_calls++;
-        }
-
-        // Progress every 100K records
-        if (cur_inst_id % 100000 == 0 && cur_inst_id > 0) {
-            ctx.progress(std::min(0.99f,
-                static_cast<float>(cur_inst_id) / static_cast<float>(
-                    std::max<uint64_t>(1, reader.file_size() / 64))));
-        }
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run();
     }
-    reader.advise_random();
+
+    auto result = collector.take_result();
 
     ctx.progress(1.0f, fmt::format(
         "syscall_intercept: {} API calls intercepted ({} unique callees)",
@@ -642,6 +637,18 @@ std::string SyscallInterceptResult::to_json() const {
     output["calls"] = std::move(calls_arr);
 
     return output.dump(2);
+}
+
+// ─── ApiArg::to_string ───────────────────────────────────────────────────
+
+std::string ApiArg::to_string() const {
+    if (as_string.has_value()) return *as_string;
+    if (as_bytes.has_value()) {
+        std::string hex;
+        for (uint8_t b : *as_bytes) hex += fmt::format("{:02x}", b);
+        return hex;
+    }
+    return fmt::format("0x{:x}", raw_value);
 }
 
 }  // namespace tenet

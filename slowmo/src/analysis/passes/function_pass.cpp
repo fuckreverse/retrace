@@ -1,5 +1,5 @@
 #include "analysis/passes/function_pass.h"
-#include "analysis/passes/xref_pass.h"
+#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -8,6 +8,7 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 namespace tenet {
 
@@ -155,7 +156,72 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
     return true;
 }
 
-}  // anonymous namespace (function serialization)
+// ─── Known non-returning functions (common in iOS/macOS AArch64 binaries) ──
+
+static const std::unordered_set<std::string> kNonReturningSymbols = {
+    "exit", "_exit", "abort", "__abort",
+    "__cxa_throw", "__cxa_rethrow", "objc_exception_throw",
+    "longjmp", "_longjmp", "siglongjmp",
+    "pthread_exit", "__pthread_exit",
+    "__assert_rtn", "__assert_fail",
+    "__stack_chk_fail", "__fortify_fail",
+    "swift_unexpectedError", "swift_fatalError",
+};
+
+// ─── AArch64 opcode classification via bit patterns ───────────────────────
+
+struct OpcodeClass {
+    bool is_call             : 1;  // BL / BLR / BLRAA/BLRAB/BLRAAZ/BLRABZ
+    bool is_ret              : 1;  // RET
+    bool is_unconditional_jump : 1; // B / BR
+};
+
+inline OpcodeClass classify_opcode(uint32_t op) {
+    OpcodeClass c{false, false, false};
+
+    // BL (direct call, imm26): bits[31:26] = 100101
+    if ((op & 0xFC000000u) == 0x94000000u) {
+        c.is_call = true;
+        return c;
+    }
+
+    // B (unconditional direct branch): bits[31:26] = 000101
+    if ((op & 0xFC000000u) == 0x14000000u) {
+        c.is_unconditional_jump = true;
+        return c;
+    }
+
+    // Remaining candidates all have bits[31:25] = 1101011 (0x6B << 25)
+    if ((op & 0xFE000000u) != 0xD6000000u) return c;
+
+    // BLR (indirect call)
+    if ((op & 0xFFFFFC1Fu) == 0xD63F0000u) {
+        c.is_call = true;
+        return c;
+    }
+
+    // RET
+    if ((op & 0xFFFFFC1Fu) == 0xD65F0000u) {
+        c.is_ret = true;
+        return c;
+    }
+
+    // BR (unconditional indirect branch)
+    if ((op & 0xFFFFFC1Fu) == 0xD61F0000u) {
+        c.is_unconditional_jump = true;
+        return c;
+    }
+
+    // BLRAA / BLRAB / BLRAAZ / BLRABZ (PAC-authenticated BLR)
+    if ((op & 0xFEFFF800u) == 0xD63F0800u) {
+        c.is_call = true;
+        return c;
+    }
+
+    return c;
+}
+
+}  // anonymous namespace
 
 // ─── FunctionResult methods ───────────────────────────────────────────────
 
@@ -173,15 +239,12 @@ void FunctionResult::build_call_index() const {
 std::vector<const CallEvent*> FunctionResult::call_stack_at(uint64_t inst_id) const {
     build_call_index();
 
-    // Binary search: find the first sorted index where call_inst_id > inst_id
     auto bound = std::upper_bound(
         sorted_call_indices_.begin(), sorted_call_indices_.end(), inst_id,
         [this](uint64_t id, size_t idx) {
             return id < call_events[idx].call_inst_id;
         });
 
-    // All events with call_inst_id <= inst_id are in [begin, bound).
-    // Among those, collect ones that haven't returned yet (return_inst_id == 0 or >= inst_id).
     std::vector<const CallEvent*> stack;
     for (auto it = sorted_call_indices_.begin(); it != bound; ++it) {
         const auto& evt = call_events[*it];
@@ -189,7 +252,6 @@ std::vector<const CallEvent*> FunctionResult::call_stack_at(uint64_t inst_id) co
             stack.push_back(&evt);
         }
     }
-    // Sort by depth (outermost first) for consistent output
     std::sort(stack.begin(), stack.end(),
               [](const CallEvent* a, const CallEvent* b) {
                   return a->depth < b->depth;
@@ -198,31 +260,21 @@ std::vector<const CallEvent*> FunctionResult::call_stack_at(uint64_t inst_id) co
 }
 
 void FunctionResult::build_depth_table() {
-    // Build a sorted sequence of (inst_id, depth) transition points.
-    // Each call event contributes two entries:
-    //   call_inst_id  → depth+1 (entering the call)
-    //   return_inst_id → depth   (after the return; caller's depth restored)
-    // We simulate the stack to get the correct depth at each transition.
     depth_table_.clear();
     if (call_events.empty()) return;
 
     depth_table_.reserve(call_events.size() * 2);
 
-    // Replay the same linear scan as call_stack_at(), but just record
-    // (inst_id, depth_after) pairs as the simulated depth changes.
     uint64_t sim_depth = 0;
     for (const auto& evt : call_events) {
-        // call_inst_id: depth increases to evt.depth + 1
         sim_depth = evt.depth + 1;
         depth_table_.push_back({evt.call_inst_id, sim_depth});
 
         if (evt.return_inst_id != 0) {
-            // After the ret, depth drops back to evt.depth
             depth_table_.push_back({evt.return_inst_id, evt.depth});
         }
     }
 
-    // Sort by inst_id (call_events are in order, but interleaved rets may not be)
     std::sort(depth_table_.begin(), depth_table_.end(),
               [](const DepthEntry& a, const DepthEntry& b) {
                   return a.inst_id < b.inst_id;
@@ -231,7 +283,6 @@ void FunctionResult::build_depth_table() {
 
 uint64_t FunctionResult::depth_at(uint64_t inst_id) const {
     if (depth_table_.empty()) {
-        // Fallback: O(N) scan (only if build_depth_table() was never called)
         uint64_t depth = 0;
         for (const auto& evt : call_events) {
             if (evt.call_inst_id > inst_id) break;
@@ -242,13 +293,11 @@ uint64_t FunctionResult::depth_at(uint64_t inst_id) const {
         return depth;
     }
 
-    // Binary search: find the last entry with inst_id <= query
-    // Use upper_bound to find the first entry > inst_id, then step back.
     auto it = std::upper_bound(depth_table_.begin(), depth_table_.end(), inst_id,
                                [](uint64_t id, const DepthEntry& e) {
                                    return id < e.inst_id;
                                });
-    if (it == depth_table_.begin()) return 0;  // before any call
+    if (it == depth_table_.begin()) return 0;
     --it;
     return it->depth;
 }
@@ -256,21 +305,17 @@ uint64_t FunctionResult::depth_at(uint64_t inst_id) const {
 const FunctionInfo* FunctionResult::function_at(uint64_t inst_id) const {
     build_call_index();
 
-    // Binary search: find the first sorted index where call_inst_id > inst_id
     auto bound = std::upper_bound(
         sorted_call_indices_.begin(), sorted_call_indices_.end(), inst_id,
         [this](uint64_t id, size_t idx) {
             return id < call_events[idx].call_inst_id;
         });
 
-    // Walk backwards from bound to find the innermost (highest depth) active call
     const CallEvent* innermost = nullptr;
     for (auto it = bound; it != sorted_call_indices_.begin(); ) {
         --it;
         const auto& evt = call_events[*it];
-        // evt.call_inst_id <= inst_id is guaranteed (we're before upper_bound)
         if (evt.return_inst_id == 0 || evt.return_inst_id >= inst_id) {
-            // This call is still active at inst_id
             if (!innermost || evt.depth > innermost->depth) {
                 innermost = &evt;
             }
@@ -283,114 +328,272 @@ const FunctionInfo* FunctionResult::function_at(uint64_t inst_id) const {
     return &it->second;
 }
 
-// ─── Pass implementation ──────────────────────────────────────────────────
+// ─── FunctionCollector implementation ─────────────────────────────────────
 
-// Known non-returning functions (common in iOS/macOS AArch64 binaries)
-static const std::unordered_set<std::string> kNonReturningSymbols = {
-    "exit", "_exit", "abort", "__abort",
-    "__cxa_throw", "__cxa_rethrow", "objc_exception_throw",
-    "longjmp", "_longjmp", "siglongjmp",
-    "pthread_exit", "__pthread_exit",
-    "__assert_rtn", "__assert_fail",
-    "__stack_chk_fail", "__fortify_fail",
-    "swift_unexpectedError", "swift_fatalError",
-};
+FunctionCollector::FunctionCollector(CodeTable& code_table,
+                                     uint64_t module_slide,
+                                     uint32_t num_gpr)
+    : code_table_(code_table)
+    , module_slide_(module_slide)
+    , num_gpr_(num_gpr)
+{}
 
-// ─── AArch64 opcode classification via bit patterns ───────────────────────
-//
-// All classifications use bitmask tests on the raw 32-bit opcode word.
-// This is 10-20× faster than going through Capstone for these few mnemonics
-// because it avoids both the Capstone decode path and the LRU cache mutex.
-//
-// References: ARM Architecture Reference Manual, AArch64 encoding summary.
-//
-// BL  (branch with link, direct):     opc[31:26] = 0b100101
-//     Encoding: 1_00101_imm26          mask=0xFC000000  val=0x94000000
-//
-// BLR (branch with link to register): opc[31:10] = 0b1101011_0001_11111_000000
-//     Encoding: 1101011_0_00_1_11111_0000_00_Rn_00000   mask=0xFFFFFC1F  val=0xD63F0000
-//     (bits [4:0] = Rd = 0b00000 = x0/xzr for BLR)
-//
-// RET (return from subroutine):        mask=0xFFFFFC1F  val=0xD65F0000
-//     Encoding: 1101011_0_01_0_11111_0000_00_Rn_00000
-//
-// B   (unconditional branch, direct):  opc[31:26] = 0b000101
-//     Encoding: 0_00101_imm26          mask=0xFC000000  val=0x14000000
-//
-// BR  (unconditional branch to reg):   mask=0xFFFFFC1F  val=0xD61F0000
-//     Encoding: 1101011_0_00_0_11111_0000_00_Rn_00000
-//
-// BLRAA/BLRAB/BLRAAZ/BLRABZ (pointer-auth variants of BLR):
-//     All share the 0b11010110_00_1 prefix and can be masked:
-//     mask = 0xFEFFF800, val = 0xD63F0800  (covers PAC BLR variants)
-//
-// Note: BL and B share the same mask (0xFC000000); differentiated by bit [31].
+bool FunctionCollector::begin(uint64_t /*start_inst_id*/, uint64_t /*end_inst_id*/) {
+    // Reset all state
+    result_ = FunctionResult{};
+    call_stack_.clear();
+    tail_candidates_.clear();
+    current_sp_ = 0;
+    sp_valid_ = false;
+    prev_was_unconditional_jump_ = false;
+    prev_jump_inst_id_ = 0;
+    prev_jump_pc_ = 0;
+    prev_jump_sp_ = 0;
+    prev_jump_sp_known_ = false;
+    prev_was_ret_ = false;
+    prev_ret_inst_id_ = 0;
+    need_next_ = false;
+    non_local_unwinds_ = 0;
+    tail_calls_detected_ = 0;
 
-namespace {
+    // ── Pre-build PC classification table from code_table ──
+    pc_kind_.clear();
+    auto all_entries = code_table_.all_entries();
+    pc_kind_.reserve(all_entries.size());
 
-/// Classify an AArch64 opcode using pure bit-pattern matching.
-/// Returns three bools: {is_call, is_ret, is_unconditional_jump}.
-/// No Capstone, no LRU cache, no mutex — just integer arithmetic.
-struct OpcodeClass {
-    bool is_call             : 1;  // BL / BLR / BLRAA/BLRAB/BLRAAZ/BLRABZ
-    bool is_ret              : 1;  // RET
-    bool is_unconditional_jump : 1; // B / BR
-};
-
-inline OpcodeClass classify_opcode(uint32_t op) {
-    OpcodeClass c{false, false, false};
-
-    // ── BL (direct call, imm26): bits[31:26] = 100101 ─────────────────
-    if ((op & 0xFC000000u) == 0x94000000u) {
-        c.is_call = true;
-        return c;
+    for (const auto& [pc, opcode] : all_entries) {
+        auto c = classify_opcode(opcode);
+        if (c.is_call || c.is_ret || c.is_unconditional_jump) {
+            uint8_t bits = 0;
+            if (c.is_call)              bits |= KIND_CALL;
+            if (c.is_ret)               bits |= KIND_RET;
+            if (c.is_unconditional_jump) bits |= KIND_BRANCH;
+            pc_kind_.emplace(pc, bits);
+        }
     }
 
-    // ── B (unconditional direct branch): bits[31:26] = 000101 ──────────
-    if ((op & 0xFC000000u) == 0x14000000u) {
-        c.is_unconditional_jump = true;
-        return c;
-    }
-
-    // Remaining candidates all have bits[31:25] = 1101011 (0x6B << 25)
-    // Check that prefix first to short-circuit the rest quickly.
-    if ((op & 0xFE000000u) != 0xD6000000u) return c;
-
-    // ── BLR  (indirect call):  [31:10]=1101011_0_00_1_11111_000000 ─────
-    //    bits[29:21]=001_11111_0, bits[20:16]=00000, bits[4:0]=00000
-    //    Full mask: 0xFFFFFC1F == 0xD63F0000
-    if ((op & 0xFFFFFC1Fu) == 0xD63F0000u) {
-        c.is_call = true;
-        return c;
-    }
-
-    // ── RET  (return):  [31:10]=1101011_0_01_0_11111_000000 ──────────
-    //    Full mask: 0xFFFFFC1F == 0xD65F0000
-    if ((op & 0xFFFFFC1Fu) == 0xD65F0000u) {
-        c.is_ret = true;
-        return c;
-    }
-
-    // ── BR   (unconditional indirect branch): 0xD61F0000 ───────────────
-    if ((op & 0xFFFFFC1Fu) == 0xD61F0000u) {
-        c.is_unconditional_jump = true;
-        return c;
-    }
-
-    // ── BLRAA / BLRAB / BLRAAZ / BLRABZ (PAC-authenticated BLR) ────────
-    //    Encoding: 1101_0110_0001_Rn__0000_1Zm_Rm_00000
-    //    bits[31:21] = 1101_0110_001  → 0xD62xxxxx pattern
-    //    Conservative mask: check bit[23]=1 (distinguishes from BR/BLR/RET)
-    //    Mask 0xFEFFF800 == 0xD63F0800 covers all four variants.
-    if ((op & 0xFEFFF800u) == 0xD63F0800u) {
-        c.is_call = true;
-        return c;
-    }
-
-    return c;
+    return true;
 }
 
-}  // anonymous namespace
+void FunctionCollector::handle_deferred_ret(uint64_t pc) {
+    if (!prev_was_ret_) return;
+    prev_was_ret_ = false;
+    if (call_stack_.empty()) return;
+
+    if (call_stack_.back().return_pc == pc) {
+        auto& top = call_stack_.back();
+        result_.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id_;
+        result_.return_site_map_[prev_ret_inst_id_] = top.call_event_idx;
+        call_stack_.pop_back();
+    } else {
+        bool found = false;
+        for (int i = static_cast<int>(call_stack_.size()) - 1; i >= 0; --i) {
+            if (call_stack_[i].return_pc == pc) {
+                for (int j = static_cast<int>(call_stack_.size()) - 1; j > i; --j) {
+                    result_.call_events[call_stack_[j].call_event_idx].return_inst_id = prev_ret_inst_id_;
+                    call_stack_.pop_back();
+                    non_local_unwinds_++;
+                }
+                result_.call_events[call_stack_[i].call_event_idx].return_inst_id = prev_ret_inst_id_;
+                result_.return_site_map_[prev_ret_inst_id_] = static_cast<size_t>(call_stack_[i].call_event_idx);
+                call_stack_.erase(call_stack_.begin() + i);
+                found = true;
+                break;
+            }
+        }
+        if (!found && !call_stack_.empty()) {
+            auto& top = call_stack_.back();
+            result_.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id_;
+            result_.return_site_map_[prev_ret_inst_id_] = top.call_event_idx;
+            call_stack_.pop_back();
+        }
+    }
+}
+
+void FunctionCollector::try_fill_call_target(uint64_t cur_inst_id, uint64_t pc) {
+    if (result_.call_events.empty()) return;
+    auto& last = result_.call_events.back();
+    if (last.target_pc == 0 && last.call_inst_id == cur_inst_id - 1) {
+        last.target_pc = pc;
+        auto& func = result_.functions[pc];
+        if (func.entry_pc == 0) {
+            func.entry_pc = pc;
+            func.name = fmt::format("sub_{:x}", pc - module_slide_);
+        }
+        func.total_calls++;
+        func.call_event_indices.push_back(result_.call_events.size() - 1);
+    }
+}
+
+void FunctionCollector::handle_inst_inner(uint64_t cur_inst_id, uint64_t pc,
+                                           uint64_t sp_new, bool sp_updated) {
+    if (sp_updated) { current_sp_ = sp_new; sp_valid_ = true; }
+
+    handle_deferred_ret(pc);
+
+    if (prev_was_unconditional_jump_) {
+        tail_candidates_.push_back({prev_jump_inst_id_, prev_jump_pc_, pc,
+                                    prev_jump_sp_, prev_jump_sp_known_});
+        prev_was_unconditional_jump_ = false;
+    }
+
+    try_fill_call_target(cur_inst_id, pc);
+
+    auto kind_it = pc_kind_.find(pc);
+    if (kind_it == pc_kind_.end()) return;
+
+    uint8_t bits = kind_it->second;
+    bool is_call  = (bits & KIND_CALL)   != 0;
+    bool is_ret   = (bits & KIND_RET)    != 0;
+    bool is_b     = (bits & KIND_BRANCH) != 0;
+
+    if (is_call) {
+        CallEvent evt;
+        evt.call_inst_id   = cur_inst_id;
+        evt.return_inst_id = 0;
+        evt.call_site_pc   = pc;
+        evt.target_pc      = 0;
+        evt.depth          = call_stack_.size();
+        evt.is_tail_call   = false;
+        size_t idx = result_.call_events.size();
+        result_.call_site_map_[cur_inst_id] = idx;
+        result_.call_events.push_back(evt);
+        call_stack_.push_back({idx, pc + 4, sp_valid_ ? current_sp_ : 0});
+    } else if (is_ret) {
+        prev_was_ret_ = true;
+        prev_ret_inst_id_ = cur_inst_id;
+    } else if (is_b) {
+        prev_was_unconditional_jump_ = true;
+        prev_jump_inst_id_  = cur_inst_id;
+        prev_jump_pc_       = pc;
+        prev_jump_sp_       = current_sp_;
+        prev_jump_sp_known_ = sp_valid_;
+    }
+}
+
+void FunctionCollector::on_anchor(uint64_t /*inst_id*/, const AnchorView& anchor) {
+    if (num_gpr_ > IDX_SP) {
+        current_sp_ = anchor.gpr_values[IDX_SP];
+        sp_valid_ = true;
+    }
+}
+
+void FunctionCollector::on_inst(uint64_t inst_id, const InstView& inst) {
+    uint64_t pc = inst.pc;
+
+    // Check if this instruction is relevant:
+    // 1. It's a call/ret/branch (in pc_kind_), OR
+    // 2. It immediately follows one (need_next_ flag).
+    bool is_interesting = (pc_kind_.find(pc) != pc_kind_.end());
+    if (is_interesting || need_next_) {
+        // Extract SP from register diffs
+        uint64_t sp_new = 0;
+        bool sp_updated = false;
+        for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
+            auto diff = inst.reg_diff(d);
+            if (diff.index == IDX_SP) {
+                sp_new = diff.value;
+                sp_updated = true;
+                break;
+            }
+        }
+
+        handle_inst_inner(inst_id, pc, sp_new, sp_updated);
+        need_next_ = is_interesting;
+    } else {
+        need_next_ = false;
+    }
+}
+
+void FunctionCollector::end() {
+    // ── Handle trailing deferred RET ──
+    if (prev_was_ret_ && !call_stack_.empty()) {
+        auto& top = call_stack_.back();
+        auto& evt = result_.call_events[top.call_event_idx];
+        evt.return_inst_id = prev_ret_inst_id_;
+        result_.return_site_map_[prev_ret_inst_id_] = top.call_event_idx;
+        call_stack_.pop_back();
+    }
+
+    // ── Pass 2: Tail-call detection (angr's two-stage heuristic) ──
+    constexpr int kMaxIterations = 4;
+    std::vector<bool> resolved(tail_candidates_.size(), false);
+
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+        ankerl::unordered_dense::set<uint64_t> known_entries;
+        known_entries.reserve(result_.functions.size());
+        for (auto& [entry_pc, _] : result_.functions) {
+            known_entries.insert(entry_pc);
+        }
+
+        uint64_t new_this_round = 0;
+
+        for (size_t ci = 0; ci < tail_candidates_.size(); ++ci) {
+            if (resolved[ci]) continue;
+            auto& cand = tail_candidates_[ci];
+
+            bool target_is_known_entry = known_entries.count(cand.target_pc) > 0;
+
+            if (!target_is_known_entry) {
+                int64_t distance = static_cast<int64_t>(cand.target_pc) -
+                                   static_cast<int64_t>(cand.jump_pc);
+                if (std::abs(distance) < 4096) {
+                    resolved[ci] = true;
+                    continue;
+                }
+                if (!cand.sp_known) continue;
+            }
+
+            bool accept = target_is_known_entry || cand.sp_known;
+
+            if (accept) {
+                CallEvent evt;
+                evt.call_inst_id = cand.inst_id;
+                evt.return_inst_id = 0;
+                evt.call_site_pc = cand.jump_pc;
+                evt.target_pc = cand.target_pc;
+                evt.depth = 0;
+                evt.is_tail_call = true;
+
+                size_t evt_idx = result_.call_events.size();
+                result_.call_site_map_[cand.inst_id] = evt_idx;
+                result_.call_events.push_back(evt);
+
+                auto& func = result_.functions[cand.target_pc];
+                if (func.entry_pc == 0) {
+                    func.entry_pc = cand.target_pc;
+                    uint64_t static_pc = cand.target_pc - module_slide_;
+                    func.name = fmt::format("sub_{:x}", static_pc);
+                }
+                func.total_calls++;
+                func.call_event_indices.push_back(evt_idx);
+
+                tail_calls_detected_++;
+                new_this_round++;
+                resolved[ci] = true;
+            }
+        }
+
+        if (new_this_round == 0) break;
+    }
+
+    // ── Calculate total_instructions per function ──
+    for (auto& [entry_pc, func] : result_.functions) {
+        uint64_t total_insts = 0;
+        for (auto idx : func.call_event_indices) {
+            auto& evt = result_.call_events[idx];
+            if (evt.return_inst_id > evt.call_inst_id) {
+                total_insts += evt.return_inst_id - evt.call_inst_id;
+            }
+        }
+        func.total_instructions = total_insts;
+    }
+
+    // Build depth table for fast O(log N) depth_at() queries.
+    result_.build_depth_table();
+}
+
+// ─── FunctionPass::run — now delegates to FunctionCollector ───────────────
 
 PassResult FunctionPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
@@ -400,9 +603,10 @@ PassResult FunctionPass::run(PassContext& ctx) {
     const auto& hdr = reader.header();
     const auto& range = ctx.range();
 
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
+    uint64_t total_insts = index.inst_count();
+    if (total_insts == 0) {
+        return PassResult::failed("Empty trace");
+    }
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
     if (range.is_full_trace()) {
@@ -410,448 +614,41 @@ PassResult FunctionPass::run(PassContext& ctx) {
         if (index.load_pass_blob("function", blob)) {
             FunctionResult cached;
             if (function_deserialize(blob, cached)) {
-                // Build depth table for fast O(log N) depth_at() queries.
                 cached.build_depth_table();
                 ctx.progress(1.0f, fmt::format(
                     "Functions: {} unique, {} call events (from cache)",
                     cached.functions.size(), cached.call_events.size()));
                 return PassResult::success(std::move(cached));
             }
-            // Corrupt / version mismatch — fall through to recompute
         }
     }
 
-    FunctionResult result;
+    ctx.progress(0.0f, "Function analysis: scanning trace...");
 
-    // ─── Pre-build PC classification table ────────────────────────────────
-    //
-    // Key optimization (same pattern as PatternPass):
-    // Decode each unique PC exactly ONCE using pure bit-pattern matching —
-    // no Capstone invocation, no LRU cache mutex. Store the result in a flat
-    // unordered_map so the main scan loop does a single hashmap lookup per
-    // instruction instead of code_table + decoder + string compare.
-    //
-    // Typical trace: 5K–50K unique PCs → this table fits entirely in L3 cache.
+    FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr);
 
-    // Compact classification: 2 bits per PC packed into uint8_t.
-    // Bit 0 = is_call, Bit 1 = is_ret, Bit 2 = is_unconditional_jump
-    static constexpr uint8_t KIND_CALL   = 0x1;
-    static constexpr uint8_t KIND_RET    = 0x2;
-    static constexpr uint8_t KIND_BRANCH = 0x4;
-
-    // Use ankerl::unordered_dense for fast O(1) lookups in the hot scan loop.
-    ankerl::unordered_dense::map<uint64_t, uint8_t> pc_kind;
-
-    {
-        auto all_entries = code_table.all_entries();
-        pc_kind.reserve(all_entries.size());
-
-        for (const auto& [pc, opcode] : all_entries) {
-            auto c = classify_opcode(opcode);
-            if (c.is_call || c.is_ret || c.is_unconditional_jump) {
-                uint8_t bits = 0;
-                if (c.is_call)              bits |= KIND_CALL;
-                if (c.is_ret)               bits |= KIND_RET;
-                if (c.is_unconditional_jump) bits |= KIND_BRANCH;
-                pc_kind.emplace(pc, bits);
-            }
-        }
-    }
-
-    // ─── Pass 1: Standard BL/BLR → RET pairing ──────────────────────────
-    // Also collect candidate tail-call sites (B/BR instructions) for Pass 2.
-
-    struct StackFrame {
-        size_t call_event_idx;
-        uint64_t return_pc;     // LR at time of call (pc + 4 for BL)
-        uint64_t entry_sp;      // SP when this frame was pushed (0 if unknown)
-    };
-    std::vector<StackFrame> call_stack;
-
-    uint64_t current_sp = 0;
-    bool sp_valid = false;
-
-    // Tail call candidates: (inst_id, pc_of_B, target_pc_next_inst, sp_at_jump)
-    struct TailCallCandidate {
-        uint64_t inst_id;
-        uint64_t jump_pc;
-        uint64_t target_pc;     // filled from next instruction's PC
-        uint64_t sp;            // SP at time of jump
-        bool sp_known;
-    };
-    std::vector<TailCallCandidate> tail_candidates;
-
-    uint64_t processed = 0;
-    uint64_t non_local_unwinds = 0;
-
-    bool prev_was_unconditional_jump = false;
-    uint64_t prev_jump_inst_id = 0;
-    uint64_t prev_jump_pc = 0;
-    uint64_t prev_jump_sp = 0;
-    bool prev_jump_sp_known = false;
-
-    bool prev_was_ret = false;
-    uint64_t prev_ret_inst_id = 0;
-
-    // ─── Helper: process one (inst_id, pc, sp_diff_val, sp_diff_valid) record
-    // Extracted to avoid code duplication between the two scan paths below.
-
-    auto handle_deferred_ret = [&](uint64_t pc) {
-        if (!prev_was_ret) return;
-        prev_was_ret = false;
-        if (call_stack.empty()) return;
-
-        if (call_stack.back().return_pc == pc) {
-            auto& top = call_stack.back();
-            result.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id;
-            result.return_site_map_[prev_ret_inst_id] = top.call_event_idx;
-            call_stack.pop_back();
-        } else {
-            bool found = false;
-            for (int i = static_cast<int>(call_stack.size()) - 1; i >= 0; --i) {
-                if (call_stack[i].return_pc == pc) {
-                    for (int j = static_cast<int>(call_stack.size()) - 1; j > i; --j) {
-                        result.call_events[call_stack[j].call_event_idx].return_inst_id = prev_ret_inst_id;
-                        call_stack.pop_back();
-                        non_local_unwinds++;
-                    }
-                    result.call_events[call_stack[i].call_event_idx].return_inst_id = prev_ret_inst_id;
-                    result.return_site_map_[prev_ret_inst_id] = static_cast<size_t>(call_stack[i].call_event_idx);
-                    call_stack.erase(call_stack.begin() + i);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found && !call_stack.empty()) {
-                auto& top = call_stack.back();
-                result.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id;
-                result.return_site_map_[prev_ret_inst_id] = top.call_event_idx;
-                call_stack.pop_back();
-            }
-        }
-    };
-
-    // ─── Shared helper: extract SP value from register diffs ───
-    // Returns {sp_value, was_updated}. Used by both scan paths.
-    auto extract_sp = [](const auto& inst) -> std::pair<uint64_t, bool> {
-        for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-            auto diff = inst.reg_diff(d);
-            if (diff.index == IDX_SP) return {diff.value, true};
-        }
-        return {0, false};
-    };
-
-    // ─── Shared helper: fill in target_pc for the most recent call event ───
-    // Called when we land on the first instruction after a call site. This
-    // populates target_pc and registers/updates the function entry.
-    auto try_fill_call_target = [&](uint64_t cur_inst_id, uint64_t pc) {
-        if (result.call_events.empty()) return;
-        auto& last = result.call_events.back();
-        if (last.target_pc == 0 && last.call_inst_id == cur_inst_id - 1) {
-            last.target_pc = pc;
-            auto& func = result.functions[pc];
-            if (func.entry_pc == 0) {
-                func.entry_pc = pc;
-                func.name = fmt::format("sub_{:x}", pc - hdr.module_slide);
-            }
-            func.total_calls++;
-            func.call_event_indices.push_back(result.call_events.size() - 1);
-        }
-    };
-
-    auto handle_inst = [&](uint64_t cur_inst_id, uint64_t pc,
-                           uint64_t sp_new, bool sp_updated) {
-        if (sp_updated) { current_sp = sp_new; sp_valid = true; }
-
-        handle_deferred_ret(pc);
-
-        if (prev_was_unconditional_jump) {
-            tail_candidates.push_back({prev_jump_inst_id, prev_jump_pc, pc,
-                                       prev_jump_sp, prev_jump_sp_known});
-            prev_was_unconditional_jump = false;
-        }
-
-        // Always attempt to fill in the target PC for the preceding call.
-        try_fill_call_target(cur_inst_id, pc);
-
-        auto kind_it = pc_kind.find(pc);
-        if (kind_it == pc_kind.end()) return;
-
-        uint8_t bits = kind_it->second;
-        bool is_call  = (bits & KIND_CALL)   != 0;
-        bool is_ret   = (bits & KIND_RET)    != 0;
-        bool is_b     = (bits & KIND_BRANCH) != 0;
-
-        if (is_call) {
-            CallEvent evt;
-            evt.call_inst_id   = cur_inst_id;
-            evt.return_inst_id = 0;
-            evt.call_site_pc   = pc;
-            evt.target_pc      = 0;
-            evt.depth          = call_stack.size();
-            evt.is_tail_call   = false;
-            size_t idx = result.call_events.size();
-            result.call_site_map_[cur_inst_id] = idx;
-            result.call_events.push_back(evt);
-            call_stack.push_back({idx, pc + 4, sp_valid ? current_sp : 0});
-        } else if (is_ret) {
-            prev_was_ret = true;
-            prev_ret_inst_id = cur_inst_id;
-        } else if (is_b) {
-            prev_was_unconditional_jump = true;
-            prev_jump_inst_id  = cur_inst_id;
-            prev_jump_pc       = pc;
-            prev_jump_sp       = current_sp;
-            prev_jump_sp_known = sp_valid;
-        }
-    };
-
-    // ─── Try XRef-accelerated scan path ───────────────────────────────────
-    //
-    // If XrefResult is available (already computed), we can avoid scanning
-    // every instruction in the trace.  Instead we:
-    //   1. Collect the union of inst_ids from all call/ret/branch PCs in xref.
-    //   2. Also collect "successor" inst_ids (+1) for deferred resolution
-    //      of RET return destinations and B/BR targets.
-    //   3. Sort the combined set into a single ordered event list.
-    //   4. Iterate this sparse list, fetching each record via offset_of_with_pc.
-    //
-    // For typical iOS traces (1-5% call/ret instructions) this reduces the
-    // number of records read by 20-100× vs the linear fallback below.
-    //
-    // SP: rather than tracking SP from every reg_diff, we lazily query it
-    //     only at call sites via find_last_writer_of(IDX_SP, call_inst_id).
-    //     This is O(log N) per call site but call sites are rare.
-    //
-    // Correctness constraint: we MUST process inst_ids in ascending order so
-    // the call stack state machine sees events in the same order as execution.
-
-    const XrefResult* xref = ctx.try_require<XrefResult>("xref");
-    bool used_xref_path = false;
-
-    if (xref && !pc_kind.empty()) {
-        // Build sorted event list: call/ret/branch inst_ids + their successors
-        // (successors carry the "landing PC" needed for deferred resolution)
-        std::vector<uint64_t> event_ids;
-        event_ids.reserve(1024);
-
-        for (const auto& [pc, bits] : pc_kind) {
-            auto it = xref->pc_to_inst_ids.find(pc);
-            if (it == xref->pc_to_inst_ids.end()) continue;
-            for (uint64_t id : it->second) {
-                if (id < start || id >= end) continue;
-                event_ids.push_back(id);
-                // Include successor to resolve deferred state
-                if (id + 1 < end) event_ids.push_back(id + 1);
-            }
-        }
-
-        if (!event_ids.empty()) {
-            // Sort + deduplicate
-            std::sort(event_ids.begin(), event_ids.end());
-            event_ids.erase(std::unique(event_ids.begin(), event_ids.end()),
-                            event_ids.end());
-
-            uint64_t total = static_cast<uint64_t>(event_ids.size());
-            reader.advise_random();
-
-            for (uint64_t ei = 0; ei < total; ei++) {
-                uint64_t cur_id = event_ids[ei];
-
-                // Fetch record via sparse index (O(log N) + ~few INST records)
-                auto [off, seed_pc] = index.offset_of_with_pc(cur_id, reader);
-                auto rec = reader.record_at(off, seed_pc);
-                if (rec.kind != RecordKind::Inst) {
-                    // offset_of points to first INST; scan forward briefly
-                    TraceReader::Iterator it2(&reader, off, seed_pc);
-                    uint64_t scanned = 0;
-                    for (; it2 != reader.end() && scanned < 8; ++it2, ++scanned) {
-                        rec = *it2;
-                        if (rec.kind == RecordKind::Inst) break;
-                    }
-                    if (rec.kind != RecordKind::Inst) continue;
-                }
-
-                auto inst = rec.as_inst();
-                uint64_t pc = inst.pc;
-
-                auto [sp_new, sp_updated] = extract_sp(inst);
-                handle_inst(cur_id, pc, sp_new, sp_updated);
-                processed++;
-
-                if (processed % 10000 == 0) {
-                    ctx.progress(static_cast<float>(ei) / static_cast<float>(total));
-                    if (ctx.cancelled()) return PassResult::failed("cancelled by user");
-                }
-            }
-
-            used_xref_path = true;
-        }
-    }
-
-    // ─── Fallback: linear sequential scan ─────────────────────────────────
-    // Used when XrefResult is not available or pc_kind is empty.
-    // Also used when xref path produced no events (shouldn't happen normally).
-    if (!used_xref_path) {
-        uint64_t inst_id = start;
-        uint64_t total = end - start;
-        reader.advise_sequential();
-
-        uint64_t seek_offset = 0;
-        uint64_t seek_seed_pc = 0;
-        if (start > 0) {
-            auto res = index.offset_of_with_pc(start, reader);
-            seek_offset = res.offset;
-            seek_seed_pc = res.seed_pc;
-        }
-        auto it_start = (seek_offset > 0)
-            ? TraceReader::Iterator(&reader, seek_offset, seek_seed_pc)
-            : reader.begin();
-
-        for (auto it = it_start; it != reader.end() && inst_id < end; ++it) {
-            auto rec = *it;
-            if (rec.kind == RecordKind::Anchor) {
-                auto anchor = rec.as_anchor(hdr.num_gpr);
-                if (hdr.num_gpr > IDX_SP) {
-                    current_sp = anchor.gpr_values[IDX_SP];
-                    sp_valid = true;
-                }
-                continue;
-            }
-            if (rec.kind != RecordKind::Inst) continue;
-
-            auto inst = rec.as_inst();
-            uint64_t pc = inst.pc;
-
-            auto [sp_new, sp_upd] = extract_sp(inst);
-            handle_inst(inst_id, pc, sp_new, sp_upd);
-            inst_id++;
-            processed++;
-
-            if (processed % 50000 == 0) {
+    // Use shared scan engine if available; otherwise create a local one.
+    auto* engine = ctx.scan_engine();
+    if (engine) {
+        engine->add_collector(&collector);
+        engine->run();
+    } else {
+        TraceScanEngine local_engine(reader, total_insts, &index);
+        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
                 ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-                if (ctx.cancelled()) {
-                    reader.advise_random();
-                    return PassResult::failed("cancelled by user");
-                }
             }
-        }
-        reader.advise_random();
+        });
+        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.add_collector(&collector);
+        local_engine.run();
     }
 
-    // ─── Handle trailing deferred RET ─────────────────────────────────────
-    if (prev_was_ret && !call_stack.empty()) {
-        auto& top = call_stack.back();
-        auto& evt = result.call_events[top.call_event_idx];
-        evt.return_inst_id = prev_ret_inst_id;
-        result.return_site_map_[prev_ret_inst_id] = top.call_event_idx;
-        call_stack.pop_back();
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
     }
 
-    // ─── Pass 2: Tail-call detection (ported from angr's two-stage heuristic) ─
-    //
-    // angr's core idea:
-    //   Stage A: "Jump target is a known function entry" → strong evidence
-    //   Stage B: "SP is restored to frame-entry value" → confirms tail call
-    //
-    // In our trace-based context we have an advantage: we can observe both
-    // conditions directly from the execution trace without static analysis.
-    //
-    // We iterate until convergence: newly discovered function entries from
-    // tail calls may enable detection of additional tail calls in later rounds.
-
-    uint64_t tail_calls_detected = 0;
-    constexpr int kMaxIterations = 4;  // Converges in 1-2 rounds typically
-
-    // Track which candidates have been resolved (to avoid re-processing)
-    std::vector<bool> resolved(tail_candidates.size(), false);
-
-    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
-        // Build the set of known function entry PCs (refreshed each iteration)
-        ankerl::unordered_dense::set<uint64_t> known_entries;
-        known_entries.reserve(result.functions.size());
-        for (auto& [entry_pc, _] : result.functions) {
-            known_entries.insert(entry_pc);
-        }
-
-        uint64_t new_this_round = 0;
-
-        for (size_t ci = 0; ci < tail_candidates.size(); ++ci) {
-            if (resolved[ci]) continue;
-            auto& cand = tail_candidates[ci];
-
-            // ─── Stage A (angr heuristic 1): target is known function entry
-            bool target_is_known_entry = known_entries.count(cand.target_pc) > 0;
-
-            if (!target_is_known_entry) {
-                // Heuristic: if target is far from the jump (> 4KB), it's likely
-                // inter-function. This catches tail calls to functions not yet
-                // in our known set (will be resolved on later iterations).
-                int64_t distance = static_cast<int64_t>(cand.target_pc) -
-                                   static_cast<int64_t>(cand.jump_pc);
-                if (std::abs(distance) < 4096) {
-                    // Likely an intra-function branch (loop, if-else, etc.)
-                    resolved[ci] = true;  // Never revisit short jumps
-                    continue;
-                }
-                // For far jumps to unknown targets, we require SP evidence
-                if (!cand.sp_known) continue;  // May resolve in later iteration
-            }
-
-            // ─── Stage B (angr heuristic 2): SP restoration check ────────
-            // For known entries: accept unconditionally (high confidence).
-            // For unknown-but-far targets with SP evidence: accept.
-            // This mirrors angr's detect_tail_calls=True aggressive mode.
-
-            bool accept = target_is_known_entry || cand.sp_known;
-
-            if (accept) {
-                // ─── Confirmed tail call: create a synthetic CallEvent ────
-
-                CallEvent evt;
-                evt.call_inst_id = cand.inst_id;
-                evt.return_inst_id = 0;  // Tail call has no explicit return
-                evt.call_site_pc = cand.jump_pc;
-                evt.target_pc = cand.target_pc;
-                evt.depth = 0;  // Depth is not meaningful for deferred detection
-                evt.is_tail_call = true;
-
-                size_t evt_idx = result.call_events.size();
-                result.call_site_map_[cand.inst_id] = evt_idx;
-                result.call_events.push_back(evt);
-
-                // Register the target as a function (if not already)
-                auto& func = result.functions[cand.target_pc];
-                if (func.entry_pc == 0) {
-                    func.entry_pc = cand.target_pc;
-                    uint64_t static_pc = cand.target_pc - hdr.module_slide;
-                    func.name = fmt::format("sub_{:x}", static_pc);
-                }
-                func.total_calls++;
-                func.call_event_indices.push_back(evt_idx);
-
-                tail_calls_detected++;
-                new_this_round++;
-                resolved[ci] = true;
-            }
-        }
-
-        // Converged: no new tail calls found this round
-        if (new_this_round == 0) break;
-    }
-
-    // ─── Calculate total_instructions per function ────────────────────────
-
-    for (auto& [entry_pc, func] : result.functions) {
-        uint64_t total_insts = 0;
-        for (auto idx : func.call_event_indices) {
-            auto& evt = result.call_events[idx];
-            if (evt.return_inst_id > evt.call_inst_id) {
-                total_insts += evt.return_inst_id - evt.call_inst_id;
-            }
-        }
-        func.total_instructions = total_insts;
-    }
+    auto result = collector.take_result();
 
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {
@@ -861,15 +658,12 @@ PassResult FunctionPass::run(PassContext& ctx) {
         }
     }
 
-    // Build depth table for fast O(log N) depth_at() queries in the UI.
-    result.build_depth_table();
-
     ctx.progress(1.0f, fmt::format(
         "Functions: {} unique, {} call events, {} tail calls, {} non-local unwinds",
         result.functions.size(),
         result.call_events.size(),
-        tail_calls_detected,
-        non_local_unwinds));
+        collector.tail_calls_detected(),
+        collector.non_local_unwinds()));
     return PassResult::success(std::move(result));
 }
 

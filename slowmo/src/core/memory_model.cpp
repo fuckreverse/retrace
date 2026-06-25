@@ -209,7 +209,7 @@ void MemoryModel::build() {
             // Populate page_activity_cache_ so active_pages() works in-memory too
             {
                 PageActivity pa;
-                pa.page_addr = page << PAGE_SHIFT;
+                pa.page_addr = page << kPageShift;
                 pa.first_inst_id = writes.front().inst_id;
                 pa.last_inst_id  = writes.back().inst_id;
                 pa.write_count   = static_cast<uint32_t>(writes.size());
@@ -267,11 +267,11 @@ void MemoryModel::build() {
                 }
 
                 uint64_t acc_addr = mem.addr;
-                uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (PAGE_SIZE - 1));
+                uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (kPageSize - 1));
 
                 // Check if access crosses a page boundary
                 uint16_t bytes_in_first_page = static_cast<uint16_t>(
-                    std::min<uint64_t>(PAGE_SIZE - first_page_offset, total_size));
+                    std::min<uint64_t>(kPageSize - first_page_offset, total_size));
 
                 // First (possibly only) KV pair: bytes in the first page
                 {
@@ -292,7 +292,7 @@ void MemoryModel::build() {
                     // Opt #4: track page activity
                     auto& pa = build_page_map[page];
                     if (pa.page_addr == 0) {
-                        pa.page_addr = page << PAGE_SHIFT;
+                        pa.page_addr = page << kPageShift;
                         pa.first_inst_id = inst_id;
                         pa.last_inst_id = inst_id;
                         pa.write_count = 0;
@@ -326,7 +326,7 @@ void MemoryModel::build() {
                     // Opt #4: track page activity for second page
                     auto& pa2 = build_page_map[second_page];
                     if (pa2.page_addr == 0) {
-                        pa2.page_addr = second_page << PAGE_SHIFT;
+                        pa2.page_addr = second_page << kPageShift;
                         pa2.first_inst_id = inst_id;
                         pa2.last_inst_id = inst_id;
                         pa2.write_count = 0;
@@ -463,7 +463,7 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
             uint64_t byte_addr  = addr + i;
             uint64_t page       = page_of(byte_addr);
-            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
             // Get (or load) the PageWriteIndex for this page.
             const PageWriteIndex* idx_ptr = nullptr;
@@ -544,8 +544,8 @@ MemoryModel::load_page_index(uint64_t page,
                 e._pad        = 0;
                 if (e.size > 16) e.size = 16;
                 // Clamp write to page boundary: a write starting at found_offset
-                // with size e.size may not exceed PAGE_SIZE.
-                uint16_t max_size = static_cast<uint16_t>(PAGE_SIZE - found_offset);
+                // with size e.size may not exceed kPageSize.
+                uint16_t max_size = static_cast<uint16_t>(kPageSize - found_offset);
                 if (e.size > max_size) e.size = static_cast<uint8_t>(max_size);
                 std::memset(e.data, 0, 16);
                 std::memcpy(e.data, val.data() + 1, e.size);
@@ -784,12 +784,12 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
         }
 
         // Resolve all bytes on this page.
-        uint64_t page_base = page << PAGE_SHIFT;
-        uint64_t page_end  = page_base + PAGE_SIZE;
+        uint64_t page_base = page << kPageShift;
+        uint64_t page_end  = page_base + kPageSize;
 
         while (off < size && (addr + off) < page_end) {
             uint64_t ba         = addr + off;
-            uint16_t page_off   = static_cast<uint16_t>(ba & (PAGE_SIZE - 1));
+            uint16_t page_off   = static_cast<uint16_t>(ba & (kPageSize - 1));
 
             if (idx_ptr) {
                 uint8_t  val    = 0;
@@ -838,7 +838,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
         for (uint8_t i = 0; i < read_size; ) {
             uint64_t byte_addr = chunk_addr + i;
             uint64_t page = page_of(byte_addr);
-            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
             char seek_key_buf[KEY_SIZE];
             auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
@@ -874,7 +874,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
                     for (uint8_t j = i; j < read_size; j++) {
                         uint64_t baddr = chunk_addr + j;
                         if (page_of(baddr) != page) break;
-                        uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
+                        uint16_t boff = static_cast<uint16_t>(baddr & (kPageSize - 1));
                         if (boff >= write_end) break;
                         if (boff < found_offset) break;
 
@@ -908,7 +908,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
 
                 uint64_t byte_addr = chunk_addr + i;
                 uint64_t page = page_of(byte_addr);
-                uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+                uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
                 char seek_key_buf[KEY_SIZE];
                 auto seek_key = encode_key_to(page, page_offset, search_id, seek_key_buf);
@@ -944,7 +944,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
                         for (uint8_t j = i; j < read_size; j++) {
                             uint64_t baddr = chunk_addr + j;
                             if (page_of(baddr) != page) break;
-                            uint16_t boff = static_cast<uint16_t>(baddr & (PAGE_SIZE - 1));
+                            uint16_t boff = static_cast<uint16_t>(baddr & (kPageSize - 1));
                             if (boff >= read_end) break;
                             if (boff < found_offset) break;
 
@@ -1017,7 +1017,7 @@ std::vector<MemoryModel::PageActivity> MemoryModel::active_pages() {
             uint16_t page_offset;
             decode_key(iter->key(), page_addr, page_offset, inst_id);
 
-            uint64_t full_page_addr = page_addr << PAGE_SHIFT;
+            uint64_t full_page_addr = page_addr << kPageShift;
 
             auto& pa = page_map[full_page_addr];
             if (pa.page_addr == 0) {
@@ -1061,7 +1061,7 @@ bool MemoryModel::was_accessed(uint64_t addr) {
     }
 
     uint64_t page = page_of(addr);
-    uint16_t page_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
+    uint16_t page_offset = static_cast<uint16_t>(addr & (kPageSize - 1));
 
     auto check_cf = [&](rocksdb::ColumnFamilyHandle* cf) -> bool {
         if (!cf) return false;
@@ -1140,7 +1140,7 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
         for (uint8_t i = 0; i < size; i++) {
             uint64_t byte_addr = addr + i;
             uint64_t page      = page_of(byte_addr);
-            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (PAGE_SIZE - 1));
+            uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
             // Get (or load) the PageWriteIndex for this page.
             const PageWriteIndex* idx_ptr = nullptr;
@@ -1177,7 +1177,7 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
 
     if (has_rocksdb_) {
         uint64_t page = page_of(addr);
-        uint16_t target_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
+        uint16_t target_offset = static_cast<uint16_t>(addr & (kPageSize - 1));
         uint16_t min_offset = (target_offset >= (MAX_WRITE_SIZE - 1))
                                   ? static_cast<uint16_t>(target_offset - (MAX_WRITE_SIZE - 1))
                                   : 0;
@@ -1245,7 +1245,7 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
 
         const uint64_t search_id = at_inst_id - 1;
         uint64_t page = page_of(addr);
-        uint16_t page_offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
+        uint16_t page_offset = static_cast<uint16_t>(addr & (kPageSize - 1));
 
         // Fast path: use per-page sorted write index (O(log W) per byte)
         // instead of raw RocksDB SeekForPrev.

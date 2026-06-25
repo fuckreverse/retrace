@@ -62,9 +62,9 @@ uint16_t mem_key_offset(const rocksdb::Slice& key) {
          | static_cast<uint8_t>(key.data()[9]);
 }
 
-static constexpr uint64_t PAGE_SHIFT = 12;
+static constexpr uint64_t kPageShift = 12;
 
-uint64_t page_of(uint64_t addr) { return addr >> PAGE_SHIFT; }
+uint64_t page_of(uint64_t addr) { return addr >> kPageShift; }
 uint16_t offset_in_page(uint64_t addr) { return static_cast<uint16_t>(addr & 0xFFF); }
 
 }  // anonymous namespace

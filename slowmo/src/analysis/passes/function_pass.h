@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -9,6 +10,8 @@
 #include <numeric>    // std::iota
 
 namespace tenet {
+
+class CodeTable;  // forward declaration
 
 // ─── Function analysis result ─────────────────────────────────────────────
 
@@ -96,6 +99,86 @@ struct FunctionResult {
     mutable bool call_index_built_ = false;
 };
 
+// ─── FunctionCollector ────────────────────────────────────────────────────
+
+/// TraceCollector that implements function call/return pairing via a state machine.
+/// Extracted from FunctionPass to enable scan fusion via TraceScanEngine.
+class FunctionCollector final : public TraceCollector {
+public:
+    FunctionCollector(CodeTable& code_table, uint64_t module_slide, uint32_t num_gpr);
+
+    std::string_view name() const override { return "FunctionCollector"; }
+
+    bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
+    void on_inst(uint64_t inst_id, const InstView& inst) override;
+    void on_anchor(uint64_t inst_id, const AnchorView& anchor) override;
+    void end() override;
+
+    /// Take ownership of the result after the scan completes.
+    FunctionResult take_result() { return std::move(result_); }
+
+    /// Statistics from the scan (valid after end()).
+    uint64_t tail_calls_detected() const { return tail_calls_detected_; }
+    uint64_t non_local_unwinds() const { return non_local_unwinds_; }
+
+private:
+    // ── Opcode classification constants ──
+    static constexpr uint8_t KIND_CALL   = 0x1;
+    static constexpr uint8_t KIND_RET    = 0x2;
+    static constexpr uint8_t KIND_BRANCH = 0x4;
+
+    struct StackFrame {
+        size_t call_event_idx;
+        uint64_t return_pc;     // LR at time of call (pc + 4 for BL)
+        uint64_t entry_sp;      // SP when this frame was pushed (0 if unknown)
+    };
+
+    struct TailCallCandidate {
+        uint64_t inst_id;
+        uint64_t jump_pc;
+        uint64_t target_pc;     // filled from next instruction's PC
+        uint64_t sp;            // SP at time of jump
+        bool sp_known;
+    };
+
+    void handle_deferred_ret(uint64_t pc);
+    void try_fill_call_target(uint64_t cur_inst_id, uint64_t pc);
+    void handle_inst_inner(uint64_t cur_inst_id, uint64_t pc,
+                           uint64_t sp_new, bool sp_updated);
+
+    // ── Configuration (immutable after construction) ──
+    CodeTable& code_table_;
+    uint64_t module_slide_;
+    uint32_t num_gpr_;
+
+    // ── Pre-built PC classification table ──
+    ankerl::unordered_dense::map<uint64_t, uint8_t> pc_kind_;
+
+    // ── State machine ──
+    std::vector<StackFrame> call_stack_;
+    std::vector<TailCallCandidate> tail_candidates_;
+
+    uint64_t current_sp_ = 0;
+    bool sp_valid_ = false;
+
+    bool prev_was_unconditional_jump_ = false;
+    uint64_t prev_jump_inst_id_ = 0;
+    uint64_t prev_jump_pc_ = 0;
+    uint64_t prev_jump_sp_ = 0;
+    bool prev_jump_sp_known_ = false;
+
+    bool prev_was_ret_ = false;
+    uint64_t prev_ret_inst_id_ = 0;
+
+    bool need_next_ = false;  // next inst triggers handle_inst unconditionally
+
+    uint64_t non_local_unwinds_ = 0;
+    uint64_t tail_calls_detected_ = 0;
+
+    // ── Result ──
+    FunctionResult result_;
+};
+
 // ─── Function analysis pass ───────────────────────────────────────────────
 
 /// Identifies function calls and builds a call graph.
@@ -109,7 +192,7 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
-        return {};  // Standalone
+        return {};  // Standalone — uses efficient linear scan with pc_kind filtering
     }
 
     PassResult run(PassContext& ctx) override;
