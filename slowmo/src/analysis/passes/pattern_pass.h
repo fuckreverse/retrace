@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
+#include <ankerl/unordered_dense.h>
 #include <filesystem>
 
 #ifdef TENET_HAS_YARA
@@ -54,7 +54,7 @@ struct PatternResult {
     std::vector<PatternMatch> matches;
 
     // Category index: category → indices into matches
-    std::unordered_map<PatternCategory, std::vector<size_t>> by_category;
+    ankerl::unordered_dense::map<PatternCategory, std::vector<size_t>> by_category;
 
     /// Get all crypto-related matches.
     std::vector<const PatternMatch*> crypto_matches() const;

@@ -143,20 +143,29 @@ PassResult EntropyPass::run(PassContext& ctx) {
         uint32_t sample_count = 0;
         float prev_entropy = 0.0f;
 
+        // Hoist vector allocations out of the loop so that the underlying
+        // heap storage is reused across iterations instead of being
+        // allocated/freed on every sample point.
+        // batch_read_region() calls resize() internally, which is a no-op
+        // when capacity is already sufficient.
+        std::vector<uint8_t> sample_data;
+        std::vector<bool> sample_known;
+        std::vector<uint8_t> known_sample;
+        sample_data.reserve(cfg_.size);
+        sample_known.reserve(cfg_.size);
+        known_sample.reserve(cfg_.size);
+
         for (uint64_t writer_id : write_history) {
             if (++sample_count % cfg_.timeline_interval != 0) continue;
 
             // ── Batch-read region at this snapshot point ──
-            std::vector<uint8_t> sample_data;
-            std::vector<bool> sample_known;
             uint32_t sample_known_count = 0;
 
             batch_read_region(memory, cfg_.addr, cfg_.size, writer_id,
                               sample_data, sample_known, sample_known_count);
 
             // Collect only known bytes for entropy calculation
-            std::vector<uint8_t> known_sample;
-            known_sample.reserve(sample_known_count);
+            known_sample.clear();
             for (uint32_t i = 0; i < cfg_.size; i++) {
                 if (sample_known[i]) known_sample.push_back(sample_data[i]);
             }

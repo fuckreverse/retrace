@@ -32,19 +32,22 @@ struct SinkTag {
 /// Describes a single backward taint propagation event.
 /// "This instruction at inst_id defined register dst_reg, which flows to the sink.
 ///  Its computation reads from src_regs and/or src_memory addresses."
+///
+/// Register sets and sink tags are stored as uint64_t bitmasks for zero-alloc
+/// hot-path performance.  Bit i corresponds to register/tag index i.
+/// Use the helper methods below to query and iterate.
 struct BackwardTaintEvent {
     uint64_t inst_id;
     uint64_t pc;
 
-    /// The register(s) defined by this instruction that contribute to the sink.
-    /// Multiple when e.g., LDP writes two registers both in the needed set.
-    std::vector<uint8_t> dst_regs;
+    /// Bitmask: bit i set → register i is a destination (defined by this instruction).
+    uint64_t dst_regs_mask = 0;
 
     /// Legacy single-reg accessor (first dst_reg, for simple cases).
     uint8_t dst_reg = 0;
 
-    /// Source registers read by this instruction (data dependencies).
-    std::vector<uint8_t> src_regs;
+    /// Bitmask: bit i set → register i is a source (read by this instruction).
+    uint64_t src_regs_mask = 0;
 
     /// Source memory addresses read by this instruction.
     std::vector<uint64_t> src_mem_addrs;
@@ -59,8 +62,48 @@ struct BackwardTaintEvent {
     uint64_t store_addr = 0;
     uint8_t store_size = 0;
 
-    /// Which sink(s) this event contributes to (per-sink attribution).
-    std::vector<uint8_t> sink_tags;  // indices into BackwardTaintResult::sink_tags
+    /// Bitmask: bit i set → this event contributes to sink tag i.
+    uint64_t sink_tags_mask = 0;
+
+    // ── Bitmask helper methods ──────────────────────────────────────────
+
+    bool has_dst_reg(uint8_t r) const { return (dst_regs_mask >> r) & 1; }
+    bool has_src_reg(uint8_t r) const { return (src_regs_mask >> r) & 1; }
+    bool has_sink_tag(uint8_t t) const { return (sink_tags_mask >> t) & 1; }
+
+    bool dst_regs_empty() const { return dst_regs_mask == 0; }
+    bool src_regs_empty() const { return src_regs_mask == 0; }
+    bool sink_tags_empty() const { return sink_tags_mask == 0; }
+
+    void add_dst_reg(uint8_t r) { dst_regs_mask |= (1ULL << r); }
+    void add_src_reg(uint8_t r) { src_regs_mask |= (1ULL << r); }
+    void add_sink_tag(uint8_t t) { sink_tags_mask |= (1ULL << t); }
+
+    /// Iterate over all set destination registers.  Fn receives uint8_t reg_id.
+    template <typename Fn>
+    void for_each_dst_reg(Fn&& fn) const {
+        for (uint64_t m = dst_regs_mask; m; m &= m - 1)
+            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+    }
+    /// Iterate over all set source registers.  Fn receives uint8_t reg_id.
+    template <typename Fn>
+    void for_each_src_reg(Fn&& fn) const {
+        for (uint64_t m = src_regs_mask; m; m &= m - 1)
+            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+    }
+    /// Iterate over all set sink tags.  Fn receives uint8_t tag index.
+    template <typename Fn>
+    void for_each_sink_tag(Fn&& fn) const {
+        for (uint64_t m = sink_tags_mask; m; m &= m - 1)
+            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+    }
+
+    /// Build a vector of destination register IDs (for serialization / JSON).
+    std::vector<uint8_t> dst_regs_list() const;
+    /// Build a vector of source register IDs (for serialization / JSON).
+    std::vector<uint8_t> src_regs_list() const;
+    /// Build a vector of sink tag indices (for serialization / JSON).
+    std::vector<uint8_t> sink_tags_list() const;
 };
 
 // DataflowEdge is defined in common/dataflow_types.h (included above).

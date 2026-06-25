@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <nlohmann/json.hpp>
+#include <ankerl/unordered_dense.h>
 #include <array>
 #include <optional>
 
@@ -50,7 +51,7 @@ struct ObjcMessage {
 struct ObjcClassInfo {
     std::string name;
     uint64_t message_count = 0;                 // total messages sent to instances
-    std::vector<std::string> selectors_seen;    // unique selectors called on this class
+    ankerl::unordered_dense::set<std::string> selectors_seen;  // unique selectors called on this class
     std::vector<size_t> message_indices;        // indices into messages vector
 };
 

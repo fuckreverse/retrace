@@ -11,6 +11,7 @@
 #include <numeric>
 #include <cassert>
 #include <fmt/core.h>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -129,8 +130,8 @@ struct SimCache {
     std::vector<CacheSet> sets;
 
     // Line/miss tracking by cache-line address
-    std::unordered_map<uint64_t, uint64_t> line_miss_count;
-    std::unordered_map<uint64_t, uint64_t> line_hit_count;
+    ankerl::unordered_dense::map<uint64_t, uint64_t> line_miss_count;
+    ankerl::unordered_dense::map<uint64_t, uint64_t> line_hit_count;
 
     CacheLevelStats stats;
     std::string name;
@@ -189,6 +190,7 @@ public:
         for (const auto& lv : cfg_.levels) {
             hierarchy_.emplace_back(lv, cfg_.policy);
         }
+        cached_line_size_ = hierarchy_.empty() ? 64 : hierarchy_[0].line_size;
     }
 
     std::string_view name() const override { return "cache_sim_collector"; }
@@ -237,10 +239,10 @@ public:
             uint16_t sz = m.size == 0 ? 1 : m.size;
 
             // Simulate each accessed cache line (one access per line touched)
-            uint64_t first_line = m.addr / (hierarchy_.empty() ? 64 : hierarchy_[0].line_size);
-            uint64_t last_line  = (m.addr + sz - 1) / (hierarchy_.empty() ? 64 : hierarchy_[0].line_size);
+            uint64_t first_line = m.addr / cached_line_size_;
+            uint64_t last_line  = (m.addr + sz - 1) / cached_line_size_;
             for (uint64_t ln = first_line; ln <= last_line; ln++) {
-                uint64_t line_byte_addr = ln * (hierarchy_.empty() ? 64 : hierarchy_[0].line_size);
+                uint64_t line_byte_addr = ln * cached_line_size_;
                 simulate_access(line_byte_addr, is_write);
             }
         }
@@ -362,7 +364,8 @@ private:
     const FunctionResult* fn_result_;
     std::vector<SimCache> hierarchy_;
     std::vector<CallFrame> call_stack_;
-    std::unordered_map<uint64_t, FunctionCacheStats> func_stats_;
+    ankerl::unordered_dense::map<uint64_t, FunctionCacheStats> func_stats_;
+    uint32_t cached_line_size_ = 64;
     uint64_t total_instructions_ = 0;
 };
 

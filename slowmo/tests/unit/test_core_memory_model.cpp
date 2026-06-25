@@ -288,24 +288,25 @@ TEST_CASE("MemoryModel: cache_stats RocksDB reads and total writes tracked",
 
     REQUIRE(env != nullptr);
 
-    // First read: cold miss → RocksDB lookup
+    // First read: cold miss → loads page index from RocksDB, then resolves
+    // via the cached PageWriteIndex (counted as cache_hits, not rocksdb_reads).
     env->memory->read(kBuf, 8, 1);
     auto stats_after_cold = env->memory->cache_stats();
 
-    // Second read: same address/time, another RocksDB seek (thread-local iterators used)
+    // Second read: same address/time, page index already cached → cache hit.
     env->memory->read(kBuf, 8, 1);
     auto stats_after_warm = env->memory->cache_stats();
 
-    SECTION("at least one RocksDB read was issued after first read") {
-        REQUIRE(stats_after_cold.rocksdb_reads > 0);
+    SECTION("at least one cache hit was recorded after first read") {
+        // The PageWriteIndex fast path increments cache_hits (not rocksdb_reads).
+        REQUIRE(stats_after_cold.cache_hits > 0);
     }
     SECTION("total writes persisted equals 1 (one write in trace)") {
         REQUIRE(stats_after_cold.total_writes_persisted == 1);
     }
-    SECTION("second read also issues RocksDB seeks") {
-        // RocksDB path: each read() call performs RocksDB seeks (no in-memory page cache).
-        // We verify at least as many reads were issued in the second call as the first.
-        REQUIRE(stats_after_warm.rocksdb_reads >= stats_after_cold.rocksdb_reads);
+    SECTION("second read also produces cache hits") {
+        // Page index is already cached; subsequent reads hit the same fast path.
+        REQUIRE(stats_after_warm.cache_hits >= stats_after_cold.cache_hits);
     }
 }
 

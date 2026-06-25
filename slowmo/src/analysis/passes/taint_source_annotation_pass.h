@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
+#include "ankerl/unordered_dense.h"
 #include <optional>
 
 namespace tenet {
@@ -84,10 +84,10 @@ struct TaintSourceAnnotationResult {
     std::vector<size_t> memory_source_indices;
 
     /// Index: ObjC selector_name → source indices
-    std::unordered_map<std::string, std::vector<size_t>> by_selector;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_selector;
 
     /// Index: ObjC class_name → source indices
-    std::unordered_map<std::string, std::vector<size_t>> by_class;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_class;
 
     size_t total() const { return sources.size(); }
 

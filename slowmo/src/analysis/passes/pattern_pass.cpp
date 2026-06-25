@@ -10,11 +10,9 @@
 
 #include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
-#include <deque>
 #include <algorithm>
 #include <cstring>
 #include <string_view>
-#include <unordered_map>
 
 namespace tenet {
 
@@ -415,7 +413,7 @@ void PatternPass::scan_trace_unified(PassContext& ctx,
         bool is_svc = false;
     };
 
-    std::unordered_map<uint64_t, PCInfo> pc_info;
+    ankerl::unordered_dense::map<uint64_t, PCInfo> pc_info;
     {
         auto all = code_table.all_entries();
         pc_info.reserve(all.size());
@@ -474,8 +472,10 @@ void PatternPass::scan_trace_unified(PassContext& ctx,
     };
     ankerl::unordered_dense::map<uint64_t, HWCryptoSite> hw_sites;  // pc → site
 
-    // XOR loop state
-    std::deque<bool> xor_window;
+    // XOR loop state - ring buffer replaces deque for cache locality
+    bool xor_ring[XOR_WINDOW_SIZE] = {};
+    size_t xor_ring_pos = 0;
+    size_t xor_ring_size = 0;
     size_t xor_eor_count = 0;
     bool in_xor_loop = false;
     uint64_t xor_loop_start = 0;
@@ -491,6 +491,12 @@ void PatternPass::scan_trace_unified(PassContext& ctx,
     uint64_t inst_id = 0;
     reader.advise_sequential();
 
+    // 1-entry cache for pc_info lookup (high locality in loops)
+    uint64_t last_pc = ~0ULL;
+    MnemonicClass last_cls = MC_OTHER;
+    const char* last_mn_str = "";
+    bool last_is_svc = false;
+
     for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
@@ -498,15 +504,28 @@ void PatternPass::scan_trace_unified(PassContext& ctx,
 
         auto inst = rec.as_inst();
 
-        // Look up pre-classified info (O(1) hash lookup, no Capstone call)
-        MnemonicClass cls = MC_OTHER;
-        const char* mn_str = "";
-        bool is_svc = false;
-        auto pc_it = pc_info.find(inst.pc);
-        if (pc_it != pc_info.end()) {
-            cls = pc_it->second.cls;
-            mn_str = pc_it->second.mnemonic;
-            is_svc = pc_it->second.is_svc;
+        // Look up pre-classified info - 1-entry cache for loop locality
+        MnemonicClass cls;
+        const char* mn_str;
+        bool is_svc;
+        if (inst.pc == last_pc) {
+            cls = last_cls;
+            mn_str = last_mn_str;
+            is_svc = last_is_svc;
+        } else {
+            cls = MC_OTHER;
+            mn_str = "";
+            is_svc = false;
+            auto pc_it = pc_info.find(inst.pc);
+            if (pc_it != pc_info.end()) {
+                cls = pc_it->second.cls;
+                mn_str = pc_it->second.mnemonic;
+                is_svc = pc_it->second.is_svc;
+            }
+            last_pc = inst.pc;
+            last_cls = cls;
+            last_mn_str = mn_str;
+            last_is_svc = is_svc;
         }
         std::string_view mn(mn_str);
 
@@ -558,14 +577,16 @@ void PatternPass::scan_trace_unified(PassContext& ctx,
         {
             bool is_eor = (cls == MC_EOR);
 
-            if (xor_window.size() >= XOR_WINDOW_SIZE) {
-                if (xor_window.front()) xor_eor_count--;
-                xor_window.pop_front();
+            if (xor_ring_size >= XOR_WINDOW_SIZE) {
+                if (xor_ring[xor_ring_pos]) xor_eor_count--;
+            } else {
+                xor_ring_size++;
             }
-            xor_window.push_back(is_eor);
+            xor_ring[xor_ring_pos] = is_eor;
+            xor_ring_pos = (xor_ring_pos + 1) % XOR_WINDOW_SIZE;
             if (is_eor) xor_eor_count++;
 
-            if (xor_window.size() >= XOR_WINDOW_SIZE && xor_eor_count >= XOR_THRESHOLD) {
+            if (xor_ring_size >= XOR_WINDOW_SIZE && xor_eor_count >= XOR_THRESHOLD) {
                 if (!in_xor_loop) {
                     in_xor_loop = true;
                     xor_loop_start = (inst_id >= XOR_WINDOW_SIZE - 1)

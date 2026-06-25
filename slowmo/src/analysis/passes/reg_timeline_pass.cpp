@@ -4,7 +4,7 @@
 #include "core/register_file.h"
 
 #include <algorithm>
-#include <unordered_set>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -132,7 +132,7 @@ done:
 
     // Build unique values for single-reg mode
     if (!track_all && target < 34) {
-        std::unordered_set<uint64_t> unique_set;
+        ankerl::unordered_dense::set<uint64_t> unique_set;
         for (const auto& e : result.entries) {
             unique_set.insert(e.new_value);
         }

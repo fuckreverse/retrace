@@ -64,8 +64,10 @@ struct ProducerChainResult {
 ///   3. For each source register, find its last writer, and recurse.
 ///   4. Stop when: no writer found, depth limit reached, or value is immediate.
 ///
-/// This is O(depth * scan_distance) and typically 10-100x faster than
-/// full backward taint for simple "where did this value come from" queries.
+/// This is O(depth * log N) per level via RocksDB REG_WRITES inverted index
+/// and direct random access (offset_of_with_pc + record_at), with no linear
+/// scanning. Typically 100-1000x faster than full backward taint for simple
+/// "where did this value come from" queries.
 ///
 /// Dependencies: none.
 ///

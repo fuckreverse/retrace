@@ -4,8 +4,6 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
-#include "core/instruction_decoder.h"
-
 #include <fmt/core.h>
 #include <algorithm>
 #include <cstring>
@@ -91,7 +89,6 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     auto& memory = ctx.memory();
     auto& regfile = ctx.regfile();
-    auto& decoder = ctx.decoder();
     auto& code_table = ctx.code_table();
 
     const auto& range = ctx.range();
@@ -118,10 +115,22 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
     std::sort(explicit_ids.begin(), explicit_ids.end());
 
     // ─── Scan the trace ──────────────────────────────────────────────────
-    uint64_t inst_id = 0;
     size_t explicit_cursor = 0;  // index into sorted explicit_ids
 
-    for (auto it = reader.begin(); it != reader.end(); ++it) {
+    // Seek directly to start position using index (avoid scanning prefix)
+    // Note: this file uses 1-based inst_id (incremented after seeing each Inst).
+    // range.start_inst_id is 1-based, so we seek to (start - 1) in 0-based terms.
+    uint64_t start_0based = (range.start_inst_id > 0) ? (range.start_inst_id - 1) : 0;
+    uint64_t start_offset = 0;
+    if (start_0based > 0) {
+        auto [off, pc] = index.offset_of_with_pc(start_0based, reader);
+        start_offset = off;
+    }
+
+    auto it_begin = (start_0based > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    uint64_t inst_id = (start_0based > 0) ? start_0based : 0;
+
+    for (auto it = it_begin; it != reader.end(); ++it) {
         if (ctx.cancelled() || limit_reached()) break;
 
         auto rec = *it;
@@ -130,8 +139,6 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
         auto inst = rec.as_inst();
         inst_id++;
 
-        // Skip instructions outside the analysis range.
-        if (inst_id < range.start_inst_id) continue;
         if (inst_id > end_id) break;
 
         // Report progress periodically.
@@ -175,44 +182,27 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
 
         // ─── Check for BL/BLR (function call auto-snapshot) ──────────────
         if (config_.snapshot_at_function_calls) {
-            // Decode the instruction to check if it's a BL/BLR
-            auto opcode = code_table.opcode_at(inst.pc);
-            if (!opcode) continue;
+            auto opcode_opt = code_table.opcode_at(inst.pc);
+            if (!opcode_opt) continue;
 
-            auto decoded = decoder.decode(inst.pc, *opcode);
-            if (!decoded) continue;
+            uint32_t opcode = *opcode_opt;
+            bool is_bl  = (opcode & 0xFC000000u) == 0x94000000u;
+            bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
 
-            std::string_view mnemonic(decoded->mnemonic);
-            // Match: bl, blr, blraa, blrab, blraaz, blrabz
-            if (mnemonic.size() >= 2 &&
-                mnemonic[0] == 'b' && mnemonic[1] == 'l') {
-
+            if (is_bl || is_blr) {
                 const RegState& regs = regfile.state_before(inst_id);
 
                 // Determine target PC for the label
                 uint64_t target_pc = 0;
-                if (mnemonic == "bl") {
-                    // For BL, target is in the operand (PC-relative).
-                    // We can get it from the next instruction's state or parse op_str.
-                    // Simplest: parse the immediate from op_str (e.g., "#0x1234")
-                    std::string_view ops(decoded->op_str);
-                    if (ops.size() > 2 && ops[0] == '#') {
-                        auto sub = ops.substr(1);
-                        if (sub.size() > 2 && sub[0] == '0' && sub[1] == 'x') {
-                            target_pc = std::strtoull(sub.data() + 2, nullptr, 16);
-                        } else {
-                            target_pc = std::strtoull(sub.data(), nullptr, 10);
-                        }
-                    }
+                if (is_bl) {
+                    // BL imm26: sign-extend the 26-bit offset and shift left 2
+                    int64_t imm26 = (int64_t)(int32_t)((opcode & 0x03FFFFFFu) << 6) >> 4;
+                    target_pc = inst.pc + imm26;
                 } else {
-                    // BLR xN — target is in the register
-                    // Parse register from op_str (e.g., "x8")
-                    std::string_view ops(decoded->op_str);
-                    if (ops.size() >= 2 && ops[0] == 'x') {
-                        int reg_idx = std::atoi(ops.data() + 1);
-                        if (reg_idx >= 0 && reg_idx < 31) {
-                            target_pc = regs.gpr[reg_idx];
-                        }
+                    // BLR Xn: register index is bits [9:5]
+                    uint8_t rn = (opcode >> 5) & 0x1F;
+                    if (rn < 31) {
+                        target_pc = regs.gpr[rn];
                     }
                 }
 

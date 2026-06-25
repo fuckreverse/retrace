@@ -117,17 +117,23 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
     result.base_inst_id = start;
     result.inst_to_pc.reserve(total);
 
-    uint64_t inst_id  = 0;
     uint64_t processed = 0;
 
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
+    // Seek directly to start position using index (avoid scanning prefix)
+    uint64_t start_offset = 0;
+    uint64_t scan_inst_id = 0;
+    if (start > 0) {
+        auto [off, pc] = index.offset_of_with_pc(start, reader);
+        start_offset = off;
+        scan_inst_id = start;
+    }
+
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    uint64_t inst_id = scan_inst_id;
+
+    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
-
-        if (inst_id < start) {
-            inst_id++;
-            continue;
-        }
 
         auto inst = rec.as_inst();
         result.inst_to_pc.push_back(inst.pc);

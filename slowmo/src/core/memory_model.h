@@ -235,6 +235,12 @@ private:
                                  uint8_t& out_value,
                                  uint64_t& out_writer) noexcept;
 
+    /// Find the inst_id of the most recent write covering `page_offset` with
+    /// inst_id <= `search_id`.  Returns 0 if no such write exists.
+    static uint64_t index_last_writer(const PageWriteIndex& idx,
+                                       uint16_t page_offset,
+                                       uint64_t search_id) noexcept;
+
     /// Check if the RocksDB already contains persisted MemoryModel data
     /// matching the current trace file (sentinel key check).
     bool check_persisted_sentinel() const;

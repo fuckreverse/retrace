@@ -45,7 +45,9 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
         for (uint64_t id : header_it->second) {
             iteration_starts.push_back(id);
         }
-        std::sort(iteration_starts.begin(), iteration_starts.end());
+        if (!std::is_sorted(iteration_starts.begin(), iteration_starts.end())) {
+            std::sort(iteration_starts.begin(), iteration_starts.end());
+        }
 
         if (iteration_starts.size() < cfg_.min_iterations_to_fold) continue;
 

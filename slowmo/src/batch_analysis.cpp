@@ -464,7 +464,7 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
             {"inst_id", ev.inst_id},
             {"pc", fmt::format("0x{:X}", ev.pc)},
             {"dst_reg", ev.dst_reg},
-            {"src_regs", ev.src_regs}
+            {"src_regs", ev.src_regs_list()}
         };
         if (ev.loads_from_memory) {
             json addrs = json::array();

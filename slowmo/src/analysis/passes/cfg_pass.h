@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <vector>
 #include <map>
-#include <unordered_map>
-#include <unordered_set>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -188,9 +186,18 @@ struct CFGResult {
             auto it = blocks.find(pc);
             if (it != blocks.end()) sub.blocks.emplace(it->first, it->second);
         }
-        for (const auto& e : edges) {
-            if (visited.count(e.from_block) && visited.count(e.to_block)) {
-                sub.edges.push_back(e);
+        // Collect edges by iterating only the adjacency lists of visited nodes
+        // instead of scanning the entire edges vector — O(visited_edges) vs O(E).
+        ankerl::unordered_dense::set<size_t> added_edge_indices;
+        for (uint64_t pc : visited) {
+            auto succ_it = succ_edge_idx_.find(pc);
+            if (succ_it != succ_edge_idx_.end()) {
+                for (size_t idx : succ_it->second) {
+                    const auto& e = edges[idx];
+                    if (visited.count(e.to_block) && added_edge_indices.insert(idx).second) {
+                        sub.edges.push_back(e);
+                    }
+                }
             }
         }
         sub.build_adjacency();

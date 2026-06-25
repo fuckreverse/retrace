@@ -17,8 +17,44 @@ namespace tenet {
 
 namespace {
 
+/// AArch64 opcode-based terminator classification (no Capstone needed).
+/// Returns Fallthrough for non-branch instructions.
+static TerminatorKind classify_opcode_terminator(uint32_t opcode) {
+    // Unconditional branch immediate: B (bit[31]=0, [30:26]=00101)
+    if ((opcode & 0xFC000000) == 0x14000000) return TerminatorKind::Branch;
+
+    // Branch with link: BL (bit[31]=1, [30:26]=00101)
+    if ((opcode & 0xFC000000) == 0x94000000) return TerminatorKind::Call;
+
+    // Conditional branch: B.cond ([31:25]=0101010, [4]=0)
+    if ((opcode & 0xFE000010) == 0x54000000) return TerminatorKind::ConditionalBranch;
+
+    // Compare and branch zero/nonzero: CBZ/CBNZ ([30:25]=011010)
+    if ((opcode & 0x7E000000) == 0x34000000) return TerminatorKind::ConditionalBranch;
+
+    // Test and branch: TBZ/TBNZ ([30:25]=011011)
+    if ((opcode & 0x7E000000) == 0x36000000) return TerminatorKind::ConditionalBranch;
+
+    // Branch register: BR ([24:21]=0000)
+    if ((opcode & 0xFE1FFC1F) == 0xD61F0000) return TerminatorKind::IndirectBranch;
+
+    // BLR: [24:21]=0001
+    if ((opcode & 0xFE1FFC1F) == 0xD63F0000) return TerminatorKind::Call;
+
+    // BLRAA/BLRAB/BLRAAZ/BLRABZ (pointer auth variants)
+    if ((opcode & 0xFEFFF800) == 0xD63F0800) return TerminatorKind::Call;
+
+    // RET: [24:21]=0010
+    if ((opcode & 0xFE1FFC1F) == 0xD65F0000) return TerminatorKind::Return;
+    // RETAA/RETAB (pointer auth)
+    if ((opcode & 0xFEFFFCFF) == 0xD65F0BFF) return TerminatorKind::Return;
+
+    return TerminatorKind::Fallthrough;
+}
+
 /// Classify an instruction mnemonic into a TerminatorKind.
 /// Returns nullopt for non-branch instructions (ordinary fallthrough).
+/// Used as fallback when opcode-based classification is not available.
 std::optional<TerminatorKind> classify_terminator(std::string_view mnemonic) {
     // Unconditional branch: b
     if (mnemonic == "b") {
@@ -123,7 +159,7 @@ PassResult CFGPass::run(PassContext& ctx) {
     //   - The instruction before a branch target
 
     // Collect all PCs that are block leaders
-    std::unordered_set<uint64_t> block_leaders;
+    ankerl::unordered_dense::set<uint64_t> block_leaders;
     block_leaders.reserve(sorted_pcs.size());
 
     // First PC is always a leader
@@ -131,16 +167,22 @@ PassResult CFGPass::run(PassContext& ctx) {
         block_leaders.insert(sorted_pcs[0]);
     }
 
-    // For each PC, decode and identify branch targets and fallthrough-after-branch
+    // Cache: PC → TerminatorKind for instructions that are terminators.
+    // Populated during Phase 2, reused in Phase 3 to avoid redundant decoding.
+    ankerl::unordered_dense::map<uint64_t, TerminatorKind> terminator_cache;
+
+    // For each PC, classify terminator using fast opcode bitmask first,
+    // falling back to Capstone decode only when we need the branch target.
     for (uint64_t pc : sorted_pcs) {
         auto opcode = code_table.opcode_at(pc);
         if (!opcode) continue;
 
-        auto d = decoder.decode(pc, *opcode);
-        if (!d) continue;
+        // Fast path: classify directly from 32-bit opcode (no Capstone)
+        auto kind = classify_opcode_terminator(*opcode);
+        if (kind == TerminatorKind::Fallthrough) continue;
 
-        auto term = classify_terminator(d->mnemonic);
-        if (!term) continue;
+        // Cache the decoded terminator kind for Phase 3
+        terminator_cache.emplace(pc, kind);
 
         // The instruction after a branch/call/return starts a new block
         uint64_t fallthrough_pc = pc + 4;
@@ -148,15 +190,17 @@ PassResult CFGPass::run(PassContext& ctx) {
             block_leaders.insert(fallthrough_pc);
         }
 
-        // The target of a branch starts a new block
-        // For direct branches (b, b.cond, cbz, cbnz, tbz, tbnz, bl)
-        // we extract the target from the operand string
-        if (*term == TerminatorKind::Branch ||
-            *term == TerminatorKind::ConditionalBranch ||
-            *term == TerminatorKind::Call) {
-            auto target = extract_branch_target(d->op_str);
-            if (target && xref.pc_to_inst_ids.count(*target)) {
-                block_leaders.insert(*target);
+        // The target of a direct branch starts a new block.
+        // We need Capstone only here to extract the branch target immediate.
+        if (kind == TerminatorKind::Branch ||
+            kind == TerminatorKind::ConditionalBranch ||
+            kind == TerminatorKind::Call) {
+            auto d = decoder.decode(pc, *opcode);
+            if (d) {
+                auto target = extract_branch_target(d->op_str);
+                if (target && xref.pc_to_inst_ids.count(*target)) {
+                    block_leaders.insert(*target);
+                }
             }
         }
         // Indirect branches (blr, br, ret) — target unknown statically,
@@ -171,24 +215,24 @@ PassResult CFGPass::run(PassContext& ctx) {
     BasicBlock current_block;
     bool in_block = false;
 
+    // Helper: finalize a block — look up terminator from cache (no re-decode),
+    // accumulate execution count, and emplace into result.
+    auto finalize_block = [&](BasicBlock& blk) {
+        auto cache_it = terminator_cache.find(blk.end_pc);
+        if (cache_it != terminator_cache.end()) {
+            blk.terminator = cache_it->second;
+        }
+        for (uint64_t insn_pc : blk.instructions) {
+            blk.execution_count += xref.execution_count(insn_pc);
+        }
+        result.blocks.emplace(blk.start_pc, std::move(blk));
+    };
+
     for (uint64_t pc : sorted_pcs) {
         if (block_leaders.count(pc)) {
             // Save the previous block if we were building one
             if (in_block) {
-                // Classify the terminator of the block
-                auto opcode = code_table.opcode_at(current_block.end_pc);
-                if (opcode) {
-                    auto d = decoder.decode(current_block.end_pc, *opcode);
-                    if (d) {
-                        auto term = classify_terminator(d->mnemonic);
-                        current_block.terminator = term.value_or(TerminatorKind::Fallthrough);
-                    }
-                }
-                // Compute execution count
-                for (uint64_t insn_pc : current_block.instructions) {
-                    current_block.execution_count += xref.execution_count(insn_pc);
-                }
-                result.blocks.emplace(current_block.start_pc, std::move(current_block));
+                finalize_block(current_block);
             }
             // Start a new block
             current_block = BasicBlock{};
@@ -206,18 +250,7 @@ PassResult CFGPass::run(PassContext& ctx) {
 
     // Don't forget the last block
     if (in_block) {
-        auto opcode = code_table.opcode_at(current_block.end_pc);
-        if (opcode) {
-            auto d = decoder.decode(current_block.end_pc, *opcode);
-            if (d) {
-                auto term = classify_terminator(d->mnemonic);
-                current_block.terminator = term.value_or(TerminatorKind::Fallthrough);
-            }
-        }
-        for (uint64_t insn_pc : current_block.instructions) {
-            current_block.execution_count += xref.execution_count(insn_pc);
-        }
-        result.blocks.emplace(current_block.start_pc, std::move(current_block));
+        finalize_block(current_block);
     }
 
     // ── Phase 4: Walk the trace to build edges and count taken ───────────
@@ -247,16 +280,24 @@ PassResult CFGPass::run(PassContext& ctx) {
         }
     };
 
-    using EdgeCountMap = std::unordered_map<EdgeKey, uint64_t, EdgeKeyHash>;
+    using EdgeCountMap = ankerl::unordered_dense::map<EdgeKey, uint64_t, EdgeKeyHash>;
 
     /// Collector that accumulates CFG edge counts during trace scan.
     /// Supports parallel sharding: each shard independently tracks block
     /// transitions, then merge() sums edge counts.
+    ///
+    /// Locality cache: most consecutive trace instructions fall within the
+    /// same basic block, so we cache the current block's [start, end] range.
+    /// On cache hit we skip the O(log B) upper_bound lookup entirely.
     struct CFGEdgeCollector final : public TraceCollector {
         const CFGResult* cfg;       // Shared (read-only) block map
         EdgeCountMap edge_counts;
         uint64_t prev_block_start = UINT64_MAX;
         uint64_t prev_pc = UINT64_MAX;  // PC of the previous instruction
+
+        // Locality cache — avoids block_containing() for sequential PCs
+        uint64_t cached_block_start_ = 0;
+        uint64_t cached_block_end_   = 0;   // inclusive, matching BasicBlock::end_pc
 
         explicit CFGEdgeCollector(const CFGResult* c) : cfg(c) {}
 
@@ -275,8 +316,24 @@ PassResult CFGPass::run(PassContext& ctx) {
         }
 
         void on_inst(uint64_t /*inst_id*/, const InstView& inst) override {
-            const BasicBlock* cur_block = cfg->block_containing(inst.pc);
-            uint64_t cur_block_start = cur_block ? cur_block->start_pc : UINT64_MAX;
+            uint64_t cur_block_start;
+
+            // Fast path: check locality cache before O(log B) lookup
+            if (inst.pc >= cached_block_start_ && inst.pc <= cached_block_end_) {
+                cur_block_start = cached_block_start_;
+            } else {
+                const BasicBlock* cur_block = cfg->block_containing(inst.pc);
+                if (cur_block) {
+                    cur_block_start = cur_block->start_pc;
+                    cached_block_start_ = cur_block->start_pc;
+                    cached_block_end_   = cur_block->end_pc;
+                } else {
+                    cur_block_start = UINT64_MAX;
+                    // Invalidate cache so the next instruction won't false-hit
+                    cached_block_start_ = 0;
+                    cached_block_end_   = 0;
+                }
+            }
 
             // 1. Inter-block edge: previous instruction was in a different block.
             if (prev_block_start != UINT64_MAX && cur_block_start != UINT64_MAX &&

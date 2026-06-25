@@ -4,8 +4,17 @@
 
 #include <fmt/core.h>
 #include <algorithm>
+#include <vector>
 
 namespace tenet {
+
+// ─── Compact per-instruction cache entry ──────────────────────────────────
+// Only stores the bitmask of written registers (bit i ↔ GPR index i).
+// Memory access info is carried separately via TaintResult.
+struct CachedInst {
+    uint64_t inst_id;
+    uint64_t written_regs_mask;  // bit i = GPR i was written by reg_diff
+};
 
 PassResult SlicePass::run(PassContext& ctx) {
     // Require taint result
@@ -18,81 +27,104 @@ PassResult SlicePass::run(PassContext& ctx) {
     result.target_inst_id = target_inst_id_;
     result.target_reg = target_reg_;
 
-    // Work backward from target
-    std::unordered_set<uint8_t> needed_regs;
-    needed_regs.insert(target_reg_);
+    constexpr uint64_t max_steps = 100000;  // Safety limit
 
-    // We need to scan backward through the trace.
-    // Since TraceReader only supports forward iteration efficiently,
-    // we'll use the index to jump to offsets and scan backward by
-    // using offset_of + reading individual records.
+    // ── Phase 1: Compute scan range ──────────────────────────────────────
+    const uint64_t scan_start = (target_inst_id_ > max_steps)
+                                    ? target_inst_id_ - max_steps
+                                    : 0;
+    const uint64_t scan_count = target_inst_id_ - scan_start;
 
-    uint64_t current_id = target_inst_id_;
-    uint64_t max_steps = 100000;  // Safety limit
-    uint64_t steps = 0;
+    if (scan_count == 0) {
+        ctx.progress(1.0f, "Slice: 0 instructions (empty range)");
+        return PassResult::success(std::move(result));
+    }
 
-    while (current_id > 0 && steps < max_steps) {
-        current_id--;
-        steps++;
+    // ── Phase 2: Forward scan — collect written-reg masks into buffer ────
+    // Single sequential pass over mmap: O(N) with madvise(SEQUENTIAL).
+    std::vector<CachedInst> buf;
+    buf.reserve(scan_count);
 
-        auto [offset, seed_pc] = index.offset_of_with_pc(current_id, reader);
-        auto rec = reader.record_at(offset, seed_pc);
+    // Seek to scan_start
+    auto [start_offset, start_seed_pc] = index.offset_of_with_pc(scan_start, reader);
+    reader.advise_sequential();
+
+    uint64_t inst_id = scan_start;
+    for (auto it = TraceReader::Iterator(&reader, start_offset, start_seed_pc);
+         it != reader.end() && inst_id < target_inst_id_;
+         ++it)
+    {
+        auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
 
         auto inst = rec.as_inst();
 
-        // Check if this instruction writes any register we need
-        bool contributes = false;
-        std::vector<uint8_t> new_needed;
-
+        // Build written-register bitmask from reg_diff entries
+        uint64_t wmask = 0;
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            if (needed_regs.count(diff.index) > 0) {
-                // This instruction writes a needed register -> it's in the slice
-                contributes = true;
-                // Add its source registers to needed set
-                for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
-                    if (i == j) continue;
-                    auto src = inst.reg_diff(j);
-                    if (needed_regs.count(src.index) == 0) {
-                        new_needed.push_back(src.index);
-                    }
-                }
-                break;  // Only track first match per instruction
-            }
+            wmask |= 1ULL << inst.reg_diff(i).index;
         }
 
-        // Also check if this instruction reads from memory that was tainted
-        // (memory sources in taint result)
-        if (!contributes && taint.is_tainted(target_reg_)) {
-            // Check if this instruction loads from a tainted memory address
-            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                auto mem = inst.mem_access(m);
-                if ((mem.type & 2) == 0) {  // read
-                    if (taint.is_memory_addr_tainted(mem.addr)) {
-                        contributes = true;
-                        break;
-                    }
-                }
-            }
-        }
+        buf.push_back({inst_id, wmask});
+        inst_id++;
+    }
+
+    reader.advise_random();  // Restore default hint
+
+    // ── Phase 3: Backward analysis over in-memory buffer ─────────────────
+    // Pure memory iteration — no RocksDB / mmap random access.
+    uint64_t needed_mask = 1ULL << target_reg_;
+
+    for (auto rit = buf.rbegin(); rit != buf.rend(); ++rit) {
+        const auto& ci = *rit;
+
+        // Fast bitmask test: does this instruction write any needed register?
+        uint64_t overlap = ci.written_regs_mask & needed_mask;
+        bool contributes = (overlap != 0);
 
         if (contributes) {
-            result.slice_inst_ids.push_back(current_id);
-            result.slice_set.insert(current_id);
-            for (auto r : new_needed) {
-                needed_regs.insert(r);
+            // All OTHER written regs of this instruction are potential sources.
+            // (Conservative heuristic: any reg touched by the same instruction
+            //  is treated as a source operand — same logic as original code.)
+            uint64_t source_regs = ci.written_regs_mask & ~overlap;
+            needed_mask |= source_regs;
+
+            result.slice_inst_ids.push_back(ci.inst_id);
+            result.slice_set.insert(ci.inst_id);
+        }
+
+        // Taint-based memory contribution check (same as original):
+        // If target_reg is tainted and this instruction loads from tainted memory,
+        // include it.  This path is rare so the extra work is acceptable.
+        if (!contributes && taint.is_tainted(target_reg_)) {
+            // We don't have memory access info in CachedInst (would bloat cache).
+            // Re-fetch this single record only when the taint check fires.
+            auto [off, spc] = index.offset_of_with_pc(ci.inst_id, reader);
+            auto rec = reader.record_at(off, spc);
+            if (rec.kind == RecordKind::Inst) {
+                auto inst = rec.as_inst();
+                for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                    auto mem = inst.mem_access(m);
+                    if ((mem.type & 2) == 0) {  // read
+                        if (taint.is_memory_addr_tainted(mem.addr)) {
+                            result.slice_inst_ids.push_back(ci.inst_id);
+                            result.slice_set.insert(ci.inst_id);
+                            break;
+                        }
+                    }
+                }
             }
         }
 
-        // Stop if we've reached the beginning or no more needed regs
-        if (needed_regs.empty()) break;
+        // Early exit if no more registers needed
+        if (needed_mask == 0) break;
     }
 
     // Reverse so slice is in forward order (oldest first)
     std::reverse(result.slice_inst_ids.begin(), result.slice_inst_ids.end());
 
-    ctx.progress(1.0f, fmt::format("Slice: {} instructions", result.slice_inst_ids.size()));
+    ctx.progress(1.0f, fmt::format("Slice: {} instructions (scanned {} in buffer)",
+                                   result.slice_inst_ids.size(), buf.size()));
     return PassResult::success(std::move(result));
 }
 

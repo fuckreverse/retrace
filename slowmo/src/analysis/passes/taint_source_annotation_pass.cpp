@@ -4,7 +4,9 @@
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
+#include "ankerl/unordered_dense.h"
 #include <algorithm>
+#include <cstring>
 
 namespace tenet {
 
@@ -86,7 +88,7 @@ TaintSourceKind TaintSourceAnnotationPass::classify_source(
             // Distinguish getter-style (no colon, doesn't start with "set")
             // vs. method-with-args vs. setter.
             bool is_getter = (sel.find(':') == std::string::npos &&
-                              sel.substr(0, 3) != "set");
+                              sel.compare(0, 3, "set") != 0);
             if (is_getter) return TaintSourceKind::ObjcGetter;
 
             bool is_setter = (sel.size() > 3 && sel[0] == 's' && sel[1] == 'e' && sel[2] == 't' &&
@@ -97,7 +99,7 @@ TaintSourceKind TaintSourceAnnotationPass::classify_source(
         } else {
             // Strict getter: zero colons, not starting with "set".
             bool is_getter = (sel.find(':') == std::string::npos &&
-                              sel.substr(0, 3) != "set");
+                              sel.compare(0, 3, "set") != 0);
             if (is_getter) return TaintSourceKind::ObjcGetter;
         }
     }
@@ -108,16 +110,14 @@ TaintSourceKind TaintSourceAnnotationPass::classify_source(
     }
 
     // If the event has no source regs and no source memory, it might be a constant.
-    if (ev.src_regs.empty() && ev.src_mem_addrs.empty() && !ev.loads_from_memory) {
+    if (ev.src_regs_empty() && ev.src_mem_addrs.empty() && !ev.loads_from_memory) {
         return TaintSourceKind::ImmediateConstant;
     }
 
     // If it wrote x0 and has no sources traced, could be a function return.
     // We can't perfectly detect this without call-graph data here, so
     // check if any dst_reg is x0 and there are no known sources in the taint set.
-    for (uint8_t dr : ev.dst_regs) {
-        if (dr == 0) return TaintSourceKind::FunctionReturn;  // x0 = return value
-    }
+    if (ev.has_dst_reg(0)) return TaintSourceKind::FunctionReturn;  // x0 = return value
 
     return TaintSourceKind::Unknown;
 }
@@ -161,14 +161,24 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
     // We just check: for each event, does it have any source reg that appears as
     // a dst_reg of an EARLIER event in the chain (i.e., a later inst_id)?
 
-    // Build "reg → last writer inst_id" map from the events.
-    std::unordered_map<uint8_t, uint64_t> reg_last_written;  // reg → latest inst_id that defines it
+    // Build "reg → last writer inst_id" fixed array (AArch64: 34 GPR).
+    static constexpr size_t kNumGPR = 34;
+    uint64_t reg_last_written[kNumGPR];
+    std::memset(reg_last_written, 0xFF, sizeof(reg_last_written));  // UINT64_MAX = not written
     for (const auto& ev : bt.events) {
-        for (uint8_t dr : ev.dst_regs) {
-            auto it = reg_last_written.find(dr);
-            if (it == reg_last_written.end() || ev.inst_id > it->second) {
+        ev.for_each_dst_reg([&](uint8_t dr) {
+            if (dr < kNumGPR && ev.inst_id > reg_last_written[dr]) {
                 reg_last_written[dr] = ev.inst_id;
             }
+        });
+    }
+
+    // Pre-build set of store addresses from contributing events → O(1) lookup.
+    ankerl::unordered_dense::set<uint64_t> contributing_store_addrs;
+    contributing_store_addrs.reserve(bt.events.size() / 4);
+    for (const auto& ev : bt.events) {
+        if (ev.stores_to_memory && ev.store_addr != 0) {
+            contributing_store_addrs.insert(ev.store_addr);
         }
     }
 
@@ -180,13 +190,13 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
 
         // Check if this event's src_regs are covered by any other contributing event.
         bool all_srcs_covered = false;
-        if (!ev.src_regs.empty()) {
+        if (!ev.src_regs_empty()) {
             all_srcs_covered = true;
-            for (uint8_t sr : ev.src_regs) {
+            for (uint64_t m = ev.src_regs_mask; m; m &= m - 1) {
+                uint8_t sr = static_cast<uint8_t>(__builtin_ctzll(m));
                 // Is there another event (earlier in time = higher inst_id in our list)
                 // that writes sr AND has inst_id < ev.inst_id?
-                auto it = reg_last_written.find(sr);
-                if (it == reg_last_written.end() || it->second >= ev.inst_id) {
+                if (sr >= kNumGPR || reg_last_written[sr] == UINT64_MAX || reg_last_written[sr] >= ev.inst_id) {
                     all_srcs_covered = false;
                     break;
                 }
@@ -196,18 +206,12 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
         // Check memory sources: is there a contributing store that feeds this load?
         bool mem_srcs_covered = false;
         if (ev.loads_from_memory && !ev.src_mem_addrs.empty()) {
-            // If any src_mem_addr was traced through a store in the contributing set,
-            // this event is not a leaf. Check by looking for contributing store events.
-            for (const auto& ev2 : bt.events) {
-                if (ev2.inst_id >= ev.inst_id) continue;
-                if (!ev2.stores_to_memory) continue;
-                for (uint64_t ma : ev.src_mem_addrs) {
-                    if (ma == ev2.store_addr) {
-                        mem_srcs_covered = true;
-                        break;
-                    }
+            // O(1) lookup per address in the pre-built contributing store set.
+            for (uint64_t ma : ev.src_mem_addrs) {
+                if (contributing_store_addrs.contains(ma)) {
+                    mem_srcs_covered = true;
+                    break;
                 }
-                if (mem_srcs_covered) break;
             }
         }
 
@@ -217,7 +221,7 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
         bool is_leaf = (!all_srcs_covered && !mem_srcs_covered);
 
         // Also consider: events with NO sources at all (pure sinks of constant loads).
-        if (ev.src_regs.empty() && !ev.loads_from_memory) {
+        if (ev.src_regs_empty() && !ev.loads_from_memory) {
             is_leaf = true;
         }
 

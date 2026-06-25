@@ -163,18 +163,24 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     std::array<uint64_t, AARCH64_GPR_COUNT> last_writer;
     last_writer.fill(NO_WRITER);
 
-    uint64_t inst_id = 0;
     uint64_t nodes_added = 0;
     uint64_t total = end - start;
 
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
+    // Seek directly to start position using index (avoid scanning prefix)
+    uint64_t start_offset = 0;
+    uint64_t scan_inst_id = 0;
+    if (start > 0) {
+        auto [off, pc] = index.offset_of_with_pc(start, reader);
+        start_offset = off;
+        scan_inst_id = start;
+    }
+
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    uint64_t inst_id = scan_inst_id;
+
+    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
-
-        if (inst_id < start) {
-            inst_id++;
-            continue;
-        }
 
         if (ctx.cancelled()) {
             break;

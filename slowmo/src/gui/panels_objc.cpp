@@ -324,13 +324,15 @@ void GuiApp::render_objc_panel() {
                     ImGui::TableSetColumnIndex(2);
                     // Show comma-separated selector list (truncated)
                     std::string sel_str;
-                    for (size_t si = 0; si < ci->selectors_seen.size(); ++si) {
+                    size_t si = 0;
+                    for (const auto& sel : ci->selectors_seen) {
                         if (si > 0) sel_str += ", ";
                         if (si >= 4 && ci->selectors_seen.size() > 5) {
                             sel_str += fmt::format("(+{})", ci->selectors_seen.size() - si);
                             break;
                         }
-                        sel_str += ci->selectors_seen[si];
+                        sel_str += sel;
+                        ++si;
                     }
                     ImGui::TextDisabled("%s", sel_str.c_str());
                     if (ImGui::IsItemHovered() && ci->selectors_seen.size() > 5) {

@@ -4,8 +4,6 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
-#include "core/instruction_decoder.h"
-
 #include <fmt/core.h>
 #include <algorithm>
 #include <cctype>
@@ -193,7 +191,6 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     auto& memory = ctx.memory();
     auto& regfile = ctx.regfile();
-    auto& decoder = ctx.decoder();
     auto& code_table = ctx.code_table();
 
     const auto& range = ctx.range();
@@ -250,17 +247,15 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
             ctx.progress(pct, "Scanning call sites for strings");
         }
 
-        // ─── Detect call instructions (BL/BLR) and SVC ───────────────────
-        auto opcode = code_table.opcode_at(inst.pc);
-        if (!opcode) continue;
+        // ─── Detect call instructions (BL/BLR) and SVC via opcode bitmask ─
+        auto opcode_opt = code_table.opcode_at(inst.pc);
+        if (!opcode_opt) continue;
 
-        auto decoded = decoder.decode(inst.pc, *opcode);
-        if (!decoded) continue;
-
-        std::string_view mnemonic(decoded->mnemonic);
-
-        bool is_call = (mnemonic.size() >= 2 && mnemonic[0] == 'b' && mnemonic[1] == 'l');
-        bool is_svc = (mnemonic == "svc");
+        uint32_t opcode = *opcode_opt;
+        bool is_bl  = (opcode & 0xFC000000u) == 0x94000000u;
+        bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
+        bool is_svc = (opcode & 0xFFE0001Fu) == 0xD4000001u;
+        bool is_call = is_bl || is_blr;
 
         if (!is_call && !is_svc) continue;
 

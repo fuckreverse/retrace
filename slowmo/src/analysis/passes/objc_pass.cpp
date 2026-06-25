@@ -15,26 +15,31 @@ namespace tenet {
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 /// Read a C string from memory at the given address and inst_id.
+/// Uses read_region() for bulk reads (one RocksDB seek per 32-byte chunk)
+/// instead of per-byte byte_at() calls.
 /// Returns the string content or a hex fallback if unreadable.
 static std::string read_cstring_from_memory(
     MemoryModel& mem, uint64_t addr, uint64_t at_inst_id, size_t max_len = 128)
 {
     if (addr == 0) return "(null)";
 
+    static constexpr size_t CHUNK = 32;
     std::string result;
     result.reserve(32);
 
-    for (size_t i = 0; i < max_len; ++i) {
-        auto byte = mem.byte_at(addr + i, at_inst_id);
-        if (!byte.has_value()) break;
+    for (size_t offset = 0; offset < max_len; offset += CHUNK) {
+        size_t to_read = std::min(CHUNK, max_len - offset);
+        auto region = mem.read_region(addr + offset, to_read, at_inst_id);
 
-        uint8_t c = *byte;
-        if (c == 0) break;  // NUL terminator
-        if (c < 0x20 || c > 0x7E) break;  // non-printable — stop
-
-        result.push_back(static_cast<char>(c));
+        for (size_t i = 0; i < to_read; ++i) {
+            if (!region.known[i]) goto done;
+            uint8_t c = region.data[i];
+            if (c == 0) goto done;        // NUL terminator
+            if (c < 0x20 || c > 0x7E) goto done;  // non-printable — stop
+            result.push_back(static_cast<char>(c));
+        }
     }
-
+done:
     if (result.empty()) {
         return fmt::format("0x{:x}", addr);
     }
@@ -61,6 +66,7 @@ static uint8_t count_selector_args(const std::string& sel_name) {
 }
 
 /// Try to dereference a pointer value as a C string from memory.
+/// Uses read_region() for bulk reads instead of per-byte byte_at() calls.
 /// Returns nullopt if the address looks like a small integer or can't be read.
 static std::optional<std::string> try_deref_string(
     MemoryModel& mem, uint64_t addr, uint64_t at_inst_id)
@@ -68,24 +74,28 @@ static std::optional<std::string> try_deref_string(
     // Heuristic: skip values that look like small integers or NULL
     if (addr < 0x1000) return std::nullopt;
 
+    static constexpr size_t MAX_LEN = 256;
+    static constexpr size_t CHUNK = 32;
     std::string result;
     result.reserve(32);
 
-    for (size_t i = 0; i < 256; ++i) {
-        auto byte = mem.byte_at(addr + i, at_inst_id);
-        if (!byte.has_value()) break;
+    for (size_t offset = 0; offset < MAX_LEN; offset += CHUNK) {
+        size_t to_read = std::min(CHUNK, MAX_LEN - offset);
+        auto region = mem.read_region(addr + offset, to_read, at_inst_id);
 
-        uint8_t c = *byte;
-        if (c == 0) break;  // NUL terminator
-        if (c < 0x20 || c > 0x7E) {
-            // Non-printable — this probably isn't a string
-            if (i == 0) return std::nullopt;
-            break;
+        for (size_t i = 0; i < to_read; ++i) {
+            if (!region.known[i]) goto done;
+            uint8_t c = region.data[i];
+            if (c == 0) goto done;  // NUL terminator
+            if (c < 0x20 || c > 0x7E) {
+                // Non-printable — this probably isn't a string
+                if (offset + i == 0) return std::nullopt;
+                goto done;
+            }
+            result.push_back(static_cast<char>(c));
         }
-
-        result.push_back(static_cast<char>(c));
     }
-
+done:
     // Require at least 2 chars to consider it a meaningful string
     if (result.size() < 2) return std::nullopt;
     return result;
@@ -343,12 +353,8 @@ public:
         cls_info.message_count++;
         cls_info.message_indices.push_back(msg_idx);
 
-        // Track unique selectors for this class
-        if (std::find(cls_info.selectors_seen.begin(),
-                      cls_info.selectors_seen.end(),
-                      msg.selector_name) == cls_info.selectors_seen.end()) {
-            cls_info.selectors_seen.push_back(msg.selector_name);
-        }
+        // Track unique selectors for this class (O(1) amortized via hash set)
+        cls_info.selectors_seen.insert(msg.selector_name);
 
         // Index by PC
         result_.by_pc[msg.pc].push_back(msg_idx);

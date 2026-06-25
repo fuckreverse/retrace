@@ -4,8 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <unordered_set>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -35,10 +34,10 @@ struct CallGraphResult {
     std::vector<CallGraphEdge> edges;
 
     /// Nodes indexed by function entry PC.
-    std::unordered_map<uint64_t, CallGraphNode> nodes;
+    ankerl::unordered_dense::map<uint64_t, CallGraphNode> nodes;
 
     /// Reverse lookup: (caller_pc, callee_pc) → edge index.
-    std::unordered_map<uint64_t, std::unordered_map<uint64_t, size_t>> edge_map_;
+    ankerl::unordered_dense::map<uint64_t, ankerl::unordered_dense::map<uint64_t, size_t>> edge_map_;
 
     /// Maximum call depth observed in the trace.
     uint64_t max_depth = 0;
@@ -119,7 +118,7 @@ struct CallGraphResult {
     /// Check if there is a call path from `from_pc` to `to_pc` (BFS).
     bool has_call_path(uint64_t from_pc, uint64_t to_pc) const {
         if (from_pc == to_pc) return true;
-        std::unordered_set<uint64_t> visited;
+        ankerl::unordered_dense::set<uint64_t> visited;
         std::vector<uint64_t> queue = {from_pc};
         visited.insert(from_pc);
         while (!queue.empty()) {

@@ -2,9 +2,9 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/passes/taint_pass.h"
+#include <ankerl/unordered_dense.h>
 #include <cstdint>
 #include <vector>
-#include <unordered_set>
 
 namespace tenet {
 
@@ -17,11 +17,11 @@ struct SliceResult {
     /// Register index that was sliced.
     uint8_t target_reg;
 
-    /// All instruction IDs that contribute to the slice (backward from target).
+    /// All instruction IDs that contribute to the slice (forward order, oldest first).
     std::vector<uint64_t> slice_inst_ids;
 
     /// Quick lookup.
-    std::unordered_set<uint64_t> slice_set;
+    ankerl::unordered_dense::set<uint64_t> slice_set;
 
     bool is_in_slice(uint64_t inst_id) const {
         return slice_set.count(inst_id) > 0;

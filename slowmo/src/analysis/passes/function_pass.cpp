@@ -4,9 +4,10 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 
+#include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
 #include <algorithm>
-#include <unordered_set>
+#include <numeric>
 
 namespace tenet {
 
@@ -158,20 +159,41 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
 
 // ─── FunctionResult methods ───────────────────────────────────────────────
 
-std::vector<const CallEvent*> FunctionResult::call_stack_at(uint64_t inst_id) const {
-    // Reconstruct call stack: walk call_events and build stack state
-    std::vector<const CallEvent*> stack;
-    for (auto& evt : call_events) {
-        if (evt.call_inst_id > inst_id) break;
+void FunctionResult::build_call_index() const {
+    if (call_index_built_) return;
+    sorted_call_indices_.resize(call_events.size());
+    std::iota(sorted_call_indices_.begin(), sorted_call_indices_.end(), 0);
+    std::sort(sorted_call_indices_.begin(), sorted_call_indices_.end(),
+              [this](size_t a, size_t b) {
+                  return call_events[a].call_inst_id < call_events[b].call_inst_id;
+              });
+    call_index_built_ = true;
+}
 
-        if (evt.call_inst_id <= inst_id) {
+std::vector<const CallEvent*> FunctionResult::call_stack_at(uint64_t inst_id) const {
+    build_call_index();
+
+    // Binary search: find the first sorted index where call_inst_id > inst_id
+    auto bound = std::upper_bound(
+        sorted_call_indices_.begin(), sorted_call_indices_.end(), inst_id,
+        [this](uint64_t id, size_t idx) {
+            return id < call_events[idx].call_inst_id;
+        });
+
+    // All events with call_inst_id <= inst_id are in [begin, bound).
+    // Among those, collect ones that haven't returned yet (return_inst_id == 0 or >= inst_id).
+    std::vector<const CallEvent*> stack;
+    for (auto it = sorted_call_indices_.begin(); it != bound; ++it) {
+        const auto& evt = call_events[*it];
+        if (evt.return_inst_id == 0 || evt.return_inst_id >= inst_id) {
             stack.push_back(&evt);
         }
-        if (evt.return_inst_id != 0 && evt.return_inst_id <= inst_id) {
-            // This call already returned
-            if (!stack.empty()) stack.pop_back();
-        }
     }
+    // Sort by depth (outermost first) for consistent output
+    std::sort(stack.begin(), stack.end(),
+              [](const CallEvent* a, const CallEvent* b) {
+                  return a->depth < b->depth;
+              });
     return stack;
 }
 
@@ -232,14 +254,29 @@ uint64_t FunctionResult::depth_at(uint64_t inst_id) const {
 }
 
 const FunctionInfo* FunctionResult::function_at(uint64_t inst_id) const {
-    // Find which function contains this inst_id by checking active calls
+    build_call_index();
+
+    // Binary search: find the first sorted index where call_inst_id > inst_id
+    auto bound = std::upper_bound(
+        sorted_call_indices_.begin(), sorted_call_indices_.end(), inst_id,
+        [this](uint64_t id, size_t idx) {
+            return id < call_events[idx].call_inst_id;
+        });
+
+    // Walk backwards from bound to find the innermost (highest depth) active call
     const CallEvent* innermost = nullptr;
-    for (auto& evt : call_events) {
-        if (evt.call_inst_id > inst_id) break;
+    for (auto it = bound; it != sorted_call_indices_.begin(); ) {
+        --it;
+        const auto& evt = call_events[*it];
+        // evt.call_inst_id <= inst_id is guaranteed (we're before upper_bound)
         if (evt.return_inst_id == 0 || evt.return_inst_id >= inst_id) {
-            innermost = &evt;
+            // This call is still active at inst_id
+            if (!innermost || evt.depth > innermost->depth) {
+                innermost = &evt;
+            }
         }
     }
+
     if (!innermost) return nullptr;
     auto it = functions.find(innermost->target_pc);
     if (it == functions.end()) return nullptr;
@@ -402,9 +439,8 @@ PassResult FunctionPass::run(PassContext& ctx) {
     static constexpr uint8_t KIND_RET    = 0x2;
     static constexpr uint8_t KIND_BRANCH = 0x4;
 
-    // Use ankerl::unordered_dense via code_table's underlying map if possible,
-    // but a plain std::unordered_map is fine here since it's populated once.
-    std::unordered_map<uint64_t, uint8_t> pc_kind;
+    // Use ankerl::unordered_dense for fast O(1) lookups in the hot scan loop.
+    ankerl::unordered_dense::map<uint64_t, uint8_t> pc_kind;
 
     {
         auto all_entries = code_table.all_entries();
@@ -732,7 +768,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
 
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
         // Build the set of known function entry PCs (refreshed each iteration)
-        std::unordered_set<uint64_t> known_entries;
+        ankerl::unordered_dense::set<uint64_t> known_entries;
         known_entries.reserve(result.functions.size());
         for (auto& [entry_pc, _] : result.functions) {
             known_entries.insert(entry_pc);

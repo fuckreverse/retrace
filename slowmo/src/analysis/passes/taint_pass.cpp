@@ -7,6 +7,7 @@
 // register_file.h and memory_model.h no longer needed in run_triton_taint
 // (concrete context injection removed; taint engine is self-contained)
 
+#include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
 #include <cstring>
 #include <algorithm>
@@ -59,27 +60,27 @@ static void emit_step(TaintResult& result, const TaintConfig& config,
 // ─── Helper: check stop conditions ─────────────────────────────────────────
 
 /// Returns non-empty string if a stop condition is met.
-static std::string check_stop_conditions(const TaintConfig& config,
-                                         const TaintResult& result,
+static std::string check_stop_conditions(const TaintResult& result,
+                                         const ankerl::unordered_dense::set<uint64_t>& stop_pc_set,
                                          uint64_t pc,
-                                         uint64_t processed) {
+                                         uint64_t processed,
+                                         uint64_t max_instructions,
+                                         uint32_t max_taint_width) {
     // max_instructions
-    if (config.max_instructions > 0 && processed >= config.max_instructions) {
+    if (max_instructions > 0 && processed >= max_instructions) {
         return "max_instructions reached";
     }
 
     // max_taint_width
-    if (config.max_taint_width > 0 &&
-        result.tainted_reg_count() > config.max_taint_width) {
+    if (max_taint_width > 0 &&
+        result.tainted_reg_count() > max_taint_width) {
         return fmt::format("max_taint_width exceeded ({} > {})",
-                           result.tainted_reg_count(), config.max_taint_width);
+                           result.tainted_reg_count(), max_taint_width);
     }
 
     // stop_pcs
-    if (!config.stop_pcs.empty()) {
-        for (uint64_t stop_pc : config.stop_pcs) {
-            if (stop_pc == pc) return fmt::format("stop_pc hit: 0x{:X}", pc);
-        }
+    if (!stop_pc_set.empty() && stop_pc_set.contains(pc)) {
+        return fmt::format("stop_pc hit: 0x{:X}", pc);
     }
 
     return {};
@@ -119,6 +120,10 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
     uint64_t start = config.source_inst_id > 0 ? config.source_inst_id : range.start_inst_id;
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
+
+    // Pre-build stop_pc set for O(1) lookup in the hot loop
+    ankerl::unordered_dense::set<uint64_t> stop_pc_set(config.stop_pcs.begin(),
+                                                        config.stop_pcs.end());
 
     // Create a fresh Triton bridge for this analysis
     auto bridge_ptr = create_triton_bridge();
@@ -160,26 +165,33 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         result.tainted_memory.add(addr);
     }
 
-    uint64_t inst_id = 0;
     uint64_t processed = 0;
     uint64_t total = end - start;
+
+    // Seek directly to start position using index (avoid scanning prefix)
+    uint64_t start_offset = 0;
+    uint64_t scan_inst_id = 0;
+    if (start > 0) {
+        auto [off, pc] = index.offset_of_with_pc(start, reader);
+        start_offset = off;
+        scan_inst_id = start;
+    }
+
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    uint64_t inst_id = scan_inst_id;
 
     // Hint to the OS that we'll be reading sequentially (improves mmap readahead)
     reader.advise_sequential();
 
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
+    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
-
-        if (inst_id < start) {
-            inst_id++;
-            continue;
-        }
 
         auto inst = rec.as_inst();
 
         // ─── Stop condition check ─────────────────────────────────────
-        auto stop = check_stop_conditions(config, result, inst.pc, processed);
+        auto stop = check_stop_conditions(result, stop_pc_set, inst.pc, processed,
+                                           config.max_instructions, config.max_taint_width);
         if (!stop.empty()) {
             result.stop_reason = std::move(stop);
             break;
@@ -409,6 +421,10 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
+    // Pre-build stop_pc set for O(1) lookup in the hot loop
+    ankerl::unordered_dense::set<uint64_t> stop_pc_set(config.stop_pcs.begin(),
+                                                        config.stop_pcs.end());
+
     // ─── Try to get XRef result for acceleration ──────────────────────
     const XrefResult* xref = nullptr;
     if (config.use_xref_acceleration) {
@@ -436,26 +452,33 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
     // registers they modify (as a bitmask). If a PC never touches any
     // tainted register, we can potentially skip future occurrences.
 
-    uint64_t inst_id = 0;
     uint64_t processed = 0;
     uint64_t total = end - start;
 
     // Track which PCs modify which registers (learned during scan, bitmask)
     ankerl::unordered_dense::map<uint64_t, uint64_t> pc_to_written_regs;
 
-    for (auto it = reader.begin(); it != reader.end() && inst_id < end; ++it) {
+    // Seek directly to start position using index (avoid scanning prefix)
+    uint64_t start_offset = 0;
+    uint64_t scan_inst_id = 0;
+    if (start > 0) {
+        auto [off, pc] = index.offset_of_with_pc(start, reader);
+        start_offset = off;
+        scan_inst_id = start;
+    }
+
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    uint64_t inst_id = scan_inst_id;
+
+    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
-
-        if (inst_id < start) {
-            inst_id++;
-            continue;
-        }
 
         auto inst = rec.as_inst();
 
         // ─── Stop condition check ─────────────────────────────────────
-        auto stop = check_stop_conditions(config, result, inst.pc, processed);
+        auto stop = check_stop_conditions(result, stop_pc_set, inst.pc, processed,
+                                           config.max_instructions, config.max_taint_width);
         if (!stop.empty()) {
             result.stop_reason = std::move(stop);
             break;
@@ -487,8 +510,10 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         // we can skip it. But we need to be conservative: the instruction
         // might KILL taint (overwrite a tainted reg with non-tainted data).
         // So we only skip if the PC doesn't touch any tainted register at all.
-        if (xref != nullptr && pc_to_written_regs.count(inst.pc) > 0) {
-            uint64_t written_mask = pc_to_written_regs[inst.pc];
+        if (xref != nullptr) {
+          auto pcwr_it = pc_to_written_regs.find(inst.pc);
+          if (pcwr_it != pc_to_written_regs.end()) {
+            uint64_t written_mask = pcwr_it->second;
             bool touches_tainted = (written_mask & result.tainted_regs) != 0;
             // Also check if any source reg is tainted (reads)
             if (!touches_tainted) {
@@ -522,6 +547,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                     continue;
                 }
             }
+          }
         }
 
         // ─── Learn which registers this PC writes ─────────────────────

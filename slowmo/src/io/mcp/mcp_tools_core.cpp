@@ -424,7 +424,7 @@ void TenetMcpService::register_taint_tools() {
                     {"inst_id", ev.inst_id},
                     {"pc", fmt::format("0x{:X}", ev.pc)},
                     {"dst_reg", ev.dst_reg},
-                    {"src_regs", ev.src_regs}
+                    {"src_regs", ev.src_regs_list()}
                 };
                 if (ev.loads_from_memory) {
                     json addrs = json::array();

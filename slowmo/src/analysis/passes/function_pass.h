@@ -4,8 +4,9 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <algorithm>  // std::upper_bound, std::lower_bound
+#include <ankerl/unordered_dense.h>
+#include <numeric>    // std::iota
 
 namespace tenet {
 
@@ -36,7 +37,7 @@ struct FunctionResult {
     std::vector<CallEvent> call_events;
 
     /// Functions by entry PC.
-    std::unordered_map<uint64_t, FunctionInfo> functions;
+    ankerl::unordered_dense::map<uint64_t, FunctionInfo> functions;
 
     /// Call stack at a given instruction ID.
     /// Returns vector of call event pointers from outermost to innermost.
@@ -51,6 +52,7 @@ struct FunctionResult {
     uint64_t depth_at(uint64_t inst_id) const;
 
     /// Which function contains inst_id? (by checking which call is active)
+    /// O(log N) via sorted index built lazily on first call.
     const FunctionInfo* function_at(uint64_t inst_id) const;
 
     /// Get call event if inst_id is a call site.
@@ -71,9 +73,13 @@ struct FunctionResult {
     /// Called once after the pass completes (or after deserialization).
     void build_depth_table();
 
+    /// Build the sorted call event index for fast function_at() / call_stack_at().
+    /// Called automatically (lazy) on first query, or can be triggered explicitly.
+    void build_call_index() const;
+
     // Internal lookup maps (populated during pass)
-    std::unordered_map<uint64_t, size_t> call_site_map_;   // call_inst_id → index
-    std::unordered_map<uint64_t, size_t> return_site_map_; // return_inst_id → index
+    ankerl::unordered_dense::map<uint64_t, size_t> call_site_map_;   // call_inst_id → index
+    ankerl::unordered_dense::map<uint64_t, size_t> return_site_map_; // return_inst_id → index
 
     // Depth-table for fast bulk depth queries.
     // Sorted by inst_id; each entry is the depth AFTER that inst_id fires.
@@ -83,6 +89,11 @@ struct FunctionResult {
         uint64_t depth;    // stack depth immediately after this event
     };
     std::vector<DepthEntry> depth_table_;
+
+    // Sorted index into call_events by call_inst_id for O(log N) lookups.
+    // Lazily built on first function_at() / call_stack_at() call.
+    mutable std::vector<size_t> sorted_call_indices_;  // indices into call_events, sorted by call_inst_id
+    mutable bool call_index_built_ = false;
 };
 
 // ─── Function analysis pass ───────────────────────────────────────────────

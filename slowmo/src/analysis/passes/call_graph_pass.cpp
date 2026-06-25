@@ -1,7 +1,9 @@
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/function_pass.h"
 
+#include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
+#include <algorithm>
 
 namespace tenet {
 
@@ -47,7 +49,9 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     };
 
     // Temporary edge accumulator: key → {count, call_site_pcs}
-    std::unordered_map<EdgeKey, std::pair<uint64_t, std::unordered_set<uint64_t>>, EdgeKeyHash> edge_accum;
+    // Uses ankerl::unordered_dense::map for better cache locality, and
+    // vector instead of unordered_set for call sites (sort+unique at the end).
+    ankerl::unordered_dense::map<EdgeKey, std::pair<uint64_t, std::vector<uint64_t>>, EdgeKeyHash> edge_accum;
 
     // Track max depth
     uint64_t max_depth = 0;
@@ -56,11 +60,8 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     // Each entry: function entry PC of the active function.
     std::vector<uint64_t> call_stack_funcs;
 
-    // We also need a mapping from entry_pc to function name. Copy from FunctionResult.
-    std::unordered_map<uint64_t, std::string> func_names;
-    for (const auto& [entry_pc, info] : func_result.functions) {
-        func_names[entry_pc] = info.name;
-    }
+    // Access function names directly from FunctionResult instead of copying.
+    const auto& func_names = func_result.functions;
 
     // Step 2: Walk through call events in order to build edges.
     // We simulate the call stack: when we see a call event, the caller is
@@ -114,7 +115,7 @@ PassResult CallGraphPass::run(PassContext& ctx) {
             EdgeKey key{caller_entry_pc, callee_entry_pc};
             auto& acc = edge_accum[key];
             acc.first++;
-            acc.second.insert(evt.call_site_pc);
+            acc.second.push_back(evt.call_site_pc);
 
             // Push callee onto stack
             call_stack_funcs.push_back(callee_entry_pc);
@@ -142,9 +143,12 @@ PassResult CallGraphPass::run(PassContext& ctx) {
         edge.caller_pc = key.caller_pc;
         edge.callee_pc = key.callee_pc;
         edge.call_count = acc_data.first;
-        edge.call_site_pcs.assign(acc_data.second.begin(), acc_data.second.end());
-        // Sort call sites for deterministic output
+        edge.call_site_pcs = std::move(acc_data.second);
+        // Sort and deduplicate call sites for deterministic output
         std::sort(edge.call_site_pcs.begin(), edge.call_site_pcs.end());
+        edge.call_site_pcs.erase(
+            std::unique(edge.call_site_pcs.begin(), edge.call_site_pcs.end()),
+            edge.call_site_pcs.end());
 
         result.edge_map_[key.caller_pc][key.callee_pc] = edge_idx;
         result.edges.push_back(std::move(edge));
@@ -154,7 +158,7 @@ PassResult CallGraphPass::run(PassContext& ctx) {
         if (caller_node.entry_pc == 0 && key.caller_pc != 0) {
             caller_node.entry_pc = key.caller_pc;
             auto nit = func_names.find(key.caller_pc);
-            caller_node.name = (nit != func_names.end()) ? nit->second
+            caller_node.name = (nit != func_names.end()) ? nit->second.name
                             : fmt::format("sub_{:x}", key.caller_pc);
         } else if (key.caller_pc == 0) {
             caller_node.entry_pc = 0;
@@ -167,7 +171,7 @@ PassResult CallGraphPass::run(PassContext& ctx) {
         if (callee_node.entry_pc == 0) {
             callee_node.entry_pc = key.callee_pc;
             auto nit = func_names.find(key.callee_pc);
-            callee_node.name = (nit != func_names.end()) ? nit->second
+            callee_node.name = (nit != func_names.end()) ? nit->second.name
                             : fmt::format("sub_{:x}", key.callee_pc);
         }
         callee_node.incoming_edges.push_back(edge_idx);

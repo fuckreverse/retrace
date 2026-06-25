@@ -97,6 +97,20 @@ bool InstructionDecoder::init() {
 std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opcode) {
     if (!initialized_) return std::nullopt;
 
+    // ── Thread-local 1-entry cache ──────────────────────────────────────
+    // Avoids lock contention for the common case of repeated decode of the
+    // same opcode (loop bodies execute the same instruction thousands of
+    // times).  PC-relative instructions are excluded because their op_str
+    // depends on the execution PC.
+    struct TLSEntry { uint32_t opcode = ~0u; DecodedInst inst; };
+    static thread_local TLSEntry tls_last;
+
+    if (tls_last.opcode == opcode && !is_pc_relative_mnemonic(tls_last.inst.mnemonic_sv())) {
+        auto copy = tls_last.inst;
+        copy.pc = pc;
+        return copy;
+    }
+
     // ── Opcode-keyed cache (thread-safe under run_all parallelism) ────────
     // AArch64 is fixed-length; the opcode word fully determines the mnemonic,
     // register access sets, and (for non-PC-relative instructions) the operand
@@ -201,6 +215,10 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
     if (!is_pc_relative_mnemonic(d.mnemonic_sv())) {
         std::unique_lock<std::shared_mutex> lk(opcode_cache_mtx_);
         opcode_cache_.put(opcode, d);
+
+        // Update thread-local 1-entry cache (lock-free fast path for next hit)
+        tls_last.opcode = opcode;
+        tls_last.inst = d;
     }
 
     return d;

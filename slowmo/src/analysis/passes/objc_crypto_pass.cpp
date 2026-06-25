@@ -168,10 +168,11 @@ PassResult ObjcCryptoPass::run(PassContext& ctx) {
                 frame.selector_name = msg.selector_name;
                 frame.receiver     = msg.receiver;
 
-                // Insert at front to maintain outermost-first order.
-                hit.objc_stack.insert(hit.objc_stack.begin(), frame);
+                // push_back and reverse later — O(N) instead of O(N²).
+                hit.objc_stack.push_back(frame);
                 ++frames_collected;
             }
+            std::reverse(hit.objc_stack.begin(), hit.objc_stack.end());
         }
 
         size_t hit_idx = result.hits.size();
