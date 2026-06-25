@@ -1,6 +1,7 @@
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
 #include "common/logger.h"
+#include "common/Profiling.h"
 #include "io/index_builder.h"
 
 #include <algorithm>
@@ -111,6 +112,9 @@ const PassResult& PassManager::require(std::string_view pass_name) {
 }
 
 void PassManager::execute_pass(PassEntry* entry) {
+    TENET_ZONE;
+    TENET_ZONE_TEXT("pass: {}", entry->pass->name());
+
     // First, recursively ensure all dependencies are done.
     for (auto dep_name : entry->pass->dependencies()) {
         const auto& dep_result = require(dep_name);
@@ -220,6 +224,7 @@ void PassManager::build_dependency_graph() {
 }
 
 void PassManager::run_all_parallel(size_t num_threads) {
+    TENET_ZONE_NAMED("PassManager::run_all_parallel");
     build_dependency_graph();
 
     // Ready queue: indices of passes whose deps are all satisfied.

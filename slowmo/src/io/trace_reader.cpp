@@ -1,4 +1,5 @@
 #include "io/trace_reader.h"
+#include "common/Profiling.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -221,6 +222,7 @@ TraceReader& TraceReader::operator=(TraceReader&& other) noexcept {
 }
 
 Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
+    TENET_ZONE_NAMED("TraceReader::open");
     TraceReader reader;
     reader.path_ = path;
 

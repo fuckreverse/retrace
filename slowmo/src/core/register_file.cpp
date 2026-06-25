@@ -1,4 +1,5 @@
 #include "core/register_file.h"
+#include "common/Profiling.h"
 #include <algorithm>
 #include <cstring>
 
@@ -8,6 +9,7 @@ RegisterFile::RegisterFile(const TraceReader& reader, const TraceIndex& index)
     : reader_(reader), index_(index) {}
 
 const RegState& RegisterFile::state_before(uint64_t inst_id) {
+    TENET_ZONE;
     // Check LRU cache first
     if (auto cached = cache_.get(inst_id)) {
         cache_stats_.hits++;

@@ -1,4 +1,5 @@
 #include "core/memory_model.h"
+#include "common/Profiling.h"
 
 #include <rocksdb/write_batch.h>
 #include <rocksdb/options.h>
@@ -154,6 +155,7 @@ void MemoryModel::ensure_built() {
 }
 
 void MemoryModel::build() {
+    TENET_ZONE_NAMED("MemoryModel::build");
     if (built_) return;
 
     // ─── Opt #1: Check if already persisted from a previous session ──────
