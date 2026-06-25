@@ -28,6 +28,7 @@
 #import <QuartzCore/QuartzCore.h>
 #endif
 
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -67,7 +68,8 @@ struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
 class GuiApp {
 public:
     GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
-           InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory);
+           InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
+           const std::filesystem::path& trace_path = {});
     ~GuiApp();
 
     /// Run the GUI event loop. Returns 0 on clean exit.
@@ -81,6 +83,9 @@ private:
     InstructionDecoder& decoder_;
     RegisterFile& regfile_;
     MemoryModel& memory_;
+
+    // ─── Trace file path (for window title) ───────────────────────────
+    std::filesystem::path trace_path_;
 
     // ─── SDL / ImGui state ────────────────────────────────────────────
     SDL_Window* window_ = nullptr;
@@ -173,6 +178,7 @@ private:
     bool show_strings_ = true;   // IDA-style: Strings shares the main area with Instructions/CFG
     bool show_demo_window_ = false;
     bool show_settings_ = false;
+    bool show_log_ = true;         // Log panel visible by default (IDA Output style)
 
     // ─── Settings ────────────────────────────────────────────────────
     GuiSettings settings_;
@@ -188,7 +194,7 @@ private:
     // Pending settings (edited in UI, applied on Start/Restart)
     struct McpGuiSettings {
         char host[64]     = "127.0.0.1";
-        int  port         = 7080;
+        int  port         = 10444;
         char username[64] = {};
         char password[64] = {};
     } mcp_gui_;
@@ -681,6 +687,25 @@ private:
     void render_memory_strings_panel();          // Time-aware memory string discovery
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
+    void render_log_panel();                       // Output / Log panel (IDA-style)
+
+    // ─── Log panel state ─────────────────────────────────────────────
+    // GuiLogEntry mirrors tenet::log::LogEntry but avoids including logger.h
+    // in every GUI translation unit.
+    struct GuiLogEntry {
+        int         level;       // cast of tenet::log::Level
+        double      timestamp;
+        double      rss_mb;
+        std::string message;
+    };
+
+    struct LogPanelState {
+        std::vector<GuiLogEntry> entries;       // accumulated log entries
+        bool auto_scroll = true;                // scroll to bottom on new entries
+        int  level_filter = 0;                  // 0=All, 1=Info+, 2=Warn+, 3=Error only
+        char filter_buf[256] = {};              // text filter
+        std::string filter_text;
+    } log_panel_;
 
     // ─── Popups / Windows ───────────────────────────────────────────
     void render_goto_popup();

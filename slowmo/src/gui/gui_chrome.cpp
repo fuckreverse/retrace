@@ -126,6 +126,7 @@ void GuiApp::render_menu_bar() {
             ImGui::MenuItem("Symbol Info (DWARF)",   nullptr, &show_dwarf_panel_);
             ImGui::MenuItem("Trace Diff",            nullptr, &show_trace_diff_);
             ImGui::Separator();
+            ImGui::MenuItem("Output (Log)",          nullptr, &show_log_);
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
             ImGui::EndMenu();
         }

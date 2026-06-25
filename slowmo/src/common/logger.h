@@ -31,8 +31,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #if defined(__APPLE__)
 #  include <mach/mach.h>
@@ -71,6 +75,51 @@ inline bool& initialized() {
     return flag;
 }
 
+// ─── GUI ring-buffer sink ─────────────────────────────────────────────────
+// Collects log entries for the GUI log panel. Thread-safe.
+
+struct LogEntry {
+    Level       level;
+    double      timestamp;   // seconds since first log call
+    double      rss_mb;      // process RSS at log time
+    std::string message;     // formatted message text
+};
+
+/// Access the GUI log buffer (singleton). Protected by gui_log_mutex().
+inline std::deque<LogEntry>& gui_log_buffer() {
+    static std::deque<LogEntry> buf;
+    return buf;
+}
+
+inline std::mutex& gui_log_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/// Maximum entries kept in the GUI log buffer.
+inline constexpr size_t kMaxGuiLogEntries = 4096;
+
+/// Push a log entry into the GUI ring buffer (called from detail::write).
+inline void gui_log_push(Level lv, double ts, double mem, const std::string& msg) {
+    std::lock_guard<std::mutex> lk(gui_log_mutex());
+    auto& buf = gui_log_buffer();
+    buf.push_back({lv, ts, mem, msg});
+    while (buf.size() > kMaxGuiLogEntries) {
+        buf.pop_front();
+    }
+}
+
+/// Drain all current entries from the GUI log buffer into `out`.
+/// This is called on the UI thread each frame.
+inline void gui_log_drain(std::vector<LogEntry>& out) {
+    std::lock_guard<std::mutex> lk(gui_log_mutex());
+    auto& buf = gui_log_buffer();
+    out.insert(out.end(),
+               std::make_move_iterator(buf.begin()),
+               std::make_move_iterator(buf.end()));
+    buf.clear();
+}
+
 // ─── Init from environment ────────────────────────────────────────────────
 
 inline Level level_from_env() {
@@ -102,11 +151,20 @@ inline Level level_from_env() {
 }
 
 /// Call once at startup (main.cpp). Also safe to call repeatedly.
-inline void init() {
+/// \p default_level is used when TENET_LOG is not set (defaults to Info so
+/// that the GUI log panel shows output without requiring an env variable).
+inline void init(Level default_level = Level::Info) {
     if (!initialized()) {
         initialized() = true;
-        global_level().store(level_from_env(), std::memory_order_relaxed);
+        const char* env = std::getenv("TENET_LOG");
+        Level lv = (env && env[0] != '\0') ? level_from_env() : default_level;
+        global_level().store(lv, std::memory_order_relaxed);
     }
+}
+
+/// Set the log level at runtime (e.g. from a GUI dropdown).
+inline void set_level(Level lv) {
+    global_level().store(lv, std::memory_order_relaxed);
 }
 
 inline bool is_enabled(Level lv) {
@@ -175,6 +233,8 @@ inline void write(Level lv, fmt::format_string<Args...> fmt_str, Args&&... args)
     std::string msg = fmt::format(fmt_str, std::forward<Args>(args)...);
     double t = wall_sec();
     double mem = rss_mb();
+    // Always push to GUI ring buffer (regardless of stderr output)
+    gui_log_push(lv, t, mem, msg);
     std::lock_guard<std::mutex> lk(global_mutex());
     // Format: [+  0.123s  42.1MB] INFO  <message>
     fmt::print(stderr, fmt::fg(fmt::color::gray),
@@ -202,6 +262,13 @@ inline void write(Level lv, fmt::format_string<Args...> fmt_str, Args&&... args)
 }
 
 }  // namespace detail
+
+/// Push a log entry from external code (e.g. MCP status, analysis events)
+/// without going through the LOG_* macros. Always captured regardless of
+/// the TENET_LOG environment variable level.
+inline void gui_log_external(Level lv, const std::string& msg) {
+    gui_log_push(lv, detail::wall_sec(), rss_mb(), msg);
+}
 
 template<typename... Args>
 inline void error(fmt::format_string<Args...> fmt_str, Args&&... args) {

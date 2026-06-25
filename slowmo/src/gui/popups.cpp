@@ -673,7 +673,10 @@ void GuiApp::render_settings_window() {
             ImGui::SeparatorText("Configuration");
             ImGui::BeginDisabled(mcp_running);
 
-            ImGui::SetNextItemWidth(160.0f);
+            // Use available width minus label area for comfortable input
+            const float input_w = ImGui::GetContentRegionAvail().x * 0.55f;
+
+            ImGui::SetNextItemWidth(input_w);
             ImGui::InputText("Host / Interface", mcp_gui_.host, sizeof(mcp_gui_.host));
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip(
@@ -682,16 +685,16 @@ void GuiApp::render_settings_window() {
                     "0.0.0.0   = all network interfaces");
             }
 
-            ImGui::SetNextItemWidth(100.0f);
+            ImGui::SetNextItemWidth(input_w);
             ImGui::InputInt("Port", &mcp_gui_.port);
             mcp_gui_.port = std::max(1, std::min(65535, mcp_gui_.port));
 
             ImGui::SeparatorText("Basic Auth (optional)");
 
-            ImGui::SetNextItemWidth(160.0f);
+            ImGui::SetNextItemWidth(input_w);
             ImGui::InputText("Username", mcp_gui_.username, sizeof(mcp_gui_.username));
 
-            ImGui::SetNextItemWidth(160.0f);
+            ImGui::SetNextItemWidth(input_w);
             ImGui::InputText("Password", mcp_gui_.password, sizeof(mcp_gui_.password),
                              ImGuiInputTextFlags_Password);
             if (ImGui::IsItemHovered()) {

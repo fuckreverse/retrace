@@ -9,6 +9,7 @@
 // GuiApp member-function declarations in gui_app.h + the linker.
 
 #include "gui/gui_app.h"
+#include "common/Profiling.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/xref_pass.h"
 
@@ -36,9 +37,11 @@ namespace tenet {
 // ─── Constructor / Destructor ───────────────────────────────────────────────
 
 GuiApp::GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
-               InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory)
+               InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
+               const std::filesystem::path& trace_path)
     : reader_(reader), index_(index), code_table_(code_table),
-      decoder_(decoder), regfile_(regfile), memory_(memory) {
+      decoder_(decoder), regfile_(regfile), memory_(memory),
+      trace_path_(trace_path.empty() ? reader.path() : trace_path) {
     total_inst_ = index.inst_count();
 
     // Restore bookmarks from the index (persisted in RocksDB META CF)
@@ -628,6 +631,7 @@ enum MenuTag : NSInteger {
     kTagViewDwarf             = 331,
     kTagViewTraceDiff         = 332,
     kTagViewTraceFold         = 333,
+    kTagViewLog               = 334,
     kTagNavGoto           = 400,
     kTagNavSearch         = 401,
     kTagNavBack           = 402,
@@ -729,6 +733,7 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
         case kTagViewTraceDiff:     action = [this]{ show_trace_diff_         = !show_trace_diff_;         }; break;
+        case kTagViewLog:           action = [this]{ show_log_                = !show_log_;                }; break;
 
         case kTagNavGoto:           action = [this]{ show_goto_popup_   = true; }; break;
         case kTagNavSearch:         action = [this]{ show_search_popup_ = true; }; break;
@@ -821,6 +826,7 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
             case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewDwarf:         it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceDiff:     it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLog:           it.state = show_log_                ? NSControlStateValueOn : NSControlStateValueOff; break;
             default: break;
         }
     }
@@ -917,6 +923,8 @@ void tenet::GuiApp::setup_native_menu() {
         [viewMenu addItem:mk(@"Register Timeline",    @"",  0,   kTagViewRegTimeline)];
         [viewMenu addItem:mk(@"Symbol Info (DWARF)",  @"",  0,   kTagViewDwarf)];
         [viewMenu addItem:mk(@"Trace Diff",           @"",  0,   kTagViewTraceDiff)];
+        [viewMenu addItem:sep()];
+        [viewMenu addItem:mk(@"Output (Log)",        @"",  0,   kTagViewLog)];
         viewItem.submenu = viewMenu;
         [bar addItem:viewItem];
     }
@@ -974,6 +982,17 @@ namespace tenet {
 int GuiApp::run() {
     if (!init_sdl()) return 1;
     if (!init_imgui()) return 1;
+
+    // Set window title to include trace file info
+    {
+        std::string filename = trace_path_.filename().string();
+        const auto& hdr = reader_.header();
+        std::string title = fmt::format("Tenet - {} [{}  {}  {} instrs]",
+            filename, hdr.module_name,
+            hdr.arch == 1 ? "AArch64" : "x86_64",
+            index_.inst_count());
+        SDL_SetWindowTitle(window_, title.c_str());
+    }
 
     // Build native macOS menu bar and assign to [NSApp mainMenu].
     // Must be called after SDL/ImGui are initialised (NSApp is ready).
@@ -1063,6 +1082,7 @@ int GuiApp::run() {
 
             // ─── 5. Finalize ImGui rendering ─────────────────────────
             ImGui::Render();
+            TENET_FRAME_MARK;
             ImGui_ImplMetal_RenderDrawData(
                 ImGui::GetDrawData(), commandBuffer, renderEncoder);
 
@@ -1100,6 +1120,7 @@ int GuiApp::run() {
 //  and status bar translation units.)
 
 void GuiApp::render_frame() {
+    TENET_ZONE_NAMED("GuiApp::render_frame");
     // During shutdown: skip all panels/popups and just render the overlay.
     // This keeps the window alive and animated while background threads drain.
     if (shutdown_requested_.load(std::memory_order_acquire)) {
@@ -1175,10 +1196,15 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderSplitNode(dock_rest, ImGuiDir_Right, 0.24f,
                                     &dock_right, &dock_center);
 
-        // ── Step 3: split center vertically: main (78%) | bottom output (22%) ──
-        ImGuiID dock_center_main, dock_center_bottom;
-        ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Down, 0.22f,
-                                    &dock_center_bottom, &dock_center_main);
+        // ── Step 3: split center vertically: main (72%) | bottom area (28%) ──
+        ImGuiID dock_center_main, dock_center_bottom_full;
+        ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Down, 0.28f,
+                                    &dock_center_bottom_full, &dock_center_main);
+
+        // ── Step 3b: split bottom area: output panels (60%) | log (40%) ──
+        ImGuiID dock_center_bottom, dock_log;
+        ImGui::DockBuilderSplitNode(dock_center_bottom_full, ImGuiDir_Right, 0.40f,
+                                    &dock_log, &dock_center_bottom);
 
         // ── Step 4: split right vertically: registers (62%) | right-bottom (38%) ──
         ImGuiID dock_right_regs, dock_right_bottom;
@@ -1218,6 +1244,9 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderDockWindow("Hex Dump",    dock_center_bottom);
         ImGui::DockBuilderDockWindow("Minimap",     dock_center_bottom);
         ImGui::DockBuilderDockWindow("Analysis",    dock_center_bottom);  // ← default active
+
+        // Bottom right: Log / Output panel (IDA-style)
+        ImGui::DockBuilderDockWindow("Output",  dock_log);
 
         // Right top: Registers
         ImGui::DockBuilderDockWindow("Registers", dock_right_regs);
@@ -1501,6 +1530,11 @@ void GuiApp::render_frame() {
     }
     if (show_trace_fold_) {
         render_trace_fold_panel();
+    }
+
+    // ─── Log panel (always rendered) ────────────────────────────────
+    if (show_log_) {
+        render_log_panel();
     }
 
     // ─── P2 panels ──────────────────────────────────────────────────

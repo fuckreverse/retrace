@@ -155,11 +155,11 @@ void GuiApp::render_memory_strings_panel() {
             table_size)) {
 
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed,   60.0f);
-        ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch, 0.40f);
-        ImGui::TableSetupColumn("Source",  ImGuiTableColumnFlags_WidthFixed,   80.0f);
-        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,   100.0f);
-        ImGui::TableSetupColumn("PC",      ImGuiTableColumnFlags_WidthFixed,   100.0f);
+        ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed,   55.0f);
+        ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Source",  ImGuiTableColumnFlags_WidthFixed,   60.0f);
+        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,   90.0f);
+        ImGui::TableSetupColumn("PC",      ImGuiTableColumnFlags_WidthFixed,   90.0f);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;

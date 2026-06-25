@@ -6,21 +6,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ─── Default build type: Debug for fast iterative development ───────────────
-# Unless explicitly specified, build in Debug mode which skips heavy
-# optimizations (ThinLTO / -O3 / -mcpu) so incremental builds stay fast —
-# important because the test suite has 37+ executables that all link tenet_lib.
-# Pass -DCMAKE_BUILD_TYPE=Release for a fully-optimized build.
+# Three-tier build strategy:
+#   Debug          — -O0 -g, fastest compile, slowest runtime
+#   RelWithDebInfo — -O2 -g -DNDEBUG, no LTO/PGO/-mcpu; incremental compile
+#                    stays fast (per-TU only), runtime ~2-3× faster than Debug
+#   Release        — -O3 + ThinLTO + -mcpu=apple-m1; slowest compile, fastest
+#                    runtime (use for final profiling / distribution)
+# Pass -DCMAKE_BUILD_TYPE=RelWithDebInfo for optimized dev builds.
+# Pass -DCMAKE_BUILD_TYPE=Release for fully-optimized builds.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
         "Build type (Debug/Release/RelWithDebInfo/MinSizeRel)" FORCE)
 endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 # ─── Performance: LTO, PGO, and architecture-specific tuning ────────────────
-# ThinLTO only applies to non-Debug builds; Debug keeps the compiler/linker
-# fast for tight edit-compile-test loops (a single LTO link costs ~13s, and
-# the default `ninja` target rebuilds 41 executables on any tenet_lib change).
-if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+# ThinLTO only applies to Release builds; Debug and RelWithDebInfo keep the
+# compiler/linker fast for tight edit-compile-test loops (a single LTO link
+# costs ~13s, and the default `ninja` target rebuilds 41 executables on any
+# tenet_lib change).  RelWithDebInfo gives -O2 without LTO — the sweet spot
+# for "fast enough at runtime, fast to recompile" during development.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CheckIPOSupported)
     check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
     if(_ipo_supported)
@@ -59,9 +65,10 @@ elseif(TENET_PGO_MODE STREQUAL "use")
 endif()
 
 # Target Apple Silicon (M1+) for NEON auto-vectorization and LSE atomics.
-# Only set for native, non-Debug builds; cross-compilation should specify its
-# own -mcpu.
-if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+# Only set for Release builds; RelWithDebInfo keeps generic codegen to avoid
+# recompiling everything when switching between machines, and to stay
+# consistent with "no global optimizations" philosophy.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND NOT CMAKE_CROSSCOMPILING)
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-m1")
@@ -78,6 +85,7 @@ option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" 
 option(TENET_BUILD_TESTS "Build unit tests" ON)
 option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
 option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
+option(TENET_ENABLE_TRACY "Enable Tracy profiler instrumentation (works in all build types)" ON)
 
 # ─── FetchContent global shared cache ──────────────────────────────────────
 # All build trees (build/, build-triton/, build-no-triton/, …) share a single
@@ -266,6 +274,28 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
+# Tracy - lightweight profiler (optional, ~2ns per zone overhead)
+if(TENET_ENABLE_TRACY)
+    FetchContent_Declare(
+        tracy
+        GIT_REPOSITORY https://github.com/wolfpld/tracy.git
+        GIT_TAG        v0.11.1
+        GIT_SHALLOW    TRUE
+    )
+    # Tracy build options:
+    #   TRACY_ENABLE        = compile in instrumentation
+    #   TRACY_ON_DEMAND=OFF = always capture (no need for Tracy GUI to connect)
+    #   TRACY_NO_EXIT=ON    = on process exit, wait for profiler to connect & download
+    #                         data before actually exiting.  This ensures short-lived
+    #                         batch runs can still be profiled: run tenet, it finishes,
+    #                         then connect tracy-capture within ~few seconds.
+    set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+    set(TRACY_ON_DEMAND OFF CACHE BOOL "Always capture, no GUI required" FORCE)
+    set(TRACY_NO_EXIT ON CACHE BOOL "Wait for profiler on exit (short-lived processes)" FORCE)
+    FetchContent_MakeAvailable(tracy)
+    message(STATUS "Tracy profiler enabled (always-capture + no-exit mode)")
+endif()
+
 # Zstd - decompression for compressed traces
 # Reuses the same FetchContent source cache as qbditrace, so zstd source
 # is already available in _deps/ and won't be re-downloaded.
@@ -438,6 +468,14 @@ else()
     message(STATUS "Zstd NOT available — compressed traces will be rejected")
 endif()
 
+# Tracy linkage (optional runtime profiler)
+if(TENET_ENABLE_TRACY)
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TRACY=1 TRACY_ENABLE)
+    target_link_libraries(tenet_lib PUBLIC TracyClient)
+else()
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TRACY=0)
+endif()
+
 # Platform libraries
 if(APPLE)
     target_link_libraries(tenet_lib PUBLIC "-framework CoreFoundation" "-framework IOKit")
@@ -473,6 +511,7 @@ src/gui/panels_trace_fold.cpp
 src/gui/panels_memory_strings.cpp
 src/gui/panels_syscall_intercept.cpp
 src/gui/panels_objc_crypto.cpp
+src/gui/panels_log.cpp
 src/gui/popups.cpp
 )
 
