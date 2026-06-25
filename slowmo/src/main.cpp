@@ -13,10 +13,12 @@
 #include "batch_analysis.h"
 
 #include "common/logger.h"
+#include "common/Profiling.h"
 
 #include <fmt/core.h>
 #include <fmt/color.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +36,9 @@ using namespace tenet;
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
+    // ─── Initialize logging ─────────────────────────────────────────────
+    tenet::log::init();
+
     // ─── Parse CLI arguments ────────────────────────────────────────────
     auto opts = tenet::parse_args(argc, argv);
     if (opts.parse_status != 0)
@@ -84,12 +89,35 @@ int main(int argc, char** argv) {
     auto t_index = TENET_TIMER_START();
 
     auto index_result = TraceIndex::open_or_build(reader,
-        [info_out](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                double pct = 100.0 * processed / total;
-                fmt::print(info_out, "\r  Progress: {:.1f}%", pct);
-                fflush(info_out);
+        [info_out, t_start = std::chrono::steady_clock::now(),
+         last_bytes = uint64_t(0), last_time = std::chrono::steady_clock::now(),
+         cur_speed = 0.0]
+        (uint64_t processed, uint64_t total) mutable {
+            if (total == 0) return;
+            auto now = std::chrono::steady_clock::now();
+            double elapsed_total = std::chrono::duration<double>(now - t_start).count();
+            // Update speed every 200ms to avoid flicker
+            double dt = std::chrono::duration<double>(now - last_time).count();
+            if (dt >= 0.2 || processed == total) {
+                uint64_t delta = processed - last_bytes;
+                cur_speed = static_cast<double>(delta) / dt;
+                last_bytes = processed;
+                last_time = now;
             }
+            double pct = 100.0 * processed / total;
+            // Format speed with appropriate unit
+            const char* unit = "B/s";
+            double display_speed = cur_speed;
+            if (display_speed >= 1e9) { display_speed /= 1e9; unit = "GB/s"; }
+            else if (display_speed >= 1e6) { display_speed /= 1e6; unit = "MB/s"; }
+            else if (display_speed >= 1e3) { display_speed /= 1e3; unit = "KB/s"; }
+            if (elapsed_total > 0.1 && cur_speed > 0) {
+                fmt::print(info_out, "\r  Progress: {:5.1f}%  [{:.1f} {}]   ",
+                           pct, display_speed, unit);
+            } else {
+                fmt::print(info_out, "\r  Progress: {:5.1f}%", pct);
+            }
+            fflush(info_out);
         });
 
     if (!index_result) {
@@ -231,7 +259,7 @@ int main(int argc, char** argv) {
 
 #if TENET_HAS_GUI
     if (!opts.force_tui) {
-        GuiApp gui(reader, index, code_table, decoder, regfile, memory);
+        GuiApp gui(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
         return gui.run();
     }
 #else
