@@ -49,6 +49,7 @@ tenet_add_test(test_io_trace_reader        unit/test_io_trace_reader.cpp)
 tenet_add_test(test_io_trace_reader_v5     unit/test_io_trace_reader_v5.cpp)
 tenet_add_test(test_io_trace_reader_v6     unit/test_io_trace_reader_v6.cpp)
 tenet_add_test(test_io_trace_reader_special unit/test_io_trace_reader_special.cpp)
+tenet_add_test(test_io_trace_reader_compressed unit/test_io_trace_reader_compressed.cpp)
 tenet_add_test(test_core_register_file     unit/test_core_register_file.cpp)
 tenet_add_test(test_core_instruction_decoder unit/test_core_instruction_decoder.cpp)
 tenet_add_test(test_core_memory_model      unit/test_core_memory_model.cpp)
@@ -82,6 +83,10 @@ tenet_add_test(test_dbg_loop               unit/test_dbg_loop.cpp)
 tenet_add_test(test_pass_objc_crypto           unit/test_pass_objc_crypto.cpp)
 tenet_add_test(test_pass_syscall_intercept     unit/test_pass_syscall_intercept.cpp)
 tenet_add_test(test_pass_taint_source_annotation unit/test_pass_taint_source_annotation.cpp)
+
+# ─── Unit tests: MCP layer (hypothesis ledger, evidence verification, batch query)
+tenet_add_test(test_mcp_hypothesis_ledger      unit/test_mcp_hypothesis_ledger.cpp)
+tenet_add_test(test_mcp_tools_ai               unit/test_mcp_tools_ai.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
