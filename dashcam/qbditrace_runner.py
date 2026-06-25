@@ -128,6 +128,17 @@ def parse_args():
                           '(0 = default 64 MiB)')
     rec.add_argument('--no-embed-code', action='store_true',
                      help='Disable embedding deduplicated code table in trace')
+    rec.add_argument('--pc-delta', action='store_true',
+                     help='Enable v5 PC-delta encoding (2-byte delta instead of '
+                          '8-byte absolute PC, ~40-60%% smaller for straight-line code)')
+    rec.add_argument('--old-value', action='store_true',
+                     help='Enable v6 old-value capture for true time-travel '
+                          '(records memory content before each write)')
+    rec.add_argument('--fpr', action='store_true',
+                     help='Enable v7 FPR/NEON register recording '
+                          '(128-bit vector regs, essential for AES/SHA analysis)')
+    rec.add_argument('--no-compress', action='store_true',
+                     help='Disable zstd stream compression (compression is ON by default)')
 
     # --- Trace mode ---
     mode = p.add_argument_group('Trace mode')
@@ -172,7 +183,9 @@ def parse_args():
     if args.trace_mode == 'once':
         pass
     elif args.trace_mode == 'multi':
-        pass
+        print('[!] WARNING: --trace-mode multi will trace every call with no '
+              'upper limit. Consider using a number (e.g. --trace-mode 5) '
+              'to set a safe limit.', file=sys.stderr)
     else:
         try:
             args.trace_mode = int(args.trace_mode)
@@ -211,6 +224,10 @@ def build_config(args):
         'anchorInterval': args.anchor_interval,
         'ringBytes': args.ring_bytes,
         'embedCode': not args.no_embed_code,
+        'pcDelta': args.pc_delta,
+        'oldValue': args.old_value,
+        'fpr': args.fpr,
+        'noCompress': args.no_compress,
         'argCount': args.arg_count,
         'traceMode': args.trace_mode,
         'rehook': not args.no_rehook,
@@ -417,6 +434,13 @@ def main():
           f'(NZCV={bool(args.record & 1)}, REGDIFF={bool(args.record & 2)}, '
           f'MEM={bool(args.record & 4)}, SVC={bool(args.record & 8)}, '
           f'OBJC={bool(args.record & 16)})')
+    extras = []
+    if args.pc_delta:    extras.append('pc-delta(v5)')
+    if args.old_value:   extras.append('old-value(v6)')
+    if args.fpr:         extras.append('fpr(v7)')
+    if args.no_compress: extras.append('no-compress')
+    else:                extras.append('zstd-compress')
+    print(f'  Features:    {" | ".join(extras)}')
     print(f'  Trace mode:  {args.trace_mode}')
     if args.trace_gcd:
         print(f'  GCD trace:   ON (filter={not args.gcd_no_filter}, max={args.gcd_max})')

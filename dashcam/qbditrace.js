@@ -119,7 +119,33 @@ function buildNativeFunctions(ex) {
 }
 
 function buildConfigStruct(opts) {
-  const SIZE = 128;
+  /* Must match sizeof(qbditrace_config_t) — 140 bytes, rounded up to 144
+   * for 8-byte alignment.  See QBDITrace.h for the canonical layout.
+   *
+   * offset   0  struct_size         u32
+   * offset   4  _reserved0          u32
+   * offset   8  trace_start         u64
+   * offset  16  trace_end           u64
+   * offset  24  module_base         u64
+   * offset  32  module_slide        u64
+   * offset  40  module_name         ptr
+   * offset  48  output_path         ptr
+   * offset  56  record              u32
+   * offset  60  anchor_interval     u32
+   * offset  64  ring_bytes          u64
+   * offset  72  objc_msgSend        u64
+   * offset  80  objc_msgSendSuper   u64
+   * offset  88  objc_msgSendSuper2  u64
+   * offset  96  objc_msgSend_stret  u64
+   * offset 104  extra_range_start   u64
+   * offset 112  extra_range_end     u64
+   * offset 120  disable_embed_code  u32
+   * offset 124  enable_pc_delta     u32
+   * offset 128  enable_old_value    u32
+   * offset 132  enable_fpr          u32
+   * offset 136  disable_compress    u32
+   */
+  const SIZE = 144;
   const cfg = Memory.alloc(SIZE);
   for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
@@ -146,6 +172,10 @@ function buildConfigStruct(opts) {
   cfg.add(104).writePointer(opts.extraRangeStart || NULL);
   cfg.add(112).writePointer(opts.extraRangeEnd || NULL);
   cfg.add(120).writeU32(opts.embedCode === false ? 1 : 0);
+  cfg.add(124).writeU32(opts.pcDelta    ? 1 : 0);
+  cfg.add(128).writeU32(opts.oldValue   ? 1 : 0);
+  cfg.add(132).writeU32(opts.fpr        ? 1 : 0);
+  cfg.add(136).writeU32(opts.noCompress ? 1 : 0);
   return cfg;
 }
 
@@ -386,6 +416,7 @@ function main() {
     maxTraces = 1;
   } else if (mode === 'multi') {
     maxTraces = Infinity;
+    log('WARNING: trace-mode "multi" has no upper limit. Use Ctrl+C or a numeric limit to stop.');
   } else if (typeof mode === 'number' && mode > 0) {
     maxTraces = Math.floor(mode);
   } else {
@@ -432,10 +463,16 @@ function main() {
   let currentCfg = configureForTrace(1);
   let traceCount = 0;
   let inTrace = false;
+  let hookActive = false;
 
   const retOut = Memory.alloc(8);
   const argc = CONFIG.argCount >>> 0;
   const argv = argc > 0 ? Memory.alloc(8 * argc) : NULL;
+
+  // We need to keep a reference to the original function so we can call it
+  // natively during re-entrant calls (when the entry function calls itself).
+  const origFunc = new NativeFunction(funcStart, 'pointer',
+      (function () { var t = []; for (var i = 0; i < argc; i++) t.push('pointer'); return t; })());
 
   function buildArgTypes(n) {
     const t = [];
@@ -443,18 +480,31 @@ function main() {
     return t;
   }
 
+  function removeHook() {
+    if (hookActive) {
+      Interceptor.revert(funcStart);
+      Interceptor.flush();
+      hookActive = false;
+    }
+  }
+
   function installHook() {
+    removeHook();  // safety: ensure no stale hook
+    hookActive = true;
+
     Interceptor.replace(funcStart, new NativeCallback(function () {
+      // --- Re-entrant guard ---
+      // If we are already inside a trace (QBDI VM is running and the traced
+      // code calls the entry function again, e.g. recursion), we MUST NOT
+      // start another trace. Just call the original function natively.
       if (inTrace) {
-        log('WARNING: re-entrant call during trace, running natively');
-        Interceptor.revert(funcStart);
-        Interceptor.flush();
-        for (let i = 0; i < argc; i++) {
-          argv.add(i * 8).writePointer(this.context['x' + i]);
+        log('WARNING: re-entrant call to entry during trace — calling original natively');
+        // Collect args from registers and forward to the original function
+        var nativeArgs = [];
+        for (var i = 0; i < argc; i++) {
+          nativeArgs.push(this.context['x' + i]);
         }
-        const r = fn.runCall(retOut, funcStart, argc, argv);
-        installHook();
-        return retOut.readPointer();
+        return origFunc.apply(null, nativeArgs);
       }
 
       inTrace = true;
@@ -468,8 +518,9 @@ function main() {
         argv.add(i * 8).writePointer(this.context['x' + i]);
       }
 
-      Interceptor.revert(funcStart);
-      Interceptor.flush();
+      // Revert the hook so QBDI can execute the original code.
+      // After runCall returns we decide whether to re-install.
+      removeHook();
 
       const r = fn.runCall(retOut, funcStart, argc, argv);
       if (r !== 0) {
@@ -484,13 +535,16 @@ function main() {
 
       inTrace = false;
 
+      // --- Decide whether to hook again ---
       const wantMore = (traceCount < maxTraces);
       if (wantMore && CONFIG.rehook !== false) {
         currentCfg = configureForTrace(traceCount + 1);
         installHook();
         log('hook re-installed for trace #' + (traceCount + 1));
-      } else if (!wantMore) {
-        log('all ' + traceCount + ' trace(s) captured. Hook removed.');
+      } else {
+        // Ensure the hook is definitively removed.
+        removeHook();
+        log('all ' + traceCount + ' trace(s) captured. Hook permanently removed.');
         status('all_done', { total: traceCount });
       }
 

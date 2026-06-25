@@ -35,6 +35,15 @@
 
 #include "QBDI.h"
 
+/* QBDI provides QBDI_GPR_GET for GPRState (rword[] reinterpret), but has no
+ * equivalent for FPRState.  FPRState contains 32 × __uint128_t (v0-v31) laid
+ * out contiguously, so reinterpreting it as a uint64_t array gives:
+ *   slot 2*i   → v[i] low  64 bits
+ *   slot 2*i+1 → v[i] high 64 bits
+ * This matches the trace format's per-half storage convention. */
+#define QBDI_FPR_GET(state, i) \
+  (reinterpret_cast<const uint64_t *>(state)[i])
+
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -184,6 +193,11 @@ struct Config {
    * QBDITRACE_HF_HAS_FPR and bumps version to QBDITRACE_VERSION_V7_HAS_FPR.
    * Off by default. */
   bool fpr_mode = false;
+
+  /* When set, compress all data after the file header using zstd streaming
+   * compression.  Activates QBDITRACE_HF_COMPRESSED.  On by default (inverted
+   * ABI: disable_compress == 0 ⇒ compressed). */
+  bool compress = true;
 };
 
 /* Classify a transfer target against the configured objc_msgSend family.
@@ -236,7 +250,8 @@ public:
     }
 
     if (!writer_started_) {
-      if (!writer_.start(cfg_.output_path.c_str(), cfg_.ring_bytes)) {
+      if (!writer_.start(cfg_.output_path.c_str(), cfg_.ring_bytes,
+                         cfg_.compress)) {
         return false;
       }
       writeFileHeader();
@@ -374,6 +389,8 @@ private:
       h.flags |= QBDITRACE_HF_OLD_VALUE;
     if (cfg_.fpr_mode)
       h.flags |= QBDITRACE_HF_HAS_FPR;
+    if (cfg_.compress && writer_.compressed())
+      h.flags |= QBDITRACE_HF_COMPRESSED;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
     writer_.writeHeaderRaw(&h, sizeof(h));
@@ -459,6 +476,20 @@ struct ThreadCtx {
   QBDI::FPRState *cur_fpr = nullptr; /* FPR pointer carried PREINST -> POSTINST */
   uint64_t prev_reg[31] = {0}; /* x0..lr snapshot for diffing */
   bool prev_valid = false;
+
+  /* Stack-depth sentinel for run_call / run_at termination.
+   *
+   * Set to the SP value just before vm.run() begins.  When preInstCB detects
+   * that the current SP has risen back to or above this value, the traced
+   * function's stack frame has been fully unwound — i.e. the call has returned
+   * (or escaped via tail-call / longjmp).  Returning VMAction::STOP at that
+   * point cleanly terminates the VM, even if the normal stop-address mechanism
+   * (PC == safeRet) failed to trigger (e.g. because of a tail-call chain that
+   * never executes `ret` to the sentinel address).
+   *
+   * A value of 0 disables the check (e.g. if ensureThreadCtx created the
+   * context but no run entry point has set the sentinel yet). */
+  uint64_t initial_sp = 0;
   /* Instructions executed since the last full-register ANCHOR was written. Used
    * to emit periodic resync checkpoints instead of one anchor per sequence. */
   uint64_t since_anchor = 0;
@@ -894,6 +925,36 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   (void)vm;
   ThreadCtx *c = ensureThreadCtx();
   const Config &cfg = Tracer::get().cfg();
+
+  /* ── Stack-depth sentinel ─────────────────────────────────────────────────
+   * When initial_sp is armed, check whether the current SP has risen
+   * **strictly above** the entry-frame value.  This means the traced
+   * function's stack frame (and the simulateCallA shim frame beneath it)
+   * has been fully unwound — the call is semantically finished.
+   *
+   * Why strictly-greater-than (>) instead of >=?
+   *   At function entry the first instruction sees cur_sp == initial_sp
+   *   (the prologue hasn't pushed anything yet).  Using >= would
+   *   immediately STOP before a single instruction executes.  The normal
+   *   return path (epilogue restores SP then executes `ret`) is already
+   *   handled by QBDI's stop-address mechanism (PC == safeRet).  The
+   *   sentinel only needs to catch abnormal exits:
+   *
+   *   • tail-call chains that jump to un-instrumented code without
+   *     returning to the safeRet sentinel
+   *   • longjmp / exception unwind past the traced frame
+   *
+   * In those cases SP rises *above* initial_sp (the shim frame is
+   * popped), so `>` is the correct predicate.
+   *
+   * The check is essentially free: one register read + one comparison. */
+  if (c->initial_sp != 0) {
+    uint64_t cur_sp = QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_SP);
+    if (cur_sp > c->initial_sp) {
+      return QBDI::STOP;
+    }
+  }
+
   /* Store fpr pointer so postInstCB can use it without re-fetching. QBDI
    * guarantees the same FPRState pointer is valid through the POSTINST
    * callback for the same instruction. */
@@ -1674,7 +1735,19 @@ bool runWithVM(uint64_t *ret_out, uint64_t function, uint32_t argc,
    * target until control returns to safeRet (the VM-exit sentinel). */
   QBDI::simulateCallA(state, safeRet, argc,
                       reinterpret_cast<const QBDI::rword *>(args.data()));
+
+  /* Arm the stack-depth sentinel so preInstCB can detect when the traced call
+   * has returned (SP restored to or above entry-frame value).  The SP after
+   * simulateCallA is the callee's entry SP — the function's prologue will push
+   * SP lower, and its epilogue will restore it.  When SP >= this value again
+   * the call is semantically over. */
+  ThreadCtx *tc = ensureThreadCtx();
+  tc->initial_sp = QBDI_GPR_GET(state, QBDITRACE_AARCH64_IDX_SP);
+
   bool ok = vm.run((QBDI::rword)function, safeRet);
+
+  /* Disarm the sentinel so it does not interfere with a subsequent run. */
+  tc->initial_sp = 0;
 
   QBDI::rword ret = QBDI_GPR_GET(vm.getGPRState(), QBDI::REG_RETURN);
   if (ret_out) {
@@ -1730,8 +1803,16 @@ bool runWithVMState(uint64_t *ret_out, uint64_t start_pc,
   state->sp = (QBDI::rword)sp;       // live caller stack
   state->pc = (QBDI::rword)start_pc;
 
+  /* Arm the stack-depth sentinel: the captured SP is the callee's entry SP.
+   * Same logic as runWithVM — see the comment there. */
+  ThreadCtx *tc = ensureThreadCtx();
+  tc->initial_sp = sp;
+
   /* Run from the function entry until it returns to the real caller (lr). */
   bool ok = vm.run((QBDI::rword)start_pc, (QBDI::rword)lr);
+
+  /* Disarm the sentinel. */
+  tc->initial_sp = 0;
 
   if (ret_out) {
     QBDI::GPRState *after = vm.getGPRState();
@@ -1788,6 +1869,8 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   cfg.old_value_mode = (in->enable_old_value != 0);
   /* v7 FPR mode: non-zero enables NEON/vector register diff recording. */
   cfg.fpr_mode = (in->enable_fpr != 0);
+  /* Compression: inverted ABI sense (0 = compressed, the default). */
+  cfg.compress = (in->disable_compress == 0);
   return Tracer::get().configure(cfg) ? 0 : -2;
 }
 

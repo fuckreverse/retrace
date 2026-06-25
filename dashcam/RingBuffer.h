@@ -33,6 +33,10 @@
 #include <unistd.h>
 #include <vector>
 
+#if QBDITRACE_HAVE_ZSTD
+#include <zstd.h>
+#endif
+
 /* Minimal async-signal-safe stderr logger for IO errors. We avoid fprintf
  * because the writer thread may encounter errors while the process is in an
  * arbitrary state. write(2) to fd 2 is safe from any context. */
@@ -72,8 +76,9 @@ public:
   BackgroundWriter() = default;
   ~BackgroundWriter() { stop(); }
 
-  /* Open output file and start the writer thread. Returns false on error. */
-  bool start(const char *path, size_t chunk_bytes);
+  /* Open output file and start the writer thread. Returns false on error.
+   * When `compress` is true, all data after the header is zstd-compressed. */
+  bool start(const char *path, size_t chunk_bytes, bool compress = false);
 
   /* Hand a filled chunk to the writer (takes ownership of chunk.data). */
   void submit(Chunk &&c);
@@ -89,13 +94,26 @@ public:
   void stop();
 
   bool ok() const { return file_ != nullptr; }
+  bool compressed() const { return compress_; }
 
 private:
   void loop();
   void recycle(uint8_t *mem);
+  /* Write raw bytes to the output file, applying zstd compression if enabled.
+   * `flush_mode` controls the zstd flush: ZSTD_e_continue (default buffering),
+   * ZSTD_e_flush (emit a complete block), or ZSTD_e_end (finalize the frame). */
+  void writeBytes(const void *data, size_t len, bool &io_error_reported,
+                  int flush_mode = 0 /* ZSTD_e_continue */);
 
   FILE *file_ = nullptr;
   size_t chunk_bytes_ = 0;
+  bool compress_ = false;
+
+#if QBDITRACE_HAVE_ZSTD
+  ZSTD_CCtx *zctx_ = nullptr;
+  uint8_t *zbuf_ = nullptr;   /* output buffer for compressed data */
+  size_t zbuf_size_ = 0;
+#endif
 
   std::mutex mtx_;
   std::condition_variable cv_;
@@ -106,12 +124,47 @@ private:
   bool header_written_ = false;
 };
 
-inline bool BackgroundWriter::start(const char *path, size_t chunk_bytes) {
+inline bool BackgroundWriter::start(const char *path, size_t chunk_bytes,
+                                    bool compress) {
   file_ = std::fopen(path, "wb");
   if (!file_) {
     return false;
   }
   chunk_bytes_ = chunk_bytes;
+  compress_ = compress;
+
+#if QBDITRACE_HAVE_ZSTD
+  if (compress_) {
+    zctx_ = ZSTD_createCCtx();
+    if (!zctx_) {
+      detail::logIOError("failed to create ZSTD_CCtx");
+      std::fclose(file_);
+      file_ = nullptr;
+      return false;
+    }
+    /* Level 1: fastest compression; still gets ~3x on trace data.
+     * The background thread has plenty of CPU time (it's I/O-bound). */
+    ZSTD_CCtx_setParameter(zctx_, ZSTD_c_compressionLevel, 1);
+    /* Checksum for integrity verification on decompression. */
+    ZSTD_CCtx_setParameter(zctx_, ZSTD_c_checksumFlag, 1);
+    zbuf_size_ = ZSTD_CStreamOutSize();
+    zbuf_ = static_cast<uint8_t *>(std::malloc(zbuf_size_));
+    if (!zbuf_) {
+      detail::logIOError("failed to allocate zstd output buffer");
+      ZSTD_freeCCtx(zctx_);
+      zctx_ = nullptr;
+      std::fclose(file_);
+      file_ = nullptr;
+      return false;
+    }
+  }
+#else
+  if (compress_) {
+    detail::logIOError("zstd compression requested but not compiled in");
+    compress_ = false;
+  }
+#endif
+
   running_.store(true);
   worker_ = std::thread([this] { loop(); });
   return true;
@@ -182,6 +235,51 @@ inline void BackgroundWriter::recycle(uint8_t *mem) {
   }
 }
 
+inline void BackgroundWriter::writeBytes(const void *data, size_t len,
+                                          bool &io_error_reported,
+                                          int flush_mode) {
+  if (!file_ || !data || len == 0) {
+    /* For flush_mode == ZSTD_e_end we still need to finalize even with no
+     * new data, but only when compressing. Handle that below. */
+    if (flush_mode == 0 || !compress_) return;
+  }
+
+#if QBDITRACE_HAVE_ZSTD
+  if (compress_ && zctx_) {
+    ZSTD_inBuffer in = {data, len, 0};
+    ZSTD_EndDirective directive = static_cast<ZSTD_EndDirective>(flush_mode);
+    size_t ret;
+    do {
+      ZSTD_outBuffer out = {zbuf_, zbuf_size_, 0};
+      ret = ZSTD_compressStream2(zctx_, &out, &in, directive);
+      if (ZSTD_isError(ret)) {
+        if (!io_error_reported) {
+          detail::logIOError("ZSTD_compressStream2 failed");
+          io_error_reported = true;
+        }
+        return;
+      }
+      if (out.pos > 0) {
+        size_t written = std::fwrite(zbuf_, 1, out.pos, file_);
+        if ((written != out.pos || std::ferror(file_)) && !io_error_reported) {
+          detail::logIOError("fwrite failed in writer thread (disk full?)");
+          io_error_reported = true;
+        }
+      }
+    } while ((flush_mode == (int)ZSTD_e_end && ret != 0) ||
+             (flush_mode == (int)ZSTD_e_flush && ret != 0) ||
+             in.pos < in.size);
+    return;
+  }
+#endif
+  /* Uncompressed path. */
+  size_t written = std::fwrite(data, 1, len, file_);
+  if ((written != len || std::ferror(file_)) && !io_error_reported) {
+    detail::logIOError("fwrite failed in writer thread (disk full?)");
+    io_error_reported = true;
+  }
+}
+
 inline void BackgroundWriter::loop() {
   /* Track whether we have already reported an IO error to avoid flooding
    * stderr with repeated messages for the same disk-full condition. */
@@ -201,11 +299,7 @@ inline void BackgroundWriter::loop() {
       queue_.pop_front();
     }
     if (file_ && c.data && c.used) {
-      size_t written = std::fwrite(c.data, 1, c.used, file_);
-      if ((written != c.used || std::ferror(file_)) && !io_error_reported) {
-        detail::logIOError("fwrite failed in writer thread (disk full?)");
-        io_error_reported = true;
-      }
+      writeBytes(c.data, c.used, io_error_reported);
     }
     recycle(c.data);
   }
@@ -225,15 +319,13 @@ inline void BackgroundWriter::stop() {
     worker_.join();
   }
   /* Drain anything still queued (defensive; loop should have emptied it). */
+  bool io_error_reported = false;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     while (!queue_.empty()) {
       Chunk &c = queue_.front();
       if (file_ && c.data && c.used) {
-        size_t written = std::fwrite(c.data, 1, c.used, file_);
-        if (written != c.used || std::ferror(file_)) {
-          detail::logIOError("fwrite failed during drain (disk full?)");
-        }
+        writeBytes(c.data, c.used, io_error_reported);
       }
       if (c.data) {
         std::free(c.data);
@@ -245,11 +337,29 @@ inline void BackgroundWriter::stop() {
     }
     free_list_.clear();
   }
+
+#if QBDITRACE_HAVE_ZSTD
+  /* Finalize the zstd frame: emit ZSTD_e_end so the decompressor sees a
+   * complete frame and can verify the content checksum. */
+  if (compress_ && zctx_ && file_) {
+    writeBytes(nullptr, 0, io_error_reported, (int)ZSTD_e_end);
+  }
+  if (zctx_) {
+    ZSTD_freeCCtx(zctx_);
+    zctx_ = nullptr;
+  }
+  if (zbuf_) {
+    std::free(zbuf_);
+    zbuf_ = nullptr;
+  }
+#endif
+
   if (file_) {
     std::fflush(file_);
     std::fclose(file_);
     file_ = nullptr;
   }
+  compress_ = false;
   header_written_ = false;
 }
 

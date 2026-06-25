@@ -125,6 +125,16 @@ typedef struct {
    * Execution overhead: ~1-2 ns per FPR-writing instruction (QBDI FPR read).
    * Zero (the default) keeps the v4/v5/v6 layout unchanged. */
   uint32_t enable_fpr;
+
+  /* Zstd stream compression (requires library compiled with QBDITRACE_HAVE_ZSTD).
+   * The sense is inverted (0 = compressed, the default): a zero-initialized
+   * config produces compressed output, matching the most common use case (mobile
+   * devices with limited storage).  Set to non-zero to disable compression and
+   * write raw, uncompressed trace data.
+   * When compressed, the 536-byte file header is written uncompressed (so the
+   * reader can always identify the file), followed by a single zstd frame
+   * containing the record stream.  HF_COMPRESSED is set in the header flags. */
+  uint32_t disable_compress;
 } qbditrace_config_t;
 
 /*

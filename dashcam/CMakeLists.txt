@@ -49,6 +49,35 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(QBDITRACE_BUILD_DYLIB "Build the tracer dylib" ON)
 option(QBDITRACE_BUILD_DECODER "Build the offline decoder (host tool)" ON)
 option(QBDITRACE_BUILD_TESTS "Build unit tests (host)" ON)
+option(QBDITRACE_ENABLE_ZSTD "Enable zstd compression for trace output" ON)
+
+# ---------------------------------------------------------------------------
+# Zstd (static, source build via FetchContent)
+# ---------------------------------------------------------------------------
+if(QBDITRACE_ENABLE_ZSTD)
+  include(FetchContent)
+
+  # Use the shared _deps cache from tenet if available, otherwise local.
+  if(NOT FETCHCONTENT_BASE_DIR)
+    set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tenet/_deps"
+        CACHE PATH "Shared FetchContent cache (reuse tenet's)")
+  endif()
+
+  # Disable everything except the static library.
+  set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+  set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    SOURCE_SUBDIR  build/cmake   # the CMakeLists.txt lives here
+  )
+  FetchContent_MakeAvailable(zstd)
+endif()
 
 # ---------------------------------------------------------------------------
 # Tracer dylib (target build)
@@ -85,6 +114,11 @@ if(QBDITRACE_BUILD_DYLIB)
   if(APPLE)
     target_link_libraries(qbditrace PRIVATE
       "-framework Foundation" "-framework CoreFoundation")
+  endif()
+
+  if(QBDITRACE_ENABLE_ZSTD AND TARGET libzstd_static)
+    target_link_libraries(qbditrace PRIVATE libzstd_static)
+    target_compile_definitions(qbditrace PRIVATE QBDITRACE_HAVE_ZSTD=1)
   endif()
 
   set_target_properties(qbditrace PROPERTIES
