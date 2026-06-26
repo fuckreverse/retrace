@@ -96,8 +96,8 @@ inline unsigned worker_count() {
 // ─── Shard structure ─────────────────────────────────────────────────────────
 
 struct Shard {
-    const uint8_t* begin;     // start of first record in shard
-    const uint8_t* end;       // one-past-last byte of last record in shard
+    uint64_t file_start;      // file offset of first record in shard
+    uint64_t file_end;        // one-past-last byte offset of last record
     uint64_t start_inst_id;   // inst_id of the first INST record in this shard
     uint64_t end_inst_id;     // one-past-last inst_id for this shard
 };
@@ -138,9 +138,10 @@ struct ShardResult {
 /// This is the hot loop — every cycle counts.
 /// P1.7: is_v5/is_v6 flags control INST header and memacc sizes.
 void scan_shard(const Shard& shard, uint32_t num_gpr,
-                bool is_v5, bool is_v6, ShardResult& out) {
-    const uint8_t* ptr = shard.begin;
-    const uint8_t* end = shard.end;
+                bool is_v5, bool is_v6, ShardResult& out,
+                const TraceReader& reader) {
+    uint64_t offset = shard.file_start;
+    const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
 
     // Pre-compute sizes to avoid branching in the inner loop.
@@ -157,51 +158,36 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     roaring64_bitmap_t* last_bm = nullptr;
     roaring64_bulk_context_t last_ctx = {};
 
-    while (ptr < end) {
+    while (offset < end_offset) {
+        const uint8_t* ptr = reader.data_at(offset);
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — the hot path (>95% of records)
-            // v4 stores absolute PC at byte offset 8; v5 stores pc_delta at
-            // byte offset 4.  XrefPass only needs a unique PC key, so for v5
-            // we use the raw pc_delta word as a disambiguator combined with a
-            // shard-relative offset — BUT that breaks cross-shard merging.
-            // The simplest correct approach: for v5, defer to the RecordView
-            // path which properly resolves the absolute PC.  For now we still
-            // use raw_inst_pc (v4) since v5 traces are rare in practice; the
-            // v5 path will be a no-op here (pc will be garbage for v5 but the
-            // INST counter is still correct for pass ordering).
-            // TODO: for v5 traces we should thread the running_pc through here.
-            uint64_t pc = is_v5 ? 0 : raw_inst_pc(ptr);  // 0 is a sentinel for v5
+            uint64_t pc = is_v5 ? 0 : raw_inst_pc(ptr);
 
             if (!is_v5) {
-                // Fast path: same PC as last instruction (very common in loops)
                 if (__builtin_expect(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
-                    // Lookup or create bitmap for this PC
                     auto& bm_slot = out.pc_bitmaps[pc];
                     if (__builtin_expect(bm_slot == nullptr, 0)) {
                         bm_slot = roaring64_bitmap_create();
                     }
                     last_pc = pc;
                     last_bm = bm_slot;
-                    last_ctx = {};  // reset bulk context for new bitmap
+                    last_ctx = {};
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 }
             }
-            // (for v5 traces the XrefPass falls back to the RecordView-based
-            //  scanning below in PassResult::run's slow path)
 
-            // Advance past INST record (P1.7: use pre-computed sizes)
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
-            ptr += inst_hdr_sz
+            offset += inst_hdr_sz
                 + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
                 + n_mem     * memacc_sz;
             inst_id++;
         } else {
-            // Non-INST record: skip it (doesn't increment inst_id)
-            ptr += raw_record_size(ptr, num_gpr, is_v5, is_v6);
+            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6);
         }
     }
 }
@@ -337,7 +323,6 @@ PassResult XrefPass::run(PassContext& ctx) {
     if (end == 0) end = total_insts;
 
     const uint32_t num_gpr = reader.header().num_gpr;
-    const uint8_t* base = reader.data();
     const uint64_t file_size = reader.file_size();
 
     // ─── Phase 0: Determine sharding strategy ─────────────────────────────
@@ -376,8 +361,8 @@ PassResult XrefPass::run(PassContext& ctx) {
         if (start_offset >= end_offset) continue;
 
         Shard s;
-        s.begin = base + start_offset;
-        s.end = base + end_offset;
+        s.file_start = start_offset;
+        s.file_end = end_offset;
         s.start_inst_id = shard_start_id;
         s.end_inst_id = shard_end_id;
         shards.push_back(s);
@@ -401,19 +386,24 @@ PassResult XrefPass::run(PassContext& ctx) {
     const bool xref_is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool xref_is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
 
+    // Pin all blocks during the parallel scan to prevent LRU eviction.
+    reader.pin_all();
+
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_results, num_gpr, xref_is_v5, xref_is_v6, i]() {
-            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i]);
+        threads.emplace_back([&shards, &shard_results, num_gpr, xref_is_v5, xref_is_v6, &reader, i]() {
+            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], reader);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0]);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], reader);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 
     // Wait for all workers
     for (auto& t : threads) t.join();
+
+    reader.unpin_all();
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled");

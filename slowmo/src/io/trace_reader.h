@@ -2,9 +2,11 @@
 
 #include "common/types.h"
 #include "TraceFormat.h"
+#include "io/block_cache_reader.h"
 
 #include <filesystem>
 #include <cstring>
+#include <memory>
 
 namespace tenet {
 
@@ -39,9 +41,9 @@ struct InstView {
     uint8_t reg_diff_count;
     uint8_t fpr_diff_count;  // v7 only; 0 for v4/v5/v6
     uint8_t mem_access_count;
-    const uint8_t* raw_diffs;    // points into mmap region (GPR diffs)
-    const uint8_t* raw_fprdiffs; // points into mmap region (FPR diffs, v7)
-    const uint8_t* raw_mems;     // points into mmap region
+    const uint8_t* raw_diffs;    // points into mmap/cache region (GPR diffs)
+    const uint8_t* raw_fprdiffs; // points into mmap/cache region (FPR diffs, v7)
+    const uint8_t* raw_mems;     // points into mmap/cache region
     bool is_v5 = false;  // true when record uses v5 (pc_delta) layout
     bool is_v6 = false;  // true when record uses v6 (old_value) layout
     bool is_v7 = false;  // true when record uses v7 (HF_HAS_FPR) layout
@@ -133,10 +135,10 @@ struct InstView {
 
 struct AnchorView {
     uint64_t pc;
-    const uint64_t* gpr_values;  // points to num_gpr uint64_t values in mmap
+    const uint64_t* gpr_values;  // points to num_gpr uint64_t values in mmap/cache
     uint32_t num_gpr;
     // FPR snapshot (v7 only): when has_fpr is true, fpr_lo and fpr_hi each
-    // point to an array of 32 uint64_t values in the mmap region.
+    // point to an array of 32 uint64_t values in the mmap/cache region.
     const uint64_t* fpr_lo = nullptr;  // bits  63:0  for v0..v31
     const uint64_t* fpr_hi = nullptr;  // bits 127:64 for v0..v31
     bool has_fpr = false;
@@ -150,7 +152,7 @@ struct AnchorView {
 struct CodeView {
     uint64_t pc;
     uint8_t size;
-    const uint8_t* bytes;  // instruction bytes in mmap
+    const uint8_t* bytes;  // instruction bytes in mmap/cache
 
     size_t byte_size() const {
         return sizeof(qbditrace::qbditrace_code_head_t) + size;
@@ -201,7 +203,7 @@ struct ThreadView {
 struct RecordView {
     RecordKind kind;
     uint64_t file_offset;
-    const uint8_t* raw_ptr;  // start of record in mmap
+    const uint8_t* raw_ptr;  // start of record in mmap/cache
 
     // Resolved absolute PC for this record.
     // - v5 (HF_PC_DELTA): Iterator reconstructs it from pc_delta chain and stores it here;
@@ -252,6 +254,7 @@ struct FileHeader {
     bool has_old_value() const { return flags & qbditrace::QBDITRACE_HF_OLD_VALUE; }
     bool has_fpr() const       { return flags & qbditrace::QBDITRACE_HF_HAS_FPR; }
     bool is_compressed() const { return flags & qbditrace::QBDITRACE_HF_COMPRESSED; }
+    bool is_block_compressed() const { return flags & qbditrace::QBDITRACE_HF_BLOCK_COMPRESSED; }
 };
 
 // ─── TraceReader ──────────────────────────────────────────────────────────
@@ -274,12 +277,37 @@ public:
 
     // ─── Accessors ──────────────────────────────────────────────────────
     const FileHeader& header() const { return header_; }
-    uint64_t file_size() const { return size_; }
+    /// Logical file size: for block-compressed traces this is the
+    /// decompressed size (header + records); for mmap'd traces it is the
+    /// actual file size.
+    uint64_t file_size() const { return logical_size_; }
     const std::filesystem::path& path() const { return path_; }
 
-    /// Raw byte access to mmap region (for IndexBuilder etc.)
-    const uint8_t* data() const { return static_cast<const uint8_t*>(mapped_); }
-    const uint8_t* data_at(uint64_t offset) const { return data() + offset; }
+    /// Whether this trace uses block-compressed on-demand decompression.
+    bool is_block_mode() const { return block_cache_ != nullptr; }
+
+    /// Raw byte access.
+    /// For mmap'd (uncompressed / stream-compressed + temp) traces, this
+    /// returns the mmap base pointer.  For block-compressed traces, this
+    /// returns nullptr — callers must use data_at() instead.
+    const uint8_t* data() const {
+        return static_cast<const uint8_t*>(mapped_);
+    }
+
+    /// Access byte at a given logical file offset.
+    /// Works for both mmap'd and block-compressed traces.
+    /// For block-compressed mode, the pointer is valid until the containing
+    /// block is evicted from the LRU cache; use pin_all()/unpin_all() if
+    /// you need longer lifetime.
+    const uint8_t* data_at(uint64_t offset) const {
+        if (block_cache_) {
+            // In block mode, offset is a logical file offset (header + records).
+            // The block cache uses logical offsets relative to the record start
+            // (i.e. after the header), so subtract header_size_.
+            return block_cache_->data_at(offset - header_size_);
+        }
+        return data() + offset;
+    }
 
     /// Get a RecordView at a given file offset.
     RecordView record_at(uint64_t offset) const;
@@ -296,6 +324,16 @@ public:
         rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
         rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
         return rv;
+    }
+
+    // ─── Pin / unpin (block-compressed mode) ─────────────────────────────
+    /// Prevent all cached blocks from being evicted. Must be balanced by
+    /// unpin_all(). Safe to call in mmap mode (no-op).
+    void pin_all() const {
+        if (block_cache_) block_cache_->pin_all();
+    }
+    void unpin_all() const {
+        if (block_cache_) block_cache_->unpin_all();
     }
 
     // ─── Sequential iteration ───────────────────────────────────────────
@@ -333,22 +371,27 @@ public:
 private:
     TraceReader() = default;
 
-    /// Decompress a compressed trace to a temp file.  On success, sets fd_,
-    /// mapped_, and size_ to the decompressed content (header + records).
-    /// The original fd/mmap must already be open so we can read the compressed
-    /// bytes.  `raw_fd`, `raw_mapped`, `raw_size` are the original file's
-    /// resources and will be released by this function on success or failure.
+    /// Decompress a stream-compressed trace to a temp file (legacy path).
     static Result<TraceReader> decompress_to_temp(
         TraceReader&& reader, int raw_fd, void* raw_mapped, uint64_t raw_size);
+
+    /// Initialize block-compressed reading mode.
+    static Result<TraceReader> init_block_compressed(
+        TraceReader&& reader);
 
     std::filesystem::path path_;
     int fd_ = -1;
     void* mapped_ = nullptr;
-    uint64_t size_ = 0;
+    uint64_t raw_file_size_ = 0;   // actual file size on disk (for mmap)
+    uint64_t logical_size_ = 0;    // logical size (header + decompressed records)
+    uint64_t header_size_ = 0;     // file header size (536 bytes)
     FileHeader header_;
     // When reading a compressed trace, the decompressed data lives in a temp
     // file that we own.  We keep the path so the destructor can unlink it.
     std::filesystem::path temp_path_;
+    // Block-compressed mode: on-demand decompression with LRU cache.
+    // When non-null, data_at() goes through block_cache_ instead of mmap.
+    mutable std::unique_ptr<BlockCacheReader> block_cache_;
 };
 
 }  // namespace tenet

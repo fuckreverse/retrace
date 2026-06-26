@@ -143,12 +143,13 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
                     reader.file_size() - new_bytes);
                 uint64_t new_inst_count = 0;
                 uint64_t scan_offset = scan_start;
-                const uint8_t* data = reader.data();
                 uint64_t file_end   = reader.file_size();
 
+                reader.pin_all();
                 while (scan_offset < file_end) {
                     if (scan_offset + 1 > file_end) break;
-                    uint8_t kind = data[scan_offset];
+                    const uint8_t* rec_ptr = reader.data_at(scan_offset);
+                    uint8_t kind = rec_ptr[0];
                     if (kind == 0) {  // REC_INST
                         new_inst_count++;
                     }
@@ -163,6 +164,7 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
                         break;
                     }
                 }
+                reader.unpin_all();
 
                 uint64_t updated_count = prev_count + new_inst_count;
                 inst_count_.store(updated_count, std::memory_order_release);

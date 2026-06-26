@@ -199,12 +199,16 @@ TraceReader::TraceReader(TraceReader&& other) noexcept
     : path_(std::move(other.path_)),
       fd_(other.fd_),
       mapped_(other.mapped_),
-      size_(other.size_),
+      raw_file_size_(other.raw_file_size_),
+      logical_size_(other.logical_size_),
+      header_size_(other.header_size_),
       header_(std::move(other.header_)),
-      temp_path_(std::move(other.temp_path_)) {
+      temp_path_(std::move(other.temp_path_)),
+      block_cache_(std::move(other.block_cache_)) {
     other.fd_ = -1;
     other.mapped_ = nullptr;
-    other.size_ = 0;
+    other.raw_file_size_ = 0;
+    other.logical_size_ = 0;
 }
 
 TraceReader& TraceReader::operator=(TraceReader&& other) noexcept {
@@ -213,12 +217,16 @@ TraceReader& TraceReader::operator=(TraceReader&& other) noexcept {
         path_ = std::move(other.path_);
         fd_ = other.fd_;
         mapped_ = other.mapped_;
-        size_ = other.size_;
+        raw_file_size_ = other.raw_file_size_;
+        logical_size_ = other.logical_size_;
+        header_size_ = other.header_size_;
         header_ = std::move(other.header_);
         temp_path_ = std::move(other.temp_path_);
+        block_cache_ = std::move(other.block_cache_);
         other.fd_ = -1;
         other.mapped_ = nullptr;
-        other.size_ = 0;
+        other.raw_file_size_ = 0;
+        other.logical_size_ = 0;
     }
     return *this;
 }
@@ -227,6 +235,7 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     TENET_ZONE_NAMED("TraceReader::open");
     TraceReader reader;
     reader.path_ = path;
+    reader.header_size_ = sizeof(qbditrace::qbditrace_file_header_t);
 
     // Open file
     reader.fd_ = ::open(path.c_str(), O_RDONLY);
@@ -240,16 +249,16 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
         ::close(reader.fd_);
         return Error::mmap_failed("fstat failed");
     }
-    reader.size_ = static_cast<uint64_t>(st.st_size);
+    reader.raw_file_size_ = static_cast<uint64_t>(st.st_size);
 
     // Validate minimum size (at least file header)
-    if (reader.size_ < sizeof(qbditrace::qbditrace_file_header_t)) {
+    if (reader.raw_file_size_ < sizeof(qbditrace::qbditrace_file_header_t)) {
         ::close(reader.fd_);
         return Error::invalid_magic();
     }
 
     // mmap the entire file read-only
-    reader.mapped_ = ::mmap(nullptr, reader.size_, PROT_READ,
+    reader.mapped_ = ::mmap(nullptr, reader.raw_file_size_, PROT_READ,
                             MAP_PRIVATE | MAP_NORESERVE, reader.fd_, 0);
     if (reader.mapped_ == MAP_FAILED) {
         ::close(reader.fd_);
@@ -265,12 +274,6 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     }
 
     // Accept v4, v5 (PC-delta), v6 (old-value), and v7 (FPR) trace files.
-    // v5 is identified by version == QBDITRACE_VERSION_V5_PC_DELTA (5) and HF_PC_DELTA.
-    // v6 is identified by version == QBDITRACE_VERSION_V6_OLD_VALUE (6) and HF_OLD_VALUE.
-    // v7 is identified by version == QBDITRACE_VERSION_V7_HAS_FPR (7) and HF_HAS_FPR.
-    // Any version may combine PC-delta (HF_PC_DELTA) with its primary flag.
-    // Any other version is rejected.
-    // Note: QBDITRACE_VERSION_* are #define macros, not namespace members.
     const uint32_t ver = raw_hdr->version;
     const uint64_t flg = raw_hdr->flags;
     bool version_ok = false;
@@ -299,17 +302,29 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     reader.header_.flags = raw_hdr->flags;
     reader.header_.module_name = std::string(raw_hdr->module_name);
 
-    // ── Handle compressed traces ─────────────────────────────────────────
-    if (reader.header_.flags & qbditrace::QBDITRACE_HF_COMPRESSED) {
+    // ── Handle block-compressed traces (new path) ─────────────────────────
+    if (reader.header_.is_block_compressed()) {
+#if TENET_HAS_ZSTD
+        return init_block_compressed(std::move(reader));
+#else
+        reader.close();
+        return Error(ErrorCode::MmapFailed,
+                     "Block-compressed trace requires zstd support, but tenet was "
+                     "built without TENET_HAS_ZSTD");
+#endif
+    }
+
+    // ── Handle legacy stream-compressed traces ────────────────────────────
+    if (reader.header_.is_compressed()) {
 #if TENET_HAS_ZSTD
         // Transfer ownership of the raw mmap/fd to decompress_to_temp,
         // which will release them and replace with the decompressed file.
         int raw_fd = reader.fd_;
         void* raw_mapped = reader.mapped_;
-        uint64_t raw_size = reader.size_;
+        uint64_t raw_size = reader.raw_file_size_;
         reader.fd_ = -1;
         reader.mapped_ = nullptr;
-        reader.size_ = 0;
+        reader.raw_file_size_ = 0;
         return decompress_to_temp(std::move(reader), raw_fd, raw_mapped, raw_size);
 #else
         reader.close();
@@ -319,19 +334,26 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
 #endif
     }
 
+    // ── Uncompressed trace: logical size == file size on disk ──────────────
+    reader.logical_size_ = reader.raw_file_size_;
+
     return reader;
 }
 
 void TraceReader::close() {
+    // Release block cache first (it references the mmap'd region).
+    block_cache_.reset();
+
     if (mapped_ && mapped_ != MAP_FAILED) {
-        ::munmap(mapped_, size_);
+        ::munmap(mapped_, raw_file_size_);
         mapped_ = nullptr;
     }
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
-    size_ = 0;
+    raw_file_size_ = 0;
+    logical_size_ = 0;
     // Clean up the temp file created for decompressed traces.
     if (!temp_path_.empty()) {
         std::filesystem::remove(temp_path_);
@@ -339,7 +361,53 @@ void TraceReader::close() {
     }
 }
 
-// ─── Decompression (zstd) ─────────────────────────────────────────────────
+// ─── Block-compressed initialization ──────────────────────────────────────
+
+#if TENET_HAS_ZSTD
+
+Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
+    constexpr size_t kHeaderSize = sizeof(qbditrace::qbditrace_file_header_t);
+
+    auto cache = std::make_unique<BlockCacheReader>();
+    bool ok = cache->init(
+        static_cast<const uint8_t*>(reader.mapped_),
+        reader.raw_file_size_,
+        kHeaderSize);
+    if (!ok) {
+        reader.close();
+        return Error(ErrorCode::MmapFailed,
+                     "Failed to initialize block-compressed reader: "
+                     "corrupt block index or footer");
+    }
+
+    // Logical size = header + decompressed records
+    reader.logical_size_ = kHeaderSize + cache->logical_size();
+    reader.block_cache_ = std::move(cache);
+
+    // Clear the block-compressed flag in the in-memory header so that
+    // downstream code (e.g. record_at, Iterator) does not need to check it.
+    // The is_block_mode() method uses block_cache_ != nullptr instead.
+    reader.header_.flags &= ~static_cast<uint64_t>(qbditrace::QBDITRACE_HF_BLOCK_COMPRESSED);
+
+    fmt::print(stderr, "Block-compressed trace: {:.1f} MB on disk → {:.1f} MB logical\n",
+               reader.raw_file_size_ / (1024.0 * 1024.0),
+               reader.logical_size_ / (1024.0 * 1024.0));
+
+    return std::move(reader);
+}
+
+#else  // !TENET_HAS_ZSTD
+
+Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
+    reader.close();
+    return Error(ErrorCode::MmapFailed,
+                 "Block-compressed trace requires zstd support, but tenet was "
+                 "built without TENET_HAS_ZSTD");
+}
+
+#endif  // TENET_HAS_ZSTD
+
+// ─── Decompression (zstd, legacy stream) ──────────────────────────────────
 
 #if TENET_HAS_ZSTD
 
@@ -352,11 +420,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     size_t compressed_size = raw_size - kHeaderSize;
 
     // Create a temp file for the decompressed trace.
-    // Use the original file's directory so we stay on the same filesystem
-    // (avoids cross-device issues and keeps the temp near the source).
     auto temp_dir = reader.path_.parent_path();
     auto temp_template = temp_dir / ".tenet-decomp-XXXXXX";
-    // mkstemp needs a mutable char buffer.
     std::string temp_str = temp_template.string();
     int tmp_fd = ::mkstemp(temp_str.data());
     if (tmp_fd < 0) {
@@ -399,7 +464,6 @@ Result<TraceReader> TraceReader::decompress_to_temp(
         return Error(ErrorCode::MmapFailed, "ZSTD_createDCtx failed");
     }
 
-    // Use a 256K output buffer — balances syscall overhead and memory use.
     constexpr size_t kOutBufSize = 256 * 1024;
     auto out_buf = std::make_unique<uint8_t[]>(kOutBufSize);
 
@@ -478,7 +542,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     // Update the reader to point at the decompressed data.
     reader.fd_ = tmp_fd;
     reader.mapped_ = mapped;
-    reader.size_ = decompressed_size;
+    reader.raw_file_size_ = decompressed_size;
+    reader.logical_size_ = decompressed_size;
     reader.temp_path_ = temp_path;
     // Clear the compressed flag in the in-memory header so downstream code
     // does not attempt to decompress again.
@@ -502,7 +567,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
 #endif  // TENET_HAS_ZSTD
 
 RecordView TraceReader::record_at(uint64_t offset) const {
-    const uint8_t* ptr = data() + offset;
+    const uint8_t* ptr = data_at(offset);
     RecordView rv;
     rv.kind = static_cast<RecordKind>(ptr[0]);
     rv.file_offset = offset;
@@ -526,7 +591,6 @@ RecordView TraceReader::Iterator::operator*() const {
 
     if (rv.kind == RecordKind::Inst && use_pc_delta) {
         // v5/v6+v5/v7+v5: reconstruct absolute PC from pc_delta.
-        // The pc_delta field is at the same offset in v5, v7+v5 headers.
         const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(rv.raw_ptr);
         int16_t delta;
         std::memcpy(&delta, &hdr->pc_delta, sizeof(delta));  // LE decode
@@ -544,17 +608,11 @@ RecordView TraceReader::Iterator::operator*() const {
 
 TraceReader::Iterator& TraceReader::Iterator::operator++() {
     // ── Performance optimization ──────────────────────────────────────────
-    // Old code called `**this` (operator*) then byte_size(), meaning every
-    // record was fully parsed TWICE: once in the loop body's `*it`, once here.
-    // For GB-level traces (100M+ records) this doubled the parsing cost.
-    //
-    // New approach: compute byte_size directly from the raw header byte.
-    // For v5 PC-delta mode we still need to update current_pc_ here only if
-    // the caller did NOT call operator*() (which is unusual — defensive).
-    // In the normal `for(*it; ++it)` pattern, current_pc_ was already updated
-    // by operator*() in the loop body.
+    // Read the record header at current offset to compute its size, then
+    // advance past it.  For block-compressed mode, data_at() goes through
+    // the BlockCacheReader LRU cache; for mmap mode it's a direct pointer.
 
-    const uint8_t* ptr = reader_->data() + offset_;
+    const uint8_t* ptr = reader_->data_at(offset_);
     auto kind = static_cast<RecordKind>(ptr[0]);
     size_t rec_size = 0;
 
@@ -622,8 +680,11 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
         break;
     }
 
-    // Prefetch the next record's cache line (hides L2 miss latency)
-    __builtin_prefetch(ptr + rec_size, 0, 1);
+    // Prefetch hint — only useful in mmap mode; harmless in block mode
+    // (the address may be in a different decompressed block anyway).
+    if (!reader_->is_block_mode()) {
+        __builtin_prefetch(ptr + rec_size, 0, 1);
+    }
 
     offset_ += rec_size;
     return *this;
@@ -631,22 +692,22 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
 
 TraceReader::Iterator TraceReader::begin() const {
     // Records start after the 536-byte file header
-    return Iterator(this, sizeof(qbditrace::qbditrace_file_header_t));
+    return Iterator(this, header_size_);
 }
 
 TraceReader::Iterator TraceReader::end() const {
-    return Iterator(this, size_);
+    return Iterator(this, logical_size_);
 }
 
 void TraceReader::advise_sequential() const {
     if (mapped_) {
-        ::madvise(mapped_, size_, MADV_SEQUENTIAL);
+        ::madvise(mapped_, raw_file_size_, MADV_SEQUENTIAL);
     }
 }
 
 void TraceReader::advise_random() const {
     if (mapped_) {
-        ::madvise(mapped_, size_, MADV_RANDOM);
+        ::madvise(mapped_, raw_file_size_, MADV_RANDOM);
     }
 }
 

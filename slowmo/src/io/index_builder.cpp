@@ -151,16 +151,31 @@ static uint64_t xxhash64(const uint8_t* data, size_t len, uint64_t seed = 0) {
 /// truncation, corruption at head/tail, and file swaps.
 static uint64_t sample_trace_hash(const TraceReader& reader) {
     constexpr size_t SAMPLE = 1024 * 1024;  // 1MB per end
-    const uint8_t* data = reader.data();
     const uint64_t size = reader.file_size();
+    if (reader.is_block_mode()) {
+        // Block-compressed: cannot get a contiguous pointer spanning the
+        // full file.  Use data_at() to read the first and last SAMPLE
+        // bytes.  Since each SAMPLE is within one or two 1MB blocks,
+        // data_at() is safe.
+        reader.pin_all();
+        const uint8_t* head = reader.data_at(0);
+        uint64_t actual_head = std::min(static_cast<uint64_t>(SAMPLE), size);
+        uint64_t h1 = xxhash64(head, static_cast<size_t>(actual_head));
+        uint64_t h2 = 0;
+        if (size > SAMPLE) {
+            const uint8_t* tail = reader.data_at(size - SAMPLE);
+            h2 = xxhash64(tail, SAMPLE);
+        }
+        reader.unpin_all();
+        return h1 ^ (h2 * XXH_PRIME64_2) ^ (size * XXH_PRIME64_3);
+    }
+    // mmap mode: contiguous access
+    const uint8_t* data = reader.data();
     if (size <= SAMPLE * 2) {
         return xxhash64(data, static_cast<size_t>(size));
     }
-    // Hash first SAMPLE bytes (includes file header + first instructions)
     uint64_t h1 = xxhash64(data, SAMPLE);
-    // Hash last SAMPLE bytes (tail of the trace)
     uint64_t h2 = xxhash64(data + size - SAMPLE, SAMPLE);
-    // Combine with file size as salt to detect truncation
     uint64_t combined = h1 ^ (h2 * XXH_PRIME64_2) ^ (size * XXH_PRIME64_3);
     return combined;
 }
@@ -532,11 +547,12 @@ Result<TraceIndex> TraceIndex::build(
         raw_anchors.reserve(4096);
 
         uint64_t scan_id = 0;
-        const uint8_t* base = reader.data();
-        const uint8_t* end  = base + file_size;
-        const uint8_t* ptr  = base + sizeof(qbditrace::qbditrace_file_header_t);
+        // Use offset-based scanning so it works for both mmap and block modes.
+        uint64_t scan_offset = sizeof(qbditrace::qbditrace_file_header_t);
+        reader.pin_all();  // keep pointers stable for the scan duration
 
-        while (ptr < end) {
+        while (scan_offset < file_size) {
+            const uint8_t* ptr = reader.data_at(scan_offset);
             auto kind = static_cast<RecordKind>(ptr[0]);
             size_t rec_size = 0;
             switch (kind) {
@@ -549,8 +565,7 @@ Result<TraceIndex> TraceIndex::build(
             case RecordKind::Anchor: {
                 rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
                 const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
-                uint64_t foff = static_cast<uint64_t>(ptr - base);
-                raw_anchors.push_back({scan_id, foff, ah->pc});
+                raw_anchors.push_back({scan_id, scan_offset, ah->pc});
                 break;
             }
             case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
@@ -561,8 +576,9 @@ Result<TraceIndex> TraceIndex::build(
             default: rec_size = 1; break;
             }
             if (rec_size == 0) break;  // guard against corrupt records
-            ptr += rec_size;
+            scan_offset += rec_size;
         }
+        reader.unpin_all();
 
         // Populate in-memory anchor table
         for (const auto& a : raw_anchors) {
@@ -811,9 +827,9 @@ Result<TraceIndex> TraceIndex::build(
         };
         std::vector<CodeEntry> code_entries;
 
-        const uint8_t* base = reader.data();
-        const uint8_t* ptr  = base + bounds.file_start;
-        const uint8_t* end  = base + bounds.file_end;
+        // Offset-based scanning: works for both mmap and block-compressed.
+        uint64_t scan_offset = bounds.file_start;
+        const uint64_t scan_end = bounds.file_end;
 
         uint64_t inst_id = bounds.inst_id_start;
 
@@ -822,7 +838,8 @@ Result<TraceIndex> TraceIndex::build(
         // are sequential I/O with no SkipList overhead.
         constexpr uint64_t SST_ROTATE_THRESHOLD = 500000;
 
-        while (ptr < end) {
+        while (scan_offset < scan_end) {
+            const uint8_t* ptr = reader.data_at(scan_offset);
             auto kind = static_cast<RecordKind>(ptr[0]);
             size_t rec_size = 0;
 
@@ -830,12 +847,11 @@ Result<TraceIndex> TraceIndex::build(
             case RecordKind::Inst: {
                 // P1.6: Sparse offset with adaptive interval
                 if (inst_id % idx.sparse_interval_ == 0) {
-                    uint64_t foff = static_cast<uint64_t>(ptr - base);
                     char key_buf[8];
                     encode_u64_to(inst_id, key_buf);
                     auto s = offset_w.add(
                         rocksdb::Slice(key_buf, 8),
-                        rocksdb::Slice(reinterpret_cast<const char*>(&foff), 8));
+                        rocksdb::Slice(reinterpret_cast<const char*>(&scan_offset), 8));
                     if (!s.ok()) { result.error = s.ToString(); return; }
                 }
                 // REG_WRITES inverted index (per-register SST writers)
@@ -868,12 +884,11 @@ Result<TraceIndex> TraceIndex::build(
             }
             case RecordKind::Anchor: {
                 rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
-                uint64_t foff = static_cast<uint64_t>(ptr - base);
                 char anchor_key_buf[8];
                 encode_u64_to(inst_id, anchor_key_buf);
                 auto s = anchor_w.add(
                     rocksdb::Slice(anchor_key_buf, 8),
-                    rocksdb::Slice(reinterpret_cast<const char*>(&foff), 8));
+                    rocksdb::Slice(reinterpret_cast<const char*>(&scan_offset), 8));
                 if (!s.ok()) { result.error = s.ToString(); return; }
                 result.anchor_count++;
                 break;
@@ -930,7 +945,7 @@ Result<TraceIndex> TraceIndex::build(
             }
 
             if (rec_size == 0) break;
-            ptr += rec_size;
+            scan_offset += rec_size;
 
             // Update shared progress counter (relaxed — just for display)
             progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
@@ -978,6 +993,10 @@ Result<TraceIndex> TraceIndex::build(
         }
     };
 
+    // Pin all cached blocks during Phase 1 so that worker threads' pointers
+    // (from data_at) are not evicted by other threads' LRU activity.
+    reader.pin_all();
+
     if (num_shards == 1) {
         // Single-threaded path (small trace or no anchors)
         process_shard(0);
@@ -1004,6 +1023,8 @@ Result<TraceIndex> TraceIndex::build(
         }
         for (auto& w : workers) w.join();
     }
+
+    reader.unpin_all();
 
     // Check for shard errors
     for (const auto& r : shard_results) {

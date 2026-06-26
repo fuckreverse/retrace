@@ -54,8 +54,8 @@ inline unsigned worker_count() {
 
 /// Per-shard boundary descriptor.
 struct ScanShard {
-    const uint8_t* begin;
-    const uint8_t* end;
+    uint64_t file_start;
+    uint64_t file_end;
     uint64_t start_inst_id;
     uint64_t end_inst_id;
 };
@@ -65,20 +65,20 @@ struct ScanShard {
 void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                            bool is_v6,
                            const std::vector<TraceCollector*>& clones,
-                           std::atomic<uint64_t>& progress_counter) {
-    const uint8_t* ptr = shard.begin;
-    const uint8_t* end_ptr = shard.end;
+                           std::atomic<uint64_t>& progress_counter,
+                           const TraceReader& reader) {
+    uint64_t offset = shard.file_start;
+    const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
-    // v6 extends memacc records from 32 to 48 bytes (adds old_value + pad fields).
     const size_t memacc_size = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)
         : sizeof(qbditrace::qbditrace_memacc_t);
 
-    while (ptr < end_ptr) {
+    while (offset < end_offset) {
+        const uint8_t* ptr = reader.data_at(offset);
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — hot path
-            // Parse InstView inline for zero-copy
             const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
             InstView inst;
             inst.pc = hdr->pc;
@@ -93,7 +93,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 c->on_inst(inst_id, inst);
             }
 
-            ptr += sizeof(qbditrace::qbditrace_inst_head_t)
+            offset += sizeof(qbditrace::qbditrace_inst_head_t)
                 + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
                 + hdr->n_mem     * memacc_size;
             inst_id++;
@@ -104,7 +104,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
             }
         } else {
             // Non-INST record: skip (is_v6 propagated for completeness)
-            ptr += raw_record_size(ptr, num_gpr, is_v6);
+            offset += raw_record_size(ptr, num_gpr, is_v6);
         }
     }
 
@@ -258,7 +258,6 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     if (n_workers == 0) n_workers = worker_count();
 
     const uint32_t num_gpr = reader_.header().num_gpr;
-    const uint8_t* base = reader_.data();
     const uint64_t file_size = reader_.file_size();
 
     uint64_t insts_per_shard = (end - start_inst_id + n_workers - 1) / n_workers;
@@ -284,8 +283,8 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
         if (start_offset >= end_offset) continue;
 
         ScanShard s;
-        s.begin = base + start_offset;
-        s.end = base + end_offset;
+        s.file_start = start_offset;
+        s.file_end = end_offset;
         s.start_inst_id = shard_start;
         s.end_inst_id = shard_end;
         shards.push_back(s);
@@ -326,15 +325,18 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     std::vector<std::thread> threads;
     threads.reserve(shards.size() - 1);
 
+    // Pin all blocks during the parallel scan to prevent LRU eviction.
+    reader_.pin_all();
+
     // Launch worker threads for shards[1..N-1]
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, num_gpr, is_v6, i]() {
-            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, num_gpr, is_v6, this, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter, reader_);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter);
+    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter, reader_);
 
     // Report progress while waiting
     if (progress_fn_) {
@@ -343,6 +345,8 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
 
     // Wait for all workers
     for (auto& t : threads) t.join();
+
+    reader_.unpin_all();
 
     // ─── Phase 3: Merge shard results ─────────────────────────────────────
 

@@ -141,13 +141,14 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
     // Find nearest anchor before target_id
     auto anchor_info = index_.nearest_anchor_before(target_id);
 
-    // ── Raw pointer into mmap ──
-    const uint8_t* base = reader_.data();
-    const uint8_t* end_ptr = base + reader_.file_size();
-    const uint8_t* ptr = base + anchor_info.file_offset;
+    // ── Offset-based scan (works for both mmap and block-compressed) ──
+    reader_.pin_all();  // keep decompressed blocks stable during rebuild
+    const uint64_t file_end = reader_.file_size();
+    uint64_t scan_offset = anchor_info.file_offset;
+    const uint8_t* ptr = reader_.data_at(scan_offset);
 
     // Load anchor's full register snapshot directly from raw bytes
-    if (ptr < end_ptr && ptr[0] == qbditrace::QBDITRACE_REC_ANCHOR) {
+    if (scan_offset < file_end && ptr[0] == qbditrace::QBDITRACE_REC_ANCHOR) {
         const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
         const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
         uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr);
@@ -161,16 +162,18 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
                 state.fpr[i].hi = fpr_hi[i];
             }
         }
-        ptr += anchor_total;
+        scan_offset += anchor_total;
+        ptr = reader_.data_at(scan_offset);
     }
 
-    // ── Replay diffs from anchor to target_id using raw pointer scan ──
+    // ── Replay diffs from anchor to target_id using offset-based scan ──
     // This avoids RecordView/InstView construction overhead for potentially
     // hundreds of records between anchor and target. On GB traces with sparse
     // index (every 256 insts), each rebuild touches up to 256 records.
     uint64_t current_inst_id = anchor_info.inst_id;
 
-    while (current_inst_id < target_id && ptr < end_ptr) {
+    while (current_inst_id < target_id && scan_offset < file_end) {
+        ptr = reader_.data_at(scan_offset);
         const uint8_t kind = ptr[0];
 
         if (kind == qbditrace::QBDITRACE_REC_INST) {
@@ -224,10 +227,7 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
                 + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)
                 + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)
                 + n_mem      * memacc_size;
-            ptr += rec_size;
-
-            // Prefetch next record header into L1
-            __builtin_prefetch(ptr, 0, 3);
+            scan_offset += rec_size;
 
             current_inst_id++;
 
@@ -245,16 +245,17 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
                     state.fpr[i].hi = fpr_hi[i];
                 }
             }
-            ptr += anchor_total;
+            scan_offset += anchor_total;
 
         } else {
             // Skip non-INST/non-ANCHOR records (THREAD, EVENT, SVC, OBJC, CODE)
-            auto rec = reader_.record_at(static_cast<uint64_t>(ptr - base));
+            auto rec = reader_.record_at(scan_offset);
             rec.is_v7 = is_v7;  // needed for anchor byte_size()
-            ptr += rec.byte_size(num_gpr);
+            scan_offset += rec.byte_size(num_gpr);
         }
     }
 
+    reader_.unpin_all();
     return state;
 }
 
