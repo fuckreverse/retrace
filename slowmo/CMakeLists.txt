@@ -398,7 +398,7 @@ src/core/register_file.cpp
     src/analysis/passes/taint_source_annotation_pass.cpp
     src/io/rpc_server.cpp
     src/io/mcp/mcp_server.cpp
-    src/io/mcp/mcp_http_sse.cpp
+    src/io/mcp/mcp_http.cpp
     src/io/mcp/mcp_tools_core.cpp
     src/io/mcp/mcp_tools_analysis.cpp
     src/io/mcp/mcp_tools_ai.cpp

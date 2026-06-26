@@ -1932,7 +1932,8 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     // ── P3: --mcp-http server mode ─────────────────────────────────────
-    // HTTP + Server-Sent Events transport (MCP 2024-11-05 spec).
+    // Streamable HTTP transport (MCP 2025-03-26+).
+    // Single /mcp endpoint, POST for requests, DELETE for session termination.
     // Useful for connecting GUI-hosted AI clients, remote access, or when
     // stdin/stdout are not available (e.g. when tenet itself is the GUI).
     // Process stays resident and blocks on SIGINT/SIGTERM.
@@ -1940,11 +1941,11 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         TenetMcpService mcp_service(reader, index, regfile, memory,
                                     &pm, &code_table, &decoder);
         if (!mcp_service.start_http(opts.mcp_http_cfg)) {
-            fmt::print(stderr, "[mcp-http] Failed to start HTTP SSE server on {}:{}\n",
+            fmt::print(stderr, "[mcp-http] Failed to start HTTP server on {}:{}\n",
                        opts.mcp_http_cfg.host, opts.mcp_http_cfg.port);
             rc |= 1;
         } else {
-            fmt::print(stderr, "[mcp-http] Listening on http://{}:{}/sse\n",
+            fmt::print(stderr, "[mcp-http] Listening on http://{}:{}/mcp\n",
                        opts.mcp_http_cfg.host, opts.mcp_http_cfg.port);
             if (!opts.mcp_http_cfg.username.empty()) {
                 fmt::print(stderr, "[mcp-http] Basic Auth enabled (user: {})\n",

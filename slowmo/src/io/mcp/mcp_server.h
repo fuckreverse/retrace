@@ -24,16 +24,16 @@ class MemoryModel;
 class PassManager;
 class CodeTable;
 class InstructionDecoder;
-class McpHttpSseTransport;
+class McpHttpTransport;
 
 // ─── MCP Transport Mode ────────────────────────────────────────────────────
 
 enum class McpTransportMode {
-    Stdio,    ///< JSON-RPC 2.0 over stdin/stdout (default; used by Claude Desktop, etc.)
-    HttpSse,  ///< HTTP + Server-Sent Events (MCP 2024-11-05 HTTP transport)
+    Stdio,          ///< JSON-RPC 2.0 over stdin/stdout (default; used by Claude Desktop, etc.)
+    StreamableHttp, ///< Streamable HTTP transport (MCP 2025-03-26+, single /mcp endpoint)
 };
 
-// ─── HTTP SSE Configuration ────────────────────────────────────────────────
+// ─── HTTP Configuration ────────────────────────────────────────────────────
 
 struct McpHttpConfig {
     std::string host     = "127.0.0.1";  ///< Bind address ("0.0.0.0" to expose on all interfaces)
@@ -101,8 +101,9 @@ private:
 ///
 /// Supports two transport modes:
 ///   - Stdio  (default): JSON-RPC 2.0 over stdin/stdout.  Call run() to block.
-///   - HttpSse:          HTTP + SSE transport.  Call start_http() to run
-///                       in the background; call stop() to shut down.
+///   - StreamableHttp:   Streamable HTTP transport (MCP 2025-03-26+).
+///                       Call start_http() to run in the background; call
+///                       stop() to shut down.
 ///
 /// All core objects (reader, index, regfile, memory, pm) are held by
 /// reference — they must outlive this service.
@@ -121,14 +122,14 @@ public:
     /// Run the MCP server in stdio mode (blocks on stdin). Returns when stdin closes.
     void run();
 
-    // ── HTTP SSE mode ──────────────────────────────────────────────────
-    /// Start HTTP SSE server in background.  Returns false on bind failure.
+    // ── HTTP mode (Streamable HTTP) ──────────────────────────────────
+    /// Start Streamable HTTP server in background.  Returns false on bind failure.
     bool start_http(const McpHttpConfig& cfg = {});
 
-    /// Stop the HTTP SSE server (no-op if not running).
+    /// Stop the HTTP server (no-op if not running).
     void stop_http();
 
-    /// Returns true if the HTTP SSE server is currently accepting connections.
+    /// Returns true if the HTTP server is currently accepting connections.
     bool http_running() const;
 
     /// Effective HTTP config (valid after start_http() succeeds).
@@ -192,8 +193,8 @@ private:
     // Stdio transport
     std::unique_ptr<McpStdioTransport> stdio_transport_;
 
-    // HTTP SSE transport
-    std::unique_ptr<McpHttpSseTransport> http_transport_;
+    // Streamable HTTP transport
+    std::unique_ptr<McpHttpTransport> http_transport_;
     McpHttpConfig http_cfg_;
 
     int tool_call_count_ = 0;

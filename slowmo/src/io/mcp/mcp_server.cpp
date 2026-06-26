@@ -1,5 +1,5 @@
 #include "mcp_server.h"
-#include "mcp_http_sse.h"
+#include "mcp_http.h"
 
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
@@ -15,14 +15,18 @@ namespace tenet {
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
-static constexpr const char* MCP_PROTOCOL_VERSION = "2024-11-05";
+static constexpr const char* MCP_PROTOCOL_VERSION = "2025-03-26";
 static constexpr const char* MCP_SERVER_NAME = "tenet-trace-analyzer";
 static constexpr const char* MCP_SERVER_VERSION = "1.0.0";
 
 // ─── Helper: log to stderr ────────────────────────────────────────────────
 
 static void mcp_log(const std::string& msg) {
-    fmt::print(stderr, "[tenet-mcp] {}\n", msg);
+    try {
+        fmt::print(stderr, "[tenet-mcp] {}\n", msg);
+    } catch (...) {
+        // stderr may be closed (e.g. parent process / pipe gone) — ignore.
+    }
 }
 
 // ─── McpStdioTransport ───────────────────────────────────────────────────
@@ -104,7 +108,7 @@ void TenetMcpService::run() {
 
 bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
     http_cfg_ = cfg;
-    http_transport_ = std::make_unique<McpHttpSseTransport>(
+    http_transport_ = std::make_unique<McpHttpTransport>(
         [this](const json& msg) -> json { return process_message(msg); },
         cfg.host, cfg.port
     );
@@ -113,7 +117,7 @@ bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
     }
     bool ok = http_transport_->start();
     if (ok) {
-        mcp_log(fmt::format("HTTP SSE server started on {}:{}", cfg.host, cfg.port));
+        mcp_log(fmt::format("Streamable HTTP server started on {}:{}", cfg.host, cfg.port));
     }
     return ok;
 }
@@ -121,7 +125,7 @@ bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
 void TenetMcpService::stop_http() {
     if (http_transport_) {
         http_transport_->stop();
-        mcp_log("HTTP SSE server stopped.");
+        mcp_log("HTTP server stopped.");
     }
 }
 

@@ -3,7 +3,7 @@
 #include <fmt/core.h>
 
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -23,7 +23,11 @@ namespace tenet {
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 static void mcp_sse_log(const std::string& msg) {
-    fmt::print(stderr, "[tenet-mcp-sse] {}\n", msg);
+    try {
+        fmt::print(stderr, "[tenet-mcp-sse] {}\n", msg);
+    } catch (...) {
+        // stderr may be closed (e.g. parent process / pipe gone) — ignore.
+    }
 }
 
 // ─── SseSession ───────────────────────────────────────────────────────────
@@ -371,11 +375,8 @@ void McpHttpSseTransport::listener_loop() {
         int sfd = server_fd_;  // snapshot — may become -1 during stop()
         if (sfd < 0) break;
 
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sfd, &rfds);
-        struct timeval tv{0, 200000};  // 200ms
-        int ret = ::select(sfd + 1, &rfds, nullptr, nullptr, &tv);
+        struct pollfd pfd{sfd, POLLIN, 0};
+        int ret = ::poll(&pfd, 1, 200);  // 200ms
         if (ret <= 0) continue;
         if (!running_.load()) break;
 

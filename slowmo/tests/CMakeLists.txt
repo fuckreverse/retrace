@@ -91,7 +91,7 @@ tenet_add_test(test_mcp_tools_ai               unit/test_mcp_tools_ai.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
-tenet_add_test(test_mcp_http_sse           integration/test_mcp_http_sse.cpp)
+tenet_add_test(test_mcp_http               integration/test_mcp_http.cpp)
 
 # ─── Performance regression tests ──────────────────────────────────────────
 # Tagged [perf]; run with:  ctest -R perf --output-on-failure

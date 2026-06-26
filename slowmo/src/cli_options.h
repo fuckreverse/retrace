@@ -155,7 +155,7 @@ struct CliOptions {
     // --- P3: MCP server ---
     bool opt_mcp = false;
 
-    // --- P3: MCP HTTP SSE server ---
+    // --- P3: MCP Streamable HTTP server ---
     bool opt_mcp_http = false;
     McpHttpConfig mcp_http_cfg;
 

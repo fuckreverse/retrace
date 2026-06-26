@@ -110,7 +110,7 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "                                    (blocks until client disconnects)\n");
     fmt::print(stderr, "  --mcp                             Start MCP server over stdio (JSON-RPC 2.0)\n");
     fmt::print(stderr, "                                    (blocks until stdin closes)\n");
-    fmt::print(stderr, "  --mcp-http [host:port]            Start MCP server over HTTP + SSE\n");
+    fmt::print(stderr, "  --mcp-http [host:port]            Start MCP server over Streamable HTTP\n");
     fmt::print(stderr, "                                    Default: 127.0.0.1:7080 (blocks until SIGINT)\n");
     fmt::print(stderr, "  --mcp-host <addr>                 Bind address for --mcp-http (e.g. 0.0.0.0)\n");
     fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 7080)\n");
