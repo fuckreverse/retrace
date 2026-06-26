@@ -141,7 +141,7 @@ function buildConfigStruct(opts) {
    * offset 112  extra_range_end     u64
    * offset 120  disable_embed_code  u32
    * offset 124  enable_pc_delta     u32
-   * offset 128  enable_old_value    u32
+   * offset 128  _reserved_old_value u32  (deprecated, ignored)
    * offset 132  enable_fpr          u32
    * offset 136  disable_compress    u32
    */
@@ -173,7 +173,7 @@ function buildConfigStruct(opts) {
   cfg.add(112).writePointer(opts.extraRangeEnd || NULL);
   cfg.add(120).writeU32(opts.embedCode === false ? 1 : 0);
   cfg.add(124).writeU32(opts.pcDelta    ? 1 : 0);
-  cfg.add(128).writeU32(opts.oldValue   ? 1 : 0);
+  cfg.add(128).writeU32(0); /* _reserved_old_value: deprecated, always 0 */
   cfg.add(132).writeU32(opts.fpr        ? 1 : 0);
   cfg.add(136).writeU32(opts.noCompress ? 1 : 0);
   return cfg;

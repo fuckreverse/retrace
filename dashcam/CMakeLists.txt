@@ -1,62 +1,50 @@
-# qbditrace - high performance instruction tracer built on QBDI
+# qbditrace — high-performance instruction tracer built on QBDI
 #
-# This is a self-contained CMake project (not wired into the main QBDI build)
-# so it can be built against an already-compiled QBDI without re-running the
-# heavy LLVM build. It produces two artifacts:
+# Self-contained CMake project (not wired into the main QBDI build).
+# Produces three categories of artifacts:
 #
-#   * libqbditrace (SHARED)  - the tracer dylib, loaded into the target by Frida.
-#                              Built for the TARGET (e.g. iOS arm64), linking the
-#                              prebuilt static libQBDI.a.
-#   * trace_decode (host)    - the offline decoder. Built for the HOST. Disable
-#                              with -DQBDITRACE_BUILD_DECODER=OFF if you only
-#                              want the dylib (e.g. during cross-compilation).
+#   * libqbditrace (SHARED)  — tracer dylib, loaded into the target by Frida
+#   * trace_decode (host)    — offline decoder (optional, -DQBDITRACE_BUILD_DECODER)
+#   * unit / integration tests (host) — lightweight, no QBDI required
 #
-# Because the dylib and the decoder usually target different platforms, build
-# them in separate configure runs:
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fixed build directories (DO NOT create new ones)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
-#   # 1) the dylib for iOS (reuse the same toolchain used to build QBDI).
-#   #    Note: Config.h for the STATIC lib lives in build-ios/include-static,
-#   #    while Version.h lives in build-ios/include -- pass BOTH.
-#   cmake -S tools/qbditrace -B build-trace-ios \
+#   Directory               Purpose                          cmake command
+#   ──────────────────────  ───────────────────────────────── ─────────────
+#   build/                  Host tests + decoder (default)   cmake ..
+#   build-ios/              iOS dylib (cross-compile)        (see below)
+#
+# All FetchContent sources are cached in _deps/ (shared across all build
+# dirs).  Never delete _deps/ — it avoids re-downloading zstd, Catch2, etc.
+#
+# Daily development (incremental build):
+#
+#   cd tools/qbditrace/build && ninja -j$(nproc)
+#
+# First-time setup (host tests + decoder):
+#
+#   cd tools/qbditrace && mkdir build && cd build
+#   cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF
+#   ninja -j$(nproc)
+#   ctest --output-on-failure
+#
+# iOS dylib cross-compile (from repo root):
+#
+#   bash tools/qbditrace/build-qbditrace-ios.sh
+#
+# Or manually:
+#
+#   cmake -S tools/qbditrace -B tools/qbditrace/build-ios \
 #         -DCMAKE_TOOLCHAIN_FILE=cmake/config/ios.toolchain.cmake \
 #         -DPLATFORM=OS64 \
 #         -DQBDI_INCLUDE_DIR=$PWD/include \
 #         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-ios/include;$PWD/build-ios/include-static" \
 #         -DQBDI_STATIC_LIB=$PWD/build-ios/libQBDI.a \
-#         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF
-#   cmake --build build-trace-ios
-#
-#   # 2) the decoder for the host (with Capstone):
-#   cmake -S tools/qbditrace -B build-trace-host \
-#         -DQBDITRACE_BUILD_DYLIB=OFF -DQBDITRACE_BUILD_DECODER=ON
-#   cmake --build build-trace-host
-#
-# Or skip CMake entirely.  Use the build-qbditrace-ios.sh helper script from
-# the repo root, which also cross-compiles zstd and enables compression:
-#
-#   bash tools/qbditrace/build-qbditrace-ios.sh
-#
-# Manual equivalent (without zstd — compression will be SILENTLY DISABLED):
-#   xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O2 -dynamiclib \
-#       -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static -Itools/qbditrace \
-#       tools/qbditrace/QBDITrace.cpp build-ios/libQBDI.a build-ios/libqbdi-llvm.a \
-#       -framework Foundation -framework CoreFoundation -o libqbditrace.dylib
-#
-# With zstd (recommended — adds ~1.5MB to dylib, enables ~3-10x trace compression):
-#   # First build libzstd for iOS (one-time):
-#   ZSTD_SRC=tools/tenet/_deps/zstd-src/lib
-#   xcrun --sdk iphoneos clang -arch arm64 -O2 -DZSTD_MULTITHREAD=0 \
-#       -I${ZSTD_SRC} -I${ZSTD_SRC}/common \
-#       -c ${ZSTD_SRC}/common/*.c ${ZSTD_SRC}/compress/*.c ${ZSTD_SRC}/decompress/*.c
-#   ar rcs build-ios/libzstd.a *.o && rm -f *.o
-#   # Then build dylib with zstd:
-#   xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O2 -dynamiclib \
-#       -DQBDITRACE_HAVE_ZSTD=1 \
-#       -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static \
-#       -Itools/qbditrace -I${ZSTD_SRC} \
-#       tools/qbditrace/QBDITrace.cpp build-ios/libQBDI.a build-ios/libqbdi-llvm.a \
-#       build-ios/libzstd.a \
-#       -framework Foundation -framework CoreFoundation -o libqbditrace.dylib
+#         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF \
+#         -DQBDITRACE_BUILD_TESTS=OFF
+#   cmake --build tools/qbditrace/build-ios
 
 cmake_minimum_required(VERSION 3.16)
 project(qbditrace C CXX)
@@ -73,17 +61,26 @@ option(QBDITRACE_BUILD_TESTS "Build unit tests (host)" ON)
 option(QBDITRACE_ENABLE_ZSTD "Enable zstd compression for trace output" ON)
 
 # ---------------------------------------------------------------------------
+# FetchContent shared cache (same pattern as tenet)
+# ---------------------------------------------------------------------------
+# All FetchContent sources are cached under tools/qbditrace/_deps/.  This
+# directory is shared across all build trees (build/, build-host-test/, etc.)
+# so dependencies are downloaded once and never re-cloned.
+#
+# If tenet's _deps/ already has the source (e.g. zstd, Catch2), the
+# FETCHCONTENT_UPDATES_DISCONNECTED flag skips network checks entirely.
+include(FetchContent)
+if(NOT DEFINED FETCHCONTENT_BASE_DIR OR FETCHCONTENT_BASE_DIR STREQUAL "")
+  set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_deps" CACHE PATH
+      "Shared FetchContent source cache (shared across all build trees)" FORCE)
+endif()
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+    "Skip network update check for already-downloaded FetchContent packages" FORCE)
+
+# ---------------------------------------------------------------------------
 # Zstd (static, source build via FetchContent)
 # ---------------------------------------------------------------------------
 if(QBDITRACE_ENABLE_ZSTD)
-  include(FetchContent)
-
-  # Use the shared _deps cache from tenet if available, otherwise local.
-  if(NOT FETCHCONTENT_BASE_DIR)
-    set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tenet/_deps"
-        CACHE PATH "Shared FetchContent cache (reuse tenet's)")
-  endif()
-
   # Disable everything except the static library.
   set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
   set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -204,7 +201,16 @@ if(QBDITRACE_BUILD_TESTS)
   # ── Catch2 unit tests ───────────────────────────────────────────────────────
   # These require Catch2 3.x.  If tenet is available as a sibling CMake project
   # it already fetches Catch2 — we can borrow its target when present.
-  # Otherwise, skip silently (legacy tests above cover the same code paths).
+  # Otherwise, fetch Catch2 standalone so the tests can still be built.
+  if(NOT TARGET Catch2::Catch2WithMain)
+    FetchContent_Declare(Catch2
+      GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+      GIT_TAG        v3.5.4
+      GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(Catch2)
+    list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
+  endif()
   if(TARGET Catch2::Catch2WithMain)
     include(Catch)
 
@@ -225,6 +231,15 @@ if(QBDITRACE_BUILD_TESTS)
     target_link_libraries(test_ring_buffer_catch2 PRIVATE
         Catch2::Catch2WithMain Threads::Threads)
     catch_discover_tests(test_ring_buffer_catch2 DISCOVERY_MODE PRE_TEST)
+
+    # test_flat_containers: FlatPcSet, FlatWriteRegCache, WriteRegList tests.
+    add_executable(test_flat_containers
+        tests/unit/test_flat_containers.cpp)
+    target_include_directories(test_flat_containers PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_flat_containers PRIVATE
+        Catch2::Catch2WithMain)
+    catch_discover_tests(test_flat_containers DISCOVERY_MODE PRE_TEST)
   endif()
 
   # ── macOS arm64 in-process integration test ─────────────────────────────────

@@ -32,6 +32,7 @@
 #include "QBDITrace.h"
 #include "RingBuffer.h"
 #include "TraceFormat.h"
+#include "FlatContainers.h"
 
 #include "QBDI.h"
 
@@ -44,6 +45,7 @@
 #define QBDI_FPR_GET(state, i) \
   (reinterpret_cast<const uint64_t *>(state)[i])
 
+#include <atomic>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -180,13 +182,9 @@ struct Config {
    * QBDITRACE_VERSION_V5_PC_DELTA. Off by default for backward compatibility. */
   bool pc_delta_mode = false;
 
-  /* When set, capture old (pre-write) memory values in every WRITE memory
-   * access record.  Uses the larger qbditrace_memacc_v6_t (48 bytes) instead
-   * of qbditrace_memacc_t (32 bytes).  safeRead() is called in preInstCB
-   * for each pending write address to snapshot the bytes before execution.
-   * Activates QBDITRACE_HF_OLD_VALUE and bumps version to
-   * QBDITRACE_VERSION_V6_OLD_VALUE. Off by default. */
-  bool old_value_mode = false;
+  /* [REMOVED] old_value_mode has been eliminated.  The offline analyser can
+   * infer old values from its MemoryModel write history, so the per-instruction
+   * safeRead() overhead in preInstCB is no longer justified. */
 
   /* When set, capture 128-bit FPR (NEON v0..v31) diffs per instruction and
    * include a 512-byte FPR snapshot in every ANCHOR.  Activates
@@ -216,17 +214,11 @@ inline int classifyObjcTarget(const Config &c, uint64_t target) {
   return -1;
 }
 
-struct WriteRegList {
-  /* QBDI GPR indices (0..30) written by an instruction. AArch64 rarely writes
-   * more than a couple of GPRs in one instruction (ldp writes 2), so a small
-   * inline array suffices. */
-  uint8_t count = 0;
-  uint8_t idx[8] = {0};
-  /* QBDI FPR indices (0..31 = v0..v31) written by an instruction.
-   * NEON instructions often write 1-2 vector registers per opcode. */
-  uint8_t fpr_count = 0;
-  uint8_t fpr_idx[8] = {0};
-};
+/* WriteRegList, FlatPcSet, FlatWriteRegCache are defined in FlatContainers.h
+ * (extracted for independent unit testing). */
+using qbditrace::WriteRegList;
+using qbditrace::FlatPcSet;
+using qbditrace::FlatWriteRegCache;
 
 class Tracer {
 public:
@@ -360,8 +352,6 @@ private:
     // older readers can gracefully reject traces they cannot parse correctly.
     if (cfg_.fpr_mode)
       h.version = QBDITRACE_VERSION_V7_HAS_FPR;
-    else if (cfg_.old_value_mode)
-      h.version = QBDITRACE_VERSION_V6_OLD_VALUE;
     else if (cfg_.pc_delta_mode)
       h.version = QBDITRACE_VERSION_V5_PC_DELTA;
     else
@@ -388,12 +378,10 @@ private:
       h.flags |= QBDITRACE_HF_HAS_CODE;
     if (cfg_.pc_delta_mode)
       h.flags |= QBDITRACE_HF_PC_DELTA;
-    if (cfg_.old_value_mode)
-      h.flags |= QBDITRACE_HF_OLD_VALUE;
     if (cfg_.fpr_mode)
       h.flags |= QBDITRACE_HF_HAS_FPR;
     if (cfg_.compress && writer_.compressed())
-      h.flags |= QBDITRACE_HF_COMPRESSED;
+      h.flags |= QBDITRACE_HF_BLOCK_COMPRESSED;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
     writer_.writeHeaderRaw(&h, sizeof(h));
@@ -474,6 +462,12 @@ private:
 
 struct ThreadCtx {
   ThreadBuffer *buf = nullptr;
+  const Config *cached_cfg = nullptr; /* cached pointer to Tracer::get().cfg();
+                                       * avoids Meyers-singleton atomic guard
+                                       * check on every instruction. Set once in
+                                       * ensureThreadCtx and never changes (the
+                                       * Config object lives inside Tracer which
+                                       * is a process-lifetime singleton). */
   uint64_t inst_count = 0;
   uint64_t cur_pc = 0;       /* executed PC carried PREINST -> POSTINST */
   QBDI::FPRState *cur_fpr = nullptr; /* FPR pointer carried PREINST -> POSTINST */
@@ -548,80 +542,15 @@ struct ThreadCtx {
   std::vector<PendingCode> pending_code;
   static constexpr size_t kPendingCodeCap = 4096;
 
-  /* v6 old-value mode: pre-write memory snapshots captured in preInstCB.
-   * For each WRITE access the upcoming instruction will perform, we read the
-   * current memory content *before* the instruction executes and store it here.
-   * postInstCB then attaches these snapshots to the memacc_v6_t records.
-   * Limited to 8 write accesses per instruction (same as QBDI's MemoryAccess
-   * limit in practice — AArch64 STP can produce 2 writes per instruction). */
-  struct PreWriteSnap {
-    uint64_t addr;
-    uint8_t  size;           // 1..16 bytes
-    uint8_t  old_bytes[16];  // captured bytes (zero-filled if read failed)
-    bool     captured;       // false = safeRead failed → set MF_OLD_UNKNOWN
-  };
-  static constexpr uint8_t kMaxPreWriteSnaps = 8;
-  PreWriteSnap pre_write_snaps[kMaxPreWriteSnaps];
-  uint8_t pre_write_count = 0;
+  /* Per-thread flat cache for WriteRegList (definition in FlatContainers.h). */
+  FlatWriteRegCache wreg_cache;
 
-  /* PCs for which a REC_CODE has already been written by this thread, so the
-   * raw bytes of each distinct instruction are emitted only once. Per-thread
-   * (not shared) to keep the hot path lock-free; if two threads trace the same
-   * code both emit it and the decoder simply overwrites identical entries.
-   *
-   * Uses a custom flat open-addressing hash set instead of std::unordered_set.
-   * Benefit: contiguous memory layout → no pointer chasing, much better cache
-   * behavior on the hot path. For typical traces (10K-100K distinct PCs), the
-   * table fits in L2/L3 and probe chains are 1-2 steps on average. */
-  struct FlatPcSet {
-    /* Sentinel: 0 means empty slot (PC 0 is never a valid instruction addr). */
-    static constexpr uint64_t kEmpty = 0;
-    static constexpr size_t kInitCap = 8192; /* power of two; ~64 KiB */
-    static constexpr double kMaxLoad = 0.75;
+  /* Pointer to the WriteRegList looked up in preInstCB and reused by postInstCB
+   * for the same instruction.  Avoids a second cache lookup per instruction. */
+  const WriteRegList *cur_wl = nullptr;
 
-    uint64_t *slots_ = nullptr;
-    size_t    cap_   = 0;    /* always power of two */
-    size_t    size_  = 0;
-
-    FlatPcSet() { resize(kInitCap); }
-    ~FlatPcSet() { std::free(slots_); }
-
-    /* Returns true if newly inserted, false if already present. */
-    bool insert(uint64_t pc) {
-      if (size_ >= (size_t)(cap_ * kMaxLoad)) {
-        resize(cap_ * 2);
-      }
-      size_t mask = cap_ - 1;
-      /* Fibonacci hash (golden ratio mixing) for better distribution of
-       * 4-byte-aligned PC values. */
-      size_t idx = (size_t)((pc >> 2) * 0x9E3779B97F4A7C15ULL) & mask;
-      for (;;) {
-        uint64_t s = slots_[idx];
-        if (s == pc) return false;   /* already present */
-        if (s == kEmpty) {
-          slots_[idx] = pc;
-          ++size_;
-          return true;               /* newly inserted */
-        }
-        idx = (idx + 1) & mask;      /* linear probe */
-      }
-    }
-
-  private:
-    void resize(size_t new_cap) {
-      uint64_t *old = slots_;
-      size_t old_cap = cap_;
-      cap_ = new_cap;
-      slots_ = (uint64_t *)std::calloc(cap_, sizeof(uint64_t));
-      size_ = 0;
-      if (old) {
-        for (size_t i = 0; i < old_cap; ++i) {
-          if (old[i] != kEmpty) insert(old[i]);
-        }
-        std::free(old);
-      }
-    }
-  } seen_code;
+  /* Per-thread PC dedup set for CODE records (definition in FlatContainers.h). */
+  FlatPcSet seen_code;
 
   ~ThreadCtx(); /* defined after flushPendingCode (uses it for LL/SC cleanup) */
 };
@@ -638,9 +567,11 @@ ThreadCtx *ensureThreadCtx() {
   if (g_tctx) {
     return g_tctx;
   }
+  Tracer &T = Tracer::get();
   ThreadCtx *c = new ThreadCtx();
-  c->buf = new ThreadBuffer(&Tracer::get().writer(), currentThreadId());
-  Tracer::get().registerThreadBuffer(c->buf);
+  c->buf = new ThreadBuffer(&T.writer(), currentThreadId());
+  c->cached_cfg = &T.cfg();
+  T.registerThreadBuffer(c->buf);
   g_tctx = c;
   return c;
 }
@@ -661,22 +592,26 @@ inline void emitThreadMarker(ThreadBuffer *buf) {
  * chunk rotation cannot sneak in between the two writes and orphan the record
  * from its marker. After this call, a reserve(payload) is guaranteed not to
  * rotate. Returns after emitting the marker if it was needed.
+ *
+ * Steady-state fast path: needThreadMarker() is false except right after a
+ * chunk rotation (roughly once per 64 MB of records), so we mark the marker
+ * branch as [[unlikely]] and keep the common path to a single room check.
  */
 inline void prepareRecord(ThreadBuffer *buf, size_t payload) {
-  size_t need = payload;
-  if (buf->needThreadMarker()) {
-    need += sizeof(qbditrace_thread_head_t);
+  if (__builtin_expect(!buf->needThreadMarker(), 1)) {
+    buf->ensureRoom(payload);
+    return;
   }
-  buf->ensureRoom(need);
-  if (buf->needThreadMarker()) {
-    emitThreadMarker(buf);
-  }
+  /* Slow path: marker needed — account for its size, ensure room for both,
+   * then emit the marker before the caller writes its record. */
+  buf->ensureRoom(payload + sizeof(qbditrace_thread_head_t));
+  emitThreadMarker(buf);
 }
 
 inline void emitAnchor(ThreadBuffer *buf, QBDI::GPRState *gpr,
-                       QBDI::FPRState *fpr, uint64_t pc) {
+                       QBDI::FPRState *fpr, uint64_t pc,
+                       bool fpr_mode) {
   const uint32_t n = QBDITRACE_AARCH64_NUM_GPR;
-  const bool fpr_mode = Tracer::get().cfg().fpr_mode;
   const size_t fpr_bytes = fpr_mode ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
   const size_t payload =
       sizeof(qbditrace_anchor_head_t) + (size_t)n * sizeof(uint64_t) + fpr_bytes;
@@ -804,10 +739,14 @@ struct PcRingEntry {
   uint32_t opcode;   /* raw 4-byte AArch64 instruction word (0 if unreadable) */
 };
 PcRingEntry g_pc_ring[kPcRingSize];
-volatile uint64_t g_pc_ring_pos = 0; /* monotonically increasing write index */
+std::atomic<uint64_t> g_pc_ring_pos{0}; /* monotonically increasing write index;
+                                          * relaxed ordering suffices: only the
+                                          * owning thread writes, readers (fault
+                                          * handler / dump) tolerate stale values. */
 
 inline void pcRingPush(uint64_t pc) {
-  uint64_t i = g_pc_ring_pos & (kPcRingSize - 1);
+  uint64_t pos = g_pc_ring_pos.load(std::memory_order_relaxed);
+  uint64_t i = pos & (kPcRingSize - 1);
   g_pc_ring[i].pc = pc;
   /* Direct dereference: QBDI guarantees instrumented PCs are readable code
    * pages — no need for vm_read_overwrite syscall on the hot path. The old
@@ -815,8 +754,8 @@ inline void pcRingPush(uint64_t pc) {
    * (~800-2000 ns Mach trap on every instruction for a diagnostic-only ring).
    * If the PC were somehow unreadable, QBDI itself would have already faulted
    * during disassembly/JIT, so this deref is safe for all instrumented code. */
-  g_pc_ring[i].opcode = *(volatile uint32_t *)(uintptr_t)pc;
-  g_pc_ring_pos = g_pc_ring_pos + 1;
+  g_pc_ring[i].opcode = *reinterpret_cast<const uint32_t *>(pc);
+  g_pc_ring_pos.store(pos + 1, std::memory_order_relaxed);
 }
 
 /* async-signal-safe-ish writer: only uses write(2) and integer formatting. */
@@ -844,7 +783,7 @@ void writePcRing(int fd) {
   static const char win[] = "\n--- last executed PCs (oldest first) ---\n";
   (void)::write(fd, win, sizeof(win) - 1);
 
-  uint64_t total = g_pc_ring_pos;
+  uint64_t total = g_pc_ring_pos.load(std::memory_order_relaxed);
   uint64_t count = total < kPcRingSize ? total : kPcRingSize;
   uint64_t start = total - count;
   for (uint64_t k = 0; k < count; ++k) {
@@ -982,7 +921,7 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
                          QBDI::FPRState *fpr, void * /*data*/) {
   (void)vm;
   ThreadCtx *c = ensureThreadCtx();
-  const Config &cfg = Tracer::get().cfg();
+  const Config &cfg = *c->cached_cfg;
 
   /* ── Stack-depth sentinel ─────────────────────────────────────────────────
    * When initial_sp is armed, check whether the current SP has risen
@@ -1040,7 +979,7 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    *
    * The dangerous calls that tear the exclusive reservation are:
    *   - emitAnchor  → prepareRecord → may trigger chunk write (mutex)
-   *   - emitCodeOnce → calls safeRead (vm_read_overwrite)
+   *   - emitCodeWithBytes → calls prepareRecord (may trigger chunk write)
    * Both are still guarded by !c->ldxr_pending checks further below.
    *
    * For opcode-based STXR detection while pending, we use the opcode word
@@ -1054,7 +993,7 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
      * wasting another ~800-2000 ns Mach trap per instruction.  The pcRing entry
      * for THIS instruction is at (g_pc_ring_pos - 1) since pcRingPush already
      * incremented the position counter above. */
-    uint64_t ring_idx = (g_pc_ring_pos - 1u) & (kPcRingSize - 1u);
+    uint64_t ring_idx = (g_pc_ring_pos.load(std::memory_order_relaxed) - 1u) & (kPcRingSize - 1u);
     cur_opcode = g_pc_ring[ring_idx].opcode;
     if (isLdxr(cur_opcode)) {
       /* The LDXR is about to execute — emit its CODE record NOW, while the
@@ -1073,7 +1012,7 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
      * pcRingPush already wrote (g_pc_ring is a plain in-memory array, no
      * syscall). The ring index for THIS instruction is (g_pc_ring_pos - 1)
      * because pcRingPush incremented g_pc_ring_pos before we reach here. */
-    uint64_t ring_idx = (g_pc_ring_pos - 1u) & (kPcRingSize - 1u);
+    uint64_t ring_idx = (g_pc_ring_pos.load(std::memory_order_relaxed) - 1u) & (kPcRingSize - 1u);
     cur_opcode = (uint32_t)g_pc_ring[ring_idx].opcode;
     if (isStxr(cur_opcode)) {
       /* STXR is about to execute — the critical section ends with this insn.
@@ -1083,8 +1022,8 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
       /* Now that the reservation is no longer live, flush the CODE records
        * deferred for the LL/SC body (LDXR's own CODE was already emitted in
        * the !ldxr_pending branch above; this covers the middle instructions).
-       * The STXR's own CODE is handled by postInstCB's emitCodeOnce (which
-       * runs because ldxr_pending is now false).                            */
+       * The STXR's own CODE is handled by postInstCB's emitCodeWithBytes
+       * (which runs because ldxr_pending is now false).                     */
       if (cfg.embed_code) {
         flushPendingCode(c);
       }
@@ -1101,11 +1040,47 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   }
 #endif
 
-  /* Snapshot x0..lr for POSTINST diffing, but only when reg diffs are wanted:
-   * with REGDIFF off this 31-register read is pure overhead on every insn. */
+  /* Precision prev_reg snapshot: look up the WriteRegList for this PC and
+   * only capture the 1-2 registers the instruction actually writes.  This
+   * replaces the previous brute-force loop over all 31 GPRs.
+   *
+   * The lookup goes through FlatWriteRegCache (per-thread, lock-free); on a
+   * miss it falls through to Tracer::writeRegsFor (global shared_mutex) and
+   * then populates the per-thread cache.  After steady-state warm-up (a few
+   * hundred distinct PCs), virtually every access is a single hash probe.
+   *
+   * cur_wl is stashed so postInstCB can reuse the same WriteRegList without a
+   * second lookup.
+   *
+   * EXCEPTION: inside an LL/SC critical section (ldxr_pending), we must NOT
+   * call Tracer::writeRegsFor (which takes a shared_mutex, a potential syscall
+   * that clears the ARM exclusive reservation).  The per-thread cache lookup
+   * is always safe (pure memory reads), but a cache miss while ldxr_pending
+   * would need to call through to the global cache.  In that case we fall back
+   * to a full 31-register snapshot so that no register change is ever lost. */
   if (cfg.record & QBDITRACE_REC_REGDIFF) {
-    for (int i = 0; i <= 30; ++i) {
-      c->prev_reg[i] = QBDI_GPR_GET(gpr, i);
+    const WriteRegList *wl = c->wreg_cache.find(c->cur_pc);
+    if (!wl) {
+      if (!c->ldxr_pending) {
+        /* Cache miss, safe to call global (outside LL/SC). */
+        const WriteRegList *global_wl = Tracer::get().writeRegsFor(vm, c->cur_pc);
+        if (global_wl) {
+          c->wreg_cache.insert(c->cur_pc, *global_wl);
+          wl = c->wreg_cache.find(c->cur_pc);
+        }
+      }
+    }
+    c->cur_wl = wl;
+    if (wl && c->prev_valid) {
+      /* Precise snapshot: only the GPRs that this instruction will write. */
+      for (uint8_t k = 0; k < wl->count; ++k) {
+        c->prev_reg[wl->idx[k]] = QBDI_GPR_GET(gpr, wl->idx[k]);
+      }
+    } else {
+      /* First instruction or cache miss inside LL/SC: full snapshot. */
+      for (int i = 0; i <= 30; ++i) {
+        c->prev_reg[i] = QBDI_GPR_GET(gpr, i);
+      }
     }
     c->prev_valid = true;
   }
@@ -1121,41 +1096,9 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    * reservation and cause the STXR to always fail (infinite retry loop). */
   if (!c->ldxr_pending &&
       (c->need_anchor || c->since_anchor >= cfg.anchor_interval)) {
-    emitAnchor(c->buf, gpr, fpr, c->cur_pc); /* handles marker/chunk atomicity */
+    emitAnchor(c->buf, gpr, fpr, c->cur_pc, cfg.fpr_mode); /* handles marker/chunk atomicity */
     c->since_anchor = 0;
     c->need_anchor = false;
-  }
-
-  /* ── v6 old-value capture ──────────────────────────────────────────────────
-   * Snapshot the bytes at each WRITE address before the instruction executes.
-   * We use QBDI's MemoryAccess list (PREINST gives the *predicted* accesses;
-   * addresses are computed from the current GPR state so they are correct for
-   * non-speculative stores). Only actual WRITE accesses are snapshotted;
-   * READs don't overwrite anything so no pre-snapshot is needed.
-   *
-   * This is safe here because:
-   *   • safeRead is only called outside ldxr_pending sections (guard below).
-   *   • The safeRead uses vm_read_overwrite which does NOT clear the exclusive
-   *     reservation since we skip the entire block when ldxr_pending is true.
-   */
-  c->pre_write_count = 0;
-  if (cfg.old_value_mode && !c->ldxr_pending && (cfg.record & QBDITRACE_REC_MEM)) {
-    /* Ask QBDI for the memory accesses the *about-to-execute* instruction will
-     * perform. In PREINST the VM has already computed the access list.
-     * Some accesses may report MEMORY_UNKNOWN_VALUE or size=0 (speculative /
-     * indirect); we skip those as their addresses are unreliable. */
-    std::vector<QBDI::MemoryAccess> pred = reinterpret_cast<QBDI::VM *>(vm)->getInstMemoryAccess();
-    for (const auto &m : pred) {
-      if (!(m.type & QBDI::MEMORY_WRITE)) continue;             // skip reads
-      if (m.size == 0 || m.size > 16) continue;                 // skip unknown/huge
-      if (m.flags & QBDI::MEMORY_UNKNOWN_SIZE) continue;        // skip unreliable
-      if (c->pre_write_count >= ThreadCtx::kMaxPreWriteSnaps) break;
-      ThreadCtx::PreWriteSnap &snap = c->pre_write_snaps[c->pre_write_count++];
-      snap.addr = m.accessAddress;
-      snap.size = (uint8_t)m.size;
-      std::memset(snap.old_bytes, 0, sizeof(snap.old_bytes));
-      snap.captured = safeRead(snap.addr, snap.old_bytes, snap.size);
-    }
   }
 
   return QBDI::CONTINUE;
@@ -1166,11 +1109,6 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
  * written.  This avoids duplicating the loop + safeRead logic in two code
  * paths.
  *
- * v6 mode (old_value_mode): each memacc record is qbditrace_memacc_v6_t (48B)
- * instead of qbditrace_memacc_t (32B). For WRITE accesses the old_value/
- * old_value_hi fields are filled from the pre_write_snaps captured in preInstCB.
- * `snaps` and `n_snaps` may be null/0 in v4/v5 mode.
- *
  * v7 mode (fpr_mode): after the GPR diff section, emit n_fprdiff *
  * qbditrace_fprdiff_t records (24 bytes each).  fprbuf and fprbuf_n describe
  * which FPR indices changed; their 128-bit values are read from `fpr_state`.
@@ -1179,7 +1117,6 @@ static inline uint8_t *serializeInstPayload(
     uint8_t *p,
     const qbditrace_regdiff_t *regbuf, uint8_t regbuf_n,
     const QBDI::MemoryAccess *macc, uint8_t n_mem,
-    const ThreadCtx::PreWriteSnap *snaps = nullptr, uint8_t n_snaps = 0,
     const QBDI::FPRState *fpr_state = nullptr,
     const uint8_t *fprbuf = nullptr, uint8_t fprbuf_n = 0) {
   for (uint8_t k = 0; k < regbuf_n; ++k) {
@@ -1202,89 +1139,27 @@ static inline uint8_t *serializeInstPayload(
     }
   }
 
-  const bool v6 = (snaps != nullptr);
-
   for (uint8_t k = 0; k < n_mem; ++k) {
     const QBDI::MemoryAccess &m = macc[k];
-    if (v6) {
-      /* v6: use the extended struct with old_value fields */
-      qbditrace_memacc_v6_t mr;
-      mr.mem_type  = (uint8_t)m.type;
-      mr.mem_flags = (uint8_t)m.flags;
-      mr.size      = m.size;
-      mr.addr      = m.accessAddress;
-      mr.value     = m.value;
-      mr.value_hi  = 0;
-      mr.old_value     = 0;
-      mr.old_value_hi  = 0;
-
-        /* Recover value if QBDI reports it as unknown.
-         * For WRITE accesses: read the already-written memory to get new value.
-         * For READ accesses: read the memory value that was loaded (post-exec,
-         *   the bytes are still at the load address, giving the decoder the
-         *   loaded datum for load-value taint propagation). */
-        if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-            m.size > 0 && m.size <= 16) {
-          uint8_t bytes[16] = {0};
-          if (safeRead(m.accessAddress, bytes, m.size)) {
-            std::memcpy(&mr.value,    bytes,     std::min((size_t)m.size, (size_t)8));
-            if (m.size > 8)
-            std::memcpy(&mr.value_hi, bytes + 8, m.size - 8);
-          mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
-        }
+    qbditrace_memacc_t mr;
+    mr.mem_type  = (uint8_t)m.type;
+    mr.mem_flags = (uint8_t)m.flags;
+    mr.size      = m.size;
+    mr.addr      = m.accessAddress;
+    mr.value     = m.value;
+    mr.value_hi  = 0;
+    /* Recover value for both READ and WRITE when QBDI reports unknown. */
+    if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
+        m.size > 0 && m.size <= 16) {
+      uint8_t bytes[16] = {0};
+      if (safeRead(m.accessAddress, bytes, m.size)) {
+        std::memcpy(&mr.value, bytes, 8);
+        std::memcpy(&mr.value_hi, bytes + 8, 8);
+        mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
       }
-
-      /* Fill old value for WRITE accesses from the preInstCB snapshots.
-       * Match by address (snaps are ordered by preInstCB collection order, so
-       * scan linearly — there are at most 8 entries). */
-      if (m.type & QBDI::MEMORY_WRITE) {
-        bool found = false;
-        for (uint8_t s = 0; s < n_snaps; ++s) {
-          if (snaps[s].addr == m.accessAddress && snaps[s].size == (uint8_t)m.size) {
-            if (snaps[s].captured) {
-              std::memcpy(&mr.old_value,    snaps[s].old_bytes,
-                          std::min((size_t)m.size, (size_t)8));
-              if (m.size > 8)
-                std::memcpy(&mr.old_value_hi, snaps[s].old_bytes + 8,
-                            m.size - 8);
-            } else {
-              mr.mem_flags |= QBDITRACE_MF_OLD_UNKNOWN;
-            }
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          /* No pre-snap for this address (e.g. address changed between PREINST
-           * and POSTINST due to register modification — very rare). Mark unknown. */
-          mr.mem_flags |= QBDITRACE_MF_OLD_UNKNOWN;
-        }
-      }
-
-      std::memcpy(p, &mr, sizeof(mr));
-      p += sizeof(mr);
-        } else {
-          /* v4/v5: original 32-byte struct */
-          qbditrace_memacc_t mr;
-          mr.mem_type  = (uint8_t)m.type;
-          mr.mem_flags = (uint8_t)m.flags;
-          mr.size      = m.size;
-          mr.addr      = m.accessAddress;
-          mr.value     = m.value;
-          mr.value_hi  = 0;
-          /* Recover value for both READ and WRITE when QBDI reports unknown. */
-          if ((m.flags & QBDI::MEMORY_UNKNOWN_VALUE) &&
-              m.size > 0 && m.size <= 16) {
-            uint8_t bytes[16] = {0};
-            if (safeRead(m.accessAddress, bytes, m.size)) {
-              std::memcpy(&mr.value, bytes, 8);
-              std::memcpy(&mr.value_hi, bytes + 8, 8);
-          mr.mem_flags &= (uint8_t)(~(unsigned)QBDI::MEMORY_UNKNOWN_VALUE);
-        }
-      }
-      std::memcpy(p, &mr, sizeof(mr));
-      p += sizeof(mr);
     }
+    std::memcpy(p, &mr, sizeof(mr));
+    p += sizeof(mr);
   }
   return p;
 }
@@ -1293,7 +1168,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
                           QBDI::FPRState *fpr, void * /*data*/) {
   ThreadCtx *c = g_tctx ? g_tctx : ensureThreadCtx();
   ThreadBuffer *buf = c->buf;
-  const Config &cfg = Tracer::get().cfg();
+  const Config &cfg = *c->cached_cfg;
   const uint64_t exec_pc = c->cur_pc;
   /* Use the FPR pointer stashed in preInstCB (same instruction, same pointer). */
   if (fpr == nullptr) fpr = c->cur_fpr;
@@ -1303,13 +1178,20 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    * CODE record is independent of the INST record that follows (the decoder
    * keys it by PC), so ordering/chunk boundaries between them do not matter.
    *
-   * Skip inside an LL/SC critical section: emitCodeOnce calls safeRead which
-   * uses mach_vm_read_overwrite (a syscall), and any syscall clears the ARM
-   * exclusive reservation, causing the paired STXR to always fail. If we skip
-   * the CODE record here, the PC will be seen again on the retry and the record
-   * will be emitted then (outside the exclusive window). */
+   * We use emitCodeWithBytes with the opcode already captured by pcRingPush
+   * (a direct 4-byte deref, no syscall).  The previous emitCodeOnce called
+   * safeRead (mach_vm_read_overwrite), adding ~800-2000 ns per *first-time*
+   * PC.  Since pcRingPush runs on every instruction anyway, reusing its
+   * opcode is free.  The pc_ring entry for this instruction is at
+   * (g_pc_ring_pos - 1) because pcRingPush already incremented the counter.
+   *
+   * Skip inside an LL/SC critical section: prepareRecord may take a mutex/
+   * syscall that clears the ARM exclusive reservation.  The CODE record
+   * for those PCs is deferred via pending_code and flushed when STXR closes
+   * the window. */
   if (cfg.embed_code && !c->ldxr_pending) {
-    emitCodeOnce(c, exec_pc);
+    uint64_t ring_idx = (g_pc_ring_pos.load(std::memory_order_relaxed) - 1u) & (kPcRingSize - 1u);
+    emitCodeWithBytes(c, exec_pc, g_pc_ring[ring_idx].opcode);
   }
 
   /* --- register diff (absolute values; decoder rebuilds prev from anchors) --- */
@@ -1319,7 +1201,18 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   uint8_t fprbuf_n = 0;
   uint8_t fprbuf[8]; /* indices of FPRs that changed */
   if (cfg.record & QBDITRACE_REC_REGDIFF) {
-    const WriteRegList *wl = Tracer::get().writeRegsFor(vm, exec_pc);
+    /* Reuse the WriteRegList looked up in preInstCB (stashed in cur_wl).
+     * If preInstCB had a cache miss inside LL/SC (cur_wl is null), fall back
+     * to the global lookup — we are now in postInstCB where ldxr_pending may
+     * already be cleared (STXR just executed), so the mutex is safe. */
+    const WriteRegList *wl = c->cur_wl;
+    if (!wl) {
+      wl = Tracer::get().writeRegsFor(vm, exec_pc);
+      /* Populate the per-thread cache for future iterations. */
+      if (wl) {
+        c->wreg_cache.insert(exec_pc, *wl);
+      }
+    }
     if (wl && c->prev_valid) {
       for (uint8_t k = 0; k < wl->count; ++k) {
         uint8_t idx = wl->idx[k];
@@ -1364,18 +1257,11 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    * v4: qbditrace_inst_head_t (16 bytes) with absolute pc
    * v5: qbditrace_inst_head_v5_t (6 bytes) with int16 pc_delta
    *     If delta overflows int16, emit an ANCHOR first then use delta=0.
-   * v6: same as v4/v5 but memacc records are qbditrace_memacc_v6_t (48B). */
-  const size_t memacc_stride = cfg.old_value_mode
-      ? sizeof(qbditrace_memacc_v6_t)
-      : sizeof(qbditrace_memacc_t);
+   */
   const size_t fpr_diff_bytes = (size_t)fprbuf_n * sizeof(qbditrace_fprdiff_t);
   const size_t payload_tail = (size_t)regbuf_n * sizeof(qbditrace_regdiff_t) +
                               fpr_diff_bytes +
-                              (size_t)n_mem * memacc_stride;
-
-  /* Convenience pointers for old-value snapshot passing */
-  const ThreadCtx::PreWriteSnap *snaps = cfg.old_value_mode ? c->pre_write_snaps : nullptr;
-  const uint8_t n_snaps = cfg.old_value_mode ? c->pre_write_count : 0;
+                              (size_t)n_mem * sizeof(qbditrace_memacc_t);
 
   /* FPR state pointer for v7 serialization */
   const QBDI::FPRState *fpr_for_serial = (cfg.fpr_mode && fprbuf_n > 0) ? fpr : nullptr;
@@ -1388,7 +1274,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     // The ANCHOR re-anchors the decoder's running PC, then delta=0.
     if (c->last_emitted_pc == 0 ||
         raw_delta < -32768 || raw_delta > 32767) {
-      emitAnchor(c->buf, gpr, fpr, exec_pc);
+      emitAnchor(c->buf, gpr, fpr, exec_pc, cfg.fpr_mode);
       c->since_anchor = 0;
       c->need_anchor = false;
       raw_delta = 0;
@@ -1411,7 +1297,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
       std::memcpy(p, &ih, sizeof(ih));
       p += sizeof(ih);
       serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem,
-                           snaps, n_snaps, fpr_for_serial, fprbuf, fprbuf_n);
+                           fpr_for_serial, fprbuf, fprbuf_n);
     } else {
       size_t need = sizeof(qbditrace_inst_head_v5_t) + payload_tail;
       prepareRecord(buf, need);
@@ -1424,7 +1310,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
       std::memcpy(&ih5.pc_delta, &pc_delta, sizeof(pc_delta));
       std::memcpy(p, &ih5, sizeof(ih5));
       p += sizeof(ih5);
-      serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem, snaps, n_snaps);
+      serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem);
     }
 
     c->last_emitted_pc = exec_pc;
@@ -1449,7 +1335,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     std::memcpy(p, &ih7, sizeof(ih7));
     p += sizeof(ih7);
     serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem,
-                         snaps, n_snaps, fpr_for_serial, fprbuf, fprbuf_n);
+                         fpr_for_serial, fprbuf, fprbuf_n);
     ++c->inst_count;
     ++c->since_anchor;
     return QBDI::CONTINUE;
@@ -1470,7 +1356,7 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
   std::memcpy(p, &ih, sizeof(ih));
   p += sizeof(ih);
 
-  serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem, snaps, n_snaps);
+  serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem);
 
   ++c->inst_count;
   ++c->since_anchor;
@@ -1571,7 +1457,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
      * (the call site inside the traced range). */
     const uint64_t target = st->basicBlockStart;
     const uint64_t site = c->cur_pc;
-    const Config &cfg = Tracer::get().cfg();
+    const Config &cfg = *c->cached_cfg;
     if (cfg.record & QBDITRACE_REC_MSGSEND) {
       int variant = classifyObjcTarget(cfg, target);
       if (variant >= 0) {
@@ -1602,7 +1488,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     const uint64_t bbStart = st->basicBlockStart;
     const uint64_t bbEnd = st->basicBlockEnd;
     if (bbStart != 0 && bbEnd > bbStart) {
-      const Config &cfg = Tracer::get().cfg();
+      const Config &cfg = *c->cached_cfg;
       if (cfg.embed_code) {
         for (uint64_t pc = bbStart; pc < bbEnd; pc += 4) {
           uint32_t opcode = *reinterpret_cast<const uint32_t *>(pc);
@@ -1938,8 +1824,7 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   cfg.embed_code = (in->disable_embed_code == 0);
   /* v5 PC-delta mode: non-zero enables it (normal positive sense). */
   cfg.pc_delta_mode = (in->enable_pc_delta != 0);
-  /* v6 old-value mode: non-zero enables capturing pre-write memory bytes. */
-  cfg.old_value_mode = (in->enable_old_value != 0);
+  /* [REMOVED] old_value_mode no longer exists; _reserved_old_value is ignored. */
   /* v7 FPR mode: non-zero enables NEON/vector register diff recording. */
   cfg.fpr_mode = (in->enable_fpr != 0);
   /* Compression: inverted ABI sense (0 = compressed, the default). */
@@ -2039,6 +1924,6 @@ extern "C" int qbditrace_dump_pcring(const char *path) {
   if (fd != 2) {
     ::close(fd);
   }
-  uint64_t total = g_pc_ring_pos;
+  uint64_t total = g_pc_ring_pos.load(std::memory_order_relaxed);
   return (int)(total < kPcRingSize ? total : kPcRingSize);
 }

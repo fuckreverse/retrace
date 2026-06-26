@@ -150,7 +150,50 @@ typedef enum {
    * Readers that do not support compressed traces should reject the file.
    * This flag is orthogonal to version — any version (v4–v7) can be compressed. */
   QBDITRACE_HF_COMPRESSED = 1u << 7,
+  /* Block-compressed format. When set, the data after the file header is laid
+   * out as:
+   *
+   *   [block_index_footer]   ← last 16 bytes of file
+   *     uint64_t  index_offset;    — file offset of the block index table
+   *     uint32_t  block_count;     — number of blocks
+   *     uint32_t  magic;           — QBDITRACE_BLOCK_INDEX_MAGIC (0x51424249)
+   *
+   *   [block_index_table]    ← at `index_offset`, block_count entries:
+   *     per entry (24 bytes):
+   *       uint64_t  original_offset;     — logical (decompressed) offset from
+   *                                        start of records (after header)
+   *       uint64_t  compressed_offset;   — physical file offset of the block
+   *       uint32_t  original_size;       — decompressed size of this block
+   *       uint32_t  compressed_size;     — compressed size on disk
+   *
+   *   [block data]           ← each block is an independent zstd frame
+   *
+   * The logical (decompressed) record stream is identical to the uncompressed
+   * format. Each block decompresses independently, enabling random access with
+   * O(1) block lookups. Default block size: 1 MB decompressed.
+   *
+   * HF_COMPRESSED and HF_BLOCK_COMPRESSED are mutually exclusive.
+   * This flag is orthogonal to version — any version (v4–v7) can use it. */
+  QBDITRACE_HF_BLOCK_COMPRESSED = 1u << 8,
 } qbditrace_header_flags;
+
+#define QBDITRACE_BLOCK_INDEX_MAGIC 0x51424249u /* "QBBI" */
+#define QBDITRACE_DEFAULT_BLOCK_SIZE (1u << 20) /* 1 MB decompressed */
+
+/* On-disk footer stored as the last 16 bytes of a block-compressed trace. */
+typedef struct {
+  uint64_t index_offset;   /* file offset of the first block index entry */
+  uint32_t block_count;    /* number of compressed blocks */
+  uint32_t magic;          /* QBDITRACE_BLOCK_INDEX_MAGIC */
+} qbditrace_block_footer_t;
+
+/* One entry in the block index table. */
+typedef struct {
+  uint64_t original_offset;   /* logical byte offset (decompressed, from rec start) */
+  uint64_t compressed_offset; /* physical file offset of the compressed block */
+  uint32_t original_size;     /* decompressed byte count */
+  uint32_t compressed_size;   /* compressed byte count on disk */
+} qbditrace_block_entry_t;
 
 /*
  * Each record begins with a single-byte `kind` tag selecting the record

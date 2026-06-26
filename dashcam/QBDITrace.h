@@ -102,17 +102,13 @@ typedef struct {
    * Zero (the default) keeps the original v4 layout for full compatibility. */
   uint32_t enable_pc_delta;
 
-  /* v6 old-value capture.  Set to non-zero to record the memory content BEFORE
-   * each write, enabling true time-travel: the decoder can undo any store by
-   * restoring the captured old bytes without rescanning from the start.
-   * Each memory access record grows from 32 bytes to 48 bytes (two extra 8-byte
-   * fields: old_value + old_value_hi).  For reads the extra fields are zero.
-   * For writes, the tracer calls safeRead() on the target address immediately
-   * before the write executes (in preInstCB); if the read fails (guard page,
-   * unmapped), the fields stay zero and QBDITRACE_MF_OLD_UNKNOWN is set.
-   * The file header version is bumped to 6 and HF_OLD_VALUE is set.
-   * Zero (the default) keeps the v4/v5 layout unchanged. */
-  uint32_t enable_old_value;
+  /* [DEPRECATED] v6 old-value capture has been removed from the writer.
+   * The offline analyser (tenet) can infer old values from its MemoryModel
+   * write history without the tracer capturing them, so the per-instruction
+   * safeRead() overhead is no longer justified.  This field is kept as
+   * reserved padding to preserve the struct layout and ABI compatibility
+   * with callers that still set it; the value is silently ignored. */
+  uint32_t _reserved_old_value;
 
   /* v7 FPR (NEON/vector) recording.  Set to non-zero to capture the 128-bit
    * value of each FPR register written by an instruction (qbditrace_fprdiff_t

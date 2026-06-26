@@ -18,9 +18,18 @@
  *
  * "Dump to disk" overflow policy: chunks are always flushed, never dropped, so
  * the trace is complete (file may grow large for hot ranges).
+ *
+ * Compression modes:
+ *   - Block-compressed (default when compress=true): records are accumulated
+ *     in a staging buffer and flushed as independent zstd frames every 1 MB of
+ *     uncompressed data. A block index table + footer are written at file close,
+ *     enabling the reader to decompress individual blocks on demand.
+ *   - Uncompressed: raw fwrite of each chunk.
  */
 #ifndef QBDITRACE_RINGBUFFER_H_
 #define QBDITRACE_RINGBUFFER_H_
+
+#include "TraceFormat.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -70,6 +79,10 @@ struct Chunk {
  * BackgroundWriter: owns the output FILE* and a queue of filled chunks. A
  * dedicated thread pops chunks and writes them out, then recycles their memory
  * back to a free list to avoid repeated large allocations.
+ *
+ * When compression is enabled, the writer produces block-compressed output
+ * (HF_BLOCK_COMPRESSED): records are accumulated in a staging buffer and
+ * flushed as independent zstd frames at 1 MB boundaries.
  */
 class BackgroundWriter {
 public:
@@ -77,7 +90,7 @@ public:
   ~BackgroundWriter() { stop(); }
 
   /* Open output file and start the writer thread. Returns false on error.
-   * When `compress` is true, all data after the header is zstd-compressed. */
+   * When `compress` is true, output uses block-compressed format. */
   bool start(const char *path, size_t chunk_bytes, bool compress = false);
 
   /* Hand a filled chunk to the writer (takes ownership of chunk.data). */
@@ -99,11 +112,17 @@ public:
 private:
   void loop();
   void recycle(uint8_t *mem);
-  /* Write raw bytes to the output file, applying zstd compression if enabled.
-   * `flush_mode` controls the zstd flush: ZSTD_e_continue (default buffering),
-   * ZSTD_e_flush (emit a complete block), or ZSTD_e_end (finalize the frame). */
-  void writeBytes(const void *data, size_t len, bool &io_error_reported,
-                  int flush_mode = 0 /* ZSTD_e_continue */);
+  /* Write raw bytes to the output file. In block-compressed mode, data is
+   * accumulated in a staging buffer and flushed as compressed blocks at
+   * QBDITRACE_DEFAULT_BLOCK_SIZE boundaries. */
+  void writeBytes(const void *data, size_t len, bool &io_error_reported);
+
+#if QBDITRACE_HAVE_ZSTD
+  /* Flush the staging buffer as one compressed block. */
+  void flushBlock(bool &io_error_reported);
+  /* Write the block index table and footer, then close the file. */
+  void finalizeBlocks(bool &io_error_reported);
+#endif
 
   FILE *file_ = nullptr;
   size_t chunk_bytes_ = 0;
@@ -111,8 +130,22 @@ private:
 
 #if QBDITRACE_HAVE_ZSTD
   ZSTD_CCtx *zctx_ = nullptr;
-  uint8_t *zbuf_ = nullptr;   /* output buffer for compressed data */
+
+  /* Block-compressed staging buffer: raw (uncompressed) record bytes are
+   * appended here until the buffer reaches QBDITRACE_DEFAULT_BLOCK_SIZE,
+   * at which point the buffer is compressed as a single zstd frame and
+   * written to disk. */
+  uint8_t *stage_buf_ = nullptr;
+  size_t stage_used_ = 0;
+  size_t stage_capacity_ = 0;
+
+  /* Compressed output buffer (reusable across blocks). */
+  uint8_t *zbuf_ = nullptr;
   size_t zbuf_size_ = 0;
+
+  /* Block index: one entry per flushed block. Written to disk at finalize. */
+  std::vector<qbditrace_block_entry_t> block_index_;
+  uint64_t logical_offset_ = 0;  /* running decompressed byte count */
 #endif
 
   std::mutex mtx_;
@@ -142,21 +175,30 @@ inline bool BackgroundWriter::start(const char *path, size_t chunk_bytes,
       file_ = nullptr;
       return false;
     }
-    /* Level 1: fastest compression; still gets ~3x on trace data.
-     * The background thread has plenty of CPU time (it's I/O-bound). */
+    /* Level 1: fastest compression; still gets ~3x on trace data. */
     ZSTD_CCtx_setParameter(zctx_, ZSTD_c_compressionLevel, 1);
-    /* Checksum for integrity verification on decompression. */
     ZSTD_CCtx_setParameter(zctx_, ZSTD_c_checksumFlag, 1);
-    zbuf_size_ = ZSTD_CStreamOutSize();
+
+    /* Allocate staging buffer (1 MB = one decompressed block). */
+    stage_capacity_ = QBDITRACE_DEFAULT_BLOCK_SIZE;
+    stage_buf_ = static_cast<uint8_t *>(std::malloc(stage_capacity_));
+    stage_used_ = 0;
+
+    /* Compressed output buffer: worst case = ZSTD_compressBound(block_size). */
+    zbuf_size_ = ZSTD_compressBound(stage_capacity_);
     zbuf_ = static_cast<uint8_t *>(std::malloc(zbuf_size_));
-    if (!zbuf_) {
-      detail::logIOError("failed to allocate zstd output buffer");
-      ZSTD_freeCCtx(zctx_);
-      zctx_ = nullptr;
-      std::fclose(file_);
-      file_ = nullptr;
+
+    if (!stage_buf_ || !zbuf_) {
+      detail::logIOError("failed to allocate block compression buffers");
+      std::free(stage_buf_); stage_buf_ = nullptr;
+      std::free(zbuf_); zbuf_ = nullptr;
+      ZSTD_freeCCtx(zctx_); zctx_ = nullptr;
+      std::fclose(file_); file_ = nullptr;
       return false;
     }
+
+    block_index_.clear();
+    logical_offset_ = 0;
   }
 #else
   if (compress_) {
@@ -236,39 +278,26 @@ inline void BackgroundWriter::recycle(uint8_t *mem) {
 }
 
 inline void BackgroundWriter::writeBytes(const void *data, size_t len,
-                                          bool &io_error_reported,
-                                          int flush_mode) {
-  if (!file_ || !data || len == 0) {
-    /* For flush_mode == ZSTD_e_end we still need to finalize even with no
-     * new data, but only when compressing. Handle that below. */
-    if (flush_mode == 0 || !compress_) return;
-  }
+                                          bool &io_error_reported) {
+  if (!file_ || !data || len == 0) return;
 
 #if QBDITRACE_HAVE_ZSTD
   if (compress_ && zctx_) {
-    ZSTD_inBuffer in = {data, len, 0};
-    ZSTD_EndDirective directive = static_cast<ZSTD_EndDirective>(flush_mode);
-    size_t ret;
-    do {
-      ZSTD_outBuffer out = {zbuf_, zbuf_size_, 0};
-      ret = ZSTD_compressStream2(zctx_, &out, &in, directive);
-      if (ZSTD_isError(ret)) {
-        if (!io_error_reported) {
-          detail::logIOError("ZSTD_compressStream2 failed");
-          io_error_reported = true;
-        }
-        return;
+    /* Block-compressed mode: accumulate in staging buffer, flush at 1 MB. */
+    const uint8_t *src = static_cast<const uint8_t *>(data);
+    size_t remaining = len;
+    while (remaining > 0) {
+      size_t room = stage_capacity_ - stage_used_;
+      size_t copy = remaining < room ? remaining : room;
+      std::memcpy(stage_buf_ + stage_used_, src, copy);
+      stage_used_ += copy;
+      src += copy;
+      remaining -= copy;
+
+      if (stage_used_ >= stage_capacity_) {
+        flushBlock(io_error_reported);
       }
-      if (out.pos > 0) {
-        size_t written = std::fwrite(zbuf_, 1, out.pos, file_);
-        if ((written != out.pos || std::ferror(file_)) && !io_error_reported) {
-          detail::logIOError("fwrite failed in writer thread (disk full?)");
-          io_error_reported = true;
-        }
-      }
-    } while ((flush_mode == (int)ZSTD_e_end && ret != 0) ||
-             (flush_mode == (int)ZSTD_e_flush && ret != 0) ||
-             in.pos < in.size);
+    }
     return;
   }
 #endif
@@ -279,6 +308,96 @@ inline void BackgroundWriter::writeBytes(const void *data, size_t len,
     io_error_reported = true;
   }
 }
+
+#if QBDITRACE_HAVE_ZSTD
+inline void BackgroundWriter::flushBlock(bool &io_error_reported) {
+  if (stage_used_ == 0) return;
+
+  /* Record current file position as the block's compressed offset. */
+  long pos = std::ftell(file_);
+  if (pos < 0) {
+    if (!io_error_reported) {
+      detail::logIOError("ftell failed in flushBlock");
+      io_error_reported = true;
+    }
+    stage_used_ = 0;
+    return;
+  }
+
+  /* Compress the entire staging buffer as one independent zstd frame.
+   * We use single-shot ZSTD_compress2 (not streaming) since we have the
+   * complete block in memory. This produces a self-contained frame. */
+  ZSTD_CCtx_reset(zctx_, ZSTD_reset_session_only);
+  ZSTD_CCtx_setParameter(zctx_, ZSTD_c_compressionLevel, 1);
+  ZSTD_CCtx_setParameter(zctx_, ZSTD_c_checksumFlag, 1);
+
+  size_t comp_size = ZSTD_compress2(zctx_, zbuf_, zbuf_size_,
+                                    stage_buf_, stage_used_);
+  if (ZSTD_isError(comp_size)) {
+    if (!io_error_reported) {
+      detail::logIOError("ZSTD_compress2 failed in flushBlock");
+      io_error_reported = true;
+    }
+    stage_used_ = 0;
+    return;
+  }
+
+  /* Write compressed block to file. */
+  size_t written = std::fwrite(zbuf_, 1, comp_size, file_);
+  if ((written != comp_size || std::ferror(file_)) && !io_error_reported) {
+    detail::logIOError("fwrite failed in flushBlock (disk full?)");
+    io_error_reported = true;
+  }
+
+  /* Record block index entry. */
+  qbditrace_block_entry_t entry;
+  entry.original_offset = logical_offset_;
+  entry.compressed_offset = static_cast<uint64_t>(pos);
+  entry.original_size = static_cast<uint32_t>(stage_used_);
+  entry.compressed_size = static_cast<uint32_t>(comp_size);
+  block_index_.push_back(entry);
+
+  logical_offset_ += stage_used_;
+  stage_used_ = 0;
+}
+
+inline void BackgroundWriter::finalizeBlocks(bool &io_error_reported) {
+  /* Flush any remaining staged data as a final (possibly smaller) block. */
+  flushBlock(io_error_reported);
+
+  if (!file_) return;
+
+  /* Write the block index table. */
+  long index_pos = std::ftell(file_);
+  if (index_pos < 0) {
+    if (!io_error_reported) {
+      detail::logIOError("ftell failed before writing block index");
+      io_error_reported = true;
+    }
+    return;
+  }
+
+  size_t table_bytes = block_index_.size() * sizeof(qbditrace_block_entry_t);
+  if (table_bytes > 0) {
+    size_t written = std::fwrite(block_index_.data(), 1, table_bytes, file_);
+    if ((written != table_bytes || std::ferror(file_)) && !io_error_reported) {
+      detail::logIOError("failed to write block index table");
+      io_error_reported = true;
+    }
+  }
+
+  /* Write the footer (last 16 bytes of file). */
+  qbditrace_block_footer_t footer;
+  footer.index_offset = static_cast<uint64_t>(index_pos);
+  footer.block_count = static_cast<uint32_t>(block_index_.size());
+  footer.magic = QBDITRACE_BLOCK_INDEX_MAGIC;
+  size_t written = std::fwrite(&footer, 1, sizeof(footer), file_);
+  if ((written != sizeof(footer) || std::ferror(file_)) && !io_error_reported) {
+    detail::logIOError("failed to write block footer");
+    io_error_reported = true;
+  }
+}
+#endif
 
 inline void BackgroundWriter::loop() {
   /* Track whether we have already reported an IO error to avoid flooding
@@ -339,10 +458,10 @@ inline void BackgroundWriter::stop() {
   }
 
 #if QBDITRACE_HAVE_ZSTD
-  /* Finalize the zstd frame: emit ZSTD_e_end so the decompressor sees a
-   * complete frame and can verify the content checksum. */
   if (compress_ && zctx_ && file_) {
-    writeBytes(nullptr, 0, io_error_reported, (int)ZSTD_e_end);
+    /* Finalize block-compressed output: flush remaining staged data,
+     * write block index table and footer. */
+    finalizeBlocks(io_error_reported);
   }
   if (zctx_) {
     ZSTD_freeCCtx(zctx_);
@@ -352,6 +471,13 @@ inline void BackgroundWriter::stop() {
     std::free(zbuf_);
     zbuf_ = nullptr;
   }
+  if (stage_buf_) {
+    std::free(stage_buf_);
+    stage_buf_ = nullptr;
+  }
+  stage_used_ = 0;
+  block_index_.clear();
+  logical_offset_ = 0;
 #endif
 
   if (file_) {

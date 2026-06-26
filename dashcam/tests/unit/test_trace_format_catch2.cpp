@@ -13,6 +13,8 @@
 #include <cstring>
 #include "TraceFormat.h"
 
+using namespace qbditrace;
+
 // ─── Compile-time assertions (double-checked here for documentation) ────────
 
 static_assert(sizeof(qbditrace_file_header_t) == 536,

@@ -131,9 +131,6 @@ def parse_args():
     rec.add_argument('--pc-delta', action='store_true',
                      help='Enable v5 PC-delta encoding (2-byte delta instead of '
                           '8-byte absolute PC, ~40-60%% smaller for straight-line code)')
-    rec.add_argument('--old-value', action='store_true',
-                     help='Enable v6 old-value capture for true time-travel '
-                          '(records memory content before each write)')
     rec.add_argument('--fpr', action='store_true',
                      help='Enable v7 FPR/NEON register recording '
                           '(128-bit vector regs, essential for AES/SHA analysis)')
@@ -225,7 +222,6 @@ def build_config(args):
         'ringBytes': args.ring_bytes,
         'embedCode': not args.no_embed_code,
         'pcDelta': args.pc_delta,
-        'oldValue': args.old_value,
         'fpr': args.fpr,
         'noCompress': args.no_compress,
         'argCount': args.arg_count,
@@ -436,7 +432,6 @@ def main():
           f'OBJC={bool(args.record & 16)})')
     extras = []
     if args.pc_delta:    extras.append('pc-delta(v5)')
-    if args.old_value:   extras.append('old-value(v6)')
     if args.fpr:         extras.append('fpr(v7)')
     if args.no_compress: extras.append('no-compress')
     else:                extras.append('zstd-compress')
