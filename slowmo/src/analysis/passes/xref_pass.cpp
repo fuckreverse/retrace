@@ -137,9 +137,11 @@ struct ShardResult {
 /// Scan a shard using raw pointer arithmetic and bulk bitmap insertion.
 /// This is the hot loop — every cycle counts.
 /// P1.7: is_v5/is_v6 flags control INST header and memacc sizes.
+/// Uses a per-thread ThreadReader to avoid mutex contention.
 void scan_shard(const Shard& shard, uint32_t num_gpr,
                 bool is_v5, bool is_v6, ShardResult& out,
-                const TraceReader& reader) {
+                const TraceReader::ThreadReader& thread_reader,
+                const std::atomic<bool>& cancelled) {
     uint64_t offset = shard.file_start;
     const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
@@ -159,7 +161,14 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     roaring64_bulk_context_t last_ctx = {};
 
     while (offset < end_offset) {
-        const uint8_t* ptr = reader.data_at(offset);
+        // Check for cancellation every 64K instructions to allow
+        // prompt shutdown without measurably impacting scan throughput.
+        if ((inst_id & 0xFFFF) == 0 &&
+            cancelled.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        const uint8_t* ptr = thread_reader.data_at(offset);
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — the hot path (>95% of records)
@@ -386,24 +395,29 @@ PassResult XrefPass::run(PassContext& ctx) {
     const bool xref_is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool xref_is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
 
-    // Pin all blocks during the parallel scan to prevent LRU eviction.
-    reader.pin_all();
+    // Create per-shard ThreadReaders to eliminate mutex contention.
+    std::vector<TraceReader::ThreadReader> thread_readers;
+    thread_readers.reserve(shards.size());
+    for (size_t i = 0; i < shards.size(); i++) {
+        thread_readers.push_back(reader.create_thread_reader(8));
+    }
+
+    // Get cancellation flag reference for shard threads.
+    const std::atomic<bool>& cancel_flag = ctx.global_cancel_flag();
 
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_results, num_gpr, xref_is_v5, xref_is_v6, &reader, i]() {
-            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], reader);
+        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, num_gpr, xref_is_v5, xref_is_v6, i]() {
+            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], thread_readers[i], cancel_flag);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], reader);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], thread_readers[0], cancel_flag);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 
     // Wait for all workers
     for (auto& t : threads) t.join();
-
-    reader.unpin_all();
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled");

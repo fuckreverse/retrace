@@ -583,7 +583,11 @@ RecordView TraceReader::record_at(uint64_t offset) const {
 }
 
 RecordView TraceReader::Iterator::operator*() const {
-    RecordView rv = reader_->record_at(offset_);
+    const uint8_t* ptr = read_at(offset_);
+    RecordView rv;
+    rv.kind = static_cast<RecordKind>(ptr[0]);
+    rv.file_offset = offset_;
+    rv.raw_ptr = ptr;
 
     const uint64_t flags = reader_->header_.flags;
     const bool use_pc_delta  = (flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
@@ -616,10 +620,10 @@ RecordView TraceReader::Iterator::operator*() const {
 TraceReader::Iterator& TraceReader::Iterator::operator++() {
     // ── Performance optimization ──────────────────────────────────────────
     // Read the record header at current offset to compute its size, then
-    // advance past it.  For block-compressed mode, data_at() goes through
-    // the BlockCacheReader LRU cache; for mmap mode it's a direct pointer.
+    // advance past it.  Uses thread-local reader when available to avoid
+    // mutex contention on the shared BlockCacheReader.
 
-    const uint8_t* ptr = reader_->data_at(offset_);
+    const uint8_t* ptr = read_at(offset_);
     auto kind = static_cast<RecordKind>(ptr[0]);
     size_t rec_size = 0;
 
@@ -704,6 +708,14 @@ TraceReader::Iterator TraceReader::begin() const {
 
 TraceReader::Iterator TraceReader::end() const {
     return Iterator(this, logical_size_);
+}
+
+TraceReader::Iterator TraceReader::begin(const ThreadReader& tr) const {
+    return Iterator(this, header_size_, &tr);
+}
+
+TraceReader::Iterator TraceReader::end(const ThreadReader& tr) const {
+    return Iterator(this, logical_size_, &tr);
 }
 
 void TraceReader::advise_sequential() const {

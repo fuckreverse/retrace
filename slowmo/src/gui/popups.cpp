@@ -765,9 +765,7 @@ void GuiApp::render_settings_window() {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.9f, 0.7f, 1.0f));
                 ImGui::TextWrapped(
                     "\"tenet\": {\n"
-                    "  \"command\": \"npx\",\n"
-                    "  \"args\": [\"@modelcontextprotocol/server-sse\",\n"
-                    "            \"http://%s:%d/sse\"]\n"
+                    "  \"url\": \"http://%s:%d/mcp\"\n"
                     "}",
                     mcp_gui_.host, mcp_gui_.port);
                 ImGui::PopStyleColor();

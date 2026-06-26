@@ -111,6 +111,12 @@ public:
     bool cancelled() const;
     void cancel();
 
+    /// Returns a reference to the global cancellation flag.  Thread-safe to
+    /// read from any thread (lock-free atomic).  Intended for passes that
+    /// spawn their own worker threads and need a lightweight cancellation
+    /// check in tight inner loops.
+    const std::atomic<bool>& global_cancel_flag() const;
+
     /// Access the shared trace scan engine (for passes that want to run collectors).
     TraceScanEngine* scan_engine();
 
@@ -234,7 +240,14 @@ public:
 
     /// Request cancellation of all in-flight passes.  Passes that check
     /// `PassContext::cancelled()` will abort early.  Thread-safe.
-    void cancel_all() { cancelled_.store(true, std::memory_order_release); }
+    void cancel_all() {
+        cancelled_.store(true, std::memory_order_release);
+        // Wake any sleeping workers in run_all_parallel so they can exit.
+        if (worker_cv_ && worker_mtx_) {
+            std::lock_guard<std::mutex> lk(*worker_mtx_);
+            worker_cv_->notify_all();
+        }
+    }
 
     /// Request cancellation of a single pass by name.  Thread-safe.
     void cancel(std::string_view pass_name);
@@ -332,6 +345,12 @@ private:
     // Global cancellation flag (set by cancel_all, read by PassContext::cancelled).
     std::atomic<bool> cancelled_{false};
 
+    // Pointer to the active worker CV in run_all_parallel so cancel_all()
+    // can wake sleeping workers immediately.  Protected by the same mutex
+    // pointed to by worker_mtx_.  Null when not in run_all_parallel.
+    std::condition_variable* worker_cv_ = nullptr;
+    std::mutex*              worker_mtx_ = nullptr;
+
     static PassResult not_found_result_;
 
     friend class PassContext;  // PassContext calls set_progress_msg / is_cancelled
@@ -355,6 +374,10 @@ const T* PassContext::try_require(std::string_view pass_name) {
     if (!result.ok() || !result.data.has_value()) return nullptr;
     const T* p = std::any_cast<T>(&result.data);
     return p;
+}
+
+inline const std::atomic<bool>& PassContext::global_cancel_flag() const {
+    return manager_.cancelled_;
 }
 
 }  // namespace tenet

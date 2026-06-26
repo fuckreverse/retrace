@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -111,6 +112,12 @@ public:
     /// Returns the block_id such that index_[block_id].original_offset
     /// <= logical_offset < index_[block_id+1].original_offset.
     uint32_t find_block(uint64_t logical_offset) const;
+
+    /// Create an independent clone that shares the same mmap and block index
+    /// but has its own LRU cache and ZSTD decompression context.
+    /// Use this to give each scanning thread its own reader, eliminating
+    /// mutex contention on the shared cache.
+    std::unique_ptr<BlockCacheReader> clone(size_t max_cached_blocks = 32) const;
 
 private:
     struct CachedBlock {
@@ -530,6 +537,25 @@ inline void BlockCacheReader::pin_all() {
 inline void BlockCacheReader::unpin_all() {
     std::lock_guard<std::mutex> lk(mtx_);
     if (global_pin_ > 0) --global_pin_;
+}
+
+inline std::unique_ptr<BlockCacheReader> BlockCacheReader::clone(size_t max_cached_blocks) const {
+    auto c = std::unique_ptr<BlockCacheReader>(new BlockCacheReader());
+    c->mapped_ = mapped_;
+    c->file_size_ = file_size_;
+    c->header_size_ = header_size_;
+    c->index_ = index_;  // shared copy of block index (read-only after init)
+    c->logical_size_ = logical_size_;
+    c->recovered_ = recovered_;
+    c->recovery_msg_ = recovery_msg_;
+    c->max_cached_ = max_cached_blocks;
+    // Pre-allocate cache slots
+    size_t slots = max_cached_blocks < index_.size() ? max_cached_blocks : index_.size();
+    c->cache_.resize(slots);
+#if TENET_HAS_ZSTD
+    c->dctx_ = ZSTD_createDCtx();
+#endif
+    return c;
 }
 
 inline bool BlockCacheReader::decompress_block(

@@ -122,6 +122,10 @@ public:
     /// Set cancellation check function.
     void set_cancel_check(std::function<bool()> fn) { cancel_fn_ = std::move(fn); }
 
+    /// Set a lightweight atomic cancellation token for parallel scanning.
+    /// When set, parallel shard threads check this flag periodically.
+    void set_cancel_token(const std::atomic<bool>* token) { cancel_token_ = token; }
+
 private:
     const TraceReader& reader_;
     uint64_t inst_count_;
@@ -129,6 +133,7 @@ private:
     std::vector<TraceCollector*> collectors_;
     ProgressFn progress_fn_;
     std::function<bool()> cancel_fn_;
+    const std::atomic<bool>* cancel_token_ = nullptr;
 };
 
 }  // namespace tenet

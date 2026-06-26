@@ -291,6 +291,44 @@ public:
         return block_cache_ ? block_cache_->block_count() : 0;
     }
 
+    /// Create a lightweight thread-local reading proxy that shares the same
+    /// mmap and block index but has an independent LRU cache.
+    /// This eliminates mutex contention when multiple threads scan the trace
+    /// concurrently.  The returned object is valid as long as `this` is alive.
+    /// For mmap (non-block) mode, this just returns a thin wrapper over the
+    /// shared mmap pointer (no contention in that case anyway).
+    class ThreadReader {
+    public:
+        ThreadReader() = default;
+
+        /// Access byte at a given logical file offset (same semantics as
+        /// TraceReader::data_at).
+        const uint8_t* data_at(uint64_t offset) const {
+            if (local_cache_) {
+                return local_cache_->data_at(offset - header_size_);
+            }
+            return mmap_base_ + offset;
+        }
+
+    private:
+        friend class TraceReader;
+        const uint8_t* mmap_base_ = nullptr;
+        uint64_t header_size_ = 0;
+        std::unique_ptr<BlockCacheReader> local_cache_;
+    };
+
+    /// Create a thread-local reader. `cache_blocks` controls the per-thread
+    /// LRU cache size (smaller is fine for sequential scans — 4~8 blocks).
+    ThreadReader create_thread_reader(size_t cache_blocks = 8) const {
+        ThreadReader tr;
+        tr.mmap_base_ = static_cast<const uint8_t*>(mapped_);
+        tr.header_size_ = header_size_;
+        if (block_cache_) {
+            tr.local_cache_ = block_cache_->clone(cache_blocks);
+        }
+        return tr;
+    }
+
     /// Size of the file header in bytes (needed to convert between
     /// logical block offsets and absolute file offsets).
     uint64_t header_size() const { return header_size_; }
@@ -378,6 +416,10 @@ public:
         Iterator(const TraceReader* reader, uint64_t offset, uint64_t seed_pc)
             : reader_(reader), offset_(offset), current_pc_(seed_pc) {}
 
+        // Constructor with a ThreadReader for lock-free data access.
+        Iterator(const TraceReader* reader, uint64_t offset, const ThreadReader* thread_reader)
+            : reader_(reader), offset_(offset), current_pc_(0), thread_reader_(thread_reader) {}
+
         RecordView operator*() const;
         Iterator& operator++();
         bool operator==(const Iterator& other) const { return offset_ >= other.offset_; }
@@ -387,13 +429,24 @@ public:
         uint64_t current_pc() const { return current_pc_; }
 
     private:
+        /// Read bytes at offset — uses thread_reader_ if set, otherwise reader_.
+        const uint8_t* read_at(uint64_t off) const {
+            if (thread_reader_) return thread_reader_->data_at(off);
+            return reader_->data_at(off);
+        }
+
         const TraceReader* reader_;
         uint64_t offset_;
         mutable uint64_t current_pc_;  // running PC for HF_PC_DELTA reconstruction
+        const ThreadReader* thread_reader_ = nullptr;
     };
 
     Iterator begin() const;
     Iterator end() const;
+
+    /// Create iterators that use a ThreadReader for lock-free data access.
+    Iterator begin(const ThreadReader& tr) const;
+    Iterator end(const ThreadReader& tr) const;
 
     /// Set madvise hint for access pattern
     void advise_sequential() const;

@@ -371,6 +371,7 @@ PassResult CFGPass::run(PassContext& ctx) {
         ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
     });
     engine.set_cancel_check([&]() { return ctx.cancelled(); });
+    engine.set_cancel_token(&ctx.global_cancel_flag());
     if (ctx.no_parallel_scan()) {
         engine.run(start, end);
     } else {

@@ -115,6 +115,15 @@ void PassManager::execute_pass(PassEntry* entry) {
     TENET_ZONE;
     TENET_ZONE_TEXT("pass: {}", entry->pass->name());
 
+    // Fast-path: skip immediately if global cancellation is requested.
+    if (is_cancelled()) {
+        std::lock_guard<std::mutex> lk(entry->mtx);
+        entry->result = PassResult::failed("cancelled");
+        entry->state.store(PassState::Failed, std::memory_order_release);
+        entry->cv.notify_all();
+        return;
+    }
+
     // First, recursively ensure all dependencies are done.
     for (auto dep_name : entry->pass->dependencies()) {
         const auto& dep_result = require(dep_name);
@@ -233,6 +242,10 @@ void PassManager::run_all_parallel(size_t num_threads) {
     std::vector<size_t> ready;
     ready.reserve(entries_.size());
 
+    // Expose CV/mutex so cancel_all() can wake sleeping workers.
+    worker_cv_  = &q_cv;
+    worker_mtx_ = &q_mtx;
+
     // Seed with all zero-dep passes.
     for (size_t i = 0; i < entries_.size(); ++i) {
         if (entries_[i]->pending_deps.load(std::memory_order_acquire) == 0) {
@@ -250,12 +263,18 @@ void PassManager::run_all_parallel(size_t num_threads) {
             {
                 std::unique_lock<std::mutex> lk(q_mtx);
                 q_cv.wait(lk, [&] {
-                    return !ready.empty() || completed.load(std::memory_order_acquire) == total;
+                    return !ready.empty()
+                        || completed.load(std::memory_order_acquire) == total
+                        || cancelled_.load(std::memory_order_acquire);
                 });
+                if (cancelled_.load(std::memory_order_acquire)) {
+                    return;  // global cancellation requested
+                }
                 if (ready.empty() &&
                     completed.load(std::memory_order_acquire) == total) {
                     return;  // everything done
                 }
+                if (ready.empty()) continue;  // spurious wakeup
                 idx = ready.back();
                 ready.pop_back();
             }
@@ -299,6 +318,10 @@ void PassManager::run_all_parallel(size_t num_threads) {
     }
     worker();  // run on main thread too
     for (auto& t : threads) t.join();
+
+    // Clear CV/mutex pointers before they go out of scope.
+    worker_cv_  = nullptr;
+    worker_mtx_ = nullptr;
 
     if (failed_dep.load(std::memory_order_relaxed)) {
         LOG_WARN("PassManager::run_all: one or more passes failed (see above)");

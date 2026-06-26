@@ -62,11 +62,13 @@ struct ScanShard {
 
 /// Scan a shard and broadcast INST records to a set of collector clones.
 /// Only on_inst() is called; non-INST records are skipped.
+/// Uses a per-thread ThreadReader to avoid mutex contention on the shared cache.
 void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                            bool is_v6,
                            const std::vector<TraceCollector*>& clones,
                            std::atomic<uint64_t>& progress_counter,
-                           const TraceReader& reader) {
+                           const TraceReader::ThreadReader& thread_reader,
+                           const std::atomic<bool>* cancel_token) {
     uint64_t offset = shard.file_start;
     const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
@@ -75,7 +77,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
         : sizeof(qbditrace::qbditrace_memacc_t);
 
     while (offset < end_offset) {
-        const uint8_t* ptr = reader.data_at(offset);
+        const uint8_t* ptr = thread_reader.data_at(offset);
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — hot path
@@ -101,6 +103,11 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
             // Update shared progress counter every 64K instructions
             if ((inst_id & 0xFFFF) == 0) {
                 progress_counter.fetch_add(0x10000, std::memory_order_relaxed);
+                // Check for cancellation at the same cadence.
+                if (cancel_token &&
+                    cancel_token->load(std::memory_order_relaxed)) {
+                    return;
+                }
             }
         } else {
             // Non-INST record: skip (is_v6 propagated for completeness)
@@ -135,6 +142,11 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
     // Advise sequential access for the mmap
     reader_.advise_sequential();
 
+    // Create a thread-local reader for lock-free data access.
+    // This gives us our own BlockCacheReader instance, eliminating contention
+    // when multiple passes scan the trace concurrently.
+    auto thread_reader = reader_.create_thread_reader(16);
+
     uint64_t inst_id = 0;
     uint64_t processed = 0;
     uint64_t total = end - start_inst_id;
@@ -142,7 +154,7 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
 
     const uint32_t num_gpr = reader_.header().num_gpr;
 
-    for (auto it = reader_.begin(); it != reader_.end() && inst_id < end; ++it) {
+    for (auto it = reader_.begin(thread_reader); it != reader_.end(thread_reader) && inst_id < end; ++it) {
         auto rec = *it;
 
         switch (rec.kind) {
@@ -325,18 +337,23 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     std::vector<std::thread> threads;
     threads.reserve(shards.size() - 1);
 
-    // Pin all blocks during the parallel scan to prevent LRU eviction.
-    reader_.pin_all();
+    // Create per-shard ThreadReaders to eliminate mutex contention.
+    std::vector<TraceReader::ThreadReader> thread_readers;
+    thread_readers.reserve(shards.size());
+    for (size_t i = 0; i < shards.size(); i++) {
+        thread_readers.push_back(reader_.create_thread_reader(8));
+    }
 
     // Launch worker threads for shards[1..N-1]
+    const std::atomic<bool>* cancel_tok = cancel_token_;
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, num_gpr, is_v6, this, i]() {
-            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter, reader_);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, num_gpr, is_v6, cancel_tok, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter, reader_);
+    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok);
 
     // Report progress while waiting
     if (progress_fn_) {
@@ -345,8 +362,6 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
 
     // Wait for all workers
     for (auto& t : threads) t.join();
-
-    reader_.unpin_all();
 
     // ─── Phase 3: Merge shard results ─────────────────────────────────────
 
