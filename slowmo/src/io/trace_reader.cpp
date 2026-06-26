@@ -377,11 +377,18 @@ Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
         reader.close();
         return Error(ErrorCode::MmapFailed,
                      "Failed to initialize block-compressed reader: "
-                     "corrupt block index or footer");
+                     "corrupt block index or footer (and recovery failed)");
     }
 
     // Logical size = header + decompressed records
     reader.logical_size_ = kHeaderSize + cache->logical_size();
+
+    if (cache->was_recovered()) {
+        fmt::print(stderr,
+                   "[WARNING] Block-compressed trace has no footer — {}\n",
+                   cache->recovery_message());
+    }
+
     reader.block_cache_ = std::move(cache);
 
     // Clear the block-compressed flag in the in-memory header so that

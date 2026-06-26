@@ -286,6 +286,37 @@ public:
     /// Whether this trace uses block-compressed on-demand decompression.
     bool is_block_mode() const { return block_cache_ != nullptr; }
 
+    /// Number of compressed blocks (0 for non-block mode).
+    uint32_t block_count() const {
+        return block_cache_ ? block_cache_->block_count() : 0;
+    }
+
+    /// Size of the file header in bytes (needed to convert between
+    /// logical block offsets and absolute file offsets).
+    uint64_t header_size() const { return header_size_; }
+
+    /// Decompress a single block into a caller-owned buffer.
+    /// Bypasses the LRU cache entirely — designed for bulk sequential scans.
+    /// `out_logical_offset` is relative to the record stream start (after header).
+    /// Returns false if block_id is out of range or decompression fails.
+    bool decompress_block(uint32_t block_id,
+                          std::vector<uint8_t>& out_buf,
+                          const uint8_t*& out_data,
+                          uint32_t& out_size,
+                          uint64_t& out_logical_offset) const {
+        if (!block_cache_) return false;
+        return block_cache_->decompress_block(block_id, out_buf, out_data,
+                                               out_size, out_logical_offset);
+    }
+
+    /// Find the block_id containing the given logical offset (relative to
+    /// the record stream start, i.e. after header).  Returns 0 for
+    /// non-block mode (meaningless).
+    uint32_t find_block_for_offset(uint64_t logical_offset) const {
+        if (!block_cache_) return 0;
+        return block_cache_->find_block(logical_offset);
+    }
+
     /// Raw byte access.
     /// For mmap'd (uncompressed / stream-compressed + temp) traces, this
     /// returns the mmap base pointer.  For block-compressed traces, this

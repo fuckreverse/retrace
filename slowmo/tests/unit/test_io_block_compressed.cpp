@@ -726,7 +726,7 @@ TEST_CASE("RegisterFile: state_before/after work on block-compressed trace",
 // Edge cases
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("BlockCacheReader: init fails on corrupt footer magic",
+TEST_CASE("BlockCacheReader: init recovers on corrupt footer magic",
           "[unit][io][block_compressed]") {
     TempDir td("bcr_corrupt_magic");
     auto uncompressed = write_simple_trace(td.path, "corrupt_m");
@@ -742,7 +742,12 @@ TEST_CASE("BlockCacheReader: init fails on corrupt footer magic",
     constexpr size_t kHdrSize = sizeof(qbditrace::qbditrace_file_header_t);
     BlockCacheReader cache;
     bool ok = cache.init(file_data.data(), file_data.size(), kHdrSize, 16);
-    REQUIRE_FALSE(ok);
+    // With zstd recovery, init succeeds by scanning zstd frames even when
+    // the footer is corrupt.  The was_recovered() flag must be set.
+    REQUIRE(ok);
+    REQUIRE(cache.was_recovered());
+    REQUIRE(cache.block_count() > 0);
+    REQUIRE_FALSE(cache.recovery_message().empty());
 }
 
 TEST_CASE("BlockCacheReader: init fails on file too small for footer",

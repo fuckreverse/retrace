@@ -158,7 +158,11 @@ static uint64_t sample_trace_hash(const TraceReader& reader) {
         // bytes.  Since each SAMPLE is within one or two 1MB blocks,
         // data_at() is safe.
         reader.pin_all();
-        const uint8_t* head = reader.data_at(0);
+        // data_at() takes a file offset (0 = start of file). In block mode
+        // it subtracts header_size_ before passing to the block cache, so
+        // we must pass header_size() (536) to get the first record byte.
+        // Passing 0 would underflow: 0 - 536 = 0xFFFFFFFFFFFFFDE8.
+        const uint8_t* head = reader.data_at(reader.header_size());
         uint64_t actual_head = std::min(static_cast<uint64_t>(SAMPLE), size);
         uint64_t h1 = xxhash64(head, static_cast<size_t>(actual_head));
         uint64_t h2 = 0;
@@ -547,38 +551,199 @@ Result<TraceIndex> TraceIndex::build(
         raw_anchors.reserve(4096);
 
         uint64_t scan_id = 0;
-        // Use offset-based scanning so it works for both mmap and block modes.
-        uint64_t scan_offset = sizeof(qbditrace::qbditrace_file_header_t);
-        reader.pin_all();  // keep pointers stable for the scan duration
+        const uint64_t hdr_sz = sizeof(qbditrace::qbditrace_file_header_t);
+        const size_t anchor_rec_sz = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
 
-        while (scan_offset < file_size) {
-            const uint8_t* ptr = reader.data_at(scan_offset);
-            auto kind = static_cast<RecordKind>(ptr[0]);
-            size_t rec_size = 0;
-            switch (kind) {
-            case RecordKind::Inst:
-                rec_size = inst_hdr_sz
-                    + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
-                    + ptr[3] * memacc_sz;
-                scan_id++;
-                break;
-            case RecordKind::Anchor: {
-                rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
-                const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
-                raw_anchors.push_back({scan_id, scan_offset, ah->pc});
-                break;
+        // Progress reporting for Phase 0 (anchor discovery).
+        // For large traces (especially block-compressed), this scan can take
+        // minutes. Report progress to stderr so the user doesn't think it's hung.
+        auto phase0_start = std::chrono::steady_clock::now();
+        uint64_t phase0_last_report = 0;
+
+        // ── Scan lambda: processes a contiguous buffer of records ──
+        // `buf_ptr` points to the first byte of the buffer.
+        // `scan_limit` is the number of bytes in which new records may START.
+        //   Typically this is the block's own data size (blk_size).
+        // `buf_total` is the total readable bytes (including any overlap from
+        //   the next block).  A record that starts within scan_limit may
+        //   extend into the overlap zone — that's fine; we use buf_total
+        //   for the `remaining` check so cross-boundary records are read
+        //   correctly.  But we never START a new record in the overlap zone,
+        //   preventing zero-padded overlap from being parsed as records.
+        // `base_file_offset` is the absolute file offset of `buf_ptr[0]`.
+        // Returns the number of bytes consumed (may be < scan_limit if the
+        // last record straddles the buffer boundary).
+        auto scan_buffer = [&](const uint8_t* buf_ptr, uint32_t scan_limit,
+                               uint32_t buf_total,
+                               uint64_t base_file_offset) -> uint32_t {
+            uint32_t pos = 0;
+            while (pos < scan_limit) {
+                const uint8_t* ptr = buf_ptr + pos;
+                // Need at least 1 byte for the record kind, but also enough
+                // to read the inst header fields (n_regdiff, n_mem at ptr[2]/[3]).
+                // The minimum INST header is 6 bytes (v5). Be conservative:
+                // if remaining < inst_hdr_sz, we might be at a boundary.
+                uint32_t remaining = buf_total - pos;
+                if (remaining < 4) break;  // can't even read kind + counts safely
+
+                auto kind = static_cast<RecordKind>(ptr[0]);
+                size_t rec_size = 0;
+                switch (kind) {
+                case RecordKind::Inst: {
+                    if (remaining < inst_hdr_sz) return pos;  // partial record
+                    rec_size = inst_hdr_sz
+                        + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                        + ptr[3] * memacc_sz;
+                    if (remaining < rec_size) return pos;  // partial record
+                    scan_id++;
+                    break;
+                }
+                case RecordKind::Anchor: {
+                    if (remaining < anchor_rec_sz) return pos;
+                    rec_size = anchor_rec_sz;
+                    const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+                    raw_anchors.push_back({scan_id, base_file_offset + pos, ah->pc});
+                    break;
+                }
+                case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
+                case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
+                case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
+                case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
+                case RecordKind::Code: {
+                    rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];
+                    break;
+                }
+                default: rec_size = 1; break;
+                }
+                if (rec_size == 0) return pos;  // corrupt record guard
+                if (remaining < rec_size) return pos;  // partial record at tail
+                pos += static_cast<uint32_t>(rec_size);
             }
-            case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
-            case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
-            case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
-            case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
-            case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
-            default: rec_size = 1; break;
+            return pos;
+        };
+
+        if (reader.is_block_mode()) {
+            // ── Block-compressed fast path ──
+            // Decompress one block at a time into a local buffer, then scan
+            // records using plain pointer arithmetic — no mutex, no LRU, no
+            // binary search.  This is ~200-500x faster than per-record data_at().
+            //
+            // Records can straddle block boundaries (the writer doesn't align
+            // records to blocks).  decompress_block() provides an overlap zone
+            // (kOverlapBytes from the next block) appended to each block's
+            // buffer, so cross-boundary records can be read safely.
+            //
+            // We track `logical_pos` — the logical offset (after header) of
+            // the next unprocessed record.  For each block, we start scanning
+            // at `logical_pos - blk_logical_offset` within the buffer, which
+            // handles the case where a previous block's overlap already
+            // consumed bytes from this block.
+            const uint32_t n_blocks = reader.block_count();
+            std::vector<uint8_t> block_buf;
+            uint64_t logical_pos = 0;  // next unprocessed logical offset
+
+            for (uint32_t bi = 0; bi < n_blocks; bi++) {
+                const uint8_t* blk_data = nullptr;
+                uint32_t blk_size = 0;
+                uint64_t blk_logical_offset = 0;
+                if (!reader.decompress_block(bi, block_buf, blk_data,
+                                              blk_size, blk_logical_offset))
+                    break;
+
+                // Skip this block if we've already scanned past it via overlap.
+                if (logical_pos >= blk_logical_offset + blk_size) continue;
+
+                // Start position within this block's buffer.
+                uint32_t pos = 0;
+                if (logical_pos > blk_logical_offset)
+                    pos = static_cast<uint32_t>(logical_pos - blk_logical_offset);
+
+                // scan_limit = bytes within this block's own data where new
+                // records can start.  buf_total = readable bytes including
+                // any overlap from the next block (for cross-boundary reads).
+                uint32_t scan_limit = blk_size - pos;
+                uint32_t buf_total  = static_cast<uint32_t>(block_buf.size()) - pos;
+                uint64_t base_file_offset = blk_logical_offset + hdr_sz;
+                uint32_t consumed = scan_buffer(blk_data + pos, scan_limit,
+                                                buf_total,
+                                                base_file_offset + pos);
+                logical_pos = blk_logical_offset + pos + consumed;
+
+                // Report Phase 0 progress every ~500 MB.
+                constexpr uint64_t kReportInterval = 500ULL * 1024 * 1024;
+                if (logical_pos - phase0_last_report >= kReportInterval) {
+                    phase0_last_report = logical_pos;
+                    auto now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - phase0_start).count();
+                    double pct = 100.0 * logical_pos / (file_size - hdr_sz);
+                    double speed_mb = (logical_pos / (1024.0 * 1024.0)) / elapsed;
+                    double eta_s = (elapsed / logical_pos) * ((file_size - hdr_sz) - logical_pos);
+                    std::fprintf(stderr,
+                        "\r  Phase 0: scanning anchors  %.1f%%  "
+                        "(%.0f MB/s, ETA %.0fs, %zu anchors, %llu insts)   ",
+                        pct, speed_mb, eta_s,
+                        raw_anchors.size(), (unsigned long long)scan_id);
+                    std::fflush(stderr);
+                }
             }
-            if (rec_size == 0) break;  // guard against corrupt records
-            scan_offset += rec_size;
+        } else {
+            // ── mmap (uncompressed) path — original per-record data_at() ──
+            uint64_t scan_offset = hdr_sz;
+            reader.pin_all();
+            while (scan_offset < file_size) {
+                const uint8_t* ptr = reader.data_at(scan_offset);
+                auto kind = static_cast<RecordKind>(ptr[0]);
+                size_t rec_size = 0;
+                switch (kind) {
+                case RecordKind::Inst:
+                    rec_size = inst_hdr_sz
+                        + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                        + ptr[3] * memacc_sz;
+                    scan_id++;
+                    break;
+                case RecordKind::Anchor: {
+                    rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                    const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+                    raw_anchors.push_back({scan_id, scan_offset, ah->pc});
+                    break;
+                }
+                case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
+                case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
+                case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
+                case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
+                case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
+                default: rec_size = 1; break;
+                }
+                if (rec_size == 0) break;
+                scan_offset += rec_size;
+
+                // Report Phase 0 progress every ~500 MB.
+                constexpr uint64_t kReportInterval = 500ULL * 1024 * 1024;
+                if (scan_offset - phase0_last_report >= kReportInterval) {
+                    phase0_last_report = scan_offset;
+                    auto now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - phase0_start).count();
+                    double pct = 100.0 * scan_offset / file_size;
+                    double speed_mb = (scan_offset / (1024.0 * 1024.0)) / elapsed;
+                    double eta = (elapsed / scan_offset) * (file_size - scan_offset);
+                    std::fprintf(stderr,
+                        "\r  Phase 0: scanning anchors  %.1f%%  "
+                        "(%.0f MB/s, ETA %.0fs, %zu anchors, %llu insts)   ",
+                        pct, speed_mb, eta,
+                        raw_anchors.size(), (unsigned long long)scan_id);
+                    std::fflush(stderr);
+                }
+            }
+            reader.unpin_all();
         }
-        reader.unpin_all();
+
+        if (phase0_last_report > 0) {
+            auto phase0_end = std::chrono::steady_clock::now();
+            double phase0_sec = std::chrono::duration<double>(phase0_end - phase0_start).count();
+            std::fprintf(stderr,
+                "\r  Phase 0: done — %llu insts, %zu anchors in %.1fs                \n",
+                (unsigned long long)scan_id, raw_anchors.size(), phase0_sec);
+        }
 
         // Populate in-memory anchor table
         for (const auto& a : raw_anchors) {
@@ -827,32 +992,38 @@ Result<TraceIndex> TraceIndex::build(
         };
         std::vector<CodeEntry> code_entries;
 
-        // Offset-based scanning: works for both mmap and block-compressed.
         uint64_t scan_offset = bounds.file_start;
         const uint64_t scan_end = bounds.file_end;
 
         uint64_t inst_id = bounds.inst_id_start;
 
         // SST rotation threshold: ~500K entries per SST file.
-        // Larger than the old WriteBatch flush (50K) because SST writes
-        // are sequential I/O with no SkipList overhead.
         constexpr uint64_t SST_ROTATE_THRESHOLD = 500000;
 
-        while (scan_offset < scan_end) {
-            const uint8_t* ptr = reader.data_at(scan_offset);
+        // ── Per-record processing lambda ──
+        // Processes one record at `ptr` with absolute file offset `rec_offset`.
+        // Returns the record size in bytes, or 0 on corrupt/unknown record.
+        // On SST error sets result.error and returns 0.
+        auto process_record = [&](const uint8_t* ptr, uint64_t rec_offset,
+                                  size_t remaining) -> size_t {
             auto kind = static_cast<RecordKind>(ptr[0]);
             size_t rec_size = 0;
 
             switch (kind) {
             case RecordKind::Inst: {
+                if (remaining < inst_hdr_sz) return 0;
+                rec_size = inst_hdr_sz
+                    + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                    + ptr[3] * memacc_sz;
+                if (remaining < rec_size) return 0;
                 // P1.6: Sparse offset with adaptive interval
                 if (inst_id % idx.sparse_interval_ == 0) {
                     char key_buf[8];
                     encode_u64_to(inst_id, key_buf);
                     auto s = offset_w.add(
                         rocksdb::Slice(key_buf, 8),
-                        rocksdb::Slice(reinterpret_cast<const char*>(&scan_offset), 8));
-                    if (!s.ok()) { result.error = s.ToString(); return; }
+                        rocksdb::Slice(reinterpret_cast<const char*>(&rec_offset), 8));
+                    if (!s.ok()) { result.error = s.ToString(); return 0; }
                 }
                 // REG_WRITES inverted index (per-register SST writers)
                 {
@@ -862,7 +1033,7 @@ Result<TraceIndex> TraceIndex::build(
                         const auto* rd = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(
                             diffs + d * sizeof(qbditrace::qbditrace_regdiff_t));
                         uint8_t ri = rd->reg_index;
-                        if (ri >= NUM_REGS) continue;  // safety guard
+                        if (ri >= NUM_REGS) continue;
                         char rw_key[10];
                         rw_key[0] = 0;
                         rw_key[1] = static_cast<char>(ri);
@@ -871,32 +1042,29 @@ Result<TraceIndex> TraceIndex::build(
                         auto s = regw_per_reg[ri]->add(
                             rocksdb::Slice(rw_key, 10),
                             rocksdb::Slice());
-                        if (!s.ok()) { result.error = s.ToString(); return; }
+                        if (!s.ok()) { result.error = s.ToString(); return 0; }
                     }
                 }
-                // P1.7: use correct memacc_sz for record size
-                rec_size = inst_hdr_sz
-                    + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
-                    + ptr[3] * memacc_sz;
                 inst_id++;
                 result.inst_count++;
                 break;
             }
             case RecordKind::Anchor: {
                 rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                if (remaining < rec_size) return 0;
                 char anchor_key_buf[8];
                 encode_u64_to(inst_id, anchor_key_buf);
                 auto s = anchor_w.add(
                     rocksdb::Slice(anchor_key_buf, 8),
-                    rocksdb::Slice(reinterpret_cast<const char*>(&scan_offset), 8));
-                if (!s.ok()) { result.error = s.ToString(); return; }
+                    rocksdb::Slice(reinterpret_cast<const char*>(&rec_offset), 8));
+                if (!s.ok()) { result.error = s.ToString(); return 0; }
                 result.anchor_count++;
                 break;
             }
             case RecordKind::Code: {
-                // P1.9: Store raw instruction bytes in CODE_BYTES CF
                 uint8_t code_size = ptr[1];
                 rec_size = sizeof(qbditrace::qbditrace_code_head_t) + code_size;
+                if (remaining < rec_size) return 0;
                 if (code_size == 4) {
                     const auto* ch = reinterpret_cast<const qbditrace::qbditrace_code_head_t*>(ptr);
                     CodeEntry ce;
@@ -909,16 +1077,20 @@ Result<TraceIndex> TraceIndex::build(
             }
             case RecordKind::Event:
                 rec_size = sizeof(qbditrace::qbditrace_event_head_t);
+                if (remaining < rec_size) return 0;
                 result.event_count++;
                 break;
             case RecordKind::Thread:
                 rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
+                if (remaining < rec_size) return 0;
                 break;
             case RecordKind::Svc:
                 rec_size = sizeof(qbditrace::qbditrace_svc_head_t);
+                if (remaining < rec_size) return 0;
                 break;
             case RecordKind::Objc:
                 rec_size = sizeof(qbditrace::qbditrace_objc_head_t);
+                if (remaining < rec_size) return 0;
                 break;
             default:
                 rec_size = 1;
@@ -928,27 +1100,86 @@ Result<TraceIndex> TraceIndex::build(
             result.total_records++;
 
             // Rotate SST files periodically to bound memory.
-            // Only check every 1024 records to avoid per-record overhead
-            // of iterating all 34 per-register writers.
             if ((result.total_records & 0x3FF) == 0) {
                 if (!offset_w.rotate_if_needed(SST_ROTATE_THRESHOLD)) {
-                    result.error = offset_w.last_rotate_error.ToString(); return;
+                    result.error = offset_w.last_rotate_error.ToString(); return 0;
                 }
                 if (!anchor_w.rotate_if_needed(SST_ROTATE_THRESHOLD)) {
-                    result.error = anchor_w.last_rotate_error.ToString(); return;
+                    result.error = anchor_w.last_rotate_error.ToString(); return 0;
                 }
                 for (auto& rw : regw_per_reg) {
                     if (!rw->rotate_if_needed(SST_ROTATE_THRESHOLD)) {
-                        result.error = rw->last_rotate_error.ToString(); return;
+                        result.error = rw->last_rotate_error.ToString(); return 0;
                     }
                 }
             }
 
-            if (rec_size == 0) break;
-            scan_offset += rec_size;
+            return rec_size;
+        };
 
-            // Update shared progress counter (relaxed — just for display)
-            progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
+        if (reader.is_block_mode()) {
+            // ── Block-compressed fast path ──
+            // Decompress blocks covering [file_start, file_end) and scan
+            // records using pointer arithmetic — no mutex, no LRU.
+            // Same cross-boundary handling as Phase 0: track logical_pos
+            // across blocks, use overlap buffer for straddling records.
+            const uint64_t hdr_sz = reader.header_size();
+            const uint64_t logical_start = bounds.file_start - hdr_sz;
+            const uint64_t logical_end   = bounds.file_end   - hdr_sz;
+
+            uint32_t start_block = reader.find_block_for_offset(logical_start);
+            const uint32_t n_blocks = reader.block_count();
+            std::vector<uint8_t> block_buf;
+            uint64_t logical_pos = logical_start;
+
+            for (uint32_t bi = start_block; bi < n_blocks; bi++) {
+                const uint8_t* blk_data = nullptr;
+                uint32_t blk_size = 0;
+                uint64_t blk_logical_offset = 0;
+                if (!reader.decompress_block(bi, block_buf, blk_data,
+                                              blk_size, blk_logical_offset))
+                    break;
+
+                // Skip if we've already scanned past this block via overlap.
+                if (logical_pos >= blk_logical_offset + blk_size) continue;
+                // Stop if this block starts at or beyond our shard end.
+                if (blk_logical_offset >= logical_end) break;
+
+                uint32_t pos = 0;
+                if (logical_pos > blk_logical_offset)
+                    pos = static_cast<uint32_t>(logical_pos - blk_logical_offset);
+
+                // scan_limit = range within this block's own data where new
+                // records can start.  buf_total = total readable bytes
+                // (including overlap) for cross-boundary record content.
+                uint32_t scan_limit = blk_size - pos;
+                uint32_t buf_total  = static_cast<uint32_t>(block_buf.size()) - pos;
+                // Clamp scan_limit to shard end.
+                if (blk_logical_offset + pos + scan_limit > logical_end)
+                    scan_limit = static_cast<uint32_t>(logical_end - blk_logical_offset - pos);
+
+                uint32_t inner_pos = 0;
+                while (inner_pos < scan_limit) {
+                    const uint8_t* ptr = blk_data + pos + inner_pos;
+                    uint32_t remaining = buf_total - inner_pos;
+                    uint64_t rec_offset = blk_logical_offset + hdr_sz + pos + inner_pos;
+                    size_t rec_size = process_record(ptr, rec_offset, remaining);
+                    if (rec_size == 0) break;
+                    inner_pos += static_cast<uint32_t>(rec_size);
+                    progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
+                }
+                logical_pos = blk_logical_offset + pos + inner_pos;
+                scan_offset = logical_pos + hdr_sz;
+            }
+        } else {
+            // ── mmap path — original per-record data_at() ──
+            while (scan_offset < scan_end) {
+                const uint8_t* ptr = reader.data_at(scan_offset);
+                size_t rec_size = process_record(ptr, scan_offset, scan_end - scan_offset);
+                if (rec_size == 0) break;
+                scan_offset += rec_size;
+                progress_bytes.fetch_add(rec_size, std::memory_order_relaxed);
+            }
         }
 
         // Finish all open SST writers

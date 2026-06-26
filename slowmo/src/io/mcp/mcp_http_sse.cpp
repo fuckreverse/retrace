@@ -318,32 +318,49 @@ bool McpHttpSseTransport::start() {
 void McpHttpSseTransport::stop() {
     if (!running_.exchange(false)) return;
 
-    // Close server socket to unblock accept()
-    if (server_fd_ >= 0) {
-        ::shutdown(server_fd_, SHUT_RDWR);
-        ::close(server_fd_);
-        server_fd_ = -1;
+    // Shutdown server socket to unblock select()/accept() in listener thread.
+    // We shutdown but DON'T close yet — listener thread still references server_fd_.
+    int sfd = server_fd_;
+    if (sfd >= 0) {
+        ::shutdown(sfd, SHUT_RDWR);
     }
 
-    // Mark all sessions as dead
+    // Mark all sessions as dead and shutdown their fds to unblock I/O
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
         for (auto& [sid, sess] : sessions_) {
             sess->alive.store(false);
             if (sess->fd >= 0) ::shutdown(sess->fd, SHUT_RDWR);
         }
-        sessions_.clear();
+        // Don't clear yet — client threads may still reference sessions
     }
 
+    // Wait for listener thread to exit (it checks running_ flag)
     if (listener_thread_.joinable()) listener_thread_.join();
 
-    // Join any lingering client threads
+    // Now close the server socket — listener is done
+    if (sfd >= 0) {
+        ::close(sfd);
+        server_fd_ = -1;
+    }
+
+    // Join all client threads (they should exit quickly since sessions are dead
+    // and fds are shut down)
     {
-        std::lock_guard<std::mutex> lk(clients_mutex_);
-        for (auto& t : client_threads_) {
-            if (t.joinable()) t.detach();
+        std::vector<std::thread> threads_to_join;
+        {
+            std::lock_guard<std::mutex> lk(clients_mutex_);
+            threads_to_join = std::move(client_threads_);
         }
-        client_threads_.clear();
+        for (auto& t : threads_to_join) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    // Now safe to clear sessions — no client threads are running
+    {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        sessions_.clear();
     }
 }
 
@@ -351,19 +368,27 @@ void McpHttpSseTransport::stop() {
 
 void McpHttpSseTransport::listener_loop() {
     while (running_.load()) {
+        int sfd = server_fd_;  // snapshot — may become -1 during stop()
+        if (sfd < 0) break;
+
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(server_fd_, &rfds);
+        FD_SET(sfd, &rfds);
         struct timeval tv{0, 200000};  // 200ms
-        int ret = ::select(server_fd_ + 1, &rfds, nullptr, nullptr, &tv);
+        int ret = ::select(sfd + 1, &rfds, nullptr, nullptr, &tv);
         if (ret <= 0) continue;
+        if (!running_.load()) break;
 
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = ::accept(server_fd_,
+        int client_fd = ::accept(sfd,
                                  reinterpret_cast<struct sockaddr*>(&client_addr),
                                  &client_len);
         if (client_fd < 0) continue;
+
+        // Set a receive timeout on client fd so handler threads don't block forever
+        struct timeval recv_tv{5, 0};  // 5 second timeout
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
 
         // Spawn a per-client thread
         std::lock_guard<std::mutex> lk(clients_mutex_);
@@ -438,11 +463,18 @@ void McpHttpSseTransport::handle_client(int client_fd) {
             "event: endpoint\ndata: {}\n\n", endpoint_url);
         session->send_raw(endpoint_evt);
 
-        // Keep-alive: send periodic comments until session dies
-        while (running_.load() && session->alive.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(15));
-            if (!running_.load() || !session->alive.load()) break;
-            session->send_raw(": ping\n\n");
+        // Keep-alive: send periodic comments until session dies.
+        // Use short sleeps so stop() can join this thread quickly.
+        {
+            int ping_counter = 0;
+            while (running_.load() && session->alive.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!running_.load() || !session->alive.load()) break;
+                if (++ping_counter >= 150) {  // ~15 seconds
+                    session->send_raw(": ping\n\n");
+                    ping_counter = 0;
+                }
+            }
         }
 
         remove_session(session->id);

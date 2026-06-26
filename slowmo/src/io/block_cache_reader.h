@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if TENET_HAS_ZSTD
@@ -75,10 +76,41 @@ public:
     /// an uncompressed file.
     uint64_t logical_size() const { return logical_size_; }
 
+    /// Whether the block index was recovered by scanning (no valid footer).
+    bool was_recovered() const { return recovered_; }
+
+    /// Human-readable recovery summary (empty if not recovered).
+    const std::string& recovery_message() const { return recovery_msg_; }
+
+    /// Number of blocks in the index.
+    uint32_t block_count() const { return static_cast<uint32_t>(index_.size()); }
+
+    /// Decompress a block and return a contiguous buffer for bulk scanning.
+    /// `block_id` must be in [0, block_count()).
+    /// `out_data`   → pointer to the decompressed bytes
+    /// `out_size`   → decompressed size in bytes
+    /// `out_logical_offset` → logical offset of the first byte of this block
+    ///                        (relative to the record stream, i.e. after header)
+    /// Returns false on decompression error.
+    ///
+    /// The returned buffer is owned by the caller (via `out_buf`) and remains
+    /// valid until `out_buf` is destroyed.  This bypasses the LRU cache
+    /// entirely to avoid mutex contention in bulk-scan scenarios.
+    bool decompress_block(uint32_t block_id,
+                          std::vector<uint8_t>& out_buf,
+                          const uint8_t*& out_data,
+                          uint32_t& out_size,
+                          uint64_t& out_logical_offset) const;
+
     /// Prevent ALL cached blocks from being evicted.  Must be balanced by
     /// unpin_all().  Nested calls are supported (refcounted).
     void pin_all();
     void unpin_all();
+
+    /// Find the block index for a given logical offset via binary search.
+    /// Returns the block_id such that index_[block_id].original_offset
+    /// <= logical_offset < index_[block_id+1].original_offset.
+    uint32_t find_block(uint64_t logical_offset) const;
 
 private:
     struct CachedBlock {
@@ -92,9 +124,6 @@ private:
     /// Decompress block `block_id` and return a reference to its CachedBlock.
     /// Caller must hold mtx_.
     CachedBlock& ensure_block(uint32_t block_id);
-
-    /// Find block_id for a given logical_offset via binary search.
-    uint32_t find_block(uint64_t logical_offset) const;
 
     /// Evict the least-recently-used unpinned block. Caller must hold mtx_.
     void evict_one();
@@ -113,12 +142,21 @@ private:
                                 size_t dst_offset,
                                 size_t max_bytes);
 
+#if TENET_HAS_ZSTD
+    /// Recover block index by scanning zstd frames from header_size to EOF.
+    /// Used when the footer/index is missing (e.g. truncated trace).
+    /// Returns true if at least one block was recovered.
+    bool recover_index();
+#endif
+
     const uint8_t* mapped_ = nullptr;
     uint64_t file_size_ = 0;
     uint64_t header_size_ = 0;
 
     std::vector<qbditrace::qbditrace_block_entry_t> index_;
     uint64_t logical_size_ = 0;
+    bool recovered_ = false;  // true if index was rebuilt from scanning
+    std::string recovery_msg_;  // human-readable recovery summary
 
     // LRU cache
     std::vector<CachedBlock> cache_;
@@ -184,30 +222,45 @@ inline bool BlockCacheReader::init(const uint8_t* mapped, uint64_t file_size,
     header_size_ = header_size;
     max_cached_ = max_cached_blocks;
 
-    // Read footer (last 16 bytes)
-    if (file_size < header_size + sizeof(qbditrace::qbditrace_block_footer_t))
-        return false;
+#if TENET_HAS_ZSTD
+    // We need dctx for both normal init and recovery, so create it early.
+    dctx_ = ZSTD_createDCtx();
+    if (!dctx_) return false;
+#endif
 
-    qbditrace::qbditrace_block_footer_t footer;
-    std::memcpy(&footer,
-                mapped + file_size - sizeof(footer),
-                sizeof(footer));
+    bool footer_ok = false;
 
-    if (footer.magic != QBDITRACE_BLOCK_INDEX_MAGIC)
-        return false;
-    if (footer.block_count == 0)
-        return false;
+    // Try reading footer (last 16 bytes)
+    if (file_size >= header_size + sizeof(qbditrace::qbditrace_block_footer_t)) {
+        qbditrace::qbditrace_block_footer_t footer;
+        std::memcpy(&footer,
+                    mapped + file_size - sizeof(footer),
+                    sizeof(footer));
 
-    // Read block index table
-    uint64_t table_size = footer.block_count *
-                          sizeof(qbditrace::qbditrace_block_entry_t);
-    if (footer.index_offset + table_size > file_size - sizeof(footer))
-        return false;
+        if (footer.magic == QBDITRACE_BLOCK_INDEX_MAGIC &&
+            footer.block_count > 0) {
+            uint64_t table_size = footer.block_count *
+                                  sizeof(qbditrace::qbditrace_block_entry_t);
+            if (footer.index_offset + table_size <= file_size - sizeof(footer)) {
+                // Footer and index table look valid.
+                index_.resize(footer.block_count);
+                std::memcpy(index_.data(),
+                            mapped + footer.index_offset,
+                            table_size);
+                footer_ok = true;
+            }
+        }
+    }
 
-    index_.resize(footer.block_count);
-    std::memcpy(index_.data(),
-                mapped + footer.index_offset,
-                table_size);
+    // If footer is missing/corrupt, try to recover by scanning zstd frames.
+    if (!footer_ok) {
+#if TENET_HAS_ZSTD
+        if (!recover_index())
+            return false;
+#else
+        return false;
+#endif
+    }
 
     // Compute logical size
     logical_size_ = 0;
@@ -220,13 +273,72 @@ inline bool BlockCacheReader::init(const uint8_t* mapped, uint64_t file_size,
     size_t slots = max_cached_ < index_.size() ? max_cached_ : index_.size();
     cache_.resize(slots);
 
+    return true;
+}
+
 #if TENET_HAS_ZSTD
-    dctx_ = ZSTD_createDCtx();
-    if (!dctx_) return false;
-#endif
+inline bool BlockCacheReader::recover_index() {
+    // Scan from right after the header, identifying independent zstd frames.
+    // Each block produced by the writer is a self-contained zstd frame
+    // (with checksum), so ZSTD_findFrameCompressedSize() can locate them.
+    index_.clear();
+    uint64_t pos = header_size_;
+    uint64_t logical_offset = 0;
+
+    while (pos < file_size_) {
+        const uint8_t* frame_start = mapped_ + pos;
+        size_t remaining = file_size_ - pos;
+
+        // Check if remaining bytes look like a zstd frame.
+        size_t frame_size = ZSTD_findFrameCompressedSize(frame_start, remaining);
+        if (ZSTD_isError(frame_size)) {
+            // Not a valid frame — this is where the data ends.
+            // Could be a partial frame from an interrupted write.
+            break;
+        }
+
+        // Determine decompressed size.  The writer uses single-shot
+        // ZSTD_compress2, which embeds the content size in the frame header.
+        unsigned long long content_size = ZSTD_getFrameContentSize(frame_start, remaining);
+        if (content_size == ZSTD_CONTENTSIZE_ERROR ||
+            content_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+            // Can't determine decompressed size — try actually decompressing.
+            // Use a generous upper bound (default block = 1 MB, but could be
+            // up to ~4 MB with custom settings).
+            size_t upper = 4u << 20;
+            std::vector<uint8_t> tmp(upper);
+            size_t dec = ZSTD_decompressDCtx(dctx_, tmp.data(), upper,
+                                             frame_start, frame_size);
+            if (ZSTD_isError(dec)) break;
+            content_size = dec;
+        }
+
+        qbditrace::qbditrace_block_entry_t entry;
+        entry.original_offset = logical_offset;
+        entry.compressed_offset = pos;
+        entry.original_size = static_cast<uint32_t>(content_size);
+        entry.compressed_size = static_cast<uint32_t>(frame_size);
+        index_.push_back(entry);
+
+        logical_offset += content_size;
+        pos += frame_size;
+    }
+
+    if (index_.empty())
+        return false;
+
+    recovered_ = true;
+
+    // Build a human-readable summary.
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "recovered %zu blocks (%.1f MB logical) from truncated trace",
+                  index_.size(), logical_offset / (1024.0 * 1024.0));
+    recovery_msg_ = buf;
 
     return true;
 }
+#endif
 
 inline uint32_t BlockCacheReader::find_block(uint64_t logical_offset) const {
     // Binary search: find the last block whose original_offset <= logical_offset
@@ -418,6 +530,71 @@ inline void BlockCacheReader::pin_all() {
 inline void BlockCacheReader::unpin_all() {
     std::lock_guard<std::mutex> lk(mtx_);
     if (global_pin_ > 0) --global_pin_;
+}
+
+inline bool BlockCacheReader::decompress_block(
+    uint32_t block_id,
+    std::vector<uint8_t>& out_buf,
+    const uint8_t*& out_data,
+    uint32_t& out_size,
+    uint64_t& out_logical_offset) const
+{
+    if (block_id >= index_.size()) return false;
+    const auto& entry = index_[block_id];
+    out_logical_offset = entry.original_offset;
+    out_size = entry.original_size;
+
+    // Allocate caller-owned buffer with kOverlapBytes extra for cross-block
+    // record reads at the tail.
+    size_t alloc = entry.original_size;
+    if (block_id + 1 < index_.size())
+        alloc += kOverlapBytes;
+    out_buf.resize(alloc);
+
+#if TENET_HAS_ZSTD
+    // Each call creates its own DCtx so this is fully thread-safe
+    // without touching mtx_ at all.
+    ZSTD_DCtx* local_dctx = ZSTD_createDCtx();
+    if (!local_dctx) return false;
+
+    size_t result = ZSTD_decompressDCtx(
+        local_dctx,
+        out_buf.data(), entry.original_size,
+        mapped_ + entry.compressed_offset, entry.compressed_size);
+    if (ZSTD_isError(result) || result != entry.original_size) {
+        ZSTD_freeDCtx(local_dctx);
+        return false;
+    }
+
+    // If there is a next block, decompress its head into the overlap zone
+    // so records straddling the block boundary can be read contiguously.
+    if (block_id + 1 < index_.size()) {
+        const auto& next = index_[block_id + 1];
+        // We need at most kOverlapBytes from the next block.
+        // Decompress the full next block into a temp buffer, then copy the head.
+        std::vector<uint8_t> tmp(next.original_size);
+        size_t r2 = ZSTD_decompressDCtx(
+            local_dctx,
+            tmp.data(), next.original_size,
+            mapped_ + next.compressed_offset, next.compressed_size);
+        if (!ZSTD_isError(r2) && r2 == next.original_size) {
+            size_t to_copy = std::min(kOverlapBytes, static_cast<size_t>(next.original_size));
+            std::memcpy(out_buf.data() + entry.original_size, tmp.data(), to_copy);
+            if (to_copy < kOverlapBytes)
+                std::memset(out_buf.data() + entry.original_size + to_copy, 0,
+                            kOverlapBytes - to_copy);
+        } else {
+            std::memset(out_buf.data() + entry.original_size, 0, kOverlapBytes);
+        }
+    }
+
+    ZSTD_freeDCtx(local_dctx);
+#else
+    std::memset(out_buf.data(), 0, alloc);
+#endif
+
+    out_data = out_buf.data();
+    return true;
 }
 
 }  // namespace tenet

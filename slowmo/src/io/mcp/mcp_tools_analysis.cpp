@@ -13,6 +13,7 @@
 #include "analysis/pass_manager.h"
 
 #include "analysis/passes/xref_pass.h"
+#include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/passes/constant_materialization_pass.h"
@@ -152,6 +153,8 @@ void TenetMcpService::register_analysis_tools() {
          "Feistel rounds, SPN rounds, ARX patterns, S-box lookups, etc.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<LoopSemanticsPass>());
             const auto& result = require_pass<LoopSemanticsResult>(pm_, "loop_semantics", "Loop semantics failed");
@@ -182,6 +185,8 @@ void TenetMcpService::register_analysis_tools() {
          "analysis to identify cryptographic algorithms in the trace.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
             pm_->register_pass(std::make_unique<PatternPass>());
             pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
@@ -221,6 +226,8 @@ void TenetMcpService::register_analysis_tools() {
          "indicators, constant markers, pattern identifiers).",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
@@ -341,6 +348,9 @@ void TenetMcpService::register_analysis_tools() {
          "repetition counts.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
+            pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<TraceFoldPass>());
             const auto& result = require_pass<TraceFoldResult>(pm_, "trace_fold", "Trace fold failed");
@@ -566,6 +576,9 @@ void TenetMcpService::register_search_tools() {
             CallContextConfig cfg;
             cfg.target_inst_id = args.at("inst_id").get<uint64_t>();
 
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
+            pm_->register_pass(std::make_unique<LoopPass>());
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<CallContextPass>(std::move(cfg)));
             const auto& result = require_pass<CallContextResult>(pm_, "call_context", "Call context failed");
@@ -675,7 +688,7 @@ void TenetMcpService::register_search_tools() {
             cfg.min_string_len = args.value("min_length", size_t(4));
 
             pm_->register_pass(std::make_unique<MemoryStringPass>(std::move(cfg)));
-            const auto& result = require_pass<MemoryStringResult>(pm_, "memory_string", "Memory strings failed");
+            const auto& result = require_pass<MemoryStringResult>(pm_, "memory_strings", "Memory strings failed");
 
             json strings = json::array();
             size_t limit = std::min(result.strings.size(), size_t(500));
@@ -710,7 +723,7 @@ void TenetMcpService::register_pass_tools() {
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
             pm_->register_pass(std::make_unique<FunctionPass>());
-            const auto& result = require_pass<FunctionResult>(pm_, "functions", "Function pass failed");
+            const auto& result = require_pass<FunctionResult>(pm_, "function", "Function pass failed");
 
             json funcs = json::array();
             for (const auto& [pc, info] : result.functions) {
@@ -732,8 +745,10 @@ void TenetMcpService::register_pass_tools() {
          "counts, body sizes, and nesting information.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
+            pm_->register_pass(std::make_unique<XrefPass>());
+            pm_->register_pass(std::make_unique<CFGPass>());
             pm_->register_pass(std::make_unique<LoopPass>());
-            const auto& result = require_pass<LoopResult>(pm_, "loops", "Loop pass failed");
+            const auto& result = require_pass<LoopResult>(pm_, "loop", "Loop pass failed");
 
             json loops = json::array();
             for (const auto& l : result.loops) {
@@ -843,7 +858,7 @@ void TenetMcpService::register_pass_tools() {
         [this](const json& args) -> json {
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<XrefPass>());
-            const auto& fn_result = require_pass<FunctionResult>(pm_, "functions", "Function pass failed");
+            const auto& fn_result = require_pass<FunctionResult>(pm_, "function", "Function pass failed");
 
             // XRef for inst_id lookup
             bool has_xref = false;
