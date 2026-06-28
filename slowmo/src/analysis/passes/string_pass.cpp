@@ -12,6 +12,117 @@
 
 namespace tenet {
 
+// ─── Blob persistence helpers ─────────────────────────────────────────────
+
+static constexpr uint32_t STRING_BLOB_MAGIC   = 0x53545247u;  // "STRG"
+static constexpr uint32_t STRING_BLOB_VERSION = 1u;
+
+/// Serialize StringResult into a compact binary blob.
+/// Format: [magic:u32][version:u32][num_strings:u64]
+///   per StringRef:
+///     [addr:u64][discovered_at:u64][encoding:u8][pad:3]
+///     [content_len:u32][content]
+///     [num_refs:u32] per ref: [inst_id:u64][pc:u64]
+/// (addr_to_index and inst_to_strings are rebuilt on deserialization)
+static std::string string_serialize(const StringResult& res) {
+    // Estimate buffer size
+    size_t est = 4 + 4 + 8;
+    for (const auto& s : res.strings) {
+        est += 8 + 8 + 1 + 3          // addr, discovered_at, encoding, pad
+             + 4 + s.content.size()    // content
+             + 4 + s.references.size() * 16;  // references
+    }
+
+    std::string buf;
+    buf.reserve(est);
+
+    auto write = [&](const void* data, size_t n) {
+        buf.append(reinterpret_cast<const char*>(data), n);
+    };
+    auto write_u8  = [&](uint8_t v)  { write(&v, 1); };
+    auto write_u32 = [&](uint32_t v) { write(&v, 4); };
+    auto write_u64 = [&](uint64_t v) { write(&v, 8); };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        if (!s.empty()) write(s.data(), s.size());
+    };
+
+    write_u32(STRING_BLOB_MAGIC);
+    write_u32(STRING_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.strings.size()));
+
+    for (const auto& s : res.strings) {
+        write_u64(s.addr);
+        write_u64(s.discovered_at);
+        write_u8(static_cast<uint8_t>(s.encoding));
+        write_u8(0); write_u8(0); write_u8(0);  // padding
+        write_str(s.content);
+        write_u32(static_cast<uint32_t>(s.references.size()));
+        for (const auto& r : s.references) {
+            write_u64(r.inst_id);
+            write_u64(r.pc);
+        }
+    }
+
+    return buf;
+}
+
+/// Deserialize StringResult from a binary blob. Returns false on corruption.
+/// Rebuilds addr_to_index and inst_to_strings derived indices.
+static bool string_deserialize(const std::string& blob, StringResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto remaining = [&]() -> size_t { return static_cast<size_t>(end - p); };
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (remaining() < 4) return false;
+        uint32_t len = read_u32();
+        if (remaining() < len) return false;
+        s.assign(p, len);
+        p += len;
+        return true;
+    };
+
+    uint32_t magic = read_u32();
+    uint32_t version = read_u32();
+    if (magic != STRING_BLOB_MAGIC || version != STRING_BLOB_VERSION) return false;
+
+    uint64_t num_strings = read_u64();
+    out.strings.resize(static_cast<size_t>(num_strings));
+
+    for (size_t i = 0; i < num_strings; i++) {
+        auto& s = out.strings[i];
+        if (remaining() < 8 + 8 + 4) return false;  // addr + discovered_at + encoding + pad
+        s.addr          = read_u64();
+        s.discovered_at = read_u64();
+        s.encoding      = static_cast<StringRef::Encoding>(read_u8());
+        read_u8(); read_u8(); read_u8();  // skip padding
+        if (!read_str(s.content)) return false;
+
+        if (remaining() < 4) return false;
+        uint32_t num_refs = read_u32();
+        if (remaining() < num_refs * 16) return false;
+        s.references.resize(num_refs);
+        for (uint32_t j = 0; j < num_refs; j++) {
+            s.references[j].inst_id = read_u64();
+            s.references[j].pc      = read_u64();
+        }
+
+        // Rebuild addr_to_index
+        out.addr_to_index[s.addr] = i;
+        // Rebuild inst_to_strings
+        for (const auto& r : s.references) {
+            out.inst_to_strings[r.inst_id].push_back(i);
+        }
+    }
+
+    return true;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 static bool is_printable(uint8_t c) {
@@ -220,6 +331,20 @@ PassResult StringPass::run(PassContext& ctx) {
     auto& index  = ctx.index();
     const auto& range = ctx.range();
 
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("strings", blob)) {
+            StringResult cached;
+            if (string_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Strings: {} discovered (from cache)",
+                    cached.total()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     uint64_t start = range.start_inst_id;
     uint64_t end   = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
@@ -256,6 +381,14 @@ PassResult StringPass::run(PassContext& ctx) {
                                     byte_cache_size));
 
     StringResult result = collector.take_result();
+
+    // ─── Persist result for future sessions ───────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob = string_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("strings", blob.data(), blob.size());
+        }
+    }
 
     ctx.progress(1.0f, fmt::format("Strings: {} discovered from {} byte addresses",
                                     result.total(), byte_cache_size));

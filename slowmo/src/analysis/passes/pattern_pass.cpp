@@ -1,6 +1,7 @@
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
+#include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
 #include "core/register_file.h"
@@ -16,6 +17,114 @@
 #include <string_view>
 
 namespace tenet {
+
+// ─── Blob persistence helpers ─────────────────────────────────────────────
+
+static constexpr uint32_t PATTERN_BLOB_MAGIC   = 0x50415454u;  // "PATT"
+static constexpr uint32_t PATTERN_BLOB_VERSION = 1u;
+
+/// Serialize PatternResult into a compact binary blob.
+/// Format: [magic:u32][version:u32][num_matches:u64]
+///   per match: [name_len:u32][name][cat:u8][conf:u8][start:u64][end:u64]
+///              [anchor_pc:u64][desc_len:u32][desc]
+///              [num_related:u32][related_inst_ids...]
+///              [num_consts:u32][constants...]
+static std::string pattern_serialize(const PatternResult& res) {
+    // Estimate buffer size
+    size_t est = 4 + 4 + 8;
+    for (const auto& m : res.matches) {
+        est += 4 + m.pattern_name.size() + 2 + 24 + 4 + m.description.size()
+             + 4 + m.related_inst_ids.size() * 8
+             + 4 + m.constants_found.size() * 8;
+    }
+
+    std::string buf;
+    buf.reserve(est);
+
+    auto write = [&](const void* data, size_t n) {
+        buf.append(reinterpret_cast<const char*>(data), n);
+    };
+    auto write_u8  = [&](uint8_t v)  { write(&v, 1); };
+    auto write_u32 = [&](uint32_t v) { write(&v, 4); };
+    auto write_u64 = [&](uint64_t v) { write(&v, 8); };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        if (!s.empty()) write(s.data(), s.size());
+    };
+
+    write_u32(PATTERN_BLOB_MAGIC);
+    write_u32(PATTERN_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.matches.size()));
+
+    for (const auto& m : res.matches) {
+        write_str(m.pattern_name);
+        write_u8(static_cast<uint8_t>(m.category));
+        write_u8(static_cast<uint8_t>(m.confidence));
+        write_u64(m.start_inst_id);
+        write_u64(m.end_inst_id);
+        write_u64(m.anchor_pc);
+        write_str(m.description);
+        write_u32(static_cast<uint32_t>(m.related_inst_ids.size()));
+        for (uint64_t id : m.related_inst_ids) write_u64(id);
+        write_u32(static_cast<uint32_t>(m.constants_found.size()));
+        for (uint64_t c : m.constants_found) write_u64(c);
+    }
+
+    return buf;
+}
+
+/// Deserialize PatternResult from a binary blob. Returns false on corruption.
+static bool pattern_deserialize(const std::string& blob, PatternResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto remaining = [&]() -> size_t { return static_cast<size_t>(end - p); };
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (remaining() < 4) return false;
+        uint32_t len = read_u32();
+        if (remaining() < len) return false;
+        s.assign(p, len);
+        p += len;
+        return true;
+    };
+
+    uint32_t magic = read_u32();
+    uint32_t version = read_u32();
+    if (magic != PATTERN_BLOB_MAGIC || version != PATTERN_BLOB_VERSION) return false;
+
+    uint64_t num_matches = read_u64();
+    out.matches.resize(static_cast<size_t>(num_matches));
+
+    for (size_t i = 0; i < num_matches; i++) {
+        auto& m = out.matches[i];
+        if (!read_str(m.pattern_name)) return false;
+        if (remaining() < 2 + 24) return false;
+        m.category   = static_cast<PatternCategory>(read_u8());
+        m.confidence = static_cast<PatternConfidence>(read_u8());
+        m.start_inst_id = read_u64();
+        m.end_inst_id   = read_u64();
+        m.anchor_pc     = read_u64();
+        if (!read_str(m.description)) return false;
+
+        if (remaining() < 4) return false;
+        uint32_t num_related = read_u32();
+        if (remaining() < num_related * 8) return false;
+        m.related_inst_ids.resize(num_related);
+        for (uint32_t j = 0; j < num_related; j++) m.related_inst_ids[j] = read_u64();
+
+        if (remaining() < 4) return false;
+        uint32_t num_consts = read_u32();
+        if (remaining() < num_consts * 8) return false;
+        m.constants_found.resize(num_consts);
+        for (uint32_t j = 0; j < num_consts; j++) m.constants_found[j] = read_u64();
+    }
+
+    return true;
+}
 
 // ─── YARA callback context ────────────────────────────────────────────────
 
@@ -501,10 +610,26 @@ PassResult PatternPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     auto& code_table = ctx.code_table();
     auto& decoder = ctx.decoder();
+    const auto& range = ctx.range();
 
     const uint64_t total_insts = index.inst_count();
     if (total_insts == 0) {
         return PassResult::failed("Empty trace");
+    }
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("pattern", blob)) {
+            PatternResult cached;
+            if (pattern_deserialize(blob, cached)) {
+                build_category_index(cached);
+                ctx.progress(1.0f, fmt::format(
+                    "Pattern: {} matches found (from cache)",
+                    cached.total()));
+                return PassResult::success(std::move(cached));
+            }
+        }
     }
 
     // Phase 1: Load YARA rules
@@ -604,6 +729,14 @@ PassResult PatternPass::run(PassContext& ctx) {
 
     // Phase 5: Build category index
     build_category_index(result);
+
+    // ─── Persist result for future sessions ───────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob = pattern_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("pattern", blob.data(), blob.size());
+        }
+    }
 
     ctx.progress(1.0f, fmt::format("Pattern: {} matches found (YARA {})",
                                     result.total(), has_yara ? "enabled" : "disabled"));
