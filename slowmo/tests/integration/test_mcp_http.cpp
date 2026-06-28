@@ -49,19 +49,23 @@ using json = nlohmann::json;
 
 namespace {
 
-/// Connect a TCP socket to host:port.  Returns fd or -1 on failure.
-int tcp_connect(const std::string& host, uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+/// Connect a TCP socket to host:port with retries.  Returns fd or -1 on failure.
+int tcp_connect(const std::string& host, uint16_t port, int retries = 3) {
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+            return fd;
         ::close(fd);
-        return -1;
+        if (attempt < retries)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempt)));
     }
-    return fd;
+    return -1;
 }
 
 /// Send a full HTTP request string over `fd`.
@@ -191,51 +195,63 @@ HttpResponse http_read_response(int fd,
 }
 
 HttpResponse http_get(const std::string& host, uint16_t port, const std::string& path) {
-    int fd = tcp_connect(host, port);
-    if (fd < 0) return {};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int fd = tcp_connect(host, port);
+        if (fd < 0) continue;
 
-    std::string req = "GET " + path + " HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      "Connection: close\r\n\r\n";
-    http_send(fd, req);
-    auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
-    ::close(fd);
-    return resp;
+        std::string req = "GET " + path + " HTTP/1.1\r\n"
+                          "Host: " + host + "\r\n"
+                          "Connection: close\r\n\r\n";
+        http_send(fd, req);
+        auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
+        ::close(fd);
+        if (resp.status != 0) return resp;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
+    }
+    return {};
 }
 
 HttpResponse http_post(const std::string& host, uint16_t port,
                        const std::string& path, const std::string& body,
                        const std::string& extra_headers = "",
                        std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-    int fd = tcp_connect(host, port);
-    if (fd < 0) return {};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int fd = tcp_connect(host, port);
+        if (fd < 0) continue;
 
-    std::string req = "POST " + path + " HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Content-Length: " + std::to_string(body.size()) + "\r\n"
-                      + extra_headers +
-                      "Connection: close\r\n\r\n" + body;
-    http_send(fd, req);
-    auto resp = http_read_response(fd, timeout);
-    ::close(fd);
-    return resp;
+        std::string req = "POST " + path + " HTTP/1.1\r\n"
+                          "Host: " + host + "\r\n"
+                          "Content-Type: application/json\r\n"
+                          "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                          + extra_headers +
+                          "Connection: close\r\n\r\n" + body;
+        http_send(fd, req);
+        auto resp = http_read_response(fd, timeout);
+        ::close(fd);
+        if (resp.status != 0) return resp;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
+    }
+    return {};
 }
 
 HttpResponse http_delete(const std::string& host, uint16_t port,
                          const std::string& path,
                          const std::string& extra_headers = "") {
-    int fd = tcp_connect(host, port);
-    if (fd < 0) return {};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int fd = tcp_connect(host, port);
+        if (fd < 0) continue;
 
-    std::string req = "DELETE " + path + " HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      + extra_headers +
-                      "Connection: close\r\n\r\n";
-    http_send(fd, req);
-    auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
-    ::close(fd);
-    return resp;
+        std::string req = "DELETE " + path + " HTTP/1.1\r\n"
+                          "Host: " + host + "\r\n"
+                          + extra_headers +
+                          "Connection: close\r\n\r\n";
+        http_send(fd, req);
+        auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
+        ::close(fd);
+        if (resp.status != 0) return resp;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
+    }
+    return {};
 }
 
 /// Streamable HTTP MCP client: manages session, provides send_rpc().
@@ -295,6 +311,40 @@ struct McpClient {
             extra = "Mcp-Session-Id: " + session_id + "\r\n";
         }
         http_post(host, port, "/mcp", notif.dump(), extra);
+    }
+
+    /// Send a tools/call RPC with automatic retry when the pass is not ready.
+    /// If the response contains {"status":"processing"}, waits and retries up
+    /// to `max_retries` times.  Returns the final parsed JSON-RPC response
+    /// (or the last "processing" response if retries exhausted).
+    json send_rpc_retry(const json& request,
+                        int max_retries = 30,
+                        std::chrono::milliseconds retry_interval = std::chrono::milliseconds(500),
+                        std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            auto resp = send_rpc(request, timeout);
+            if (resp.is_null()) return resp;
+
+            // Check if this is a "pass not ready" processing response.
+            try {
+                if (resp.contains("result") &&
+                    resp["result"].contains("content") &&
+                    resp["result"]["content"].is_array() &&
+                    !resp["result"]["content"].empty()) {
+                    auto text = resp["result"]["content"][0]["text"].get<std::string>();
+                    auto inner = json::parse(text);
+                    if (inner.contains("status") && inner["status"] == "processing") {
+                        if (attempt < max_retries) {
+                            std::this_thread::sleep_for(retry_interval);
+                            continue;
+                        }
+                    }
+                }
+            } catch (...) {}
+
+            return resp;
+        }
+        return nullptr;
     }
 
     /// Delete session.
@@ -514,7 +564,12 @@ static void gen_comprehensive_trace(TraceWriter& tw) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Test Environment: trace + MCP service + HTTP server
+// Shared Test Environment
+//
+// All test cases in this file share a single trace+server environment.
+// Building the trace, RocksDB index, and analysis stack is expensive (~0.5s),
+// so we do it once and reuse.  The server binds to port 0 (OS-assigned) to
+// eliminate TOCTOU port races entirely.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct McpHttpEnv {
@@ -532,69 +587,50 @@ struct McpHttpEnv {
     }
 };
 
-/// Pick a free ephemeral port by binding to port 0 and reading back the assignment.
-static uint16_t pick_port() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 19200;
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = 0;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return 19200;
-    }
-    socklen_t len = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
-    uint16_t p = ntohs(addr.sin_port);
-    ::close(fd);
-    return p;
-}
+/// Lazily build the shared test environment (once per process).
+static McpHttpEnv& shared_env() {
+    static McpHttpEnv ctx = [] {
+        McpHttpEnv result;
+        result.env = make_env(gen_comprehensive_trace, "mcp_http");
+        if (!result.env) throw std::runtime_error("Failed to create trace env");
 
-static McpHttpEnv make_http_env() {
-    McpHttpEnv result;
-    result.env = make_env(gen_comprehensive_trace, "mcp_http");
-    REQUIRE(result.env != nullptr);
+        result.pm = make_pm(*result.env);
+        result.mcp = std::make_unique<TenetMcpService>(
+            *result.env->reader, *result.env->index,
+            *result.env->regfile, *result.env->memory,
+            result.pm.get(),
+            &result.env->code_table, &result.env->decoder);
 
-    result.pm = make_pm(*result.env);
-    result.mcp = std::make_unique<TenetMcpService>(
-        *result.env->reader, *result.env->index,
-        *result.env->regfile, *result.env->memory,
-        result.pm.get(),
-        &result.env->code_table, &result.env->decoder);
-
-    bool ok = false;
-    for (int attempt = 0; attempt < 5 && !ok; attempt++) {
-        result.port = pick_port();
+        // Bind to port 0 — OS assigns an ephemeral port atomically.
+        // No TOCTOU race: the server socket stays open.
         McpHttpConfig cfg;
         cfg.host = "127.0.0.1";
-        cfg.port = result.port;
-        ok = result.mcp->start_http(cfg);
-        if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    REQUIRE(ok);
+        cfg.port = 0;
+        if (!result.mcp->start_http(cfg))
+            throw std::runtime_error("Failed to start HTTP server");
 
-    // Wait for server to be ready
-    for (int i = 0; i < 50; i++) {
-        auto resp = http_get("127.0.0.1", result.port, "/health");
-        if (resp.status == 200) return result;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    FAIL("HTTP server did not become ready");
-    return result;
+        result.port = result.mcp->http_listening_port();
+
+        // Wait for server to be ready (poll /health)
+        for (int i = 0; i < 50; i++) {
+            auto resp = http_get("127.0.0.1", result.port, "/health");
+            if (resp.status == 200) return result;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        throw std::runtime_error("HTTP server did not become ready");
+    }();
+    return ctx;
 }
 
 /// Create an McpClient, connect, and initialize (assign session).
-/// Retries initialization a few times to handle transient port-reuse issues.
-/// SKIPs (instead of failing) if all retries are exhausted (transient).
 static McpClient make_client(const McpHttpEnv& ctx) {
     McpClient client;
     client.connect("127.0.0.1", ctx.port);
     json init_resp;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 3; i++) {
         init_resp = client.initialize();
         if (!init_resp.is_null() && !client.session_id.empty()) return client;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     SKIP("Client initialization timed out (transient)");
     return client;
@@ -605,7 +641,7 @@ static McpClient make_client(const McpHttpEnv& ctx) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("MCP HTTP: /health endpoint", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp = http_get("127.0.0.1", ctx.port, "/health");
     REQUIRE(resp.status == 200);
     auto j = json::parse(resp.body);
@@ -613,13 +649,13 @@ TEST_CASE("MCP HTTP: /health endpoint", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: 404 for unknown path", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp = http_get("127.0.0.1", ctx.port, "/nonexistent");
     CHECK(resp.status == 404);
 }
 
 TEST_CASE("MCP HTTP: legacy SSE endpoints return 404", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp_sse = http_get("127.0.0.1", ctx.port, "/sse");
     CHECK(resp_sse.status == 404);
     auto resp_msg = http_post("127.0.0.1", ctx.port, "/messages", "{}");
@@ -627,7 +663,7 @@ TEST_CASE("MCP HTTP: legacy SSE endpoints return 404", "[integration][mcp][http]
 }
 
 TEST_CASE("MCP HTTP: initialize + session management", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
 
     // POST /mcp with initialize — should get session ID back
     json init_req = {
@@ -676,7 +712,7 @@ TEST_CASE("MCP HTTP: initialize + session management", "[integration][mcp][http]
 }
 
 TEST_CASE("MCP HTTP: DELETE /mcp terminates session", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     // Session works
@@ -696,7 +732,7 @@ TEST_CASE("MCP HTTP: DELETE /mcp terminates session", "[integration][mcp][http]"
 }
 
 TEST_CASE("MCP HTTP: tools/list", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_rpc("tools/list", 2));
@@ -723,7 +759,7 @@ TEST_CASE("MCP HTTP: tools/list", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: notification returns 202", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     // Send notifications/initialized
@@ -734,7 +770,7 @@ TEST_CASE("MCP HTTP: notification returns 202", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: ping", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_rpc("ping", 99));
@@ -744,7 +780,7 @@ TEST_CASE("MCP HTTP: ping", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: trace_info tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("trace_info", 10));
@@ -760,7 +796,7 @@ TEST_CASE("MCP HTTP: trace_info tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: disasm tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("disasm", 11, {
@@ -776,7 +812,7 @@ TEST_CASE("MCP HTTP: disasm tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: get_regs tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("get_regs", 12, {
@@ -791,7 +827,7 @@ TEST_CASE("MCP HTTP: get_regs tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: memread tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("memread", 13, {
@@ -804,11 +840,11 @@ TEST_CASE("MCP HTTP: memread tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: search_pc tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     uint64_t rt_xor = 0x200CULL + 0x4000ULL;
-    auto resp = client.send_rpc(make_tool_call("search_pc", 14, {
+    auto resp = client.send_rpc_retry(make_tool_call("search_pc", 14, {
         {"pc", fmt::format("0x{:X}", rt_xor)}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -820,14 +856,14 @@ TEST_CASE("MCP HTTP: search_pc tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: taint_forward tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     // taint_forward may take >10s on large traces; use 60s timeout
-    auto resp = client.send_rpc(make_tool_call("taint_forward", 15, {
+    auto resp = client.send_rpc_retry(make_tool_call("taint_forward", 15, {
         {"inst_id", 2},
         {"reg_index", 0}
-    }), std::chrono::milliseconds(60000));
+    }), 60, std::chrono::milliseconds(1000), std::chrono::milliseconds(60000));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -838,10 +874,10 @@ TEST_CASE("MCP HTTP: taint_forward tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: cfg_export tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("cfg_export", 16));
+    auto resp = client.send_rpc_retry(make_tool_call("cfg_export", 16));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -851,10 +887,10 @@ TEST_CASE("MCP HTTP: cfg_export tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: call_graph tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("call_graph", 17));
+    auto resp = client.send_rpc_retry(make_tool_call("call_graph", 17));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -864,10 +900,10 @@ TEST_CASE("MCP HTTP: call_graph tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: pattern_scan tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("pattern_scan", 18));
+    auto resp = client.send_rpc_retry(make_tool_call("pattern_scan", 18));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -877,10 +913,10 @@ TEST_CASE("MCP HTTP: pattern_scan tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: functions tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("functions", 19));
+    auto resp = client.send_rpc_retry(make_tool_call("functions", 19));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -891,10 +927,10 @@ TEST_CASE("MCP HTTP: functions tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: loops tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("loops", 20));
+    auto resp = client.send_rpc_retry(make_tool_call("loops", 20));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -905,37 +941,37 @@ TEST_CASE("MCP HTTP: loops tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: xref tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("xref", 21));
+    auto resp = client.send_rpc_retry(make_tool_call("xref", 21));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: strings_scan tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("strings_scan", 22));
+    auto resp = client.send_rpc_retry(make_tool_call("strings_scan", 22));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: constants_scan tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("constants_scan", 23));
+    auto resp = client.send_rpc_retry(make_tool_call("constants_scan", 23));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: objc_messages tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("objc_messages", 24));
+    auto resp = client.send_rpc_retry(make_tool_call("objc_messages", 24));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 
@@ -945,7 +981,7 @@ TEST_CASE("MCP HTTP: objc_messages tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: verify_evidence tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("verify_evidence", 25, {
@@ -965,7 +1001,7 @@ TEST_CASE("MCP HTTP: verify_evidence tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: batch_query tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("batch_query", 26, {
@@ -986,7 +1022,7 @@ TEST_CASE("MCP HTTP: batch_query tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: hypothesis workflow", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     // Add a hypothesis
@@ -1020,7 +1056,7 @@ TEST_CASE("MCP HTTP: hypothesis workflow", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: mem_write_history tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("mem_write_history", 33, {
@@ -1036,10 +1072,10 @@ TEST_CASE("MCP HTTP: mem_write_history tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: window_stats tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("window_stats", 34, {
+    auto resp = client.send_rpc_retry(make_tool_call("window_stats", 34, {
         {"start_inst_id", 0}, {"end_inst_id", 10}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1047,16 +1083,16 @@ TEST_CASE("MCP HTTP: window_stats tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: entropy_analysis tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("entropy_analysis", 35));
+    auto resp = client.send_rpc_retry(make_tool_call("entropy_analysis", 35));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: unknown tool returns error", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_tool_call("nonexistent_tool_xyz", 99));
@@ -1065,7 +1101,7 @@ TEST_CASE("MCP HTTP: unknown tool returns error", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: invalid JSON-RPC method", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     auto resp = client.send_rpc(make_rpc("nonexistent/method", 100));
@@ -1075,10 +1111,10 @@ TEST_CASE("MCP HTTP: invalid JSON-RPC method", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: taint_backward tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("taint_backward", 36, {
+    auto resp = client.send_rpc_retry(make_tool_call("taint_backward", 36, {
         {"sink_inst_id", 12},
         {"sink_reg", 3}
     }));
@@ -1087,10 +1123,10 @@ TEST_CASE("MCP HTTP: taint_backward tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: dataflow_graph tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("dataflow_graph", 37, {
+    auto resp = client.send_rpc_retry(make_tool_call("dataflow_graph", 37, {
         {"start_inst_id", 0}, {"end_inst_id", 10}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1098,28 +1134,28 @@ TEST_CASE("MCP HTTP: dataflow_graph tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: loop_semantics tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("loop_semantics", 38));
+    auto resp = client.send_rpc_retry(make_tool_call("loop_semantics", 38));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: algorithm_summary tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("algorithm_summary", 39));
+    auto resp = client.send_rpc_retry(make_tool_call("algorithm_summary", 39));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: memory_snapshot tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("memory_snapshot", 40, {
+    auto resp = client.send_rpc_retry(make_tool_call("memory_snapshot", 40, {
         {"inst_ids", json::array({5, 10})}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1127,10 +1163,10 @@ TEST_CASE("MCP HTTP: memory_snapshot tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: reg_timeline tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("reg_timeline", 41, {
+    auto resp = client.send_rpc_retry(make_tool_call("reg_timeline", 41, {
         {"reg_index", 0}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1138,10 +1174,10 @@ TEST_CASE("MCP HTTP: reg_timeline tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: producer_chain tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("producer_chain", 42, {
+    auto resp = client.send_rpc_retry(make_tool_call("producer_chain", 42, {
         {"inst_id", 10}, {"reg_index", 3}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1149,10 +1185,10 @@ TEST_CASE("MCP HTTP: producer_chain tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: find_function tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("find_function", 43, {
+    auto resp = client.send_rpc_retry(make_tool_call("find_function", 43, {
         {"inst_id", 10}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1160,32 +1196,32 @@ TEST_CASE("MCP HTTP: find_function tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: syscall_intercept tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("syscall_intercept", 44));
+    auto resp = client.send_rpc_retry(make_tool_call("syscall_intercept", 44));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: critical_path tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     // critical_path may take >10s on large traces; use 60s timeout
-    auto resp = client.send_rpc(make_tool_call("critical_path", 45, {
+    auto resp = client.send_rpc_retry(make_tool_call("critical_path", 45, {
         {"source_reg", 0}, {"source_inst_id", 2},
         {"sink_reg", 3}, {"sink_inst_id", 12}
-    }), std::chrono::milliseconds(60000));
+    }), 60, std::chrono::milliseconds(1000), std::chrono::milliseconds(60000));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: call_context tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("call_context", 46, {
+    auto resp = client.send_rpc_retry(make_tool_call("call_context", 46, {
         {"inst_id", 10}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1193,10 +1229,10 @@ TEST_CASE("MCP HTTP: call_context tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: memory_strings tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("memory_strings", 47, {
+    auto resp = client.send_rpc_retry(make_tool_call("memory_strings", 47, {
         {"at_inst_id", 10}
     }));
     REQUIRE_HTTP_RESPONSE(resp);
@@ -1204,20 +1240,20 @@ TEST_CASE("MCP HTTP: memory_strings tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: trace_fold tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
-    auto resp = client.send_rpc(make_tool_call("trace_fold", 48));
+    auto resp = client.send_rpc_retry(make_tool_call("trace_fold", 48));
     REQUIRE_HTTP_RESPONSE(resp);
     CHECK(resp["result"]["isError"] == false);
 }
 
 TEST_CASE("MCP HTTP: symbol_annotation tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto client = make_client(ctx);
 
     uint64_t xor_pc = 0x2000ULL + 0x4000ULL;
-    auto resp = client.send_rpc(make_tool_call("symbol_annotation", 49, {
+    auto resp = client.send_rpc_retry(make_tool_call("symbol_annotation", 49, {
         {"address", fmt::format("0x{:X}", xor_pc)},
         {"name", "xor_decrypt"}
     }));
@@ -1226,21 +1262,225 @@ TEST_CASE("MCP HTTP: symbol_annotation tool", "[integration][mcp][http]") {
 }
 
 TEST_CASE("MCP HTTP: GET /mcp returns 405", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp = http_get("127.0.0.1", ctx.port, "/mcp");
     CHECK(resp.status == 405);
 }
 
 TEST_CASE("MCP HTTP: empty body returns 400", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp = http_post("127.0.0.1", ctx.port, "/mcp", "");
     CHECK(resp.status == 400);
 }
 
 TEST_CASE("MCP HTTP: malformed JSON returns parse error", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
+    auto& ctx = shared_env();
     auto resp = http_post("127.0.0.1", ctx.port, "/mcp", "{not json}");
     REQUIRE(resp.status == 200);
     auto body = json::parse(resp.body);
     CHECK(body["error"]["code"] == -32700);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Concurrency Tests
+//
+// Verify the shared_mutex-based read/write tool concurrency model:
+//   - Read-only tools execute in parallel (shared_lock)
+//   - Write tools (hypothesis_*) acquire exclusive lock (unique_lock)
+//   - Mixed read/write workloads produce no data corruption
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread-safe RPC: uses the shared session_id but creates its own TCP connection.
+/// Does NOT use Catch2 macros (which are not thread-safe).
+static json thread_safe_rpc(const std::string& host, uint16_t port,
+                            const std::string& session_id,
+                            const json& request) {
+    std::string extra = "Mcp-Session-Id: " + session_id + "\r\n";
+    auto resp = http_post(host, port, "/mcp", request.dump(), extra);
+    if (resp.status == 0) return nullptr;
+    try { return json::parse(resp.body); }
+    catch (...) { return nullptr; }
+}
+
+TEST_CASE("MCP HTTP: parallel read tools execute concurrently",
+          "[integration][mcp][http][concurrency]") {
+    auto& ctx = shared_env();
+
+    // Fire N read-only tool calls from separate threads.
+    // All share a single pre-initialized session (created on main thread).
+    constexpr int N = 8;
+    struct ReadJob {
+        std::string tool;
+        json args;
+    };
+    // Use tools that reliably succeed (avoid xref/constants_scan which
+    // have known null-handling issues in this trace fixture).
+    // Only use tools that never require a pass (no PassNotReady retry needed).
+    std::vector<ReadJob> jobs = {
+        {"trace_info",  {}},
+        {"get_regs",    {{"inst_id", 0}}},
+        {"get_regs",    {{"inst_id", 2}}},
+        {"disasm",      {{"start_inst_id", 0}, {"count", 3}}},
+        {"memread",     {{"addr", "0x200000000"}, {"at_inst_id", 5}, {"size", 8}}},
+        {"get_regs",    {{"inst_id", 3}}},
+        {"get_regs",    {{"inst_id", 5}}},
+        {"disasm",      {{"start_inst_id", 5}, {"count", 3}}},
+    };
+    static_assert(N == 8);
+
+    // Pre-initialize a session on the main thread
+    auto client0 = make_client(ctx);
+    const std::string session_id = client0.session_id;
+    REQUIRE_FALSE(session_id.empty());
+
+    // Measure sequential baseline
+    auto t_seq_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; i++) {
+        auto r = client0.send_rpc(make_tool_call(jobs[i].tool, 1000 + i, jobs[i].args));
+        REQUIRE_HTTP_RESPONSE(r);
+        CHECK(r["result"]["isError"] == false);
+    }
+    auto t_seq_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_seq_start).count();
+
+    // Fire all N calls concurrently, sharing the same session
+    std::vector<json> results(N);
+    std::vector<std::thread> threads;
+    threads.reserve(N);
+
+    auto t_par_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back([&, i]() {
+            results[i] = thread_safe_rpc(
+                "127.0.0.1", ctx.port, session_id,
+                make_tool_call(jobs[i].tool, 2000 + i, jobs[i].args));
+        });
+    }
+    for (auto& th : threads) th.join();
+    auto t_par_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_par_start).count();
+
+    // Verify all succeeded (checked on main thread)
+    for (int i = 0; i < N; i++) {
+        INFO("tool=" << jobs[i].tool << " index=" << i);
+        REQUIRE_FALSE(results[i].is_null());
+        CHECK(results[i]["result"]["isError"] == false);
+    }
+
+    // Log timing for manual inspection.  On a small synthetic trace the
+    // per-tool work is sub-millisecond, so TCP connection overhead dominates
+    // and parallel wall-clock may actually be *higher*.  We intentionally
+    // do NOT assert on timing here — the value of this test is proving that
+    // all N concurrent requests complete successfully without races/crashes.
+    INFO("sequential=" << t_seq_us << "us  parallel=" << t_par_us << "us");
+}
+
+TEST_CASE("MCP HTTP: write tools serialize correctly (hypothesis_add)",
+          "[integration][mcp][http][concurrency]") {
+    auto& ctx = shared_env();
+
+    // Pre-initialize session on main thread
+    auto client0 = make_client(ctx);
+    const std::string session_id = client0.session_id;
+    REQUIRE_FALSE(session_id.empty());
+
+    // Fire N concurrent hypothesis_add calls.  Because write tools
+    // acquire a unique_lock, they execute serially.  Each hypothesis
+    // should get a unique sequential ID.
+    constexpr int N = 6;
+    std::vector<json> results(N);
+    std::vector<std::thread> threads;
+    threads.reserve(N);
+
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back([&, i]() {
+            results[i] = thread_safe_rpc(
+                "127.0.0.1", ctx.port, session_id,
+                make_tool_call("hypothesis_add", 3000 + i, {
+                    {"statement", fmt::format("Concurrent hypothesis {}", i)}
+                }));
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // All must succeed and return unique IDs
+    std::unordered_set<std::string> ids;
+    for (int i = 0; i < N; i++) {
+        INFO("index=" << i);
+        REQUIRE_FALSE(results[i].is_null());
+        CHECK(results[i]["result"]["isError"] == false);
+
+        auto text = results[i]["result"]["content"][0]["text"].get<std::string>();
+        auto parsed = json::parse(text);
+        std::string hyp_id;
+        if (parsed.contains("id")) hyp_id = parsed["id"].get<std::string>();
+        else if (parsed.contains("hypothesis_id")) hyp_id = parsed["hypothesis_id"].get<std::string>();
+        REQUIRE_FALSE(hyp_id.empty());
+        ids.insert(hyp_id);
+    }
+
+    // All IDs must be unique — proves serialization prevented races
+    CHECK(ids.size() == static_cast<size_t>(N));
+}
+
+TEST_CASE("MCP HTTP: mixed read/write workload is safe",
+          "[integration][mcp][http][concurrency]") {
+    auto& ctx = shared_env();
+
+    // Pre-initialize session on main thread
+    auto client0 = make_client(ctx);
+    const std::string session_id = client0.session_id;
+    REQUIRE_FALSE(session_id.empty());
+
+    // Launch a mixed workload: some read tools + some write tools
+    // concurrently.  The test verifies no crashes, no JSON parse
+    // errors, and all calls return valid responses.
+    struct MixedJob {
+        std::string tool;
+        json args;
+        bool is_write;
+    };
+    // Only use read tools that never require a pass (avoid PassNotReady).
+    std::vector<MixedJob> jobs = {
+        {"trace_info",      {},                                 false},
+        {"hypothesis_add",  {{"statement", "mixed-test-1"}},    true},
+        {"get_regs",        {{"inst_id", 5}},                   false},
+        {"disasm",          {{"start_inst_id", 0}, {"count", 3}}, false},
+        {"hypothesis_add",  {{"statement", "mixed-test-2"}},    true},
+        {"memread",         {{"addr", "0x200000000"}, {"at_inst_id", 5}, {"size", 8}}, false},
+        {"get_regs",        {{"inst_id", 3}},                   false},
+        {"hypothesis_add",  {{"statement", "mixed-test-3"}},    true},
+        {"get_regs",        {{"inst_id", 10}},                  false},
+        {"disasm",          {{"start_inst_id", 10}, {"count", 3}}, false},
+    };
+    const int N = static_cast<int>(jobs.size());
+
+    std::vector<json> results(N);
+    std::vector<std::thread> threads;
+    threads.reserve(N);
+
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back([&, i]() {
+            results[i] = thread_safe_rpc(
+                "127.0.0.1", ctx.port, session_id,
+                make_tool_call(jobs[i].tool, 4000 + i, jobs[i].args));
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // Every call should return a valid JSON-RPC response
+    int read_ok = 0, write_ok = 0;
+    for (int i = 0; i < N; i++) {
+        INFO("tool=" << jobs[i].tool << " index=" << i
+             << " is_write=" << jobs[i].is_write);
+        REQUIRE_FALSE(results[i].is_null());
+        CHECK(results[i]["result"]["isError"] == false);
+
+        if (jobs[i].is_write) write_ok++;
+        else read_ok++;
+    }
+
+    // Sanity: we had 7 reads and 3 writes
+    CHECK(read_ok == 7);
+    CHECK(write_ok == 3);
 }

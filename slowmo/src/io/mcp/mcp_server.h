@@ -10,7 +10,9 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -132,6 +134,10 @@ public:
     /// Returns true if the HTTP server is currently accepting connections.
     bool http_running() const;
 
+    /// Actual listening port (differs from configured port when port=0).
+    /// Only valid after start_http() succeeds.
+    uint16_t http_listening_port() const;
+
     /// Effective HTTP config (valid after start_http() succeeds).
     McpHttpConfig http_config() const { return http_cfg_; }
 
@@ -197,10 +203,28 @@ private:
     std::unique_ptr<McpHttpTransport> http_transport_;
     McpHttpConfig http_cfg_;
 
-    int tool_call_count_ = 0;
+    std::atomic<int> tool_call_count_{0};
 
     HypothesisLedger ledger_;
     DisciplineInjector discipline_;
+
+    // ── Concurrency: read/write tool classification ─────────────────
+    //
+    // Only hypothesis_* tools mutate shared state (the HypothesisLedger).
+    // All other tools are read-only (or their underlying data structures
+    // are already thread-safe: PassManager uses CAS+cv, MemoryModel has
+    // its own mutex, RegisterFile uses thread-local instances, etc.).
+    //
+    // We use a shared_mutex so that:
+    //   - Multiple read-only tool calls can execute in parallel (shared lock)
+    //   - Write tools (hypothesis_*) acquire an exclusive lock
+    //
+    // The write-tool set is populated during register_all_tools().
+    mutable std::shared_mutex tool_rw_mutex_;
+    std::unordered_set<std::string> write_tools_;
+
+    /// Returns true if `tool_name` is classified as a write tool.
+    bool is_write_tool(const std::string& tool_name) const;
 };
 
 }  // namespace tenet

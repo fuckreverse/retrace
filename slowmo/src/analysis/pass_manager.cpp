@@ -65,8 +65,15 @@ PassManager::~PassManager() = default;
 
 void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
-    auto entry = std::make_unique<PassEntry>();
     auto name = pass->name();
+
+    // Reject duplicate registration — silently ignore if already present.
+    if (name_map_.count(name)) {
+        LOG_WARN("PassManager: duplicate registration of '{}' ignored", name);
+        return;
+    }
+
+    auto entry = std::make_unique<PassEntry>();
     entry->pass = std::move(pass);
     auto* ptr = entry.get();
     entries_.push_back(std::move(entry));

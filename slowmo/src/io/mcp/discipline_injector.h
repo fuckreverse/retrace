@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +24,7 @@ public:
 private:
     int short_interval_;
     int full_interval_;
+    mutable std::mutex mutex_;  // protects call_count_ and reminder_index_
     int call_count_ = 0;
     int reminder_index_ = 0;
 

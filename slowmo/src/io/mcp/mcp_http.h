@@ -72,6 +72,9 @@ public:
     std::string host() const { return host_; }
     uint16_t    port() const { return port_; }
 
+    /// Actual listening port (differs from configured port when port=0).
+    uint16_t listening_port() const { return listening_port_; }
+
 private:
     void listener_loop();
     void handle_client(int client_fd);
@@ -102,6 +105,7 @@ private:
     std::string host_;
     uint16_t    port_;
     int         server_fd_ = -1;
+    uint16_t    listening_port_ = 0;  // actual port after bind (useful when port_==0)
 
     std::atomic<bool> running_{false};
     std::thread       listener_thread_;
@@ -117,8 +121,9 @@ private:
     std::string session_id_;          // empty = no active session
     bool        session_ever_created_ = false; // true once first initialize completes
 
-    // Dispatch mutex: serialises tool handler calls (same model as stdio)
-    std::mutex dispatch_mutex_;
+    // NOTE: dispatch_mutex_ removed — concurrency is now managed by
+    // TenetMcpService::tool_rw_mutex_ (shared_mutex with read/write classification).
+    // Read-only tools execute in parallel; write tools acquire exclusive lock.
 
     // Per-client threads
     std::mutex clients_mutex_;

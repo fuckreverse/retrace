@@ -264,7 +264,7 @@ void TenetMcpService::register_query_tools() {
 
             if (pm_) {
                 pm_->register_pass(std::make_unique<XrefPass>());
-                const auto& raw = pm_->require("xref");
+                const auto& raw = require_pass_nb(pm_, "xref");
                 if (raw.ok()) {
                     const auto& xref = raw.get<XrefResult>();
                     auto ids = xref.inst_ids_at(pc);
@@ -329,7 +329,7 @@ void TenetMcpService::register_taint_tools() {
 
             pm_->register_pass(std::make_unique<XrefPass>());
             pm_->register_pass(std::make_unique<TaintPass>(std::move(cfg)));
-            const auto& raw = pm_->require("taint");
+            const auto& raw = require_pass_nb(pm_, "taint");
             if (!raw.ok()) throw std::runtime_error("Taint pass failed: " + raw.error_message);
             const auto& result = raw.get<TaintResult>();
 
@@ -403,7 +403,7 @@ void TenetMcpService::register_taint_tools() {
             if (max_steps > 0) cfg.max_steps = max_steps;
 
             pm_->register_pass(std::make_unique<BackwardTaintPass>(std::move(cfg)));
-            const auto& raw = pm_->require("backward_taint");
+            const auto& raw = require_pass_nb(pm_, "backward_taint");
             if (!raw.ok()) throw std::runtime_error("Backward taint failed: " + raw.error_message);
             const auto& result = raw.get<BackwardTaintResult>();
 
@@ -473,8 +473,8 @@ void TenetMcpService::register_taint_tools() {
             bt_cfg.propagate_through_memory = true;
             pm_->register_pass(std::make_unique<BackwardTaintPass>(std::move(bt_cfg)));
 
-            const auto& ft_raw = pm_->require("taint");
-            const auto& bt_raw = pm_->require("backward_taint");
+            const auto& ft_raw = require_pass_nb(pm_, "taint");
+            const auto& bt_raw = require_pass_nb(pm_, "backward_taint");
             if (!ft_raw.ok()) throw std::runtime_error("Forward taint failed");
             if (!bt_raw.ok()) throw std::runtime_error("Backward taint failed");
 
@@ -519,7 +519,7 @@ void TenetMcpService::register_graph_tools() {
             pm_->register_pass(std::make_unique<CFGPass>());
             pm_->register_pass(std::make_unique<CFGLayoutPass>());
 
-            const auto& raw = pm_->require("cfg_layout");
+            const auto& raw = require_pass_nb(pm_, "cfg_layout");
             if (!raw.ok()) throw std::runtime_error("CFG pass failed: " + raw.error_message);
             const auto& layout = raw.get<CFGLayoutResult>();
 
@@ -559,7 +559,7 @@ void TenetMcpService::register_graph_tools() {
             pm_->register_pass(std::make_unique<FunctionPass>());
             pm_->register_pass(std::make_unique<CallGraphPass>());
 
-            const auto& raw = pm_->require("call_graph");
+            const auto& raw = require_pass_nb(pm_, "call_graph");
             if (!raw.ok()) throw std::runtime_error("Call graph failed: " + raw.error_message);
             const auto& cg = raw.get<CallGraphResult>();
 
@@ -605,7 +605,7 @@ void TenetMcpService::register_graph_tools() {
             std::string format = args.value("format", "json");
 
             pm_->register_pass(std::make_unique<DataflowGraphPass>(std::move(cfg)));
-            const auto& raw = pm_->require("dataflow_graph");
+            const auto& raw = require_pass_nb(pm_, "dataflow_graph");
             if (!raw.ok()) throw std::runtime_error("Dataflow graph failed: " + raw.error_message);
             const auto& dfg = raw.get<DataflowGraphResult>();
 

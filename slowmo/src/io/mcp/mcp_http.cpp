@@ -276,11 +276,20 @@ bool McpHttpTransport::start() {
         return false;
     }
 
-    if (::listen(server_fd_, 16) < 0) {
+    if (::listen(server_fd_, 128) < 0) {
         mcp_http_log(fmt::format("listen() failed: {}", strerror(errno)));
         ::close(server_fd_);
         server_fd_ = -1;
         return false;
+    }
+
+    // Read back the actual port (important when port_==0, i.e. OS-assigned)
+    struct sockaddr_in bound_addr{};
+    socklen_t bound_len = sizeof(bound_addr);
+    if (::getsockname(server_fd_, reinterpret_cast<struct sockaddr*>(&bound_addr), &bound_len) == 0) {
+        listening_port_ = ntohs(bound_addr.sin_port);
+    } else {
+        listening_port_ = port_;  // fallback
     }
 
     // Non-blocking for poll-based accept loop
@@ -289,7 +298,7 @@ bool McpHttpTransport::start() {
 
     running_.store(true);
     listener_thread_ = std::thread([this] { listener_loop(); });
-    mcp_http_log(fmt::format("Streamable HTTP server listening on {}:{}", host_, port_));
+    mcp_http_log(fmt::format("Streamable HTTP server listening on {}:{}", host_, listening_port_));
     return true;
 }
 
@@ -426,12 +435,8 @@ void McpHttpTransport::handle_client(int client_fd) {
 
         // ── Initialize: special handling — assign session ──────────────
         if (method == "initialize") {
-            // Dispatch to handler
-            json response;
-            {
-                std::lock_guard<std::mutex> dispatch_lk(dispatch_mutex_);
-                response = handler_(msg);
-            }
+            // Dispatch to handler (initialize is inherently single-shot)
+            json response = handler_(msg);
 
             // Assign a new session ID
             std::string new_session_id = generate_uuid();
@@ -453,10 +458,10 @@ void McpHttpTransport::handle_client(int client_fd) {
         // ── All other requests: require valid session ──────────────────
         if (!check_session(req, client_fd)) return;
 
-        // Dispatch to handler (serialized)
+        // Dispatch to handler — concurrency managed by TenetMcpService
+        // (read tools run in parallel, write tools acquire exclusive lock).
         json response;
         try {
-            std::lock_guard<std::mutex> dispatch_lk(dispatch_mutex_);
             response = handler_(msg);
         } catch (const std::exception& e) {
             response = {

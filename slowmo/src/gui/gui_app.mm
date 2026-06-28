@@ -266,6 +266,36 @@ void GuiApp::render_shutdown_overlay() {
 // By the time we reach here, shutdown_complete_ is true and no background
 // thread accesses any of these objects any more.
 
+void GuiApp::auto_start_mcp() {
+    ensure_pass_manager();
+
+    mcp_service_ = std::make_unique<TenetMcpService>(
+        reader_, index_, regfile_, memory_,
+        pass_manager_.get(), &code_table_, &decoder_);
+
+    McpHttpConfig cfg;
+    cfg.host = mcp_gui_.host;
+    auto base_port = static_cast<uint16_t>(mcp_gui_.port);
+
+    constexpr int kMaxRetries = 16;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        cfg.port = static_cast<uint16_t>(base_port + attempt);
+        if (mcp_service_->start_http(cfg)) {
+            auto actual_port = mcp_service_->http_listening_port();
+            mcp_gui_.port = actual_port;
+            mcp_status_msg_ = fmt::format(
+                "Auto-started on {}:{}", cfg.host, actual_port);
+            return;
+        }
+    }
+
+    // All attempts failed — clean up
+    mcp_status_msg_ = fmt::format(
+        "Auto-start failed: ports {}-{} all in use.",
+        base_port, base_port + kMaxRetries - 1);
+    mcp_service_.reset();
+}
+
 void GuiApp::shutdown() {
     if (!window_) return;  // Already shut down
 
@@ -1011,6 +1041,10 @@ int GuiApp::run() {
     // The analyses run in a separate thread; results are delivered via
     // pending_apply_ and applied on the UI thread each frame.
     run_startup_analysis();
+
+    // Auto-start MCP HTTP server so external tools (Claude Desktop, etc.)
+    // can connect immediately without manual interaction.
+    auto_start_mcp();
 
     while (running_) {
         // ─── 1. Poll SDL events ─────────────────────────────────────

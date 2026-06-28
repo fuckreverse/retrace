@@ -31,6 +31,7 @@ const char* HypothesisLedger::status_str(HypothesisStatus s) {
 json HypothesisLedger::add(const std::string& statement,
                             const std::string& category,
                             const std::vector<std::string>& conflicts_with) {
+    std::lock_guard<std::mutex> lk(mutex_);
     std::string hid = fmt::format("H{:03d}", next_id_++);
     Hypothesis h;
     h.id = hid;
@@ -57,6 +58,7 @@ json HypothesisLedger::add(const std::string& statement,
 }
 
 json HypothesisLedger::activate(const std::string& hid) {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};
@@ -76,6 +78,7 @@ json HypothesisLedger::add_evidence(const std::string& hid,
                                      const json& data,
                                      bool supports,
                                      bool verified) {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};
@@ -110,6 +113,7 @@ json HypothesisLedger::add_evidence(const std::string& hid,
 }
 
 json HypothesisLedger::conclude(const std::string& hid, const std::string& conclusion) {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};
@@ -153,6 +157,7 @@ json HypothesisLedger::conclude(const std::string& hid, const std::string& concl
 }
 
 json HypothesisLedger::abandon(const std::string& hid, const std::string& reason) {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};
@@ -167,6 +172,7 @@ json HypothesisLedger::abandon(const std::string& hid, const std::string& reason
 }
 
 json HypothesisLedger::list_all(const std::string& status_filter) const {
+    std::lock_guard<std::mutex> lk(mutex_);
     json results = json::array();
     int count_proposed = 0, count_active = 0, count_concluded = 0, count_abandoned = 0;
 
@@ -210,6 +216,7 @@ json HypothesisLedger::list_all(const std::string& status_filter) const {
 }
 
 json HypothesisLedger::get(const std::string& hid) const {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};
@@ -257,6 +264,7 @@ json HypothesisLedger::get(const std::string& hid) const {
 }
 
 json HypothesisLedger::mark_reviewed(const std::string& hid) {
+    std::lock_guard<std::mutex> lk(mutex_);
     auto it = hypotheses_.find(hid);
     if (it == hypotheses_.end())
         return {{"error", "Hypothesis " + hid + " not found"}};

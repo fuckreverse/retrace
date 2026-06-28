@@ -40,6 +40,7 @@ const char* DisciplineInjector::short_reminder(int index) {
 }
 
 std::string DisciplineInjector::on_tool_call(const std::string& tool_name) {
+    std::lock_guard<std::mutex> lk(mutex_);
     call_count_++;
 
     // Hypothesis tools are already disciplined — don't nag
@@ -61,11 +62,13 @@ std::string DisciplineInjector::on_tool_call(const std::string& tool_name) {
 }
 
 void DisciplineInjector::reset() {
+    std::lock_guard<std::mutex> lk(mutex_);
     call_count_ = 0;
     reminder_index_ = 0;
 }
 
 json DisciplineInjector::stats() const {
+    std::lock_guard<std::mutex> lk(mutex_);
     return {
         {"total_tool_calls", call_count_},
         {"short_reminders_sent", call_count_ / short_interval_},

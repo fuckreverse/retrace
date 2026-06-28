@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <optional>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -70,6 +71,7 @@ private:
     double compute_confidence(const Hypothesis& h) const;
     static const char* status_str(HypothesisStatus s);
 
+    mutable std::mutex mutex_;  // protects all mutable state below
     std::unordered_map<std::string, Hypothesis> hypotheses_;
     int next_id_ = 1;
     std::unordered_map<std::string, std::vector<std::string>> conflict_graph_;

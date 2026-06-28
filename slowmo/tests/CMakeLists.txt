@@ -91,7 +91,16 @@ tenet_add_test(test_mcp_tools_ai               unit/test_mcp_tools_ai.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
-tenet_add_test(test_mcp_http               integration/test_mcp_http.cpp)
+
+# test_mcp_http uses a shared in-process server environment (static singleton).
+# Running all TEST_CASEs in a single process (instead of per-test discovery)
+# avoids rebuilding the trace+RocksDB+server 48× and eliminates port races.
+add_executable(test_mcp_http integration/test_mcp_http.cpp)
+target_link_libraries(test_mcp_http PRIVATE tenet_lib Catch2::Catch2WithMain)
+target_include_directories(test_mcp_http PRIVATE ${TENET_TEST_INCLUDES})
+set_target_properties(test_mcp_http PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+target_compile_options(test_mcp_http PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O1>)
+add_test(NAME "MCP HTTP (all)" COMMAND test_mcp_http --order rand)
 
 # ─── Performance regression tests ──────────────────────────────────────────
 # Tagged [perf]; run with:  ctest -R perf --output-on-failure

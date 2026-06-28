@@ -725,6 +725,7 @@ private:
     // ─── Analysis helpers ───────────────────────────────────────────
     void ensure_pass_manager();
     void run_startup_analysis();    // Runs essential analyses in background on startup
+    void auto_start_mcp();         // Auto-start MCP HTTP server on GUI launch
     void run_taint_analysis();
     void run_backward_taint_analysis();
     void run_slice_analysis();

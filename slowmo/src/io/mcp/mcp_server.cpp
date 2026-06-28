@@ -1,11 +1,13 @@
 #include "mcp_server.h"
 #include "mcp_http.h"
+#include "mcp_helpers.h"
 
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 
 #include <fmt/core.h>
 
+#include <cmath>
 #include <iostream>
 #include <string>
 
@@ -133,6 +135,10 @@ bool TenetMcpService::http_running() const {
     return http_transport_ && http_transport_->is_running();
 }
 
+uint16_t TenetMcpService::http_listening_port() const {
+    return http_transport_ ? http_transport_->listening_port() : 0;
+}
+
 void TenetMcpService::stop() {
     if (stdio_transport_) stdio_transport_->stop();
     stop_http();
@@ -202,8 +208,18 @@ json TenetMcpService::process_message(const json& msg) {
         }
 
         try {
-            tool_call_count_++;
-            json result = it->second(arguments);
+            tool_call_count_.fetch_add(1, std::memory_order_relaxed);
+
+            // Concurrency: write tools (hypothesis_*) acquire exclusive lock;
+            // all other tools acquire shared lock for parallel execution.
+            json result;
+            if (is_write_tool(tool_name)) {
+                std::unique_lock<std::shared_mutex> lk(tool_rw_mutex_);
+                result = it->second(arguments);
+            } else {
+                std::shared_lock<std::shared_mutex> lk(tool_rw_mutex_);
+                result = it->second(arguments);
+            }
 
             // Inject discipline reminder if applicable
             auto reminder = discipline_.on_tool_call(tool_name);
@@ -217,6 +233,27 @@ json TenetMcpService::process_message(const json& msg) {
                 {"id", msg_id},
                 {"result", {
                     {"content", json::array({{{"type", "text"}, {"text", std::move(text)}}})},
+                    {"isError", false}
+                }}
+            };
+        } catch (const PassNotReady& e) {
+            mcp_log(fmt::format("Tool {} pass not ready: {} ({:.0f}%)",
+                                tool_name, e.pass_name, e.progress * 100));
+            json retry_info = {
+                {"status",         "processing"},
+                {"pass",           e.pass_name},
+                {"progress",       std::round(e.progress * 100.0) / 100.0},
+                {"progress_pct",   fmt::format("{:.0f}%", e.progress * 100)},
+                {"message",        e.progress_msg.empty()
+                                       ? fmt::format("Pass '{}' is still running", e.pass_name)
+                                       : e.progress_msg},
+                {"retry_after_ms", 1000}
+            };
+            return {
+                {"jsonrpc", "2.0"},
+                {"id", msg_id},
+                {"result", {
+                    {"content", json::array({{{"type", "text"}, {"text", retry_info.dump()}}})},
                     {"isError", false}
                 }}
             };
@@ -258,6 +295,19 @@ void TenetMcpService::register_all_tools() {
     register_evidence_tools();
     register_batch_tools();
     register_hypothesis_tools();
+
+    // Classify write tools: hypothesis_* tools mutate HypothesisLedger state.
+    // All other tools are read-only (or their data structures have internal
+    // synchronisation) and can execute concurrently.
+    for (const auto& schema : tool_schemas_) {
+        if (schema.name.rfind("hypothesis_", 0) == 0) {
+            write_tools_.insert(schema.name);
+        }
+    }
+}
+
+bool TenetMcpService::is_write_tool(const std::string& tool_name) const {
+    return write_tools_.count(tool_name) > 0;
 }
 
 }  // namespace tenet
