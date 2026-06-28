@@ -2,6 +2,7 @@
 #include "analysis/passes/objc_pass.h"
 #include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
+#include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/memory_model.h"
 
@@ -13,6 +14,187 @@
 namespace tenet {
 
 using json = nlohmann::json;
+
+// ─── SyscallInterceptResult serialization helpers ─────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x53494341 ("SICA")
+//   u32  version = 1
+//   u64  num_calls
+//   for each InterceptedCall:
+//     u64  inst_id
+//     u64  call_site_pc
+//     u64  callee_pc
+//     u32  callee_name_len; u8[] callee_name
+//     u8   category  (cast of ApiCategory)
+//     u8   arg_count
+//     u64[8]  raw_args
+//     u32  summary_len; u8[] decoded_summary
+//     u8   has_key_bytes; if 1: u32 key_len, u8[] key_bytes
+//     u8   has_iv_bytes;  if 1: u32 iv_len, u8[] iv_bytes
+//     u8   has_data_bytes;if 1: u32 data_len, u8[] data_bytes
+//     u64  key_length
+//     u64  data_length
+//     u64  return_value
+//     u8   has_return
+//     u8   has_objc_ctx; if 1: u32 objc_len, u8[] objc_ctx
+
+namespace {
+
+static constexpr uint32_t SICA_BLOB_MAGIC   = 0x53494341u;  // "SICA"
+static constexpr uint32_t SICA_BLOB_VERSION = 1u;
+
+// Helper: compute serialized size of an InterceptedCall
+static size_t call_serial_size(const InterceptedCall& c) {
+    size_t sz = 8 + 8 + 8;  // inst_id, call_site_pc, callee_pc
+    sz += 4 + c.callee_name.size();  // callee_name
+    sz += 1 + 1 + 8 * 8;  // category, arg_count, raw_args
+    sz += 4 + c.decoded_summary.size();  // summary
+    sz += 1;  // has_key_bytes
+    if (c.key_bytes.has_value()) sz += 4 + c.key_bytes->size();
+    sz += 1;  // has_iv_bytes
+    if (c.iv_bytes.has_value()) sz += 4 + c.iv_bytes->size();
+    sz += 1;  // has_data_bytes
+    if (c.data_bytes.has_value()) sz += 4 + c.data_bytes->size();
+    sz += 8 + 8 + 8 + 1;  // key_length, data_length, return_value, has_return
+    sz += 1;  // has_objc_ctx
+    if (c.objc_context.has_value()) sz += 4 + c.objc_context->size();
+    return sz;
+}
+
+std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
+    size_t total = 4 + 4 + 8;  // magic, version, num_calls
+    for (const auto& c : res.calls) total += call_serial_size(c);
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        std::memcpy(p, s.data(), s.size()); p += s.size();
+    };
+    auto write_opt_bytes = [&](const std::optional<std::vector<uint8_t>>& ob) {
+        if (ob.has_value()) {
+            write_u8(1u);
+            write_u32(static_cast<uint32_t>(ob->size()));
+            std::memcpy(p, ob->data(), ob->size()); p += ob->size();
+        } else {
+            write_u8(0u);
+        }
+    };
+    auto write_opt_str = [&](const std::optional<std::string>& os) {
+        if (os.has_value()) {
+            write_u8(1u);
+            write_str(*os);
+        } else {
+            write_u8(0u);
+        }
+    };
+
+    write_u32(SICA_BLOB_MAGIC);
+    write_u32(SICA_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.calls.size()));
+
+    for (const auto& c : res.calls) {
+        write_u64(c.inst_id);
+        write_u64(c.call_site_pc);
+        write_u64(c.callee_pc);
+        write_str(c.callee_name);
+        write_u8(static_cast<uint8_t>(c.category));
+        write_u8(c.arg_count);
+        for (uint64_t a : c.raw_args) write_u64(a);
+        write_str(c.decoded_summary);
+        write_opt_bytes(c.key_bytes);
+        write_opt_bytes(c.iv_bytes);
+        write_opt_bytes(c.data_bytes);
+        write_u64(c.key_length);
+        write_u64(c.data_length);
+        write_u64(c.return_value);
+        write_u8(c.has_return ? 1u : 0u);
+        write_opt_str(c.objc_context);
+    }
+
+    return buf;
+}
+
+bool syscall_intercept_deserialize(const std::string& blob, SyscallInterceptResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (p + 4 > end) return false;
+        uint32_t len = read_u32();
+        if (p + len > end) return false;
+        s.assign(p, len); p += len;
+        return true;
+    };
+    auto read_opt_bytes = [&](std::optional<std::vector<uint8_t>>& ob) -> bool {
+        if (p + 1 > end) return false;
+        uint8_t has = read_u8();
+        if (has) {
+            if (p + 4 > end) return false;
+            uint32_t len = read_u32();
+            if (p + len > end) return false;
+            ob.emplace(p, p + len); p += len;
+        }
+        return true;
+    };
+    auto read_opt_str = [&](std::optional<std::string>& os) -> bool {
+        if (p + 1 > end) return false;
+        uint8_t has = read_u8();
+        if (has) {
+            std::string s;
+            if (!read_str(s)) return false;
+            os = std::move(s);
+        }
+        return true;
+    };
+
+    if (read_u32() != SICA_BLOB_MAGIC)   return false;
+    if (read_u32() != SICA_BLOB_VERSION) return false;
+
+    uint64_t n = read_u64();
+    out.calls.reserve(static_cast<size_t>(n));
+
+    for (uint64_t i = 0; i < n; i++) {
+        if (p + 8 + 8 + 8 > end) return false;
+        InterceptedCall c;
+        c.inst_id      = read_u64();
+        c.call_site_pc = read_u64();
+        c.callee_pc    = read_u64();
+        if (!read_str(c.callee_name)) return false;
+        if (p + 1 + 1 + 8 * 8 > end) return false;
+        c.category  = static_cast<ApiCategory>(read_u8());
+        c.arg_count = read_u8();
+        for (uint64_t& a : c.raw_args) a = read_u64();
+        if (!read_str(c.decoded_summary)) return false;
+        if (!read_opt_bytes(c.key_bytes)) return false;
+        if (!read_opt_bytes(c.iv_bytes)) return false;
+        if (!read_opt_bytes(c.data_bytes)) return false;
+        if (p + 8 + 8 + 8 + 1 > end) return false;
+        c.key_length   = read_u64();
+        c.data_length  = read_u64();
+        c.return_value = read_u64();
+        c.has_return   = read_u8() != 0;
+        if (!read_opt_str(c.objc_context)) return false;
+
+        size_t idx = out.calls.size();
+        out.by_callee[c.callee_name].push_back(idx);
+        out.by_category[c.category].push_back(idx);
+        out.calls.push_back(std::move(c));
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (syscall_intercept serialization)
 
 // ─── Known iOS API signature table ────────────────────────────────────────
 //
@@ -519,6 +701,25 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
     const auto& code_table = ctx.code_table();
 
+    // ── Fast path: load from persisted cache ──────────────────────────────
+    // Only cache when default config (no extra_api_names, no intercept_unresolved)
+    // to keep the cache key unambiguous.
+    const bool is_default_cfg =
+        config_.extra_api_names.empty() && !config_.intercept_unresolved &&
+        config_.capture_bytes == 64;
+    if (is_default_cfg && ctx.range().is_full_trace()) {
+        std::string blob;
+        if (ctx.index().load_pass_blob("syscall_intercept", blob)) {
+            SyscallInterceptResult cached;
+            if (syscall_intercept_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "syscall_intercept: {} calls ({} unique callees) (from cache)",
+                    cached.calls.size(), cached.by_callee.size()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     // Optional: get ObjC messages for context annotation.
     const ObjcResult* objc = ctx.try_require<ObjcResult>("objc");
 
@@ -546,6 +747,14 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
     }
 
     auto result = collector.take_result();
+
+    // ── Persist result for future sessions ───────────────────────────────
+    if (is_default_cfg && ctx.range().is_full_trace()) {
+        std::string blob = syscall_intercept_serialize(result);
+        if (!blob.empty()) {
+            ctx.index().save_pass_blob("syscall_intercept", blob.data(), blob.size());
+        }
+    }
 
     ctx.progress(1.0f, fmt::format(
         "syscall_intercept: {} API calls intercepted ({} unique callees)",

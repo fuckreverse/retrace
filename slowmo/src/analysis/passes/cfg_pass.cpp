@@ -13,6 +13,119 @@
 
 namespace tenet {
 
+// ─── CFGResult serialization helpers ──────────────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic    = 0x43464700 ("CFG\0")
+//   u32  version  = 1
+//   u64  num_blocks
+//   for each BasicBlock:
+//     u64  start_pc
+//     u64  end_pc
+//     u64  execution_count
+//     u8   terminator      (cast of TerminatorKind)
+//     u64  num_instructions
+//     u64[] instructions[num_instructions]
+//   u64  num_edges
+//   for each CFGEdge:
+//     u64  from_block
+//     u64  to_block
+//     u64  taken_count
+//     u8   is_fallthrough
+
+namespace {
+
+static constexpr uint32_t CFG_BLOB_MAGIC   = 0x43464700u;  // "CFG\0"
+static constexpr uint32_t CFG_BLOB_VERSION = 1u;
+
+std::string cfg_serialize(const CFGResult& res) {
+    // Compute total size first
+    size_t total = 4 + 4 + 8;  // magic + version + num_blocks
+    for (const auto& [start_pc, blk] : res.blocks) {
+        total += 8 + 8 + 8 + 1 + 8;  // start_pc, end_pc, exec_count, terminator, num_insns
+        total += blk.instructions.size() * 8;
+    }
+    total += 8;  // num_edges
+    total += res.edges.size() * (8 + 8 + 8 + 1);  // from, to, count, fallthrough
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(CFG_BLOB_MAGIC);
+    write_u32(CFG_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.blocks.size()));
+
+    for (const auto& [start_pc, blk] : res.blocks) {
+        write_u64(blk.start_pc);
+        write_u64(blk.end_pc);
+        write_u64(blk.execution_count);
+        write_u8(static_cast<uint8_t>(blk.terminator));
+        write_u64(static_cast<uint64_t>(blk.instructions.size()));
+        for (uint64_t pc : blk.instructions) write_u64(pc);
+    }
+
+    write_u64(static_cast<uint64_t>(res.edges.size()));
+    for (const auto& e : res.edges) {
+        write_u64(e.from_block);
+        write_u64(e.to_block);
+        write_u64(e.taken_count);
+        write_u8(e.is_fallthrough ? 1u : 0u);
+    }
+
+    return buf;
+}
+
+bool cfg_deserialize(const std::string& blob, CFGResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != CFG_BLOB_MAGIC)   return false;
+    if (read_u32() != CFG_BLOB_VERSION) return false;
+
+    uint64_t n_blocks = read_u64();
+    for (uint64_t i = 0; i < n_blocks; i++) {
+        if (p + 8 + 8 + 8 + 1 + 8 > end) return false;
+        BasicBlock blk;
+        blk.start_pc        = read_u64();
+        blk.end_pc          = read_u64();
+        blk.execution_count = read_u64();
+        blk.terminator      = static_cast<TerminatorKind>(read_u8());
+        uint64_t n_insns    = read_u64();
+        if (p + n_insns * 8 > end) return false;
+        blk.instructions.resize(static_cast<size_t>(n_insns));
+        for (uint64_t j = 0; j < n_insns; j++) {
+            blk.instructions[j] = read_u64();
+        }
+        out.blocks.emplace(blk.start_pc, std::move(blk));
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_edges = read_u64();
+    out.edges.reserve(static_cast<size_t>(n_edges));
+    for (uint64_t i = 0; i < n_edges; i++) {
+        if (p + 8 + 8 + 8 + 1 > end) return false;
+        CFGEdge e;
+        e.from_block     = read_u64();
+        e.to_block       = read_u64();
+        e.taken_count    = read_u64();
+        e.is_fallthrough = read_u8() != 0;
+        out.edges.push_back(e);
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (cfg serialization)
+
 // ─── AArch64 branch classification helpers ────────────────────────────────
 
 namespace {
@@ -130,13 +243,29 @@ std::optional<uint64_t> extract_branch_target(std::string_view op_str) {
 // ─── CFGPass implementation ────────────────────────────────────────────────
 
 PassResult CFGPass::run(PassContext& ctx) {
+    auto& index = ctx.index();
+    const auto& range = ctx.range();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("cfg", blob)) {
+            CFGResult cached;
+            if (cfg_deserialize(blob, cached)) {
+                cached.build_adjacency();
+                ctx.progress(1.0f, fmt::format(
+                    "CFG: {} blocks, {} edges (from cache)",
+                    cached.block_count(), cached.edge_count()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     // Require xref pass results to get the set of executed PCs
     const auto& xref = ctx.require<XrefResult>("xref");
     auto& code_table = ctx.code_table();
     auto& decoder = ctx.decoder();
     auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    const auto& range = ctx.range();
 
     CFGResult result;
 
@@ -421,11 +550,19 @@ PassResult CFGPass::run(PassContext& ctx) {
         result.edges.push_back(std::move(edge));
     }
 
-    ctx.progress(1.0f, fmt::format("CFG: {} blocks, {} edges",
-                             result.block_count(), result.edge_count()));
-
     // Build O(1) adjacency index for successor/predecessor queries.
     result.build_adjacency();
+
+    // ─── Persist result for future sessions ───────────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob = cfg_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("cfg", blob.data(), blob.size());
+        }
+    }
+
+    ctx.progress(1.0f, fmt::format("CFG: {} blocks, {} edges",
+                             result.block_count(), result.edge_count()));
 
     return PassResult::success(std::move(result));
 }

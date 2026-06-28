@@ -202,6 +202,20 @@ public:
     /// @param pass_name  Same identifier used in save_pass_blob().
     void delete_pass_blob(std::string_view pass_name);
 
+    /// Enumerate all persisted pass-result blobs.
+    /// Returns a list of (pass_name, blob_size_bytes) pairs for every entry
+    /// in the META CF whose key starts with "pass:".
+    /// Useful for the cache management panel.
+    struct PassBlobInfo {
+        std::string name;    ///< Pass name (without "pass:" prefix)
+        size_t      size;    ///< Blob size in bytes
+    };
+    std::vector<PassBlobInfo> list_pass_blobs() const;
+
+    /// Delete all persisted pass-result blobs in one batch operation.
+    /// Returns the number of entries deleted.
+    size_t delete_all_pass_blobs();
+
 private:
     TraceIndex() = default;
 

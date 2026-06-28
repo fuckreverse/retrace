@@ -514,6 +514,7 @@ src/gui/panels_memory_strings.cpp
 src/gui/panels_syscall_intercept.cpp
 src/gui/panels_objc_crypto.cpp
 src/gui/panels_log.cpp
+src/gui/panels_cache_manager.cpp
 src/gui/popups.cpp
 )
 

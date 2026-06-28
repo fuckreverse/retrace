@@ -456,6 +456,39 @@ const PassManager::PassEntry* PassManager::find_entry(std::string_view name) con
     return (it != name_map_.end()) ? it->second : nullptr;
 }
 
+// ─── Cache management ─────────────────────────────────────────────────────
+
+std::vector<PassManager::BlobCacheEntry> PassManager::query_blob_info() const {
+    std::vector<BlobCacheEntry> result;
+    if (!index_) return result;
+
+    // Get all persisted blobs from RocksDB.
+    auto blobs = index_->list_pass_blobs();
+    result.reserve(blobs.size());
+    for (const auto& b : blobs) {
+        BlobCacheEntry entry;
+        entry.name      = b.name;
+        entry.blob_size = b.size;
+        // Check if there's also an in-memory result.
+        const auto* e = find_entry(entry.name);
+        if (e) {
+            PassState s = e->state.load(std::memory_order_acquire);
+            entry.in_memory = (s == PassState::Completed);
+            entry.state     = s;
+        } else {
+            entry.in_memory = false;
+            entry.state     = PassState::NotRun;
+        }
+        result.push_back(std::move(entry));
+    }
+    return result;
+}
+
+size_t PassManager::clear_all_blobs() {
+    if (!index_) return 0;
+    return index_->delete_all_pass_blobs();
+}
+
 std::vector<std::vector<std::string_view>> PassManager::topological_levels() const {
     // Kahn's algorithm for topological sort with level tracking.
     std::unordered_map<std::string_view, size_t> in_degree;

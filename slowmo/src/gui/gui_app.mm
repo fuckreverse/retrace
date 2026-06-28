@@ -660,8 +660,9 @@ enum MenuTag : NSInteger {
     kTagViewRegTimeline       = 330,
     kTagViewDwarf             = 331,
     kTagViewTraceDiff         = 332,
-    kTagViewTraceFold         = 333,
-    kTagViewLog               = 334,
+kTagViewTraceFold         = 333,
+kTagViewLog               = 334,
+kTagViewCacheManager      = 335,
     kTagNavGoto           = 400,
     kTagNavSearch         = 401,
     kTagNavBack           = 402,
@@ -764,6 +765,7 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
         case kTagViewTraceDiff:     action = [this]{ show_trace_diff_         = !show_trace_diff_;         }; break;
         case kTagViewLog:           action = [this]{ show_log_                = !show_log_;                }; break;
+        case kTagViewCacheManager: action = [this]{ show_cache_manager_      = !show_cache_manager_;      cache_manager_dirty_ = true; }; break;
 
         case kTagNavGoto:           action = [this]{ show_goto_popup_   = true; }; break;
         case kTagNavSearch:         action = [this]{ show_search_popup_ = true; }; break;
@@ -857,6 +859,7 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
             case kTagViewDwarf:         it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceDiff:     it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewLog:           it.state = show_log_                ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCacheManager: it.state = show_cache_manager_      ? NSControlStateValueOn : NSControlStateValueOff; break;
             default: break;
         }
     }
@@ -955,6 +958,8 @@ void tenet::GuiApp::setup_native_menu() {
         [viewMenu addItem:mk(@"Trace Diff",           @"",  0,   kTagViewTraceDiff)];
         [viewMenu addItem:sep()];
         [viewMenu addItem:mk(@"Output (Log)",        @"",  0,   kTagViewLog)];
+        [viewMenu addItem:sep()];
+        [viewMenu addItem:mk(@"Cache Manager",        @"",  0,   kTagViewCacheManager)];
         viewItem.submenu = viewMenu;
         [bar addItem:viewItem];
     }
@@ -1034,6 +1039,39 @@ int GuiApp::run() {
     // -activateIgnoringOtherApps: on launch.
     [NSApp activateIgnoringOtherApps:YES];
 
+    // Pump the AppKit run loop briefly so that:
+    //  1. The [NSApp setMainMenu:] change is committed and the new menu bar
+    //     is actually drawn at the top of the screen.
+    //  2. The activateIgnoringOtherApps: notification is delivered so the
+    //     app becomes the frontmost application immediately.
+    //
+    // Without this, macOS queues NSUpdateMenuItemRequest and the activation
+    // events internally, but they are not processed until SDL_PollEvent()
+    // calls nextEventMatchingMask:, which only happens after all setup.
+    // The result: a noticeable delay between launch and the menu bar appearing.
+    //
+    // Strategy:
+    //  a) Run the NSDefaultRunLoopMode briefly (50 ms max, non-blocking after
+    //     the first empty drain) to flush pending AppKit notifications.
+    //  b) Call [NSApp updateWindows] to force any deferred window/menu updates.
+    {
+        // Drain pending AppKit events non-blockingly.
+        // [NSDate distantPast] = return immediately when queue is empty.
+        NSDate* deadline = [NSDate distantPast];
+        for (;;) {
+            NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:deadline
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) break;
+            [NSApp sendEvent:ev];
+        }
+        // Run the default run-loop mode for one short spin to let AppKit
+        // dispatch NSApplicationDidBecomeActiveNotification and redraw the
+        // menu bar.  CFRunLoopRunInMode returns immediately if nothing fires.
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false);
+    }
+
     // Start the background analysis worker thread (processes manual triggers).
     start_analysis_worker();
 
@@ -1042,9 +1080,10 @@ int GuiApp::run() {
     // pending_apply_ and applied on the UI thread each frame.
     run_startup_analysis();
 
-    // Auto-start MCP HTTP server so external tools (Claude Desktop, etc.)
-    // can connect immediately without manual interaction.
-    auto_start_mcp();
+    // NOTE: auto_start_mcp() is intentionally deferred to the first rendered
+    // frame (see below).  Calling it here — before the SDL event loop starts —
+    // blocks the main thread on socket bind / port-scan retries, which prevents
+    // macOS from processing AppKit events and delays the menu bar appearance.
 
     while (running_) {
         // ─── 1. Poll SDL events ─────────────────────────────────────
@@ -1067,6 +1106,64 @@ int GuiApp::run() {
         if (shutdown_complete_.load(std::memory_order_acquire)) {
             running_ = false;
             continue;   // skip rendering and fall out of the loop
+        }
+
+        // ─── 1.55. Deferred MCP auto-start (after first rendered frame) ──
+        // auto_start_mcp() does up to 16 socket bind attempts, each of which
+        // can block the calling thread briefly.  Doing this before the render
+        // loop starts would stall macOS AppKit event processing and delay
+        // the menu bar appearance.  Instead we post it to the analysis worker
+        // queue after the first frame has been drawn so the UI is already visible.
+        // auto_start_mcp() accesses mcp_service_ (a UI-thread-only member), so it
+        // must run on the UI thread via enqueue_async → post_apply.
+        if (!first_frame_ && !mcp_autostart_done_.exchange(true)) {
+            enqueue_async("mcp_autostart", [this]() {
+                // Perform the blocking socket bind off the UI thread.
+                // We cannot touch mcp_service_ here; instead we capture the
+                // result and apply it back on the UI thread via post_apply.
+                ensure_pass_manager();  // pass_manager_ is thread-safe for init
+
+                // Build a temporary TenetMcpService and try to bind a port.
+                // This is the only blocking part; everything else is quick.
+                auto svc = std::make_unique<TenetMcpService>(
+                    reader_, index_, regfile_, memory_,
+                    pass_manager_.get(), &code_table_, &decoder_);
+
+                McpHttpConfig cfg;
+                cfg.host = mcp_gui_.host;
+                auto base_port = static_cast<uint16_t>(mcp_gui_.port);
+
+                constexpr int kMaxRetries = 16;
+                bool started = false;
+                uint16_t actual_port = base_port;
+                for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+                    cfg.port = static_cast<uint16_t>(base_port + attempt);
+                    if (svc->start_http(cfg)) {
+                        actual_port = svc->http_listening_port();
+                        started = true;
+                        break;
+                    }
+                }
+
+                // Hand ownership and result back to the UI thread.
+                // std::function requires copyable captures, so wrap in shared_ptr.
+                auto svc_owner = std::make_shared<std::unique_ptr<TenetMcpService>>(std::move(svc));
+                post_apply([this, svc_owner, started, actual_port, base_port]() {
+                    if (started) {
+                        mcp_service_ = std::move(*svc_owner);
+                        mcp_gui_.port = actual_port;
+                        mcp_status_msg_ = fmt::format(
+                            "Auto-started on {}:{}", mcp_gui_.host, actual_port);
+                    } else {
+                        // svc_owner (and the TenetMcpService it wraps) are
+                        // destroyed here on the UI thread — correct teardown.
+                        svc_owner->reset();
+                        mcp_status_msg_ = fmt::format(
+                            "Auto-start failed: ports {}-{} all in use.",
+                            base_port, base_port + kMaxRetries - 1);
+                    }
+                });
+            });
         }
 
         // ─── 1.6. Apply pending analysis results on the UI thread ────
@@ -1569,6 +1666,11 @@ void GuiApp::render_frame() {
     // ─── Log panel (always rendered) ────────────────────────────────
     if (show_log_) {
         render_log_panel();
+    }
+
+    // ─── Cache Manager panel ────────────────────────────────────────
+    if (show_cache_manager_) {
+        render_cache_manager_panel();
     }
 
     // ─── P2 panels ──────────────────────────────────────────────────

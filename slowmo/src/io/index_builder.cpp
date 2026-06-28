@@ -1902,4 +1902,65 @@ void TraceIndex::delete_pass_blob(std::string_view pass_name) {
     db_->Delete(wo, meta_cf, key);
 }
 
+std::vector<TraceIndex::PassBlobInfo> TraceIndex::list_pass_blobs() const {
+    std::vector<PassBlobInfo> result;
+    if (!db_) return result;
+    auto* meta_cf = get_cf(cf::META);
+    if (!meta_cf) return result;
+
+    // Iterate through all keys in META CF that start with "pass:"
+    static const std::string kPrefix = "pass:";
+    rocksdb::ReadOptions ro;
+    ro.total_order_seek = false;
+    auto* it = db_->NewIterator(ro, meta_cf);
+    for (it->Seek(kPrefix); it->Valid(); it->Next()) {
+        auto k = it->key();
+        std::string_view ks(k.data(), k.size());
+        // C++17-compatible prefix check
+        if (ks.size() < kPrefix.size() ||
+            ks.compare(0, kPrefix.size(), kPrefix) != 0)
+            break;
+        PassBlobInfo info;
+        info.name = std::string(ks.substr(kPrefix.size()));
+        info.size = it->value().size();
+        result.push_back(std::move(info));
+    }
+    delete it;
+    return result;
+}
+
+size_t TraceIndex::delete_all_pass_blobs() {
+    if (!db_) return 0;
+    auto* meta_cf = get_cf(cf::META);
+    if (!meta_cf) return 0;
+
+    static const std::string kPrefix = "pass:";
+
+    // Collect all keys first, then batch-delete them.
+    std::vector<std::string> keys;
+    rocksdb::ReadOptions ro;
+    auto* it = db_->NewIterator(ro, meta_cf);
+    for (it->Seek(kPrefix); it->Valid(); it->Next()) {
+        auto k = it->key();
+        std::string_view ks(k.data(), k.size());
+        // C++17-compatible prefix check
+        if (ks.size() < kPrefix.size() ||
+            ks.compare(0, kPrefix.size(), kPrefix) != 0)
+            break;
+        keys.emplace_back(k.data(), k.size());
+    }
+    delete it;
+
+    if (keys.empty()) return 0;
+
+    rocksdb::WriteBatch batch;
+    for (const auto& key : keys) {
+        batch.Delete(meta_cf, key);
+    }
+    rocksdb::WriteOptions wo;
+    wo.sync = false;
+    db_->Write(wo, &batch);
+    return keys.size();
+}
+
 }  // namespace tenet

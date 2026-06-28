@@ -7,8 +7,69 @@
 
 #include <fmt/core.h>
 #include <string_view>
+#include <cstring>
 
 namespace tenet {
+
+// ─── DisasmTable partial serialization helpers ────────────────────────────
+//
+// Only the inst_to_pc mapping is persisted; the pc_table is reconstructed
+// from the code table (which is already in memory from code section parsing).
+//
+// Blob format (all little-endian):
+//   u32  magic         = 0x44534D54 ("DSMT")
+//   u32  version       = 1
+//   u64  base_inst_id
+//   u64  num_inst_to_pc
+//   u64[] inst_to_pc[num_inst_to_pc]
+
+namespace {
+
+static constexpr uint32_t DSMT_BLOB_MAGIC   = 0x44534D54u;  // "DSMT"
+static constexpr uint32_t DSMT_BLOB_VERSION = 1u;
+
+std::string disasm_serialize_inst_to_pc(const DisasmTable& tbl) {
+    const size_t n = tbl.inst_to_pc.size();
+    const size_t total = 4 + 4 + 8 + 8 + n * 8;
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(DSMT_BLOB_MAGIC);
+    write_u32(DSMT_BLOB_VERSION);
+    write_u64(tbl.base_inst_id);
+    write_u64(static_cast<uint64_t>(n));
+    for (uint64_t pc : tbl.inst_to_pc) write_u64(pc);
+
+    return buf;
+}
+
+bool disasm_deserialize_inst_to_pc(const std::string& blob,
+                                    uint64_t& base_inst_id_out,
+                                    std::vector<uint64_t>& inst_to_pc_out) {
+    if (blob.size() < 4 + 4 + 8 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != DSMT_BLOB_MAGIC)   return false;
+    if (read_u32() != DSMT_BLOB_VERSION) return false;
+
+    base_inst_id_out = read_u64();
+    uint64_t n = read_u64();
+    if (p + n * 8 > end) return false;
+    inst_to_pc_out.resize(static_cast<size_t>(n));
+    for (uint64_t i = 0; i < n; i++) inst_to_pc_out[i] = read_u64();
+
+    return true;
+}
+
+}  // anonymous namespace (disasm serialization)
 
 // ─── Mnemonic classification helper ──────────────────────────────────────
 
@@ -71,6 +132,7 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
     const uint64_t total_insts = index.inst_count();
 
     // ─── Phase 1: Build pc_table from code table (O(unique PCs)) ─────────
+    // This is fast and always runs (code_table is already in memory).
 
     DisasmTable result;
     {
@@ -101,6 +163,24 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
 
     ctx.progress(0.1f, fmt::format("DisasmTable: {} unique PCs decoded", result.pc_table.size()));
 
+    // ─── Fast path: load inst_to_pc from persisted cache ──────────────────
+    // pc_table is rebuilt above; only inst_to_pc needs to come from the cache.
+    if (range.is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("disassembly", blob)) {
+            uint64_t cached_base = 0;
+            std::vector<uint64_t> cached_inst_to_pc;
+            if (disasm_deserialize_inst_to_pc(blob, cached_base, cached_inst_to_pc)) {
+                result.base_inst_id = cached_base;
+                result.inst_to_pc   = std::move(cached_inst_to_pc);
+                ctx.progress(1.0f, fmt::format(
+                    "DisasmTable: {} instructions indexed, {} unique PCs (from cache)",
+                    result.inst_to_pc.size(), result.pc_table.size()));
+                return PassResult::success(std::move(result));
+            }
+        }
+    }
+
     // ─── Phase 2: Build inst_to_pc via collector ──────────────────────────
 
     const uint64_t total = (end > start) ? (end - start) : 0;
@@ -130,6 +210,14 @@ PassResult DisassemblyPass::run(PassContext& ctx) {
     }
 
     result.inst_to_pc = collector.take_inst_to_pc();
+
+    // ─── Persist inst_to_pc for future sessions ───────────────────────────
+    if (range.is_full_trace()) {
+        std::string blob = disasm_serialize_inst_to_pc(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("disassembly", blob.data(), blob.size());
+        }
+    }
 
     ctx.progress(1.0f, fmt::format(
         "DisasmTable: {} instructions indexed, {} unique PCs",

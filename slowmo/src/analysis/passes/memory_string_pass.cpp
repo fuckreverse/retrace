@@ -12,6 +12,108 @@
 
 namespace tenet {
 
+// ─── MemoryStringResult serialization helpers ─────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x4D535452 ("MSTR")
+//   u32  version = 1
+//   u64  num_strings
+//   for each MemoryString:
+//     u64  addr
+//     u64  discovered_at
+//     u32  content_len; u8[] content
+//     u8   encoding
+//     u8   source
+//     u8   source_reg
+//     u64  call_site_inst_id
+//     u64  call_site_pc
+
+namespace {
+
+static constexpr uint32_t MSTR_BLOB_MAGIC   = 0x4D535452u;  // "MSTR"
+static constexpr uint32_t MSTR_BLOB_VERSION = 1u;
+
+std::string memory_string_serialize(const MemoryStringResult& res) {
+    size_t total = 4 + 4 + 8;  // magic, version, num_strings
+    for (const auto& s : res.strings) {
+        total += 8 + 8;                     // addr, discovered_at
+        total += 4 + s.content.size();      // content
+        total += 1 + 1 + 1 + 8 + 8;        // encoding, source, source_reg, call_site ids
+    }
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(MSTR_BLOB_MAGIC);
+    write_u32(MSTR_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.strings.size()));
+
+    for (const auto& s : res.strings) {
+        write_u64(s.addr);
+        write_u64(s.discovered_at);
+        write_u32(static_cast<uint32_t>(s.content.size()));
+        std::memcpy(p, s.content.data(), s.content.size());
+        p += s.content.size();
+        write_u8(static_cast<uint8_t>(s.encoding));
+        write_u8(static_cast<uint8_t>(s.source));
+        write_u8(s.source_reg);
+        write_u64(s.call_site_inst_id);
+        write_u64(s.call_site_pc);
+    }
+
+    return buf;
+}
+
+bool memory_string_deserialize(const std::string& blob, MemoryStringResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != MSTR_BLOB_MAGIC)   return false;
+    if (read_u32() != MSTR_BLOB_VERSION) return false;
+
+    uint64_t n = read_u64();
+    out.strings.reserve(static_cast<size_t>(n));
+
+    for (uint64_t i = 0; i < n; i++) {
+        if (p + 8 + 8 + 4 > end) return false;
+        MemoryString s;
+        s.addr         = read_u64();
+        s.discovered_at = read_u64();
+        uint32_t clen   = read_u32();
+        if (p + clen > end) return false;
+        s.content.assign(p, clen);
+        p += clen;
+        if (p + 1 + 1 + 1 + 8 + 8 > end) return false;
+        s.encoding        = static_cast<MemoryString::Encoding>(read_u8());
+        s.source          = static_cast<MemoryString::Source>(read_u8());
+        s.source_reg      = read_u8();
+        s.call_site_inst_id = read_u64();
+        s.call_site_pc    = read_u64();
+
+        // Rebuild index structures
+        size_t idx = out.strings.size();
+        out.by_addr[s.addr].push_back(idx);
+        out.by_call_site[s.call_site_inst_id].push_back(idx);
+        // Rebuild unique_contents set
+        std::string key = fmt::format("{}:{}", s.addr, s.content);
+        out.unique_contents.insert(key);
+        out.strings.push_back(std::move(s));
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (memory_string serialization)
+
 // ─── MemoryStringCollector ────────────────────────────────────────────────
 
 bool MemoryStringCollector::begin(uint64_t /*start_inst_id*/,
@@ -228,6 +330,31 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
     if (end_id == 0) end_id = index.inst_count();
 
+    // ── Fast path: load from persisted cache ──────────────────────────────
+    // Only cache for default config + full trace to avoid config mismatches.
+    const bool is_default_cfg =
+        config_.scan_size == 256 &&
+        config_.min_pointer_value == 0x100000000ULL &&
+        config_.scan_stack &&
+        config_.stack_scan_size == 512 &&
+        config_.max_call_sites == 0 &&
+        config_.deep_probe &&
+        config_.deep_probe_max_steps == 50 &&
+        config_.min_string_len == 4 &&
+        config_.max_string_len == 512;
+    if (is_default_cfg && ctx.range().is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("memory_strings", blob)) {
+            MemoryStringResult cached;
+            if (memory_string_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Done: {} strings ({} unique) (from cache)",
+                    cached.total(), cached.unique_count()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     ctx.progress(0.0f, "Scanning call sites for strings");
 
     // ─── Phase 1: collect call sites via collector ─────────────────────────
@@ -348,6 +475,14 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
                     }
                 }
             }
+        }
+    }
+
+    // ── Persist result for future sessions ───────────────────────────────
+    if (is_default_cfg && ctx.range().is_full_trace()) {
+        std::string blob = memory_string_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("memory_strings", blob.data(), blob.size());
         }
     }
 

@@ -9,8 +9,149 @@
 #include "core/instruction_decoder.h"
 
 #include <fmt/core.h>
+#include <cstring>
 
 namespace tenet {
+
+// ─── AnnotationResult serialization helpers ───────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x414E4E54 ("ANNT")
+//   u32  version = 1
+//   u64  num_by_pc
+//   for each by_pc entry:
+//     u64  pc
+//     u32  num_annotations
+//     for each Annotation:
+//       u8   kind
+//       f32  priority
+//       u32  label_len; u8[] label
+//       u32  detail_len; u8[] detail
+//   u64  num_by_inst_id
+//   for each by_inst_id entry: (same layout as by_pc but keyed by inst_id)
+
+namespace {
+
+static constexpr uint32_t ANNT_BLOB_MAGIC   = 0x414E4E54u;  // "ANNT"
+static constexpr uint32_t ANNT_BLOB_VERSION = 1u;
+
+// Helper: compute serialized size for one Annotation vector
+static size_t ann_vec_size(const std::vector<Annotation>& anns) {
+    size_t sz = 4;  // num_annotations
+    for (const auto& a : anns) {
+        sz += 1 + 4;           // kind, priority
+        sz += 4 + a.label.size();
+        sz += 4 + a.detail.size();
+    }
+    return sz;
+}
+
+static void serialize_ann_vec(char*& p, const std::vector<Annotation>& anns) {
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
+
+    write_u32(static_cast<uint32_t>(anns.size()));
+    for (const auto& a : anns) {
+        write_u8(static_cast<uint8_t>(a.kind));
+        write_f32(a.priority);
+        write_u32(static_cast<uint32_t>(a.label.size()));
+        std::memcpy(p, a.label.data(), a.label.size()); p += a.label.size();
+        write_u32(static_cast<uint32_t>(a.detail.size()));
+        std::memcpy(p, a.detail.data(), a.detail.size()); p += a.detail.size();
+    }
+}
+
+static bool deserialize_ann_vec(const char*& p, const char* end,
+                                 std::vector<Annotation>& out) {
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+
+    if (p + 4 > end) return false;
+    uint32_t n = read_u32();
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        if (p + 1 + 4 > end) return false;
+        Annotation a;
+        a.kind     = static_cast<Annotation::Kind>(read_u8());
+        a.priority = read_f32();
+        if (p + 4 > end) return false;
+        uint32_t llen = read_u32();
+        if (p + llen > end) return false;
+        a.label.assign(p, llen); p += llen;
+        if (p + 4 > end) return false;
+        uint32_t dlen = read_u32();
+        if (p + dlen > end) return false;
+        a.detail.assign(p, dlen); p += dlen;
+        out.push_back(std::move(a));
+    }
+    return true;
+}
+
+std::string annotation_serialize(const AnnotationResult& res) {
+    // Compute total size
+    size_t total = 4 + 4 + 8;  // magic, version, num_by_pc
+    for (const auto& [pc, anns] : res.by_pc) {
+        total += 8 + ann_vec_size(anns);  // key + annotations
+    }
+    total += 8;  // num_by_inst_id
+    for (const auto& [id, anns] : res.by_inst_id) {
+        total += 8 + ann_vec_size(anns);
+    }
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(ANNT_BLOB_MAGIC);
+    write_u32(ANNT_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.by_pc.size()));
+    for (const auto& [pc, anns] : res.by_pc) {
+        write_u64(pc);
+        serialize_ann_vec(p, anns);
+    }
+    write_u64(static_cast<uint64_t>(res.by_inst_id.size()));
+    for (const auto& [id, anns] : res.by_inst_id) {
+        write_u64(id);
+        serialize_ann_vec(p, anns);
+    }
+
+    return buf;
+}
+
+bool annotation_deserialize(const std::string& blob, AnnotationResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != ANNT_BLOB_MAGIC)   return false;
+    if (read_u32() != ANNT_BLOB_VERSION) return false;
+
+    uint64_t n_pc = read_u64();
+    for (uint64_t i = 0; i < n_pc; i++) {
+        if (p + 8 > end) return false;
+        uint64_t key = read_u64();
+        if (!deserialize_ann_vec(p, end, out.by_pc[key])) return false;
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_id = read_u64();
+    for (uint64_t i = 0; i < n_id; i++) {
+        if (p + 8 > end) return false;
+        uint64_t key = read_u64();
+        if (!deserialize_ann_vec(p, end, out.by_inst_id[key])) return false;
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (symbol_annotation serialization)
 
 // ─── AnnotationResult methods ─────────────────────────────────────────────
 
@@ -48,6 +189,20 @@ std::string AnnotationResult::format_pc(uint64_t pc) const {
 // ─── Pass implementation ──────────────────────────────────────────────────
 
 PassResult SymbolAnnotationPass::run(PassContext& ctx) {
+    // ── Fast path: load from persisted cache ──────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob;
+        if (ctx.index().load_pass_blob("symbol_annotation", blob)) {
+            AnnotationResult cached;
+            if (annotation_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Symbol annotation: {} PCs, {} inst_ids (from cache)",
+                    cached.by_pc.size(), cached.by_inst_id.size()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     AnnotationResult result;
 
     ctx.progress(0.0f, "Collecting annotations from passes");
@@ -101,7 +256,16 @@ PassResult SymbolAnnotationPass::run(PassContext& ctx) {
     // 5. Sort all annotation vectors by priority descending
     sort_annotations(result);
 
-    ctx.progress(1.0f, "Symbol annotation pass complete");
+    // ── Persist result for future sessions ───────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob = annotation_serialize(result);
+        if (!blob.empty()) {
+            ctx.index().save_pass_blob("symbol_annotation", blob.data(), blob.size());
+        }
+    }
+
+    ctx.progress(1.0f, fmt::format("Symbol annotation: {} PCs, {} inst_ids",
+                                    result.by_pc.size(), result.by_inst_id.size()));
 
     return PassResult::success(std::move(result));
 }

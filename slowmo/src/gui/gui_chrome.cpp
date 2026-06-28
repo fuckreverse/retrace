@@ -127,6 +127,8 @@ void GuiApp::render_menu_bar() {
             ImGui::MenuItem("Trace Diff",            nullptr, &show_trace_diff_);
             ImGui::Separator();
             ImGui::MenuItem("Output (Log)",          nullptr, &show_log_);
+            ImGui::Separator();
+            ImGui::MenuItem("Cache Manager",         nullptr, &show_cache_manager_);
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
             ImGui::EndMenu();
         }

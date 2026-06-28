@@ -191,6 +191,11 @@ private:
     // TenetMcpService is created here and runs in the background.
     std::unique_ptr<TenetMcpService> mcp_service_;
 
+    // Guard: auto_start_mcp() is deferred to a background thread after the
+    // first frame is rendered (so the macOS menu bar appears immediately).
+    // This flag ensures the deferred start fires exactly once.
+    std::atomic<bool> mcp_autostart_done_{false};
+
     // Pending settings (edited in UI, applied on Start/Restart)
     struct McpGuiSettings {
         char host[64]     = "127.0.0.1";
@@ -518,6 +523,12 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     const TraceFoldResult* trace_fold_result_ = nullptr;
     bool show_trace_fold_ = false;
 
+    // ─── Cache Manager panel state ─────────────────────────────────────────
+    bool show_cache_manager_ = false;
+    bool cache_manager_dirty_ = true;  ///< Re-load entry list from RocksDB next frame.
+    std::vector<PassManager::BlobCacheEntry> cache_manager_entries_;
+    std::string cache_manager_status_;  ///< One-line feedback shown below buttons.
+
     // ─── Multi-trace diff state (P2-14) ────────────────────────────────
     bool show_trace_diff_ = false;
     // Region A and B inst_id ranges to compare
@@ -688,6 +699,7 @@ private:
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
     void render_log_panel();                       // Output / Log panel (IDA-style)
+    void render_cache_manager_panel();             // Pass-cache management panel
 
     // ─── Log panel state ─────────────────────────────────────────────
     // GuiLogEntry mirrors tenet::log::LogEntry but avoids including logger.h

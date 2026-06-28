@@ -234,8 +234,13 @@ public:
 
     /// Invalidate a pass result AND delete its persisted RocksDB blob so that
     /// the next run performs a full re-computation instead of loading from cache.
-    /// Only meaningful for passes that use save_pass_blob (xref, function,
-    /// constant_materialization).  Safe to call for any pass name.
+    ///
+    /// Passes that use save_pass_blob (and thus honour this call):
+    ///   xref, function, constant_materialization, cfg, loop, call_graph,
+    ///   disassembly, thread, loop_semantics, window_stats, syscall_intercept,
+    ///   memory_strings, symbol_annotation.
+    ///
+    /// Safe to call for any pass name (no-op for passes without a cache blob).
     void invalidate_and_clear_blob(std::string_view pass_name);
 
     /// Request cancellation of all in-flight passes.  Passes that check
@@ -261,6 +266,26 @@ public:
     enum class PassState : int { NotRun = 0, Running = 1, Completed = 2, Failed = 3 };
     PassState state(std::string_view pass_name) const;
     std::vector<std::string_view> all_passes() const;
+
+    // ─── Cache management (for the Cache Manager panel) ────────────────
+
+    /// Information about a single pass's persisted blob cache.
+    struct BlobCacheEntry {
+        std::string name;       ///< Pass name
+        size_t      blob_size;  ///< Persisted blob size in bytes
+        bool        in_memory;  ///< Whether an in-memory result exists
+        PassState   state;      ///< Current pass execution state
+    };
+
+    /// Return information about all persisted pass-result blobs in the RocksDB
+    /// index.  Each entry has a name, disk size, and whether there's also an
+    /// in-memory result ready.
+    std::vector<BlobCacheEntry> query_blob_info() const;
+
+    /// Delete all persisted pass-result blobs from the RocksDB index in one
+    /// batch.  Does NOT invalidate in-memory results.
+    /// Returns the number of blobs deleted.
+    size_t clear_all_blobs();
 
     /// Per-pass progress in [0,1].  Returns 0 for unknown / not-yet-run passes.
     float progress_of(std::string_view pass_name) const;
