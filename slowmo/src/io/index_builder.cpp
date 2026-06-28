@@ -1,6 +1,11 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "common/Profiling.h"
+
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+#include <tbb/parallel_sort.h>
+#endif
+
 #include <rocksdb/table.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
@@ -32,7 +37,10 @@ namespace tenet {
 //     Bumping to v6 invalidates all such caches globally, forcing a rebuild.
 // v7: Added trace_hash (xxHash64 of trace content) for integrity detection.
 //     Index directory renamed from .tenet_cache_<name> to <name>.tenet
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 7;
+// v8: All index CFs now use LZ4 compression; REG_WRITES CF gains a prefix
+//     extractor (FixedPrefix(2)) + bloom filter; CompactRange after build.
+//     Old uncompressed caches are invalidated to rebuild with new settings.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 8;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -290,14 +298,46 @@ Result<TraceIndex> TraceIndex::open_or_build(
 
         // MEM_WRITE/MEM_READ CF options must match build-time settings
         // (prefix extractor, block cache, bloom filter) for correct operation.
-        auto make_mem_cf_opts = []() {
+        // Share a single 512MB block cache between both CFs to avoid doubling
+        // memory usage and improve cross-CF cache hit rate.
+        auto mem_block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
+        auto make_mem_cf_opts = [&mem_block_cache]() {
             rocksdb::ColumnFamilyOptions o;
             o.compression = rocksdb::kLZ4Compression;
             o.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
                 rocksdb::NewFixedPrefixTransform(8));  // page(8) only
             rocksdb::BlockBasedTableOptions tbl;
             tbl.block_size = 4 * 1024;
-            tbl.block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
+            tbl.block_cache = mem_block_cache;  // shared between MEM_WRITE & MEM_READ
+            tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+            tbl.whole_key_filtering = false;
+            o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
+            return o;
+        };
+
+        // OFFSET/ANCHOR/CODE_BYTES: match build-time settings (LZ4, 16KB block)
+        // for consistent read performance.
+        auto make_index_cf_opts = [&mem_block_cache]() {
+            rocksdb::ColumnFamilyOptions o;
+            o.compression = rocksdb::kLZ4Compression;
+            rocksdb::BlockBasedTableOptions tbl;
+            tbl.block_size = 16 * 1024;
+            tbl.block_cache = mem_block_cache;  // share cache with MEM CFs
+            tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+            o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
+            return o;
+        };
+
+        // REG_WRITES: prefix extractor (2 bytes = 0x00 + reg_idx) + bloom filter
+        // to accelerate SeekForPrev per-register lookups.
+        auto make_reg_writes_cf_opts = [&mem_block_cache]() {
+            rocksdb::ColumnFamilyOptions o;
+            o.compression = rocksdb::kNoCompression;
+            o.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
+                rocksdb::NewFixedPrefixTransform(2));  // 0x00 + reg_idx
+            rocksdb::BlockBasedTableOptions tbl;
+            tbl.block_size = 32 * 1024;
+            tbl.block_cache = mem_block_cache;
             tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
             tbl.whole_key_filtering = false;
             o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
@@ -307,12 +347,12 @@ Result<TraceIndex> TraceIndex::open_or_build(
         std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
             {"default", rocksdb::ColumnFamilyOptions()},
             {cf::META, rocksdb::ColumnFamilyOptions()},
-            {cf::OFFSET, rocksdb::ColumnFamilyOptions()},
-            {cf::ANCHOR, rocksdb::ColumnFamilyOptions()},
+            {cf::OFFSET, make_index_cf_opts()},
+            {cf::ANCHOR, make_index_cf_opts()},
             {cf::MEM_WRITE, make_mem_cf_opts()},
             {cf::MEM_READ,  make_mem_cf_opts()},
-            {cf::REG_WRITES, rocksdb::ColumnFamilyOptions()},
-            {cf::CODE_BYTES, rocksdb::ColumnFamilyOptions()},
+            {cf::REG_WRITES, make_reg_writes_cf_opts()},
+            {cf::CODE_BYTES, make_index_cf_opts()},
         };
 
         rocksdb::DB* raw_db = nullptr;
@@ -439,22 +479,13 @@ Result<TraceIndex> TraceIndex::build(
     opts.compression = rocksdb::kNoCompression;
     opts.write_buffer_size = 256 * 1024 * 1024;  // 256MB: reduces compactions during bulk build
     // Bulk-load optimisation: disable auto-compaction and raise L0 triggers
-    // so the initial write doesn't stall.  After build we CompactRange() once.
+    // so the initial write doesn't stall.  After ingest we CompactRange() on
+    // CFs used for point lookups (OFFSET, REG_WRITES, CODE_BYTES).
     opts.disable_auto_compactions = true;
     opts.level0_file_num_compaction_trigger = 1024;
     opts.level0_slowdown_writes_trigger = 1024;
     opts.level0_stop_writes_trigger = 1024;
     opts.max_write_buffer_number = 4;
-
-    // Helper: apply bulk-load settings to a column-family options object.
-    auto apply_bulk_load_opts = [](rocksdb::ColumnFamilyOptions& o) {
-        o.disable_auto_compactions = true;
-        o.level0_file_num_compaction_trigger = 1024;
-        o.level0_slowdown_writes_trigger = 1024;
-        o.level0_stop_writes_trigger = 1024;
-        o.max_write_buffer_number = 4;
-        o.write_buffer_size = 256 * 1024 * 1024;
-    };
 
     rocksdb::BlockBasedTableOptions table_opts;
     table_opts.block_cache = rocksdb::NewLRUCache(128 * 1024 * 1024);
@@ -476,20 +507,35 @@ Result<TraceIndex> TraceIndex::build(
 
     rocksdb::ColumnFamilyOptions reg_writes_cf_opts;
     reg_writes_cf_opts.compression = rocksdb::kNoCompression;
+    reg_writes_cf_opts.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
+        rocksdb::NewFixedPrefixTransform(2));  // key prefix = 0x00 + reg_idx
     rocksdb::BlockBasedTableOptions reg_writes_table_opts;
     reg_writes_table_opts.block_size = 32 * 1024;
+    reg_writes_table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+    reg_writes_table_opts.whole_key_filtering = false;
     reg_writes_cf_opts.table_factory.reset(
         rocksdb::NewBlockBasedTableFactory(reg_writes_table_opts));
+
+    // OFFSET/ANCHOR/CODE_BYTES: LZ4 compression + 16KB blocks (matches default table_opts)
+    rocksdb::ColumnFamilyOptions index_cf_opts;
+    index_cf_opts.compression = rocksdb::kLZ4Compression;
+    {
+        rocksdb::BlockBasedTableOptions tbl;
+        tbl.block_size = 16 * 1024;
+        tbl.block_cache = table_opts.block_cache;  // share build-time cache
+        tbl.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+        index_cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
+    }
 
     std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
         {"default", rocksdb::ColumnFamilyOptions()},
         {cf::META,       rocksdb::ColumnFamilyOptions()},
-        {cf::OFFSET,     rocksdb::ColumnFamilyOptions()},
-        {cf::ANCHOR,     rocksdb::ColumnFamilyOptions()},
+        {cf::OFFSET,     index_cf_opts},
+        {cf::ANCHOR,     index_cf_opts},
         {cf::MEM_WRITE,  mem_write_cf_opts},
         {cf::MEM_READ,   mem_write_cf_opts},
         {cf::REG_WRITES, reg_writes_cf_opts},
-        {cf::CODE_BYTES, rocksdb::ColumnFamilyOptions()},  // P1.9: CODE records
+        {cf::CODE_BYTES, index_cf_opts},
     };
 
     TraceIndex idx;
@@ -953,10 +999,9 @@ Result<TraceIndex> TraceIndex::build(
         };
 
         // SstFileWriter needs Options that match the CF's table format.
-        // For bulk-load SSTs we use simple options (no compression for
-        // OFFSET/ANCHOR/REG_WRITES, LZ4 for MEM_WRITE/MEM_READ).
+        // All CFs use LZ4 compression for reduced disk usage.
         rocksdb::Options sst_opts;
-        sst_opts.compression = rocksdb::kNoCompression;
+        sst_opts.compression = rocksdb::kLZ4Compression;
 
         CfWriter offset_w(sst_opts, &result.offset_ssts, "offset", shard_idx, sst_dir);
         // Enable dedup for anchor_w: multiple ANCHOR records can share the same
@@ -1196,10 +1241,17 @@ Result<TraceIndex> TraceIndex::build(
         // Write sorted CODE_BYTES SST
         if (!code_entries.empty()) {
             // Sort by key (big-endian PC) — required by SstFileWriter
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+            tbb::parallel_sort(code_entries.begin(), code_entries.end(),
+                      [](const CodeEntry& a, const CodeEntry& b) {
+                          return std::memcmp(a.key, b.key, 8) < 0;
+                      });
+#else
             std::sort(code_entries.begin(), code_entries.end(),
                       [](const CodeEntry& a, const CodeEntry& b) {
                           return std::memcmp(a.key, b.key, 8) < 0;
                       });
+#endif
             // Deduplicate: keep last occurrence of each PC (latest code bytes)
             auto new_end = std::unique(code_entries.rbegin(), code_entries.rend(),
                                        [](const CodeEntry& a, const CodeEntry& b) {
@@ -1209,7 +1261,7 @@ Result<TraceIndex> TraceIndex::build(
                                new_end.base());
 
             rocksdb::Options code_sst_opts;
-            code_sst_opts.compression = rocksdb::kNoCompression;
+            code_sst_opts.compression = rocksdb::kLZ4Compression;
             rocksdb::SstFileWriter code_w(rocksdb::EnvOptions(), code_sst_opts);
             auto code_path = sst_dir / ("code_s" + std::to_string(shard_idx) + ".sst");
             auto s = code_w.Open(code_path.string());
@@ -1318,6 +1370,16 @@ Result<TraceIndex> TraceIndex::build(
         if (!s.ok()) {
             return Error::rocksdb_error("SST ingest failed: " + s.ToString());
         }
+
+        // Compact CFs used for point lookups / SeekForPrev to consolidate L0
+        // SSTs into sorted levels. This is a one-time cost during build that
+        // significantly improves subsequent read performance (avoids checking
+        // multiple overlapping L0 files per query).
+        rocksdb::CompactRangeOptions cro;
+        cro.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
+        idx.db_->CompactRange(cro, idx.get_cf(cf::OFFSET), nullptr, nullptr);
+        idx.db_->CompactRange(cro, idx.get_cf(cf::REG_WRITES), nullptr, nullptr);
+        idx.db_->CompactRange(cro, idx.get_cf(cf::CODE_BYTES), nullptr, nullptr);
     }
 
     // ── Phase 3: Aggregate statistics ────────────────────────────────────
@@ -1339,41 +1401,47 @@ Result<TraceIndex> TraceIndex::build(
     idx.sparse_interval_ = actual_interval;
     idx.stats_.sparse_interval = static_cast<uint32_t>(actual_interval);
 
-    // Write metadata
+    // Write metadata as a single atomic batch (one WAL + memtable write)
     auto* meta_cf = idx.get_cf(cf::META);
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "version", "1");
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "schema_version",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&INDEX_SCHEMA_VERSION), 4));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "inst_count",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&inst_id), 8));
     uint64_t fsize = reader.file_size();
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "file_size",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&fsize), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "total_records",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&total_records), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "anchor_count",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.anchor_count), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "code_count",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.code_count), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "event_count",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.event_count), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "sparse_interval",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&actual_interval), 8));
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "num_shards",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.num_shards), 4));
-
-    // Store trace hash for integrity verification (fast sample-based hash)
     uint64_t trace_hash = sample_trace_hash(reader);
-    idx.db_->Put(rocksdb::WriteOptions(), meta_cf, "trace_hash",
-                 rocksdb::Slice(reinterpret_cast<const char*>(&trace_hash), 8));
+
+    rocksdb::WriteBatch meta_batch;
+    meta_batch.Put(meta_cf, "version", "1");
+    meta_batch.Put(meta_cf, "schema_version",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&INDEX_SCHEMA_VERSION), 4));
+    meta_batch.Put(meta_cf, "inst_count",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&inst_id), 8));
+    meta_batch.Put(meta_cf, "file_size",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&fsize), 8));
+    meta_batch.Put(meta_cf, "total_records",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&total_records), 8));
+    meta_batch.Put(meta_cf, "anchor_count",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.anchor_count), 8));
+    meta_batch.Put(meta_cf, "code_count",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.code_count), 8));
+    meta_batch.Put(meta_cf, "event_count",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.event_count), 8));
+    meta_batch.Put(meta_cf, "sparse_interval",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&actual_interval), 8));
+    meta_batch.Put(meta_cf, "num_shards",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.num_shards), 4));
+    meta_batch.Put(meta_cf, "trace_hash",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&trace_hash), 8));
+    idx.db_->Write(rocksdb::WriteOptions(), &meta_batch);
 
     auto t1 = std::chrono::steady_clock::now();
     idx.stats_.build_seconds =
         std::chrono::duration<double>(t1 - t0).count();
 
     // Sort anchors (gathered from Phase 0 raw scan, already in order but sort for safety)
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+    tbb::parallel_sort(idx.anchors_.begin(), idx.anchors_.end(),
+              [](const auto& a, const auto& b) { return a.inst_id < b.inst_id; });
+#else
     std::sort(idx.anchors_.begin(), idx.anchors_.end(),
               [](const auto& a, const auto& b) { return a.inst_id < b.inst_id; });
+#endif
 
     reader.advise_random();
 
