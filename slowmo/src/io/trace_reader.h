@@ -37,7 +37,7 @@ struct MemAccessView {
 
 struct InstView {
     uint64_t pc;
-    uint8_t nzcv;
+    uint8_t nzcv;            // bits[3:0] = N/Z/C/V flags; bits[7:4] = branch hint (when HF_BRANCH_HINT is set)
     uint8_t reg_diff_count;
     uint8_t fpr_diff_count;  // v7 only; 0 for v4/v5/v6
     uint8_t mem_access_count;
@@ -47,6 +47,14 @@ struct InstView {
     bool is_v5 = false;  // true when record uses v5 (pc_delta) layout
     bool is_v6 = false;  // true when record uses v6 (old_value) layout
     bool is_v7 = false;  // true when record uses v7 (HF_HAS_FPR) layout
+
+    /// Extract the branch-hint nibble from the high 4 bits of nzcv.
+    /// Returns 0 (NONE), 1 (CALL), 2 (RET), or 4 (BRANCH).
+    /// Only meaningful when the trace file has HF_BRANCH_HINT set.
+    uint8_t branch_hint() const { return (nzcv >> 4) & 0xF; }
+
+    /// The actual N/Z/C/V flags (low nibble only).
+    uint8_t nzcv_flags() const { return nzcv & 0xF; }
 
     RegDiffView reg_diff(uint8_t i) const {
         // qbditrace_regdiff_t: u8 reg_index @0, pad[7], u64 value @8
@@ -252,9 +260,13 @@ struct FileHeader {
     bool has_code() const      { return flags & qbditrace::QBDITRACE_HF_HAS_CODE; }
     bool reg_diff() const      { return flags & qbditrace::QBDITRACE_HF_REG_DIFF; }
     bool has_old_value() const { return flags & qbditrace::QBDITRACE_HF_OLD_VALUE; }
-    bool has_fpr() const       { return flags & qbditrace::QBDITRACE_HF_HAS_FPR; }
-    bool is_compressed() const { return flags & qbditrace::QBDITRACE_HF_COMPRESSED; }
+    bool has_fpr() const          { return flags & qbditrace::QBDITRACE_HF_HAS_FPR; }
+    bool is_compressed() const    { return flags & qbditrace::QBDITRACE_HF_COMPRESSED; }
     bool is_block_compressed() const { return flags & qbditrace::QBDITRACE_HF_BLOCK_COMPRESSED; }
+    /// When true, every REC_INST nzcv byte encodes the branch class in bits[7:4]:
+    ///   0 = not a branch, 1 = CALL (BL/BLR), 2 = RET, 4 = BRANCH (B/BR).
+    /// The low nibble retains the normal N/Z/C/V flags.
+    bool has_branch_hint() const  { return flags & qbditrace::QBDITRACE_HF_BRANCH_HINT; }
 };
 
 // ─── TraceReader ──────────────────────────────────────────────────────────

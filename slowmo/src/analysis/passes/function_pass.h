@@ -114,7 +114,11 @@ struct FunctionResult {
 ///     tail-call resolution and bookkeeping.
 class FunctionCollector final : public TraceCollector {
 public:
-    FunctionCollector(CodeTable& code_table, uint64_t module_slide, uint32_t num_gpr);
+    /// `has_branch_hint` should be set to `reader.header().has_branch_hint()` so
+    /// on_inst can skip the binary-search pc_kind lookup for the vast majority of
+    /// instructions (ordinary ones) using the cheap bit-shift path instead.
+    FunctionCollector(CodeTable& code_table, uint64_t module_slide, uint32_t num_gpr,
+                      bool has_branch_hint = false);
 
     std::string_view name() const override { return "FunctionCollector"; }
 
@@ -178,6 +182,10 @@ private:
     CodeTable& code_table_;
     uint64_t module_slide_;
     uint32_t num_gpr_;
+    /// When true, on_inst reads the branch-hint nibble (bits[7:4] of inst.nzcv)
+    /// before falling back to the binary-search pc_kind table.  Set when the
+    /// trace file has HF_BRANCH_HINT (qbditrace records branch class inline).
+    bool has_branch_hint_ = false;
 
     // ── Pre-built PC classification table (sorted flat array) ──────────
     // Replaces ankerl::unordered_dense::map<uint64_t, uint8_t>:

@@ -175,7 +175,35 @@ typedef enum {
    * HF_COMPRESSED and HF_BLOCK_COMPRESSED are mutually exclusive.
    * This flag is orthogonal to version — any version (v4–v7) can use it. */
   QBDITRACE_HF_BLOCK_COMPRESSED = 1u << 8,
+  /* Branch-hint encoding in nzcv high bits.  When set, every REC_INST record
+   * encodes the instruction's branch class in the high 4 bits of the `nzcv`
+   * byte (bits[7:4]).  The low 4 bits retain the normal N/Z/C/V flags.
+   *
+   * High-nibble encoding (bits[7:4]):
+   *   0b0000  (0)  — ordinary instruction (not a branch)
+   *   0b0001  (1)  — CALL  (BL / BLR)
+   *   0b0010  (2)  — RET   (RET, RETAA, RETAB)
+   *   0b0100  (4)  — BRANCH (B, BR — unconditional non-call jump)
+   *
+   * This allows offline decoders (e.g. tenet FunctionPass) to skip the
+   * per-instruction binary search in the pc_kind table for the vast majority
+   * of instructions (ordinary) and use a fast bit-shift for branch-class
+   * instructions (~2–5% of the stream).  Zero additional bytes on disk.
+   *
+   * Backward compatibility: on traces without this flag the high nibble is
+   * always 0 (old writers never set it), so old readers that ignore the high
+   * nibble see no change.  New readers can detect this flag and skip the
+   * pc_kind table lookup when the high nibble is non-zero; they fall back to
+   * the table for instructions whose high nibble is 0 (which includes all
+   * instructions on older traces). */
+  QBDITRACE_HF_BRANCH_HINT = 1u << 9,
 } qbditrace_header_flags;
+
+/* Branch-hint nibble values (bits[7:4] of the nzcv byte in REC_INST). */
+#define QBDITRACE_BRANCH_HINT_NONE   0u  /* ordinary instruction */
+#define QBDITRACE_BRANCH_HINT_CALL   1u  /* BL / BLR */
+#define QBDITRACE_BRANCH_HINT_RET    2u  /* RET / RETAA / RETAB */
+#define QBDITRACE_BRANCH_HINT_BRANCH 4u  /* B / BR (unconditional jump) */
 
 #define QBDITRACE_BLOCK_INDEX_MAGIC 0x51424249u /* "QBBI" */
 #define QBDITRACE_DEFAULT_BLOCK_SIZE (1u << 20) /* 1 MB decompressed */

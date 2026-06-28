@@ -250,6 +250,44 @@ struct TraceWriter {
         prev_pc_ = 0;
     }
 
+    /// Write a header with HF_BRANCH_HINT set (branch class encoded in nzcv[7:4]).
+    /// Used for tests that exercise the branch-hint fast path in FunctionCollector.
+    void write_header_branch_hint(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_BRANCH_HINT;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
+    /// Write a header with both HF_BRANCH_HINT and HF_PC_DELTA set.
+    void write_header_branch_hint_v5(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V5_PC_DELTA;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_PC_DELTA | QBDITRACE_HF_BRANCH_HINT;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+        prev_pc_ = 0;
+    }
+
     /// Write a v5+v6 combined header: HF_PC_DELTA + HF_OLD_VALUE.
     /// Version is set to QBDITRACE_VERSION_V6_OLD_VALUE (v6 supersedes v5 numerically).
     /// emit_v5v6() must be used with this header (6-byte inst head + 48-byte memacc).

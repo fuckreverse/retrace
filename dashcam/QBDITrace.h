@@ -131,6 +131,15 @@ typedef struct {
    * reader can always identify the file), followed by a single zstd frame
    * containing the record stream.  HF_COMPRESSED is set in the header flags. */
   uint32_t disable_compress;
+
+  /* Branch-hint encoding (HF_BRANCH_HINT).
+   * The sense is inverted (0 = enabled, the default): a zero-initialized config
+   * will write the branch class (CALL/RET/BRANCH) in bits[7:4] of the nzcv byte
+   * of every REC_INST, enabling tenet's FunctionPass to skip per-instruction
+   * binary-search in the pc_kind table.  Zero additional bytes on disk.
+   * Set to non-zero only to produce traces compatible with very old readers
+   * that might misinterpret a non-zero high nibble in nzcv. */
+  uint32_t disable_branch_hint;
 } qbditrace_config_t;
 
 /*

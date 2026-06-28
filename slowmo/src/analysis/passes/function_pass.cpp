@@ -370,10 +370,12 @@ const FunctionInfo* FunctionResult::function_at(uint64_t inst_id) const {
 
 FunctionCollector::FunctionCollector(CodeTable& code_table,
                                      uint64_t module_slide,
-                                     uint32_t num_gpr)
+                                     uint32_t num_gpr,
+                                     bool has_branch_hint)
     : code_table_(code_table)
     , module_slide_(module_slide)
     , num_gpr_(num_gpr)
+    , has_branch_hint_(has_branch_hint)
 {}
 
 // ── Phase-1 helper: binary-search lookup in sorted flat array ────────────
@@ -471,9 +473,28 @@ void FunctionCollector::on_inst(uint64_t inst_id, const InstView& inst) {
         // Fall through: this instruction might itself be a branch-class PC.
     }
 
-    // ── Fast gate: skip ordinary instructions ─────────────────────────────
-    const uint8_t kind = lookup_pc_kind(pc);
-    if (kind == 0) return;
+    // ── Fast gate: classify instruction ──────────────────────────────────────
+    // When HF_BRANCH_HINT is set (new traces from qbditrace), the branch class
+    // is encoded in bits[7:4] of the nzcv byte by the tracer at recording time.
+    // branch_hint() is a single bit-shift with no memory access (sub-ns) and
+    // handles ~95-98% of instructions by immediately returning 0 (ordinary).
+    //
+    // QBDITRACE_BRANCH_HINT_* values map directly to KIND_* constants:
+    //   HINT_CALL(1) = KIND_CALL(1), HINT_RET(2) = KIND_RET(2),
+    //   HINT_BRANCH(4) = KIND_BRANCH(4)  —  same bit values, no translation.
+    //
+    // For old traces (no HF_BRANCH_HINT) we fall back to the binary-search table
+    // lookup on pc_kind_sorted_, which is still cache-friendly for sparse sets.
+    uint8_t kind;
+    if (has_branch_hint_) {
+        // O(1) path: read pre-computed hint directly from nzcv high nibble.
+        kind = inst.branch_hint();
+        if (kind == 0) return;  // Fast return for ordinary instructions (~95%)
+    } else {
+        // O(log N) fallback for old traces without HF_BRANCH_HINT.
+        kind = lookup_pc_kind(pc);
+        if (kind == 0) return;
+    }
 
     // ── Extract SP from register diffs ────────────────────────────────────
     // Only done for branch-class instructions (ordinary instructions are
@@ -776,7 +797,8 @@ PassResult FunctionPass::run(PassContext& ctx) {
 
     ctx.progress(0.0f, "Function analysis: scanning trace...");
 
-    FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr);
+    FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr,
+                                 hdr.has_branch_hint());
 
     // Use shared scan engine if available; otherwise create a local one.
     auto* engine = ctx.scan_engine();

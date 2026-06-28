@@ -163,3 +163,188 @@ TEST_CASE("FunctionPass call_at and return_at queries", "[unit][pass][function]"
     auto* ret = fr.return_at(1);
     REQUIRE(ret != nullptr);
 }
+
+// ─── HF_BRANCH_HINT tests ─────────────────────────────────────────────────────
+
+// Helper: compute the branch-hint nibble for a given opcode (mirrors the
+// qbditrace logic so tests are self-consistent).
+static uint8_t hint_for_opcode(uint32_t op) {
+    // BL
+    if ((op & 0xFC000000u) == 0x94000000u) return 1;
+    // BLR
+    if ((op & 0xFFFFFC00u) == 0xD63F0000u) return 1;
+    // RET
+    if ((op & 0xFFFFFC00u) == 0xD65F0000u) return 2;
+    // B
+    if ((op & 0xFC000000u) == 0x14000000u) return 4;
+    // BR
+    if ((op & 0xFFFFFC00u) == 0xD61F0000u) return 4;
+    return 0;
+}
+
+TEST_CASE("InstView::branch_hint extracts high nibble", "[unit][pass][function][branch_hint]") {
+    // Verify the accessor decodes high nibble correctly regardless of trace flag.
+    // Build a minimal InstView by hand.
+    auto make_view = [](uint8_t full_nzcv) -> InstView {
+        InstView v;
+        v.nzcv = full_nzcv;
+        v.reg_diff_count = 0;
+        v.fpr_diff_count = 0;
+        v.mem_access_count = 0;
+        v.raw_diffs = nullptr;
+        v.raw_fprdiffs = nullptr;
+        v.raw_mems = nullptr;
+        v.pc = 0;
+        return v;
+    };
+
+    SECTION("ordinary instruction — hint == 0") {
+        auto v = make_view(0x0A);  // nzcv flags=0xA, hint=0
+        REQUIRE(v.branch_hint() == 0);
+        REQUIRE(v.nzcv_flags() == 0xA);
+    }
+
+    SECTION("CALL hint (1) — high nibble") {
+        auto v = make_view((uint8_t)((1u << 4) | 0x5));  // hint=1, nzcv=0x5
+        REQUIRE(v.branch_hint() == 1);
+        REQUIRE(v.nzcv_flags() == 0x5);
+    }
+
+    SECTION("RET hint (2) — high nibble") {
+        auto v = make_view((uint8_t)((2u << 4) | 0x0));
+        REQUIRE(v.branch_hint() == 2);
+        REQUIRE(v.nzcv_flags() == 0x0);
+    }
+
+    SECTION("BRANCH hint (4) — high nibble") {
+        auto v = make_view((uint8_t)((4u << 4) | 0xF));
+        REQUIRE(v.branch_hint() == 4);
+        REQUIRE(v.nzcv_flags() == 0xF);
+    }
+}
+
+TEST_CASE("FunctionPass works with HF_BRANCH_HINT trace", "[unit][pass][function][branch_hint]") {
+    // Build a trace identical to the BL/RET test but using write_header_branch_hint
+    // so the reader sets has_branch_hint() = true, and INST records carry the
+    // branch class in the high nibble of nzcv.
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_branch_hint();  // sets HF_BRANCH_HINT
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // Encode nzcv with branch-hint nibble for each instruction.
+        auto hint_nzcv = [](uint32_t opcode, uint8_t nzcv_flags) -> uint8_t {
+            return (uint8_t)((hint_for_opcode(opcode) << 4) | (nzcv_flags & 0xF));
+        };
+
+        uint32_t bl_op  = enc::bl(0x2000 - 0x1004);
+        uint32_t nop_op = enc::nop();
+        uint32_t ret_op = enc::ret();
+
+        // 0x1000: mov x0, #1
+        tw.emit(ms, 0x1000, enc::movz(0, 1), {{0, 1ULL}, {33, tw.rt(0x1004)}}, {},
+                hint_nzcv(enc::movz(0, 1), 0));
+        // 0x1004: bl 0x2000  → hint = CALL(1)
+        tw.emit(ms, 0x1004, bl_op,
+                {{30, tw.rt(0x1008)}, {33, tw.rt(0x2000)}}, {},
+                hint_nzcv(bl_op, 0));
+        // 0x2000: nop  → hint = 0
+        tw.emit(ms, 0x2000, nop_op, {{33, tw.rt(0x2004)}}, {},
+                hint_nzcv(nop_op, 0));
+        // 0x2004: ret  → hint = RET(2)
+        tw.emit(ms, 0x2004, ret_op, {{33, tw.rt(0x1008)}}, {},
+                hint_nzcv(ret_op, 0));
+        // 0x1008: ret  → hint = RET(2)
+        tw.emit(ms, 0x1008, ret_op, {{33, 0ULL}}, {},
+                hint_nzcv(ret_op, 0));
+        tw.emit_anchor(ms);
+    }, "func_branch_hint");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<FunctionPass>());
+
+    auto& result_raw = pm->require("function");
+    REQUIRE(result_raw.ok());
+    auto& fr = result_raw.get<FunctionResult>();
+
+    SECTION("HF_BRANCH_HINT detected in header") {
+        REQUIRE(env->reader->header().has_branch_hint() == true);
+    }
+
+    SECTION("call event recorded via hint path") {
+        REQUIRE(fr.call_events.size() >= 1);
+        const auto& ce = fr.call_events[0];
+        REQUIRE(ce.call_site_pc == rt_pc(0x1004));
+        REQUIRE(ce.target_pc == rt_pc(0x2000));
+    }
+
+    SECTION("function identified via hint path") {
+        REQUIRE(fr.functions.count(rt_pc(0x2000)) >= 1);
+        const auto& fi = fr.functions.at(rt_pc(0x2000));
+        REQUIRE(fi.total_calls == 1);
+    }
+}
+
+TEST_CASE("FunctionPass hint path == non-hint path for same trace structure",
+          "[unit][pass][function][branch_hint]") {
+    // Run the same call sequence through both the legacy (binary search) and
+    // new (branch_hint) code paths and verify that the results are identical.
+    const uint32_t bl_op  = enc::bl(0x2000 - 0x1000);
+    const uint32_t nop_op = enc::nop();
+    const uint32_t ret_op = enc::ret();
+
+    auto hint_nzcv = [](uint32_t opcode, uint8_t nzcv_flags) -> uint8_t {
+        return (uint8_t)((hint_for_opcode(opcode) << 4) | (nzcv_flags & 0xF));
+    };
+
+    // Build legacy trace (no HF_BRANCH_HINT)
+    auto env_old = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();          // no HF_BRANCH_HINT
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, bl_op,  {{30, tw.rt(0x1004)}, {33, tw.rt(0x2000)}}, {}, 0);
+        tw.emit(ms, 0x2000, nop_op, {{33, tw.rt(0x2004)}}, {}, 0);
+        tw.emit(ms, 0x2004, ret_op, {{33, tw.rt(0x1004)}}, {}, 0);
+        tw.emit_anchor(ms);
+    }, "func_hint_compare_old");
+
+    // Build new trace (with HF_BRANCH_HINT)
+    auto env_new = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_branch_hint();  // has HF_BRANCH_HINT
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, bl_op,  {{30, tw.rt(0x1004)}, {33, tw.rt(0x2000)}}, {},
+                hint_nzcv(bl_op, 0));
+        tw.emit(ms, 0x2000, nop_op, {{33, tw.rt(0x2004)}}, {},
+                hint_nzcv(nop_op, 0));
+        tw.emit(ms, 0x2004, ret_op, {{33, tw.rt(0x1004)}}, {},
+                hint_nzcv(ret_op, 0));
+        tw.emit_anchor(ms);
+    }, "func_hint_compare_new");
+
+    auto pm_old = make_pm(*env_old);
+    pm_old->register_pass(std::make_unique<FunctionPass>());
+    auto& fr_old = pm_old->require("function").get<FunctionResult>();
+
+    auto pm_new = make_pm(*env_new);
+    pm_new->register_pass(std::make_unique<FunctionPass>());
+    auto& fr_new = pm_new->require("function").get<FunctionResult>();
+
+    SECTION("same number of call events") {
+        REQUIRE(fr_old.call_events.size() == fr_new.call_events.size());
+    }
+
+    SECTION("same call site PC") {
+        REQUIRE(!fr_old.call_events.empty());
+        REQUIRE(!fr_new.call_events.empty());
+        REQUIRE(fr_old.call_events[0].call_site_pc == fr_new.call_events[0].call_site_pc);
+    }
+
+    SECTION("same target PC") {
+        REQUIRE(fr_old.call_events[0].target_pc == fr_new.call_events[0].target_pc);
+    }
+
+    SECTION("same function count") {
+        REQUIRE(fr_old.functions.size() == fr_new.functions.size());
+    }
+}
