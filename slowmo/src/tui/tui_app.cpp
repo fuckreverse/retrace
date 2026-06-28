@@ -8,7 +8,6 @@
 #include "tui/panels/breakpoint_panel.h"
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
-#include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/slice_pass.h"
 #include "analysis/passes/backward_taint_pass.h"

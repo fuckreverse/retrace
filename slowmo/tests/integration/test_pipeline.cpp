@@ -3,7 +3,7 @@
  *
  * Generates a realistic trace (loop + function calls + memory + taint chain)
  * and runs the complete pass DAG: xref → cfg → loop → function → call_graph
- * → disassembly → taint, verifying every pass completes successfully and
+ * → taint, verifying every pass completes successfully and
  * cross-pass dependencies are resolved correctly by PassManager.
  */
 #include <catch2/catch_test_macros.hpp>
@@ -14,7 +14,6 @@
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/call_graph_pass.h"
-#include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/taint_pass.h"
 
 using namespace tenet;
@@ -85,7 +84,6 @@ TEST_CASE("Full pipeline: all passes complete successfully", "[integration][pipe
     pm->register_pass(std::make_unique<LoopPass>());
     pm->register_pass(std::make_unique<FunctionPass>());
     pm->register_pass(std::make_unique<CallGraphPass>());
-    pm->register_pass(std::make_unique<DisassemblyPass>());
 
     TaintConfig taint_cfg;
     taint_cfg.add_source_reg(0);  // x0 = key is the taint source
@@ -128,14 +126,6 @@ TEST_CASE("Full pipeline: all passes complete successfully", "[integration][pipe
         REQUIRE(cg.nodes.size() >= 1);
     }
 
-    SECTION("disassembly completes") {
-        auto& r = pm->require("disassembly");
-        REQUIRE(r.ok());
-        auto& dt = r.get<DisasmTable>();
-        REQUIRE(dt.unique_pc_count() > 0);
-        REQUIRE(dt.inst_count() > 0);
-    }
-
     SECTION("taint completes and processes instructions") {
         auto& r = pm->require("taint");
         REQUIRE(r.ok());
@@ -161,7 +151,6 @@ TEST_CASE("Pipeline: pass dependency resolution", "[integration][pipeline]") {
     pm->register_pass(std::make_unique<LoopPass>());       // deps: cfg
     pm->register_pass(std::make_unique<FunctionPass>());   // no deps
     pm->register_pass(std::make_unique<CallGraphPass>());  // deps: function
-    pm->register_pass(std::make_unique<DisassemblyPass>()); // no deps
 
     SECTION("loop pass auto-runs xref and cfg") {
         auto& r = pm->require("loop");
@@ -185,14 +174,12 @@ TEST_CASE("Pipeline: run_all executes all registered passes", "[integration][pip
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
-    pm->register_pass(std::make_unique<DisassemblyPass>());
 
     pm->run_all(1);  // single-threaded
 
     SECTION("all passes completed") {
         REQUIRE(pm->state("xref") == PassManager::PassState::Completed);
         REQUIRE(pm->state("cfg") == PassManager::PassState::Completed);
-        REQUIRE(pm->state("disassembly") == PassManager::PassState::Completed);
     }
 }
 

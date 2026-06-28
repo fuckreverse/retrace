@@ -45,7 +45,6 @@
     "pattern": 0.1,
     "constant_materialization": 0.2,
     "strings": 0.1,
-    "disassembly": 2692.1,
     "objc": 0.2,
     "thread": 0.0,
     "backward_taint": 2.1,
@@ -68,7 +67,6 @@
     "taint": 1.15,
     "call_graph": 1.3,
     "memory_snapshot": 1.2,
-    "disassembly": 1.2,
     "symbol_annotation": 1.2
   },
   "legacy_v1": {

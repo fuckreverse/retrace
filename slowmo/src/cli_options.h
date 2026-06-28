@@ -144,7 +144,6 @@ struct CliOptions {
     std::vector<uint64_t> thread_filter_ids;
 
     // --- Generic pass runner ---
-    bool opt_disassembly = false;
     bool opt_index_build = false;
     std::vector<std::string> run_pass_names;
 

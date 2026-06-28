@@ -29,7 +29,7 @@ bool CliOptions::has_analysis_option() const {
            opt_rpc || opt_mcp || opt_mcp_http || opt_streaming || opt_stats_only ||
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
-           opt_disassembly || opt_index_build ||
+           opt_index_build ||
            !run_pass_names.empty();
 }
 
@@ -51,7 +51,6 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "\nAnalysis options (batch mode, suppress interactive):\n");
     fmt::print(stderr, "  --run-pass <name>         Run any catalog pass (repeatable). Names: see --list-passes\n");
     fmt::print(stderr, "  --list-passes             List all available pass names and exit\n");
-    fmt::print(stderr, "  --disassembly             Build PC-indexed disassembly table\n");
     fmt::print(stderr, "  --index-build             (Re)build the RocksDB trace index\n");
     fmt::print(stderr, "  --export-cfg <file.dot>   Export annotated CFG as Graphviz DOT\n");
     fmt::print(stderr, "  --taint <reg_index>       Run taint analysis from register index\n");
@@ -339,8 +338,6 @@ CliOptions parse_args(int argc, char** argv) {
                     }
                 }
             }
-        } else if (arg == "--disassembly") {
-            opts.opt_disassembly = true;
         } else if (arg == "--index-build") {
             opts.opt_index_build = true;
         } else if (arg == "--run-pass" && i + 1 < argc) {

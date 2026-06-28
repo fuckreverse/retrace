@@ -36,7 +36,6 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
-#include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/index_build_pass.h"
 #include "io/rpc_server.h"
 #include "io/mcp/mcp_server.h"
@@ -1838,20 +1837,6 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             }
             tf_json["threads"] = std::move(threads_arr);
             fmt::print("{}\n", tf_json.dump(2));
-        }
-    }
-
-    // ── --disassembly: build PC-indexed disassembly table ─────────────
-    if (opts.opt_disassembly) {
-        pm.register_pass(std::make_unique<DisassemblyPass>());
-        const auto& raw = pm.require("disassembly");
-        if (!raw.ok()) {
-            fmt::print(stderr, "[disassembly] Pass failed: {}\n", raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& tbl = raw.get<DisasmTable>();
-            fmt::print(stderr, "[disassembly] {} unique PCs, {} instructions indexed\n",
-                       tbl.unique_pc_count(), tbl.inst_count());
         }
     }
 

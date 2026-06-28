@@ -23,7 +23,6 @@
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/taint_pass.h"
-#include "analysis/passes/disassembly_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -205,30 +204,6 @@ TEST_CASE("TaintPass throughput: 100K taint chain", "[perf][pass]") {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DisassemblyPass throughput
-// ═══════════════════════════════════════════════════════════════════════════════
-
-TEST_CASE("DisassemblyPass throughput: 200K linear trace", "[perf][pass]") {
-    const uint64_t N = 200000;
-    auto env = make_env(wrap_gen(gen_linear_trace, N), "perf_pass_disasm");
-    REQUIRE(env != nullptr);
-
-    auto pm = make_pm(*env);
-    pm->register_pass(std::make_unique<DisassemblyPass>());
-
-    Timer t;
-    t.start();
-    auto& r = pm->require("disassembly");
-    double ms = t.elapsed_ms();
-
-    REQUIRE(r.ok());
-    auto& dt = r.get<DisasmTable>();
-    REQUIRE(dt.unique_pc_count() > 0);
-
-    PERF_CHECK_MINST(ms, N, 0.2);  // > 200K inst/s
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // End-to-end pipeline throughput (xref → cfg → loop → function)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -242,7 +217,6 @@ TEST_CASE("Full pipeline throughput: 200K mixed trace", "[perf][pass]") {
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
     pm->register_pass(std::make_unique<FunctionPass>());
-    pm->register_pass(std::make_unique<DisassemblyPass>());
 
     Timer t;
     t.start();

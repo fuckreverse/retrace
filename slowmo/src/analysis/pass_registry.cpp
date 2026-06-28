@@ -21,7 +21,6 @@
 #include "analysis/passes/taint_source_annotation_pass.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
-#include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/index_build_pass.h"
 
 #include "analysis/passes/taint_pass.h"
@@ -107,7 +106,6 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
     if (name == "cfg_layout")              return std::make_unique<CFGLayoutPass>();
     if (name == "call_graph")              return std::make_unique<CallGraphPass>();
     if (name == "loop")                    return std::make_unique<LoopPass>();
-    if (name == "disassembly")             return std::make_unique<DisassemblyPass>();
     if (name == "index_build")             return std::make_unique<IndexBuildPass>();
     // Crypto
     if (name == "pattern")                 return std::make_unique<PatternPass>();
@@ -244,7 +242,6 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"cfg_layout",            "CFG Layout",    "Graph layout coordinates for CFG view",                  PassCategory::Structure, PassDefault::No},
         {"call_graph",            "Call Graph",    "Inter-function call graph",                              PassCategory::Structure, PassDefault::Yes},
         {"loop",                  "Loops",         "Detect loops via back-edges in CFG",                     PassCategory::Structure, PassDefault::Yes},
-        {"disassembly",           "Disassembly",   "PC-indexed disassembly table",                           PassCategory::Structure, PassDefault::Yes},
         {"index_build",           "Index Build",   "(Re)build the RocksDB trace index",                      PassCategory::Structure, PassDefault::No},
 
         // — Taint —
@@ -398,11 +395,6 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
     if (name == "loop") {
         if (auto* r = try_get<LoopResult>(result))
             return cat_count("loops", r->loops.size());
-    }
-    if (name == "disassembly") {
-        if (auto* r = try_get<DisasmTable>(result))
-            return fmt::format("unique PCs: {}, insts: {}",
-                               r->unique_pc_count(), r->inst_count());
     }
     if (name == "index_build") {
         if (auto* r = try_get<IndexStats>(result))

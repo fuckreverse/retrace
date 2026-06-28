@@ -52,14 +52,6 @@
     {
       "category": "root",
       "dependencies": [],
-      "name": "disassembly",
-      "own_ms": 298.58125,
-      "success": true,
-      "total_ms": 298.58125
-    },
-    {
-      "category": "root",
-      "dependencies": [],
       "name": "objc",
       "own_ms": 36.469208,
       "success": true,

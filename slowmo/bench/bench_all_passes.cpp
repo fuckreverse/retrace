@@ -29,7 +29,6 @@
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/passes/constant_materialization_pass.h"
 #include "analysis/passes/slice_pass.h"
-#include "analysis/passes/disassembly_pass.h"
 #include "analysis/passes/index_build_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/symbol_annotation_pass.h"
@@ -210,7 +209,6 @@ int main(int argc, char** argv) {
     pm.register_pass(std::make_unique<PatternPass>());
     pm.register_pass(std::make_unique<ConstantMaterializationPass>());
     pm.register_pass(std::make_unique<StringPass>());
-    pm.register_pass(std::make_unique<DisassemblyPass>());
     pm.register_pass(std::make_unique<ObjcPass>());
     pm.register_pass(std::make_unique<ThreadPass>());
 
@@ -278,7 +276,6 @@ int main(int argc, char** argv) {
         {"pattern",                  "root", {}},
         {"constant_materialization", "root", {}},
         {"strings",                  "root", {}},
-        {"disassembly",              "root", {}},
         {"objc",                     "root", {}},
         {"thread",                   "root", {}},
         {"backward_taint",           "root", {}},
