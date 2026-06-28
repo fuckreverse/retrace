@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -268,7 +269,7 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
 
     // ── Phase 1: Accumulate per-algorithm evidence ───────────────────────
     // Key: normalised algorithm name → accumulator.
-    std::unordered_map<std::string, EvidenceAccumulator> accum;
+    ankerl::unordered_dense::map<std::string, EvidenceAccumulator> accum;
 
     auto get_accum = [&](const std::string& algo) -> EvidenceAccumulator& {
         auto& a = accum[algo];

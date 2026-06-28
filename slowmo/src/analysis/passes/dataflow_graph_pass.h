@@ -37,7 +37,7 @@ struct DataflowNode {
 struct DataflowGraphResult {
     std::vector<DataflowNode> nodes;
     std::vector<DFGEdge> edges;
-    std::unordered_map<uint64_t, size_t> inst_to_node;  // inst_id → node index
+    ankerl::unordered_dense::map<uint64_t, size_t> inst_to_node;  // inst_id → node index
 
     // ─── Adjacency index (built by build_adjacency()) ─────────────────
     ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> incoming_edge_idx_;

@@ -63,10 +63,10 @@ struct ObjcResult {
     std::vector<ObjcMessage> messages;
 
     /// Class name → aggregated class info.
-    std::unordered_map<std::string, ObjcClassInfo> classes;
+    ankerl::unordered_dense::map<std::string, ObjcClassInfo> classes;
 
     /// PC → indices into messages vector (for looking up calls at a given site).
-    std::unordered_map<uint64_t, std::vector<size_t>> by_pc;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> by_pc;
 
     // ─── Query helpers ───────────────────────────────────────────────────
 

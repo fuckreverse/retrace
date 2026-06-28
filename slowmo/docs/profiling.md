@@ -355,3 +355,248 @@ ninja -j$(nproc) tenet
 - **Debug 模式测性能**：`-O0` 下 inline 全部关闭，函数调用开销放大 10 倍以上，会产生虚假热点。性能数字只在 `RelWithDebInfo` 或 `Release` 下有意义。
 - **缓存失效假设**：ObjC selector 缓存假设同一地址→同一字符串（runtime 保证）。String deref 缓存假设字符串内容不变（对 NSString 常量成立，对可变堆字符串可能不精确——但对 ObjC pass 的参数显示用途完全可接受，非精确分析场景）。
 - **负缓存的重要性**：`deref_cache_` 存储 `nullopt` 表示"此地址解引用失败"。如果不缓存失败结果，每次遇到相同的无效指针仍会触发 `read_region()` → RocksDB lookup。
+
+---
+
+## Pass 优化技术全景
+
+对全部 ~36 个 Pass 进行系统性代码分析后，将所有优化手段归纳为以下 9 类。每类注明了已使用的 Pass 和可进一步推广的 Pass，供下一步优化参考。
+
+### 1. 高速哈希表：`ankerl::unordered_dense`
+
+**原理**：基于 Robin Hood 哈希 + 开放寻址，元素紧凑存储在单一连续数组，cache line 命中率比 `std::unordered_map`（链式哈希）高 3-5×。在每条指令都要查表的热路径上效果最显著。
+
+**已用 Pass**：
+
+| Pass | 用于哪些结构 |
+|---|---|
+| `pattern_pass` | `by_category`、`pc_info_`、`hw_sites_` |
+| `objc_pass` | `sel_name_cache_`、`deref_cache_` |
+| `cache_sim_pass` | `line_miss_count`、`line_hit_count`、`func_stats_` |
+| `window_stats_pass` | `pc_cache_`、`mnemonic_counts_`、`unique_pcs_`、`unique_mem_addrs_` |
+| `dataflow_graph_pass` | `incoming_edge_idx_`、`outgoing_edge_idx_` |
+| `taint_source_annotation_pass` | 主结果表 |
+| `constant_materialization_pass` | 两个 match 表 |
+| `loop_pass`、`cfg_pass`、`xref_pass` | 块 / PC / xref 索引 |
+
+**可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_contents`、`by_addr`）、`disassembly_pass`（`pc_table`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
+
+---
+
+### 2. RocksDB Blob 持久化缓存（全量 Pass Cache）
+
+**原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records）写入 RocksDB。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
+
+**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`、`algorithm_summary`、`objc`、`objc_crypto`、`cache_sim`、`window_stats`、`thread`、`symbol_annotation`、`syscall_intercept`、`constant_materialization`。
+
+**关键设计变体**：`memory_string`、`memory_snapshot`、`cache_sim`、`window_stats` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果。
+
+**可推广的 Pass**：`reg_timeline_pass`（目前每次重算）、`literal_search_pass`/`mem_search_pass`（搜索结果可以 pattern hash 为 key 缓存）、`entropy_pass`、`trace_fold_pass`/`trace_diff_pass`。
+
+---
+
+### 3. 并行化：TBB 任务调度 + 分片扫描
+
+**原理**：利用 TBB `task_group` 和 `parallel_sort` 进行数据并行和任务并行。
+
+**已用 Pass**：
+
+- **`PassManager`**：TBB `task_group` 实现 DAG 调度，依赖满足的 Pass 并行执行；lock-free CAS ready-queue 消除调度开销。
+- **`xref_pass`**：最典型案例。将 trace 分成 N 个 shard（N = CPU 核数），每 shard 独立扫描。每个 shard 直接用原始指针算术解析 trace 字节（消除虚函数调用），扫完 `merge()` 合并。
+- **`index_build_pass`**（`IndexBuilder`）：`parallel_sort` 对地址/PC 数组排序（TBB 实现，O(N log N / P)）。
+
+**可推广的 Pass**：
+
+- `string_pass`：Phase 2 的连续地址段扫描相互独立，可 `parallel_for`。
+- `entropy_pass`：多个内存区域的熵计算完全独立，可 `parallel_for`。
+- `cache_sim_pass`：不同函数的 cache 统计相互独立，可 per-function 并行。
+- `taint_pass`：理论上可按时间窗口分片 + 合并（有寄存器状态依赖，难度较高）。
+
+---
+
+### 4. Scan Fusion：多 Collector 单次遍历
+
+**原理**：`TraceScanEngine` 单次遍历 trace，将每条记录广播给所有注册的 `TraceCollector`。11+ 个扫描型 Pass 共享一次 IO 遍历，替代各自独立扫描。注释明确说明 `constant_materialization_pass` 的 Collector 融合"halving the total trace I/O"。
+
+**已用 Pass**：`xref`、`disassembly`、`cfg`、`function`、`string`、`thread`、`objc`、`pattern`、`window_stats`、`syscall_intercept`、`constant_materialization`（通过 `prepare_scan()`/`finish_scan()` 接口参与）。
+
+**可推广的 Pass**：
+
+- `entropy_pass` + `memory_string_pass` 可共享同一次内存区域扫描。
+- `reg_timeline_pass` + `disassembly_pass` 可合并（都需要全量指令遍历）。
+- `string_pass` + `symbol_annotation_pass` 可合并（都扫内存读写事件）。
+
+---
+
+### 5. I/O 局部性优化：mmap Advise + 按页排序批量读
+
+**原理**：通过空间局部性提升 MemoryModel / RocksDB block cache 命中率，减少随机 I/O。
+
+**已用 Pass**：
+
+- **`memory_snapshot_pass`（最典型）**：两阶段设计——Phase A 收集所有 `(addr, inst_id)` 请求但不读内存；Phase B 按 `page = addr >> 12` 排序后批量执行 `capture_region`。按页排序让同页访问连续，命中 MemoryModel 的 thread-local page cache。包含 `std::chrono` 精确计时对比，效果可量化，实测 5.4s → 1.2s（4.5×）。
+- **`objc_pass`**：直接遍历 raw trace 字节（绕过 `TraceScanEngine` 抽象），只处理 OBJC 记录（kind=5），跳过 >99.99% 的 INST 记录。`advise_sequential()`/`advise_random()` 切换 mmap 预读策略。
+- **`taint_pass`、`xref_pass`、`slice_pass`、`literal_search_pass`**：显式调用 `advise_sequential()` 提示 OS 预读。
+- **`entropy_pass`、`syscall_intercept_pass`**：以 16 字节为单位批量调用 `memory.read()`，比逐字节 `byte_at()` 减少 RocksDB seek 次数 16×。
+
+**可推广的 Pass**：
+
+- `loop_pass`：遍历 CFG 块时按 PC 排序后访问，提升 code_table 局部性。
+- `backward_taint_pass`：按内存地址批量请求 `find_last_writer_of`（当前逐个请求）。
+- 任何涉及内存读取的 Pass：检查是否可将分散的地址请求先收集、排序、再批量提交。
+
+---
+
+### 6. Index 跳跃：O(log N) 定位，避免线性扫描
+
+**原理**：利用 RocksDB 索引或预建的事件列表做二分/seek 定位，跳过不相关的大段 trace，避免从起点线性扫描。
+
+**已用 Pass**：
+
+| Pass | 跳跃机制 |
+|---|---|
+| `taint_pass` | `index.offset_of(inst_id)` + `reader.seek(offset)` 直接定位指令 |
+| `backward_taint_pass` | `index.find_last_writer_of(reg, before_inst)`，一次跳过数十万指令 |
+| `call_context_pass` | `lower_bound` 二分定位 `FunctionResult` 中的 call/ret 事件 |
+| `slice_pass` | `index.offset_of_with_pc(start_pc, start_inst)` 定位切片起点 |
+| `dataflow_graph_pass` | `index.offset_of()` 定位子图起点 |
+| `producer_chain_pass` | RocksDB `SeekForPrev` 反向查最近写入，O(log N) |
+| `thread_pass` | 4 处 `std::lower_bound` 在有序事件列表上二分搜索 |
+
+**可推广的 Pass**：
+
+- `reg_timeline_pass`：当前从指定 inst_id 往前线性扫描，可改为反向 seek。
+- `mem_search_pass`：对稀疏匹配引入地址区间索引，避免扫描不含目标的区域。
+- `loop_semantics_pass`：定位 loop header 的多次执行可利用 XRef 的 PC→inst_id 倒排直接跳转。
+
+---
+
+### 7. 位操作与紧凑数据表示
+
+**原理**：用位操作替代集合容器，用 bitmap 替代 `unordered_set`，减少内存占用和迭代开销。
+
+**已用 Pass**：
+
+| Pass | 位操作技术 |
+|---|---|
+| `taint_pass`、`backward_taint_pass` | 寄存器集合用 `uint64_t bitmask`（34 个 GPR 刚好覆盖），`__builtin_ctzll(mask)` 迭代非零位；stack-local 数组消除热路径堆分配 |
+| `thread_filter_pass` | **Roaring64Map**（roaring bitmap）存储线程指令 ID 集合，`contains()` O(1)，内存远小于 `unordered_set<uint64_t>` |
+| `memory_snapshot_pass` | `known` 标志位向量序列化时 bit-packing（每字节存 8 个 boolean），压缩比 8:1 |
+| `xref_pass` | PC→inst_id 倒排用 `Roaring64Map` bitmap |
+| `slice_pass` | 64-bit bitmask 标记 active 寄存器集合 |
+| `taint_source_annotation_pass` | `__builtin_ctzll` 迭代寄存器 bitmask |
+
+**可推广的 Pass**：
+
+- `cfg_pass`：基本块 predecessor/successor 集合（当前 `vector`），块数 < 64 时可改为 `uint64_t` bitset。
+- `call_graph_pass`：visited 集合改用 Roaring bitmap（函数 PC 离散，roaring 效果好）。
+- `loop_pass`：loop body 的 inst_id 集合可用 Roaring bitmap，减少内存并加速 `contains`。
+
+---
+
+### 8. 数据局部性与内存布局优化
+
+**原理**：减少堆分配、复用已有内存、利用访问模式的时间局部性。
+
+**已用 Pass**：
+
+- **`function_pass`（热/冷路径两阶段分离）**：Phase 1 热路径每条 INST 只做 1-bit 的 `HF_BRANCH_HINT` 查找；Phase 2 冷路径只处理 CALL/RET/SVC 等少数事件（< 0.1% 指令）。
+- **`pattern_pass`（1-entry PC 缓存）**：`last_pc_`/`last_cls_`/`last_mn_str_` 利用循环局部性，连续相同 PC 直接命中，跳过哈希查找。`char[12]` 固定大小存 mnemonic，避免 `std::string` 堆分配。`PCInfo::xor_ring_[8]` 环形缓冲区滑动窗口。
+- **`window_stats_pass`**：`std::array<uint32_t, 34>` 替代 map 存寄存器写计数；window 结束后 `clear()` 复用容器内存而非重建。
+- **`entropy_pass`**：三个工作 vector 在循环外 `reserve()`，循环内 `resize()`（no-op），复用堆内存。
+- **`dataflow_graph_pass`**：`std::array<uint64_t, AARCH64_GPR_COUNT> last_writer` 固定大小 34 元素数组，O(1) 寄存器写追踪，零堆分配。
+
+**可推广的 Pass**：
+
+- `taint_pass`：`PropagationState` 向量在 hot loop 中频繁分配，改用 monotonic arena allocator 可消除 malloc 碎片（批量分配 O(1)，整体释放 O(1)）。
+- `cfg_pass`：`BasicBlock` 对象生命周期一致（一次性构建，结果保留），适合 arena 分配。
+- `backward_taint_pass`：回溯路径节点可用 pool allocator。
+
+---
+
+### 9. 算法级优化
+
+**原理**：从算法复杂度或领域特性入手，不依赖底层 trick 就能获得数量级提升。
+
+**已用 Pass**：
+
+| Pass | 算法优化 |
+|---|---|
+| `loop_semantics_pass` | `regfile.warm_range(start, end)` 预热 loop 范围内所有 ANCHOR 缓存，避免后续数万次 random replay |
+| `cache_sim_pass` | `std::partial_sort` 只取 Top-100 热 cache line，O(N log 100) vs O(N log N) |
+| `pattern_pass` | XOR loop 检测用环形缓冲区 `xor_ring_[8]`，O(1) 维护窗口内 EOR 密度 |
+| `trace_fold_pass` | 对超长 trace 使用迭代采样（iter threshold），不全量处理 |
+| `mem_search_pass`、`yara_mem_scan_pass` | YARA Aho-Corasick 自动机多模式匹配，O(N)（与 pattern 数无关） |
+| `yara_mem_scan_pass` | 三级预过滤：写入次数 → known 数据量 → Shannon 熵，大幅减少实际扫描页数 |
+| `objc_pass` | selector name cache 利用 ObjC runtime 保证（同一 SEL 指针始终同一字符串），缓存命中率 ~95%+ |
+
+**可推广的 Pass**：
+
+- `string_pass`：引入 Shannon 熵预过滤，跳过熵值极低（全零/统一字节）的内存区域。
+- `xref_pass`：热 PC 的 xref 统计可用 `partial_sort` 只取 Top-K，减少全排序开销。
+- `memory_string_pass`：复用 `yara_mem_scan` 的多级过滤框架（写入次数、已知字节量）。
+- `algorithm_summary_pass`：引入分层采样——先用 1% trace 快速估算置信度，置信度足够则提前终止（近似查询处理思路）。
+
+---
+
+### 当前优化覆盖率矩阵
+
+| Pass | 高速哈希表 | Blob 缓存 | Scan Fusion | 并行化 | Index 跳跃 | 位操作 | I/O 优化 | 算法优化 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| index_build | ✓ | ✓ | — | ✓ parallel_sort | — | — | — | — |
+| xref | ✓ | ✓ | ✓ | ✓ shard | — | ✓ roaring | ✓ advise | — |
+| function | ✓ | ✓ | ✓ | — | ✓ | ✓ | — | ✓ hot/cold |
+| cfg | ✓ | ✓ | ✓ | — | — | — | — | — |
+| call_graph | ✓ | ✓ | — | — | — | — | — | — |
+| taint | ✓ | ✓ | — | — | ✓ | ✓ bitmask | ✓ advise | — |
+| backward_taint | ✓ | ✓ | — | — | ✓ SeekPrev | ✓ bitmask | — | — |
+| loop | ✓ | ✓ | — | — | — | — | — | — |
+| loop_semantics | — | — | — | — | — | — | — | ✓ warm_range |
+| string | — | ✓ | ✓ | — | — | — | — | — |
+| memory_string | — | ✓ | ✓ | — | — | — | — | — |
+| memory_snapshot | — | ✓ | — | — | — | ✓ bitpack | ✓ page-sort | — |
+| disassembly | — | ✓ | ✓ | — | — | — | — | — |
+| entropy | — | — | — | — | — | — | ✓ 16B batch | — |
+| pattern | ✓ | ✓ | ✓ | — | — | — | — | ✓ ring-buf |
+| algorithm_summary | — | ✓ | — | — | — | — | — | — |
+| objc | ✓ | ✓ | — | — | — | — | ✓ raw-scan | ✓ sel-cache |
+| objc_crypto | — | ✓ | — | — | — | — | — | ✓ binary-search |
+| cache_sim | ✓ | ✓ | ✓ | — | — | — | — | ✓ partial_sort |
+| window_stats | ✓ | ✓ | ✓ | — | — | — | — | ✓ sliding-win |
+| dataflow_graph | ✓ | ✓ | — | — | ✓ | — | — | — |
+| slice | — | — | — | — | ✓ | ✓ | ✓ advise | — |
+| producer_chain | — | — | — | — | ✓ SeekPrev | — | — | — |
+| thread_filter | — | — | — | — | — | ✓ roaring | — | — |
+| thread | ✓ | ✓ | ✓ | — | ✓ binary | — | — | — |
+| literal_search | ✓ | — | — | — | — | — | ✓ advise | — |
+| mem_search | — | — | — | — | — | — | ✓ advise | ✓ YARA AC |
+| reg_timeline | ✓ | — | — | — | ✓ anchor | — | — | — |
+| symbol_annotation | — | ✓ | — | — | — | — | — | — |
+| taint_src_annot | ✓ | — | — | — | — | ✓ ctzll | — | — |
+| syscall_intercept | — | ✓ | ✓ | — | — | — | ✓ 16B batch | — |
+| constant_mat | ✓ | ✓ | ✓ | — | — | — | — | — |
+| yara_mem_scan | — | — | — | — | — | — | — | ✓ multi-filter |
+
+---
+
+### 尚未引入但可考虑的优化方向
+
+**1. 增量 Pass 执行（Dirty 标记传播）**
+
+投入产出比最高的方向。当用户修改分析范围或过滤参数后，当前实现全量重算。`PassManager` 已有 DAG 框架，只需补充：Pass 结果的 range-keyed cache（key = inst_range + config hash）+ dirty 标记沿 DAG 向下游传播。未 dirty 的 Pass 直接复用缓存，只重算 dirty Pass 及其下游。
+
+**2. SIMD 向量化**
+
+当前 `entropy_pass` 的频率直方图计算、`string_pass` 的可打印字符判断均逐字节处理。NEON `vceq.u8`/`vcntq_u8` 可批量处理 32 字节，理论加速 32×。`mem_search_pass` 的朴素字节比较可用 SIMD 加速。
+
+**3. 稀疏倒排索引（xref 扩展）**
+
+当前 `xref_pass` 按时序存储执行记录。对"找所有调用 PC X 的位置"需顺序扫描。可为高频被调用 PC 建立稀疏倒排索引，实现 O(result) 而非 O(trace) 查询。
+
+**4. GPU 加速（yara_mem_scan / entropy）**
+
+内存扫描和熵计算是完全数据并行的（每页独立）。macOS 上可用 Metal Compute Shader offload，GPU 的 1000+ 核心对此类任务有数量级加速空间。
+
+**5. Trace Column-Store 格式（整体 I/O）**
+
+将 PC 列、寄存器列、内存列分离存储，配合 Delta/Zigzag 编码。PC 扫描（最频繁）只读 PC 列，不触碰寄存器数据，减少 I/O 放大。对 `xref`、`function`、`cfg` 等只需 PC 的 Pass 尤其有效。

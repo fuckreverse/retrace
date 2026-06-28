@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -41,7 +42,7 @@ struct MemorySnapshotResult {
     std::vector<MemoryRegion> snapshots;
 
     /// inst_id → indices into `snapshots` vector.
-    std::unordered_map<uint64_t, std::vector<size_t>> by_inst_id;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> by_inst_id;
 
     /// Get all snapshots taken at a specific inst_id.
     std::vector<const MemoryRegion*> snapshots_at(uint64_t inst_id) const {

@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -67,10 +68,10 @@ struct ObjcCryptoResult {
     std::vector<size_t> objc_pattern_indices;   // indices into hits
 
     // Index: ObjC selector_name → hit indices for quick lookup
-    std::unordered_map<std::string, std::vector<size_t>> by_selector;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_selector;
 
     // Index: class_name → hit indices
-    std::unordered_map<std::string, std::vector<size_t>> by_class;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_class;
 
     /// Total hits.
     size_t total() const { return hits.size(); }

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <optional>
 #include <array>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -26,6 +27,19 @@ enum class ApiCategory {
     LibSystem,
     Custom,
 };
+
+} // namespace tenet
+
+// Hash specialization for ApiCategory (required by ankerl::unordered_dense)
+template <>
+struct ankerl::unordered_dense::hash<tenet::ApiCategory> {
+    using is_avalanching = void;
+    auto operator()(tenet::ApiCategory cat) const noexcept -> uint64_t {
+        return static_cast<uint64_t>(cat);
+    }
+};
+
+namespace tenet {
 
 // ─── CCAlgorithm / CCOperation enums ──────────────────────────────────────
 
@@ -113,8 +127,8 @@ struct ApiSignature {
 
 struct SyscallInterceptResult {
     std::vector<InterceptedCall> calls;
-    std::unordered_map<std::string, std::vector<size_t>> by_callee;
-    std::unordered_map<ApiCategory, std::vector<size_t>> by_category;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_callee;
+    ankerl::unordered_dense::map<ApiCategory, std::vector<size_t>> by_category;
     size_t total() const { return calls.size(); }
     std::vector<const InterceptedCall*> find_calls(const std::string& name_pattern) const;
     std::string to_json() const;
@@ -162,7 +176,7 @@ private:
     const ObjcResult* objc_result_;
 
     // ── Known API lookup ──
-    std::unordered_map<std::string, const ApiSignature*> api_by_name_;
+    ankerl::unordered_dense::map<std::string, const ApiSignature*> api_by_name_;
 
     // ── Rolling register state ──
     static constexpr uint32_t MAX_ARG_REGS = 8;

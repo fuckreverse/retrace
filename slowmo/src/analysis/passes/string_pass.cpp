@@ -9,6 +9,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -319,8 +320,8 @@ private:
     uint64_t range_start_;
     uint64_t range_end_;
 
-    std::unordered_map<uint64_t, uint8_t> bytes_;
-    std::unordered_map<uint64_t, uint64_t> addr_first_inst_;
+    ankerl::unordered_dense::map<uint64_t, uint8_t> bytes_;
+    ankerl::unordered_dense::map<uint64_t, uint64_t> addr_first_inst_;
     StringResult result_;
 };
 

@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -36,8 +37,8 @@ struct StringRef {
 /// Result of the string discovery pass.
 struct StringResult {
     std::vector<StringRef> strings;                             // All discovered strings
-    std::unordered_map<uint64_t, size_t> addr_to_index;        // addr → strings[] index
-    std::unordered_map<uint64_t, std::vector<size_t>> inst_to_strings; // inst_id → referenced string indices
+    ankerl::unordered_dense::map<uint64_t, size_t> addr_to_index;        // addr → strings[] index
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> inst_to_strings; // inst_id → referenced string indices
 
     static constexpr size_t MAX_STRING_LEN = 256;
     static constexpr size_t MIN_STRING_LEN = 4;    // Minimum 4 chars to qualify as a string

@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -78,13 +79,13 @@ struct MemoryStringResult {
     std::vector<MemoryString> strings;
 
     /// addr → indices (multiple strings at same addr, different times).
-    std::unordered_map<uint64_t, std::vector<size_t>> by_addr;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> by_addr;
 
     /// inst_id → indices (all strings visible at a call site).
-    std::unordered_map<uint64_t, std::vector<size_t>> by_call_site;
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> by_call_site;
 
     /// Deduplicated content set (for quick "already found?" checks).
-    std::unordered_set<std::string> unique_contents;
+    ankerl::unordered_dense::set<std::string> unique_contents;
 
     /// Lookup strings at a specific address.
     std::vector<const MemoryString*> at_addr(uint64_t addr) const {

@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -34,10 +35,10 @@ struct Annotation {
 /// Aggregated annotation layer for the entire trace.
 struct AnnotationResult {
     /// Annotations keyed by PC address.
-    std::unordered_map<uint64_t, std::vector<Annotation>> by_pc;
+    ankerl::unordered_dense::map<uint64_t, std::vector<Annotation>> by_pc;
 
     /// Annotations keyed by instruction ID.
-    std::unordered_map<uint64_t, std::vector<Annotation>> by_inst_id;
+    ankerl::unordered_dense::map<uint64_t, std::vector<Annotation>> by_inst_id;
 
     // ─── Query helpers ────────────────────────────────────────────────
 

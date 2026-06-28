@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <array>
 #include <optional>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -62,7 +63,7 @@ struct ConstantMaterializationResult {
     std::vector<size_t> identified_indices;   // indices into constants[]
 
     /// Group by algorithm: algorithm_name → indices into constants[]
-    std::unordered_map<std::string, std::vector<size_t>> by_algorithm;
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_algorithm;
 
     /// Total number of materialized constants found.
     size_t total() const { return constants.size(); }
@@ -166,9 +167,9 @@ private:
     uint8_t min_parts_ = 2;
 
     /// Known constants database (value → KnownConstant).
-    std::unordered_map<uint64_t, KnownConstant> known_db_;
+    ankerl::unordered_dense::map<uint64_t, KnownConstant> known_db_;
     /// For 32-bit constants, also index the lower 32 bits.
-    std::unordered_map<uint32_t, const KnownConstant*> known_db_32_;
+    ankerl::unordered_dense::map<uint32_t, const KnownConstant*> known_db_32_;
 
     bool db_initialized_ = false;
 };
