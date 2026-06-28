@@ -30,7 +30,7 @@ uint64_t ProducerChainPass::find_last_writer(PassContext& ctx, uint64_t before_i
 
 PassResult ProducerChainPass::run(PassContext& ctx) {
     if (cfg_.start_inst_id == 0) {
-        return PassResult::failed("start_inst_id must be specified");
+        return PassResult::skipped();
     }
 
     auto& reader = ctx.reader();

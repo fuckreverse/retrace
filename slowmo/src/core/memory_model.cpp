@@ -1,5 +1,6 @@
 #include "core/memory_model.h"
 #include "common/Profiling.h"
+#include "common/logger.h"
 
 #include <rocksdb/write_batch.h>
 #include <rocksdb/options.h>
@@ -8,13 +9,32 @@
 #include <rocksdb/cache.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <thread>
 #include <unordered_map>
 
 namespace tenet {
 
 // ─── Static thread_local definition ───────────────────────────────────────
 thread_local MemoryModel::IteratorPair MemoryModel::tl_iterators_;
+
+// ─── Thread-local page cache (for read_region fast path) ──────────────────
+// Caches the last PageWriteIndex pointer to skip mutex + hash map lookup when
+// consecutive reads hit the same page (common for try_deref_string chunks).
+// We store idx as `const void*` because PageWriteIndex is a private type alias
+// inside MemoryModel; the pointer is cast back inside read_region().
+struct TLPageCache {
+    const void* owner = nullptr;  // &page_index_cache_ of owning MemoryModel
+    uint64_t page = UINT64_MAX;
+    uint64_t gen  = 0;            // LRU generation at snapshot time
+    const void* idx = nullptr;    // actually const PageWriteIndex*
+};
+
+static TLPageCache& tl_page_cache() {
+    static thread_local TLPageCache instance;
+    return instance;
+}
 
 // ─── Key encoding ─────────────────────────────────────────────────────────
 // Key = [page_addr BE(8)] [page_offset BE(2)] [inst_id BE(8)] = 18 bytes
@@ -86,8 +106,22 @@ pair.owner_db = nullptr;
 }
 }
 
+void MemoryModel::invalidate_tl_page_cache() {
+    auto& tl = tl_page_cache();
+    if (tl.owner == &page_index_cache_) {
+        tl.owner = nullptr;
+        tl.page  = UINT64_MAX;
+        tl.gen   = 0;
+        tl.idx   = nullptr;
+    }
+}
+
 MemoryModel::~MemoryModel() {
 invalidate_thread_iterators();
+// Also invalidate the thread-local page cache if it points into our cache.
+// This prevents use-after-free when a new MemoryModel is allocated at the
+// same address (common in unit tests).
+invalidate_tl_page_cache();
 }
 
 // ─── Sentinel / persistence detection ─────────────────────────────────────
@@ -154,7 +188,7 @@ void MemoryModel::ensure_built() {
     build();
 }
 
-void MemoryModel::build() {
+void MemoryModel::build(BuildProgressFn progress_fn) {
     TENET_ZONE_NAMED("MemoryModel::build");
     if (built_) return;
 
@@ -163,9 +197,14 @@ void MemoryModel::build() {
         // Data already in RocksDB from last run. Just load page activity cache.
         // We still need to scan the CF for page activity (or load from a cached key).
         // For now, mark built and let active_pages() do lazy scan if needed.
+        LOG_INFO("MemoryModel: using persisted data from previous session (skip rebuild)");
         built_ = true;
         return;
     }
+
+    const uint64_t total_insts = index_.inst_count();
+    LOG_INFO("MemoryModel::build: starting full trace scan ({} instructions, {})",
+             total_insts, has_rocksdb_ ? "RocksDB" : "in-memory");
 
     if (!has_rocksdb_) {
         // Fallback: in-memory only. Build LRU cache from trace.
@@ -196,6 +235,12 @@ void MemoryModel::build() {
                     stats_.total_writes_persisted.fetch_add(1, std::memory_order_relaxed);
                 }
                 inst_id++;
+                if ((inst_id & 0xFFFFF) == 0) {  // every ~1M instructions
+                    LOG_INFO("MemoryModel::build (in-memory): {}/{}  ({:.0f}%)",
+                             inst_id, total_insts,
+                             100.0 * static_cast<double>(inst_id) / static_cast<double>(total_insts));
+                    if (progress_fn) progress_fn(inst_id, total_insts);
+                }
             }
         }
 
@@ -224,6 +269,9 @@ void MemoryModel::build() {
                   });
         page_activity_cached_ = true;
 
+        LOG_INFO("MemoryModel::build: complete (in-memory, {} instructions, {} pages)",
+                 inst_id, page_activity_cache_.size());
+
         built_ = true;
         return;
     }
@@ -234,130 +282,206 @@ void MemoryModel::build() {
     //
     // Cross-page writes are split into two KV pairs at the page boundary.
 
-    // Opt #4: Collect page activity data during build to avoid later full scan
-    std::unordered_map<uint64_t, PageActivity> build_page_map;
+    // Opt #4: Collect page activity data during build to avoid later full scan.
+    // Pre-size to reduce rehash (typical trace has 10-50K pages).
+    ankerl::unordered_dense::map<uint64_t, PageActivity> build_page_map;
+    build_page_map.reserve(65536);
 
-    rocksdb::WriteBatch batch;
+    // Use a local write counter to avoid 200M+ atomic fetch_add calls.
+    uint64_t local_writes_persisted = 0;
+
+    // ─── Double-buffered pipeline ─────────────────────────────────────────
+    // Front thread (this): parses trace → fills batch_front
+    // Back thread: writes batch_back to RocksDB
+    // When batch_front is full, swap with batch_back (which has been flushed).
+    // This overlaps RocksDB I/O with trace parsing for ~2x speedup.
+
+    rocksdb::WriteBatch batch_a, batch_b;
+    rocksdb::WriteBatch* batch_front = &batch_a;  // currently being filled
+    rocksdb::WriteBatch* batch_back  = &batch_b;  // being written by bg thread
     uint64_t inst_id = 0;
     uint64_t batch_count = 0;
 
+    // Threshold per batch: 2M entries × ~30 bytes ≈ 60MB.
+    static constexpr uint64_t kBatchFlushThreshold = 2'000'000;
+
     rocksdb::WriteOptions wo;
-    wo.disableWAL = true;  // Faster bulk load, data is reconstructible
+    wo.disableWAL = true;
+    wo.no_slowdown = false;
+
+    // Background writer state
+    std::mutex writer_mu;
+    std::condition_variable writer_cv;
+    bool writer_has_work = false;
+    bool writer_done = false;
+    rocksdb::WriteBatch* writer_batch = nullptr;  // batch to write (set by producer)
+
+    std::thread writer_thread([&]() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(writer_mu);
+            writer_cv.wait(lk, [&]{ return writer_has_work || writer_done; });
+            if (writer_done && !writer_has_work) break;
+            rocksdb::WriteBatch* wb = writer_batch;
+            writer_has_work = false;
+            lk.unlock();
+            writer_cv.notify_one();  // signal producer that batch_back is free
+
+            db_->Write(wo, wb);
+            wb->Clear();
+        }
+    });
+
+    // Helper: submit current batch_front to background writer, then swap.
+    auto flush_batch = [&]() {
+        // Wait until writer finishes previous batch_back.
+        {
+            std::unique_lock<std::mutex> lk(writer_mu);
+            writer_cv.wait(lk, [&]{ return !writer_has_work; });
+            writer_batch = batch_front;
+            writer_has_work = true;
+        }
+        writer_cv.notify_one();
+        // Swap: next fill goes into the (now-free) other buffer.
+        std::swap(batch_front, batch_back);
+        batch_count = 0;
+    };
+
+    // Hint the OS to prefetch trace pages sequentially.
+    reader_.advise_sequential();
 
     for (auto it = reader_.begin(); it != reader_.end(); ++it) {
         auto rec = *it;
-        if (rec.kind == RecordKind::Inst) {
-            auto inst = rec.as_inst();
-            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                auto mem = inst.mem_access(m);
-                bool is_write = (mem.type & 0x02) != 0;
-                // Route writes to mem_write CF, reads to mem_read CF.
-                rocksdb::ColumnFamilyHandle* target_cf = is_write ? mem_cf_ : mem_read_cf_;
-                if (!target_cf) continue;  // skip reads when mem_read CF absent
+        if (rec.kind != RecordKind::Inst) continue;  // skip non-INST early
 
-                uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
+        auto inst = rec.as_inst();
+        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+            auto mem = inst.mem_access(m);
+            bool is_write = (mem.type & 0x02) != 0;
+            // Route writes to mem_write CF, reads to mem_read CF.
+            rocksdb::ColumnFamilyHandle* target_cf = is_write ? mem_cf_ : mem_read_cf_;
+            if (!target_cf) continue;  // skip reads when mem_read CF absent
 
-                // Extract all data bytes
-                uint8_t all_data[16];
-                std::memset(all_data, 0, 16);
-                std::memcpy(all_data, &mem.value, std::min<uint8_t>(total_size, 8));
-                if (total_size > 8) {
-                    std::memcpy(all_data + 8, &mem.value_hi,
-                                std::min<uint8_t>(total_size - 8, 8));
+            uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
+
+            // Extract all data bytes (branchless: always copy full 16 bytes)
+            uint8_t all_data[16];
+            std::memcpy(all_data, &mem.value, 8);
+            std::memcpy(all_data + 8, &mem.value_hi, 8);
+
+            uint64_t acc_addr = mem.addr;
+            uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (kPageSize - 1));
+
+            // Check if access crosses a page boundary
+            uint16_t bytes_in_first_page = static_cast<uint16_t>(
+                std::min<uint64_t>(kPageSize - first_page_offset, total_size));
+
+            // First (possibly only) KV pair: bytes in the first page
+            {
+                uint64_t page = page_of(acc_addr);
+                char key_buf[KEY_SIZE];
+                auto key = encode_key_to(page, first_page_offset, inst_id, key_buf);
+
+                // Value: [size(1)] [data(size)]
+                uint8_t val_buf[17]; // max 1 + 16
+                val_buf[0] = bytes_in_first_page;
+                std::memcpy(val_buf + 1, all_data, bytes_in_first_page);
+
+                batch_front->Put(target_cf, key,
+                                 rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
+                                                1 + bytes_in_first_page));
+                batch_count++;
+
+                // Track page activity
+                auto [it_pa, inserted] = build_page_map.try_emplace(page, PageActivity{});
+                auto& pa = it_pa->second;
+                if (inserted) {
+                    pa.page_addr = page << kPageShift;
+                    pa.first_inst_id = inst_id;
+                    pa.last_inst_id = inst_id;
+                    pa.write_count = 0;
+                    pa.read_count = 0;
+                } else {
+                    pa.last_inst_id = inst_id;
                 }
-
-                uint64_t acc_addr = mem.addr;
-                uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (kPageSize - 1));
-
-                // Check if access crosses a page boundary
-                uint16_t bytes_in_first_page = static_cast<uint16_t>(
-                    std::min<uint64_t>(kPageSize - first_page_offset, total_size));
-
-                // First (possibly only) KV pair: bytes in the first page
-                {
-                    uint64_t page = page_of(acc_addr);
-                    char key_buf[KEY_SIZE];
-                    auto key = encode_key_to(page, first_page_offset, inst_id, key_buf);
-
-                    // Value: [size(1)] [data(size)]
-                    uint8_t val_buf[17]; // max 1 + 16
-                    val_buf[0] = bytes_in_first_page;
-                    std::memcpy(val_buf + 1, all_data, bytes_in_first_page);
-
-                    batch.Put(target_cf, key,
-                              rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
-                                             1 + bytes_in_first_page));
-                    batch_count++;
-
-                    // Opt #4: track page activity
-                    auto& pa = build_page_map[page];
-                    if (pa.page_addr == 0) {
-                        pa.page_addr = page << kPageShift;
-                        pa.first_inst_id = inst_id;
-                        pa.last_inst_id = inst_id;
-                        pa.write_count = 0;
-                        pa.read_count = 0;
-                    }
-                    pa.first_inst_id = std::min(pa.first_inst_id, inst_id);
-                    pa.last_inst_id = std::max(pa.last_inst_id, inst_id);
-                    if (is_write) pa.write_count++;
-                    else pa.read_count++;
-                }
-
-                // Second KV pair (if access crosses page boundary)
-                if (bytes_in_first_page < total_size) {
-                    uint8_t remaining = total_size - bytes_in_first_page;
-                    uint64_t second_page_addr = acc_addr + bytes_in_first_page;
-                    uint64_t second_page = page_of(second_page_addr);
-                    uint16_t second_offset = 0; // starts at beginning of next page
-
-                    char key_buf2[KEY_SIZE];
-                    auto key2 = encode_key_to(second_page, second_offset, inst_id, key_buf2);
-
-                    uint8_t val_buf[17];
-                    val_buf[0] = remaining;
-                    std::memcpy(val_buf + 1, all_data + bytes_in_first_page, remaining);
-
-                    batch.Put(target_cf, key2,
-                              rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
-                                             1 + remaining));
-                    batch_count++;
-
-                    // Opt #4: track page activity for second page
-                    auto& pa2 = build_page_map[second_page];
-                    if (pa2.page_addr == 0) {
-                        pa2.page_addr = second_page << kPageShift;
-                        pa2.first_inst_id = inst_id;
-                        pa2.last_inst_id = inst_id;
-                        pa2.write_count = 0;
-                        pa2.read_count = 0;
-                    }
-                    pa2.first_inst_id = std::min(pa2.first_inst_id, inst_id);
-                    pa2.last_inst_id = std::max(pa2.last_inst_id, inst_id);
-                    if (is_write) pa2.write_count++;
-                    else pa2.read_count++;
-                }
-
-                if (is_write) {
-                    stats_.total_writes_persisted.fetch_add(1, std::memory_order_relaxed);
-                }
+                if (is_write) pa.write_count++;
+                else pa.read_count++;
             }
 
-            // Flush batch periodically (every ~100K entries)
-            if (batch_count >= 100000) {
-                db_->Write(wo, &batch);
-                batch.Clear();
-                batch_count = 0;
+            // Second KV pair (if access crosses page boundary — rare)
+            if (__builtin_expect(bytes_in_first_page < total_size, 0)) {
+                uint8_t remaining = total_size - bytes_in_first_page;
+                uint64_t second_page_addr = acc_addr + bytes_in_first_page;
+                uint64_t second_page = page_of(second_page_addr);
+                uint16_t second_offset = 0;
+
+                char key_buf2[KEY_SIZE];
+                auto key2 = encode_key_to(second_page, second_offset, inst_id, key_buf2);
+
+                uint8_t val_buf2[17];
+                val_buf2[0] = remaining;
+                std::memcpy(val_buf2 + 1, all_data + bytes_in_first_page, remaining);
+
+                batch_front->Put(target_cf, key2,
+                                 rocksdb::Slice(reinterpret_cast<const char*>(val_buf2),
+                                                1 + remaining));
+                batch_count++;
+
+                // Track page activity for second page
+                auto [it_pa2, ins2] = build_page_map.try_emplace(second_page, PageActivity{});
+                auto& pa2 = it_pa2->second;
+                if (ins2) {
+                    pa2.page_addr = second_page << kPageShift;
+                    pa2.first_inst_id = inst_id;
+                    pa2.last_inst_id = inst_id;
+                    pa2.write_count = 0;
+                    pa2.read_count = 0;
+                } else {
+                    pa2.last_inst_id = inst_id;
+                }
+                if (is_write) pa2.write_count++;
+                else pa2.read_count++;
             }
 
-            inst_id++;
+            if (is_write) {
+                local_writes_persisted++;
+            }
+        }
+
+        // Flush batch to background writer when threshold reached
+        if (batch_count >= kBatchFlushThreshold) {
+            flush_batch();
+        }
+
+        inst_id++;
+        if ((inst_id & 0xFFFFF) == 0) {  // every ~1M instructions
+            LOG_INFO("MemoryModel::build (RocksDB): {}/{}  ({:.0f}%)",
+                     inst_id, total_insts,
+                     100.0 * static_cast<double>(inst_id) / static_cast<double>(total_insts));
+            if (progress_fn) progress_fn(inst_id, total_insts);
         }
     }
 
-    // Final flush
-    if (batch.Count() > 0) {
-        db_->Write(wo, &batch);
+    // Final flush: write remaining entries
+    if (batch_front->Count() > 0) {
+        // Wait for any in-progress background write to finish
+        {
+            std::unique_lock<std::mutex> lk(writer_mu);
+            writer_cv.wait(lk, [&]{ return !writer_has_work; });
+        }
+        db_->Write(wo, batch_front);
+        batch_front->Clear();
     }
+
+    // Shut down writer thread
+    {
+        std::lock_guard<std::mutex> lk(writer_mu);
+        writer_done = true;
+    }
+    writer_cv.notify_one();
+    writer_thread.join();
+
+    // Publish the local write counter to the atomic stat.
+    stats_.total_writes_persisted.store(local_writes_persisted, std::memory_order_relaxed);
 
     // Opt #4: Store page activity cache
     page_activity_cache_.reserve(build_page_map.size());
@@ -372,6 +496,9 @@ void MemoryModel::build() {
 
     // Opt #1: Write sentinel so next session skips rebuild
     write_persisted_sentinel();
+
+    LOG_INFO("MemoryModel::build: complete ({} instructions, {} writes persisted, {} pages)",
+             inst_id, local_writes_persisted, page_activity_cache_.size());
 
     built_ = true;
 }
@@ -761,6 +888,9 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
     // Get thread-local iterators (needed for load_page_index on cache miss).
     auto& iters = get_thread_iterators();
 
+    // Thread-local page cache (defined at file scope, see TLPageCache above).
+    auto& tl_page = tl_page_cache();
+
     // Process each byte via the PageWriteIndex fast path.
     // We group consecutive bytes on the same page to avoid redundant cache
     // lookups: load the page index once, then resolve all bytes on that page.
@@ -771,16 +901,30 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
 
         // --- Get (or load) the PageWriteIndex for this page ---------------
         const PageWriteIndex* idx_ptr = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(cache_mutex_);
-            idx_ptr = page_index_cache_.get_mutable(page);
-        }
-        if (!idx_ptr) {
-            // Cache miss: load whole page from RocksDB (one forward scan).
-            // load_page_index acquires cache_mutex_ internally.
-            idx_ptr = load_page_index(page,
-                                      iters.write_iter.get(),
-                                      iters.read_iter.get());
+
+        // Fast path: same page as last lookup AND no eviction since snapshot
+        // AND same MemoryModel instance — skip lock entirely.
+        if (tl_page.owner == &page_index_cache_ &&
+            page == tl_page.page && tl_page.idx &&
+            tl_page.gen == page_index_cache_.generation()) {
+            idx_ptr = static_cast<const PageWriteIndex*>(tl_page.idx);
+        } else {
+            {
+                std::lock_guard<std::mutex> lk(cache_mutex_);
+                idx_ptr = page_index_cache_.get_mutable(page);
+            }
+            if (!idx_ptr) {
+                // Cache miss: load whole page from RocksDB (one forward scan).
+                // load_page_index acquires cache_mutex_ internally.
+                idx_ptr = load_page_index(page,
+                                          iters.write_iter.get(),
+                                          iters.read_iter.get());
+            }
+            // Update thread-local cache with current generation and owner.
+            tl_page.owner = &page_index_cache_;
+            tl_page.page  = page;
+            tl_page.gen   = page_index_cache_.generation();
+            tl_page.idx   = static_cast<const void*>(idx_ptr);
         }
 
         // Resolve all bytes on this page.

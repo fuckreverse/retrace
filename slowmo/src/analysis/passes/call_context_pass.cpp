@@ -105,7 +105,7 @@ std::vector<CallStackFrame> CallContextPass::reconstruct_call_stack(
 
 PassResult CallContextPass::run(PassContext& ctx) {
     if (cfg_.target_inst_id == 0) {
-        return PassResult::failed("target_inst_id must be specified");
+        return PassResult::skipped();
     }
 
     auto& reader = ctx.reader();

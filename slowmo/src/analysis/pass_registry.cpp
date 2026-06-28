@@ -321,6 +321,15 @@ void register_default_passes(PassManager& pm) {
     }
 }
 
+void register_all_passes(PassManager& pm, const PassRunCtx& ctx) {
+    // Register every pass in the catalog.  register_pass_by_name() handles
+    // dependencies recursively and is idempotent (skips already-registered
+    // passes), so this is safe to call on a pm that already has some passes.
+    for (const auto& entry : pass_catalog()) {
+        register_pass_by_name(pm, entry.name, ctx);
+    }
+}
+
 bool register_pass_by_name(PassManager& pm, std::string_view name,
                            const PassRunCtx& ctx) {
     if (!is_known_pass(name)) return false;

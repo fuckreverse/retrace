@@ -95,9 +95,9 @@ public:
         return "Loop detection via dominator tree on CFG (LLVM-style)";
     }
 
-    std::vector<std::string_view> dependencies() const override {
-        return { "cfg" };  // Depends on CFG pass (which depends on xref)
-    }
+std::vector<std::string_view> dependencies() const override {
+return { "cfg" };  // Depends on CFG pass (which has no dependencies)
+}
 
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 2.0f; }  // Much cheaper now

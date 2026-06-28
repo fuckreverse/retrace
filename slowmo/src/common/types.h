@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -189,6 +190,20 @@ public:
         return &nodes_[idx].value;
     }
 
+    /// Read-only lookup WITHOUT promoting the entry to the LRU head.
+    /// Safe to call concurrently with other peek() calls under a shared_lock.
+    /// Returns nullptr if absent.  The returned pointer stays valid as long as
+    /// the entry is not evicted by a concurrent put() on the same cache.
+    ///
+    /// Use this on read-heavy hot paths (e.g. MemoryModel::read) where the
+    /// LRU recency benefit of promote() is outweighed by the contention of an
+    /// exclusive lock — peek() enables std::shared_lock parallel readers.
+    const Value* peek(const Key& key) const {
+        auto it = map_.find(key);
+        if (it == map_.end()) return nullptr;
+        return &nodes_[it->second].value;
+    }
+
     void put(const Key& key, Value value) {
         auto it = map_.find(key);
         if (it != map_.end()) {
@@ -218,12 +233,18 @@ public:
             nodes_[idx].value = std::move(value);
             // Link at head
             link_at_head(idx);
+            generation_.fetch_add(1, std::memory_order_relaxed);
         }
         map_[key] = idx;
     }
 
     size_t size() const { return size_; }
     size_t capacity() const { return capacity_; }
+
+    /// Monotonically increasing counter bumped on every eviction or erasure.
+    /// External caches can snapshot this to detect when their pointers might
+    /// be stale (the pointed-to slot may have been reused for a different key).
+    uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
 
     /// Remove a single entry by key (no-op if not found).
     void erase(const Key& key) {
@@ -233,6 +254,7 @@ public:
         unlink(idx);
         map_.erase(it);
         size_--;
+        generation_.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Alias for erase() — invalidate a cached entry.
@@ -312,6 +334,7 @@ private:
 
     size_t capacity_;
     size_t size_ = 0;
+    std::atomic<uint64_t> generation_{0};
     uint32_t head_ = NIL;
     uint32_t tail_ = NIL;
     std::vector<Node> nodes_;

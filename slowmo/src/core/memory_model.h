@@ -13,6 +13,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <memory>
+#include <functional>
 #include <filesystem>
 #include <algorithm>
 
@@ -136,7 +137,9 @@ public:
     /// Performs a single sequential scan and bulk-writes all memory writes.
     /// If the data has been persisted from a previous session (sentinel key matches),
     /// build() returns immediately without re-scanning.
-    void build();
+    /// Optional progress callback: (current_insts, total_insts).
+    using BuildProgressFn = std::function<void(uint64_t, uint64_t)>;
+    void build(BuildProgressFn progress_fn = nullptr);
 
     /// Check if already built (data persisted in RocksDB).
     bool is_built() const { return built_; }
@@ -149,6 +152,10 @@ public:
     /// need to close the DB before destroying the MemoryModel should call
     /// this first.
     void invalidate_thread_iterators();
+
+    /// Invalidate the thread-local page-cache entry if it belongs to this
+    /// instance.  Called from destructor to prevent dangling pointers.
+    void invalidate_tl_page_cache();
 
 private:
     static constexpr uint64_t kPageShift = 12;

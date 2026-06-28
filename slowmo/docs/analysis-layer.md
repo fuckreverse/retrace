@@ -9,12 +9,12 @@
 
 - **`PassResult`**：类型擦除结果容器。`Status{Success,Failed,Skipped}` + `error_message` + `std::any data`。`success<T>(val)` / `failed(msg)` / `skipped()` 工厂。`get<T>()` 类型安全取值。
 - **`PassContext`**：Pass 执行上下文。提供 IO/Core 层访问（`reader()/index()/code_table()/regfile()/memory()/decoder()`）、Pass 间结果获取（`require<T>("name")` 触发依赖执行；`try_require<T>("name")` 不触发，返回 nullptr）、分析范围 `range()`、进度报告 `progress(pct)`、取消检查 `cancelled()`、共享扫描引擎 `scan_engine()`。
-- **`AnalysisPass`**：基类。虚接口：`name()/description()/dependencies()/run(ctx)/supports_incremental()/update(ctx,changed)/estimated_cost()`。
+- **`AnalysisPass`**：基类。虚接口：`name()/description()/dependencies()/run(ctx)/supports_incremental()/update(ctx,changed)/estimated_cost()`。**Scan Fusion 接口**（可选）：`prepare_scan(ctx)→TraceCollector*` 声明可融合的 collector，`finish_scan(ctx)→PassResult` 从 collector 提取结果。返回 nullptr 表示不参与融合，走 `run()` 独立执行。
 
 **PassManager 调度**：
 - `register_pass(unique_ptr)` 注册（main.cpp 装配时调用）。
 - `require("name")` 按需执行：递归解析依赖链，CAS 状态机防重复执行（`NotRun→Running→Completed/Failed`），条件变量等依赖完成。**线程安全**，多线程可并发 `require`。
-- `run_all(num_threads)` 全量执行：`topological_levels()` 算 DAG 层级，同层 Pass 并发跑。
+- `run_all(num_threads)` 全量执行：**Phase 1 — Scan Fusion**（`run_fused_scans()`）：按 DAG 层级分组，每层所有声明了 `prepare_scan()` 的 Pass 的 collector 挂到同一个 `TraceScanEngine` 上，**单次 `run()` 广播给所有 collector**（只扫一遍 trace），然后 `finish_scan()` 提取各 Pass 结果并直接写入 `PassEntry`（标记 Completed）。**Phase 2 — DAG 调度**（`run_all_parallel()`）：TBB `task_group` 就绪队列调度，已融合的 Pass 走无锁快路径跳过。
 - `invalidate("name")` / `invalidate_all()` 失效缓存。
 - 内存压力：`set_rss_limit_mb()` 超限时跳过非关键 Pass。
 
@@ -28,7 +28,9 @@
 
 **并行分片**：Collector 声明 `supports_parallel()==true` 并实现 `clone()`/`merge()`，则 Engine 以 ANCHOR 边界分片多线程扫（每分片一个 clone，扫完 `merge()` 合并）。非并行 Collector 单独顺序跑保证正确性。`run_parallel(num_threads)` 自动判断（trace <50K 或无并行 Collector 时回退顺序）。XrefCollector 是典型并行实现。
 
-**与 Pass 的关系**：Pass 在 `run()` 中可创建 Collector 注册到 `ctx.scan_engine()`，由引擎统一调度扫描。也可自己直接遍历 reader。
+**Scan Fusion（`run_all` 模式）**：`PassManager::run_fused_scans()` 按 DAG 层级分组，每层所有声明了 `prepare_scan()` 的 Pass 的 collector 挂到同一个 `TraceScanEngine` 上，**单次 `run()` 广播给所有 collector**（一次 IO 遍历）。然后 `finish_scan()` 从各 collector 提取结果。11+ 个扫描型 Pass（xref/disasm/cfg/function/string/thread/objc/pattern/window_stats/syscall_intercept/const_mat）共享一次扫描，替代了原来各自独立扫一遍。`run()` 仍保留用于独立执行（如 `--run-pass xref`）。
+
+**与 Pass 的关系**：Pass 通过 `prepare_scan()` 提供 collector 参与融合，`finish_scan()` 提取结果。独立执行时 `run()` 自建 local engine 扫描。
 
 ## Pass 依赖 DAG
 
@@ -41,11 +43,14 @@ Level 0 (无依赖，可并行):
   yara_mem_scan  cache_sim  syscall_intercept
 
 Level 1:
-  cfg ← xref                    call_graph ← function
-  taint ← xref                  trace_fold ← {loop, xref}
-  loop_semantics ← {loop, xref} thread_filter ← thread
-  call_context ← loop           objc_crypto ← {pattern, objc}
-  slice ← taint                 cfg_layout ← cfg
+  call_graph ← function         taint ← xref
+  trace_fold ← {loop, xref}     loop_semantics ← {loop, xref}
+  thread_filter ← thread        objc_crypto ← {pattern, objc}
+  call_context ← loop           cfg_layout ← cfg
+  slice ← taint
+
+  注：cfg 已重设计为无依赖（collector 自行追踪 PC 执行计数和转移），
+  不再依赖 xref，可参与 Round 0 融合。
 
 Level 2:
   loop ← cfg                    symbol_annotation ← {function, loop, constant_materialization, pattern}
@@ -190,7 +195,7 @@ class MyPass final : public AnalysisPass {
 **要点**：
 - 结果类型放头文件（供其他 Pass `require<T>` 取）。
 - 长耗时操作用 `ctx.progress(pct)` 报告，定期检查 `ctx.cancelled()`。
-- 需扫 trace 时优先用 `ctx.scan_engine()` + 自定义 Collector，而非自己遍历。
+- 需扫 trace 时优先实现 `prepare_scan()/finish_scan()` 参与 Scan Fusion（`run_all` 模式下只扫一遍）。`run()` 中自建 local `TraceScanEngine` 作为独立执行的后备路径。
 - 软依赖用 `try_require<T>`，硬依赖写进 `dependencies()`。
 - 线程安全：`run()` 中创建的 RegisterFile/Decoder 等可变对象是 Pass 私有，无需加锁；共享只读对象（reader/index）天然安全。
 

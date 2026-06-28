@@ -205,7 +205,7 @@ void MemSearchPass::yara_scan_buffer(
 
 PassResult MemSearchPass::run(PassContext& ctx) {
     if (cfg_.patterns.empty()) {
-        return PassResult::failed("No search patterns specified");
+        return PassResult::skipped();
     }
 
     auto& reader = ctx.reader();

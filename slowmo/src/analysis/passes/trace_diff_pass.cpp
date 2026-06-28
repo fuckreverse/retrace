@@ -27,13 +27,10 @@ PassResult TraceDiffPass::run(PassContext& ctx) {
     uint64_t b_start = config_.trace_b_start;
     uint64_t b_end = std::min(config_.trace_b_end, total_insts);
 
-    if (a_start >= a_end) {
-        return PassResult::failed(
-            fmt::format("trace_diff: region A is empty or invalid [{}, {})", a_start, a_end));
-    }
-    if (b_start >= b_end) {
-        return PassResult::failed(
-            fmt::format("trace_diff: region B is empty or invalid [{}, {})", b_start, b_end));
+    // Validate config ranges — empty regions mean the user hasn't configured
+    // the comparison yet; treat as skipped rather than failed.
+    if (a_start >= a_end || b_start >= b_end) {
+        return PassResult::skipped();
     }
 
     const uint64_t region_a_len = a_end - a_start;

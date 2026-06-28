@@ -9,7 +9,7 @@ namespace tenet {
 
 PassResult LiteralSearchPass::run(PassContext& ctx) {
     if (cfg_.search_values.empty()) {
-        return PassResult::failed("No search values specified");
+        return PassResult::skipped();
     }
 
     auto& reader = ctx.reader();

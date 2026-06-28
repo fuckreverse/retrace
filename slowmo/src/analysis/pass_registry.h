@@ -80,6 +80,14 @@ std::vector<std::string_view> default_ui_pass_names();
 /// Idempotent: passes already present in `pm` are skipped.
 void register_default_passes(PassManager& pm);
 
+/// Register *every* pass in the catalog with `ctx`-derived configs.
+/// This is the "run everything at startup" entry point used by GUI/TUI
+/// when the user wants all analyses available immediately.
+/// Passes that need cursor-specific params (taint, slice, reg_timeline, …)
+/// are created with whatever `ctx` provides (defaults to inst 0 / reg 0).
+/// Idempotent: passes already present in `pm` are skipped.
+void register_all_passes(PassManager& pm, const PassRunCtx& ctx = {});
+
 /// Register a single pass by name, deriving its config from `ctx` when the
 /// pass needs one. Idempotent for the same `pm` (skips if already present).
 /// Returns true if the pass is known and was (or already is) registered.
