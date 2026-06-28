@@ -85,7 +85,7 @@ option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" 
 option(TENET_BUILD_TESTS "Build unit tests" ON)
 option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
 option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
-option(TENET_ENABLE_TRACY "Enable Tracy profiler instrumentation (works in all build types)" ON)
+option(TENET_ENABLE_PROFILING "Enable os_signpost profiling instrumentation (macOS only, visible in Instruments)" ON)
 
 # ─── FetchContent global shared cache ──────────────────────────────────────
 # All build trees (build/, build-triton/, build-no-triton/, …) share a single
@@ -274,26 +274,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
-# Tracy - lightweight profiler (optional, ~2ns per zone overhead)
-if(TENET_ENABLE_TRACY)
-    FetchContent_Declare(
-        tracy
-        GIT_REPOSITORY https://github.com/wolfpld/tracy.git
-        GIT_TAG        v0.11.1
-        GIT_SHALLOW    TRUE
-    )
-    # Tracy build options:
-    #   TRACY_ENABLE        = compile in instrumentation
-    #   TRACY_ON_DEMAND=OFF = always capture (no need for Tracy GUI to connect)
-    #   TRACY_NO_EXIT=ON    = on process exit, wait for profiler to connect & download
-    #                         data before actually exiting.  This ensures short-lived
-    #                         batch runs can still be profiled: run tenet, it finishes,
-    #                         then connect tracy-capture within ~few seconds.
-    set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
-    set(TRACY_ON_DEMAND OFF CACHE BOOL "Always capture, no GUI required" FORCE)
-    set(TRACY_NO_EXIT ON CACHE BOOL "Wait for profiler on exit (short-lived processes)" FORCE)
-    FetchContent_MakeAvailable(tracy)
-    message(STATUS "Tracy profiler enabled (always-capture + no-exit mode)")
+# os_signpost profiling (macOS only, zero third-party deps)
+if(TENET_ENABLE_PROFILING AND APPLE)
+    message(STATUS "os_signpost profiling enabled (visible in Instruments.app)")
 endif()
 
 # Zstd - decompression for compressed traces
@@ -488,12 +471,11 @@ else()
     message(STATUS "Zstd NOT available — compressed traces will be rejected")
 endif()
 
-# Tracy linkage (optional runtime profiler)
-if(TENET_ENABLE_TRACY)
-    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TRACY=1 TRACY_ENABLE)
-    target_link_libraries(tenet_lib PUBLIC TracyClient)
+# os_signpost profiling compile definition
+if(TENET_ENABLE_PROFILING AND APPLE)
+    target_compile_definitions(tenet_lib PUBLIC TENET_ENABLE_PROFILING=1)
 else()
-    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TRACY=0)
+    target_compile_definitions(tenet_lib PUBLIC TENET_ENABLE_PROFILING=0)
 endif()
 
 # Platform libraries
@@ -569,6 +551,9 @@ target_link_libraries(bench_tenet PRIVATE tenet_lib mimalloc)
 
 add_executable(bench_all_passes bench/bench_all_passes.cpp)
 target_link_libraries(bench_all_passes PRIVATE tenet_lib mimalloc)
+
+add_executable(bench_memory_snapshot bench/bench_memory_snapshot.cpp)
+target_link_libraries(bench_memory_snapshot PRIVATE tenet_lib mimalloc)
 
 add_executable(bench_loop_only bench/bench_loop_only.cpp)
 target_link_libraries(bench_loop_only PRIVATE tenet_lib mimalloc)

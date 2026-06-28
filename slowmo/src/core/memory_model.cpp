@@ -755,6 +755,88 @@ bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
     return false;
 }
 
+// ─── Batch range read (single reverse scan) ──────────────────────────────
+//
+// For reading N contiguous bytes on the same page at the same time point,
+// doing N independent upper_bound + backward scans is O(N log W) where W is
+// the page write count.  This method does a single backward scan from the
+// upper bound of the LAST byte in the range, resolving all bytes in one pass.
+// Complexity: O(log W + S) where S is the number of write entries in the
+// [start_offset - 15, start_offset + count - 1] window.
+
+size_t MemoryModel::index_read_range(const PageWriteIndex& idx,
+                                      uint16_t start_offset,
+                                      uint16_t count,
+                                      uint64_t search_id,
+                                      uint8_t* out_data,
+                                      bool* out_known) noexcept {
+    if (idx.empty() || count == 0) return 0;
+
+    std::memset(out_known, 0, count * sizeof(bool));
+    size_t known_count = 0;
+
+    // The last byte offset in the range.
+    const uint16_t end_offset = static_cast<uint16_t>(start_offset + count - 1);
+
+    // A write at page_offset P with size S covers bytes [P, P+S-1].
+    // To cover any byte in [start_offset, end_offset], a write must satisfy:
+    //   P <= end_offset (its start is at or before our last byte)
+    //   P + S > start_offset (it extends past our first byte)
+    // The minimum P we need to consider is: start_offset - (MAX_WRITE_SIZE - 1)
+    const uint16_t min_start = (start_offset >= (MAX_WRITE_SIZE - 1))
+                                   ? static_cast<uint16_t>(start_offset - (MAX_WRITE_SIZE - 1))
+                                   : 0;
+
+    // upper_bound past the last relevant entry: any write starting after
+    // end_offset can't cover our range.  We search for (end_offset, search_id).
+    auto scan_end = std::upper_bound(idx.begin(), idx.end(),
+                                      std::make_pair(end_offset, search_id),
+                                      PageWriteEntryLess{});
+
+    if (scan_end == idx.begin()) return 0;
+
+    // Single backward scan: for each write entry, check which bytes in our
+    // range it covers and fill them in (only if not already filled — we want
+    // the MOST RECENT write, which is the one with highest inst_id, so we
+    // process entries in reverse inst_id order within each offset group).
+    auto it = scan_end;
+    while (it != idx.begin()) {
+        --it;
+
+        // Stop when we're past the relevant offset window.
+        if (it->page_offset < min_start) break;
+
+        // Skip writes that are newer than our search point.
+        if (it->inst_id > search_id) continue;
+
+        // Determine byte coverage overlap with [start_offset, end_offset].
+        uint16_t write_start = it->page_offset;
+        uint16_t write_end   = static_cast<uint16_t>(write_start + it->size); // exclusive
+
+        // Intersect [write_start, write_end) with [start_offset, start_offset+count)
+        uint16_t overlap_begin = std::max(write_start, start_offset);
+        uint16_t overlap_end   = std::min(write_end, static_cast<uint16_t>(start_offset + count));
+
+        if (overlap_begin >= overlap_end) continue;
+
+        // Fill bytes that haven't been resolved yet (newer writes take precedence).
+        for (uint16_t b = overlap_begin; b < overlap_end; ++b) {
+            size_t result_idx = b - start_offset;
+            if (!out_known[result_idx]) {
+                uint8_t byte_in_write = static_cast<uint8_t>(b - write_start);
+                out_data[result_idx]  = it->data[byte_in_write];
+                out_known[result_idx] = true;
+                ++known_count;
+            }
+        }
+
+        // Early exit: all bytes resolved.
+        if (known_count == count) break;
+    }
+
+    return known_count;
+}
+
 // ─── In-memory fallback helpers ──────────────────────────────────────────
 // These methods implement the non-RocksDB query paths using page_cache_.
 // Each acquires cache_mutex_ internally, matching the original inline code.
@@ -927,29 +1009,40 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
             tl_page.idx   = static_cast<const void*>(idx_ptr);
         }
 
-        // Resolve all bytes on this page.
+        // Resolve all bytes on this page using batch range read.
         uint64_t page_base = page << kPageShift;
         uint64_t page_end  = page_base + kPageSize;
 
-        while (off < size && (addr + off) < page_end) {
-            uint64_t ba         = addr + off;
-            uint16_t page_off   = static_cast<uint16_t>(ba & (kPageSize - 1));
+        // How many bytes of our request fall on this page?
+        uint16_t page_off_start = static_cast<uint16_t>((addr + off) & (kPageSize - 1));
+        size_t bytes_on_page = std::min(
+            size - off,
+            static_cast<size_t>(page_end - (addr + off)));
+        uint16_t chunk_count = static_cast<uint16_t>(bytes_on_page);
 
-            if (idx_ptr) {
-                uint8_t  val    = 0;
-                uint64_t writer = 0;
-                if (index_read_byte(*idx_ptr, page_off, search_id, val, writer)) {
-                    result.data[off]  = val;
-                    result.known[off] = true;
+        if (idx_ptr && chunk_count > 0) {
+            // Use batch range read: single upper_bound + one reverse scan
+            // instead of chunk_count individual upper_bound calls.
+            // vector<bool> can't give us a bool* directly, so use a stack buffer.
+            bool known_buf[4096];  // max page size
+
+            size_t resolved = index_read_range(
+                *idx_ptr, page_off_start, chunk_count, search_id,
+                result.data.data() + off,
+                known_buf);
+
+            for (uint16_t i = 0; i < chunk_count; ++i) {
+                if (known_buf[i]) {
+                    result.known[off + i] = true;
                     result.known_count++;
-                    stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            // If idx_ptr is null (RocksDB unavailable for this page), the byte
-            // remains unknown — consistent with the previous behaviour.
-
-            ++off;
+            stats_.cache_hits.fetch_add(resolved, std::memory_order_relaxed);
         }
+        // If idx_ptr is null (RocksDB unavailable for this page), all bytes
+        // remain unknown — consistent with the previous behaviour.
+
+        off += bytes_on_page;
     }
 
     return result;

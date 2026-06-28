@@ -2,10 +2,11 @@
 
 // ─── tenet profiling infrastructure ─────────────────────────────────────────
 //
-// Compile-time integration with Tracy Profiler for low-overhead runtime
-// performance instrumentation. When TENET_HAS_TRACY is defined and non-zero,
-// all macros expand to actual Tracy calls (~2-5 ns per zone on M1); otherwise
-// they compile to nothing.
+// Lightweight runtime instrumentation using Apple's os_signpost API.
+// When TENET_ENABLE_PROFILING is defined and the target is macOS/iOS,
+// macros expand to os_signpost calls that appear in Instruments.app
+// (Points of Interest / os_signpost instrument). Otherwise they compile
+// to nothing.
 //
 // Usage:
 //   #include "common/Profiling.h"
@@ -13,102 +14,99 @@
 //   void hot_function() {
 //       TENET_ZONE;                         // auto-named zone (function name)
 //       TENET_ZONE_NAMED("custom name");    // explicit name
+//   }
+//
+//   void pass_entry() {
+//       TENET_ZONE_NAMED("CfgPass::run");
 //       ...
-//       TENET_ZONE_TEXT("processing inst #{}", inst_id);  // dynamic text
 //   }
 //
-//   void alloc_heavy() {
-//       auto* p = malloc(sz);
-//       TENET_ALLOC(p, sz);                 // track allocation
-//       free(p);
-//       TENET_FREE(p);                      // track deallocation
-//   }
+// Profile:
+//   xcrun xctrace record --template 'Time Profiler' \
+//       --output tenet.trace --launch -- ./tenet trace.bin
+//   open tenet.trace
 //
-//   TENET_FRAME_MARK;                       // mark GUI frame boundary
-//
-// Build:
-//   cmake .. -DTENET_ENABLE_TRACY=ON        // enable (works with any build type)
-//   cmake ..                                // disable (default, zero overhead)
-//
-// Connect:
-//   Run the Tracy profiler GUI (https://github.com/wolfpld/tracy) and connect
-//   to the tenet process for real-time visualization, or let it write a
-//   .tracy capture file for offline analysis.
+// The os_signpost intervals appear under "os_signpost" instrument or
+// "Points of Interest" in Instruments, providing per-Pass timing with
+// zero cost when not profiling (signposts are compiled in but only
+// captured when Instruments is attached).
 // ──────────────────────────────────────────────────────────────────────────────
 
-#if TENET_HAS_TRACY
+#if defined(__APPLE__) && TENET_ENABLE_PROFILING
 
-#include <tracy/Tracy.hpp>
-#include <fmt/format.h>
+#include <os/log.h>
+#include <os/signpost.h>
+
+namespace tenet::profiling {
+
+/// Subsystem log handle for all tenet signposts.
+inline os_log_t log_handle() {
+    // "OS_LOG_CATEGORY_POINTS_OF_INTEREST" makes these appear in Instruments
+    // without needing to add the os_signpost instrument manually.
+    static os_log_t handle = os_log_create("com.tenet.profiler", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+    return handle;
+}
+
+/// Detailed log handle (shows under separate "tenet.detail" category).
+inline os_log_t log_handle_detail() {
+    static os_log_t handle = os_log_create("com.tenet.profiler", "detail");
+    return handle;
+}
+
+/// RAII signpost interval — begins on construction, ends on destruction.
+class SignpostInterval {
+public:
+    explicit SignpostInterval(const char* name, os_log_t log = log_handle())
+        : log_(log), id_(os_signpost_id_generate(log)) {
+        os_signpost_interval_begin(log_, id_, "tenet", "%s", name);
+    }
+
+    ~SignpostInterval() {
+        os_signpost_interval_end(log_, id_, "tenet");
+    }
+
+    // Non-copyable, non-movable.
+    SignpostInterval(const SignpostInterval&) = delete;
+    SignpostInterval& operator=(const SignpostInterval&) = delete;
+
+private:
+    os_log_t log_;
+    os_signpost_id_t id_;
+};
+
+}  // namespace tenet::profiling
 
 // ─── Zone macros ────────────────────────────────────────────────────────────
 
-/// Instrument the current scope with Tracy. Zone name = function name.
-#define TENET_ZONE                  ZoneScoped
+/// Instrument the current scope. Zone name = function name.
+#define TENET_ZONE \
+    ::tenet::profiling::SignpostInterval _tenet_signpost_##__LINE__(__FUNCTION__)
 
 /// Instrument with an explicit name (must be a string literal).
-#define TENET_ZONE_NAMED(name)      ZoneScopedN(name)
+#define TENET_ZONE_NAMED(name) \
+    ::tenet::profiling::SignpostInterval _tenet_signpost_named_##__LINE__(name)
 
-/// Instrument with a color (useful for distinguishing pass categories).
-/// color is a 0xRRGGBB uint32_t.
-#define TENET_ZONE_COLOR(name, color) ZoneScopedNC(name, color)
+/// Instrument with a color — on os_signpost there's no color concept,
+/// so this is equivalent to TENET_ZONE_NAMED.
+#define TENET_ZONE_COLOR(name, color) TENET_ZONE_NAMED(name)
 
-/// Attach dynamic text to the current zone (formatted string).
-/// Example: TENET_ZONE_TEXT("inst_count={}", count);
-/// Note: the text is only sent if a Tracy profiler is connected.
-#define TENET_ZONE_TEXT(fmt_str, ...)                              \
-    do {                                                           \
-        auto _zt_str = fmt::format(fmt_str, ##__VA_ARGS__);       \
-        ZoneText(_zt_str.c_str(), _zt_str.size());                \
-    } while (0)
+// ─── No-op stubs for features without os_signpost equivalent ────────────────
+// These were Tracy-specific and have no meaningful os_signpost counterpart.
+// They remain as no-ops so existing call sites compile cleanly.
 
-/// Attach a numeric value to the current zone for plotting.
-#define TENET_ZONE_VALUE(val)       ZoneValue(static_cast<int64_t>(val))
+#define TENET_ZONE_TEXT(fmt_str, ...)    (void)0
+#define TENET_ZONE_VALUE(val)           (void)0
+#define TENET_FRAME_MARK                (void)0
+#define TENET_FRAME_MARK_NAMED(name)    (void)0
+#define TENET_ALLOC(ptr, size)          (void)0
+#define TENET_FREE(ptr)                 (void)0
+#define TENET_PLOT(name, val)           (void)0
+#define TENET_MESSAGE(msg, len)         (void)0
+#define TENET_MESSAGE_FMT(fmt_str, ...) (void)0
 
-// ─── Frame marks ────────────────────────────────────────────────────────────
+#else  // !(__APPLE__ && TENET_ENABLE_PROFILING)
 
-/// Mark a frame boundary (GUI main loop).
-#define TENET_FRAME_MARK            FrameMark
-
-/// Mark a secondary frame boundary with a name (e.g. "render", "logic").
-#define TENET_FRAME_MARK_NAMED(name) FrameMarkNamed(name)
-
-// ─── Memory tracking ────────────────────────────────────────────────────────
-
-/// Track a heap allocation.
-#define TENET_ALLOC(ptr, size)      TracyAlloc(ptr, size)
-
-/// Track a heap deallocation.
-#define TENET_FREE(ptr)             TracyFree(ptr)
-
-// ─── Plots (time-series values) ─────────────────────────────────────────────
-
-/// Plot a named scalar value over time (e.g. RSS, queue depth).
-#define TENET_PLOT(name, val)       TracyPlot(name, static_cast<double>(val))
-
-// ─── Messages (log to Tracy timeline) ───────────────────────────────────────
-
-/// Send a message to the Tracy timeline.
-#define TENET_MESSAGE(msg, len)     TracyMessage(msg, len)
-
-/// Send a formatted message.
-#define TENET_MESSAGE_FMT(fmt_str, ...)                            \
-    do {                                                           \
-        auto _tm_str = fmt::format(fmt_str, ##__VA_ARGS__);       \
-        TracyMessage(_tm_str.c_str(), _tm_str.size());            \
-    } while (0)
-
-// ─── Lockable wrappers ──────────────────────────────────────────────────────
-
-/// Use TracyLockable(std::mutex) instead of std::mutex to track contention.
-/// Example:
-///   TracyLockable(std::mutex, my_mutex_);
-///   std::lock_guard<LockableBase(std::mutex)> lock(my_mutex_);
-// (These are already provided by Tracy.hpp, documented here for reference.)
-
-#else  // !TENET_HAS_TRACY
-
-// ─── No-op stubs (zero overhead when Tracy is disabled) ─────────────────────
+// ─── No-op stubs (zero overhead) ─────────────────────────────────────────────
 
 #define TENET_ZONE                      (void)0
 #define TENET_ZONE_NAMED(name)          (void)0
@@ -123,4 +121,4 @@
 #define TENET_MESSAGE(msg, len)         (void)0
 #define TENET_MESSAGE_FMT(fmt_str, ...) (void)0
 
-#endif  // TENET_HAS_TRACY
+#endif  // __APPLE__ && TENET_ENABLE_PROFILING

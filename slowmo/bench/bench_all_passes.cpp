@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
         {"thread",                   "root", {}},
         {"backward_taint",           "root", {}},
         {"trace_diff",               "root", {}},
-        {"memory_snapshot",          "root", {}},
+        {"memory_snapshot",          "derived", {"function"}},
         {"dataflow_graph",           "root", {}},
         // Derived passes
         {"cfg",            "derived", {"xref"}},

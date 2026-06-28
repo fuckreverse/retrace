@@ -80,7 +80,9 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
-        return {};  // Standalone — uses raw trace iteration + memory model
+        // Depend on "function" pass to get pre-computed call events (fast path).
+        // If function pass is unavailable, falls back to linear scan.
+        return {"function"};
     }
 
     PassResult run(PassContext& ctx) override;

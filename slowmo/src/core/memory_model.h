@@ -242,6 +242,18 @@ private:
                                  uint8_t& out_value,
                                  uint64_t& out_writer) noexcept;
 
+    /// Batch-read a contiguous range of bytes [start_offset, start_offset+count)
+    /// within one page from a PageWriteIndex.  Much faster than calling
+    /// index_read_byte() per byte because it uses a single reverse scan.
+    /// Fills `out_data` and `out_known` arrays (must have `count` elements).
+    /// Returns number of bytes resolved (known_count).
+    static size_t index_read_range(const PageWriteIndex& idx,
+                                    uint16_t start_offset,
+                                    uint16_t count,
+                                    uint64_t search_id,
+                                    uint8_t* out_data,
+                                    bool* out_known) noexcept;
+
     /// Find the inst_id of the most recent write covering `page_offset` with
     /// inst_id <= `search_id`.  Returns 0 if no such write exists.
     static uint64_t index_last_writer(const PageWriteIndex& idx,
