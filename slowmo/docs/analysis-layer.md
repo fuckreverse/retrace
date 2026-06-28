@@ -199,15 +199,30 @@ class MyPass final : public AnalysisPass {
 - 软依赖用 `try_require<T>`，硬依赖写进 `dependencies()`。
 - 线程安全：`run()` 中创建的 RegisterFile/Decoder 等可变对象是 Pass 私有，无需加锁；共享只读对象（reader/index）天然安全。
 
-## 性能预算（100M trace）
+## 性能预算
 
-| Pass | 耗时 | 内存 |
-|------|------|------|
-| index_build | ~60s（首次）/ 0（缓存） | ~50MB 峰值 |
-| xref | ~5s（并行分片） | ~50MB |
-| cfg（单函数） | ~200ms | ~10MB |
-| taint（10K 步） | ~50ms | ~5MB |
-| backward_taint | ~100ms | ~10MB |
-| string | ~30s | ~100MB 峰值 |
-| pattern | ~5s | ~10MB |
-| loop_semantics | ~500ms | ~20MB |
+> 以下数字来自 **test_50m.bin**（真实 iOS App trace，19.8M 指令，block-compressed，50MB on disk → 1058MB logical），
+> 在 Apple M1 上以 **RelWithDebInfo** 构建测量，RocksDB index + blob cache **已预热**（二次运行）。
+> 首次运行需额外约 60s 构建 RocksDB 索引。
+
+| Pass | 耗时（缓存热） | 说明 |
+|------|---:|------|
+| index_build | ~60s 首次 / **0**（缓存） | 构建 PC/inst/mem 倒排索引 |
+| xref | **18.5 ms** | 并行分片扫描，Roaring64Map 倒排 |
+| function | **318 ms** | BL/RET 配对 + 调用栈模拟，19.8M inst |
+| loop | **2.3 ms** | CFG 支配树循环检测（缓存命中） |
+| loop_semantics | **0.03 ms** | 依赖 loop 结果，采样 2-3 次迭代 |
+| cfg（单函数） | **< 1 ms** | 从 xref 结果派生，缓存命中近零 |
+| cfg_layout | **0.4 ms** | Sugiyama 分层布局（单函数子图） |
+| taint（全量） | **10156 ms** | 前向污点，trace 全程；稀疏 XRef 跳跃 |
+| backward_taint | **1.9 ms** | 反向污点，REG_WRITES 索引跳跃 |
+| call_graph | **0.34 ms** | 依赖 function 结果，纯构图 |
+| pattern | **0.03 ms** | YARA + mnemonic 检测（缓存命中） |
+| constant_materialization | **0.7 ms** | MOVZ/MOVK 常量链匹配 |
+| strings | **0.2 ms** | 内存字节缓存 → 字符串扫描（缓存命中） |
+| memory_snapshot | **1031 ms** | 1000 个调用点快照，page-sorted batch read |
+| objc | **0.16 ms** | ObjC 消息解析（缓存命中） |
+| symbol_annotation | **485 ms** | 聚合多 pass 注释，by_pc/by_inst_id 构建 |
+| algorithm_summary | **0.18 ms** | 综合推断，依赖上游 pass 缓存 |
+| dataflow_graph | **0.9 ms** | 寄存器依赖图（5000 节点上限） |
+| thread | **0.01 ms** | 线程上下文切换统计（缓存命中） |

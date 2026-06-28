@@ -256,6 +256,52 @@ ctest -R perf --output-on-failure
 3. **`is_likely_pointer()` 快速过滤**：在调用 `read_region()` 前判断地址是否可能是有效 userspace 指针——过滤掉 `<0x1000`（小整数）、`>=0xFFFF000000000000`（内核地址）、top nibble 非 0/1（ObjC tagged pointer）。这些情况直接返回 nullopt，零 IO 开销。
 4. **增大 chunk size**（32→64 字节）：减少 `read_region()` 调用次数（selector 名平均 15-20 字符，一次 64B 读取通常一次完成）。
 
+### 成功案例：ankerl::unordered_dense 全量迁移（function -26%，symbol_annotation -42%）
+
+**问题**：`function_pass` 和 `symbol_annotation_pass` 的热路径中大量使用 `std::unordered_map/set`，其链式哈希实现每次查找涉及指针追踪，cache miss 率高。
+
+**分析**：
+
+- **`function_pass`**：`FunctionResult::call_stack_at()` 和内部 `CallEvent` 按 inst_id 索引的 map（`std::unordered_map`），在 327ms 的 pass 里被百万次查询。
+- **`symbol_annotation_pass`**：`AnnotationResult::by_pc` 和 `by_inst_id` 为 `std::unordered_map<uint64_t, vector<Annotation>>`，每次 GUI 渲染或 CLI 输出都密集查询。
+- **`string_pass`**（`StringCollector`）：`bytes_` 和 `addr_first_inst_` 是每条 MEM 事件都写入的热路径 map，`std::unordered_map` 内存碎片化导致高 cache miss。
+- **根因**：`std::unordered_map` 使用链式哈希（bucket array + linked list），元素分散在堆各处，连续 `find()` 操作对 L1/L2 cache 不友好。`ankerl::unordered_dense` 采用开放寻址 + Robin Hood 哈希，所有元素紧凑存储在单一连续数组，查找路径局部性极佳。
+
+**优化措施**：
+
+将以下 11 个文件共 29 处 `std::unordered_map/set` 替换为 `ankerl::unordered_dense::map/set`：
+
+| 文件 | 替换字段 |
+|---|---|
+| `string_pass.h` | `addr_to_index`、`inst_to_strings` |
+| `string_pass.cpp` | `bytes_`、`addr_first_inst_`（StringCollector 热路径） |
+| `memory_string_pass.h` | `by_addr`、`by_call_site`、`unique_contents` |
+| `memory_snapshot_pass.h` | `by_inst_id` |
+| `symbol_annotation_pass.h` | `by_pc`、`by_inst_id` |
+| `objc_pass.h` | `classes`、`by_pc` |
+| `objc_crypto_pass.h` | `by_selector`、`by_class` |
+| `syscall_intercept_pass.h` | `by_callee`、`by_category`、`api_by_name_` |
+| `dataflow_graph_pass.h` | `inst_to_node` |
+| `constant_materialization_pass.h` | `known_db_`、`known_db_32_`、`by_algorithm` |
+| `algorithm_summary_pass.cpp` | `accum`（局部 EvidenceAccumulator map） |
+
+注：`syscall_intercept_pass.h` 中的 `ApiCategory` 是 `enum class`，需在 `namespace tenet` 外补充 `ankerl::unordered_dense::hash<ApiCategory>` 特化（以 `static_cast<uint64_t>` 直接映射枚举值，标记 `is_avalanching`）。
+
+**结果**（test_50m.bin，19.8M 指令，RelWithDebInfo，RocksDB blob cache warm）：
+
+| Pass | 优化前 | 优化后 | 变化 |
+|---|---:|---:|---|
+| `function_pass` | 427.8 ms | 318.0 ms | **-26%** |
+| `symbol_annotation_pass` | 838.0 ms | 484.7 ms | **-42%** |
+| `xref_pass` | 20.3 ms | 18.5 ms | -9% |
+| `taint_pass` | 10382.3 ms | 10156.1 ms | -2% |
+
+**关键教训**：
+
+- `std::unordered_map` 在元素数量不大（< 10K）但访问频次极高的场景（如每条 trace 指令都查询一次）中，cache miss 是主要瓶颈，替换 `ankerl::unordered_dense` 通常有 20-50% 提升。
+- 对于 `enum class` key，需要显式提供 `ankerl::unordered_dense::hash<T>` 特化，否则编译报错。特化需放在 `namespace tenet` 之外（全局命名空间），且必须在 key 类型定义之后、使用之前。
+- 替换后接口完全兼容（`find`/`operator[]`/`insert`/`emplace`/迭代器语义一致），无需修改调用侧代码。
+
 ### 测试策略
 
 #### 1. 单元测试验证正确性
