@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <algorithm>  // std::upper_bound, std::lower_bound
+#include <algorithm>  // std::upper_bound, std::lower_bound, std::sort
 #include <ankerl/unordered_dense.h>
 #include <numeric>    // std::iota
 
@@ -103,6 +103,15 @@ struct FunctionResult {
 
 /// TraceCollector that implements function call/return pairing via a state machine.
 /// Extracted from FunctionPass to enable scan fusion via TraceScanEngine.
+///
+/// Two-phase design for maximum performance:
+///   Phase 1 (on_inst loop): Collects only branch-related events into a compact
+///     BranchEvent array.  The pc_kind_ lookup table is a sorted flat array
+///     (binary search) instead of a hash map — better cache behaviour for
+///     sparse PC sets.
+///   Phase 2 (end()): Runs the call/return state machine over the small
+///     BranchEvent array (typically 2-5% of total instructions), then performs
+///     tail-call resolution and bookkeeping.
 class FunctionCollector final : public TraceCollector {
 public:
     FunctionCollector(CodeTable& code_table, uint64_t module_slide, uint32_t num_gpr);
@@ -127,6 +136,20 @@ private:
     static constexpr uint8_t KIND_RET    = 0x2;
     static constexpr uint8_t KIND_BRANCH = 0x4;
 
+    // ── Compact event record (Phase 1 output / Phase 2 input) ───────────
+    // Replaces per-instruction state machine updates with a two-step approach:
+    // Phase 1 records only branch-class events; Phase 2 processes them.
+    struct BranchEvent {
+        uint64_t inst_id;
+        uint64_t pc;
+        uint8_t  kind;         // KIND_CALL | KIND_RET | KIND_BRANCH; 0 = plain successor
+        bool     sp_valid;
+        uint64_t sp;           // SP value (valid when sp_valid == true)
+        // For CALL events: target_pc is resolved in Phase 1 when the successor
+        // instruction fires (phase1_need_next_).  0 = not yet resolved.
+        uint64_t target_pc;
+    };
+
     struct StackFrame {
         size_t call_event_idx;
         uint64_t return_pc;     // LR at time of call (pc + 4 for BL)
@@ -136,45 +159,66 @@ private:
     struct TailCallCandidate {
         uint64_t inst_id;
         uint64_t jump_pc;
-        uint64_t target_pc;     // filled from next instruction's PC
+        uint64_t target_pc;     // PC of first instruction after the jump
         uint64_t sp;            // SP at time of jump
         bool sp_known;
     };
 
-    void handle_deferred_ret(uint64_t pc);
-    void try_fill_call_target(uint64_t cur_inst_id, uint64_t pc);
-    void handle_inst_inner(uint64_t cur_inst_id, uint64_t pc,
-                           uint64_t sp_new, bool sp_updated);
+    // ─── Phase-1 helpers ────────────────────────────────────────────────
+    /// Look up the kind bits for `pc`.  Returns 0 if not a branch-class PC.
+    /// Uses binary search on the sorted pc_kind_sorted_ flat array.
+    inline uint8_t lookup_pc_kind(uint64_t pc) const;
+
+    // ─── Phase-2 helpers ────────────────────────────────────────────────
+    void run_state_machine();
+    void handle_deferred_ret(uint64_t pc, uint64_t ret_inst_id);
+    void handle_branch_event(const BranchEvent& ev);
 
     // ── Configuration (immutable after construction) ──
     CodeTable& code_table_;
     uint64_t module_slide_;
     uint32_t num_gpr_;
 
-    // ── Pre-built PC classification table ──
-    ankerl::unordered_dense::map<uint64_t, uint8_t> pc_kind_;
+    // ── Pre-built PC classification table (sorted flat array) ──────────
+    // Replaces ankerl::unordered_dense::map<uint64_t, uint8_t>:
+    //   - Binary search on a sorted contiguous array has much better cache
+    //     behaviour than open-addressing hash map for sparse PC sets
+    //   - No per-entry heap allocation overhead
+    struct PcKindEntry {
+        uint64_t pc;
+        uint8_t  kind;
+    };
+    std::vector<PcKindEntry> pc_kind_sorted_;  // sorted by pc
 
-    // ── State machine ──
+    // ── Phase-1 output ──────────────────────────────────────────────────
+    // Compact event stream: only CALL/RET/BRANCH instructions are recorded.
+    // Typically 2-5% of total instruction count.
+    std::vector<BranchEvent> branch_events_;
+
+    // SP state maintained during Phase 1 (to attach to BranchEvent records).
+    uint64_t phase1_sp_      = 0;
+    bool     phase1_sp_valid_ = false;
+    // When phase1_need_next_ is true, the next on_inst call must resolve the
+    // target_pc of the last BranchEvent (the preceding CALL).
+    bool     phase1_need_next_ = false;
+
+    // ── State machine (Phase 2) ──────────────────────────────────────────
     std::vector<StackFrame> call_stack_;
     std::vector<TailCallCandidate> tail_candidates_;
 
     // Fast lookup: return_pc → count of frames in call_stack_ with that return_pc.
-    // Allows O(1) existence check before doing linear search.
     ankerl::unordered_dense::map<uint64_t, uint32_t> ret_pc_refcount_;
 
-    uint64_t current_sp_ = 0;
-    bool sp_valid_ = false;
+    // Deferred RET tracking (Phase 2)
+    bool     p2_prev_was_ret_   = false;
+    uint64_t p2_prev_ret_inst_id_ = 0;
 
-    bool prev_was_unconditional_jump_ = false;
-    uint64_t prev_jump_inst_id_ = 0;
-    uint64_t prev_jump_pc_ = 0;
-    uint64_t prev_jump_sp_ = 0;
-    bool prev_jump_sp_known_ = false;
-
-    bool prev_was_ret_ = false;
-    uint64_t prev_ret_inst_id_ = 0;
-
-    bool need_next_ = false;  // next inst triggers handle_inst unconditionally
+    // Unconditional branch tracking (Phase 2)
+    bool     p2_prev_was_branch_  = false;
+    uint64_t p2_prev_jump_inst_id_ = 0;
+    uint64_t p2_prev_jump_pc_      = 0;
+    uint64_t p2_prev_jump_sp_      = 0;
+    bool     p2_prev_jump_sp_known_ = false;
 
     uint64_t non_local_unwinds_ = 0;
     uint64_t tail_calls_detected_ = 0;
