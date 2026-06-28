@@ -184,7 +184,8 @@ int main(int argc, char** argv) {
     RegisterFile regfile(reader, index);
     InstructionDecoder decoder;
     decoder.init();
-    MemoryModel memory(reader, index);
+    MemoryModel memory(reader, index,
+                       index.raw_db(), index.mem_write_cf(), index.mem_read_cf());
     timer.start();
     memory.build();
     double mem_build_ms = timer.elapsed_ms();
