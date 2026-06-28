@@ -1,15 +1,174 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/passes/objc_pass.h"
+#include "io/index_builder.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <sstream>
+#include <cstring>
 
 namespace tenet {
 
 using json = nlohmann::json;
+
+// ─── ObjcCryptoResult serialization helpers ────────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x4F43525A ("OCRZ")
+//   u32  version = 1
+//   u64  num_hits
+//   for each ObjcCryptoHit:
+//     u32  pattern_name_len; u8[] pattern_name
+//     u32  category (enum)
+//     u32  confidence (enum)
+//     u64  pattern_start_inst, pattern_end_inst, anchor_pc
+//     u32  description_len; u8[] description
+//     u64  num_stack_frames
+//     for each ObjcCallFrame:
+//       u64  inst_id, objc_pc, receiver
+//       u32  class_name_len; u8[] class_name
+//       u32  selector_name_len; u8[] selector_name
+//   u64  num_bare_indices; u64[] bare_pattern_indices
+//   u64  num_objc_indices; u64[] objc_pattern_indices
+//   (by_selector and by_class indices are rebuilt from hits after deserialization)
+
+namespace {
+
+static constexpr uint32_t OCRZ_BLOB_MAGIC   = 0x4F43525Au;  // "OCRZ"
+static constexpr uint32_t OCRZ_BLOB_VERSION = 1u;
+
+std::string objc_crypto_serialize(const ObjcCryptoResult& res) {
+    size_t total = 4 + 4 + 8;  // magic, version, num_hits
+    for (const auto& h : res.hits) {
+        total += 4 + h.pattern_name.size();
+        total += 4 + 4;  // category, confidence (enums as u32)
+        total += 8 + 8 + 8;  // pattern_start_inst, pattern_end_inst, anchor_pc
+        total += 4 + h.description.size();
+        total += 8;  // num_stack_frames
+        for (const auto& f : h.objc_stack) {
+            total += 8 + 8 + 8;  // inst_id, objc_pc, receiver
+            total += 4 + f.class_name.size();
+            total += 4 + f.selector_name.size();
+        }
+    }
+    total += 8 + res.bare_pattern_indices.size() * 8;
+    total += 8 + res.objc_pattern_indices.size() * 8;
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        std::memcpy(p, s.data(), s.size()); p += s.size();
+    };
+
+    write_u32(OCRZ_BLOB_MAGIC);
+    write_u32(OCRZ_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.hits.size()));
+
+    for (const auto& h : res.hits) {
+        write_str(h.pattern_name);
+        write_u32(static_cast<uint32_t>(h.category));
+        write_u32(static_cast<uint32_t>(h.confidence));
+        write_u64(h.pattern_start_inst);
+        write_u64(h.pattern_end_inst);
+        write_u64(h.anchor_pc);
+        write_str(h.description);
+        write_u64(static_cast<uint64_t>(h.objc_stack.size()));
+        for (const auto& f : h.objc_stack) {
+            write_u64(f.inst_id);
+            write_u64(f.objc_pc);
+            write_u64(f.receiver);
+            write_str(f.class_name);
+            write_str(f.selector_name);
+        }
+    }
+
+    write_u64(static_cast<uint64_t>(res.bare_pattern_indices.size()));
+    for (size_t idx : res.bare_pattern_indices) write_u64(static_cast<uint64_t>(idx));
+    write_u64(static_cast<uint64_t>(res.objc_pattern_indices.size()));
+    for (size_t idx : res.objc_pattern_indices) write_u64(static_cast<uint64_t>(idx));
+
+    return buf;
+}
+
+bool objc_crypto_deserialize(const std::string& blob, ObjcCryptoResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (p + 4 > end) return false;
+        uint32_t len = read_u32();
+        if (p + len > end) return false;
+        s.assign(p, len); p += len;
+        return true;
+    };
+
+    if (read_u32() != OCRZ_BLOB_MAGIC)   return false;
+    if (read_u32() != OCRZ_BLOB_VERSION) return false;
+
+    uint64_t n_hits = read_u64();
+    out.hits.reserve(static_cast<size_t>(n_hits));
+
+    for (uint64_t i = 0; i < n_hits; i++) {
+        ObjcCryptoHit h;
+        if (!read_str(h.pattern_name)) return false;
+        if (p + 4 + 4 + 8 + 8 + 8 > end) return false;
+        h.category   = static_cast<PatternCategory>(read_u32());
+        h.confidence = static_cast<PatternConfidence>(read_u32());
+        h.pattern_start_inst = read_u64();
+        h.pattern_end_inst   = read_u64();
+        h.anchor_pc          = read_u64();
+        if (!read_str(h.description)) return false;
+        if (p + 8 > end) return false;
+        uint64_t n_frames = read_u64();
+        h.objc_stack.reserve(static_cast<size_t>(n_frames));
+        for (uint64_t j = 0; j < n_frames; j++) {
+            ObjcCallFrame f;
+            if (p + 8 + 8 + 8 > end) return false;
+            f.inst_id  = read_u64();
+            f.objc_pc  = read_u64();
+            f.receiver = read_u64();
+            if (!read_str(f.class_name))    return false;
+            if (!read_str(f.selector_name)) return false;
+            h.objc_stack.push_back(std::move(f));
+        }
+        out.hits.push_back(std::move(h));
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_bare = read_u64();
+    out.bare_pattern_indices.resize(static_cast<size_t>(n_bare));
+    if (p + n_bare * 8 > end) return false;
+    for (auto& idx : out.bare_pattern_indices) idx = static_cast<size_t>(read_u64());
+
+    if (p + 8 > end) return false;
+    uint64_t n_objc = read_u64();
+    out.objc_pattern_indices.resize(static_cast<size_t>(n_objc));
+    if (p + n_objc * 8 > end) return false;
+    for (auto& idx : out.objc_pattern_indices) idx = static_cast<size_t>(read_u64());
+
+    // Rebuild by_selector and by_class indices from hits
+    for (size_t hi = 0; hi < out.hits.size(); hi++) {
+        const auto& h = out.hits[hi];
+        if (!h.objc_stack.empty()) {
+            const auto& inner = h.objc_stack.back();
+            out.by_selector[inner.selector_name].push_back(hi);
+            out.by_class[inner.class_name].push_back(hi);
+        }
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (objc_crypto serialization)
 
 // ─── ObjcCryptoHit helpers ────────────────────────────────────────────────
 
@@ -91,6 +250,22 @@ std::string ObjcCryptoResult::to_json() const {
 // ─── ObjcCryptoPass::run ──────────────────────────────────────────────────
 
 PassResult ObjcCryptoPass::run(PassContext& ctx) {
+    auto& index = ctx.index();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("objc_crypto", blob)) {
+            ObjcCryptoResult cached;
+            if (objc_crypto_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "objc_crypto: {} hits ({} in ObjC, {} bare) (from cache)",
+                    cached.hits.size(), cached.in_objc_count(), cached.bare_count()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     const auto& pattern_result = ctx.require<PatternResult>("pattern");
     const auto& objc_result    = ctx.require<ObjcResult>("objc");
 
@@ -206,6 +381,14 @@ PassResult ObjcCryptoPass::run(PassContext& ctx) {
         "objc_crypto: {} hits ({} in ObjC context, {} bare)",
         result.hits.size(), result.objc_pattern_indices.size(),
         result.bare_pattern_indices.size()));
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob = objc_crypto_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("objc_crypto", blob.data(), blob.size());
+        }
+    }
 
     return PassResult::success(std::move(result));
 }

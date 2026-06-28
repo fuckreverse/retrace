@@ -7,8 +7,139 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
+#include <cstring>
 
 namespace tenet {
+
+// ─── DataflowGraphResult serialization helpers ────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x44464752 ("DFGR")
+//   u32  version = 1
+//   u64  num_nodes
+//   for each DataflowNode:
+//     u64  inst_id, pc
+//     u32  mnemonic_len; u8[] mnemonic
+//     u32  num_regs_read; u8[] regs_read
+//     u32  num_regs_written; u8[] regs_written
+//   u64  num_edges
+//   for each DFGEdge:
+//     u64  from_inst_id, to_inst_id
+//     u8   via_reg
+//     u64  via_mem_addr
+//   (adjacency index rebuilt after deserialization)
+
+namespace {
+
+static constexpr uint32_t DFGR_BLOB_MAGIC   = 0x44464752u;  // "DFGR"
+static constexpr uint32_t DFGR_BLOB_VERSION = 1u;
+
+std::string dataflow_graph_serialize(const DataflowGraphResult& res) {
+    size_t total = 4 + 4 + 8;  // magic, version, num_nodes
+    for (const auto& n : res.nodes) {
+        total += 8 + 8;  // inst_id, pc
+        total += 4 + n.mnemonic.size();
+        total += 4 + n.regs_read.size();
+        total += 4 + n.regs_written.size();
+    }
+    total += 8;  // num_edges
+    total += res.edges.size() * (8 + 8 + 1 + 8);  // from, to, reg, mem_addr
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u8  = [&](uint8_t  v) { *reinterpret_cast<uint8_t*>(p) = v; p += 1; };
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+
+    write_u32(DFGR_BLOB_MAGIC);
+    write_u32(DFGR_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.nodes.size()));
+
+    for (const auto& n : res.nodes) {
+        write_u64(n.inst_id);
+        write_u64(n.pc);
+        write_u32(static_cast<uint32_t>(n.mnemonic.size()));
+        std::memcpy(p, n.mnemonic.data(), n.mnemonic.size()); p += n.mnemonic.size();
+        write_u32(static_cast<uint32_t>(n.regs_read.size()));
+        std::memcpy(p, n.regs_read.data(), n.regs_read.size()); p += n.regs_read.size();
+        write_u32(static_cast<uint32_t>(n.regs_written.size()));
+        std::memcpy(p, n.regs_written.data(), n.regs_written.size()); p += n.regs_written.size();
+    }
+
+    write_u64(static_cast<uint64_t>(res.edges.size()));
+    for (const auto& e : res.edges) {
+        write_u64(e.from_inst_id);
+        write_u64(e.to_inst_id);
+        write_u8(e.via_reg);
+        write_u64(e.via_mem_addr);
+    }
+
+    return buf;
+}
+
+bool dataflow_graph_deserialize(const std::string& blob, DataflowGraphResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v = *reinterpret_cast<const uint8_t*>(p); p += 1; return v; };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    if (read_u32() != DFGR_BLOB_MAGIC)   return false;
+    if (read_u32() != DFGR_BLOB_VERSION) return false;
+
+    uint64_t n_nodes = read_u64();
+    out.nodes.reserve(static_cast<size_t>(n_nodes));
+
+    for (uint64_t i = 0; i < n_nodes; i++) {
+        DataflowNode n;
+        if (p + 8 + 8 > end) return false;
+        n.inst_id = read_u64();
+        n.pc      = read_u64();
+        if (p + 4 > end) return false;
+        uint32_t mnem_len = read_u32();
+        if (p + mnem_len > end) return false;
+        n.mnemonic.assign(p, mnem_len); p += mnem_len;
+        if (p + 4 > end) return false;
+        uint32_t nr = read_u32();
+        if (p + nr > end) return false;
+        n.regs_read.assign(reinterpret_cast<const uint8_t*>(p),
+                           reinterpret_cast<const uint8_t*>(p) + nr);
+        p += nr;
+        if (p + 4 > end) return false;
+        uint32_t nw = read_u32();
+        if (p + nw > end) return false;
+        n.regs_written.assign(reinterpret_cast<const uint8_t*>(p),
+                              reinterpret_cast<const uint8_t*>(p) + nw);
+        p += nw;
+
+        size_t node_idx = out.nodes.size();
+        out.inst_to_node[n.inst_id] = node_idx;
+        out.nodes.push_back(std::move(n));
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_edges = read_u64();
+    out.edges.reserve(static_cast<size_t>(n_edges));
+    for (uint64_t i = 0; i < n_edges; i++) {
+        if (p + 8 + 8 + 1 + 8 > end) return false;
+        DFGEdge e;
+        e.from_inst_id = read_u64();
+        e.to_inst_id   = read_u64();
+        e.via_reg      = read_u8();
+        e.via_mem_addr = read_u64();
+        out.edges.push_back(e);
+    }
+
+    // Rebuild adjacency index
+    out.build_adjacency();
+
+    return true;
+}
+
+}  // anonymous namespace (dataflow_graph serialization)
 
 // ─── Register name helper (AArch64) ───────────────────────────────────────
 
@@ -147,6 +278,22 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     // Determine effective analysis range by intersecting config with context range
     uint64_t start = std::max(config_.start_inst_id, range.start_inst_id);
     uint64_t end   = std::min(config_.end_inst_id, range.end_inst_id);
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    // Only cache when using the full trace with default config range.
+    bool is_default_range = (config_.start_inst_id == 0 && config_.end_inst_id == UINT64_MAX);
+    if (ctx.range().is_full_trace() && is_default_range) {
+        std::string blob;
+        if (index.load_pass_blob("dataflow_graph", blob)) {
+            DataflowGraphResult cached;
+            if (dataflow_graph_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Dataflow graph: {} nodes, {} edges (from cache)",
+                    cached.nodes.size(), cached.edges.size()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
     end = std::min(end, index.inst_count());
     if (end == 0) end = index.inst_count();
 
@@ -263,6 +410,14 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
 
     // Build O(1) adjacency index for producer/consumer queries.
     result.build_adjacency();
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace() && is_default_range) {
+        std::string blob = dataflow_graph_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("dataflow_graph", blob.data(), blob.size());
+        }
+    }
 
     return PassResult::success(std::move(result));
 }

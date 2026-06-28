@@ -2,12 +2,164 @@
 #include "analysis/passes/cfg_pass.h"
 #include "core/instruction_decoder.h"
 #include "io/code_table.h"
+#include "io/index_builder.h"
 
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <sstream>
+#include <cstring>
 
 namespace tenet {
+
+// ─── CFGLayoutResult serialization helpers ────────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x43464C59 ("CFLY")
+//   u32  version = 1
+//   s32  canvas_width
+//   s32  canvas_height
+//   u64  num_blocks
+//   for each block:
+//     u64  pc
+//     s32  x, y, width, height
+//   u64  num_edges
+//   for each edge:
+//     u64  from_block
+//     u64  to_block
+//     u32  arrow
+//     u64  num_points
+//     for each point:
+//       f32  x, y
+//   u32  dot_len
+//   u8[] dot[dot_len]
+//   u32  dot_annotated_len
+//   u8[] dot_annotated[dot_annotated_len]
+
+namespace {
+
+static constexpr uint32_t CFLY_BLOB_MAGIC   = 0x43464C59u;  // "CFLY"
+static constexpr uint32_t CFLY_BLOB_VERSION = 1u;
+
+std::string cfg_layout_serialize(const CFGLayoutResult& res) {
+    size_t total = 4 + 4 + 4 + 4;  // magic, version, canvas_width, canvas_height
+    total += 8;                     // num_blocks
+    total += res.block_layouts.size() * (8 + 4 + 4 + 4 + 4);  // pc, x,y,w,h
+    total += 8;                     // num_edges
+    for (const auto& e : res.edge_layouts) {
+        total += 8 + 8 + 4;         // from_block, to_block, arrow
+        total += 8 + e.polyline.size() * (4 + 4);  // num_points + (fx,fy)*N
+    }
+    total += 4 + res.dot.size();
+    total += 4 + res.dot_annotated.size();
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_s32 = [&](int32_t  v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
+
+    write_u32(CFLY_BLOB_MAGIC);
+    write_u32(CFLY_BLOB_VERSION);
+    write_s32(res.canvas_width);
+    write_s32(res.canvas_height);
+
+    write_u64(static_cast<uint64_t>(res.block_layouts.size()));
+    for (const auto& [pc, bl] : res.block_layouts) {
+        write_u64(pc);
+        write_s32(bl.x);
+        write_s32(bl.y);
+        write_s32(bl.width);
+        write_s32(bl.height);
+    }
+
+    write_u64(static_cast<uint64_t>(res.edge_layouts.size()));
+    for (const auto& el : res.edge_layouts) {
+        write_u64(el.from_block);
+        write_u64(el.to_block);
+        write_u32(static_cast<uint32_t>(el.arrow));
+        write_u64(static_cast<uint64_t>(el.polyline.size()));
+        for (const auto& pt : el.polyline) {
+            write_f32(pt.x);
+            write_f32(pt.y);
+        }
+    }
+
+    write_u32(static_cast<uint32_t>(res.dot.size()));
+    std::memcpy(p, res.dot.data(), res.dot.size());
+    p += res.dot.size();
+
+    write_u32(static_cast<uint32_t>(res.dot_annotated.size()));
+    std::memcpy(p, res.dot_annotated.data(), res.dot_annotated.size());
+    p += res.dot_annotated.size();
+
+    return buf;
+}
+
+bool cfg_layout_deserialize(const std::string& blob, CFGLayoutResult& out) {
+    if (blob.size() < 4 + 4 + 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_s32 = [&]() -> int32_t  { int32_t  v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+
+    if (read_u32() != CFLY_BLOB_MAGIC)   return false;
+    if (read_u32() != CFLY_BLOB_VERSION) return false;
+
+    out.canvas_width  = read_s32();
+    out.canvas_height = read_s32();
+
+    uint64_t n_blocks = read_u64();
+    for (uint64_t i = 0; i < n_blocks; i++) {
+        if (p + 8 + 4*4 > end) return false;
+        uint64_t pc = read_u64();
+        BlockLayout bl;
+        bl.x      = read_s32();
+        bl.y      = read_s32();
+        bl.width  = read_s32();
+        bl.height = read_s32();
+        out.block_layouts[pc] = bl;
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_edges = read_u64();
+    out.edge_layouts.reserve(static_cast<size_t>(n_edges));
+    for (uint64_t i = 0; i < n_edges; i++) {
+        if (p + 8 + 8 + 4 + 8 > end) return false;
+        EdgeLayout el;
+        el.from_block = read_u64();
+        el.to_block   = read_u64();
+        el.arrow      = static_cast<GraphEdge::ArrowDirection>(read_u32());
+        uint64_t n_pts = read_u64();
+        if (p + n_pts * 8 > end) return false;
+        el.polyline.resize(static_cast<size_t>(n_pts));
+        for (uint64_t j = 0; j < n_pts; j++) {
+            el.polyline[j].x = read_f32();
+            el.polyline[j].y = read_f32();
+        }
+        out.edge_layouts.push_back(std::move(el));
+    }
+
+    if (p + 4 > end) return false;
+    uint32_t dot_len = read_u32();
+    if (p + dot_len > end) return false;
+    out.dot.assign(p, dot_len);
+    p += dot_len;
+
+    if (p + 4 > end) return false;
+    uint32_t dot_ann_len = read_u32();
+    if (p + dot_ann_len > end) return false;
+    out.dot_annotated.assign(p, dot_ann_len);
+    p += dot_ann_len;
+
+    return true;
+}
+
+}  // anonymous namespace
 
 // ─── DOT generation helpers ───────────────────────────────────────────────
 
@@ -62,6 +214,22 @@ constexpr size_t LARGE_CFG_THRESHOLD = 2000;
 // ─── CFGLayoutPass::run ────────────────────────────────────────────────────
 
 PassResult CFGLayoutPass::run(PassContext& ctx) {
+    auto& index = ctx.index();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("cfg_layout", blob)) {
+            CFGLayoutResult cached;
+            if (cfg_layout_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "CFG layout: {} blocks, {}×{} canvas (from cache)",
+                    cached.block_layouts.size(), cached.canvas_width, cached.canvas_height));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     const auto& cfg = ctx.require<CFGResult>("cfg");
 
     CFGLayoutResult result;
@@ -172,6 +340,14 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
         num_blocks, cfg.edges.size(),
         result.canvas_width, result.canvas_height,
         num_blocks > LARGE_CFG_THRESHOLD ? " (fast mode)" : ""));
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob = cfg_layout_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("cfg_layout", blob.data(), blob.size());
+        }
+    }
 
     return PassResult::success(std::move(result));
 }

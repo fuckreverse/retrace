@@ -13,6 +13,135 @@
 
 namespace tenet {
 
+// ─── MemorySnapshotResult serialization helpers ────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x4D534E50 ("MSNP")
+//   u32  version = 1
+//   u64  num_snapshots
+//   for each MemoryRegion:
+//     u64  addr
+//     u64  at_inst_id
+//     u32  label_len; u8[] label
+//     u64  data_len
+//     u8[] data[data_len]
+//     u64  known_len (== data_len)
+//     u8[] known_bits: packed as bytes (bit i = known[i])
+//   (by_inst_id is rebuilt after deserialization)
+
+namespace {
+
+static constexpr uint32_t MSNP_BLOB_MAGIC   = 0x4D534E50u;  // "MSNP"
+static constexpr uint32_t MSNP_BLOB_VERSION = 1u;
+
+std::string memory_snapshot_serialize(const MemorySnapshotResult& res) {
+    size_t total = 4 + 4 + 8;  // magic, version, num_snapshots
+    for (const auto& r : res.snapshots) {
+        total += 8 + 8;  // addr, at_inst_id
+        total += 4 + r.label.size();
+        size_t n = r.data.size();
+        total += 8 + n;  // data_len + data
+        // known: pack into bytes (ceil(n/8) bytes)
+        size_t known_bytes = (n + 7) / 8;
+        total += 8 + known_bytes;
+    }
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        std::memcpy(p, s.data(), s.size()); p += s.size();
+    };
+
+    write_u32(MSNP_BLOB_MAGIC);
+    write_u32(MSNP_BLOB_VERSION);
+    write_u64(static_cast<uint64_t>(res.snapshots.size()));
+
+    for (const auto& r : res.snapshots) {
+        write_u64(r.addr);
+        write_u64(r.at_inst_id);
+        write_str(r.label);
+
+        size_t n = r.data.size();
+        write_u64(static_cast<uint64_t>(n));
+        std::memcpy(p, r.data.data(), n); p += n;
+
+        // Pack known bits
+        size_t known_bytes = (n + 7) / 8;
+        write_u64(static_cast<uint64_t>(known_bytes));
+        std::memset(p, 0, known_bytes);
+        for (size_t i = 0; i < n; i++) {
+            if (r.known[i]) {
+                reinterpret_cast<uint8_t*>(p)[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+            }
+        }
+        p += known_bytes;
+    }
+
+    return buf;
+}
+
+bool memory_snapshot_deserialize(const std::string& blob, MemorySnapshotResult& out) {
+    if (blob.size() < 4 + 4 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (p + 4 > end) return false;
+        uint32_t len = read_u32();
+        if (p + len > end) return false;
+        s.assign(p, len); p += len;
+        return true;
+    };
+
+    if (read_u32() != MSNP_BLOB_MAGIC)   return false;
+    if (read_u32() != MSNP_BLOB_VERSION) return false;
+
+    uint64_t n_snaps = read_u64();
+    out.snapshots.reserve(static_cast<size_t>(n_snaps));
+
+    for (uint64_t i = 0; i < n_snaps; i++) {
+        MemoryRegion r;
+        if (p + 8 + 8 > end) return false;
+        r.addr       = read_u64();
+        r.at_inst_id = read_u64();
+        if (!read_str(r.label)) return false;
+
+        if (p + 8 > end) return false;
+        uint64_t data_len = read_u64();
+        if (p + data_len > end) return false;
+        r.data.assign(reinterpret_cast<const uint8_t*>(p),
+                      reinterpret_cast<const uint8_t*>(p) + data_len);
+        p += data_len;
+
+        if (p + 8 > end) return false;
+        uint64_t known_bytes = read_u64();
+        if (p + known_bytes > end) return false;
+        r.known.resize(static_cast<size_t>(data_len), false);
+        for (size_t bi = 0; bi < static_cast<size_t>(data_len); bi++) {
+            uint8_t byte = reinterpret_cast<const uint8_t*>(p)[bi / 8];
+            r.known[bi] = (byte >> (bi % 8)) & 1u;
+        }
+        p += known_bytes;
+
+        out.snapshots.push_back(std::move(r));
+    }
+
+    // Rebuild by_inst_id index
+    for (size_t idx = 0; idx < out.snapshots.size(); idx++) {
+        out.by_inst_id[out.snapshots[idx].at_inst_id].push_back(idx);
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (memory_snapshot serialization)
+
 // ─── Hex dump formatting ──────────────────────────────────────────────────
 
 std::string MemorySnapshotResult::hex_dump(const MemoryRegion& region) {
@@ -86,6 +215,22 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
     auto& regfile = ctx.regfile();
 
     const auto& range = ctx.range();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    // Only cache default config (snapshot_at_function_calls, no explicit ids).
+    bool is_default_config = (config_.snapshot_inst_ids.empty() &&
+                              config_.snapshot_at_function_calls);
+    if (ctx.range().is_full_trace() && is_default_config) {
+        std::string blob;
+        if (index.load_pass_blob("memory_snapshot", blob)) {
+            MemorySnapshotResult cached;
+            if (memory_snapshot_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Memory snapshot: {} snapshots (from cache)", cached.total()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
     uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
     if (end_id == 0) end_id = index.inst_count();
 
@@ -354,6 +499,15 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
                memread_calls ? memread_us / memread_calls : 0.0);
 
     ctx.progress(1.0f, fmt::format("Done: {} snapshots captured", result.total()));
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace() && is_default_config) {
+        std::string blob = memory_snapshot_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("memory_snapshot", blob.data(), blob.size());
+        }
+    }
+
     return PassResult::success(std::move(result));
 }
 

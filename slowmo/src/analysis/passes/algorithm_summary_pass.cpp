@@ -11,8 +11,145 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
 
 namespace tenet {
+
+// ─── AlgorithmSummaryResult serialization helpers ─────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x414C474F ("ALGO")
+//   u32  version = 1
+//   u32  summary_text_len
+//   u8[] summary_text
+//   u32  summary_json_len
+//   u8[] summary_json (JSON string)
+//   u64  num_candidates
+//   for each AlgorithmCandidate:
+//     u32  name_len; u8[] name
+//     f32  confidence
+//     u32  evidence_len; u8[] evidence
+//     u64  estimated_start, estimated_end
+//     u64  num_key_pcs; u64[] key_pcs
+//     u64  num_key_inst_ids; u64[] key_inst_ids
+
+namespace {
+
+static constexpr uint32_t ALGO_BLOB_MAGIC   = 0x414C474Fu;  // "ALGO"
+static constexpr uint32_t ALGO_BLOB_VERSION = 1u;
+
+std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
+    // Pre-compute json string
+    std::string json_str = res.summary_json.dump();
+
+    size_t total = 4 + 4;  // magic, version
+    total += 4 + res.summary_text.size();
+    total += 4 + json_str.size();
+    total += 8;  // num_candidates
+    for (const auto& c : res.candidates) {
+        total += 4 + c.name.size();
+        total += 4;  // confidence (f32)
+        total += 4 + c.evidence.size();
+        total += 8 + 8;  // estimated_start, estimated_end
+        total += 8 + c.key_pcs.size() * 8;
+        total += 8 + c.key_inst_ids.size() * 8;
+    }
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        std::memcpy(p, s.data(), s.size());
+        p += s.size();
+    };
+
+    write_u32(ALGO_BLOB_MAGIC);
+    write_u32(ALGO_BLOB_VERSION);
+    write_str(res.summary_text);
+    write_str(json_str);
+
+    write_u64(static_cast<uint64_t>(res.candidates.size()));
+    for (const auto& c : res.candidates) {
+        write_str(c.name);
+        write_f32(c.confidence);
+        write_str(c.evidence);
+        write_u64(c.estimated_start);
+        write_u64(c.estimated_end);
+        write_u64(static_cast<uint64_t>(c.key_pcs.size()));
+        for (uint64_t pc : c.key_pcs) write_u64(pc);
+        write_u64(static_cast<uint64_t>(c.key_inst_ids.size()));
+        for (uint64_t id : c.key_inst_ids) write_u64(id);
+    }
+
+    return buf;
+}
+
+bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResult& out) {
+    if (blob.size() < 4 + 4) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (p + 4 > end) return false;
+        uint32_t len = read_u32();
+        if (p + len > end) return false;
+        s.assign(p, len);
+        p += len;
+        return true;
+    };
+
+    if (read_u32() != ALGO_BLOB_MAGIC)   return false;
+    if (read_u32() != ALGO_BLOB_VERSION) return false;
+
+    if (!read_str(out.summary_text)) return false;
+
+    std::string json_str;
+    if (!read_str(json_str)) return false;
+    try {
+        out.summary_json = nlohmann::json::parse(json_str);
+    } catch (...) {
+        return false;
+    }
+
+    if (p + 8 > end) return false;
+    uint64_t n_cands = read_u64();
+    out.candidates.reserve(static_cast<size_t>(n_cands));
+    for (uint64_t i = 0; i < n_cands; i++) {
+        AlgorithmCandidate c;
+        if (!read_str(c.name)) return false;
+        if (p + 4 > end) return false;
+        c.confidence = read_f32();
+        if (!read_str(c.evidence)) return false;
+        if (p + 8 + 8 > end) return false;
+        c.estimated_start = read_u64();
+        c.estimated_end   = read_u64();
+
+        if (p + 8 > end) return false;
+        uint64_t n_pcs = read_u64();
+        if (p + n_pcs * 8 > end) return false;
+        c.key_pcs.resize(static_cast<size_t>(n_pcs));
+        for (uint64_t j = 0; j < n_pcs; j++) c.key_pcs[j] = read_u64();
+
+        if (p + 8 > end) return false;
+        uint64_t n_ids = read_u64();
+        if (p + n_ids * 8 > end) return false;
+        c.key_inst_ids.resize(static_cast<size_t>(n_ids));
+        for (uint64_t j = 0; j < n_ids; j++) c.key_inst_ids[j] = read_u64();
+
+        out.candidates.push_back(std::move(c));
+    }
+
+    return true;
+}
+
+}  // anonymous namespace (algo serialization)
 
 namespace {
 
@@ -90,6 +227,22 @@ const char* confidence_label(float c) {
 // ─── AlgorithmSummaryPass::run ────────────────────────────────────────────
 
 PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
+    auto& index = ctx.index();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob;
+        if (index.load_pass_blob("algorithm_summary", blob)) {
+            AlgorithmSummaryResult cached;
+            if (algorithm_summary_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Algorithm summary: {} candidate(s) (from cache)",
+                    cached.candidates.size()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     ctx.progress(0.0f, "Algorithm summary: collecting evidence...");
 
     // ── Soft-require all dependencies ────────────────────────────────────
@@ -435,6 +588,14 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
 
     ctx.progress(1.0f, fmt::format("Algorithm summary: {} candidate(s) detected",
                                    result.candidates.size()));
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace()) {
+        std::string blob = algorithm_summary_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("algorithm_summary", blob.data(), blob.size());
+        }
+    }
 
     return PassResult::success(std::move(result));
 }

@@ -4,16 +4,195 @@
 #include "analysis/trace_collector.h"
 #include "analysis/passes/function_pass.h"
 #include "io/trace_reader.h"
+#include "io/index_builder.h"
 #include "core/register_file.h"
 
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <cassert>
+#include <cstring>
 #include <fmt/core.h>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
+
+// ─── CacheSimResult serialization helpers ─────────────────────────────────
+//
+// Blob format (all little-endian):
+//   u32  magic   = 0x43534D52 ("CSMR")
+//   u32  version = 1
+//   u64  total_instructions
+//   u64  num_levels
+//   for each CacheLevelStats:
+//     u32  name_len; u8[] name
+//     u64  total_accesses, hits, misses, read_accesses, write_accesses
+//     u64  read_hits, write_hits, evictions
+//   u64  num_function_stats
+//   for each FunctionCacheStats:
+//     u64  entry_pc
+//     u32  name_len; u8[] name
+//     u64  total_calls
+//     u64  num_per_call; u64[] l1d_misses_per_call
+//   u64  num_sidechannels
+//   for each TimingSidechannel:
+//     u64  entry_pc
+//     u32  name_len; u8[] name
+//     f64  cv
+//     u64  min_misses, max_misses, total_calls
+//     u32  reason_len; u8[] reason
+//   u64  num_hottest_lines
+//   for each HotCacheLine:
+//     u64  addr, misses, hits
+
+namespace {
+
+static constexpr uint32_t CSMR_BLOB_MAGIC   = 0x43534D52u;  // "CSMR"
+static constexpr uint32_t CSMR_BLOB_VERSION = 1u;
+
+std::string cache_sim_serialize(const CacheSimResult& res) {
+    size_t total = 4 + 4 + 8 + 8;  // magic, version, total_instructions, num_levels
+    for (const auto& ls : res.level_stats) {
+        total += 4 + ls.name.size() + 8 * 8;
+    }
+    total += 8;  // num_function_stats
+    for (const auto& fs : res.function_stats) {
+        total += 4 + fs.name.size() + 8 + 8 + 8 + fs.l1d_misses_per_call.size() * 8;
+    }
+    total += 8;  // num_sidechannels
+    for (const auto& sc : res.sidechannels) {
+        total += 8 + 4 + sc.function_name.size() + 8 + 8 + 8 + 8 + 4 + sc.reason.size();
+    }
+    total += 8 + res.hottest_lines.size() * (8 + 8 + 8);
+
+    std::string buf(total, '\0');
+    char* p = buf.data();
+
+    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_f64 = [&](double   v) { std::memcpy(p, &v, 8); p += 8; };
+    auto write_str = [&](const std::string& s) {
+        write_u32(static_cast<uint32_t>(s.size()));
+        std::memcpy(p, s.data(), s.size()); p += s.size();
+    };
+
+    write_u32(CSMR_BLOB_MAGIC);
+    write_u32(CSMR_BLOB_VERSION);
+    write_u64(res.total_instructions);
+    write_u64(static_cast<uint64_t>(res.level_stats.size()));
+    for (const auto& ls : res.level_stats) {
+        write_str(ls.name);
+        write_u64(ls.total_accesses);
+        write_u64(ls.hits);
+        write_u64(ls.misses);
+        write_u64(ls.read_accesses);
+        write_u64(ls.write_accesses);
+        write_u64(ls.read_hits);
+        write_u64(ls.write_hits);
+        write_u64(ls.evictions);
+    }
+    write_u64(static_cast<uint64_t>(res.function_stats.size()));
+    for (const auto& fs : res.function_stats) {
+        write_u64(fs.entry_pc);
+        write_str(fs.name);
+        write_u64(fs.total_calls);
+        write_u64(static_cast<uint64_t>(fs.l1d_misses_per_call.size()));
+        for (uint64_t v : fs.l1d_misses_per_call) write_u64(v);
+    }
+    write_u64(static_cast<uint64_t>(res.sidechannels.size()));
+    for (const auto& sc : res.sidechannels) {
+        write_u64(sc.entry_pc);
+        write_str(sc.function_name);
+        write_f64(sc.cv);
+        write_u64(sc.min_misses);
+        write_u64(sc.max_misses);
+        write_u64(sc.total_calls);
+        write_str(sc.reason);
+    }
+    write_u64(static_cast<uint64_t>(res.hottest_lines.size()));
+    for (const auto& hl : res.hottest_lines) {
+        write_u64(hl.addr);
+        write_u64(hl.misses);
+        write_u64(hl.hits);
+    }
+    return buf;
+}
+
+bool cache_sim_deserialize(const std::string& blob, CacheSimResult& out) {
+    if (blob.size() < 4 + 4 + 8 + 8) return false;
+    const char* p = blob.data();
+    const char* end = p + blob.size();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_f64 = [&]() -> double   { double   v; std::memcpy(&v, p, 8); p += 8; return v; };
+    auto read_str = [&](std::string& s) -> bool {
+        if (p + 4 > end) return false;
+        uint32_t len = read_u32();
+        if (p + len > end) return false;
+        s.assign(p, len); p += len;
+        return true;
+    };
+
+    if (read_u32() != CSMR_BLOB_MAGIC)   return false;
+    if (read_u32() != CSMR_BLOB_VERSION) return false;
+
+    out.total_instructions = read_u64();
+    uint64_t n_levels = read_u64();
+    out.level_stats.resize(static_cast<size_t>(n_levels));
+    for (auto& ls : out.level_stats) {
+        if (!read_str(ls.name)) return false;
+        if (p + 8 * 8 > end) return false;
+        ls.total_accesses  = read_u64();
+        ls.hits            = read_u64();
+        ls.misses          = read_u64();
+        ls.read_accesses   = read_u64();
+        ls.write_accesses  = read_u64();
+        ls.read_hits       = read_u64();
+        ls.write_hits      = read_u64();
+        ls.evictions       = read_u64();
+    }
+    if (p + 8 > end) return false;
+    uint64_t n_fs = read_u64();
+    out.function_stats.resize(static_cast<size_t>(n_fs));
+    for (auto& fs : out.function_stats) {
+        if (p + 8 > end) return false;
+        fs.entry_pc = read_u64();
+        if (!read_str(fs.name)) return false;
+        if (p + 8 + 8 > end) return false;
+        fs.total_calls = read_u64();
+        uint64_t n_mis = read_u64();
+        if (p + n_mis * 8 > end) return false;
+        fs.l1d_misses_per_call.resize(static_cast<size_t>(n_mis));
+        for (auto& v : fs.l1d_misses_per_call) v = read_u64();
+    }
+    if (p + 8 > end) return false;
+    uint64_t n_sc = read_u64();
+    out.sidechannels.resize(static_cast<size_t>(n_sc));
+    for (auto& sc : out.sidechannels) {
+        if (p + 8 > end) return false;
+        sc.entry_pc = read_u64();
+        if (!read_str(sc.function_name)) return false;
+        if (p + 8 + 8 + 8 + 8 > end) return false;
+        sc.cv          = read_f64();
+        sc.min_misses  = read_u64();
+        sc.max_misses  = read_u64();
+        sc.total_calls = read_u64();
+        if (!read_str(sc.reason)) return false;
+    }
+    if (p + 8 > end) return false;
+    uint64_t n_hl = read_u64();
+    out.hottest_lines.resize(static_cast<size_t>(n_hl));
+    for (auto& hl : out.hottest_lines) {
+        if (p + 8 * 3 > end) return false;
+        hl.addr   = read_u64();
+        hl.misses = read_u64();
+        hl.hits   = read_u64();
+    }
+    return true;
+}
+
+}  // anonymous namespace (cache_sim serialization)
 
 // ─── FunctionCacheStats helpers ──────────────────────────────────────────
 
@@ -376,6 +555,25 @@ PassResult CacheSimPass::run(PassContext& ctx) {
         return PassResult::failed("CacheSimPass: no cache levels configured");
     }
 
+    auto& index = ctx.index();
+
+    // ─── Fast path: load from persisted cache ─────────────────────────────
+    // Only cache when using the full trace with default start/end range,
+    // since config parameters (level geometry, policy) affect results.
+    bool is_default_range = (cfg_.start_inst_id == 0 && cfg_.end_inst_id == UINT64_MAX);
+    if (ctx.range().is_full_trace() && is_default_range) {
+        std::string blob;
+        if (index.load_pass_blob("cache_sim", blob)) {
+            CacheSimResult cached;
+            if (cache_sim_deserialize(blob, cached)) {
+                ctx.progress(1.0f, fmt::format(
+                    "Cache sim: {} instructions, {} levels (from cache)",
+                    cached.total_instructions, cached.level_stats.size()));
+                return PassResult::success(std::move(cached));
+            }
+        }
+    }
+
     // Try to get function pass result for per-function stats
     const FunctionResult* fn_result = nullptr;
     if (cfg_.per_function_stats) {
@@ -407,6 +605,15 @@ PassResult CacheSimPass::run(PassContext& ctx) {
     }
 
     CacheSimResult result = collector.build_result(cfg_);
+
+    // ─── Persist to cache ─────────────────────────────────────────────────
+    if (ctx.range().is_full_trace() && is_default_range) {
+        std::string blob = cache_sim_serialize(result);
+        if (!blob.empty()) {
+            index.save_pass_blob("cache_sim", blob.data(), blob.size());
+        }
+    }
+
     return PassResult::success(std::move(result));
 }
 
