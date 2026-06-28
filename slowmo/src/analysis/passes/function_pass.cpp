@@ -8,7 +8,7 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <numeric>
-#include <unordered_set>
+#include <string_view>
 
 namespace tenet {
 
@@ -158,7 +158,7 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
 
 // ─── Known non-returning functions (common in iOS/macOS AArch64 binaries) ──
 
-static const std::unordered_set<std::string> kNonReturningSymbols = {
+static constexpr std::string_view kNonReturningSymbols[] = {
     "exit", "_exit", "abort", "__abort",
     "__cxa_throw", "__cxa_rethrow", "objc_exception_throw",
     "longjmp", "_longjmp", "siglongjmp",
@@ -167,6 +167,14 @@ static const std::unordered_set<std::string> kNonReturningSymbols = {
     "__stack_chk_fail", "__fortify_fail",
     "swift_unexpectedError", "swift_fatalError",
 };
+
+/// Check if a symbol name is a known non-returning function.
+static bool is_non_returning(std::string_view name) {
+    for (auto sv : kNonReturningSymbols) {
+        if (sv == name) return true;
+    }
+    return false;
+}
 
 // ─── AArch64 opcode classification via bit patterns ───────────────────────
 
@@ -343,6 +351,7 @@ bool FunctionCollector::begin(uint64_t /*start_inst_id*/, uint64_t /*end_inst_id
     result_ = FunctionResult{};
     call_stack_.clear();
     tail_candidates_.clear();
+    ret_pc_refcount_.clear();
     current_sp_ = 0;
     sp_valid_ = false;
     prev_was_unconditional_jump_ = false;
@@ -381,30 +390,57 @@ void FunctionCollector::handle_deferred_ret(uint64_t pc) {
     if (call_stack_.empty()) return;
 
     if (call_stack_.back().return_pc == pc) {
+        // Fast path: top of stack matches (most common case).
         auto& top = call_stack_.back();
         result_.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id_;
         result_.return_site_map_[prev_ret_inst_id_] = top.call_event_idx;
+        // Decrement refcount for this return_pc before popping.
+        auto rc_it = ret_pc_refcount_.find(top.return_pc);
+        if (rc_it != ret_pc_refcount_.end()) {
+            if (--rc_it->second == 0) ret_pc_refcount_.erase(rc_it);
+        }
         call_stack_.pop_back();
     } else {
-        bool found = false;
-        for (int i = static_cast<int>(call_stack_.size()) - 1; i >= 0; --i) {
-            if (call_stack_[i].return_pc == pc) {
-                for (int j = static_cast<int>(call_stack_.size()) - 1; j > i; --j) {
-                    result_.call_events[call_stack_[j].call_event_idx].return_inst_id = prev_ret_inst_id_;
-                    call_stack_.pop_back();
-                    non_local_unwinds_++;
+        // O(1) check: is this return_pc anywhere in the stack?
+        auto rc_it = ret_pc_refcount_.find(pc);
+        if (rc_it != ret_pc_refcount_.end()) {
+            // Found — linear search from top to locate exact position.
+            for (int i = static_cast<int>(call_stack_.size()) - 1; i >= 0; --i) {
+                if (call_stack_[i].return_pc == pc) {
+                    // Non-local unwind: pop all frames above i.
+                    for (int j = static_cast<int>(call_stack_.size()) - 1; j > i; --j) {
+                        auto& frame = call_stack_[j];
+                        result_.call_events[frame.call_event_idx].return_inst_id = prev_ret_inst_id_;
+                        // Decrement refcount for popped frame.
+                        auto rc2 = ret_pc_refcount_.find(frame.return_pc);
+                        if (rc2 != ret_pc_refcount_.end()) {
+                            if (--rc2->second == 0) ret_pc_refcount_.erase(rc2);
+                        }
+                        call_stack_.pop_back();
+                        non_local_unwinds_++;
+                    }
+                    // Now pop frame i itself.
+                    result_.call_events[call_stack_[i].call_event_idx].return_inst_id = prev_ret_inst_id_;
+                    result_.return_site_map_[prev_ret_inst_id_] = static_cast<size_t>(call_stack_[i].call_event_idx);
+                    // Decrement refcount for this frame.
+                    auto rc3 = ret_pc_refcount_.find(call_stack_[i].return_pc);
+                    if (rc3 != ret_pc_refcount_.end()) {
+                        if (--rc3->second == 0) ret_pc_refcount_.erase(rc3);
+                    }
+                    call_stack_.erase(call_stack_.begin() + i);
+                    break;
                 }
-                result_.call_events[call_stack_[i].call_event_idx].return_inst_id = prev_ret_inst_id_;
-                result_.return_site_map_[prev_ret_inst_id_] = static_cast<size_t>(call_stack_[i].call_event_idx);
-                call_stack_.erase(call_stack_.begin() + i);
-                found = true;
-                break;
             }
-        }
-        if (!found && !call_stack_.empty()) {
+        } else {
+            // return_pc not in stack at all — fallback: pop top frame.
             auto& top = call_stack_.back();
             result_.call_events[top.call_event_idx].return_inst_id = prev_ret_inst_id_;
             result_.return_site_map_[prev_ret_inst_id_] = top.call_event_idx;
+            // Decrement refcount for popped frame.
+            auto rc2 = ret_pc_refcount_.find(top.return_pc);
+            if (rc2 != ret_pc_refcount_.end()) {
+                if (--rc2->second == 0) ret_pc_refcount_.erase(rc2);
+            }
             call_stack_.pop_back();
         }
     }
@@ -458,7 +494,9 @@ void FunctionCollector::handle_inst_inner(uint64_t cur_inst_id, uint64_t pc,
         size_t idx = result_.call_events.size();
         result_.call_site_map_[cur_inst_id] = idx;
         result_.call_events.push_back(evt);
-        call_stack_.push_back({idx, pc + 4, sp_valid_ ? current_sp_ : 0});
+        uint64_t ret_pc = pc + 4;
+        call_stack_.push_back({idx, ret_pc, sp_valid_ ? current_sp_ : 0});
+        ret_pc_refcount_[ret_pc]++;
     } else if (is_ret) {
         prev_was_ret_ = true;
         prev_ret_inst_id_ = cur_inst_id;
@@ -640,6 +678,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
             }
         });
         local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.set_cancel_token(&ctx.global_cancel_flag());
         local_engine.add_collector(&collector);
         local_engine.run();
     }

@@ -158,6 +158,10 @@ private:
     std::vector<StackFrame> call_stack_;
     std::vector<TailCallCandidate> tail_candidates_;
 
+    // Fast lookup: return_pc → count of frames in call_stack_ with that return_pc.
+    // Allows O(1) existence check before doing linear search.
+    ankerl::unordered_dense::map<uint64_t, uint32_t> ret_pc_refcount_;
+
     uint64_t current_sp_ = 0;
     bool sp_valid_ = false;
 
@@ -196,6 +200,7 @@ public:
     }
 
     PassResult run(PassContext& ctx) override;
+
     float estimated_cost() const override { return 7.0f; }
 };
 
