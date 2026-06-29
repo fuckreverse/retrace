@@ -633,7 +633,14 @@ ninja -j$(nproc) tenet
 
 **2. SIMD 向量化**
 
-当前 `entropy_pass` 的频率直方图计算、`string_pass` 的可打印字符判断均逐字节处理。NEON `vceq.u8`/`vcntq_u8` 可批量处理 32 字节，理论加速 32×。`mem_search_pass` 的朴素字节比较可用 SIMD 加速。
+**经分析，手写 NEON intrinsics 在当前架构下收益极低，不建议投入。** 原因如下：
+
+- **编译器已经处理**：Release 构建使用 `-mcpu=apple-m1`，Clang 对满足条件的循环会自动生成 NEON 指令；手写 intrinsics 只能弥补编译器无法自动向量化的剩余场景。
+- **候选场景的瓶颈不在计算**：`entropy_pass` 的核心是 256-bucket 频率统计（间接索引写 `freq[data[i]]++`），瓶颈是 RocksDB `read_region()` I/O（单次 ≥ 1μs），而非频率计算本身（4096B ≈ 0.4μs）；I/O 与计算比超过 1000:1，NEON 对总时间的改善 < 0.2%。`string_pass` 实测仅耗时 **0.2ms**，根本不是瓶颈。
+- **热路径本质上不可向量化**：`taint_pass`（10s+）是 Triton 串行依赖链，`function_pass`（318ms）是条件分支密集的调用栈更新，`symbol_annotation`（485ms）是 hash map 批量插入——这三类都无法从 NEON 获益。
+- **`entropy` 多区域批量场景**：即使 `yara_mem_scan` 对 50K 个页批量计算熵（50K × 0.4μs ≈ 20ms CPU），同期 I/O 仍以数量级压倒计算，NEON 对总时间的改变微乎其微。
+
+如确实需要提升 `entropy_pass` 性能，应聚焦于减少 RocksDB seek 次数（如增大 batch 读取粒度、或引入页级别的预读缓存），而非向量化计算本身。
 
 **3. 稀疏倒排索引（xref 扩展）**
 
@@ -641,7 +648,15 @@ ninja -j$(nproc) tenet
 
 **4. GPU 加速（yara_mem_scan / entropy）**
 
-内存扫描和熵计算是完全数据并行的（每页独立）。macOS 上可用 Metal Compute Shader offload，GPU 的 1000+ 核心对此类任务有数量级加速空间。
+**经分析，GPU offload 在当前架构下不可行，不建议投入。** 原因如下：
+
+- **尚未实现**：`src/` 下没有任何 `.metal` 文件或 Metal Compute API 调用，属于未验证的假设。
+- **真正瓶颈不在计算**：`yara_mem_scan` 和 `entropy` 均不是高耗时 Pass（未进 Top-5）；每页 `read_region()` 是 RocksDB I/O，GPU 无法加速数据库读取。
+- **小数据量 + kernel launch overhead 倒挂**：单页 4KB，Metal kernel launch 延迟约 50-200μs，而 CPU 处理同等数据只需 < 1μs；overhead 远超计算本身。
+- **YARA 不可 GPU 化**：Aho-Corasick 是分支密集型状态机，在 GPU warp 上存在严重的 warp divergence，实际性能可能劣于 CPU。
+- **架构不配合**：最大瓶颈 `taint_pass`（占总时间 87%）是强顺序依赖的数据流传播，是 GPU 的天然死穴。
+
+如需改善 `yara_mem_scan` 性能，应聚焦于：增大 `max_bytes_per_page`（当前 64KB）配合更积极的熵预过滤阈值，以及将所有页的 `read_region()` 请求按页地址排序后批量提交（类似 `memory_snapshot_pass` 的两阶段 page-sorted batch 设计），而非引入 GPU pipeline。
 
 **5. Trace Column-Store 格式（整体 I/O）**
 

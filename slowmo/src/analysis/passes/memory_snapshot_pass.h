@@ -81,9 +81,13 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
-        // Depend on "function" pass to get pre-computed call events (fast path).
-        // If function pass is unavailable, falls back to linear scan.
-        return {"function"};
+        // "function" is an OPTIONAL dependency: the pass uses
+        // ctx.try_require<FunctionResult>("function") at runtime and falls
+        // back to a linear scan when it is unavailable.  Declaring it as a
+        // hard dependency here would cause the pass to fail whenever
+        // FunctionPass is not registered (e.g. unit tests with explicit
+        // snapshot_inst_ids).
+        return {};
     }
 
     PassResult run(PassContext& ctx) override;

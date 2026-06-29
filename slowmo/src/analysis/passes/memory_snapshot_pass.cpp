@@ -10,6 +10,10 @@
 #include <chrono>
 #include <cstring>
 #include <numeric>
+#if TENET_HAS_TBB
+#include <tbb/parallel_for_each.h>
+#include <mutex>
+#endif
 
 namespace tenet {
 
@@ -337,6 +341,29 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
             fmt::print(stderr, "[memory_snapshot] fast-path: {} call events, limit={}\n",
                        events.size(), config_.max_snapshots);
 
+            // ── Opt: pre-cache regfile for all call sites before the loop ──
+            // state_before(inst_id) rebuilds from the nearest anchor and
+            // replays diffs.  When call events are sparse (avg gap >> anchor
+            // interval), warm_range with a fixed stride creates too many
+            // useless checkpoints.  Instead, warm_at each target directly in
+            // ascending order so the I/O traversal is sequential and each
+            // call site gets its result cached before the timing loop starts.
+            {
+                auto t_warm0 = HiResClock::now();
+                size_t warmed = 0;
+                for (const auto& ev : events) {
+                    if (ev.call_inst_id < range.start_inst_id) continue;
+                    if (ev.call_inst_id > end_id) break;
+                    regfile.warm_at(ev.call_inst_id);
+                    ++warmed;
+                    if (warmed >= config_.max_snapshots) break;
+                }
+                auto t_warm1 = HiResClock::now();
+                double warm_ms = std::chrono::duration<double, std::milli>(t_warm1 - t_warm0).count();
+                fmt::print(stderr, "[memory_snapshot] warm_at {} call sites: {:.1f} ms\n",
+                           warmed, warm_ms);
+            }
+
             for (const auto& ev : events) {
                 if (limit_reached() || ctx.cancelled()) break;
                 if (ev.call_inst_id < range.start_inst_id) continue;
@@ -451,22 +478,67 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
             size_t original_idx;
             MemoryRegion region;
         };
-        std::vector<IndexedRegion> indexed_regions;
-        indexed_regions.reserve(requests.size());
+        // Pre-allocate result slots so threads can write without re-allocation.
+        std::vector<IndexedRegion> indexed_regions(order.size());
+        for (size_t i = 0; i < order.size(); ++i)
+            indexed_regions[i].original_idx = order[i];
 
+#if TENET_HAS_TBB
+        // ── Phase B (TBB parallel): group by page and process concurrently ──
+        // Each page group is independent: read_region uses thread-local RocksDB
+        // iterators, so no sharing.  memread_us/memread_calls accumulation uses
+        // a small mutex so the diagnostic output is still accurate.
+        //
+        // Build page-group ranges first (we already have order[] sorted by page).
+        struct PageGroup { size_t begin; size_t end; };
+        std::vector<PageGroup> page_groups;
+        {
+            size_t g_start = 0;
+            for (size_t i = 1; i <= order.size(); ++i) {
+                bool last = (i == order.size());
+                bool new_page = !last &&
+                    (requests[order[i]].page != requests[order[i-1]].page);
+                if (last || new_page) {
+                    page_groups.push_back({g_start, i});
+                    g_start = i;
+                }
+            }
+        }
+
+        std::mutex diag_mutex;
+        tbb::parallel_for_each(
+            page_groups.begin(), page_groups.end(),
+            [&](const PageGroup& grp) {
+                if (ctx.cancelled()) return;
+                double local_us = 0;
+                for (size_t i = grp.begin; i < grp.end; ++i) {
+                    auto& req = requests[order[i]];
+                    auto t2 = HiResClock::now();
+                    indexed_regions[i].region = capture_region(
+                        memory, req.addr, config_.snapshot_size, req.inst_id,
+                        std::move(req.label));
+                    auto t3 = HiResClock::now();
+                    local_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(diag_mutex);
+                    memread_us    += local_us;
+                    memread_calls += static_cast<size_t>(grp.end - grp.begin);
+                }
+            });
+#else
+        // ── Phase B (serial): page-sorted to maximise TL-cache hits ─────────
         for (size_t i = 0; i < order.size(); ++i) {
             if (ctx.cancelled()) break;
 
             auto& req = requests[order[i]];
             auto t2 = HiResClock::now();
-            auto region = capture_region(
+            indexed_regions[i].region = capture_region(
                 memory, req.addr, config_.snapshot_size, req.inst_id,
                 std::move(req.label));
             auto t3 = HiResClock::now();
             memread_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
             memread_calls++;
-
-            indexed_regions.push_back({order[i], std::move(region)});
 
             if ((i & 0xFF) == 0) {
                 ctx.progress(
@@ -474,8 +546,11 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
                     "Batch reading memory");
             }
         }
+#endif
 
         // Sort back to original insertion order for deterministic output.
+        // (indexed_regions[i].original_idx == order[i], so sort by original_idx
+        // restores the insertion order regardless of TBB task scheduling.)
         std::sort(indexed_regions.begin(), indexed_regions.end(),
                   [](const IndexedRegion& a, const IndexedRegion& b) {
                       return a.original_idx < b.original_idx;
