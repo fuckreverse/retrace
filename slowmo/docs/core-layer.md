@@ -1,155 +1,288 @@
 # Core 层
 
-> 职责：在 IO 层的原始记录流之上，重建程序执行的**完整状态快照**（寄存器/内存/指令语义），并桥接 Triton。
-> 源码：`src/core/`。是 Analysis 层与 IO 层之间的「状态预言机」。
+Core 层把 IO 层提供的“记录与索引”提升成“某一时刻程序真实状态”。
 
-## 组件清单
+如果说 IO 层解决的是“数据怎么读”，那么 Core 层解决的是：
 
-| 文件 | 类 | 职责 |
+- 某条指令执行前寄存器是什么
+- 某个地址在某个时刻内存里是什么
+- 某个 PC 的 opcode 和语义是什么
+- 在这些基础上，如何支撑断点、污点和高层分析
+
+## 组件总览
+
+| 组件 | 文件 | 作用 |
 |------|------|------|
-| register_file.{h,cpp} | `RegisterFile` | 任意 inst_id 的寄存器状态 O(1) 重建 |
-| memory_model.{h,cpp} | `MemoryModel` | 时间索引内存（带写历史） |
-| instruction_decoder.{h,cpp} | `InstructionDecoder` | Capstone 反汇编 + LRU 缓存 |
-| triton_bridge.{h,cpp} | `TritonBridge` + `TritonPool` | Triton 语义引擎桥接（可选，stub 降级） |
-| breakpoint_engine.{h,cpp} | `BreakpointEngine` | 时空断点/观察点（前向+后向） |
+| `RegisterFile` | `register_file.{h,cpp}` | 通过 ANCHOR + diff 重建任意时刻寄存器状态 |
+| `MemoryModel` | `memory_model.{h,cpp}` | 时间感知内存读取与写历史查询 |
+| `InstructionDecoder` | `instruction_decoder.{h,cpp}` | Capstone 解码与缓存 |
+| `TritonBridge` / `TritonPool` | `triton_bridge.{h,cpp}` | 精确语义、污点与可选 Triton 实例池 |
+| `BreakpointEngine` | `breakpoint_engine.{h,cpp}` | 基于静态 trace 的断点 / 观察点 / continue |
 
-## RegisterFile — Anchor + Diff + LRU
-
-**算法**：trace 每 ~4096 条 INST 夹一个 ANCHOR 全量快照，中间 INST 只存 diff。重建 inst_id=N：
-1. `index.nearest_anchor_before(N)` → 二分找到 ≤N 的最近 anchor。
-2. 加载 anchor 的 34 个 GPR 全量值。
-3. 从 anchor 向前顺序扫，逐条 apply diff（`InstView.reg_diff(i)` 覆盖对应寄存器）。
-4. 结果存入 LRU。
-
-**接口**：
-- `state_before(inst_id)` → `const RegState&`（主接口，返回引用可能被后续 LRU 淘汰失效）。
-- `state_after(inst_id)` → 值返回（= before + apply 本条 diff）。
-- `warm_range(start, end, stride, progress)` → 预热缓存：按 stride 采样若干 checkpoint 插入 LRU，使后续 `state_before()` 命中附近 baseline，最多 replay stride 条而非几千条。Pass 在密集遍历前调用。
-- `warm_at(inst_id)` → 预热单点。
-- `cache_stats()` → hits/misses/warm_samples。
-
-**LRU**：4096 条 × 272B ≈ 1.1MB。用 `common/types.h` 的零分配 LRU（数组 + 侵入式链表）。
-
-**性能**：cache hit <1μs；跨 anchor 随机跳转 ~500μs（加载 anchor + apply ≤4096 diff）；`warm_range` 批量 ~2ms/万条。
-
-**双向遍历**：LRU 存 `state_before`。`state_after(id)` = `state_before(id+1)` = `state_before(id)` + apply diff[id]。逆向单步若 LRU 有前一条则直接命中。
-
-## MemoryModel — 时间索引内存
-
-**设计**：所有内存写按 `[page(8)|page_off(2)|inst_id(8)]` 大端编码存入 RocksDB `mem_write` CF。单条 N 字节写产生 1 个 KV（跨页拆 2 个），value = `[size(1)|data]`。这比逐字节存省 8-16x KV 数量。
-
-**读查询** `read(addr, size, at_inst_id)`：
-1. page = addr >> 12。
-2. 用 RocksDB iterator `SeekForPrev([page|target_byte_off|at_inst_id])`。
-3. 向前回扫，找覆盖目标字节的写（写的 `[page_off, page_off+size)` 覆盖 target_byte）。
-4. 回扫上限 = MAX_WRITE_SIZE-1（16B 写最多覆盖前 15 字节）。
-5. 拼装 `MemReadResult{data[16], known[16], writer_id[16]}`。
-
-**mem_read CF 的妙用**：read 访问携带当时内存值。若某地址从未被追踪代码写过（如未插桩代码准备的 buffer），可从最近 read 恢复值。编码与 mem_write 相同。
-
-**接口**：
-- `read(addr, size, at_inst_id)` → 16B 内结果。
-- `read_region(addr, size, at_inst_id)` → 任意大小，内部分块。
-- `last_writer(addr, size, before_id)` → inst_id。
-- `write_history(addr, size)` → 所有写入时刻列表。
-- `byte_at(addr, at_inst_id)` → 单字节。
-- `active_pages()` → 所有被访问过的页的活动统计（PageActivity：first/last inst_id、读/写计数）。
-- `was_accessed(addr)` → 单地址快速判断。
-
-**缓存**：三級——
-1. `page_cache_`：512 页的 LRU，缓存页内完整写历史（`vector<MemWrite>`）。
-2. `byte_cache_`：65536 项的 `(addr,inst_id)→byte` 热查询缓存。
-3. RocksDB block cache（256MB）。
-
-**线程安全**：thread_local iterator 池（每线程缓一对 write/read iterator，按 owner_db 校验避免 use-after-free）。`cache_mutex_`/`byte_cache_mutex_` 保护缓存。统计用 atomic。
-
-**懒加载**：不预加载任何内存数据。`build()` 单遍扫 trace 写入 mem_write CF（带 sentinel 防重复构建）。内存占用与活跃分析地址范围成正比，而非 trace 总量。
-
-## InstructionDecoder — Capstone + 缓存
-
-**设计**：Capstone handle 非线程安全，用 mutex 保护。`DecodedInst` 用**定长数组**（mnemonic[12]/op_str[64]/regs_read[8]/regs_written[8]）消除热路径堆分配。
-
-**接口**：
-- `decode(pc, opcode)` → `optional<DecodedInst>`。
-- `decode(pc, code_table)` → 便捷包装。
-- `format(pc, opcode)` → "addr: mnemonic operands" 字符串。
-
-**LRU**：16384 条，按 PC 缓存。同一 PC 的指令语义确定（除 SMC，本系统暂不支持版本链）。
-
-**注意**：许多 Pass 用 `common/aarch64_classify.h` 的纯位运算分类，绕过 Capstone 提速。
-
-## TritonBridge — 语义预言机（可选）
-
-**设计**：抽象接口 `TritonBridge`，默认 `TritonBridgeStub`（全返回 not available）。`create_triton_bridge()` 工厂在链接了 libTriton 时返回真实实现，否则返回 stub。`TritonBridgeTaint` 扩展接口提供污点 API（`taint_register`/`process_instruction`/`is_register_tainted`）。
-
-**语义查询**：`query_semantics(pc, code, size)` → `InstructionSemantics{reg_accesses, mem_accesses, is_branch/is_call/is_return, expression}`。`set_register_context()`/`set_memory_context()` 设具体状态做上下文敏感分析。
-
-**TritonPool**：池化 4 个 TritonBridge 实例供并发 Pass 使用。`borrow()` 返回 RAII `BorrowedBridge`，析构自动归还。池满阻塞。
-
-**降级策略**：无 Triton 时，TaintPass/BackwardTaintPass 用启发式 fallback（基于 `aarch64_classify.h` 的指令分类 + 手写传播规则），精度略降但功能完整。
-
-**编译开关**：`TENET_ENABLE_TRITON=ON/OFF`。OFF 时编译为纯 stub，无 libTriton 依赖。
-
-## BreakpointEngine — 时空断点
-
-**设计**：在静态 trace 上模拟断点/观察点，支持前向（continue）和后向（reverse-continue）。
-
-**三种断点**：
-| 类型 | 结构 | 复杂度 | 实现 |
-|------|------|--------|------|
-| PC 断点 | `PcBreakpoint{addr}` | O(1) | 从 XRef 的 `pc_to_inst_ids` bitmap 直接取所有命中 inst_id |
-| 内存写观察点 | `WatchBreakpoint{addr, size}` | O(log N) | 从 RocksDB mem_write CF 取该地址所有写入 |
-| 条件断点 | `ConditionalBreakpoint{predicate}` | O(N) | 顺序扫，每条调 predicate |
-
-**接口**：
-- `add_breakpoint(spec)` / `remove_breakpoint(id)` / `clear_breakpoints()`。
-- `run_forward(from_id)` / `run_backward(from_id)` → `optional<BreakpointHit>`。
-- 便捷：`next_execution(pc, from)` / `prev_execution(pc, from)` / `next_write(addr, size, from)` / `prev_write(...)`。
-
-**TUI 命令**：`parse_breakpoint_cmd("b 0x1234")` → PcBreakpoint；`"w 0x1234 8"` → WatchBreakpoint。
-
-## 组件交互
-
-```
-        ┌──────────────┐
-        │ TritonPool    │  (语义/污点，可选)
-        └──────┬───────┘
-               │ borrow()
-   ┌───────────┼───────────┐
-   ▼           ▼           ▼
-┌─────────┐ ┌───────────┐ ┌──────────────────┐
-│RegFile  │ │MemoryModel│ │InstructionDecoder │
-└────┬────┘ └─────┬─────┘ └────────┬─────────┘
-     │            │                │
-     └────────────┴────────────────┘
-                  │ 都依赖
-                  ▼
-          ┌─────────────────┐
-          │ IO (TraceReader │
-          │  + TraceIndex)  │
-          └─────────────────┘
+```mermaid
+flowchart LR
+    IO[TraceReader + TraceIndex + CodeTable] --> RF[RegisterFile]
+    IO --> MM[MemoryModel]
+    IO --> DEC[InstructionDecoder]
+    RF --> TB[TritonBridge / TritonPool]
+    MM --> TB
+    DEC --> TB
+    RF --> BP[BreakpointEngine]
+    MM --> BP
 ```
 
-Pass 使用典型模式：`regfile.state_before(id)` 取状态 → `code_table.opcode_at(pc)` 取指令 → `decoder.decode(pc, opcode)` 或 `triton.query_semantics(...)` 取语义 → `memory.read(addr, size, id)` 取内存值。
+## 1. RegisterFile：任意时刻寄存器重建
 
-## 线程安全模型
+`RegisterFile` 的任务是：给定一个 `inst_id`，快速回答“这条指令执行前 / 后 34 个 GPR 分别是什么”。
 
-| 组件 | 线程安全 | 说明 |
-|------|----------|------|
-| TraceReader | 完全 | 只读 mmap |
-| TraceIndex | 完全 | RocksDB MVCC |
-| RegisterFile | 单线程 | LRU 无锁，每 Pass 线程建议独立实例（轻量） |
-| MemoryModel | 并发安全 | thread_local iterator + 缓存 mutex |
-| InstructionDecoder | mutex 保护 | Capstone handle 非线程安全 |
-| TritonBridge | 池化 | 每实例独占，池本身 mutex |
-| BreakpointEngine | 单线程 | 读多写少，调用方串行 |
+### 基本机制
 
-**推荐**：每 Pass 线程拥有独立 RegisterFile/Decoder（轻量），共享 TraceReader/TraceIndex（天然安全），TritonBridge 通过池化共享。
+trace 里不会为每条指令保存完整寄存器快照，而是：
 
-## 关键设计决策
+- 周期性 `ANCHOR` 记录保存全量寄存器
+- 普通 `INST` 只记录改动过的寄存器 diff
 
-1. **Anchor 周期是核心**：整个寄存器重建依赖 ANCHOR 间隔。间隔大→重建慢但 trace 小；间隔小→重建快但 trace 大。qbditrace 默认 ~4096。
-2. **内存写按「写」粒度存**：而非逐字节。一次 8B STR 只产 1 个 KV，读时回扫找覆盖写。
-3. **mem_read 回填**：巧妙利用 read 访问携带的值，恢复未插桩代码写入的数据。
-4. **Triton 可选**：stub 模式保证无 libTriton 也能编译运行，启发式 fallback 保功能。
-5. **BreakpointEngine 索引加速**：PC/内存断点不扫 trace，直接查索引，秒级定位。
+于是 `RegisterFile` 的查询流程是：
+
+1. 用 `TraceIndex::nearest_anchor_before(inst_id)` 找最近 anchor
+2. 从 anchor 读出完整寄存器集
+3. 从 anchor 到目标位置依次 apply diff
+4. 把结果缓存进 LRU
+
+### 为什么这样设计
+
+- 全量快照每条都存，trace 会非常大
+- 每次从头 replay 到当前位置，查询又会太慢
+
+所以 ANCHOR + diff 是一个平衡点：
+
+- trace 不会膨胀到不可用
+- 任意跳转仍然能在微秒到亚毫秒级完成
+
+### 关键接口
+
+| 接口 | 作用 |
+|------|------|
+| `state_before(inst_id)` | 最常用，返回执行前状态 |
+| `state_after(inst_id)` | 返回执行后状态 |
+| `warm_range(start,end,stride,...)` | 预热一段范围的缓存 |
+| `warm_at(inst_id)` | 预热某个热点点位 |
+| `cache_stats()` | 查看缓存命中情况 |
+
+### 什么时候会受益于预热
+
+- 某个 pass 需要在一小段范围内大量取 `state_before()`
+- GUI / TUI 在附近滚动浏览
+- 需要多次采样循环多轮迭代的寄存器状态
+
+## 2. MemoryModel：时间感知内存模型
+
+`MemoryModel` 的职责是：
+
+- 回答“某个地址在某个时刻的值是什么”
+- 回答“谁最后写了它”
+- 回答“这个区域有哪些写历史”
+
+### 关键思想
+
+它并不维护一个巨大的“每时刻完整内存镜像”，而是把写入记录落进 RocksDB：
+
+- key 编码页号、页内偏移和 `inst_id`
+- value 编码写入大小与数据内容
+
+查询时再按时间回扫最近覆盖写。
+
+### 读查询怎么工作
+
+对 `read(addr, size, at_inst_id)`：
+
+1. 找到地址所在页
+2. 用 RocksDB iterator 跳到不晚于 `at_inst_id` 的最近记录
+3. 向前回扫覆盖当前字节的写
+4. 拼装出 `MemReadResult`
+
+### 为什么 `mem_read` 也要入库
+
+有些数据不是被当前追踪代码写出来的，而是：
+
+- 由未插桩代码准备
+- 从共享缓存、系统库或外部路径带进来
+
+如果 trace 里有 read 访问，并且 read 记录带着当时读到的值，那么 `MemoryModel` 可以用 `mem_read` CF 去“回填”这部分历史。这是它非常有价值的一点。
+
+### 关键接口
+
+| 接口 | 作用 |
+|------|------|
+| `read(addr,size,at_inst_id)` | 小块时间感知读取 |
+| `read_region(addr,size,at_inst_id)` | 任意长度区域读取 |
+| `last_writer(addr,size,before_id)` | 找最近写入者 |
+| `write_history(addr,size)` | 列出所有写时刻 |
+| `byte_at(addr,at_inst_id)` | 单字节查询 |
+| `active_pages()` | 活跃页统计 |
+| `was_accessed(addr)` | 地址是否出现过 |
+
+### 缓存层级
+
+`MemoryModel` 不是每次都重新扫 RocksDB，它用了三层缓存：
+
+1. `page_cache_`：缓存整页写历史
+2. `byte_cache_`：缓存热点 `(addr,inst_id) -> byte`
+3. RocksDB block cache
+
+## 3. InstructionDecoder：把 opcode 变成人能看的指令
+
+`InstructionDecoder` 基于 Capstone，但做了两层工程封装：
+
+- 线程安全保护（Capstone handle 本身不安全）
+- 热路径缓存（同一个 PC 不应重复解码）
+
+### 典型用途
+
+- GUI / TUI 渲染指令行
+- CLI / RPC / MCP 输出反汇编文本
+- 各类 pass 判断 mnemonic、操作数字符串或读写集合
+
+### 接口
+
+| 接口 | 作用 |
+|------|------|
+| `decode(pc, opcode)` | 解码一条 opcode |
+| `decode(pc, code_table)` | 从 `CodeTable` 间接解码 |
+| `format(pc, opcode)` | 直接生成字符串形式 |
+
+### 为什么很多 pass 还要绕过它
+
+不是所有场景都值得走 Capstone。对热循环上的快速分类，tenet 还提供了 `common/aarch64_classify.h` 这类纯位运算判断，避免所有指令都做完整解码。
+
+## 4. TritonBridge / TritonPool：按需精确语义
+
+Triton 在 tenet 里不是“永远在线的大脑”，而是按需借用的精确语义引擎。
+
+### 为什么要桥接层
+
+- Triton 是可选依赖，不一定总能启用
+- tenet 需要在无 Triton 时仍能运行
+- 不同 pass 不应直接依赖 Triton 细节 API
+
+所以 tenet 把它包装成：
+
+- `TritonBridge`：统一语义接口
+- `TritonBridgeStub`：无 Triton 时的降级实现
+- `TritonBridgeTaint`：精确污点接口扩展
+- `TritonPool`：多个 pass 并发时的实例池
+
+### 典型场景
+
+- 精确寄存器 / 内存读写集合查询
+- 前向污点传播
+- 反向污点的精细语义判断
+- 分析某些复杂 AArch64 指令对状态的影响
+
+### 为什么要池化
+
+Triton 实例不是零成本对象，而且并发访问时需要隔离上下文。池化让 tenet 能：
+
+- 控制实例数量
+- 避免反复创建销毁
+- 在多 pass 并发时按需 borrow / return
+
+## 5. BreakpointEngine：在静态 trace 上模拟调试体验
+
+`BreakpointEngine` 不是在线调试器，它是在一条已经录完的时间轴上模拟调试语义。
+
+### 支持的断点类型
+
+| 类型 | 思路 |
+|------|------|
+| PC 断点 | 利用 XRef 的 `pc -> inst_ids` 直接定位命中点 |
+| 内存写观察点 | 利用 `mem_write` 倒排查找地址写入 |
+| 条件断点 | 顺序扫并调用 predicate |
+
+### 关键价值
+
+- 可以做 forward / reverse continue
+- 支撑 GUI / TUI 里的时间导航体验
+- 不需要重新执行程序，也不依赖在线环境
+
+### 接口
+
+| 接口 | 作用 |
+|------|------|
+| `add_breakpoint()` / `remove_breakpoint()` | 管理断点 |
+| `run_forward(from_id)` | 前向继续到下一命中 |
+| `run_backward(from_id)` | 反向继续到上一命中 |
+| `next_execution(pc, from)` | 找某 PC 下一次执行 |
+| `next_write(addr, size, from)` | 找某地址下一次写入 |
+
+## 6. Core 层如何服务 Analysis 层
+
+Analysis 层经常组合使用 Core 对象：
+
+```mermaid
+flowchart TD
+    A[inst_id] --> B[RegisterFile.state_before]
+    A --> C[TraceIndex / CodeTable]
+    B --> D[InstructionDecoder.decode]
+    B --> E[MemoryModel.read]
+    D --> F[TritonBridge.query_semantics]
+    E --> F
+    F --> G[Pass result]
+```
+
+典型模式是：
+
+1. 用 `inst_id` 找到当前 `pc`
+2. 用 `RegisterFile` 拿执行前状态
+3. 用 `CodeTable + InstructionDecoder` 还原指令
+4. 用 `MemoryModel` 取相关地址的值
+5. 需要高精度时再调 Triton
+
+## 7. 线程安全与对象共享原则
+
+| 组件 | 并发特性 | 实践建议 |
+|------|----------|----------|
+| `TraceReader` | 完全只读安全 | 可以全局共享 |
+| `TraceIndex` | RocksDB 并发安全 | 可以全局共享 |
+| `RegisterFile` | 偏向单线程缓存 | 热路径建议每个 worker 私有或串行用 |
+| `MemoryModel` | 并发安全 | 可共享 |
+| `InstructionDecoder` | 内部 mutex | 可共享，但高并发下注意争用 |
+| `TritonBridge` | 实例独占 | 通过 `TritonPool` 借用 |
+| `BreakpointEngine` | 偏向单线程交互 | 主要供 GUI / TUI 主线程使用 |
+
+## 8. 这一层最重要的设计取舍
+
+### ANCHOR 周期
+
+- anchor 更密：查询更快，trace 更大
+- anchor 更稀：查询更慢，trace 更小
+
+### 写粒度索引，而非全量镜像
+
+- 写粒度索引让 `MemoryModel` 可扩展到大 trace
+- 代价是读取时必须做回扫拼装
+
+### Triton 可选，而不是硬依赖
+
+- 好处：开发、部署、调试门槛更低
+- 代价：无 Triton 时某些分析精度会下降
+
+### Core 与 UI 解耦
+
+- GUI/TUI 直接消费 Core，但不在 Core 中写界面逻辑
+- Core 的任务只是不偏不倚地回答“当时状态是什么”
+
+## 9. 改这一层代码时优先检查什么
+
+- 这个能力应不应该落在 Core，而不是 Analysis 或 UI？
+- 会不会把缓存做成线程争用热点？
+- 是否破坏了 `state_before()` / `state_after()` 的时间语义？
+- `MemoryModel` 的 key / value 变化会不会影响历史兼容？
+- 无 Triton 时是否仍然能优雅降级？
+
+## 继续阅读
+
+- 想看这些状态如何被组织成可组合分析：看 [`analysis-layer.md`](analysis-layer.md)
+- 想看它们的底层数据来源：看 [`io-layer.md`](io-layer.md)
+- 想看 GUI / CLI / MCP 如何消费这些对象：看 [`ui-layer.md`](ui-layer.md)
+- 想写一个依赖这些对象的新 pass：看 [`pass-cookbook.md`](pass-cookbook.md)

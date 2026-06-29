@@ -1,259 +1,225 @@
-# Tenet — 离线 Trace 分析器 总体架构设计 (v2)
+# tenet 设计说明
 
-## 设计哲学
+这份文档回答的不是“有哪些类和文件”，而是“为什么 tenet 会长成现在这样”。
 
-1. **不重新发明轮子**：指令语义、污点传播、符号执行交给 Triton；图布局交给 Graphviz；KV 索引交给 RocksDB。只自研真正独特的部分（trace 重建、Pass 编排）。
-2. **极致性能**：mmap 零拷贝、列式二级索引、Anchor+Diff O(1) 状态重建、Pass 级并行。
-3. **可扩展分析**：LLVM 风格 Pass Pipeline，每个分析能力是一个独立 Pass，支持依赖声明、缓存、按需触发。
+如果你想看模块边界、启动流程和能力入口，优先读：
 
-## 技术栈
+- [`docs/README.md`](docs/README.md)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/capabilities.md`](docs/capabilities.md)
 
-| 组件 | 选型 | 许可证 | 作用 |
-|------|------|--------|------|
-| 指令语义/污点/符号 | **Triton** (libTriton) | Apache 2.0 | 核心分析引擎 |
-| 反汇编 | **Capstone** | BSD-3 | 指令解码与显示 |
-| Trace 存储 | **mmap** (POSIX) | — | 零拷贝原始流访问 |
-| 二级索引 | **RocksDB** | Apache 2.0 | PC→时间戳、地址→访问点等倒排索引 |
-| CFG 布局 | **Graphviz** (libcgraph + libgvc) | EPL-1.0 | Sugiyama 分层布局 |
-| 压缩 | **Zstd** (seekable format) | BSD-3 | 可选的 trace 压缩与随机访问 |
-| Bitmap | **Roaring Bitmap** | Apache 2.0 | 大规模 inst_id 集合（污点结果等） |
-| TUI | **FTXUI** | MIT | 终端交互界面 |
-| 构建 | **CMake** 3.20+ | — | — |
-| 测试 | **Catch2** | BSL-1.0 | 单元测试 |
-| 语言 | **C++17** | — | 与 Triton/Capstone/RocksDB 原生兼容 |
+## 设计目标
 
-## 架构总览
+tenet 要解决的问题不是“做一个反汇编器”，而是“把一次真实执行过程变成可反复查询的离线分析样本”。围绕这个目标，设计重点是：
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Frontend (UI / CLI / API)                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                        Pass Pipeline (Analysis)                      │
-│  ┌────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────┐  │
-│  │ TaintPass  │ │ XRefPass     │ │ CFGPass      │ │ UserPass…  │  │
-│  └─────┬──────┘ └──────┬───────┘ └──────┬───────┘ └─────┬──────┘  │
-│        └───────────┬────┴───────────┬────┴───────────────┘         │
-│                    ▼                ▼                                │
-│              PassManager (依赖解析 + 缓存 + 调度)                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                        Core (State Reconstruction)                   │
-│  ┌───────────────┐ ┌────────────────┐ ┌────────────────────────┐   │
-│  │ RegisterFile   │ │ MemoryModel    │ │TritonContext (per-inst)│   │
-│  │ (Anchor+Diff)  │ │ (Temporal KV)  │ │(语义/污点/符号 delegate)│   │
-│  └───────────────┘ └────────────────┘ └────────────────────────┘   │
-├─────────────────────────────────────────────────────────────────────┤
-│                        IO (Storage + Index)                          │
-│  ┌────────────┐ ┌────────────────┐ ┌──────────┐ ┌──────────────┐  │
-│  │TraceReader │ │ RocksDB Index  │ │CodeTable │ │ SymbolTable  │  │
-│  │(mmap zero  │ │ (倒排索引)     │ │(代码缓存)│ │ (符号加载)   │  │
-│  │  copy)     │ │                │ │          │ │              │  │
-│  └────────────┘ └────────────────┘ └──────────┘ └──────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-```
+1. **保留真实执行语义**：所有分析都建立在真实 trace 上，而不是静态猜测。
+2. **让随机查询足够快**：任意跳到某个 `inst_id` 时，用户不能等待秒级重建。
+3. **让分析能力可叠加**：函数、CFG、污点、模式识别不能彼此写死耦合。
+4. **让入口层复用同一核心**：GUI、CLI、RPC、MCP 看到的是同一套结果，而不是四套实现。
+5. **让大 trace 仍然可工作**：设计要面向亿级指令、GB 级 trace，而不是 demo 数据。
 
-## Pass Pipeline 设计
+## 非目标
 
-### 核心概念
+- 不把 tenet 做成在线插桩器；录制由 `qbditrace` 负责。
+- 不把 tenet 做成通用反编译器；它消费的是动态执行历史，不试图替代 IDA / Ghidra。
+- 不要求所有分析都在启动时全量完成；按需和缓存优先于“一次算完所有东西”。
 
-```cpp
-// 每个 Pass 是一个独立的分析单元
-class AnalysisPass {
-public:
-    virtual ~AnalysisPass() = default;
+## 核心设计选择
 
-    // Pass 元信息
-    virtual std::string name() const = 0;
-    virtual std::string description() const = 0;
+### 1. 用 trace 作为唯一事实来源
 
-    // 依赖声明：本 pass 需要哪些其他 pass 的结果
-    virtual std::vector<std::string> dependencies() const { return {}; }
+tenet 的所有高层能力都建立在 trace 之上：
 
-    // 执行入口
-    virtual PassResult run(PassContext& ctx) = 0;
+- 函数边界来自实际调用/返回行为
+- CFG 来自真实执行过的转移
+- 污点传播建立在真实寄存器和内存状态上
+- 模式识别建立在真实常量、循环和调用上下文上
 
-    // 可选：增量更新（当 trace 范围变化时，无需完全重跑）
-    virtual bool supports_incremental() const { return false; }
-    virtual PassResult update(PassContext& ctx, const Range& changed) {
-        return run(ctx);
-    }
-};
+这让 tenet 天然适合处理：
 
-// PassContext 提供对 Core 层和其他 Pass 结果的访问
-class PassContext {
-public:
-    // Core 层访问
-    TraceReader& reader();
-    RegisterFile& regfile();
-    MemoryModel& memory();
-    triton::API& triton();       // Triton 实例
-    RocksDBIndex& index();
+- 间接跳转
+- 运行时解密
+- 动态派发
+- ObjC / 系统调用上下文
+- 只在某些输入下出现的执行路径
 
-    // 获取已运行 Pass 的结果
-    template<typename T>
-    const T& result(const std::string& pass_name);
+代价是：它只能回答“这次运行发生了什么”，而不是“理论上所有可能路径是什么”。这是刻意取舍。
 
-    // 查询范围（可能是全 trace，也可能是子范围）
-    Range analysis_range() const;
+### 2. 分层，而不是单体上下文
 
-    // 进度回调
-    void report_progress(float pct, const std::string& msg);
-};
-
-// PassManager：注册、依赖解析、缓存、调度
-class PassManager {
-public:
-    void register_pass(std::unique_ptr<AnalysisPass> pass);
-
-    // 按需执行：自动解析依赖链
-    template<typename ResultT>
-    const ResultT& require(const std::string& pass_name);
-
-    // 并行执行所有无依赖冲突的 pass
-    void run_all();
-
-    // 使某个 pass 的缓存失效
-    void invalidate(const std::string& pass_name);
-};
+```mermaid
+flowchart LR
+    IO[IO\ntrace + index] --> CORE[Core\nstate reconstruction]
+    CORE --> ANA[Analysis\npass pipeline]
+    ANA --> UI[UI / Service\nGUI CLI RPC MCP]
 ```
 
-### 内置 Pass 列表
+这样分层的原因是：
 
-| Pass 名 | 依赖 | 输出 | 说明 |
-|----------|------|------|------|
-| `IndexBuildPass` | — | RocksDB 倒排索引 | 首次打开时构建，之后缓存 |
-| `XRefPass` | IndexBuildPass | `XRefResult` | Use-Def / Def-Use 链 |
-| `TaintPass` | XRefPass | `TaintResult` (Roaring Bitmap) | 正/逆向污点，Triton 语义驱动 |
-| `CFGPass` | IndexBuildPass | `CFGResult` | 函数级 CFG + 循环识别 |
-| `CFGLayoutPass` | CFGPass | `LayoutResult` | Graphviz 分层布局坐标 |
-| `StringPass` | — | `StringResult` | 字符串扫描 |
-| `PatternPass` | StringPass | `PatternResult` | 密码学/反调试模式匹配 |
-| `CallGraphPass` | CFGPass | `CallGraphResult` | 全局调用图 |
-| `SlicePass` | XRefPass, TaintPass | `SliceResult` | 程序切片 |
+- IO 层只关心“如何快速读和定位记录”。
+- Core 层只关心“如何重建某时刻状态”。
+- Analysis 层只关心“如何把状态组织成复用结果”。
+- UI / Service 层只关心“如何把结果暴露给人或程序”。
 
-### Pass 并行策略
+如果把这些职责混在一起，任何新入口或新分析都会反复复制逻辑。
 
-```
-                 IndexBuildPass
-                /      |       \
-        XRefPass    CFGPass    StringPass
-        /    \         |          |
-  TaintPass  SlicePass CFGLayoutPass  PatternPass
-```
+### 3. 选择 RocksDB，而不是自研内存索引
 
-无依赖的 Pass 可并行执行（通过线程池）。PassManager 基于 DAG 拓扑序调度。
+大 trace 的问题不是“能不能扫出来”，而是“第二次还能不能快打开”。
 
-## Triton 集成方案
+选择 RocksDB 的原因：
 
-### 角色
+- 需要持久化，而不是每次打开都重建索引
+- 需要范围查询和倒排查询，而不是单一数组偏移
+- 需要多 Column Family，把 offset / anchor / mem / reg / code 分开治理
+- 需要在大数据量下保持工程稳定性
 
-Triton 在 tenet 中担任**语义预言机 (Semantic Oracle)**：
+代价是索引构建会比较重，但这是一次性成本；第二次打开的收益远大于代价。
 
-1. **精确的 read/write set**：给定一条指令的字节码，Triton 返回它读写了哪些寄存器和内存。比 Capstone 的 `detail->regs_read/regs_write` 精确得多（处理条件执行、隐式操作数、STP/LDP 等复杂指令）。
-2. **污点传播**：Triton 内置 TaintEngine，逐条指令处理 `taintAssignment / taintUnion`，自动处理子寄存器、内存别名、条件传播。
-3. **符号执行**：可选——对关键路径做约束求解（如验证路径可达性、提取常量）。
+### 4. 选择 ANCHOR + diff，而不是每条指令全快照
 
-### 使用模式：Trace Replay on Triton
+寄存器状态查询必须足够快，但每条 INST 都存全量寄存器会让 trace 膨胀得不可接受。
 
-```cpp
-// 不是让 Triton "执行"指令，而是 "replay" trace 上的每条指令
-void replay_instruction(triton::API& triton, const InstRecord& rec) {
-    // 1. 设置 concrete 寄存器值（来自 RegisterFile 重建）
-    for (auto& [reg_id, val] : rec.reg_state_before)
-        triton.setConcreteRegisterValue(reg_id, val);
+因此采用：
 
-    // 2. 设置 concrete 内存值（来自 MemoryModel）
-    for (auto& acc : rec.mem_reads)
-        triton.setConcreteMemoryAreaValue(acc.addr, acc.data);
+- 周期性 `ANCHOR` 存全量寄存器
+- 普通 `INST` 只存变化寄存器 diff
+- `RegisterFile` 查询时从最近 anchor 回放 diff
 
-    // 3. 让 Triton "处理"这条指令（更新内部语义/污点/符号状态）
-    triton::arch::Instruction inst;
-    inst.setAddress(rec.pc);
-    inst.setOpcode(rec.opcode, rec.opcode_size);
-    triton.processing(inst);
+这是一种典型的“空间换时间折中”：
 
-    // 4. 现在可以查询：
-    //    - inst.getReadRegisters() / getWrittenRegisters()
-    //    - inst.getLoadAccess() / getStoreAccess()
-    //    - triton.isRegisterTainted(reg) / isMemoryTainted(addr)
-    //    - inst.getSymbolicExpressions() (符号表达式)
-}
-```
+- anchor 更密：查询更快，trace 更大
+- anchor 更稀：查询更慢，trace 更小
 
-### 性能考量
+当前系统把这条边界固定在“足够快地重建，又不至于膨胀过头”的区间。
 
-- Triton `processing()` 每条指令约 **2-5 μs**（AArch64）。
-- 对 1 亿条指令做全量 replay 需 200-500s —— **不可接受作为启动成本**。
-- 解决方案：**按需 replay**。只在用户请求污点/XRef 时，对相关子范围（由 RocksDB 索引加速定位）做 Triton replay。
-- TaintPass 的典型工作量：从一个 source 出发传播 ~10K-100K 步，耗时 20ms-500ms。
+### 5. 选择 Pass Pipeline，而不是硬编码调用链
 
-## 性能目标（修订版）
+如果把功能写成：
 
-| 操作 | 目标 | 实现路径 |
-|------|------|----------|
-| 打开 1.5GB trace | < 2s（有缓存 < 50ms） | mmap + RocksDB 缓存持久化 |
-| 随机跳转 inst_id | < 500μs | 分页索引 + Anchor LRU |
-| 全量索引构建 | < 60s (100M inst) | 顺序扫描 + RocksDB batch write |
-| 正向污点 10K 步 | < 50ms | XRef 跳跃 + Triton 语义 |
-| 逆向污点 10K 步 | < 100ms | 逆向 XRef + Triton |
-| CFG 构建（单函数） | < 200ms | PC 索引直接获取 transitions |
-| CFG 布局 | < 500ms | Graphviz dot 算法 |
-| 字符串扫描 | < 30s | 内存最终快照扫描 |
-| 内存预算 | < 2GB RSS | mmap 不计入；RocksDB block cache 可配 |
+- `run_cfg()` 里直接调用 `run_xref()`
+- `run_algorithm_summary()` 里直接调用 `run_pattern()`、`run_loop()`、`run_call_graph()`
 
-## 目录结构
+那么每个入口都会复制依赖调度逻辑，功能越多越难维护。
 
-```
-tools/tenet/
-├── CMakeLists.txt
-├── README.md
-├── DESIGN.md                    ← 本文件
-├── docs/
-│   ├── io-layer.md              ← IO 层设计
-│   ├── core-layer.md            ← Core 层 + Triton 集成
-│   ├── analysis-layer.md        ← Pass Pipeline 设计
-│   ├── ui-layer.md              ← UI 接口设计
-│   └── trace-format.md          ← 与 qbditrace 的格式契约
-├── src/
-│   ├── io/                      ← TraceReader, RocksDB 索引
-│   ├── core/                    ← RegisterFile, MemoryModel, Triton 桥接
-│   ├── analysis/
-│   │   ├── pass_manager.h/cpp   ← PassManager 框架
-│   │   ├── passes/              ← 各内置 Pass
-│   │   └── results/             ← Pass 输出类型定义
-│   ├── ui/                      ← 视图层
-│   └── main.cpp
-├── include/tenet/               ← 公共 API 头文件
-├── tests/
-│   ├── unit/
-│   └── integration/
-└── third_party/                 ← 子模块或 vendored 依赖
-    ├── triton/
-    ├── capstone/
-    ├── rocksdb/
-    ├── roaring/
-    └── ftxui/
-```
+Pass Pipeline 的好处是：
 
-## 里程碑（修订版）
+- 依赖声明显式化
+- 结果缓存标准化
+- GUI / CLI / MCP 可以共用 `require(name)`
+- 新 pass 可以独立加入 catalog
 
-| 阶段 | 目标 | 预计周期 | 关键交付 |
-|------|------|----------|----------|
-| **M1** | IO 层 + 基础 Core | 2-3 周 | TraceReader, RocksDB 索引, RegisterFile, 能遍历 trace |
-| **M2** | Triton 集成 + MemoryModel | 2 周 | Triton replay 管线, 时间内存模型 |
-| **M3** | Pass Pipeline 框架 + XRef/Taint | 3 周 | PassManager, XRefPass, TaintPass |
-| **M4** | CFG + Graphviz 布局 | 2 周 | CFGPass, CFGLayoutPass, DOT/SVG 导出 |
-| **M5** | TUI 交互 | 2 周 | FTXUI 界面, 全功能交互 |
-| **M6** | 性能调优 + 100M trace 验证 | 2 周 | 基准测试, 内存优化, 并行 Pass |
-| **M7** | 扩展 Pass + 脚本接口 | 持续 | PatternPass, SlicePass, Python 绑定 |
+这也是 tenet 能从“几个功能”演进成“几十个可组合能力”的关键。
 
-## 与上一版设计的关键变化
+### 6. 选择单遍扫描融合，而不是每个 pass 各扫一次
 
-| 项目 | v1 (旧) | v2 (新) | 原因 |
-|------|---------|---------|------|
-| 污点引擎 | 自研（基于 Capstone detail） | Triton TaintEngine | 精度与正确性，免维护 |
-| 指令语义 | 手写特例表 | Triton 自动解析 | AArch64 500+ 指令无法穷举 |
-| 二级索引 | 自研分页内存结构 | RocksDB | 持久化、复杂查询、久经考验 |
-| CFG 布局 | 自研 8 步算法 | Graphviz libgvc | 工业级质量，开发成本 → 0 |
-| 分析扩展 | 硬编码层次调用 | Pass Pipeline | 可插拔、可并行、依赖自动解析 |
-| taint 集合 | `std::set<uint64_t>` | Roaring Bitmap | 亿级集合内存 1/10，交集/并集 100x 快 |
-| TUI | ncurses (undecided) | FTXUI | 现代 C++、声明式布局、零全局状态 |
+很多 pass 的基本形态其实是：
+
+- 顺序扫 trace
+- 看一部分字段
+- 做统计或收集映射
+
+如果每个 pass 独立扫一遍，大 trace 的 IO 成本会被线性放大。所以 tenet 引入：
+
+- `TraceCollector`
+- `TraceScanEngine`
+- `prepare_scan()` / `finish_scan()`
+- `run_fused_scans()`
+
+它们的目的不是“炫技”，而是压掉重复扫描。
+
+### 7. Triton 是语义引擎，不是整套系统核心
+
+tenet 依赖 Triton 做精确污点与语义推理，但没有把全部系统建立在 Triton 的重 replay 上。
+
+原因很简单：
+
+- Triton 在单条指令上的精度很好
+- 但对亿级 trace 做全量 replay 的代价太高
+
+所以 tenet 的策略是：
+
+- 常规浏览、结构恢复、索引、字符串、图恢复尽量不依赖 Triton
+- 需要精确语义时，再在局部范围内按需使用 Triton
+
+这让 Triton 成为“高价值、按需启用的语义预言机”，而不是启动成本中心。
+
+## 入口层为什么要复用同一核心
+
+GUI、CLI、RPC、MCP 的差异，本质上只是：
+
+- 谁来发起请求
+- 结果如何展示
+- 输出是面板、文本、JSON 还是工具结果
+
+它们不应该拥有不同版本的分析逻辑。
+
+因此 tenet 保持：
+
+- CLI 只是把 pass 结果格式化
+- RPC 只是把现有对象放到 Unix socket 后面
+- MCP 只是把现有对象放到工具协议后面
+- GUI/TUI 只是把现有结果可视化
+
+这个约束让“修一处，所有入口一致收益”成为可能。
+
+## 为什么要有 MCP 专用能力
+
+MCP 不是简单包装 CLI 命令。AI 使用 tenet 时，存在两个额外问题：
+
+1. 它会高频做小粒度查询
+2. 它会在证据不足时过度归纳
+
+所以 MCP 额外提供：
+
+- `batch_query`：减少往返
+- `verify_evidence`：把结论落回 trace 验证
+- `hypothesis_*`：显式建模“猜测、证据、结论”链路
+
+这让 AI 接入变成“被约束的分析流程”，而不是只会拼 prompt。
+
+## 为什么保留多种入口
+
+这是出于实际使用场景，而不是“功能越多越好”：
+
+- **GUI**：最适合人类长时间浏览和比对
+- **TUI**：最适合远程环境和轻量分析
+- **CLI**：最适合批处理、导出和脚本链路
+- **RPC**：最适合本地程序接入
+- **MCP**：最适合 AI 驱动与工具化推理
+- **MCP HTTP**：最适合没有 stdio 的宿主或远程接入
+- **Streaming**：最适合录制尚未结束时提前索引
+
+如果只保留一种入口，往往会把不属于它的需求强塞进去，结果谁都不好用。
+
+## 扩展原则
+
+新增能力时，优先遵守下面这组顺序：
+
+1. 这是不是一个新的 pass？
+2. 如果不是 pass，是不是一个现有结果的新展示方式？
+3. 如果要暴露给外部，是走 CLI、RPC 还是 MCP？
+4. 这个能力是否会重复扫描 trace，能否进入 Scan Fusion？
+5. 这个能力是否真的需要 Triton，还是普通状态查询就够了？
+
+这组问题可以有效避免：
+
+- 在 UI 层偷写分析逻辑
+- 在 CLI 和 MCP 各写一遍实现
+- 为了一个小功能引入新的全局状态
+- 对本可静态统计的能力过度使用 Triton
+
+## 当前文档分工
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：讲系统怎么装配、怎么跑起来
+- [`docs/capabilities.md`](docs/capabilities.md)：讲 tenet 能做什么
+- [`docs/io-layer.md`](docs/io-layer.md)：讲如何读 trace 和建索引
+- [`docs/core-layer.md`](docs/core-layer.md)：讲如何重建寄存器、内存和语义
+- [`docs/analysis-layer.md`](docs/analysis-layer.md)：讲 pass 体系如何组织
+- [`docs/ui-layer.md`](docs/ui-layer.md)：讲 GUI / CLI / RPC / MCP / HTTP 如何暴露能力
+
+## 最后一句话
+
+tenet 的核心设计哲学可以压缩成一句话：
+
+> 用持久化索引和按需状态重建，把一次真实执行变成一个可反复提问的分析数据库。
