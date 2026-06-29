@@ -12,6 +12,9 @@
 #include "common/Profiling.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/xref_pass.h"
+#include "analysis/passes/call_graph_pass.h"
+#include "analysis/passes/backward_taint_pass.h"
+#include "analysis/passes/cfg_layout_pass.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -31,6 +34,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <AppKit/AppKit.h>     // NSMenu, NSMenuItem, NSMenuDelegate, NSApp
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>  // UTType (NSSavePanel allowedContentTypes)
 
 namespace tenet {
 
@@ -514,8 +518,11 @@ void GuiApp::setup_fonts() {
     // ── Merge Unicode symbol ranges from Apple Symbols ───────────────────
     // The primary monospace font (SF Mono / Menlo) only covers ASCII + Latin-1.
     // UI chrome uses Unicode glyphs: arrows (←→▲▼↺↳↵⇆), geometric shapes
-    // (▶▷◁▸), stars (★☆), dingbats (⚠✂), punctuation (…—) etc.
+    // (▶▷◁▸░▒▓─), stars (★☆), dingbats (⚠✂✓✗⚙), punctuation (…—),
+    // Misc Technical (⌕⌛⌘), Braille spinner (⣾⣽⣻⢿⡿⣟⣯⣷) etc.
     // We merge these ranges from Apple Symbols so they render correctly.
+    // NOTE: All icon characters must exist in Apple Symbols — avoid PUA (U+E000+)
+    // and Emoji (U+1F3xx+) ranges as Apple Symbols does not cover them.
     static const char* symbol_font = "/System/Library/Fonts/Apple Symbols.ttf";
     if (FILE* sf = fopen(symbol_font, "rb")) {
         fclose(sf);
@@ -524,18 +531,20 @@ void GuiApp::setup_fonts() {
         //   U+00D7        × (multiplication sign, used for close button)
         //   U+2013–U+2026 General Punctuation (—, …)
         //   U+2190–U+21FF Arrows (←→↑↓↺↳↵⇆ and friends)
-        //   U+2395        ⌕ (APL search icon)
-        //   U+25A0–U+25FF Geometric Shapes (▶▷◁▲▼▸ etc.)
-        //   U+2600–U+26FF Misc Symbols (★☆⚠ etc.)
-        //   U+2700–U+27BF Dingbats (✂ etc.)
+        //   U+2300–U+23FF Misc Technical (⌕⌛⌘ and various)
+        //   U+2500–U+25FF Box Drawing + Block Elements + Geometric Shapes (▶▷◁▲▼▸░▒▓─ etc.)
+        //   U+2600–U+26FF Misc Symbols (★☆⚠⚙ etc.)
+        //   U+2700–U+27FF Dingbats + Misc Math (✂✓✗ etc.)
+        //   U+2800–U+28FF Braille Patterns (⣾⣽⣻⢿⡿ spinner animation)
         static const ImWchar symbol_ranges[] = {
             0x00D7, 0x00D7,   // ×
             0x2013, 0x2026,   // —…
             0x2190, 0x21FF,   // Arrows
-            0x2395, 0x2395,   // ⌕
-            0x25A0, 0x25FF,   // Geometric Shapes
-            0x2600, 0x26FF,   // Misc Symbols
-            0x2700, 0x27BF,   // Dingbats
+            0x2300, 0x23FF,   // Misc Technical (⌕⌛⌘⌦ etc.)
+            0x2500, 0x25FF,   // Box Drawing + Block Elements + Geometric Shapes
+            0x2600, 0x26FF,   // Misc Symbols (★☆⚠⚙ etc.)
+            0x2700, 0x27FF,   // Dingbats + Supplemental Arrows-B
+            0x2800, 0x28FF,   // Braille Patterns (spinner: ⣾⣽⣻⢿⡿⣟⣯⣷)
             0,
         };
 
@@ -633,56 +642,130 @@ void GuiApp::apply_settings() {
 //  • GuiApp::setup_native_menu — builds the NSMenu tree and calls [NSApp setMainMenu:].
 
 // ── Integer tag for each menu item (visible to both ObjC and C++) ────────────
+//
+// Tag space layout:
+//   100-199  File / App
+//   200-299  Edit
+//   300-399  View  (panels)
+//   400-499  Navigate
+//   500-599  Analysis  (run passes)
+//   600-699  Export
+//   700-799  Tools  (one-shot queries / diagnostics)
+//   800-899  Help
+//
 enum MenuTag : NSInteger {
-    kTagFileQuit          = 100,
-    kTagEditSettings      = 200,
-    kTagViewRegisters     = 300,
-    kTagViewMemory        = 301,
-    kTagViewCallStack     = 302,
-    kTagViewAnalysis      = 303,
-    kTagViewHexDump       = 304,
-    kTagViewStrings       = 305,
-    kTagViewFunctions     = 306,
-    kTagViewThreads       = 307,
-    kTagViewMinimap       = 310,
-    kTagViewLoops         = 311,
-    kTagViewCFG           = 312,
-    kTagViewObjC          = 320,
-    kTagViewLoopSemantics = 321,
-    kTagViewPatterns      = 322,
-    kTagViewConstants     = 323,
-    kTagViewAlgoSummary   = 324,
-    kTagViewCallGraph          = 325,
+    // ── File / App: 100-199 ──────────────────────────────────────────
+    kTagFileQuit              = 100,
+
+    // ── Edit: 200-299 ───────────────────────────────────────────────
+    kTagEditSettings          = 200,
+
+    // ── View — Core panels: 300-309 ─────────────────────────────────
+    kTagViewRegisters         = 300,
+    kTagViewMemory            = 301,
+    kTagViewCallStack         = 302,
+    kTagViewAnalysis          = 303,
+    kTagViewHexDump           = 304,
+    kTagViewStrings           = 305,
+    kTagViewFunctions         = 306,
+    kTagViewThreads           = 307,
+
+    // ── View — Visualization: 310-319 ───────────────────────────────
+    kTagViewMinimap           = 310,
+    kTagViewLoops             = 311,
+    kTagViewCFG               = 312,
+
+    // ── View — Analysis Results (ObjC/iOS): 320-329 ─────────────────
+    kTagViewObjC              = 320,
+    kTagViewLoopSemantics     = 321,
+    kTagViewPatterns          = 322,
+    kTagViewConstants         = 323,
+    kTagViewAlgoSummary       = 324,
+    kTagViewCallGraph         = 325,
     kTagViewObjCCrypto        = 326,
     kTagViewMemStrings        = 327,
     kTagViewSyscallIntercept  = 328,
     kTagViewCacheSim          = 329,
+
+    // ── View — Profiling & Diff: 330-339 ────────────────────────────
     kTagViewRegTimeline       = 330,
     kTagViewDwarf             = 331,
     kTagViewTraceDiff         = 332,
-kTagViewTraceFold         = 333,
-kTagViewLog               = 334,
-kTagViewCacheManager      = 335,
-    kTagNavGoto           = 400,
-    kTagNavSearch         = 401,
-    kTagNavBack           = 402,
-    kTagNavForward        = 403,
-    kTagNavFirst          = 404,
-    kTagNavLast           = 405,
-    kTagNavBookmark       = 406,
-    kTagNavFollowCall     = 407,
-    kTagNavFollowReturn   = 408,
-    kTagAnaTaint          = 500,
-    kTagAnaBackTaint      = 501,
-    kTagAnaSlice          = 502,
-    kTagAnaFunction       = 510,
-    kTagAnaXref           = 511,
-    kTagAnaStrings        = 512,
-    kTagAnaThread         = 513,
-    kTagAnaCallGraph      = 514,
-    kTagAnaLoop           = 515,
-    kTagAnaCFG            = 516,
-    kTagAnaClear          = 520,
+    kTagViewTraceFold         = 333,
+    kTagViewLog               = 334,
+    kTagViewCacheManager      = 335,
+
+    // ── Navigate: 400-419 ───────────────────────────────────────────
+    kTagNavGoto               = 400,
+    kTagNavSearch             = 401,
+    kTagNavBack               = 402,
+    kTagNavForward            = 403,
+    kTagNavFirst              = 404,
+    kTagNavLast               = 405,
+    kTagNavBookmark           = 406,
+    kTagNavFollowCall         = 407,
+    kTagNavFollowReturn       = 408,
+    kTagNavNextTainted        = 410,
+    kTagNavPrevTainted        = 411,
+    kTagNavNextBackTainted    = 412,
+    kTagNavPrevBackTainted    = 413,
+
+    // ── Analysis — Data Flow: 500-509 ───────────────────────────────
+    kTagAnaTaint              = 500,
+    kTagAnaBackTaint          = 501,
+    kTagAnaSlice              = 502,
+    kTagAnaRegTimeline        = 503,
+    kTagAnaProducerChain      = 504,
+
+    // ── Analysis — Structure: 510-519 ───────────────────────────────
+    kTagAnaFunction           = 510,
+    kTagAnaXref               = 511,
+    kTagAnaStrings            = 512,
+    kTagAnaThread             = 513,
+    kTagAnaCallGraph          = 514,
+    kTagAnaLoop               = 515,
+    kTagAnaCFG                = 516,
+
+    // ── Analysis — Crypto & Pattern: 520-529 ────────────────────────
+    kTagAnaPattern            = 520,
+    kTagAnaConstants          = 521,
+    kTagAnaLoopSemantics      = 522,
+    kTagAnaAlgoSummary        = 523,
+    kTagAnaObjCCrypto         = 524,
+
+    // ── Analysis — ObjC / iOS: 530-539 ──────────────────────────────
+    kTagAnaObjC               = 530,
+    kTagAnaAPIIntercepts      = 531,
+
+    // ── Analysis — Profiling: 540-549 ───────────────────────────────
+    kTagAnaCacheSim           = 540,
+    kTagAnaTraceFold          = 541,
+    kTagAnaTraceDiff          = 542,
+    kTagAnaMemStrings         = 543,
+
+    // ── Analysis — Maintenance: 590-599 ─────────────────────────────
+    kTagAnaClearTaint         = 590,
+    kTagAnaClear              = 591,
+
+    // ── Export: 600-699 ─────────────────────────────────────────────
+    kTagExportCFG             = 600,
+    kTagExportCallGraph       = 601,
+    kTagExportBackwardTaintGraph = 602,
+    kTagExportDataflowGraph   = 603,
+
+    // ── Tools: 700-799 ──────────────────────────────────────────────
+    kTagToolEntropy           = 700,
+    kTagToolMemSnapshot       = 701,
+    kTagToolLiteralSearch     = 702,
+    kTagToolMemSearch         = 703,
+    kTagToolYaraScan          = 704,
+    kTagToolMemHistory        = 705,
+    kTagToolCallContext       = 706,
+
+    // ── Help: 800-899 ───────────────────────────────────────────────
+    kTagHelpAbout             = 800,
+    kTagHelpDocs              = 801,
+    kTagHelpShortcuts         = 802,
 };
 
 // ── ObjC action target ────────────────────────────────────────────────────────
@@ -736,9 +819,11 @@ static NSMenu* tenet_make_submenu(NSString* title, TenetMenuDelegate* delegate) 
 void tenet::GuiApp::_post_native_action(long tag) {
     std::function<void()> action;
     switch (static_cast<MenuTag>(tag)) {
+        // ── File / App ──────────────────────────────────────────────────
         case kTagFileQuit:          action = [this]{ begin_shutdown(); }; break;
         case kTagEditSettings:      action = [this]{ show_settings_ = true; }; break;
 
+        // ── View — Core Panels ───────────────────────────────────────────
         case kTagViewRegisters:     action = [this]{ show_registers_         = !show_registers_;         }; break;
         case kTagViewMemory:        action = [this]{ show_memory_             = !show_memory_;             }; break;
         case kTagViewCallStack:     action = [this]{ show_callstack_          = !show_callstack_;          }; break;
@@ -747,29 +832,38 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagViewStrings:       action = [this]{ show_strings_            = !show_strings_;            }; break;
         case kTagViewFunctions:     action = [this]{ show_functions_          = !show_functions_;          }; break;
         case kTagViewThreads:       action = [this]{ show_threads_            = !show_threads_;            }; break;
+
+        // ── View — Visualization ─────────────────────────────────────────
         case kTagViewMinimap:       action = [this]{ show_minimap_            = !show_minimap_;            }; break;
         case kTagViewLoops:         action = [this]{ show_loops_              = !show_loops_;              }; break;
         case kTagViewCFG:           action = [this]{ show_cfg_                = !show_cfg_;                }; break;
+        case kTagViewCallGraph:     action = [this]{ show_call_graph_         = !show_call_graph_;         }; break;
+
+        // ── View — Analysis Results ──────────────────────────────────────
         case kTagViewObjC:          action = [this]{ show_objc_               = !show_objc_;               }; break;
         case kTagViewLoopSemantics: action = [this]{ show_loop_semantics_     = !show_loop_semantics_;     }; break;
         case kTagViewPatterns:      action = [this]{ show_pattern_            = !show_pattern_;            }; break;
         case kTagViewConstants:     action = [this]{ show_constant_           = !show_constant_;           }; break;
         case kTagViewAlgoSummary:   action = [this]{ show_algorithm_summary_  = !show_algorithm_summary_;  }; break;
-        case kTagViewCallGraph:          action = [this]{ show_call_graph_         = !show_call_graph_;         }; break;
         case kTagViewObjCCrypto:       action = [this]{ show_objc_crypto_        = !show_objc_crypto_;        }; break;
         case kTagViewMemStrings:       action = [this]{ show_mem_strings_        = !show_mem_strings_;        }; break;
         case kTagViewSyscallIntercept: action = [this]{ show_syscall_intercept_  = !show_syscall_intercept_;  }; break;
+
+        // ── View — Profiling & Diff ──────────────────────────────────────
         case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show_cache_sim_;          }; break;
         case kTagViewTraceFold:        action = [this]{ show_trace_fold_         = !show_trace_fold_;         }; break;
         case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
         case kTagViewTraceDiff:     action = [this]{ show_trace_diff_         = !show_trace_diff_;         }; break;
-        case kTagViewLog:           action = [this]{ show_log_                = !show_log_;                }; break;
-        case kTagViewCacheManager: action = [this]{ show_cache_manager_      = !show_cache_manager_;      cache_manager_dirty_ = true; }; break;
 
+        // ── View — Tools ─────────────────────────────────────────────────
+        case kTagViewLog:           action = [this]{ show_log_                = !show_log_;                }; break;
+        case kTagViewCacheManager:  action = [this]{ show_cache_manager_      = !show_cache_manager_;      cache_manager_dirty_ = true; }; break;
+
+        // ── Navigate ─────────────────────────────────────────────────────
         case kTagNavGoto:           action = [this]{ show_goto_popup_   = true; }; break;
         case kTagNavSearch:         action = [this]{ show_search_popup_ = true; }; break;
-        case kTagNavBack:           action = [this]{ nav_back();   }; break;
+        case kTagNavBack:           action = [this]{ nav_back();    }; break;
         case kTagNavForward:        action = [this]{ nav_forward(); }; break;
         case kTagNavFirst:          action = [this]{ navigate_to(0); }; break;
         case kTagNavLast:           action = [this]{ navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0); }; break;
@@ -796,10 +890,24 @@ void tenet::GuiApp::_post_native_action(long tag) {
                 }
             };
             break;
+        // Taint navigation (enabled only when taint/backward-taint result is present)
+        case kTagNavNextTainted:      action = [this]{ if (show_taint_ && taint_result_) jump_taint_next(); }; break;
+        case kTagNavPrevTainted:      action = [this]{ if (show_taint_ && taint_result_) jump_taint_prev(); }; break;
+        case kTagNavNextBackTainted:  action = [this]{ if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_next(); }; break;
+        case kTagNavPrevBackTainted:  action = [this]{ if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev(); }; break;
 
+        // ── Analysis — Data Flow ─────────────────────────────────────────
         case kTagAnaTaint:          action = [this]{ run_taint_analysis(); }; break;
         case kTagAnaBackTaint:      action = [this]{ run_backward_taint_analysis(); }; break;
         case kTagAnaSlice:          action = [this]{ run_slice_analysis(); }; break;
+        case kTagAnaRegTimeline:
+            action = [this]{ show_reg_timeline_ = true; reg_timeline_dirty_ = true; };
+            break;
+        case kTagAnaProducerChain:
+            action = [this]{ show_reg_timeline_ = true; run_producer_chain(current_inst_, reg_timeline_reg_); };
+            break;
+
+        // ── Analysis — Structure ─────────────────────────────────────────
         case kTagAnaFunction:       action = [this]{ run_pass_by_name("function"); }; break;
         case kTagAnaXref:           action = [this]{ run_pass_by_name("xref"); }; break;
         case kTagAnaStrings:        action = [this]{ run_pass_by_name("strings"); }; break;
@@ -807,7 +915,71 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagAnaCallGraph:      action = [this]{ run_call_graph_analysis(); }; break;
         case kTagAnaLoop:           action = [this]{ run_pass_by_name("loop"); }; break;
         case kTagAnaCFG:            action = [this]{ run_cfg_layout(); }; break;
+
+        // ── Analysis — Crypto & Pattern ──────────────────────────────────
+        case kTagAnaPattern:        action = [this]{ run_pass_by_name("pattern"); show_pattern_ = true; }; break;
+        case kTagAnaConstants:      action = [this]{ run_pass_by_name("constant_materialization"); show_constant_ = true; }; break;
+        case kTagAnaLoopSemantics:  action = [this]{ run_pass_by_name("loop_semantics"); show_loop_semantics_ = true; }; break;
+        case kTagAnaAlgoSummary:    action = [this]{ run_pass_by_name("algorithm_summary"); show_algorithm_summary_ = true; }; break;
+        case kTagAnaObjCCrypto:     action = [this]{ run_pass_by_name("objc_crypto"); show_objc_crypto_ = true; }; break;
+
+        // ── Analysis — ObjC / iOS ────────────────────────────────────────
+        case kTagAnaObjC:           action = [this]{ run_pass_by_name("objc"); show_objc_ = true; }; break;
+        case kTagAnaAPIIntercepts:  action = [this]{ run_pass_by_name("syscall_intercept"); show_syscall_intercept_ = true; }; break;
+
+        // ── Analysis — Profiling ─────────────────────────────────────────
+        case kTagAnaCacheSim:       action = [this]{ run_pass_by_name("cache_sim"); show_cache_sim_ = true; }; break;
+        case kTagAnaTraceFold:      action = [this]{ run_pass_by_name("trace_fold"); show_trace_fold_ = true; }; break;
+        case kTagAnaTraceDiff:      action = [this]{ show_trace_diff_ = true; }; break;
+        case kTagAnaMemStrings:     action = [this]{ run_pass_by_name("memory_strings"); show_mem_strings_ = true; }; break;
+
+        // ── Analysis — Maintenance ───────────────────────────────────────
+        case kTagAnaClearTaint:
+            action = [this]{
+                show_taint_           = false;
+                show_backward_taint_  = false;
+                show_slice_           = false;
+                taint_result_         = nullptr;
+                backward_taint_result_= nullptr;
+                slice_result_         = nullptr;
+                taint_sorted_ids_dirty_ = true;
+            };
+            break;
         case kTagAnaClear:          action = [this]{ clear_analysis(); }; break;
+
+        // ── Export ───────────────────────────────────────────────────────
+        case kTagExportCFG:
+            action = [this]{ export_cfg_to_file(); }; break;
+        case kTagExportCallGraph:
+            action = [this]{ export_call_graph_to_file(); }; break;
+        case kTagExportBackwardTaintGraph:
+            action = [this]{ export_backward_taint_graph_to_file(); }; break;
+        case kTagExportDataflowGraph:
+            action = [this]{ /* TODO: dataflow_graph pass not yet plumbed into GUI */ }; break;
+
+        // ── Tools ────────────────────────────────────────────────────────
+        // Tools open a small modal in the Analysis panel (reuse show_analysis_)
+        case kTagToolEntropy:
+            action = [this]{ run_pass_by_name("entropy"); show_analysis_ = true; }; break;
+        case kTagToolMemSnapshot:
+            action = [this]{ run_pass_by_name("memory_snapshot"); show_analysis_ = true; }; break;
+        case kTagToolLiteralSearch:
+            action = [this]{ run_pass_by_name("literal_search"); show_analysis_ = true; }; break;
+        case kTagToolMemSearch:
+            action = [this]{ run_pass_by_name("mem_search"); show_analysis_ = true; }; break;
+        case kTagToolYaraScan:
+            action = [this]{ run_pass_by_name("yara_mem_scan"); show_analysis_ = true; }; break;
+        case kTagToolMemHistory:
+            action = [this]{ show_memory_ = true; }; break;
+        case kTagToolCallContext:
+            action = [this]{ run_pass_by_name("call_context"); show_analysis_ = true; }; break;
+
+        // ── Help ─────────────────────────────────────────────────────────
+        case kTagHelpShortcuts:
+            action = [this]{ show_settings_ = true; /* TODO: jump to shortcuts tab */ }; break;
+        case kTagHelpAbout:
+        case kTagHelpDocs:
+            break;  // handled by native NSApp actions or not yet implemented
 
         default: return;
     }
@@ -821,6 +993,8 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
     NSMenu* menu = (__bridge NSMenu*)menuPtr;
     for (NSMenuItem* it in menu.itemArray) {
         switch (static_cast<MenuTag>(it.tag)) {
+
+            // ── Navigate: enable/disable based on state ──────────────────
             case kTagNavBack:
                 it.enabled = can_nav_back(); break;
             case kTagNavForward:
@@ -832,34 +1006,51 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
                 it.enabled = (function_result_ != nullptr &&
                                (function_result_->return_at(current_inst_) != nullptr ||
                                 !current_call_stack().empty())); break;
+            // Taint jump items: only enabled when the corresponding result is active
+            case kTagNavNextTainted:
+            case kTagNavPrevTainted:
+                it.enabled = (show_taint_ && taint_result_ != nullptr); break;
+            case kTagNavNextBackTainted:
+            case kTagNavPrevBackTainted:
+                it.enabled = (show_backward_taint_ && backward_taint_result_ != nullptr); break;
 
-            case kTagViewRegisters:     it.state = show_registers_         ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewMemory:        it.state = show_memory_             ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewCallStack:     it.state = show_callstack_          ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewAnalysis:      it.state = show_analysis_           ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewHexDump:       it.state = show_hex_dump_           ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewStrings:       it.state = show_strings_            ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewFunctions:     it.state = show_functions_          ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewThreads:       it.state = show_threads_            ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewMinimap:       it.state = show_minimap_            ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewLoops:         it.state = show_loops_              ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewCFG:           it.state = show_cfg_                ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewObjC:          it.state = show_objc_               ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewLoopSemantics: it.state = show_loop_semantics_     ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewPatterns:      it.state = show_pattern_            ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewConstants:     it.state = show_constant_           ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewAlgoSummary:   it.state = show_algorithm_summary_  ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewCallGraph:          it.state = show_call_graph_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            // ── View: checkmarks for panel visibility ────────────────────
+            case kTagViewRegisters:        it.state = show_registers_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewMemory:           it.state = show_memory_             ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCallStack:        it.state = show_callstack_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewAnalysis:         it.state = show_analysis_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewHexDump:          it.state = show_hex_dump_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewStrings:          it.state = show_strings_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewFunctions:        it.state = show_functions_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewThreads:          it.state = show_threads_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewMinimap:          it.state = show_minimap_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLoops:            it.state = show_loops_              ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCFG:              it.state = show_cfg_                ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCallGraph:        it.state = show_call_graph_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewObjC:             it.state = show_objc_               ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLoopSemantics:    it.state = show_loop_semantics_     ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewPatterns:         it.state = show_pattern_            ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewConstants:        it.state = show_constant_           ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewAlgoSummary:      it.state = show_algorithm_summary_  ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewObjCCrypto:       it.state = show_objc_crypto_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewMemStrings:       it.state = show_mem_strings_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewDwarf:         it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewTraceDiff:     it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewLog:           it.state = show_log_                ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewCacheManager: it.state = show_cache_manager_      ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewDwarf:            it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewTraceDiff:        it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewLog:              it.state = show_log_                ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewCacheManager:     it.state = show_cache_manager_      ? NSControlStateValueOn : NSControlStateValueOff; break;
+
+            // ── Export: disable if required result not yet computed ───────
+            case kTagExportBackwardTaintGraph:
+                it.enabled = (backward_taint_result_ != nullptr); break;
+
+            // ── Analysis — Clear Taint: only useful when taint is active ─
+            case kTagAnaClearTaint:
+                it.enabled = (show_taint_ || show_backward_taint_ || show_slice_); break;
+
             default: break;
         }
     }
@@ -882,6 +1073,7 @@ void tenet::GuiApp::setup_native_menu() {
 
     const NSUInteger Cmd   = NSEventModifierFlagCommand;
     const NSUInteger Shift = NSEventModifierFlagShift;
+    const NSUInteger Opt   = NSEventModifierFlagOption;
 
     auto mk = [&](NSString* title, NSString* key, NSUInteger mods, NSInteger tag) -> NSMenuItem* {
         return tenet_make_item(title, key, mods, tag, target);
@@ -890,10 +1082,20 @@ void tenet::GuiApp::setup_native_menu() {
     auto sub = [&](NSString* title) -> NSMenu* {
         return tenet_make_submenu(title, delegate);
     };
+    // Helper: build a titled submenu item and attach it as a child menu
+    auto mksub = [&](NSMenu* parent, NSString* title) -> NSMenu* {
+        NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+        NSMenu* m = sub(title);
+        holder.submenu = m;
+        [parent addItem:holder];
+        return m;
+    };
 
     NSMenu* bar = [[NSMenu alloc] initWithTitle:@"MainMenu"];
 
-    // ── App menu ────────────────────────────────────────────────────
+    // ╔═══════════════════════════════════╗
+    // ║         Tenet (App) menu          ║
+    // ╚═══════════════════════════════════╝
     {
         NSMenuItem* appItem = [[NSMenuItem alloc] initWithTitle:@"Tenet" action:nil keyEquivalent:@""];
         NSMenu* appMenu = sub(@"Tenet");
@@ -910,7 +1112,9 @@ void tenet::GuiApp::setup_native_menu() {
         [bar addItem:appItem];
     }
 
-    // ── File menu ────────────────────────────────────────────────────
+    // ╔═══════════════════════════════════╗
+    // ║            File menu              ║
+    // ╚═══════════════════════════════════╝
     {
         NSMenuItem* fileItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
         NSMenu* fileMenu = sub(@"File");
@@ -918,92 +1122,214 @@ void tenet::GuiApp::setup_native_menu() {
                                                           action:nil
                                                    keyEquivalent:@"o"];
         openItem.keyEquivalentModifierMask = Cmd;
-        openItem.enabled = NO;
+        openItem.enabled = NO;  // TODO: file dialog
         [fileMenu addItem:openItem];
+        // Recent files are managed in the ImGui menu (dynamic list);
+        // native side only shows the static items.
         fileItem.submenu = fileMenu;
         [bar addItem:fileItem];
     }
 
-    // ── View menu ────────────────────────────────────────────────────
+    // ╔═══════════════════════════════════════════════════════════════╗
+    // ║  View menu  —  organised into four sub-menus + Log at bottom  ║
+    // ╚═══════════════════════════════════════════════════════════════╝
     {
         NSMenuItem* viewItem = [[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""];
         NSMenu* viewMenu = sub(@"View");
-        [viewMenu addItem:mk(@"Registers",            @"r", Cmd, kTagViewRegisters)];
-        [viewMenu addItem:mk(@"Memory",               @"m", Cmd, kTagViewMemory)];
-        [viewMenu addItem:mk(@"Call Stack",           @"",  0,   kTagViewCallStack)];
-        [viewMenu addItem:mk(@"Analysis",             @"",  0,   kTagViewAnalysis)];
-        [viewMenu addItem:mk(@"Hex Dump",             @"",  0,   kTagViewHexDump)];
-        [viewMenu addItem:mk(@"Strings",              @"",  0,   kTagViewStrings)];
-        [viewMenu addItem:mk(@"Functions",            @"",  0,   kTagViewFunctions)];
-        [viewMenu addItem:mk(@"Threads",              @"",  0,   kTagViewThreads)];
+
+        // ── Core Panels ──────────────────────────────────────────────
+        NSMenu* coreMenu = mksub(viewMenu, @"Core Panels");
+        [coreMenu addItem:mk(@"Registers",       @"r", Cmd, kTagViewRegisters)];
+        [coreMenu addItem:mk(@"Memory",          @"m", Cmd, kTagViewMemory)];
+        [coreMenu addItem:mk(@"Hex Dump",        @"", 0,   kTagViewHexDump)];
+        [coreMenu addItem:sep()];
+        [coreMenu addItem:mk(@"Call Stack",      @"", 0,   kTagViewCallStack)];
+        [coreMenu addItem:mk(@"Functions",       @"", 0,   kTagViewFunctions)];
+        [coreMenu addItem:mk(@"Strings",         @"", 0,   kTagViewStrings)];
+        [coreMenu addItem:mk(@"Threads",         @"", 0,   kTagViewThreads)];
+        [coreMenu addItem:sep()];
+        [coreMenu addItem:mk(@"Analysis",        @"", 0,   kTagViewAnalysis)];
+
+        // ── Visualization ─────────────────────────────────────────────
+        NSMenu* vizMenu = mksub(viewMenu, @"Visualization");
+        [vizMenu addItem:mk(@"CFG View",         @"", 0, kTagViewCFG)];
+        [vizMenu addItem:mk(@"Call Graph",       @"", 0, kTagViewCallGraph)];
+        [vizMenu addItem:mk(@"Minimap",          @"", 0, kTagViewMinimap)];
+        [vizMenu addItem:mk(@"Loop Highlight",   @"", 0, kTagViewLoops)];
+
+        // ── Analysis Results ─────────────────────────────────────────
+        NSMenu* resMenu = mksub(viewMenu, @"Analysis Results");
+        [resMenu addItem:mk(@"Patterns",           @"", 0, kTagViewPatterns)];
+        [resMenu addItem:mk(@"Constants",          @"", 0, kTagViewConstants)];
+        [resMenu addItem:mk(@"Loop Semantics",     @"", 0, kTagViewLoopSemantics)];
+        [resMenu addItem:mk(@"Algorithm Summary",  @"", 0, kTagViewAlgoSummary)];
+        [resMenu addItem:sep()];
+        [resMenu addItem:mk(@"ObjC Messages",      @"", 0, kTagViewObjC)];
+        [resMenu addItem:mk(@"ObjC Crypto",        @"", 0, kTagViewObjCCrypto)];
+        [resMenu addItem:mk(@"API Intercepts",     @"", 0, kTagViewSyscallIntercept)];
+        [resMenu addItem:sep()];
+        [resMenu addItem:mk(@"Memory Strings",     @"", 0, kTagViewMemStrings)];
+
+        // ── Profiling & Diff ──────────────────────────────────────────
+        NSMenu* profMenu = mksub(viewMenu, @"Profiling & Diff");
+        [profMenu addItem:mk(@"Cache Sim",           @"", 0, kTagViewCacheSim)];
+        [profMenu addItem:mk(@"Trace Fold",          @"", 0, kTagViewTraceFold)];
+        [profMenu addItem:mk(@"Register Timeline",   @"", 0, kTagViewRegTimeline)];
+        [profMenu addItem:mk(@"Trace Diff",          @"", 0, kTagViewTraceDiff)];
+        [profMenu addItem:sep()];
+        [profMenu addItem:mk(@"Symbol Info (DWARF)", @"", 0, kTagViewDwarf)];
+
         [viewMenu addItem:sep()];
-        [viewMenu addItem:mk(@"Minimap",              @"",  0,   kTagViewMinimap)];
-        [viewMenu addItem:mk(@"Loop Highlight",       @"",  0,   kTagViewLoops)];
-        [viewMenu addItem:mk(@"CFG View",             @"",  0,   kTagViewCFG)];
-        [viewMenu addItem:sep()];
-        [viewMenu addItem:mk(@"ObjC Messages",        @"",  0,   kTagViewObjC)];
-        [viewMenu addItem:mk(@"Loop Semantics",       @"",  0,   kTagViewLoopSemantics)];
-        [viewMenu addItem:mk(@"Patterns",             @"",  0,   kTagViewPatterns)];
-        [viewMenu addItem:mk(@"Constants",            @"",  0,   kTagViewConstants)];
-        [viewMenu addItem:mk(@"Algorithm Summary",    @"",  0,   kTagViewAlgoSummary)];
-        [viewMenu addItem:mk(@"Call Graph",           @"",  0,   kTagViewCallGraph)];
-        [viewMenu addItem:mk(@"ObjC Crypto",          @"",  0,   kTagViewObjCCrypto)];
-        [viewMenu addItem:mk(@"Memory Strings",       @"",  0,   kTagViewMemStrings)];
-        [viewMenu addItem:mk(@"API Intercepts",       @"",  0,   kTagViewSyscallIntercept)];
-        [viewMenu addItem:mk(@"Cache Sim",            @"",  0,   kTagViewCacheSim)];
-        [viewMenu addItem:mk(@"Trace Fold",           @"",  0,   kTagViewTraceFold)];
-        [viewMenu addItem:sep()];
-        [viewMenu addItem:mk(@"Register Timeline",    @"",  0,   kTagViewRegTimeline)];
-        [viewMenu addItem:mk(@"Symbol Info (DWARF)",  @"",  0,   kTagViewDwarf)];
-        [viewMenu addItem:mk(@"Trace Diff",           @"",  0,   kTagViewTraceDiff)];
-        [viewMenu addItem:sep()];
-        [viewMenu addItem:mk(@"Output (Log)",        @"",  0,   kTagViewLog)];
-        [viewMenu addItem:sep()];
-        [viewMenu addItem:mk(@"Cache Manager",        @"",  0,   kTagViewCacheManager)];
+        [viewMenu addItem:mk(@"Output (Log)",        @"", 0, kTagViewLog)];
+        [viewMenu addItem:mk(@"Cache Manager",       @"", 0, kTagViewCacheManager)];
+
         viewItem.submenu = viewMenu;
         [bar addItem:viewItem];
     }
 
-    // ── Navigate menu ────────────────────────────────────────────────
+    // ╔═══════════════════════════════════╗
+    // ║          Navigate menu            ║
+    // ╚═══════════════════════════════════╝
     {
         NSMenuItem* navItem = [[NSMenuItem alloc] initWithTitle:@"Navigate" action:nil keyEquivalent:@""];
         NSMenu* navMenu = sub(@"Navigate");
+
         [navMenu addItem:mk(@"Go to Instruction\u2026", @"g", Cmd, kTagNavGoto)];
         [navMenu addItem:mk(@"Search\u2026",            @"f", Cmd, kTagNavSearch)];
         [navMenu addItem:sep()];
-        [navMenu addItem:mk(@"Back",               @"[", Cmd, kTagNavBack)];
-        [navMenu addItem:mk(@"Forward",            @"]", Cmd, kTagNavForward)];
+        [navMenu addItem:mk(@"Back",                    @"[", Cmd, kTagNavBack)];
+        [navMenu addItem:mk(@"Forward",                 @"]", Cmd, kTagNavForward)];
         [navMenu addItem:sep()];
-        [navMenu addItem:mk(@"First Instruction",  @"",  0,   kTagNavFirst)];
-        [navMenu addItem:mk(@"Last Instruction",   @"",  0,   kTagNavLast)];
+        [navMenu addItem:mk(@"First Instruction",       @"", 0, kTagNavFirst)];
+        [navMenu addItem:mk(@"Last Instruction",        @"", 0, kTagNavLast)];
         [navMenu addItem:sep()];
-        [navMenu addItem:mk(@"Toggle Bookmark",    @"b", Cmd, kTagNavBookmark)];
+        [navMenu addItem:mk(@"Toggle Bookmark",         @"b", Cmd, kTagNavBookmark)];
         [navMenu addItem:sep()];
-        [navMenu addItem:mk(@"Follow Call",        @"",  0,   kTagNavFollowCall)];
-        [navMenu addItem:mk(@"Follow Return",      @"",  0,   kTagNavFollowReturn)];
+        [navMenu addItem:mk(@"Follow Call",             @"", 0, kTagNavFollowCall)];
+        [navMenu addItem:mk(@"Follow Return",           @"", 0, kTagNavFollowReturn)];
+        [navMenu addItem:sep()];
+        // Taint navigation — dynamically enabled/disabled via _update_native_menu
+        [navMenu addItem:mk(@"Next Tainted Instruction",          @"", 0, kTagNavNextTainted)];
+        [navMenu addItem:mk(@"Prev Tainted Instruction",          @"", 0, kTagNavPrevTainted)];
+        [navMenu addItem:mk(@"Next Backward-Tainted Instruction", @"", 0, kTagNavNextBackTainted)];
+        [navMenu addItem:mk(@"Prev Backward-Tainted Instruction", @"", 0, kTagNavPrevBackTainted)];
+
         navItem.submenu = navMenu;
         [bar addItem:navItem];
     }
 
-    // ── Analysis menu ────────────────────────────────────────────────
+    // ╔════════════════════════════════════════════════════════════════════╗
+    // ║  Analysis menu  —  grouped by category, each triggers a pass run  ║
+    // ╚════════════════════════════════════════════════════════════════════╝
     {
         NSMenuItem* anaItem = [[NSMenuItem alloc] initWithTitle:@"Analysis" action:nil keyEquivalent:@""];
         NSMenu* anaMenu = sub(@"Analysis");
-        [anaMenu addItem:mk(@"Forward Taint",    @"t", Cmd,         kTagAnaTaint)];
-        [anaMenu addItem:mk(@"Backward Taint",   @"t", Cmd | Shift, kTagAnaBackTaint)];
-        [anaMenu addItem:mk(@"Slice",            @"s", Cmd,         kTagAnaSlice)];
+
+        // ── Data Flow ─────────────────────────────────────────────────
+        NSMenu* dfMenu = mksub(anaMenu, @"Data Flow");
+        [dfMenu addItem:mk(@"Forward Taint\u2026",     @"t", Cmd,         kTagAnaTaint)];
+        [dfMenu addItem:mk(@"Backward Taint\u2026",    @"t", Cmd | Shift, kTagAnaBackTaint)];
+        [dfMenu addItem:mk(@"Slice\u2026",             @"s", Cmd,         kTagAnaSlice)];
+        [dfMenu addItem:sep()];
+        [dfMenu addItem:mk(@"Register Timeline",       @"", 0, kTagAnaRegTimeline)];
+        [dfMenu addItem:mk(@"Producer Chain",          @"", 0, kTagAnaProducerChain)];
+
+        // ── Structure ─────────────────────────────────────────────────
+        NSMenu* strMenu = mksub(anaMenu, @"Structure");
+        [strMenu addItem:mk(@"Function Analysis",  @"", 0, kTagAnaFunction)];
+        [strMenu addItem:mk(@"Xref Analysis",      @"", 0, kTagAnaXref)];
+        [strMenu addItem:mk(@"String Analysis",    @"", 0, kTagAnaStrings)];
+        [strMenu addItem:mk(@"Thread Analysis",    @"", 0, kTagAnaThread)];
+        [strMenu addItem:sep()];
+        [strMenu addItem:mk(@"Call Graph",         @"", 0, kTagAnaCallGraph)];
+        [strMenu addItem:mk(@"Loop Analysis",      @"", 0, kTagAnaLoop)];
+        [strMenu addItem:mk(@"CFG Layout",         @"", 0, kTagAnaCFG)];
+
+        // ── Crypto & Pattern ──────────────────────────────────────────
+        NSMenu* cpMenu = mksub(anaMenu, @"Crypto & Pattern");
+        [cpMenu addItem:mk(@"Pattern Detection",   @"", 0, kTagAnaPattern)];
+        [cpMenu addItem:mk(@"Constants",           @"", 0, kTagAnaConstants)];
+        [cpMenu addItem:mk(@"Loop Semantics",      @"", 0, kTagAnaLoopSemantics)];
+        [cpMenu addItem:mk(@"Algorithm Summary",   @"", 0, kTagAnaAlgoSummary)];
+        [cpMenu addItem:mk(@"ObjC Crypto",         @"", 0, kTagAnaObjCCrypto)];
+
+        // ── ObjC / iOS ────────────────────────────────────────────────
+        NSMenu* objcMenu = mksub(anaMenu, @"ObjC / iOS");
+        [objcMenu addItem:mk(@"ObjC Messages",     @"", 0, kTagAnaObjC)];
+        [objcMenu addItem:mk(@"API Intercepts",    @"", 0, kTagAnaAPIIntercepts)];
+
+        // ── Profiling ─────────────────────────────────────────────────
+        NSMenu* profAnaMenu = mksub(anaMenu, @"Profiling");
+        [profAnaMenu addItem:mk(@"Cache Simulation",  @"", 0, kTagAnaCacheSim)];
+        [profAnaMenu addItem:mk(@"Trace Fold",        @"", 0, kTagAnaTraceFold)];
+        [profAnaMenu addItem:mk(@"Trace Diff",        @"", 0, kTagAnaTraceDiff)];
+        [profAnaMenu addItem:mk(@"Memory Strings",    @"", 0, kTagAnaMemStrings)];
+
         [anaMenu addItem:sep()];
-        [anaMenu addItem:mk(@"Function Analysis",  @"", 0, kTagAnaFunction)];
-        [anaMenu addItem:mk(@"Xref Analysis",      @"", 0, kTagAnaXref)];
-        [anaMenu addItem:mk(@"String Analysis",    @"", 0, kTagAnaStrings)];
-        [anaMenu addItem:mk(@"Thread Analysis",    @"", 0, kTagAnaThread)];
-        [anaMenu addItem:mk(@"Call Graph",         @"", 0, kTagAnaCallGraph)];
-        [anaMenu addItem:mk(@"Loop Analysis",      @"", 0, kTagAnaLoop)];
-        [anaMenu addItem:mk(@"CFG Layout",         @"", 0, kTagAnaCFG)];
-        [anaMenu addItem:sep()];
-        [anaMenu addItem:mk(@"Clear All Analysis", @"", 0, kTagAnaClear)];
+        [anaMenu addItem:mk(@"Clear Taint",         @"", 0, kTagAnaClearTaint)];
+        [anaMenu addItem:mk(@"Clear All Analysis",  @"", 0, kTagAnaClear)];
+
         anaItem.submenu = anaMenu;
         [bar addItem:anaItem];
+    }
+
+    // ╔═══════════════════════════════════╗
+    // ║           Export menu             ║
+    // ╚═══════════════════════════════════╝
+    {
+        NSMenuItem* expItem = [[NSMenuItem alloc] initWithTitle:@"Export" action:nil keyEquivalent:@""];
+        NSMenu* expMenu = sub(@"Export");
+
+        [expMenu addItem:mk(@"Export CFG\u2026 (DOT)",           @"", 0, kTagExportCFG)];
+        [expMenu addItem:mk(@"Export Call Graph\u2026 (DOT)",    @"", 0, kTagExportCallGraph)];
+        [expMenu addItem:sep()];
+        [expMenu addItem:mk(@"Export Backward Taint Graph\u2026 (DOT)", @"", 0, kTagExportBackwardTaintGraph)];
+        [expMenu addItem:mk(@"Export Dataflow Graph\u2026 (DOT/JSON)",  @"", 0, kTagExportDataflowGraph)];
+
+        expItem.submenu = expMenu;
+        [bar addItem:expItem];
+    }
+
+    // ╔═══════════════════════════════════╗
+    // ║            Tools menu             ║
+    // ╚═══════════════════════════════════╝
+    {
+        NSMenuItem* toolItem = [[NSMenuItem alloc] initWithTitle:@"Tools" action:nil keyEquivalent:@""];
+        NSMenu* toolMenu = sub(@"Tools");
+
+        [toolMenu addItem:mk(@"Entropy at Cursor\u2026",         @"", 0, kTagToolEntropy)];
+        [toolMenu addItem:mk(@"Memory Snapshot\u2026",           @"", 0, kTagToolMemSnapshot)];
+        [toolMenu addItem:sep()];
+        [toolMenu addItem:mk(@"Literal Search\u2026",            @"", 0, kTagToolLiteralSearch)];
+        [toolMenu addItem:mk(@"Memory Pattern Search\u2026",     @"", 0, kTagToolMemSearch)];
+#if TENET_ENABLE_YARA
+        [toolMenu addItem:mk(@"YARA Scan\u2026",                 @"", 0, kTagToolYaraScan)];
+#endif
+        [toolMenu addItem:sep()];
+        [toolMenu addItem:mk(@"Memory Write History\u2026",      @"", 0, kTagToolMemHistory)];
+        [toolMenu addItem:mk(@"Call Context at Cursor\u2026",    @"", 0, kTagToolCallContext)];
+
+        toolItem.submenu = toolMenu;
+        [bar addItem:toolItem];
+    }
+
+    // ╔═══════════════════════════════════╗
+    // ║            Help menu              ║
+    // ╚═══════════════════════════════════╝
+    {
+        NSMenuItem* helpItem = [[NSMenuItem alloc] initWithTitle:@"Help" action:nil keyEquivalent:@""];
+        NSMenu* helpMenu = sub(@"Help");
+
+        [helpMenu addItem:mk(@"Keyboard Shortcuts",  @"/", Cmd, kTagHelpShortcuts)];
+        [helpMenu addItem:sep()];
+        NSMenuItem* docsItem = [[NSMenuItem alloc] initWithTitle:@"Documentation"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+        docsItem.enabled = NO;   // TODO: open docs URL
+        [helpMenu addItem:docsItem];
+
+        helpItem.submenu = helpMenu;
+        [bar addItem:helpItem];
     }
 
     [NSApp setMainMenu:bar];
@@ -1698,6 +2024,146 @@ void GuiApp::render_frame() {
     if (show_demo_window_) {
         ImGui::ShowDemoWindow(&show_demo_window_);
     }
+}
+
+// ─── Export helpers ──────────────────────────────────────────────────────────
+//
+// Each helper follows the same pattern:
+//   1. If the required pass result is already available, go straight to
+//      the NSSavePanel flow.
+//   2. Otherwise, run the pass and then open the save panel in the
+//      post_apply callback (which executes on the UI thread).
+//
+// NSSavePanel must be called on the main thread.  Both the pending_native_actions_
+// drain and post_apply callbacks execute on the UI thread, so no extra
+// dispatch is needed — but we keep dispatch_async(main) as an explicit
+// safety belt for any future refactor.
+
+// ── Helper: show an NSSavePanel and write the given text to the chosen file ──
+static void save_text_to_file_async(NSString* default_name,
+                                    NSString* file_type_desc,
+                                    NSString* file_ext,
+                                    std::string content) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSSavePanel* panel = [NSSavePanel savePanel];
+        panel.nameFieldStringValue = default_name;
+        panel.allowedContentTypes  = @[
+            [UTType typeWithFilenameExtension:file_ext]
+        ];
+        panel.message = [NSString stringWithFormat:@"Save %@ file", file_type_desc];
+
+        [panel beginSheetModalForWindow:[NSApp keyWindow]
+                      completionHandler:^(NSModalResponse result) {
+            if (result != NSModalResponseOK) return;
+            NSURL* url = panel.URL;
+            if (!url) return;
+            NSError* err = nil;
+            NSString* ns = [NSString stringWithUTF8String:content.c_str()];
+            [ns writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            if (err) {
+                NSAlert* alert = [[NSAlert alloc] init];
+                alert.messageText     = @"Export failed";
+                alert.informativeText = err.localizedDescription;
+                [alert runModal];
+            }
+        }];
+    });
+}
+
+// ── Export CFG ────────────────────────────────────────────────────────────────
+
+void tenet::GuiApp::export_cfg_to_file() {
+    // If the cfg_layout pass has already run, grab the DOT immediately.
+    auto* raw = completed_result("cfg_layout");
+    if (raw && raw->ok()) {
+        std::string dot = raw->get<CFGLayoutResult>().dot_annotated;
+        if (dot.empty()) dot = raw->get<CFGLayoutResult>().dot;
+        if (dot.empty()) {
+            last_pass_status_ = "CFG layout has no DOT output; try re-running CFG Layout.";
+            return;
+        }
+        save_text_to_file_async(@"cfg.dot", @"DOT (CFG)", @"dot", std::move(dot));
+        return;
+    }
+
+    // Pass not yet done — run it, then export in the completion callback.
+    last_pass_status_ = "Running CFG layout for export…";
+    run_cfg_layout();
+
+    // post_apply fires on the UI thread after run_cfg_layout's post_apply.
+    post_apply([this]() {
+        auto* r = completed_result("cfg_layout");
+        if (!r || !r->ok()) {
+            last_pass_status_ = "CFG layout failed; cannot export.";
+            return;
+        }
+        std::string dot = r->get<CFGLayoutResult>().dot_annotated;
+        if (dot.empty()) dot = r->get<CFGLayoutResult>().dot;
+        save_text_to_file_async(@"cfg.dot", @"DOT (CFG)", @"dot", std::move(dot));
+    });
+}
+
+// ── Export Call Graph ─────────────────────────────────────────────────────────
+
+// Mirrors batch_analysis.cpp run_call_graph() DOT generation.
+static std::string build_call_graph_dot(const tenet::CallGraphResult& cg) {
+    std::string dot;
+    dot.reserve(4096);
+    dot += "digraph callgraph {\n";
+    dot += "  node [shape=box, style=filled, fillcolor=lightyellow];\n";
+    dot += "  edge [color=gray40];\n\n";
+    for (const auto& [pc, node] : cg.nodes) {
+        std::string label = node.name.empty()
+            ? fmt::format("sub_{:X}", pc)
+            : node.name;
+        dot += fmt::format("  \"0x{:X}\" [label=\"{}\"];\n", pc, label);
+    }
+    dot += "\n";
+    for (const auto& edge : cg.edges) {
+        dot += fmt::format("  \"0x{:X}\" -> \"0x{:X}\" [label=\"{}\"];\n",
+                           edge.caller_pc, edge.callee_pc, edge.call_count);
+    }
+    dot += "}\n";
+    return dot;
+}
+
+void tenet::GuiApp::export_call_graph_to_file() {
+    auto* raw = completed_result("call_graph");
+    if (raw && raw->ok()) {
+        std::string dot = build_call_graph_dot(raw->get<CallGraphResult>());
+        save_text_to_file_async(@"callgraph.dot", @"DOT (Call Graph)", @"dot",
+                                std::move(dot));
+        return;
+    }
+
+    last_pass_status_ = "Running call graph for export…";
+    run_call_graph_analysis();
+
+    post_apply([this]() {
+        auto* r = completed_result("call_graph");
+        if (!r || !r->ok()) {
+            last_pass_status_ = "Call graph failed; cannot export.";
+            return;
+        }
+        std::string dot = build_call_graph_dot(r->get<CallGraphResult>());
+        save_text_to_file_async(@"callgraph.dot", @"DOT (Call Graph)", @"dot",
+                                std::move(dot));
+    });
+}
+
+// ── Export Backward Taint Graph ───────────────────────────────────────────────
+
+void tenet::GuiApp::export_backward_taint_graph_to_file() {
+    if (!backward_taint_result_) {
+        last_pass_status_ =
+            "Run Backward Taint analysis first "
+            "(Analysis > Data Flow > Backward Taint\u2026).";
+        return;
+    }
+    std::string dot = backward_taint_result_->to_dot();
+    save_text_to_file_async(@"backward_taint.dot",
+                            @"DOT (Backward Taint Graph)", @"dot",
+                            std::move(dot));
 }
 
 }  // namespace tenet

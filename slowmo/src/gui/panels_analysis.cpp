@@ -792,7 +792,7 @@ void GuiApp::render_analysis_panel() {
                 ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.75f, 0.20f, 0.20f, 1.0f));
-                if (ImGui::SmallButton("\xe2\x8f\xb9 Stop")) {  // ⏹
+                if (ImGui::SmallButton("\xe2\x96\xa0 Stop")) {  // ■ (U+25A0, was ⏹ U+23F9 not in Apple Symbols)
                     pass_manager_->cancel_all();
                 }
                 ImGui::PopStyleColor(3);
@@ -824,7 +824,7 @@ void GuiApp::render_analysis_panel() {
                 icon = "\xe2\x9c\x97";  // ✗
                 icon_color = ImVec4(0.90f, 0.30f, 0.30f, 1.0f);
             } else {
-                icon = "\xe2\x8f\xb3";  // ⏳
+                icon = "\xe2\x8c\x9b";  // ⌛ (U+231B, was ⏳ U+23F3 not in Apple Symbols)
                 icon_color = ImVec4(0.45f, 0.50f, 0.60f, 1.0f);
             }
 

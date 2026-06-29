@@ -20,11 +20,20 @@
 namespace tenet {
 
 // ─── Menu Bar ───────────────────────────────────────────────────────────────
+//
+// On macOS the actual system menu bar is the native NSMenu built in
+// gui_app.mm::setup_native_menu().  This ImGui menu bar is rendered ONLY
+// when the native menu is absent (non-macOS builds, or if the window is
+// embedded without an NSApp).  The two implementations must stay in sync.
 
 void GuiApp::render_menu_bar() {
     if (ImGui::BeginMenuBar()) {
+
+        // ╔═══════════════════════════════════╗
+        // ║            File menu              ║
+        // ╚═══════════════════════════════════╝
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open Trace...", "Cmd+O")) {
+            if (ImGui::MenuItem("Open Trace\xe2\x80\xa6", "Cmd+O")) {
                 // TODO: file dialog integration
             }
 
@@ -34,20 +43,15 @@ void GuiApp::render_menu_bar() {
             if (!has_recent) ImGui::BeginDisabled();
             if (ImGui::BeginMenu("Open Recent")) {
                 for (const auto& entry : recent.entries()) {
-                    // Format: "module_name  (N inst)  – /path/to/trace.bin"
-                    // Shorten path to last 2 components for readability
                     std::string display;
                     {
                         auto p = entry.path;
-                        // Find last two path separators
                         auto s2 = p.rfind('/');
                         if (s2 != std::string::npos && s2 > 0) {
                             auto s1 = p.rfind('/', s2 - 1);
-                            if (s1 != std::string::npos) {
-                                p = "\xe2\x80\xa6" + p.substr(s1);  // … + tail
-                            }
+                            if (s1 != std::string::npos)
+                                p = "\xe2\x80\xa6" + p.substr(s1);  // …/tail
                         }
-                        // Format timestamp as "YYYY-MM-DD HH:MM"
                         char ts_buf[24] = {};
                         if (entry.last_opened > 0) {
                             time_t t = static_cast<time_t>(entry.last_opened);
@@ -59,21 +63,14 @@ void GuiApp::render_menu_bar() {
                             entry.module_name.empty() ? p : entry.module_name,
                             entry.inst_count, ts_buf);
                     }
-                    if (ImGui::MenuItem(display.c_str())) {
-                        // Show the full path as tooltip even though we can't
-                        // reload in this session (trace is already open)
-                        // In a future implementation, this would re-open tenet
-                        // with the selected trace. For now, copy path to clipboard.
+                    if (ImGui::MenuItem(display.c_str()))
                         ImGui::SetClipboardText(entry.path.c_str());
-                    }
-                    if (ImGui::IsItemHovered()) {
+                    if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s\n(path copied to clipboard on click)",
                                           entry.path.c_str());
-                    }
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Clear Recent Files")) {
-                    // Overwrite with empty list
                     RecentFiles empty;
                     empty.save();
                 }
@@ -88,184 +85,305 @@ void GuiApp::render_menu_bar() {
             ImGui::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Settings...", "Cmd+,")) {
-                show_settings_ = true;
-            }
-            ImGui::EndMenu();
-        }
-
+        // ╔════════════════════════════════════════════════════════════════════╗
+        // ║  View menu  —  four sub-menus + Output / Cache at the bottom       ║
+        // ╚════════════════════════════════════════════════════════════════════╝
         if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Registers", "R", &show_registers_);
-            ImGui::MenuItem("Memory", "M", &show_memory_);
-            ImGui::MenuItem("Call Stack", "F", &show_callstack_);
-            ImGui::MenuItem("Analysis", "A", &show_analysis_);
-            ImGui::MenuItem("Hex Dump", "H", &show_hex_dump_);
-            ImGui::MenuItem("Strings", "I", &show_strings_);
-            ImGui::MenuItem("Functions", "L", &show_functions_);
-            ImGui::MenuItem("Threads", "T", &show_threads_);
+
+            // ── Core Panels ──────────────────────────────────────────────
+            if (ImGui::BeginMenu("Core Panels")) {
+                ImGui::MenuItem("Registers",  "Cmd+R", &show_registers_);
+                ImGui::MenuItem("Memory",     "Cmd+M", &show_memory_);
+                ImGui::MenuItem("Hex Dump",   nullptr, &show_hex_dump_);
+                ImGui::Separator();
+                ImGui::MenuItem("Call Stack", nullptr, &show_callstack_);
+                ImGui::MenuItem("Functions",  nullptr, &show_functions_);
+                ImGui::MenuItem("Strings",    nullptr, &show_strings_);
+                ImGui::MenuItem("Threads",    nullptr, &show_threads_);
+                ImGui::Separator();
+                ImGui::MenuItem("Analysis",   nullptr, &show_analysis_);
+                ImGui::EndMenu();
+            }
+
+            // ── Visualization ─────────────────────────────────────────────
+            if (ImGui::BeginMenu("Visualization")) {
+                ImGui::MenuItem("CFG View",       nullptr, &show_cfg_);
+                ImGui::MenuItem("Call Graph",     nullptr, &show_call_graph_);
+                ImGui::MenuItem("Minimap",        nullptr, &show_minimap_);
+                ImGui::MenuItem("Loop Highlight", nullptr, &show_loops_);
+                ImGui::EndMenu();
+            }
+
+            // ── Analysis Results ─────────────────────────────────────────
+            if (ImGui::BeginMenu("Analysis Results")) {
+                ImGui::MenuItem("Patterns",          nullptr, &show_pattern_);
+                ImGui::MenuItem("Constants",         nullptr, &show_constant_);
+                ImGui::MenuItem("Loop Semantics",    nullptr, &show_loop_semantics_);
+                ImGui::MenuItem("Algorithm Summary", nullptr, &show_algorithm_summary_);
+                ImGui::Separator();
+                ImGui::MenuItem("ObjC Messages",     nullptr, &show_objc_);
+                ImGui::MenuItem("ObjC Crypto",       nullptr, &show_objc_crypto_);
+                ImGui::MenuItem("API Intercepts",    nullptr, &show_syscall_intercept_);
+                ImGui::Separator();
+                ImGui::MenuItem("Memory Strings",    nullptr, &show_mem_strings_);
+                ImGui::EndMenu();
+            }
+
+            // ── Profiling & Diff ──────────────────────────────────────────
+            if (ImGui::BeginMenu("Profiling & Diff")) {
+                ImGui::MenuItem("Cache Sim",           nullptr, &show_cache_sim_);
+                ImGui::MenuItem("Trace Fold",          nullptr, &show_trace_fold_);
+                ImGui::MenuItem("Register Timeline",   nullptr, &show_reg_timeline_);
+                ImGui::MenuItem("Trace Diff",          nullptr, &show_trace_diff_);
+                ImGui::Separator();
+                ImGui::MenuItem("Symbol Info (DWARF)", nullptr, &show_dwarf_panel_);
+                ImGui::EndMenu();
+            }
+
             ImGui::Separator();
-            ImGui::MenuItem("Minimap", "V", &show_minimap_);
-            ImGui::MenuItem("Loop Highlight", "O", &show_loops_);
-            ImGui::MenuItem("CFG View", "K", &show_cfg_);
+            ImGui::MenuItem("Output (Log)",  nullptr, &show_log_);
+            ImGui::MenuItem("Cache Manager", nullptr, &show_cache_manager_);
             ImGui::Separator();
-            ImGui::MenuItem("ObjC Messages",         nullptr, &show_objc_);
-            ImGui::MenuItem("ObjC Crypto",           nullptr, &show_objc_crypto_);
-            ImGui::MenuItem("Loop Semantics",        nullptr, &show_loop_semantics_);
-            ImGui::MenuItem("Patterns",              nullptr, &show_pattern_);
-            ImGui::MenuItem("Constants",             nullptr, &show_constant_);
-            ImGui::MenuItem("Algorithm Summary",     nullptr, &show_algorithm_summary_);
-            ImGui::MenuItem("Call Graph",            nullptr, &show_call_graph_);
-            ImGui::MenuItem("Memory Strings",        nullptr, &show_mem_strings_);
-            ImGui::MenuItem("API Intercepts",        nullptr, &show_syscall_intercept_);
-            ImGui::MenuItem("Cache Sim",             nullptr, &show_cache_sim_);
-            ImGui::MenuItem("Trace Fold",            nullptr, &show_trace_fold_);
-            ImGui::Separator();
-            // ── P2 panels ────────────────────────────────────────────
-            ImGui::MenuItem("Register Timeline",     nullptr, &show_reg_timeline_);
-            ImGui::MenuItem("Symbol Info (DWARF)",   nullptr, &show_dwarf_panel_);
-            ImGui::MenuItem("Trace Diff",            nullptr, &show_trace_diff_);
-            ImGui::Separator();
-            ImGui::MenuItem("Output (Log)",          nullptr, &show_log_);
-            ImGui::Separator();
-            ImGui::MenuItem("Cache Manager",         nullptr, &show_cache_manager_);
+            // Developer tools — shown in ImGui menu (not native NSMenu)
+            if (ImGui::MenuItem("Settings\xe2\x80\xa6", "Cmd+,"))
+                show_settings_ = true;
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
             ImGui::EndMenu();
         }
 
+        // ╔═══════════════════════════════════╗
+        // ║          Navigate menu            ║
+        // ╚═══════════════════════════════════╝
         if (ImGui::BeginMenu("Navigate")) {
-            if (ImGui::MenuItem("Goto Instruction...", "G")) {
+            if (ImGui::MenuItem("Go to Instruction\xe2\x80\xa6", "G"))
                 show_goto_popup_ = true;
-            }
-            if (ImGui::MenuItem("Search...", "/")) {
+            if (ImGui::MenuItem("Search\xe2\x80\xa6", "/"))
                 show_search_popup_ = true;
-            }
             ImGui::Separator();
-            // Navigation history
             {
                 bool can_back = can_nav_back();
                 bool can_fwd  = can_nav_forward();
                 if (!can_back) ImGui::BeginDisabled();
-                if (ImGui::MenuItem("Back", "Alt+Left")) {
-                    nav_back();
-                }
+                if (ImGui::MenuItem("Back", "Alt+\xe2\x86\x90")) nav_back();   // ←
                 if (!can_back) ImGui::EndDisabled();
-                if (!can_fwd) ImGui::BeginDisabled();
-                if (ImGui::MenuItem("Forward", "Alt+Right")) {
-                    nav_forward();
-                }
-                if (!can_fwd) ImGui::EndDisabled();
-                // Show history size
-                if (!nav_history_.empty()) {
-                    ImGui::TextDisabled("  History: [%zu/%zu]",
+                if (!can_fwd)  ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Forward", "Alt+\xe2\x86\x92")) nav_forward();  // →
+                if (!can_fwd)  ImGui::EndDisabled();
+                if (!nav_history_.empty())
+                    ImGui::TextDisabled("  history [%zu/%zu]",
                         nav_history_pos_ + 1, nav_history_.size());
-                }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("First Instruction", "Home")) {
+            if (ImGui::MenuItem("First Instruction", "Home"))
                 navigate_to(0);
-            }
-            if (ImGui::MenuItem("Last Instruction", "End")) {
+            if (ImGui::MenuItem("Last Instruction", "End"))
                 navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0);
-            }
             ImGui::Separator();
-            if (ImGui::MenuItem("Toggle Bookmark", "B")) {
+            if (ImGui::MenuItem("Toggle Bookmark", "B"))
                 toggle_bookmark();
-            }
             ImGui::Separator();
-            // Follow call/return
-            if (ImGui::MenuItem("Follow Call (enter callee)", "E")) {
-                if (function_result_) {
+            // Follow call / return (greyed out if unavailable)
+            {
+                bool has_call = (function_result_ != nullptr &&
+                                 function_result_->call_at(current_inst_) != nullptr);
+                bool has_ret  = (function_result_ != nullptr &&
+                                 (function_result_->return_at(current_inst_) != nullptr ||
+                                  !current_call_stack().empty()));
+                if (!has_call) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Follow Call", "E")) {
                     auto* evt = function_result_->call_at(current_inst_);
-                    if (evt && evt->call_inst_id + 1 < total_inst_) {
+                    if (evt && evt->call_inst_id + 1 < total_inst_)
                         navigate_to(evt->call_inst_id + 1);
-                    }
                 }
-            }
-            if (ImGui::MenuItem("Follow Return (back to caller)", "R")) {
-                if (function_result_) {
-                    auto* evt = function_result_->return_at(current_inst_);
-                    if (evt) {
-                        navigate_to(evt->call_inst_id);
-                    } else {
-                        const auto& stk = current_call_stack();
-                        if (!stk.empty()) {
-                            navigate_to(stk.back()->call_inst_id);
+                if (!has_call) ImGui::EndDisabled();
+                if (!has_ret) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Follow Return", "R")) {
+                    if (function_result_) {
+                        auto* evt = function_result_->return_at(current_inst_);
+                        if (evt) {
+                            navigate_to(evt->call_inst_id);
+                        } else {
+                            const auto& stk = current_call_stack();
+                            if (!stk.empty()) navigate_to(stk.back()->call_inst_id);
                         }
                     }
                 }
+                if (!has_ret) ImGui::EndDisabled();
             }
             ImGui::Separator();
-            // Taint jump
-            if (show_taint_ && taint_result_) {
-                if (ImGui::MenuItem("Next Tainted Inst", "]")) {
-                    jump_taint_next();
-                }
-                if (ImGui::MenuItem("Prev Tainted Inst", "[")) {
-                    jump_taint_prev();
-                }
-            }
-            if (show_backward_taint_ && backward_taint_result_) {
-                if (ImGui::MenuItem("Next Backward-Tainted Inst", "Shift+]")) {
-                    jump_backward_taint_next();
-                }
-                if (ImGui::MenuItem("Prev Backward-Tainted Inst", "Shift+[")) {
-                    jump_backward_taint_prev();
-                }
+            // Taint jump — always shown; greyed when no active result
+            {
+                bool has_fwd  = (show_taint_ && taint_result_ != nullptr);
+                bool has_back = (show_backward_taint_ && backward_taint_result_ != nullptr);
+                if (!has_fwd) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Next Tainted Instruction",    "]"))        jump_taint_next();
+                if (ImGui::MenuItem("Prev Tainted Instruction",    "["))        jump_taint_prev();
+                if (!has_fwd) ImGui::EndDisabled();
+                if (!has_back) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Next Backward-Tainted", "Shift+]"))  jump_backward_taint_next();
+                if (ImGui::MenuItem("Prev Backward-Tainted", "Shift+["))  jump_backward_taint_prev();
+                if (!has_back) ImGui::EndDisabled();
             }
             ImGui::EndMenu();
         }
 
+        // ╔════════════════════════════════════════════════════════════════════╗
+        // ║  Analysis menu  —  sub-menus by category, each triggers a pass run ║
+        // ╚════════════════════════════════════════════════════════════════════╝
         if (ImGui::BeginMenu("Analysis")) {
-            if (ImGui::MenuItem("Forward Taint", "T")) {
-                run_taint_analysis();
+
+            // ── Data Flow ─────────────────────────────────────────────────
+            if (ImGui::BeginMenu("Data Flow")) {
+                if (ImGui::MenuItem("Forward Taint\xe2\x80\xa6",  "Cmd+T"))
+                    run_taint_analysis();
+                if (ImGui::MenuItem("Backward Taint\xe2\x80\xa6", "Cmd+Shift+T"))
+                    run_backward_taint_analysis();
+                if (ImGui::MenuItem("Slice\xe2\x80\xa6",          "Cmd+S"))
+                    run_slice_analysis();
+                ImGui::Separator();
+                if (ImGui::MenuItem("Register Timeline")) {
+                    show_reg_timeline_ = true;
+                    reg_timeline_dirty_ = true;
+                }
+                if (ImGui::MenuItem("Producer Chain")) {
+                    show_reg_timeline_ = true;
+                    run_producer_chain(current_inst_, reg_timeline_reg_);
+                }
+                ImGui::EndMenu();
             }
-            if (ImGui::MenuItem("Backward Taint", "Shift+B")) {
-                run_backward_taint_analysis();
+
+            // ── Structure ─────────────────────────────────────────────────
+            if (ImGui::BeginMenu("Structure")) {
+                if (ImGui::MenuItem("Function Analysis"))  run_pass_by_name("function");
+                if (ImGui::MenuItem("Xref Analysis"))      run_pass_by_name("xref");
+                if (ImGui::MenuItem("String Analysis"))    run_pass_by_name("strings");
+                if (ImGui::MenuItem("Thread Analysis"))    run_pass_by_name("thread");
+                ImGui::Separator();
+                if (ImGui::MenuItem("Call Graph"))         run_call_graph_analysis();
+                if (ImGui::MenuItem("Loop Analysis"))      run_pass_by_name("loop");
+                if (ImGui::MenuItem("CFG Layout"))         run_cfg_layout();
+                ImGui::EndMenu();
             }
-            if (ImGui::MenuItem("Slice", "S")) {
-                run_slice_analysis();
+
+            // ── Crypto & Pattern ──────────────────────────────────────────
+            if (ImGui::BeginMenu("Crypto & Pattern")) {
+                if (ImGui::MenuItem("Pattern Detection")) {
+                    run_pass_by_name("pattern"); show_pattern_ = true;
+                }
+                if (ImGui::MenuItem("Constants")) {
+                    run_pass_by_name("constant_materialization"); show_constant_ = true;
+                }
+                if (ImGui::MenuItem("Loop Semantics")) {
+                    run_pass_by_name("loop_semantics"); show_loop_semantics_ = true;
+                }
+                if (ImGui::MenuItem("Algorithm Summary")) {
+                    run_pass_by_name("algorithm_summary"); show_algorithm_summary_ = true;
+                }
+                if (ImGui::MenuItem("ObjC Crypto")) {
+                    run_pass_by_name("objc_crypto"); show_objc_crypto_ = true;
+                }
+                ImGui::EndMenu();
             }
+
+            // ── ObjC / iOS ────────────────────────────────────────────────
+            if (ImGui::BeginMenu("ObjC / iOS")) {
+                if (ImGui::MenuItem("ObjC Messages")) {
+                    run_pass_by_name("objc"); show_objc_ = true;
+                }
+                if (ImGui::MenuItem("API Intercepts")) {
+                    run_pass_by_name("syscall_intercept"); show_syscall_intercept_ = true;
+                }
+                ImGui::EndMenu();
+            }
+
+            // ── Profiling ─────────────────────────────────────────────────
+            if (ImGui::BeginMenu("Profiling")) {
+                if (ImGui::MenuItem("Cache Simulation")) {
+                    run_pass_by_name("cache_sim"); show_cache_sim_ = true;
+                }
+                if (ImGui::MenuItem("Trace Fold")) {
+                    run_pass_by_name("trace_fold"); show_trace_fold_ = true;
+                }
+                if (ImGui::MenuItem("Trace Diff")) {
+                    show_trace_diff_ = true;
+                }
+                if (ImGui::MenuItem("Memory Strings")) {
+                    run_pass_by_name("memory_strings"); show_mem_strings_ = true;
+                }
+                ImGui::EndMenu();
+            }
+
             ImGui::Separator();
-            // ── P2 data-flow tools ─────────────────────────────────
-            if (ImGui::MenuItem("Register Timeline...", nullptr)) {
-                show_reg_timeline_ = true;
-                reg_timeline_dirty_ = true;
+            // Clear Taint (greyed out when no taint active)
+            {
+                bool has_taint = (show_taint_ || show_backward_taint_ || show_slice_);
+                if (!has_taint) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Clear Taint")) {
+                    show_taint_ = show_backward_taint_ = show_slice_ = false;
+                    taint_result_          = nullptr;
+                    backward_taint_result_ = nullptr;
+                    slice_result_          = nullptr;
+                    taint_sorted_ids_dirty_ = true;
+                }
+                if (!has_taint) ImGui::EndDisabled();
             }
-            if (ImGui::MenuItem("Producer Chain (current reg)")) {
-                show_reg_timeline_ = true;
-                run_producer_chain(current_inst_, reg_timeline_reg_);
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Function Analysis", "Shift+F")) {
-                run_pass_by_name("function");
-            }
-            if (ImGui::MenuItem("Xref Analysis", "X")) {
-                run_pass_by_name("xref");
-            }
-            if (ImGui::MenuItem("String Analysis", "I")) {
-                run_pass_by_name("strings");
-            }
-            if (ImGui::MenuItem("Thread Analysis", "T")) {
-                run_pass_by_name("thread");
-            }
-            if (ImGui::MenuItem("Call Graph Analysis")) {
-                run_call_graph_analysis();
-            }
-            if (ImGui::MenuItem("Loop Analysis", "O")) {
-                run_pass_by_name("loop");
-            }
-            if (ImGui::MenuItem("CFG Layout", "K")) {
-                run_cfg_layout();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Clear All Analysis", "C")) {
+            if (ImGui::MenuItem("Clear All Analysis"))
                 clear_analysis();
+            ImGui::EndMenu();
+        }
+
+        // ╔═══════════════════════════════════╗
+        // ║           Export menu             ║
+        // ╚═══════════════════════════════════╝
+        if (ImGui::BeginMenu("Export")) {
+            if (ImGui::MenuItem("Export CFG\xe2\x80\xa6 (DOT)"))
+                export_cfg_to_file();
+            if (ImGui::MenuItem("Export Call Graph\xe2\x80\xa6 (DOT)"))
+                export_call_graph_to_file();
+            ImGui::Separator();
+            {
+                bool has_bt = (backward_taint_result_ != nullptr);
+                if (!has_bt) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Export Backward Taint Graph\xe2\x80\xa6 (DOT)"))
+                    export_backward_taint_graph_to_file();
+                if (!has_bt) ImGui::EndDisabled();
+            }
+            if (ImGui::MenuItem("Export Dataflow Graph\xe2\x80\xa6 (DOT/JSON)")) {
+                // TODO: dataflow_graph pass not yet plumbed into GUI
             }
             ImGui::EndMenu();
         }
 
-        // Status indicator on the right side of menu bar
+        // ╔═══════════════════════════════════╗
+        // ║            Tools menu             ║
+        // ╚═══════════════════════════════════╝
+        if (ImGui::BeginMenu("Tools")) {
+            if (ImGui::MenuItem("Entropy at Cursor\xe2\x80\xa6")) {
+                run_pass_by_name("entropy"); show_analysis_ = true;
+            }
+            if (ImGui::MenuItem("Memory Snapshot\xe2\x80\xa6")) {
+                run_pass_by_name("memory_snapshot"); show_analysis_ = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Literal Search\xe2\x80\xa6")) {
+                run_pass_by_name("literal_search"); show_analysis_ = true;
+            }
+            if (ImGui::MenuItem("Memory Pattern Search\xe2\x80\xa6")) {
+                run_pass_by_name("mem_search"); show_analysis_ = true;
+            }
+            if (ImGui::MenuItem("YARA Scan\xe2\x80\xa6")) {
+                run_pass_by_name("yara_mem_scan"); show_analysis_ = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Memory Write History\xe2\x80\xa6"))
+                show_memory_ = true;
+            if (ImGui::MenuItem("Call Context at Cursor\xe2\x80\xa6")) {
+                run_pass_by_name("call_context"); show_analysis_ = true;
+            }
+            ImGui::EndMenu();
+        }
+
+        // ── Right-side inst counter ──────────────────────────────────────
         {
             std::string status = fmt::format("  inst {}/{} ", current_inst_, total_inst_);
             float text_width = ImGui::CalcTextSize(status.c_str()).x;

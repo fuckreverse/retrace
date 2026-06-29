@@ -745,6 +745,12 @@ private:
     void run_cfg_layout();
     void clear_analysis();
 
+    // Export helpers: run the underlying pass (if needed) then write to disk.
+    // On macOS these open an NSSavePanel to pick the destination.
+    void export_cfg_to_file();
+    void export_call_graph_to_file();
+    void export_backward_taint_graph_to_file();
+
     /// Run any catalog pass by name, deriving config from the current cursor.
     /// Stores a one-line summary in last_pass_status_.
     void run_pass_by_name(std::string_view name);

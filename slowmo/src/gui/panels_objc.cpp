@@ -44,7 +44,7 @@ void GuiApp::render_objc_panel() {
 
     // ── Summary header ─────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xef\xa3\xbf  %zu messages  |  %zu classes",   // Apple  
+        "\xe2\x8c\x98  %zu messages  |  %zu classes",   // ⌘ U+2318 (was Apple logo U+F8FF PUA)
         objc_result_->total_messages(),
         objc_result_->unique_classes());
 

@@ -409,7 +409,7 @@ void GuiApp::render_hex_dump_panel() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Follow current instruction's memory access");
     ImGui::SameLine();
-    if (ImGui::Button("Watch\xf0\x9f\x94\xad##watchaddr") && has_addr) {
+    if (ImGui::Button("Watch\xe2\x8c\x95##watchaddr") && has_addr) {  // ⌕ U+2315 (was 🔭 U+1F52D emoji)
         timeline_watch_addr_ = display_addr;
     }
     if (ImGui::IsItemHovered())
@@ -715,7 +715,7 @@ void GuiApp::render_hex_dump_panel() {
 
     ImGui::Separator();
     ImGui::TextDisabled(
-        "Click: select byte | Dbl-click: jump to writer | Watch\xf0\x9f\x94\xad: mark in Timeline | Struct Overlay: field-aware display");
+        "Click: select byte | Dbl-click: jump to writer | Watch\xe2\x8c\x95: mark in Timeline | Struct Overlay: field-aware display");  // ⌕ (was 🔭)
 
     ImGui::End();
 }

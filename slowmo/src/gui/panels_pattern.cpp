@@ -101,7 +101,7 @@ void GuiApp::render_pattern_panel() {
     }
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-        "\xef\x8b\x9b  %zu matches   "     // shield icon
+        "\xe2\x97\x86  %zu matches   "     // ◆ U+25C6 (was fa-shield U+F2DB PUA)
         "Crypto:%zu  AntiDebug:%zu  Other:%zu",
         pattern_result_->total(), n_crypto, n_antidebug, n_other);
 

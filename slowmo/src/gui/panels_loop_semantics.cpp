@@ -90,7 +90,7 @@ void GuiApp::render_loop_semantics_panel() {
     size_t crypto_count = res.crypto_loops().size();
 
     ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f),
-        "\xf0\x9f\x94\x84  %zu loops  |  %zu crypto",  // 🔄
+        "\xe2\x86\xba  %zu loops  |  %zu crypto",  // ↺ U+21BA (was 🔄 U+1F504 emoji)
         total_loops, crypto_count);
 
     ImGui::SameLine(panel_w - 90.0f);

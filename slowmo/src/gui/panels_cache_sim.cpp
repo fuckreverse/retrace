@@ -77,7 +77,7 @@ void GuiApp::render_cache_sim_panel() {
     // ── Summary header ─────────────────────────────────────────────────────
     double omr = cache_sim_result_->overall_miss_rate();
     ImGui::TextColored(miss_rate_color(omr),
-        "\xf0\x9f\x97\x84  Overall miss rate: %.1f%%  |  %s instructions",
+        "\xe2\x96\xa4  Overall miss rate: %.1f%%  |  %s instructions",  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
         omr * 100.0,
         fmt_count(cache_sim_result_->total_instructions).c_str());
 

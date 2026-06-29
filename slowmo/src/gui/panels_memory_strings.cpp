@@ -82,7 +82,7 @@ void GuiApp::render_memory_strings_panel() {
 
     // ── Summary header ─────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xef\x83\x82  %zu strings  |  %zu unique",   // fa-font
+        "\xe2\x8c\x95  %zu strings  |  %zu unique",   // ⌕ U+2315 (was fa-font U+F0C2 PUA)
         mem_string_result_->total(),
         mem_string_result_->unique_count());
 

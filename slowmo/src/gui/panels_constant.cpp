@@ -64,7 +64,7 @@ void GuiApp::render_constant_panel() {
 
     // ── Summary header ───────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xf0\x9f\x94\x90  %zu total,  %zu identified",   // 🔐
+        "\xe2\x97\x89  %zu total,  %zu identified",   // ◉ U+25C9 (was 🔐 U+1F510 emoji)
         constant_result_->total(),
         constant_result_->identified_count());
 

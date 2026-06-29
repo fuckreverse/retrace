@@ -90,7 +90,7 @@ void GuiApp::render_cache_manager_panel() {
 
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
         ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f),
-            "\xf0\x9f\x97\x84  Pass Cache Manager");  // 🗄
+            "\xe2\x96\xa4  Pass Cache Manager");  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
 
         // Reload button (refresh cache info list)
         ImGui::SameLine(panel_w - 120.0f);

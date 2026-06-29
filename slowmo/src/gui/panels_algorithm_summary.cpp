@@ -45,7 +45,7 @@ void GuiApp::render_algorithm_summary_panel() {
     // ── Summary header ─────────────────────────────────────────────────────
     const char* crypto_badge = res.has_crypto() ? "  \xe2\x9a\xa0 CRYPTO" : "";  // ⚠
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xf0\x9f\x94\x8d  %zu candidate(s)%s",   // 🔍
+        "\xe2\x8c\x95  %zu candidate(s)%s",   // ⌕ U+2315 (was 🔍 U+1F50D emoji)
         res.total(), crypto_badge);
 
     ImGui::SameLine(panel_w - 90.0f);

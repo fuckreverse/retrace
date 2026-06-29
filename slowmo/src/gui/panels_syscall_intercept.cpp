@@ -112,7 +112,7 @@ void GuiApp::render_syscall_intercept_panel() {
         crypto_count += cc_it->second.size();
 
     ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
-        "\xef\xa3\xa8  %zu calls  |  %zu CommonCrypto",   // lock icon (PUA)
+        "\xe2\x9a\x99  %zu calls  |  %zu CommonCrypto",   // ⚙ U+2699 (was lock U+F8E8 PUA)
         syscall_result_->total(),
         crypto_count);
 

@@ -95,7 +95,7 @@ void GuiApp::render_objc_crypto_panel() {
 
     // ── Summary header ────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.70f, 1.0f),
-        "\xef\x87\xbb  %zu hits",          // lock icon approximation
+        "\xe2\x97\x89  %zu hits",          // ◉ U+25C9 (was fa-lock U+F1FB PUA)
         objc_crypto_result_->total());
     ImGui::SameLine(0, 12);
     ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.00f, 1.0f),
