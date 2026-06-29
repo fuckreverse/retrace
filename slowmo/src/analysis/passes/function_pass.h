@@ -127,6 +127,13 @@ public:
     void on_anchor(uint64_t inst_id, const AnchorView& anchor) override;
     void end() override;
 
+    /// Set a progress callback for Phase 2.  The callback receives a float in
+    /// [0, 1] representing progress within Phase 2 only.  The caller is
+    /// responsible for mapping this into the overall pass progress range.
+    /// Must be called before end().
+    using ProgressFn = std::function<void(float)>;
+    void set_progress_fn(ProgressFn fn) { progress_fn_ = std::move(fn); }
+
     /// Take ownership of the result after the scan completes.
     FunctionResult take_result() { return std::move(result_); }
 
@@ -230,6 +237,9 @@ private:
 
     uint64_t non_local_unwinds_ = 0;
     uint64_t tail_calls_detected_ = 0;
+
+    // ── Phase 2 progress callback (optional, set via set_progress_fn()) ──
+    ProgressFn progress_fn_;
 
     // ── Result ──
     FunctionResult result_;

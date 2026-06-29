@@ -625,14 +625,20 @@ void FunctionCollector::handle_branch_event(const BranchEvent& ev) {
 
         const uint64_t ret_pc = ev.pc + 4;
         call_stack_.push_back({idx, ret_pc, ev.sp_valid ? ev.sp : 0});
-        ret_pc_refcount_[ret_pc]++;
+        // Use try_emplace to avoid a double hash lookup: insert-or-increment
+        // in a single operation instead of operator[] (find + insert) + ++.
+        ++ret_pc_refcount_.try_emplace(ret_pc, 0u).first->second;
 
         // Register the target function immediately (deferred name).
         if (tgt != 0) {
-            auto& func = result_.functions[tgt];
-            if (func.entry_pc == 0) {
+            // try_emplace avoids default-constructing FunctionInfo when the
+            // key already exists (saves one redundant zero-init + heap alloc
+            // for the name/call_event_indices vectors on every repeated call).
+            auto [it, inserted] = result_.functions.try_emplace(tgt);
+            auto& func = it->second;
+            if (inserted) {
                 func.entry_pc = tgt;
-                func.name.clear();  // generated in batch at end()
+                // name is left empty; generated in batch at end()
             }
             func.total_calls++;
             func.call_event_indices.push_back(idx);
@@ -662,9 +668,44 @@ void FunctionCollector::run_state_machine() {
 // ── end(): Phase 2 entry point ───────────────────────────────────────────
 
 void FunctionCollector::end() {
+    // ── Phase 2 pre-allocation ────────────────────────────────────────────
+    // branch_events_ is fully built by now.  Roughly half its entries are
+    // CALL events (the others are RET / unconditional BRANCH).  Reserve the
+    // output containers up-front so that run_state_machine() never triggers
+    // a vector/map reallocation, eliminating the memmove traffic that showed
+    // up as the #1 hot spot in sampling (383 memmove samples in 10 s).
+    if (!branch_events_.empty()) {
+        const size_t call_est = branch_events_.size() / 2 + 64;
+        result_.call_events.reserve(call_est);
+        result_.call_site_map_.reserve(call_est);
+        result_.return_site_map_.reserve(call_est);
+        // call_stack_ depth is bounded by the call-tree depth; reserve a
+        // generous upper bound to avoid any realloc during the scan.
+        call_stack_.reserve(std::min(call_est, size_t(4096)));
+        // tail_candidates_ mirrors unconditional-branch events.
+        tail_candidates_.reserve(branch_events_.size() / 4 + 64);
+        // ret_pc_refcount_ tracks unique return-PC values on the live stack.
+        ret_pc_refcount_.reserve(std::min(call_est, size_t(4096)));
+    }
+
     // ── Phase 2: state machine over branch_events_ ────────────────────────
     // branch_events_ holds ~2-5% of total instruction count.
-    run_state_machine();
+    // Report progress through the state machine in ~5% increments.
+    if (progress_fn_ && !branch_events_.empty()) {
+        const size_t total = branch_events_.size();
+        const size_t report_interval = std::max(total / 20, size_t(1));
+        size_t processed = 0;
+        for (const auto& ev : branch_events_) {
+            handle_branch_event(ev);
+            ++processed;
+            if (processed % report_interval == 0) {
+                progress_fn_(static_cast<float>(processed) / static_cast<float>(total));
+            }
+        }
+        progress_fn_(1.0f);
+    } else {
+        run_state_machine();
+    }
 
     // ── Handle trailing deferred RET ─────────────────────────────────────
     if (p2_prev_was_ret_ && !call_stack_.empty()) {
@@ -722,10 +763,11 @@ void FunctionCollector::end() {
             result_.call_site_map_[cand.inst_id] = evt_idx;
             result_.call_events.push_back(evt);
 
-            auto& func = result_.functions[cand.target_pc];
-            if (func.entry_pc == 0) {
+            auto [fit, finserted] = result_.functions.try_emplace(cand.target_pc);
+            auto& func = fit->second;
+            if (finserted) {
                 func.entry_pc = cand.target_pc;
-                func.name.clear();  // generated below
+                // name left empty — generated in batch below
                 // Incremental update — no full set rebuild needed.
                 known_entries.insert(cand.target_pc);
             }
@@ -795,39 +837,69 @@ PassResult FunctionPass::run(PassContext& ctx) {
         }
     }
 
+    // ── Progress budget allocation (based on profiling) ──────────────────
+    // Phase 1 (trace scan):         0% → 70%
+    // Phase 2 (state machine):     70% → 85%
+    // Post-processing (tail/names): 85% → 90%
+    // Serialize + save_blob:        90% → 100%
+    constexpr float kPhase1End   = 0.70f;
+    constexpr float kPhase2End   = 0.85f;
+    constexpr float kPostEnd     = 0.90f;
+
     ctx.progress(0.0f, "Function analysis: scanning trace...");
 
     FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr,
                                  hdr.has_branch_hint());
 
+    // Phase 2 progress: map [0,1] → [kPhase1End, kPhase2End]
+    collector.set_progress_fn([&](float p2_pct) {
+        ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
+                     "Function analysis: building call graph...");
+    });
+
     // Use shared scan engine if available; otherwise create a local one.
     auto* engine = ctx.scan_engine();
     if (engine) {
+        // Shared engine: we can't intercept per-instruction progress, but we
+        // can at least mark phase boundaries around run() and end().
+        ctx.progress(0.0f, "Function analysis: scanning trace (shared engine)...");
         engine->add_collector(&collector);
         engine->run();
+        // Phase 1 done — engine has already called collector.end() internally,
+        // which drove the phase-2 progress callback above.
+        // Jump to post-processing marker.
+        ctx.progress(kPhase2End, "Function analysis: finalising...");
     } else {
         TraceScanEngine local_engine(reader, total_insts, &index);
+        // Phase 1: map engine progress [0,1] → [0, kPhase1End]
         local_engine.set_progress([&](uint64_t processed, uint64_t total) {
             if (total > 0) {
-                ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+                ctx.progress(static_cast<float>(processed) /
+                             static_cast<float>(total) * kPhase1End,
+                             "Function analysis: scanning trace...");
             }
         });
         local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
         local_engine.set_cancel_token(&ctx.global_cancel_flag());
         local_engine.add_collector(&collector);
         local_engine.run();
+        // Phase 2 progress is driven by the set_progress_fn callback above.
+        ctx.progress(kPhase2End, "Function analysis: finalising...");
     }
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
 
+    ctx.progress(kPostEnd, "Function analysis: post-processing...");
     auto result = collector.take_result();
 
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {
+        ctx.progress(kPostEnd, "Function analysis: serialising...");
         std::string blob = function_serialize(result);
         if (!blob.empty()) {
+            ctx.progress(0.95f, "Function analysis: writing cache...");
             index.save_pass_blob("function", blob.data(), blob.size());
         }
     }
