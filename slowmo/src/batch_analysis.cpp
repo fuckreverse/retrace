@@ -1840,6 +1840,35 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         }
     }
 
+    // ── --cache-list / --cache-delete: pass blob cache management ─────
+    // These operations act directly on the RocksDB index and exit early,
+    // so they run before any pass is registered or executed.
+    if (opts.opt_cache_list) {
+        const auto blobs = index.list_pass_blobs();
+        if (blobs.empty()) {
+            fmt::print(stderr, "[cache-list] No pass blobs cached for this trace.\n");
+        } else {
+            fmt::print(stderr, "[cache-list] {} cached pass blob(s):\n", blobs.size());
+            for (const auto& b : blobs) {
+                const double kb = static_cast<double>(b.size) / 1024.0;
+                fmt::print(stderr, "  {:<28} {:>8.1f} KB\n", b.name, kb);
+            }
+        }
+        return rc;
+    }
+    if (!opts.cache_delete_blobs.empty()) {
+        for (const auto& target : opts.cache_delete_blobs) {
+            if (target == "all") {
+                const size_t n = index.delete_all_pass_blobs();
+                fmt::print(stderr, "[cache-delete] Deleted all {} pass blob(s).\n", n);
+            } else {
+                index.delete_pass_blob(target);
+                fmt::print(stderr, "[cache-delete] Deleted blob: {}\n", target);
+            }
+        }
+        return rc;
+    }
+
     // ── --index-build: (re)build the RocksDB trace index ──────────────
     if (opts.opt_index_build) {
         pm.register_pass(std::make_unique<IndexBuildPass>());

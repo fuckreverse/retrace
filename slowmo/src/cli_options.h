@@ -147,6 +147,13 @@ struct CliOptions {
     bool opt_index_build = false;
     std::vector<std::string> run_pass_names;
 
+    // --- Pass blob cache management ---
+    // --cache-list: print all persisted pass blobs (name + size) then exit.
+    bool opt_cache_list = false;
+    // --cache-delete <pass|all>: delete one or all pass blobs then exit.
+    // Special value "all" deletes every blob.  Repeatable.
+    std::vector<std::string> cache_delete_blobs;
+
     // --- P3: RPC server ---
     bool opt_rpc = false;
     std::string rpc_socket_path;

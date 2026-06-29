@@ -30,7 +30,9 @@ bool CliOptions::has_analysis_option() const {
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
            opt_index_build ||
-           !run_pass_names.empty();
+           !run_pass_names.empty() ||
+           opt_cache_list ||
+           !cache_delete_blobs.empty();
 }
 
 // ─── print_usage ────────────────────────────────────────────────────────────
@@ -52,6 +54,9 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --run-pass <name>         Run any catalog pass (repeatable). Names: see --list-passes\n");
     fmt::print(stderr, "  --list-passes             List all available pass names and exit\n");
     fmt::print(stderr, "  --index-build             (Re)build the RocksDB trace index\n");
+  fmt::print(stderr, "  --cache-list              List all persisted pass blob caches (name + size)\n");
+  fmt::print(stderr, "  --cache-delete <pass|all> Delete a pass blob cache (use 'all' to clear all)\n");
+  fmt::print(stderr, "                            Repeatable. Exits after deletion.\n");
     fmt::print(stderr, "  --export-cfg <file.dot>   Export annotated CFG as Graphviz DOT\n");
     fmt::print(stderr, "  --taint <reg_index>       Run taint analysis from register index\n");
     fmt::print(stderr, "  --taint-inst <inst_id>    Start taint from specific instruction ID\n");
@@ -338,6 +343,10 @@ CliOptions parse_args(int argc, char** argv) {
                     }
                 }
             }
+        } else if (arg == "--cache-list") {
+            opts.opt_cache_list = true;
+        } else if (arg == "--cache-delete" && i + 1 < argc) {
+            opts.cache_delete_blobs.push_back(argv[++i]);
         } else if (arg == "--index-build") {
             opts.opt_index_build = true;
         } else if (arg == "--run-pass" && i + 1 < argc) {
