@@ -1,5 +1,6 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
+#include "common/logger.h"
 #include "common/Profiling.h"
 
 #if defined(TENET_HAS_TBB) && TENET_HAS_TBB
@@ -253,19 +254,36 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     std::string schema_val;
     auto sv = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                        "schema_version", &schema_val);
-    if (!sv.ok() || schema_val.size() < 4) return false;
+    if (!sv.ok() || schema_val.size() < 4) {
+        LOG_WARN("Index cache invalid: missing schema_version key ({})",
+                 sv.ok() ? "too short" : sv.ToString());
+        return false;
+    }
     uint32_t stored_schema = 0;
     std::memcpy(&stored_schema, schema_val.data(), 4);
-    if (stored_schema != INDEX_SCHEMA_VERSION) return false;
+    if (stored_schema != INDEX_SCHEMA_VERSION) {
+        LOG_WARN("Index cache invalid: schema version mismatch "
+                 "(stored={}, current={}) — rebuilding",
+                 stored_schema, INDEX_SCHEMA_VERSION);
+        return false;
+    }
 
     // Check stored file size matches
     std::string value;
     auto s = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                       "file_size", &value);
-    if (!s.ok()) return false;
+    if (!s.ok()) {
+        LOG_WARN("Index cache invalid: missing file_size key — rebuilding");
+        return false;
+    }
     uint64_t stored_size = 0;
     std::memcpy(&stored_size, value.data(), std::min(value.size(), size_t(8)));
-    if (stored_size != reader.file_size()) return false;
+    if (stored_size != reader.file_size()) {
+        LOG_WARN("Index cache invalid: file size mismatch "
+                 "(stored={}, current={}) — rebuilding",
+                 stored_size, reader.file_size());
+        return false;
+    }
 
     // Check trace hash (schema v7+): detects file swaps and content corruption.
     // Old caches (schema < v7) lack this key; they're already invalidated by the
@@ -273,11 +291,20 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     std::string hash_val;
     auto hs = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                        "trace_hash", &hash_val);
-    if (!hs.ok() || hash_val.size() < 8) return false;
+    if (!hs.ok() || hash_val.size() < 8) {
+        LOG_WARN("Index cache invalid: missing trace_hash key — rebuilding");
+        return false;
+    }
     uint64_t stored_hash = 0;
     std::memcpy(&stored_hash, hash_val.data(), 8);
     uint64_t current_hash = sample_trace_hash(reader);
-    return stored_hash == current_hash;
+    if (stored_hash != current_hash) {
+        LOG_WARN("Index cache invalid: trace content hash mismatch "
+                 "(stored={:#018x}, current={:#018x}) — rebuilding",
+                 stored_hash, current_hash);
+        return false;
+    }
+    return true;
 }
 
 // ─── Open or build ────────────────────────────────────────────────────────
@@ -360,6 +387,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
                                    &idx.cf_handles_, &raw_db);
         if (s.ok()) {
             idx.db_ = std::unique_ptr<rocksdb::DB>(raw_db);
+            LOG_INFO("Index cache found at '{}', validating...", db_path.string());
             if (idx.is_valid_for(reader)) {
                 // Load stats from the META column family. inst_count and
                 // file_size are always present (written by build()). The
@@ -409,16 +437,22 @@ Result<TraceIndex> TraceIndex::open_or_build(
                 // shows the real count instead of 0 when loading from cache).
                 idx.stats_.anchor_count = idx.anchors_.size();
 
+                LOG_INFO("Index cache hit: {} instructions, {} anchors",
+                         idx.stats_.inst_count, idx.stats_.anchor_count);
                 return idx;
             }
         }
         // Invalid cache - rebuild
+        LOG_INFO("Removing stale index cache at '{}'", db_path.string());
         for (auto* h : idx.cf_handles_) {
             if (h && raw_db) raw_db->DestroyColumnFamilyHandle(h);
         }
         idx.cf_handles_.clear();
         idx.db_.reset();
         std::filesystem::remove_all(db_path);
+    } else {
+        LOG_INFO("No index cache found for '{}', building from scratch...",
+                 reader.path().filename().string());
     }
 
     // Build from scratch
