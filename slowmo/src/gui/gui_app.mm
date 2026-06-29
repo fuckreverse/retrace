@@ -88,6 +88,12 @@ bool GuiApp::init_sdl() {
         return false;
     }
 
+    // Enable VSync to cap frame rate at display refresh rate.
+    // Without this the render loop runs unbounded, causing Metal to allocate
+    // hundreds of 128 MB IOAccelerator buffers (command buffers pile up faster
+    // than the GPU can retire them), leading to 30+ GB memory bloat.
+    SDL_SetRenderVSync(renderer_, 1);
+
     // Get DPI scale
     dpi_scale_ = SDL_GetWindowDisplayScale(window_);
     if (dpi_scale_ <= 0.0f) dpi_scale_ = 1.0f;
@@ -124,6 +130,16 @@ bool GuiApp::init_imgui() {
         return false;
     }
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+    // Limit in-flight drawables to 2 (double-buffering).  The default is 3,
+    // but with VSync this is more than enough.  Fewer drawables = fewer Metal
+    // buffers retained by the driver at any given time, reducing peak memory.
+    layer.maximumDrawableCount = 2;
+
+    // Ensure the layer syncs to display refresh (belt-and-suspenders with
+    // SDL_SetRenderVSync above — SDL may not always propagate vsync to the
+    // underlying CAMetalLayer on all driver versions).
+    layer.displaySyncEnabled = YES;
 
     ImGui_ImplMetal_Init(layer.device);
 
