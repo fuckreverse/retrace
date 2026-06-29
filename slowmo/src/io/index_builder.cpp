@@ -13,6 +13,10 @@
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/sst_file_writer.h>
 
+#if defined(TENET_HAS_ZSTD) && TENET_HAS_ZSTD
+#include <zstd.h>
+#endif
+
 #include <chrono>
 #include <algorithm>
 #include <atomic>
@@ -41,7 +45,20 @@ namespace tenet {
 // v8: All index CFs now use LZ4 compression; REG_WRITES CF gains a prefix
 //     extractor (FixedPrefix(2)) + bloom filter; CompactRange after build.
 //     Old uncompressed caches are invalidated to rebuild with new settings.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 8;
+// v9: Added PASS_CACHE CF for large pass result blobs (previously stored in
+//     META CF).  On macOS, pread(2) rejects requests > 2 GB (EINVAL); with
+//     large traces, META+blobs exceeded 2 GB in a single SST file, making
+//     DB::Open fail and causing perpetual cache misses.  Keeping blobs in a
+//     dedicated CF with 512 MB target_file_size_base keeps each SST small.
+//     meta_batch.Write() now uses sync=true to survive OOM-kills.
+// v10: PASS_CACHE CF removed entirely.  Pass result blobs are now stored as
+//      plain files under <index_dir>/pass_cache/<name>.bin rather than
+//      inside RocksDB.  Pass blobs are opaque byte arrays with no need for
+//      DB key lookup, iteration, or transactions.  Plain files avoid the
+//      2 GB macOS pread SST limit, allow zero-copy reads, and eliminate
+//      compaction overhead.  The pass_cache/ directory is wiped together
+//      with the index when DestroyDB removes the .tenet directory.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 10;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -236,15 +253,16 @@ TraceIndex& TraceIndex::operator=(TraceIndex&& other) noexcept {
 }
 
 rocksdb::ColumnFamilyHandle* TraceIndex::get_cf(const char* name) const {
-    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), mem_read(5), reg_writes(6), code_bytes(7)
-    if (std::strcmp(name, "default") == 0)      return cf_handles_[0];
-    if (std::strcmp(name, cf::META) == 0)       return cf_handles_[1];
-    if (std::strcmp(name, cf::OFFSET) == 0)     return cf_handles_[2];
-    if (std::strcmp(name, cf::ANCHOR) == 0)     return cf_handles_[3];
-    if (std::strcmp(name, cf::MEM_WRITE) == 0   && cf_handles_.size() > 4) return cf_handles_[4];
-    if (std::strcmp(name, cf::MEM_READ) == 0    && cf_handles_.size() > 5) return cf_handles_[5];
-    if (std::strcmp(name, cf::REG_WRITES) == 0  && cf_handles_.size() > 6) return cf_handles_[6];
-    if (std::strcmp(name, cf::CODE_BYTES) == 0  && cf_handles_.size() > 7) return cf_handles_[7];
+    // Order: default(0), meta(1), offset(2), anchor(3), mem_write(4), mem_read(5),
+    //        reg_writes(6), code_bytes(7)
+    if (std::strcmp(name, "default") == 0)       return cf_handles_[0];
+    if (std::strcmp(name, cf::META) == 0)        return cf_handles_[1];
+    if (std::strcmp(name, cf::OFFSET) == 0)      return cf_handles_[2];
+    if (std::strcmp(name, cf::ANCHOR) == 0)      return cf_handles_[3];
+    if (std::strcmp(name, cf::MEM_WRITE) == 0    && cf_handles_.size() > 4) return cf_handles_[4];
+    if (std::strcmp(name, cf::MEM_READ) == 0     && cf_handles_.size() > 5) return cf_handles_[5];
+    if (std::strcmp(name, cf::REG_WRITES) == 0   && cf_handles_.size() > 6) return cf_handles_[6];
+    if (std::strcmp(name, cf::CODE_BYTES) == 0   && cf_handles_.size() > 7) return cf_handles_[7];
     return nullptr;
 }
 
@@ -273,7 +291,23 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     auto s = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                       "file_size", &value);
     if (!s.ok()) {
-        LOG_WARN("Index cache invalid: missing file_size key — rebuilding");
+        // Dump all keys in META CF to diagnose what's actually present
+        std::string meta_keys_str;
+        if (auto* meta_cf = get_cf(cf::META)) {
+            std::unique_ptr<rocksdb::Iterator> it(
+                db_->NewIterator(rocksdb::ReadOptions(), meta_cf));
+            for (it->SeekToFirst(); it->Valid(); it->Next()) {
+                auto k = it->key().ToString();
+                // Truncate long values (pass blobs can be hundreds of MB)
+                if (k.size() < 32) {
+                    if (!meta_keys_str.empty()) meta_keys_str += ", ";
+                    meta_keys_str += k;
+                }
+            }
+        }
+        LOG_WARN("Index cache invalid: missing file_size key — rebuilding "
+                 "(status={}, meta_cf={}, keys_in_meta=[{}])",
+                 s.ToString(), static_cast<void*>(get_cf(cf::META)), meta_keys_str);
         return false;
     }
     uint64_t stored_size = 0;
@@ -371,21 +405,143 @@ Result<TraceIndex> TraceIndex::open_or_build(
             return o;
         };
 
+        // META CF: small key-value metadata only (no blobs). Keep target SST
+        // size <= 128 MB so we never hit macOS pread's 2 GB EINVAL limit.
+        rocksdb::ColumnFamilyOptions meta_cf_opts;
+        meta_cf_opts.compression = rocksdb::kLZ4Compression;
+        meta_cf_opts.target_file_size_base = 128 * 1024 * 1024;  // 128 MB
+
         std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
             {"default", rocksdb::ColumnFamilyOptions()},
-            {cf::META, rocksdb::ColumnFamilyOptions()},
-            {cf::OFFSET, make_index_cf_opts()},
-            {cf::ANCHOR, make_index_cf_opts()},
-            {cf::MEM_WRITE, make_mem_cf_opts()},
-            {cf::MEM_READ,  make_mem_cf_opts()},
+            {cf::META,       meta_cf_opts},
+            {cf::OFFSET,     make_index_cf_opts()},
+            {cf::ANCHOR,     make_index_cf_opts()},
+            {cf::MEM_WRITE,  make_mem_cf_opts()},
+            {cf::MEM_READ,   make_mem_cf_opts()},
             {cf::REG_WRITES, make_reg_writes_cf_opts()},
             {cf::CODE_BYTES, make_index_cf_opts()},
+        };
+
+        // Helper: close db + cf handles, then wipe the DB directory.
+        // Uses rocksdb::DestroyDB (not remove_all) so RocksDB removes its own
+        // lock files and WAL in the correct order, preventing stale LOCK files
+        // that would make the next DB::Open fail with "Resource unavailable".
+        // Falls back to filesystem::remove_all if DestroyDB itself fails.
+        //
+        // keep_pass_cache: when true, the pass_cache/ subdirectory is moved
+        // out before DestroyDB and moved back afterwards.  Use this when only
+        // the index schema changed but the trace content is unchanged — in that
+        // case pass results are still valid and should not be recomputed.
+        auto destroy_and_wipe = [&](rocksdb::DB* rdb, bool keep_pass_cache) {
+            // 0. Optionally rescue pass_cache/ before wiping the DB dir.
+            auto pc_dir    = db_path / "pass_cache";
+            auto pc_tmp    = db_path.parent_path() / (db_path.filename().string() + ".pc_tmp");
+            bool pc_saved  = false;
+            if (keep_pass_cache) {
+                std::error_code ec;
+                if (std::filesystem::exists(pc_dir, ec) && !ec) {
+                    std::filesystem::rename(pc_dir, pc_tmp, ec);
+                    if (!ec) {
+                        pc_saved = true;
+                    } else {
+                        LOG_WARN("destroy_and_wipe: could not move pass_cache aside ({})"
+                                 " — pass results will be recomputed", ec.message());
+                    }
+                }
+            }
+
+            // 1. Destroy CF handles and close DB first.
+            for (auto* h : idx.cf_handles_) {
+                if (h && rdb) rdb->DestroyColumnFamilyHandle(h);
+            }
+            idx.cf_handles_.clear();
+            idx.db_.reset();  // calls delete rdb
+
+            // 2. DestroyDB removes SSTs, WAL, MANIFEST, LOCK cleanly.
+            rocksdb::Options destroy_opts;
+            auto ds = rocksdb::DestroyDB(db_path.string(), destroy_opts);
+            if (!ds.ok()) {
+                LOG_WARN("DestroyDB '{}' failed ({}), falling back to remove_all",
+                         db_path.string(), ds.ToString());
+                std::error_code ec;
+                std::filesystem::remove_all(db_path, ec);
+                if (ec) {
+                    LOG_WARN("remove_all '{}' also failed: {} — build will overwrite in-place",
+                             db_path.string(), ec.message());
+                }
+            }
+
+            // 3. Restore pass_cache/ into the (now empty / recreatable) db_path.
+            if (pc_saved) {
+                std::error_code ec;
+                std::filesystem::create_directories(db_path, ec);  // re-create dir if gone
+                std::filesystem::rename(pc_tmp, pc_dir, ec);
+                if (ec) {
+                    LOG_WARN("destroy_and_wipe: could not restore pass_cache ({})"
+                             " — pass results will be recomputed", ec.message());
+                    std::filesystem::remove_all(pc_tmp, ec);
+                } else {
+                    LOG_INFO("Pass cache preserved across index rebuild ({} entries)",
+                             [&]() -> size_t {
+                                 std::error_code e2;
+                                 size_t n = 0;
+                                 for (auto& ent : std::filesystem::directory_iterator(pc_dir, e2))
+                                     if (ent.path().extension() == ".bin") n++;
+                                 return n;
+                             }());
+                }
+            }
         };
 
         rocksdb::DB* raw_db = nullptr;
         auto s = rocksdb::DB::Open(opts, db_path.string(), cf_descs,
                                    &idx.cf_handles_, &raw_db);
-        if (s.ok()) {
+        if (!s.ok()) {
+            // Open failed (e.g. corrupt SST, schema mismatch, missing CF).
+            // raw_db may be null, but cf_handles_ may have been partially
+            // populated by RocksDB — clean up whatever was allocated.
+            LOG_WARN("Failed to open index cache '{}': {} — will rebuild",
+                     db_path.string(), s.ToString());
+            // DestroyColumnFamilyHandle requires a valid DB pointer; if raw_db
+            // is null we just clear the handles (they are already invalid).
+            if (raw_db) {
+                for (auto* h : idx.cf_handles_) {
+                    if (h) raw_db->DestroyColumnFamilyHandle(h);
+                }
+                delete raw_db;
+            }
+            idx.cf_handles_.clear();
+            // Wipe the broken RocksDB directory so build() starts clean.
+            // pass_cache/ is a plain-file directory independent of RocksDB;
+            // we cannot verify its validity without opening the DB, so leave
+            // it in place — build() will overwrite individual blobs as passes
+            // run, and stale blobs for passes that don't re-run are harmless
+            // (they'll be reused on the next open after trace hash is stored).
+            {
+                // Move pass_cache/ aside before DestroyDB/remove_all.
+                std::error_code ec;
+                auto pc_dir = db_path / "pass_cache";
+                auto pc_tmp = db_path.parent_path()
+                              / (db_path.filename().string() + ".pc_tmp");
+                bool pc_saved = false;
+                if (std::filesystem::exists(pc_dir, ec) && !ec) {
+                    std::filesystem::rename(pc_dir, pc_tmp, ec);
+                    pc_saved = !ec;
+                }
+
+                rocksdb::Options destroy_opts;
+                auto ds = rocksdb::DestroyDB(db_path.string(), destroy_opts);
+                if (!ds.ok()) {
+                    std::filesystem::remove_all(db_path, ec);
+                }
+
+                if (pc_saved) {
+                    std::filesystem::create_directories(db_path, ec);
+                    std::filesystem::rename(pc_tmp, pc_dir, ec);
+                    if (ec) std::filesystem::remove_all(pc_tmp, ec);
+                }
+            }
+        } else {
             idx.db_ = std::unique_ptr<rocksdb::DB>(raw_db);
             LOG_INFO("Index cache found at '{}', validating...", db_path.string());
             if (idx.is_valid_for(reader)) {
@@ -441,15 +597,36 @@ Result<TraceIndex> TraceIndex::open_or_build(
                          idx.stats_.inst_count, idx.stats_.anchor_count);
                 return idx;
             }
+            // Valid open but stale schema/hash — destroy and rebuild.
+            // Before wiping, check whether the trace CONTENT is still the
+            // same (file_size + trace_hash).  If so, pass results remain valid
+            // even though the index schema changed; we can preserve pass_cache/.
+            bool trace_content_unchanged = false;
+            {
+                auto* meta_cf = idx.get_cf(cf::META);
+                if (meta_cf) {
+                    std::string fsz_val, hash_val;
+                    bool have_fsz  = idx.db_->Get(rocksdb::ReadOptions(), meta_cf,
+                                                   "file_size",  &fsz_val).ok()
+                                     && fsz_val.size() == 8;
+                    bool have_hash = idx.db_->Get(rocksdb::ReadOptions(), meta_cf,
+                                                   "trace_hash", &hash_val).ok()
+                                     && hash_val.size() == 8;
+                    if (have_fsz && have_hash) {
+                        uint64_t stored_fsz = 0, stored_hash = 0;
+                        std::memcpy(&stored_fsz,  fsz_val.data(),  8);
+                        std::memcpy(&stored_hash, hash_val.data(), 8);
+                        uint64_t cur_hash = sample_trace_hash(reader);
+                        trace_content_unchanged = (stored_fsz  == reader.file_size())
+                                               && (stored_hash == cur_hash);
+                    }
+                }
+            }
+            LOG_INFO("Removing stale index cache at '{}' (pass_cache: {})",
+                     db_path.string(),
+                     trace_content_unchanged ? "preserved" : "invalidated");
+            destroy_and_wipe(raw_db, /*keep_pass_cache=*/trace_content_unchanged);
         }
-        // Invalid cache - rebuild
-        LOG_INFO("Removing stale index cache at '{}'", db_path.string());
-        for (auto* h : idx.cf_handles_) {
-            if (h && raw_db) raw_db->DestroyColumnFamilyHandle(h);
-        }
-        idx.cf_handles_.clear();
-        idx.db_.reset();
-        std::filesystem::remove_all(db_path);
     } else {
         LOG_INFO("No index cache found for '{}', building from scratch...",
                  reader.path().filename().string());
@@ -527,6 +704,12 @@ Result<TraceIndex> TraceIndex::build(
     table_opts.block_size = 16 * 1024;
     opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
 
+    // MEM_WRITE / MEM_READ share a single 128 MB block cache during build.
+    // Previously each had its own 512 MB cache (1 GB total), causing OOM on
+    // large traces where the build already consumes GBs of address space for
+    // mmap + WriteBatches.  During build we don't do read-heavy MEM queries,
+    // so a small shared cache is sufficient.
+    auto mem_build_block_cache = rocksdb::NewLRUCache(128 * 1024 * 1024);
     rocksdb::ColumnFamilyOptions mem_write_cf_opts;
     mem_write_cf_opts.compression = rocksdb::kLZ4Compression;
     mem_write_cf_opts.prefix_extractor =
@@ -534,7 +717,7 @@ Result<TraceIndex> TraceIndex::build(
             rocksdb::NewFixedPrefixTransform(8));  // page(8) only — optimal for SeekForPrev
     rocksdb::BlockBasedTableOptions mem_table_opts;
     mem_table_opts.block_size = 4 * 1024;
-    mem_table_opts.block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
+    mem_table_opts.block_cache = mem_build_block_cache;  // shared — avoid OOM
     mem_table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
     mem_table_opts.whole_key_filtering = false;
     mem_write_cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(mem_table_opts));
@@ -561,9 +744,15 @@ Result<TraceIndex> TraceIndex::build(
         index_cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbl));
     }
 
+    // META CF: small metadata keys only. 128 MB SST ceiling keeps DB::Open
+    // working even after many write cycles (avoids macOS pread 2 GB limit).
+    rocksdb::ColumnFamilyOptions meta_cf_opts;
+    meta_cf_opts.compression = rocksdb::kLZ4Compression;
+    meta_cf_opts.target_file_size_base = 128 * 1024 * 1024;  // 128 MB
+
     std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
         {"default", rocksdb::ColumnFamilyOptions()},
-        {cf::META,       rocksdb::ColumnFamilyOptions()},
+        {cf::META,       meta_cf_opts},
         {cf::OFFSET,     index_cf_opts},
         {cf::ANCHOR,     index_cf_opts},
         {cf::MEM_WRITE,  mem_write_cf_opts},
@@ -1409,11 +1598,63 @@ Result<TraceIndex> TraceIndex::build(
         // SSTs into sorted levels. This is a one-time cost during build that
         // significantly improves subsequent read performance (avoids checking
         // multiple overlapping L0 files per query).
+        //
+        // Compactions run in parallel (one thread per CF) to cut wall-clock
+        // time on large traces where each CF can be hundreds of MB.
+        //
+        // Report Phase 2 progress via the same callback using the sentinel
+        // convention: processed = file_size + step (1..3), total = file_size.
+        // Callers detect Phase 2 when processed > total.
         rocksdb::CompactRangeOptions cro;
         cro.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
-        idx.db_->CompactRange(cro, idx.get_cf(cf::OFFSET), nullptr, nullptr);
-        idx.db_->CompactRange(cro, idx.get_cf(cf::REG_WRITES), nullptr, nullptr);
-        idx.db_->CompactRange(cro, idx.get_cf(cf::CODE_BYTES), nullptr, nullptr);
+
+        if (progress) progress(file_size + 1, file_size);  // compact phase started
+
+        // Run the three compactions in parallel — each can take tens of seconds
+        // on large traces, so parallelising cuts the total wait to the slowest one.
+        struct CompactTask {
+            rocksdb::ColumnFamilyHandle* cf;
+            std::string error;
+        };
+        std::vector<CompactTask> compact_tasks = {
+            {idx.get_cf(cf::OFFSET),     {}},
+            {idx.get_cf(cf::REG_WRITES), {}},
+            {idx.get_cf(cf::CODE_BYTES), {}},
+        };
+        std::atomic<uint32_t> compact_done{0};
+        const uint32_t compact_total = static_cast<uint32_t>(
+            std::count_if(compact_tasks.begin(), compact_tasks.end(),
+                          [](const CompactTask& t) { return t.cf != nullptr; }));
+        std::vector<std::thread> compact_threads;
+        compact_threads.reserve(compact_tasks.size());
+        for (auto& task : compact_tasks) {
+            if (!task.cf) continue;
+            compact_threads.emplace_back([&idx, &cro, &task, &compact_done]() {
+                auto cs = idx.db_->CompactRange(cro, task.cf, nullptr, nullptr);
+                if (!cs.ok()) task.error = cs.ToString();
+                compact_done.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        // Poll progress while compactions run.
+        if (progress) {
+            while (compact_done.load(std::memory_order_relaxed) < compact_total) {
+                uint32_t done = compact_done.load(std::memory_order_relaxed);
+                // Map done count (0-3) to step (1-3) so progress stays in [1,3].
+                progress(file_size + 1 + done, file_size);
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        for (auto& t : compact_threads) {
+            if (t.joinable()) t.join();
+        }
+        // Log compaction errors but don't abort — the index is still usable
+        // (queries just do more L0 file checks).
+        for (const auto& task : compact_tasks) {
+            if (!task.error.empty()) {
+                LOG_WARN("CompactRange failed: {} — reads may be slower", task.error);
+            }
+        }
+        if (progress) progress(file_size + 3, file_size);  // compact done
     }
 
     // ── Phase 3: Aggregate statistics ────────────────────────────────────
@@ -1462,7 +1703,19 @@ Result<TraceIndex> TraceIndex::build(
                    rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.num_shards), 4));
     meta_batch.Put(meta_cf, "trace_hash",
                    rocksdb::Slice(reinterpret_cast<const char*>(&trace_hash), 8));
-    idx.db_->Write(rocksdb::WriteOptions(), &meta_batch);
+    {
+        rocksdb::WriteOptions wo;
+        wo.sync = true;  // Sync meta to disk: must survive crashes / OOM-kills.
+        // Without sync, a hard kill between Write() and DB close can leave the
+        // DB in a state where all SSTs are present but the META CF is empty —
+        // triggering "missing file_size key" on every subsequent open.
+        auto wstatus = idx.db_->Write(wo, &meta_batch);
+        if (!wstatus.ok()) {
+            LOG_ERROR("Failed to write index metadata: {} — index may be incomplete",
+                      wstatus.ToString());
+            return Error::rocksdb_error("meta_batch write failed: " + wstatus.ToString());
+        }
+    }
 
     auto t1 = std::chrono::steady_clock::now();
     idx.stats_.build_seconds =
@@ -1884,117 +2137,233 @@ uint64_t TraceIndex::load_last_inst() const {
 
 // ─── Generic pass-result blob cache ───────────────────────────────────────
 
+// ─── Pass blob file helpers ───────────────────────────────────────────────
+//
+// Pass result blobs are stored as plain files under
+//   <db_path_>/pass_cache/<pass_name>.bin
+//
+// Rationale: blobs are opaque byte arrays with no need for DB key lookup,
+// iteration, or transactions.  Plain files allow:
+//   - Zero-copy reads via the caller's own mmap or fread.
+//   - Simple atomic replace (write to .tmp, rename).
+//   - No 2 GB macOS pread SST size limit.
+//   - Directory listing via std::filesystem for list_pass_blobs().
+
+namespace {
+
+/// Returns the pass_cache directory for this index.
+std::filesystem::path pass_cache_dir(const std::filesystem::path& db_path) {
+    return db_path / "pass_cache";
+}
+
+/// Returns the file path for a given pass name.
+std::filesystem::path pass_blob_path(const std::filesystem::path& db_path,
+                                     std::string_view pass_name) {
+    // Sanitise: pass names are short identifiers (xref, cfg, …) with no
+    // path separators, but be safe.
+    std::string fname(pass_name);
+    for (char& c : fname) {
+        if (c == '/' || c == '\\' || c == ':') c = '_';
+    }
+    fname += ".bin";
+    return pass_cache_dir(db_path) / fname;
+}
+
+// File-level magic for zstd-compressed pass blobs.
+// Layout: [4-byte magic][8-byte original_size][zstd-compressed payload]
+// Old uncompressed files lack this magic and are loaded as-is (backward compat).
+static constexpr uint32_t PASS_BLOB_ZSTD_MAGIC = 0x5A504243u;  // "ZPBC"
+
+} // namespace
+
 void TraceIndex::save_pass_blob(std::string_view pass_name,
                                 const void* data, size_t size) {
-    if (!db_ || !data || size == 0) return;
-    auto* meta_cf = get_cf(cf::META);
-    if (!meta_cf) return;
+    if (db_path_.empty() || !data || size == 0) return;
 
-    // Key: "pass:<name>" to avoid collisions with other META keys.
-    std::string key;
-    key.reserve(5 + pass_name.size());
-    key += "pass:";
-    key += pass_name;
+    // Ensure the pass_cache directory exists.
+    std::error_code ec;
+    auto dir = pass_cache_dir(db_path_);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        LOG_WARN("save_pass_blob: cannot create pass_cache dir '{}': {}",
+                 dir.string(), ec.message());
+        return;
+    }
 
-    rocksdb::WriteOptions wo;
-    wo.sync = false;
-    db_->Put(wo, meta_cf, key,
-             rocksdb::Slice(static_cast<const char*>(data), size));
+    // Write to a .tmp file then rename for atomicity.
+    auto final_path = pass_blob_path(db_path_, pass_name);
+    auto tmp_path   = final_path;
+    tmp_path += ".tmp";
+
+    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (!f) {
+        LOG_WARN("save_pass_blob '{}': cannot open '{}' for write",
+                 pass_name, tmp_path.string());
+        return;
+    }
+
+    bool write_ok = false;
+
+#if defined(TENET_HAS_ZSTD) && TENET_HAS_ZSTD
+    // Compress with zstd level 3 (fast, ~3-8x ratio on serialised structs).
+    // For blobs < 4KB compression overhead isn't worth it; store raw.
+    if (size >= 4096) {
+        size_t bound = ZSTD_compressBound(size);
+        std::vector<char> cbuf(bound);
+        size_t csize = ZSTD_compress(cbuf.data(), bound, data, size, /*level=*/3);
+        if (!ZSTD_isError(csize) && csize < size) {
+            // Write header: magic(4) + original_size(8) + compressed_payload
+            uint64_t orig_size = static_cast<uint64_t>(size);
+            bool ok = true;
+            ok = ok && std::fwrite(&PASS_BLOB_ZSTD_MAGIC, 4, 1, f) == 1;
+            ok = ok && std::fwrite(&orig_size, 8, 1, f) == 1;
+            ok = ok && std::fwrite(cbuf.data(), 1, csize, f) == csize;
+            write_ok = ok;
+            if (ok) {
+                LOG_DEBUG("save_pass_blob '{}': {}B → {}B (zstd, {:.1f}x)",
+                          pass_name, size, csize, static_cast<double>(size) / csize);
+            }
+        }
+        // If zstd failed or didn't compress, fall through to raw write below.
+    }
+#endif
+
+    if (!write_ok) {
+        // Raw (uncompressed) write — no magic header, plain payload.
+        // This is the fallback when zstd is unavailable, disabled, or
+        // the compressed output is larger than the input.
+        std::rewind(f);
+        write_ok = (std::fwrite(data, 1, size, f) == size);
+    }
+
+    std::fflush(f);
+    std::fclose(f);
+
+    if (!write_ok) {
+        LOG_WARN("save_pass_blob '{}': write failed, discarding", pass_name);
+        std::filesystem::remove(tmp_path, ec);
+        return;
+    }
+
+    // Atomic rename
+    std::filesystem::rename(tmp_path, final_path, ec);
+    if (ec) {
+        LOG_WARN("save_pass_blob '{}': rename failed: {}", pass_name, ec.message());
+        std::filesystem::remove(tmp_path, ec);
+    }
 }
 
 bool TraceIndex::load_pass_blob(std::string_view pass_name,
                                 std::string& out) const {
-    if (!db_) return false;
-    auto* meta_cf = get_cf(cf::META);
-    if (!meta_cf) return false;
+    if (db_path_.empty()) return false;
 
-    std::string key;
-    key.reserve(5 + pass_name.size());
-    key += "pass:";
-    key += pass_name;
+    auto path = pass_blob_path(db_path_, pass_name);
+    std::error_code ec;
+    auto fsize_u = std::filesystem::file_size(path, ec);
+    if (ec || fsize_u == 0) return false;
+    size_t fsize = static_cast<size_t>(fsize_u);
 
-    std::string value;
-    auto s = db_->Get(rocksdb::ReadOptions(), meta_cf, key, &value);
-    if (!s.ok() || value.empty()) return false;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
 
-    out = std::move(value);
+    // Peek at the first 4 bytes to detect the zstd magic.
+    uint32_t magic = 0;
+    bool has_magic = (fsize >= 12) && (std::fread(&magic, 4, 1, f) == 1);
+
+#if defined(TENET_HAS_ZSTD) && TENET_HAS_ZSTD
+    if (has_magic && magic == PASS_BLOB_ZSTD_MAGIC) {
+        // Read original_size from next 8 bytes.
+        uint64_t orig_size = 0;
+        if (std::fread(&orig_size, 8, 1, f) != 1 || orig_size == 0 || orig_size > 4ULL * 1024 * 1024 * 1024) {
+            std::fclose(f);
+            LOG_WARN("load_pass_blob '{}': corrupt header", pass_name);
+            return false;
+        }
+        // Read compressed payload.
+        size_t payload_size = fsize - 12;
+        std::vector<char> cbuf(payload_size);
+        if (std::fread(cbuf.data(), 1, payload_size, f) != payload_size) {
+            std::fclose(f);
+            LOG_WARN("load_pass_blob '{}': short read of compressed payload", pass_name);
+            return false;
+        }
+        std::fclose(f);
+
+        // Decompress.
+        std::string buf;
+        buf.resize(static_cast<size_t>(orig_size));
+        size_t dsize = ZSTD_decompress(buf.data(), buf.size(),
+                                       cbuf.data(), payload_size);
+        if (ZSTD_isError(dsize) || dsize != orig_size) {
+            LOG_WARN("load_pass_blob '{}': decompression failed: {}",
+                     pass_name, ZSTD_getErrorName(dsize));
+            return false;
+        }
+        out = std::move(buf);
+        return true;
+    }
+#endif
+
+    // No magic (or zstd unavailable) — read as raw uncompressed blob.
+    // If we already read 4 bytes, rewind and read from the start.
+    if (has_magic) std::rewind(f);
+
+    std::string buf;
+    buf.resize(fsize);
+    size_t nread = std::fread(buf.data(), 1, fsize, f);
+    std::fclose(f);
+
+    if (nread != fsize) {
+        LOG_WARN("load_pass_blob '{}': short read ({}/{})", pass_name, nread, fsize);
+        return false;
+    }
+    out = std::move(buf);
     return true;
 }
 
 void TraceIndex::delete_pass_blob(std::string_view pass_name) {
-    if (!db_) return;
-    auto* meta_cf = get_cf(cf::META);
-    if (!meta_cf) return;
-
-    std::string key;
-    key.reserve(5 + pass_name.size());
-    key += "pass:";
-    key += pass_name;
-
-    rocksdb::WriteOptions wo;
-    wo.sync = false;
-    db_->Delete(wo, meta_cf, key);
+    if (db_path_.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(pass_blob_path(db_path_, pass_name), ec);
+    // Ignore ec: no-op if file doesn't exist.
 }
 
 std::vector<TraceIndex::PassBlobInfo> TraceIndex::list_pass_blobs() const {
     std::vector<PassBlobInfo> result;
-    if (!db_) return result;
-    auto* meta_cf = get_cf(cf::META);
-    if (!meta_cf) return result;
+    if (db_path_.empty()) return result;
 
-    // Iterate through all keys in META CF that start with "pass:"
-    static const std::string kPrefix = "pass:";
-    rocksdb::ReadOptions ro;
-    ro.total_order_seek = false;
-    auto* it = db_->NewIterator(ro, meta_cf);
-    for (it->Seek(kPrefix); it->Valid(); it->Next()) {
-        auto k = it->key();
-        std::string_view ks(k.data(), k.size());
-        // C++17-compatible prefix check
-        if (ks.size() < kPrefix.size() ||
-            ks.compare(0, kPrefix.size(), kPrefix) != 0)
-            break;
+    auto dir = pass_cache_dir(db_path_);
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return result;
+
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        auto& p = entry.path();
+        if (p.extension() != ".bin") continue;
         PassBlobInfo info;
-        info.name = std::string(ks.substr(kPrefix.size()));
-        info.size = it->value().size();
-        result.push_back(std::move(info));
+        info.name = p.stem().string();  // filename without .bin = pass name
+        info.size = static_cast<size_t>(entry.file_size(ec));
+        if (!ec) result.push_back(std::move(info));
     }
-    delete it;
     return result;
 }
 
 size_t TraceIndex::delete_all_pass_blobs() {
-    if (!db_) return 0;
-    auto* meta_cf = get_cf(cf::META);
-    if (!meta_cf) return 0;
+    if (db_path_.empty()) return 0;
 
-    static const std::string kPrefix = "pass:";
+    auto dir = pass_cache_dir(db_path_);
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return 0;
 
-    // Collect all keys first, then batch-delete them.
-    std::vector<std::string> keys;
-    rocksdb::ReadOptions ro;
-    auto* it = db_->NewIterator(ro, meta_cf);
-    for (it->Seek(kPrefix); it->Valid(); it->Next()) {
-        auto k = it->key();
-        std::string_view ks(k.data(), k.size());
-        // C++17-compatible prefix check
-        if (ks.size() < kPrefix.size() ||
-            ks.compare(0, kPrefix.size(), kPrefix) != 0)
-            break;
-        keys.emplace_back(k.data(), k.size());
+    size_t count = 0;
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.path().extension() != ".bin") continue;
+        std::error_code rem_ec;
+        std::filesystem::remove(entry.path(), rem_ec);
+        if (!rem_ec) count++;
     }
-    delete it;
-
-    if (keys.empty()) return 0;
-
-    rocksdb::WriteBatch batch;
-    for (const auto& key : keys) {
-        batch.Delete(meta_cf, key);
-    }
-    rocksdb::WriteOptions wo;
-    wo.sync = false;
-    db_->Write(wo, &batch);
-    return keys.size();
+    return count;
 }
 
 }  // namespace tenet

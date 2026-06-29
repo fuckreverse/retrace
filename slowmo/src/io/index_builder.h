@@ -17,6 +17,12 @@
 namespace tenet {
 
 /// Callback for progress reporting: (processed_records, total_file_bytes)
+///
+/// Phase convention:
+///   - During scan (Phase 1): 0 ≤ processed ≤ total, with total = file_size.
+///   - During compaction (Phase 2): processed > total.  The value
+///     (processed - total) encodes the compaction step (1, 2, 3) out of 3
+///     column families.  Callers can detect this with `processed > total`.
 using ProgressCallback = std::function<void(uint64_t processed, uint64_t total)>;
 
 /// Statistics from an index build.
@@ -56,7 +62,12 @@ namespace cf {
     // full file scan for CodeTable population (P1.9 optimization).
     // Key: u64 runtime_pc (big-endian, 8 bytes)
     // Value: u8 opcode[4]  (AArch64 instruction, little-endian)
-    constexpr const char* CODE_BYTES = "code_bytes"; // runtime_pc → 4-byte opcode
+    constexpr const char* CODE_BYTES  = "code_bytes";  // runtime_pc → 4-byte opcode
+    // NOTE: Pass result blobs are no longer stored in RocksDB.
+    // They are stored as plain files in <index_dir>/pass_cache/<name>.bin
+    // because pass blobs are opaque byte arrays with no need for DB features
+    // (no key lookup, no iteration, no transactions).  Plain files allow
+    // zero-copy mmap reads and avoid the 2 GB macOS pread SST limit entirely.
 }
 
 /// Manages the RocksDB-based trace index.
@@ -172,17 +183,17 @@ public:
 
     // ─── Generic pass-result blob cache ──────────────────────────────────
     //
-    // Passes can persist their serialized results into the META column family
-    // under a key of the form "pass:<name>".  On the next open, the pass
-    // reads back the blob and skips the expensive trace scan entirely.
+    // Pass results are persisted as plain files under
+    //   <index_dir>/pass_cache/<pass_name>.bin
+    // rather than inside RocksDB, because:
+    //   - Blobs are opaque byte arrays; no DB key lookup / iteration needed.
+    //   - Large blobs (xref, cfg, symbol_annotation: 100s of MB) caused
+    //     RocksDB SST files to exceed macOS pread's 2 GB EINVAL limit.
+    //   - Plain files allow zero-copy mmap reads and simple atomic replace.
     //
-    // The blob is opaque from TraceIndex's perspective — each pass owns its
-    // own serialisation format.  TraceIndex merely stores and retrieves bytes.
-    //
-    // Cache validity: the index is already tied to a specific trace file via
-    // the schema_version + file_size + trace_hash triple checked in
-    // is_valid_for().  When any of those change the whole DB is rebuilt, which
-    // automatically invalidates all cached pass blobs as well.
+    // Cache validity: when the RocksDB index is rebuilt (schema / file_size /
+    // trace_hash mismatch) the entire .tenet directory is wiped by DestroyDB,
+    // which also removes the pass_cache/ subdirectory automatically.
 
     /// Persist a pass-result blob.  Overwrites any previously saved value.
     /// @param pass_name  Unique pass identifier (e.g. "xref", "function").
