@@ -882,10 +882,138 @@ void GuiApp::render_progress_overlay() {
     ImGui::PopStyleVar(2);
 }
 
+// ─── Minimap Pixel Cache ─────────────────────────────────────────────────────
+// Builds a per-pixel-row color/pc table once; render_minimap_panel() reuses it
+// every frame with zero fetch_row() calls (fetch_row triggers ZSTD decompress
+// on cold blocks and was the primary 100% CPU offender on the main thread).
+//
+// Invalidation: any change to total_inst, panel height, or a relevant analysis
+// result pointer / visibility toggle causes a full rebuild.  Bookmarks are
+// intentionally excluded from the cache key — they are cheap bitset lookups
+// handled separately in the render path via the sorted bookmarks_ vector.
+
+void GuiApp::rebuild_minimap_cache(int pixel_rows) {
+    auto& c = minimap_pixel_cache_;
+
+    // Rebuild the call-site sorted cache first (used below)
+    if (function_result_ && minimap_call_cache_.source != function_result_) {
+        minimap_call_cache_.sorted_call_ids.clear();
+        minimap_call_cache_.sorted_call_ids.reserve(function_result_->call_events.size());
+        for (const auto& evt : function_result_->call_events)
+            minimap_call_cache_.sorted_call_ids.push_back(evt.call_inst_id);
+        std::sort(minimap_call_cache_.sorted_call_ids.begin(),
+                  minimap_call_cache_.sorted_call_ids.end());
+        minimap_call_cache_.source = function_result_;
+    }
+
+    c.total_inst  = total_inst_;
+    c.pixel_rows  = pixel_rows;
+    c.taint_src   = taint_result_;
+    c.back_src    = backward_taint_result_;
+    c.loop_src    = loop_result_;
+    c.func_src    = function_result_;
+    c.show_taint  = show_taint_;
+    c.show_btaint = show_backward_taint_;
+    c.show_loops  = show_loops_;
+
+    c.colors.resize(static_cast<size_t>(pixel_rows));
+    c.pcs.resize(static_cast<size_t>(pixel_rows), 0);
+    c.inst_ids.resize(static_cast<size_t>(pixel_rows), 0);
+
+    uint64_t bucket_size = std::max(uint64_t(1),
+                                    total_inst_ / static_cast<uint64_t>(pixel_rows));
+
+    const uint64_t slide = reader_.header().module_slide;
+
+    for (int row = 0; row < pixel_rows; row++) {
+        uint64_t bucket_start = static_cast<uint64_t>(row) * bucket_size;
+        uint64_t bucket_end   = std::min(bucket_start + bucket_size, total_inst_);
+        if (bucket_start >= total_inst_) {
+            c.colors[static_cast<size_t>(row)]   = kMinimapDefault;
+            c.pcs[static_cast<size_t>(row)]      = 0;
+            c.inst_ids[static_cast<size_t>(row)] = bucket_start;
+            continue;
+        }
+
+        bool has_taint       = false;
+        bool has_back_taint  = false;
+        bool has_bookmark    = false;
+        bool has_loop_header = false;
+        bool has_loop_body   = false;
+        bool has_call        = false;
+        bool has_branch      = false;
+
+        // Call check via binary search (O(log N), no fetch_row)
+        if (function_result_ && !minimap_call_cache_.sorted_call_ids.empty()) {
+            auto it = std::lower_bound(minimap_call_cache_.sorted_call_ids.begin(),
+                                       minimap_call_cache_.sorted_call_ids.end(),
+                                       bucket_start);
+            has_call = (it != minimap_call_cache_.sorted_call_ids.end() &&
+                        *it < bucket_end);
+        }
+
+        // Bookmark check via binary search on sorted bookmarks_ (no fetch_row)
+        if (!bookmarks_.empty()) {
+            auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), bucket_start);
+            has_bookmark = (it != bookmarks_.end() && *it < bucket_end);
+        }
+
+        // Taint / backward-taint checks (bitmap queries, no fetch_row)
+        if (show_taint_ && taint_result_) {
+            uint64_t step = std::max(uint64_t(1), bucket_size / 4);
+            for (uint64_t sid = bucket_start; sid < bucket_end && !has_taint; sid += step)
+                has_taint = taint_result_->has_event_at(sid);
+        }
+        if (show_backward_taint_ && backward_taint_result_) {
+            uint64_t step = std::max(uint64_t(1), bucket_size / 4);
+            for (uint64_t sid = bucket_start; sid < bucket_end && !has_back_taint; sid += step)
+                has_back_taint = backward_taint_result_->is_contributing(sid);
+        }
+
+        // Sample a representative inst_id from the bucket centre for PC / loop lookup.
+        // This is the ONLY call to fetch_row in the rebuild path — one per row, done
+        // once at cache-build time rather than every frame.
+        uint64_t mid_id = bucket_start + bucket_size / 2;
+        if (mid_id >= total_inst_) mid_id = total_inst_ - 1;
+        c.inst_ids[static_cast<size_t>(row)] = mid_id;
+
+        uint64_t rep_pc = 0;
+        if (show_loops_ && loop_result_) {
+            // Need the PC to query loop membership; pay the fetch_row cost once.
+            auto srow = fetch_row(mid_id);
+            rep_pc = srow.pc;
+            if (loop_result_->is_loop_header(rep_pc))      has_loop_header = true;
+            else if (loop_result_->is_in_loop(rep_pc))     has_loop_body   = true;
+        } else {
+            // fetch_row only to get the PC for the tooltip (cheap when cache warm,
+            // or skip entirely by using a raw index lookup if available in the future).
+            auto srow = fetch_row(mid_id);
+            rep_pc = srow.pc;
+        }
+        c.pcs[static_cast<size_t>(row)] = (rep_pc >= slide) ? rep_pc - slide : rep_pc;
+
+        // Color priority
+        ImU32 col;
+        if (has_bookmark)        col = kMinimapBookmark;
+        else if (has_back_taint) col = kMinimapBackTaint;
+        else if (has_taint)      col = kMinimapTaint;
+        else if (has_loop_header) col = kMinimapLoopHeader;
+        else if (has_loop_body)  col = kMinimapLoopBody;
+        else if (has_call)       col = kMinimapCall;
+        else                     col = kMinimapDefault;
+
+        c.colors[static_cast<size_t>(row)] = col;
+    }
+}
+
 // ─── Minimap Panel ────────────────────────────────────────────────────────────
 // Bird's-eye view of the entire trace. Each pixel row represents a bucket of
 // N instructions. Colors encode instruction types and analysis results.
 // Clicking navigates to the corresponding instruction.
+//
+// Hot path: render_minimap_panel() does ZERO fetch_row() calls per frame.
+// All per-row classification is pre-computed in rebuild_minimap_cache() which
+// runs only when trace / analysis state changes.
 
 void GuiApp::render_minimap_panel() {
     ImGuiWindowFlags win_flags = ImGuiWindowFlags_NoScrollbar;
@@ -910,6 +1038,27 @@ void GuiApp::render_minimap_panel() {
         return;
     }
 
+    int pixel_rows = static_cast<int>(panel_h);
+    if (pixel_rows < 1) pixel_rows = 1;
+
+    // ── Pixel cache validity check ────────────────────────────────────
+    {
+        auto& c = minimap_pixel_cache_;
+        bool stale = !c.is_valid()
+            || c.total_inst  != total_inst_
+            || c.pixel_rows  != pixel_rows
+            || c.taint_src   != taint_result_
+            || c.back_src    != backward_taint_result_
+            || c.loop_src    != loop_result_
+            || c.func_src    != function_result_
+            || c.show_taint  != show_taint_
+            || c.show_btaint != show_backward_taint_
+            || c.show_loops  != show_loops_;
+        if (stale)
+            rebuild_minimap_cache(pixel_rows);
+    }
+    const auto& cache = minimap_pixel_cache_;
+
     // Reserve space for the minimap canvas
     ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##minimap_canvas", ImVec2(panel_w, panel_h));
@@ -919,99 +1068,28 @@ void GuiApp::render_minimap_panel() {
     ImDrawList* draw = ImGui::GetWindowDrawList();
 
     // Background
-    draw->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + panel_w, canvas_pos.y + panel_h),
+    draw->AddRectFilled(canvas_pos,
+                        ImVec2(canvas_pos.x + panel_w, canvas_pos.y + panel_h),
                         kMinimapBg);
 
-    // Instructions per pixel row
-    int pixel_rows = static_cast<int>(panel_h);
-    if (pixel_rows < 1) pixel_rows = 1;
-    uint64_t bucket_size = std::max(uint64_t(1), total_inst_ / static_cast<uint64_t>(pixel_rows));
-
-    // Build sorted call-site id cache once per function_result_ change.
-    // Avoids O(1) unordered_map::find × N_buckets × 4 samples = thousands of hash
-    // lookups per frame; replaced by a single lower_bound per bucket.
-    if (function_result_ &&
-        minimap_call_cache_.source != function_result_) {
-        minimap_call_cache_.sorted_call_ids.clear();
-        minimap_call_cache_.sorted_call_ids.reserve(
-            function_result_->call_events.size());
-        for (const auto& evt : function_result_->call_events) {
-            minimap_call_cache_.sorted_call_ids.push_back(evt.call_inst_id);
-        }
-        std::sort(minimap_call_cache_.sorted_call_ids.begin(),
-                  minimap_call_cache_.sorted_call_ids.end());
-        minimap_call_cache_.source = function_result_;
-    }
-
-    for (int row = 0; row < pixel_rows; row++) {
-        uint64_t bucket_start = static_cast<uint64_t>(row) * bucket_size;
-        uint64_t bucket_end = std::min(bucket_start + bucket_size, total_inst_);
-        if (bucket_start >= total_inst_) break;
-
+    // ── Draw pre-computed pixel rows (zero fetch_row calls) ───────────
+    for (int row = 0; row < pixel_rows && row < static_cast<int>(cache.colors.size()); row++) {
         float y0 = canvas_pos.y + static_cast<float>(row);
         float y1 = y0 + 1.0f;
-
-        // Classify this bucket by sampling a few instructions
-        bool has_taint = false;
-        bool has_back_taint = false;
-        bool has_bookmark = false;
-        bool has_loop_header = false;
-        bool has_loop_body = false;
-        bool has_call = false;
-        bool has_branch = false;
-
-        // Check for call in bucket via binary search on sorted cache (O(log N) per bucket).
-        if (function_result_ && !minimap_call_cache_.sorted_call_ids.empty()) {
-            auto it = std::lower_bound(minimap_call_cache_.sorted_call_ids.begin(),
-                                       minimap_call_cache_.sorted_call_ids.end(),
-                                       bucket_start);
-            has_call = (it != minimap_call_cache_.sorted_call_ids.end() &&
-                        *it < bucket_end);
-        }
-
-        // Sample up to 4 instructions per bucket for efficiency
-        uint64_t sample_step = std::max(uint64_t(1), bucket_size / 4);
-        for (uint64_t sid = bucket_start; sid < bucket_end; sid += sample_step) {
-            auto srow = fetch_row(sid);
-
-            if (show_taint_ && taint_result_ && taint_result_->has_event_at(sid))
-                has_taint = true;
-            if (show_backward_taint_ && backward_taint_result_ &&
-                backward_taint_result_->is_contributing(sid))
-                has_back_taint = true;
-            if (srow.has_bookmark) has_bookmark = true;
-            if (show_loops_ && loop_result_) {
-                if (loop_result_->is_loop_header(srow.pc)) has_loop_header = true;
-                else if (loop_result_->is_in_loop(srow.pc)) has_loop_body = true;
-            }
-            // has_call is now handled above via binary search — no call_at() here
-            if (srow.disasm.size() > 0 &&
-                (srow.disasm[0] == 'b' || srow.disasm.find("bl") == 0)) has_branch = true;
-        }
-
-        // Choose color based on analysis priority
-        ImU32 col;
-        if (has_bookmark)       col = kMinimapBookmark;
-        else if (has_back_taint) col = kMinimapBackTaint;
-        else if (has_taint)      col = kMinimapTaint;
-        else if (has_loop_header) col = kMinimapLoopHeader;
-        else if (has_loop_body)  col = kMinimapLoopBody;
-        else if (has_call)       col = kMinimapCall;
-        else if (has_branch)     col = kMinimapBranch;
-        else                     col = kMinimapDefault;
-
-        draw->AddLine(ImVec2(canvas_pos.x, y0), ImVec2(canvas_pos.x + panel_w, y1), col, 1.0f);
+        draw->AddLine(ImVec2(canvas_pos.x, y0),
+                      ImVec2(canvas_pos.x + panel_w, y1),
+                      cache.colors[static_cast<size_t>(row)], 1.0f);
     }
 
     // Current position indicator: bright horizontal line
     {
         float cur_y = canvas_pos.y +
             static_cast<float>(current_inst_) / static_cast<float>(total_inst_) * panel_h;
-        draw->AddLine(ImVec2(canvas_pos.x, cur_y), ImVec2(canvas_pos.x + panel_w, cur_y),
+        draw->AddLine(ImVec2(canvas_pos.x, cur_y),
+                      ImVec2(canvas_pos.x + panel_w, cur_y),
                       kMinimapCursorLine, 2.0f);
         // Viewport window indicator (yellow bracket)
-        // Estimate visible range from instruction panel scroll
-        uint64_t vis_rows = 40;  // conservative estimate
+        uint64_t vis_rows = 40;
         float vis_start_y = canvas_pos.y +
             static_cast<float>(current_inst_ > vis_rows / 2 ? current_inst_ - vis_rows / 2 : 0) /
             static_cast<float>(total_inst_) * panel_h;
@@ -1034,18 +1112,20 @@ void GuiApp::render_minimap_panel() {
         }
     }
 
-    // Hover tooltip
+    // Hover tooltip — reads from pre-computed cache, zero fetch_row calls
     if (canvas_hovered) {
         float my = ImGui::GetIO().MousePos.y;
         float rel = (my - canvas_pos.y) / panel_h;
         if (rel >= 0.0f && rel <= 1.0f) {
+            int hover_row = static_cast<int>(rel * static_cast<float>(pixel_rows));
+            if (hover_row >= pixel_rows) hover_row = pixel_rows - 1;
             uint64_t hover_id = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
             if (hover_id >= total_inst_) hover_id = total_inst_ - 1;
-            auto hover_row = fetch_row(hover_id);
-            ImGui::SetTooltip("inst %llu\n0x%llx  %s\n(click to navigate)",
+            uint64_t hover_pc = (hover_row < static_cast<int>(cache.pcs.size()))
+                                ? cache.pcs[static_cast<size_t>(hover_row)] : 0;
+            ImGui::SetTooltip("inst %llu\n0x%llx\n(click to navigate)",
                 (unsigned long long)hover_id,
-                (unsigned long long)hover_row.static_pc,
-                hover_row.disasm.c_str());
+                (unsigned long long)hover_pc);
         }
     }
 

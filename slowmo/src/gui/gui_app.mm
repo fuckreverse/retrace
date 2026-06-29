@@ -131,10 +131,9 @@ bool GuiApp::init_imgui() {
     }
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 
-    // Limit in-flight drawables to 2 (double-buffering).  The default is 3,
-    // but with VSync this is more than enough.  Fewer drawables = fewer Metal
-    // buffers retained by the driver at any given time, reducing peak memory.
-    layer.maximumDrawableCount = 2;
+    // Keep the default maximumDrawableCount (3) to match kMaxInflightFrames.
+    // Apple recommends aligning these values — the semaphore count should equal
+    // the drawable count to avoid one throttle mechanism shadowing the other.
 
     // Ensure the layer syncs to display refresh (belt-and-suspenders with
     // SDL_SetRenderVSync above — SDL may not always propagate vsync to the
@@ -146,6 +145,11 @@ bool GuiApp::init_imgui() {
     // Create our own command queue for ImGui rendering
     metal_command_queue_ = [layer.device newCommandQueue];
     metal_render_pass_desc_ = [MTLRenderPassDescriptor new];
+
+    // Create the in-flight frame semaphore (triple buffering).
+    // The render loop waits on this before submitting a new command buffer,
+    // ensuring at most kMaxInflightFrames are queued at once.
+    frame_semaphore_ = dispatch_semaphore_create(kMaxInflightFrames);
 
     // Load persistent settings
     settings_.load(GuiSettings::default_path());
@@ -1444,6 +1448,15 @@ int GuiApp::run() {
             }
         }
 
+        // ─── 1.45. Drain the main dispatch queue (non-blocking) ────────
+        // ImGui's Metal backend returns used MTLBuffers to its cache via
+        // dispatch_async(dispatch_get_main_queue(), ...) in the command buffer
+        // completion handler.  In a SDL tight render loop (no CFRunLoop), these
+        // blocks never execute unless we explicitly drain the queue.  Without
+        // this, ImGui allocates new Metal buffers every frame instead of
+        // reusing old ones, causing unbounded IOAccelerator memory growth.
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+
         // ─── 1.5. Check whether async shutdown has completed ─────────
         if (shutdown_complete_.load(std::memory_order_acquire)) {
             running_ = false;
@@ -1515,14 +1528,19 @@ int GuiApp::run() {
         }
 
         // ─── 2. Acquire Metal drawable and begin render pass ─────────
+        // Throttle: wait until the GPU has finished one of the in-flight
+        // frames before submitting another.  This caps memory usage to
+        // kMaxInflightFrames worth of GPU resources (~a few hundred MB)
+        // instead of letting hundreds of command buffers pile up (30+ GB).
+        dispatch_semaphore_wait(frame_semaphore_, DISPATCH_TIME_FOREVER);
+
         @autoreleasepool {
             CAMetalLayer* layer = (__bridge CAMetalLayer*)SDL_GetRenderMetalLayer(renderer_);
             id<CAMetalDrawable> drawable = [layer nextDrawable];
             if (!drawable) {
-                // If we just applied analysis results but couldn't get a
-                // drawable, we need to render them in the next iteration.
-                // Nothing special to do — results_applied_this_frame_ will
-                // remain true and the main loop will retry immediately.
+                // No drawable available — signal semaphore back so we don't
+                // permanently consume a slot, then retry next iteration.
+                dispatch_semaphore_signal(frame_semaphore_);
                 continue;
             }
 
@@ -1562,6 +1580,14 @@ int GuiApp::run() {
             // ─── 6. End encoding and present ─────────────────────────
             [renderEncoder endEncoding];
             [commandBuffer presentDrawable:drawable];
+
+            // Signal the in-flight semaphore once the GPU finishes this frame.
+            // This allows the render loop to submit the next command buffer.
+            __block dispatch_semaphore_t sema = frame_semaphore_;
+            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+                dispatch_semaphore_signal(sema);
+            }];
+
             [commandBuffer commit];
         }
     }

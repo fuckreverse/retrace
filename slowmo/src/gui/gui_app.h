@@ -28,6 +28,8 @@
 #import <QuartzCore/QuartzCore.h>
 #endif
 
+#include <dispatch/dispatch.h>
+
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -124,6 +126,13 @@ private:
     void* metal_command_queue_ = nullptr;
     void* metal_render_pass_desc_ = nullptr;
 #endif
+
+    // In-flight frame throttle: limits the number of command buffers the CPU
+    // can submit ahead of the GPU.  Without this, the render loop piles up
+    // hundreds of command buffers (each retaining ~128 MB of IOAccelerator
+    // heap), leading to 20-35 GB memory bloat.  Value of 3 = triple buffering.
+    static constexpr int kMaxInflightFrames = 3;
+    dispatch_semaphore_t frame_semaphore_ = nullptr;
 
     // ─── Navigation state ───────────────────────────────────────────────
     uint64_t total_inst_ = 0;
@@ -257,6 +266,36 @@ private:
         const FunctionResult* source = nullptr;
         std::vector<uint64_t> sorted_call_ids;  // sorted call_inst_id list
     } minimap_call_cache_;
+
+    // ─── Pre-computed minimap pixel cache ────────────────────────────
+    // Minimap used to call fetch_row() up to 4× per pixel row every frame,
+    // causing hundreds of ZSTD block decompressions (cold cache misses) at
+    // 100% CPU.  This cache stores one color + one representative PC per row;
+    // it is rebuilt only when the panel dimensions, trace metadata, or any
+    // relevant analysis result changes.  Rendering becomes a simple memcpy of
+    // ImU32 values — zero fetch_row() calls per frame.
+    struct MinimapPixelCache {
+        // Invalidation keys — rebuilt whenever any of these change
+        uint64_t              total_inst        = 0;
+        int                   pixel_rows        = 0;   // panel height in integer pixels
+        const TaintResult*         taint_src    = nullptr;
+        const BackwardTaintResult* back_src     = nullptr;
+        const LoopResult*          loop_src     = nullptr;
+        const FunctionResult*      func_src     = nullptr;
+        bool                       show_taint   = false;
+        bool                       show_btaint  = false;
+        bool                       show_loops   = false;
+        // Payload — one entry per pixel row
+        std::vector<ImU32>    colors;   // ImGui color per row
+        std::vector<uint64_t> pcs;      // representative static_pc per row (for tooltip)
+        std::vector<uint64_t> inst_ids; // representative inst_id per row (for tooltip)
+
+        bool is_valid() const { return !colors.empty(); }
+        void invalidate()  { colors.clear(); pcs.clear(); inst_ids.clear(); }
+    } minimap_pixel_cache_;
+
+    /// Rebuild minimap_pixel_cache_ for the given pixel_rows count.
+    void rebuild_minimap_cache(int pixel_rows);
 
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
