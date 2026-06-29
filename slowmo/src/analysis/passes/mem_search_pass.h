@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <functional>
 
 #ifdef TENET_HAS_YARA
 struct YR_RULES;
@@ -114,7 +115,8 @@ private:
                           const std::vector<uint64_t>& offset_to_addr,
                           const std::vector<uint8_t>& offset_to_size,
                           MemSearchMatch::Source source,
-                          MemSearchResult& result);
+                          MemSearchResult& result,
+                          const std::function<bool()>& cancel_check = {});
 #endif
 
     /// Whether any pattern uses wildcards (mask != all-zero).

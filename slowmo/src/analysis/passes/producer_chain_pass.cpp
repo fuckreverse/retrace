@@ -49,6 +49,10 @@ PassResult ProducerChainPass::run(PassContext& ctx) {
     uint64_t current_id = cfg_.start_inst_id;
 
     for (uint32_t depth = 0; depth < cfg_.max_depth; depth++) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
+
         // ── Step 1: O(log N) jump to the last writer ──
         uint64_t last_writer_id = find_last_writer(ctx, current_id, current_reg);
         if (last_writer_id == 0) break;  // No writer found

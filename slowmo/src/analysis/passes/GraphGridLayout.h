@@ -11,6 +11,7 @@
 #include "common/LinkedListPool.h"
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +88,9 @@ public:
 
     void calculateLayout(Graph &blocks, uint64_t entry, int &width, int &height) const;
 
+    void setCancelCheck(std::function<bool()> fn) { cancel_check_ = std::move(fn); }
+    bool cancelled() const { return cancel_check_ && cancel_check_(); }
+
     void setLayoutConfig(const LayoutConfig &config) { layoutConfig = config; }
     void setTightSubtreePlacement(bool enabled) { tightSubtreePlacement = enabled; }
     void setParentBetweenDirectChild(bool enabled) { parentBetweenDirectChild = enabled; }
@@ -99,6 +103,7 @@ private:
     bool parentBetweenDirectChild    = false;
     bool verticalBlockAlignmentMiddle = false;
     bool useLayoutOptimization       = true;
+    std::function<bool()> cancel_check_;
 
     struct GridBlock {
         uint64_t id;

@@ -158,6 +158,10 @@ PassResult EntropyPass::run(PassContext& ctx) {
         for (uint64_t writer_id : write_history) {
             if (++sample_count % cfg_.timeline_interval != 0) continue;
 
+            if (ctx.cancelled()) {
+                return PassResult::failed("cancelled by user");
+            }
+
             // ── Batch-read region at this snapshot point ──
             uint32_t sample_known_count = 0;
 

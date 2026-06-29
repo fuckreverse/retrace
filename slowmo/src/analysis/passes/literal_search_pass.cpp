@@ -133,6 +133,9 @@ PassResult LiteralSearchPass::run(PassContext& ctx) {
 
         if (inst_id % progress_interval == 0) {
             ctx.progress(static_cast<float>(inst_id) / total_insts);
+            if (ctx.cancelled()) {
+                return PassResult::failed("cancelled by user");
+            }
         }
     }
 

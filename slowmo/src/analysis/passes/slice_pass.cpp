@@ -50,6 +50,8 @@ PassResult SlicePass::run(PassContext& ctx) {
     reader.advise_sequential();
 
     uint64_t inst_id = scan_start;
+    const uint64_t phase2_interval = std::max(scan_count / 100, uint64_t(1));
+
     for (auto it = TraceReader::Iterator(&reader, start_offset, start_seed_pc);
          it != reader.end() && inst_id < target_inst_id_;
          ++it)
@@ -67,16 +69,43 @@ PassResult SlicePass::run(PassContext& ctx) {
 
         buf.push_back({inst_id, wmask});
         inst_id++;
+
+        if ((inst_id - scan_start) % phase2_interval == 0) {
+            ctx.progress(0.5f * static_cast<float>(inst_id - scan_start) /
+                         static_cast<float>(scan_count),
+                         "Slice: forward scan...");
+            if (ctx.cancelled()) {
+                reader.advise_random();
+                return PassResult::failed("Slice: cancelled by user");
+            }
+        }
     }
 
     reader.advise_random();  // Restore default hint
 
+    if (ctx.cancelled()) {
+        return PassResult::failed("Slice: cancelled by user");
+    }
+
     // ── Phase 3: Backward analysis over in-memory buffer ─────────────────
     // Pure memory iteration — no RocksDB / mmap random access.
     uint64_t needed_mask = 1ULL << target_reg_;
+    const size_t buf_size = buf.size();
+    const size_t phase3_interval = std::max(buf_size / 100, size_t(1));
+    size_t phase3_idx = 0;
 
     for (auto rit = buf.rbegin(); rit != buf.rend(); ++rit) {
         const auto& ci = *rit;
+        phase3_idx++;
+
+        if (phase3_idx % phase3_interval == 0) {
+            ctx.progress(0.5f + 0.5f * static_cast<float>(phase3_idx) /
+                         static_cast<float>(buf_size),
+                         "Slice: backward analysis...");
+            if (ctx.cancelled()) {
+                return PassResult::failed("Slice: cancelled by user");
+            }
+        }
 
         // Fast bitmask test: does this instruction write any needed register?
         uint64_t overlap = ci.written_regs_mask & needed_mask;

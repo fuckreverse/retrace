@@ -3,6 +3,7 @@
 #include "analysis/pass_manager.h"
 #include "analysis/passes/pattern_pass.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -138,7 +139,8 @@ private:
     void scan_buffer(const uint8_t* data, size_t size,
                      uint64_t base_addr, uint64_t at_inst_id,
                      const std::string& label,
-                     YaraMemScanResult& result);
+                     YaraMemScanResult& result,
+                     const std::function<bool()>& cancel_check = {});
     static float compute_shannon_entropy(const uint8_t* data, size_t size);
 
     YR_RULES* yr_rules_ = nullptr;

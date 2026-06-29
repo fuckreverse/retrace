@@ -14,6 +14,7 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <string_view>
 
 namespace tenet {
@@ -138,16 +139,20 @@ struct YaraScanContext {
     const std::vector<uint64_t>* offset_to_inst_id;
     const std::vector<uint64_t>* offset_to_pc;
     const std::vector<PatternPass::SyscallEntry>* syscall_entries;
+    const std::function<bool()>* cancel_check = nullptr;
 };
 
 static constexpr size_t SYSCALL_ENTRY_SIZE = 16;
 
 int yara_scan_callback(YR_SCAN_CONTEXT* context, int message,
                        void* message_data, void* user_data) {
+    auto* ctx = static_cast<YaraScanContext*>(user_data);
+    if (ctx->cancel_check && *ctx->cancel_check && (*ctx->cancel_check)()) {
+        return CALLBACK_ABORT;
+    }
     if (message != CALLBACK_MSG_RULE_MATCHING)
         return CALLBACK_CONTINUE;
 
-    auto* ctx = static_cast<YaraScanContext*>(user_data);
     auto* rule = static_cast<YR_RULE*>(message_data);
 
     // Extract meta fields
@@ -656,6 +661,7 @@ PassResult PatternPass::run(PassContext& ctx) {
             }
         });
         local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        local_engine.set_cancel_token(&ctx.global_cancel_flag());
         local_engine.add_collector(&collector);
         local_engine.run();
     }
@@ -672,6 +678,7 @@ PassResult PatternPass::run(PassContext& ctx) {
         auto reg_buf = collector.take_reg_buf();
         auto sys_buf = collector.take_sys_buf();
 
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
         ctx.progress(0.7f, "Pattern: scanning register values with YARA...");
         if (!reg_buf.data.empty()) {
             std::string name = "reg_value";
@@ -682,11 +689,15 @@ PassResult PatternPass::run(PassContext& ctx) {
             scan_ctx.offset_to_inst_id = &reg_buf.offset_to_inst_id;
             scan_ctx.offset_to_pc = nullptr;
             scan_ctx.syscall_entries = nullptr;
+            scan_ctx.cancel_check = nullptr;
 
+            std::function<bool()> cancel_check = [&]() { return ctx.cancelled(); };
+            scan_ctx.cancel_check = &cancel_check;
             yr_rules_scan_mem(yr_rules_, reg_buf.data.data(), reg_buf.data.size(),
                               0, yara_scan_callback, &scan_ctx, 0);
         }
 
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
         ctx.progress(0.8f, "Pattern: scanning code bytes with YARA...");
         auto code_buf = build_code_buffer(ctx);
         if (!code_buf.data.empty()) {
@@ -698,11 +709,15 @@ PassResult PatternPass::run(PassContext& ctx) {
             scan_ctx.offset_to_inst_id = nullptr;
             scan_ctx.offset_to_pc = &code_buf.offset_to_pc;
             scan_ctx.syscall_entries = nullptr;
+            scan_ctx.cancel_check = nullptr;
 
+            std::function<bool()> cancel_check = [&]() { return ctx.cancelled(); };
+            scan_ctx.cancel_check = &cancel_check;
             yr_rules_scan_mem(yr_rules_, code_buf.data.data(), code_buf.data.size(),
                               0, yara_scan_callback, &scan_ctx, 0);
         }
 
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
         ctx.progress(0.9f, "Pattern: scanning syscalls with YARA...");
         if (!sys_buf.data.empty()) {
             std::string name = "syscall";
@@ -713,7 +728,10 @@ PassResult PatternPass::run(PassContext& ctx) {
             scan_ctx.offset_to_inst_id = nullptr;
             scan_ctx.offset_to_pc = nullptr;
             scan_ctx.syscall_entries = &sys_buf.entries;
+            scan_ctx.cancel_check = nullptr;
 
+            std::function<bool()> cancel_check = [&]() { return ctx.cancelled(); };
+            scan_ctx.cancel_check = &cancel_check;
             yr_rules_scan_mem(yr_rules_, sys_buf.data.data(), sys_buf.data.size(),
                               0, yara_scan_callback, &scan_ctx, 0);
         }

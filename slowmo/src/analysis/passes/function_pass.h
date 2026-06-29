@@ -134,6 +134,12 @@ public:
     using ProgressFn = std::function<void(float)>;
     void set_progress_fn(ProgressFn fn) { progress_fn_ = std::move(fn); }
 
+    /// Set a cancellation check callback.  The callback should return true
+    /// when the analysis has been cancelled and should stop.
+    /// Must be called before end().
+    using CancelFn = std::function<bool()>;
+    void set_cancel_fn(CancelFn fn) { cancel_fn_ = std::move(fn); }
+
     /// Take ownership of the result after the scan completes.
     FunctionResult take_result() { return std::move(result_); }
 
@@ -240,6 +246,12 @@ private:
 
     // ── Phase 2 progress callback (optional, set via set_progress_fn()) ──
     ProgressFn progress_fn_;
+
+    // ── Cancellation callback (optional, set via set_cancel_fn()) ──
+    CancelFn cancel_fn_;
+
+    /// Check whether cancellation has been requested.
+    inline bool is_cancelled() const { return cancel_fn_ && cancel_fn_(); }
 
     // ── Result ──
     FunctionResult result_;

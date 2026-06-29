@@ -691,18 +691,19 @@ void FunctionCollector::end() {
     // ── Phase 2: state machine over branch_events_ ────────────────────────
     // branch_events_ holds ~2-5% of total instruction count.
     // Report progress through the state machine in ~5% increments.
-    if (progress_fn_ && !branch_events_.empty()) {
+    if ((progress_fn_ || cancel_fn_) && !branch_events_.empty()) {
         const size_t total = branch_events_.size();
         const size_t report_interval = std::max(total / 20, size_t(1));
         size_t processed = 0;
         for (const auto& ev : branch_events_) {
+            if (is_cancelled()) return;
             handle_branch_event(ev);
             ++processed;
-            if (processed % report_interval == 0) {
+            if (progress_fn_ && processed % report_interval == 0) {
                 progress_fn_(static_cast<float>(processed) / static_cast<float>(total));
             }
         }
-        progress_fn_(1.0f);
+        if (progress_fn_) progress_fn_(1.0f);
     } else {
         run_state_machine();
     }
@@ -730,6 +731,7 @@ void FunctionCollector::end() {
     }
 
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+        if (is_cancelled()) return;
         uint64_t new_this_round = 0;
 
         for (size_t ci = 0; ci < n_cands; ++ci) {
@@ -781,6 +783,8 @@ void FunctionCollector::end() {
 
         if (new_this_round == 0) break;
     }
+
+    if (is_cancelled()) return;
 
     // ── Generate deferred function names ──────────────────────────────────
     // Batching fmt::format calls here avoids per-call heap allocation in
@@ -856,6 +860,8 @@ PassResult FunctionPass::run(PassContext& ctx) {
         ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
                      "Function analysis: building call graph...");
     });
+    // Cancellation: allow end() to bail out early when user cancels.
+    collector.set_cancel_fn([&]() { return ctx.cancelled(); });
 
     // Use shared scan engine if available; otherwise create a local one.
     auto* engine = ctx.scan_engine();
@@ -894,11 +900,18 @@ PassResult FunctionPass::run(PassContext& ctx) {
     ctx.progress(kPostEnd, "Function analysis: post-processing...");
     auto result = collector.take_result();
 
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
+
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {
         ctx.progress(kPostEnd, "Function analysis: serialising...");
         std::string blob = function_serialize(result);
         if (!blob.empty()) {
+            if (ctx.cancelled()) {
+                return PassResult::failed("cancelled by user");
+            }
             ctx.progress(0.95f, "Function analysis: writing cache...");
             index.save_pass_blob("function", blob.data(), blob.size());
         }

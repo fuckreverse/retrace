@@ -166,6 +166,9 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
     uint64_t reg_last_written[kNumGPR];
     std::memset(reg_last_written, 0xFF, sizeof(reg_last_written));  // UINT64_MAX = not written
     for (const auto& ev : bt.events) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("taint_source_annotation: cancelled");
+        }
         ev.for_each_dst_reg([&](uint8_t dr) {
             if (dr < kNumGPR && ev.inst_id > reg_last_written[dr]) {
                 reg_last_written[dr] = ev.inst_id;
@@ -177,6 +180,9 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
     ankerl::unordered_dense::set<uint64_t> contributing_store_addrs;
     contributing_store_addrs.reserve(bt.events.size() / 4);
     for (const auto& ev : bt.events) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("taint_source_annotation: cancelled");
+        }
         if (ev.stores_to_memory && ev.store_addr != 0) {
             contributing_store_addrs.insert(ev.store_addr);
         }

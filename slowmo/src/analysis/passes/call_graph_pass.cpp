@@ -251,6 +251,9 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     timeline.reserve(func_result.call_events.size() * 2);
 
     for (size_t i = 0; i < func_result.call_events.size(); i++) {
+        if ((i % 1000) == 0 && ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         const auto& evt = func_result.call_events[i];
         timeline.push_back({evt.call_inst_id, true, i});
         if (evt.return_inst_id != 0) {
@@ -268,6 +271,9 @@ PassResult CallGraphPass::run(PassContext& ctx) {
 
     // Process timeline
     for (const auto& te : timeline) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         const auto& evt = func_result.call_events[te.event_index];
 
         if (te.is_call) {
@@ -306,6 +312,9 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     const uint64_t ROOT_PC = 0;
 
     for (const auto& [key, acc_data] : edge_accum) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         size_t edge_idx = result.edges.size();
 
         CallGraphEdge edge;

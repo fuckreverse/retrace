@@ -249,6 +249,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
     Graph layout_graph;
     layout_graph.reserve(num_blocks);
     for (const auto& [pc, block] : cfg.blocks) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         GraphBlock gb;
         gb.entry  = pc;
         gb.width  = default_block_width;
@@ -260,6 +263,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
 
     // Add edges
     for (const auto& edge : cfg.edges) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         auto it = layout_graph.find(edge.from_block);
         if (it == layout_graph.end()) continue;
         it->second.edges.emplace_back(GraphEdge(edge.to_block));
@@ -278,6 +284,7 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
     }
 
     GraphGridLayout layout_algo(effective_layout_type);
+    layout_algo.setCancelCheck([&]() { return ctx.cancelled(); });
 
     // For extremely large CFGs, disable the expensive optimization pass
     if (num_blocks > LARGE_CFG_THRESHOLD) {
@@ -286,6 +293,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
 
     layout_algo.calculateLayout(layout_graph, entry,
                                 result.canvas_width, result.canvas_height);
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
 
     ctx.progress(0.6f, "CFG layout: positions computed");
 
@@ -293,6 +303,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
 
     result.block_layouts.clear();
     for (const auto& [pc, gb] : layout_graph) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         BlockLayout bl;
         bl.x      = gb.x;
         bl.y      = gb.y;
@@ -304,6 +317,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
     // Copy routed edge polylines
     result.edge_layouts.reserve(cfg.edges.size());
     for (const auto& [pc, gb] : layout_graph) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         for (const auto& ge : gb.edges) {
             EdgeLayout el;
             el.from_block = pc;
@@ -320,6 +336,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
 
     // Simple DOT is always generated (cheap: O(V+E) with just PC labels)
     result.dot = generate_dot(cfg);
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
 
     // Annotated DOT with full disassembly — expensive for large CFGs
     // Skip for large graphs; it can be generated on-demand if needed.
@@ -327,6 +346,9 @@ PassResult CFGLayoutPass::run(PassContext& ctx) {
         auto& decoder    = ctx.decoder();
         auto& code_table = ctx.code_table();
         result.dot_annotated = generate_dot_annotated(cfg, decoder, code_table);
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
     } else {
         // Provide a placeholder that indicates on-demand generation is available
         result.dot_annotated = fmt::format(

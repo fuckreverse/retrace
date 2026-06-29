@@ -33,6 +33,9 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
     // Strategy: find loops with iteration_count >= min_iterations_to_fold,
     // then identify the inst_id ranges of each iteration by tracking back-edge crossings.
     for (const auto& loop : loops.loops) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         if (loop.iteration_count < cfg_.min_iterations_to_fold) continue;
 
         // Get all execution instances of the loop header
@@ -119,6 +122,9 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
     // Build kept_ranges (complement of folded regions)
     uint64_t cursor = 0;
     for (const auto& fr : result.folded_regions) {
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
         if (cursor < fr.first_inst_id) {
             result.kept_ranges.push_back({cursor, fr.first_inst_id - 1});
         }

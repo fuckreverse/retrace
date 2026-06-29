@@ -424,6 +424,8 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
         }
 
         if (!warm_ids.empty()) {
+            if (ctx.cancelled()) return PassResult::failed("Cancelled");
+
             std::sort(warm_ids.begin(), warm_ids.end());
             warm_ids.erase(std::unique(warm_ids.begin(), warm_ids.end()), warm_ids.end());
 
@@ -439,6 +441,7 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
             };
 
             for (size_t i = 1; i < warm_ids.size(); ++i) {
+                if (ctx.cancelled()) return PassResult::failed("Cancelled");
                 if (warm_ids[i] - span_end <= COALESCE_GAP) {
                     span_end = warm_ids[i] + 1;
                 } else {

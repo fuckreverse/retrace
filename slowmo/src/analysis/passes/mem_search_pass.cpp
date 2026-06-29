@@ -83,14 +83,18 @@ struct MemSearchYaraCtx {
     const std::vector<uint8_t>* offset_to_size;
     MemSearchMatch::Source source;
     size_t entry_size;  // bytes per entry in the buffer (8 for reg, 16 for mem)
+    const std::function<bool()>* cancel_check = nullptr;
 };
 
 int memsearch_yara_callback(YR_SCAN_CONTEXT* context, int message,
                             void* message_data, void* user_data) {
+    auto* ctx = static_cast<MemSearchYaraCtx*>(user_data);
+    if (ctx->cancel_check && *ctx->cancel_check && (*ctx->cancel_check)()) {
+        return CALLBACK_ABORT;
+    }
     if (message != CALLBACK_MSG_RULE_MATCHING)
         return CALLBACK_CONTINUE;
 
-    auto* ctx = static_cast<MemSearchYaraCtx*>(user_data);
     auto* rule = static_cast<YR_RULE*>(message_data);
 
     // Parse pattern_index from rule identifier: "pat_<idx>"
@@ -180,7 +184,8 @@ void MemSearchPass::yara_scan_buffer(
     const std::vector<uint64_t>& offset_to_addr,
     const std::vector<uint8_t>& offset_to_size,
     MemSearchMatch::Source source,
-    MemSearchResult& result)
+    MemSearchResult& result,
+    const std::function<bool()>& cancel_check)
 {
     if (!yr_rules_ || len == 0) return;
 
@@ -195,6 +200,7 @@ void MemSearchPass::yara_scan_buffer(
     ctx.offset_to_size = &offset_to_size;
     ctx.source = source;
     ctx.entry_size = entry_size;
+    ctx.cancel_check = &cancel_check;
 
     yr_rules_scan_mem(yr_rules_, data, len, 0, memsearch_yara_callback, &ctx, 0);
 }
@@ -291,6 +297,10 @@ PassResult MemSearchPass::run(PassContext& ctx) {
                 if (inst_id < start) continue;
                 if (inst_id > end) break;
 
+                if (inst_id % 10000 == 0 && ctx.cancelled()) {
+                    return PassResult::failed("cancelled by user");
+                }
+
                 auto inst = rec.as_inst();
 
                 // Collect mem-write entries
@@ -330,6 +340,10 @@ PassResult MemSearchPass::run(PassContext& ctx) {
             result.instructions_scanned = end - start;
         }
 
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
+
         // ── YARA scan: mem-writes ───────────────────────────────────────
         if (cfg_.search_mem_writes && !mem_buf.empty()) {
             result.bytes_scanned += mem_buf.size();
@@ -339,7 +353,12 @@ PassResult MemSearchPass::run(PassContext& ctx) {
 
             yara_scan_buffer(mem_buf.data(), mem_buf.size(),
                             mem_inst_ids, mem_pcs, mem_addrs, mem_sizes,
-                            MemSearchMatch::MemWrite, result);
+                            MemSearchMatch::MemWrite, result,
+                            [&]() { return ctx.cancelled(); });
+        }
+
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
         }
 
         // ── YARA scan: reg-diffs ────────────────────────────────────────
@@ -351,7 +370,8 @@ PassResult MemSearchPass::run(PassContext& ctx) {
 
             yara_scan_buffer(reg_buf.data(), reg_buf.size(),
                             reg_inst_ids, reg_pcs, reg_addrs, reg_sizes,
-                            MemSearchMatch::RegDiff, result);
+                            MemSearchMatch::RegDiff, result,
+                            [&]() { return ctx.cancelled(); });
         }
 
         reader.advise_random();
@@ -362,6 +382,9 @@ PassResult MemSearchPass::run(PassContext& ctx) {
 
     // ─── Fallback: linear scan ────────────────────────────────────────────
     linear_scan(ctx, result);
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
+    }
     return PassResult::success(std::move(result));
 }
 
@@ -461,6 +484,9 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result) {
 
         if (inst_id % progress_interval == 0) {
             ctx.progress(static_cast<float>(inst_id - start) / (end - start));
+            if (ctx.cancelled()) {
+                return;
+            }
         }
     }
 

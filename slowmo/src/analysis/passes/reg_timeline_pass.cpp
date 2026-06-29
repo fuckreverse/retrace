@@ -124,11 +124,15 @@ PassResult RegTimelinePass::run(PassContext& ctx) {
 
         if ((inst_id - start) % progress_interval == 0) {
             ctx.progress(static_cast<float>(inst_id - start) / (end - start));
+            if (ctx.cancelled()) goto done;
         }
     }
 
 done:
     reader.advise_random();
+    if (ctx.cancelled()) {
+        return PassResult::failed("RegTimeline: cancelled by user");
+    }
 
     // Build unique values for single-reg mode
     if (!track_all && target < 34) {

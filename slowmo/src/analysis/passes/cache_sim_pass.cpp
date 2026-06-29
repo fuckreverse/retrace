@@ -600,8 +600,20 @@ PassResult CacheSimPass::run(PassContext& ctx) {
         uint64_t inst_count = index.inst_count();
 
         TraceScanEngine own_engine(reader, inst_count, &index);
+        own_engine.set_progress([&](uint64_t processed, uint64_t total) {
+            if (total > 0) {
+                ctx.progress(static_cast<float>(processed) / static_cast<float>(total),
+                             "CacheSim: scanning trace...");
+            }
+        });
+        own_engine.set_cancel_check([&]() { return ctx.cancelled(); });
+        own_engine.set_cancel_token(&ctx.global_cancel_flag());
         own_engine.add_collector(&collector);
         own_engine.run(cfg_.start_inst_id, cfg_.end_inst_id);
+    }
+
+    if (ctx.cancelled()) {
+        return PassResult::failed("cancelled by user");
     }
 
     CacheSimResult result = collector.build_result(cfg_);

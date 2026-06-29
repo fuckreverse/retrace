@@ -43,12 +43,17 @@ std::vector<CallStackFrame> CallContextPass::reconstruct_call_stack(
         ? TraceReader::Iterator(&reader, start_offset)
         : reader.begin();
 
+    uint64_t rs_progress_interval = std::max((target_inst_id - scan_start) / 100, uint64_t(1));
     for (auto it = it_start; it != reader.end(); ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
 
         inst_id++;
         if (inst_id > target_inst_id) break;
+
+        if ((inst_id - scan_start) % rs_progress_interval == 0 && ctx.cancelled()) {
+            return {};  // cancelled — return empty stack
+        }
 
         auto inst = rec.as_inst();
 
@@ -152,12 +157,21 @@ PassResult CallContextPass::run(PassContext& ctx) {
         ? TraceReader::Iterator(&reader, start_offset)
         : reader.begin();
 
+    const uint64_t run_total = window_end - scan_start;
+    const uint64_t run_interval = std::max(run_total / 100, uint64_t(1));
+
     for (auto it = it_start; it != reader.end(); ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
 
         inst_id++;
         if (inst_id > window_end) break;
+
+        if ((inst_id - scan_start) % run_interval == 0) {
+            ctx.progress(static_cast<float>(inst_id - scan_start) / static_cast<float>(run_total),
+                         "CallContext: single-pass collection...");
+            if (ctx.cancelled()) return PassResult::failed("CallContext: cancelled by user");
+        }
 
         auto inst = rec.as_inst();
 

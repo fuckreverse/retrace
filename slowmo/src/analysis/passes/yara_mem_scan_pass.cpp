@@ -60,15 +60,19 @@ struct YaraCallbackCtx {
     uint64_t           base_addr;
     uint64_t           at_inst_id;
     std::string        label;
+    const std::function<bool()>* cancel_check = nullptr;
 };
 
 /// YARA rule match callback (called per-match).
 static int yara_callback(YR_SCAN_CONTEXT* ctx, int msg, void* msg_data, void* user_data) {
     (void)ctx;
+    auto* cb_ctx  = static_cast<YaraCallbackCtx*>(user_data);
+    if (cb_ctx->cancel_check && *cb_ctx->cancel_check && (*cb_ctx->cancel_check)()) {
+        return CALLBACK_ABORT;
+    }
     if (msg != CALLBACK_MSG_RULE_MATCHING) return CALLBACK_CONTINUE;
 
     auto* yr_rule = static_cast<YR_RULE*>(msg_data);
-    auto* cb_ctx  = static_cast<YaraCallbackCtx*>(user_data);
 
     // Extract meta fields
     std::string description, cat_str, conf_str;
@@ -172,7 +176,8 @@ bool YaraMemScanPass::load_rules(const std::filesystem::path& default_dir) {
 void YaraMemScanPass::scan_buffer(const uint8_t* data, size_t size,
                                    uint64_t base_addr, uint64_t at_inst_id,
                                    const std::string& label,
-                                   YaraMemScanResult& result) {
+                                   YaraMemScanResult& result,
+                                   const std::function<bool()>& cancel_check) {
     if (!yr_rules_ || size == 0) return;
 
     // Entropy pre-filter
@@ -185,6 +190,7 @@ void YaraMemScanPass::scan_buffer(const uint8_t* data, size_t size,
     }
 
     YaraCallbackCtx cb_ctx{&result, base_addr, at_inst_id, label};
+    cb_ctx.cancel_check = &cancel_check;
     yr_rules_scan_mem(yr_rules_,
                       data, size,
                       SCAN_FLAGS_FAST_MODE,
@@ -230,8 +236,12 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
     YaraMemScanResult result;
     auto& memory = ctx.memory();
 
+    ctx.progress(0.0f, "YaraMemScan: scanning explicit points...");
+
     // ── Explicit scan points ─────────────────────────────────────────────
     for (const auto& sp : cfg_.scan_points) {
+        if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
+
         uint64_t sz = sp.size == 0 ? 4096 : sp.size;
         sz = std::min(sz, cfg_.max_bytes_per_page);
         uint64_t inst_id = (sp.inst_id == 0) ? ctx.index().inst_count() : sp.inst_id;
@@ -240,15 +250,29 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
         if (rr.known_count == 0) continue;
 
         scan_buffer(rr.data.data(), rr.data.size(),
-                    sp.addr, inst_id, sp.label, result);
+                    sp.addr, inst_id, sp.label, result,
+                    [&]() { return ctx.cancelled(); });
     }
 
     // ── Auto-scan active pages ────────────────────────────────────────────
     if (cfg_.auto_scan_all_pages) {
+        ctx.progress(0.1f, "YaraMemScan: scanning active pages...");
+
         uint64_t trace_end = ctx.index().inst_count();
         auto pages = memory.active_pages();
+        const size_t total_pages = pages.size();
+        size_t page_idx = 0;
 
         for (const auto& page : pages) {
+            if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
+
+            page_idx++;
+            if (page_idx % 64 == 0 && total_pages > 0) {
+                ctx.progress(0.1f + 0.7f * static_cast<float>(page_idx) /
+                             static_cast<float>(total_pages),
+                             "YaraMemScan: scanning active pages...");
+            }
+
             if (page.write_count < cfg_.min_writes_per_page) continue;
 
             // Scan at last-write point so we see the final state of the page
@@ -260,15 +284,20 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
 
             std::string label = fmt::format("page@0x{:X}", page.page_addr);
             scan_buffer(rr.data.data(), rr.data.size(),
-                        page.page_addr, at_id, label, result);
+                        page.page_addr, at_id, label, result,
+                        [&]() { return ctx.cancelled(); });
         }
     }
+
+    if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
 
     // ── Code buffer scan ─────────────────────────────────────────────────
     // Reconstruct a contiguous byte buffer from the CodeTable's sorted entries.
     // Each entry is (runtime_pc, opcode_u32_le); we write them in PC order so
     // YARA can match byte patterns that span adjacent instructions.
     if (cfg_.scan_code_buffer) {
+        if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
+        ctx.progress(0.8f, "YaraMemScan: scanning code buffer...");
         try {
             auto& ct = ctx.code_table();
             auto entries = ct.all_entries();  // sorted vector<pair<uint64_t,uint32_t>>
@@ -277,6 +306,10 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
                 std::vector<uint8_t> code_bytes;
                 code_bytes.reserve(entries.size() * 4);
                 for (const auto& [pc, opcode] : entries) {
+                    (void)pc;
+                    if ((code_bytes.size() % (4096 * 4)) == 0 && ctx.cancelled()) {
+                        return PassResult::failed("YaraMemScan: cancelled by user");
+                    }
                     code_bytes.push_back(static_cast<uint8_t>(opcode & 0xFF));
                     code_bytes.push_back(static_cast<uint8_t>((opcode >> 8) & 0xFF));
                     code_bytes.push_back(static_cast<uint8_t>((opcode >> 16) & 0xFF));
@@ -284,14 +317,21 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
                 }
                 uint64_t base_addr = entries.front().first;
                 scan_buffer(code_bytes.data(), code_bytes.size(),
-                            base_addr, 0, "code_buffer", result);
+                            base_addr, 0, "code_buffer", result,
+                            [&]() { return ctx.cancelled(); });
             }
         } catch (...) {
             // code_table may not be available in all contexts — silently skip
         }
     }
 
+    if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
+
+    ctx.progress(0.9f, "YaraMemScan: deduplicating results...");
+
     // Remove duplicate matches (same rule + addr + inst_id)
+    if (ctx.cancelled()) return PassResult::failed("YaraMemScan: cancelled by user");
+
     std::sort(result.matches.begin(), result.matches.end(),
         [](const YaraMemMatch& a, const YaraMemMatch& b) {
             if (a.rule_name != b.rule_name) return a.rule_name < b.rule_name;

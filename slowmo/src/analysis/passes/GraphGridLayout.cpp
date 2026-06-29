@@ -295,15 +295,27 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
     }
 
     for (auto &it : blocks) {
+        if (cancelled()) {
+            return;
+        }
         GridBlock block;
         block.id = it.first;
         layoutState.gridBlocks[it.first] = block;
     }
 
+    if (cancelled()) {
+        return;
+    }
     auto blockOrder = topoSort(layoutState, entry);
     computeAllBlockPlacement(blockOrder, layoutState);
+    if (cancelled()) {
+        return;
+    }
 
     for (auto &blockIt : blocks) {
+        if (cancelled()) {
+            return;
+        }
         layoutState.edge[blockIt.first].resize(blockIt.second.edges.size());
         for (size_t i = 0; i < blockIt.second.edges.size(); i++) {
             layoutState.edge[blockIt.first][i].dest = blockIt.second.edges[i].target;
@@ -311,6 +323,9 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
         }
     }
     for (const auto &edgeList : layoutState.edge) {
+        if (cancelled()) {
+            return;
+        }
         auto &startBlock = layoutState.gridBlocks[edgeList.first];
         startBlock.outputCount = edgeList.second.size();
         for (auto &edge : edgeList.second) {
@@ -322,6 +337,9 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
     layoutState.columns = 1;
     layoutState.rows = 1;
     for (auto &node : layoutState.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         // count is at least index + 1
         layoutState.rows = std::max(layoutState.rows, size_t(node.second.row) + 1);
         // block is 2 column wide
@@ -331,6 +349,9 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
     layoutState.rowHeight.assign(layoutState.rows, 0);
     layoutState.columnWidth.assign(layoutState.columns, 0);
     for (auto &node : layoutState.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         const auto &inputBlock = blocks[node.first];
         layoutState.rowHeight[node.second.row] =
                 std::max(inputBlock.height, layoutState.rowHeight[node.second.row]);
@@ -341,10 +362,19 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
     }
 
     routeEdges(layoutState);
+    if (cancelled()) {
+        return;
+    }
 
     convertToPixelCoordinates(layoutState, width, height);
+    if (cancelled()) {
+        return;
+    }
     if (useLayoutOptimization) {
         optimizeLayout(layoutState);
+        if (cancelled()) {
+            return;
+        }
         cropToContent(blocks, width, height);
     }
 }
@@ -352,6 +382,9 @@ void GraphGridLayout::calculateLayout(Graph &blocks, uint64_t entry, int &width,
 void GraphGridLayout::findMergePoints(GraphGridLayout::LayoutState &state) const
 {
     for (auto &blockIt : state.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         const GridBlock *mergeBlock = nullptr;
         int grandChildCount = 0;
@@ -408,6 +441,9 @@ void GraphGridLayout::computeAllBlockPlacement(const std::vector<uint64_t> &bloc
     // Process nodes in the order from bottom to top. Ensures that all subtrees are processed before
     // parent node.
     for (auto blockId : blockOrder) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = layoutState.gridBlocks[blockId];
         if (block.treeEdge.size() == 0) {
             block.rowCount = 1;
@@ -527,6 +563,9 @@ void GraphGridLayout::computeAllBlockPlacement(const std::vector<uint64_t> &bloc
     // unreahable basic blocks or using the algorithm for non control flow graphs.
     int nextEmptyColumn = 0;
     for (auto &blockIt : layoutState.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         if (block.row == 0) { // place all the roots first
             auto offset = -block.leftPosition;
@@ -536,6 +575,9 @@ void GraphGridLayout::computeAllBlockPlacement(const std::vector<uint64_t> &bloc
     }
     // Visit all nodes top to bottom, converting relative positions to absolute.
     for (auto it = blockOrder.rbegin(), end = blockOrder.rend(); it != end; it++) { // NOLINT
+        if (cancelled()) {
+            return;
+        }
         auto &block = layoutState.gridBlocks[*it];
         assert(block.col >= 0);
         for (auto childId : block.treeEdge) {
@@ -548,7 +590,13 @@ void GraphGridLayout::computeAllBlockPlacement(const std::vector<uint64_t> &bloc
 void GraphGridLayout::routeEdges(GraphGridLayout::LayoutState &state) const
 {
     calculateEdgeMainColumn(state);
+    if (cancelled()) {
+        return;
+    }
     roughRouting(state);
+    if (cancelled()) {
+        return;
+    }
     elaborateEdgePlacement(state);
 }
 
@@ -570,6 +618,9 @@ void GraphGridLayout::calculateEdgeMainColumn(GraphGridLayout::LayoutState &stat
     std::vector<Event> events;
     events.reserve(state.gridBlocks.size() * 2);
     for (const auto &it : state.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         events.push_back({ it.first, 0, it.second.row, Event::Block });
         const auto &inputBlock = (*state.blocks)[it.first];
         const int startRow = it.second.row + 1;
@@ -594,6 +645,9 @@ void GraphGridLayout::calculateEdgeMainColumn(GraphGridLayout::LayoutState &stat
     // process events and choose main column for each edge
     PointSetMinTree blockedColumns(state.columns + 1, -1);
     for (const auto &event : events) {
+        if (cancelled()) {
+            return;
+        }
         if (event.type == Event::Block) {
             auto block = state.gridBlocks[event.blockId];
             blockedColumns.set(block.col + 1, event.row);
@@ -665,6 +719,9 @@ void GraphGridLayout::roughRouting(GraphGridLayout::LayoutState &state) const
     };
 
     for (auto &blockIt : state.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &blockEdges = state.edge[blockIt.first];
         for (auto &edge : blockEdges) {
             const auto &start = blockIt.second;
@@ -1005,6 +1062,9 @@ void GraphGridLayout::elaborateEdgePlacement(GraphGridLayout::LayoutState &state
 
     // Vertical segments
     for (auto &edgeListIt : state.edge) {
+        if (cancelled()) {
+            return;
+        }
         for (const auto &edge : edgeListIt.second) {
             for (size_t j = 1; j < edge.points.size(); j += 2) {
                 segments.push_back(
@@ -1015,6 +1075,9 @@ void GraphGridLayout::elaborateEdgePlacement(GraphGridLayout::LayoutState &state
         }
     }
     for (auto &blockIt : state.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &node = blockIt.second;
         auto width = (*state.blocks)[blockIt.first].width;
         auto leftWidth = width / 2;
@@ -1084,6 +1147,9 @@ void GraphGridLayout::elaborateEdgePlacement(GraphGridLayout::LayoutState &state
 
     edgeIndex = 0;
     for (auto &edgeListIt : state.edge) {
+        if (cancelled()) {
+            return;
+        }
         for (const auto &edge : edgeListIt.second) {
             for (size_t j = 2; j < edge.points.size(); j += 2) {
                 const int y0 =
@@ -1097,6 +1163,9 @@ void GraphGridLayout::elaborateEdgePlacement(GraphGridLayout::LayoutState &state
     }
     edgeOffsets.resize(edgeIndex);
     for (auto &blockIt : state.gridBlocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &node = blockIt.second;
         auto blockWidth = (*state.blocks)[node.id].width;
         const int leftSide = state.edgeColumnOffset[node.col + 1]
@@ -1172,6 +1241,9 @@ void GraphGridLayout::convertToPixelCoordinates(GraphGridLayout::LayoutState &st
 
     // block pixel positions
     for (auto &block : (*state.blocks)) {
+        if (cancelled()) {
+            return;
+        }
         const auto &gridBlock = state.gridBlocks[block.first];
 
         block.second.x = state.edgeColumnOffset[gridBlock.col + 1]
@@ -1183,6 +1255,9 @@ void GraphGridLayout::convertToPixelCoordinates(GraphGridLayout::LayoutState &st
     }
     // edge pixel positions
     for (auto &it : (*state.blocks)) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = it.second;
         for (size_t i = 0; i < block.edges.size(); i++) {
             auto &resultEdge = block.edges[i];
@@ -1227,6 +1302,9 @@ void GraphGridLayout::cropToContent(Graph &graph, int &width, int &height) const
     };
 
     for (const auto &blockIt : graph) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         updateLimits(block.x, block.y);
         updateLimits(block.x + block.width, block.y + block.height);
@@ -1585,6 +1663,9 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
     std::unordered_map<uint64_t, int> blockMapping;
     size_t blockIndex = 0;
     for (auto &blockIt : *state.blocks) {
+        if (cancelled()) {
+            return;
+        }
         blockMapping[blockIt.first] = blockIndex++;
     }
     std::vector<size_t> variableGroups(blockMapping.size());
@@ -1652,6 +1733,9 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
 
     objectiveFunction.assign(blockMapping.size(), 1);
     for (auto &blockIt : *state.blocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         const int blockVariable = blockMapping[blockIt.first];
         for (auto &edge : block.edges) {
@@ -1693,6 +1777,9 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
 
     objectiveFunction.resize(solution.size());
     optimizeLinearProgram(solution.size(), objectiveFunction, inequalities, equalities, solution);
+    if (cancelled()) {
+        return;
+    }
     copyVariablesToPositions(solution, true);
     connectEdgeEnds(*state.blocks);
 
@@ -1706,6 +1793,9 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
     variableIndex = blockMapping.size();
     edgeIndex = 0;
     for (auto &blockIt : *state.blocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         for (auto &edge : block.edges) {
             if (edge.polyline.size() < 2) {
@@ -1747,6 +1837,9 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
     objectiveFunction.resize(solution.size());
     // horizontal centering constraints
     for (auto &blockIt : *state.blocks) {
+        if (cancelled()) {
+            return;
+        }
         auto &block = blockIt.second;
         const int blockVariable = blockMapping[blockIt.first];
         if (block.edges.size() == 2) {
@@ -1772,5 +1865,8 @@ void GraphGridLayout::optimizeLayout(GraphGridLayout::LayoutState &state) const
     }
 
     optimizeLinearProgram(solution.size(), objectiveFunction, inequalities, equalities, solution);
+    if (cancelled()) {
+        return;
+    }
     copyVariablesToPositions(solution);
 }

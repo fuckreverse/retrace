@@ -352,6 +352,9 @@ static PassResult run_backward_taint_common(
         ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> addr_to_readers;
 
         for (size_t i = 0; i < result.events.size(); i++) {
+            if ((i % 1000) == 0 && ctx.cancelled()) {
+                return PassResult::failed("cancelled by user");
+            }
             const auto& ev = result.events[i];
 
             ev.for_each_dst_reg([&](uint8_t dr) {
