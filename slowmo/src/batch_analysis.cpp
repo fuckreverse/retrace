@@ -1654,6 +1654,7 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         st_json["file_size"]     = reader.file_size();
         st_json["arch"]          = hdr.arch == 1 ? "aarch64" : "x86_64";
         st_json["version"]       = hdr.version;
+        st_json["target_os"]     = target_os_name(hdr.target_os);
         st_json["flags"] = {
             {"has_mem",       hdr.has_mem()},
             {"has_code",      hdr.has_code()},

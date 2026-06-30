@@ -96,7 +96,8 @@ public:
                      InstructionDecoder& decoder,
                      RegisterFile* regfile,
                      bool build_yara_buffers,
-                     const ConstantMaterializationResult* constmat);
+                     const ConstantMaterializationResult* constmat,
+                     uint32_t target_os = 0);
 
     std::string_view name() const override { return "PatternCollector"; }
 
@@ -183,8 +184,10 @@ private:
 
     // ─── YARA buffer state ───────────────────────────────────────────────
 
-    static constexpr uint8_t REG_X16 = 16;
+    static constexpr uint8_t REG_X16 = 16;   // Darwin syscall number register
+    static constexpr uint8_t REG_X8  = 8;    // Linux/Android syscall number register
     static constexpr size_t SYSCALL_ENTRY_SIZE = 16;
+    uint8_t syscall_reg_;                      // platform-selected syscall register
 
     RegValueBuffer reg_buf_;
     SyscallBuffer sys_buf_;

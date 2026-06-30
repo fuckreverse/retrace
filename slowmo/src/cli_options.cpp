@@ -89,7 +89,7 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
     fmt::print(stderr, "  --objc-class <name>           Filter ObjC messages by class name\n");
     fmt::print(stderr, "  --objc-crypto                 Correlate crypto patterns with ObjC call stack\n");
-    fmt::print(stderr, "  --syscall-intercept           Extract iOS system API call params (CommonCrypto, Security.framework)\n");
+    fmt::print(stderr, "  --syscall-intercept           Extract crypto/system API call params (auto-selects per platform)\n");
     fmt::print(stderr, "  --syscall-intercept-bytes <N> Bytes to capture per pointer arg (default: 64)\n");
     fmt::print(stderr, "  --taint-source-annotation     Annotate backward taint leaf sources with ObjC getter context\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
@@ -360,7 +360,7 @@ CliOptions parse_args(int argc, char** argv) {
                     case tenet::PassCategory::Taint:      cat = "Taint";     break;
                     case tenet::PassCategory::Crypto:     cat = "Crypto";    break;
                     case tenet::PassCategory::Memory:     cat = "Memory";    break;
-                    case tenet::PassCategory::ObjcSyscall:cat = "ObjC/Sys";  break;
+                    case tenet::PassCategory::PlatformApi:cat = "Platform"; break;
                     case tenet::PassCategory::Profile:    cat = "Profile";   break;
                     case tenet::PassCategory::Misc:       cat = "Misc";      break;
                 }

@@ -19,12 +19,17 @@ struct ObjcResult;
 // ─── Known cross-library API categories ──────────────────────────────────
 
 enum class ApiCategory {
+    // ── iOS / macOS (Darwin) ──────────────────────────────────────────────
     CommonCrypto,
     SecurityFramework,
     CryptoKit,
-    Compression,
     CocoaFoundation,
     LibSystem,
+    // ── Android / Linux ──────────────────────────────────────────────────
+    BoringSSL,         // BoringSSL / OpenSSL (EVP_*, HMAC_*, AES_*)
+    AndroidKeystore,   // Android Keystore JNI
+    // ── Cross-platform ───────────────────────────────────────────────────
+    Compression,
     Custom,
 };
 
@@ -146,12 +151,15 @@ struct SyscallInterceptConfig {
 
 /// TraceCollector that tracks register state (x0-x7), Objc messages,
 /// and Event records (XFER_CALL) to intercept cross-library API calls.
+/// The `target_os` parameter selects which API signature table to load
+/// (Darwin: CommonCrypto/Security.framework, Android: BoringSSL/OpenSSL).
 class SyscallInterceptCollector final : public TraceCollector {
 public:
     SyscallInterceptCollector(const SyscallInterceptConfig& config,
                                const CodeTable& code_table,
                                MemoryModel& memory,
-                               const ObjcResult* objc);
+                               const ObjcResult* objc,
+                               uint32_t target_os = 0);
 
     std::string_view name() const override { return "SyscallInterceptCollector"; }
 
@@ -201,7 +209,7 @@ public:
 
     std::string_view name() const override { return "syscall_intercept"; }
     std::string_view description() const override {
-        return "Extract parameters from iOS system API calls (CommonCrypto, Security.framework)";
+        return "Extract parameters from platform crypto/system API calls";
     }
 
     std::vector<std::string_view> dependencies() const override {

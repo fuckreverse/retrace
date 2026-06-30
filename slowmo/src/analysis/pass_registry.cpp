@@ -272,9 +272,9 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"literal_search",        "Literal Search","Search literal values in reg/mem/immediates",            PassCategory::Memory,    PassDefault::No},
         {"yara_mem_scan",         "YARA Mem Scan", "YARA scan of memory pages (crypto constants in mem)",    PassCategory::Memory,    PassDefault::No},
 
-        // — ObjC / Syscall —
-        {"objc",                  "ObjC",          "Objective-C message send analysis",                      PassCategory::ObjcSyscall, PassDefault::No},
-        {"syscall_intercept",     "Syscalls",      "Intercept crypto/compression/syscall APIs",              PassCategory::ObjcSyscall, PassDefault::No},
+        // — Platform API —
+        {"objc",                  "ObjC",          "Objective-C message send analysis",                      PassCategory::PlatformApi, PassDefault::No},
+        {"syscall_intercept",     "Syscalls",      "Intercept crypto/system API calls (platform-aware)",    PassCategory::PlatformApi, PassDefault::No},
 
         // — Profile / Trace —
         {"trace_fold",            "Trace Fold",    "Fold repetitive loop iterations into summaries",         PassCategory::Profile,   PassDefault::No},

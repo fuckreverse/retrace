@@ -400,23 +400,224 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
     return apis;
 }
 
+// ─── Android / Linux (BoringSSL / OpenSSL) API signature table ────────────
+//
+// BoringSSL is the default TLS/crypto library on Android (used by
+// conscrypt, OkHttp, Chromium, ...).  Function signatures follow
+// the OpenSSL EVP interface — same argument positions on AArch64.
+
+static const std::vector<ApiSignature>& known_android_apis() {
+    static const std::vector<ApiSignature> apis = {
+        // ── BoringSSL / OpenSSL EVP symmetric cipher ──────────────────────
+        {
+            .name          = "EVP_EncryptInit_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+            .key_ptr_arg   = 3,    // x3 = key pointer
+            .iv_ptr_arg    = 4,    // x4 = IV pointer
+        },
+        {
+            .name          = "EVP_DecryptInit_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+            .key_ptr_arg   = 3,
+            .iv_ptr_arg    = 4,
+        },
+        {
+            .name          = "EVP_CipherInit_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 6,
+            .key_ptr_arg   = 3,
+            .iv_ptr_arg    = 4,
+            .operation_arg = 5,    // x5 = enc (1) or dec (0)
+        },
+        {
+            .name          = "EVP_EncryptUpdate",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+            .data_ptr_arg  = 3,    // x3 = input data
+            .data_len_arg  = 4,    // x4 = input length
+        },
+        {
+            .name          = "EVP_DecryptUpdate",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+            .data_ptr_arg  = 3,
+            .data_len_arg  = 4,
+        },
+        {
+            .name          = "EVP_EncryptFinal_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+        },
+        {
+            .name          = "EVP_DecryptFinal_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+        },
+        // ── BoringSSL / OpenSSL HMAC ──────────────────────────────────────
+        {
+            .name          = "HMAC",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 7,
+            .key_ptr_arg   = 1,    // x1 = key
+            .key_len_arg   = 2,    // x2 = key_len
+            .data_ptr_arg  = 3,    // x3 = data
+            .data_len_arg  = 4,    // x4 = data_len
+        },
+        {
+            .name          = "HMAC_Init_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 4,
+            .key_ptr_arg   = 1,
+            .key_len_arg   = 2,
+        },
+        {
+            .name          = "HMAC_Update",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+            .data_ptr_arg  = 1,
+            .data_len_arg  = 2,
+        },
+        // ── BoringSSL / OpenSSL Digest ────────────────────────────────────
+        {
+            .name          = "EVP_DigestInit_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+        },
+        {
+            .name          = "EVP_DigestUpdate",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+            .data_ptr_arg  = 1,
+            .data_len_arg  = 2,
+        },
+        {
+            .name          = "EVP_DigestFinal_ex",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+        },
+        // ── BoringSSL / OpenSSL RSA / EC signing ──────────────────────────
+        {
+            .name          = "EVP_DigestSignInit",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+        },
+        {
+            .name          = "EVP_DigestSignFinal",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+        },
+        {
+            .name          = "EVP_DigestVerifyInit",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 5,
+        },
+        {
+            .name          = "EVP_DigestVerifyFinal",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+            .data_ptr_arg  = 1,
+            .data_len_arg  = 2,
+        },
+        // ── BoringSSL / OpenSSL AES low-level ─────────────────────────────
+        {
+            .name          = "AES_set_encrypt_key",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+            .key_ptr_arg   = 0,    // x0 = userKey
+            .key_len_arg   = 1,    // x1 = bits (128/192/256)
+        },
+        {
+            .name          = "AES_set_decrypt_key",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 3,
+            .key_ptr_arg   = 0,
+            .key_len_arg   = 1,
+        },
+        {
+            .name          = "AES_cbc_encrypt",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 6,
+            .data_ptr_arg  = 0,    // x0 = in
+            .data_len_arg  = 2,    // x2 = length
+            .iv_ptr_arg    = 4,    // x4 = ivec
+            .operation_arg = 5,    // x5 = enc
+        },
+        // ── BoringSSL / OpenSSL KDF ───────────────────────────────────────
+        {
+            .name          = "PKCS5_PBKDF2_HMAC",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 8,
+            .key_ptr_arg   = 0,    // x0 = password
+            .key_len_arg   = 1,    // x1 = pass_len
+            .data_ptr_arg  = 3,    // x3 = salt
+            .data_len_arg  = 4,    // x4 = salt_len
+        },
+        {
+            .name          = "PKCS5_PBKDF2_HMAC_SHA1",
+            .category      = ApiCategory::BoringSSL,
+            .arg_count     = 7,
+            .key_ptr_arg   = 0,
+            .key_len_arg   = 1,
+            .data_ptr_arg  = 2,    // x2 = salt
+            .data_len_arg  = 3,    // x3 = salt_len
+        },
+        // ── Compression (shared with iOS) ─────────────────────────────────
+        {
+            .name          = "compress2",
+            .category      = ApiCategory::Compression,
+            .arg_count     = 5,
+            .data_ptr_arg  = 2,
+            .data_len_arg  = 3,
+        },
+        {
+            .name          = "uncompress",
+            .category      = ApiCategory::Compression,
+            .arg_count     = 4,
+            .data_ptr_arg  = 2,
+            .data_len_arg  = 3,
+        },
+    };
+    return apis;
+}
+
 // ─── SyscallInterceptCollector ────────────────────────────────────────────
 
 SyscallInterceptCollector::SyscallInterceptCollector(
     const SyscallInterceptConfig& config,
     const CodeTable& code_table,
     MemoryModel& memory,
-    const ObjcResult* objc)
+    const ObjcResult* objc,
+    uint32_t target_os)
     : config_(config)
     , code_table_(code_table)
     , memory_(memory)
     , objc_result_(objc)
 {
-    // Build known API name → signature lookup.
-    const auto& apis = known_apis();
-    for (const auto& sig : apis) {
-        api_by_name_[sig.name] = &sig;
+    // Select the API signature table based on target platform.
+    // Darwin → CommonCrypto/Security.framework table.
+    // Android/Linux → BoringSSL/OpenSSL table.
+    // Unknown → load both tables (best-effort match).
+    auto load_table = [&](const std::vector<ApiSignature>& table) {
+        for (const auto& sig : table) {
+            api_by_name_[sig.name] = &sig;
+        }
+    };
+
+    bool is_darwin_target = (target_os == 1);   // TargetOS::iOS
+    bool is_linux_target  = (target_os == 2 || target_os == 3);  // Android or Linux
+
+    if (is_darwin_target) {
+        load_table(known_apis());
+    } else if (is_linux_target) {
+        load_table(known_android_apis());
+    } else {
+        // Unknown platform — load both tables for best coverage.
+        load_table(known_apis());
+        load_table(known_android_apis());
     }
+
     // Add user-specified extra names (matched as prefix, no decode).
     for (const auto& extra : config_.extra_api_names) {
         if (api_by_name_.find(extra) == api_by_name_.end()) {
@@ -725,7 +926,8 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
 
     ctx.progress(0.01f, "syscall_intercept: scanning trace...");
 
-    SyscallInterceptCollector collector(config_, code_table, ctx.memory(), objc);
+    SyscallInterceptCollector collector(config_, code_table, ctx.memory(), objc,
+                                       static_cast<uint32_t>(reader.header().target_os));
 
     auto* engine = ctx.scan_engine();
     if (engine) {
@@ -781,9 +983,11 @@ static const char* api_category_str(ApiCategory cat) {
         case ApiCategory::CommonCrypto:      return "CommonCrypto";
         case ApiCategory::SecurityFramework: return "Security.framework";
         case ApiCategory::CryptoKit:         return "CryptoKit";
-        case ApiCategory::Compression:       return "Compression";
         case ApiCategory::CocoaFoundation:   return "Foundation";
         case ApiCategory::LibSystem:         return "libSystem";
+        case ApiCategory::BoringSSL:         return "BoringSSL";
+        case ApiCategory::AndroidKeystore:   return "AndroidKeystore";
+        case ApiCategory::Compression:       return "Compression";
         case ApiCategory::Custom:            return "Custom";
     }
     return "Unknown";

@@ -339,12 +339,14 @@ PatternCollector::PatternCollector(CodeTable& code_table,
                                    InstructionDecoder& decoder,
                                    RegisterFile* regfile,
                                    bool build_yara_buffers,
-                                   const ConstantMaterializationResult* constmat)
+                                   const ConstantMaterializationResult* constmat,
+                                   uint32_t target_os)
     : code_table_(code_table)
     , decoder_(decoder)
     , regfile_(regfile)
     , build_yara_buffers_(build_yara_buffers)
     , constmat_(constmat)
+    , syscall_reg_((target_os == 2 || target_os == 3) ? REG_X8 : REG_X16)  // Android/Linux → x8, Darwin/Unknown → x16
 {}
 
 bool PatternCollector::begin(uint64_t start_inst_id, uint64_t end_inst_id) {
@@ -451,7 +453,7 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
     // ── Collect syscall entries (only when building YARA buffer) ──
     if (build_yara_buffers_ && is_svc && regfile_) {
         auto state = regfile_->state_before(inst_id);
-        uint16_t syscall_no = static_cast<uint16_t>(state.gpr[REG_X16] & 0xFFFF);
+        uint16_t syscall_no = static_cast<uint16_t>(state.gpr[syscall_reg_] & 0xFFFF);
         SyscallEntry entry;
         entry.inst_id = inst_id;
         entry.syscall_no = syscall_no;
@@ -647,7 +649,8 @@ PassResult PatternPass::run(PassContext& ctx) {
 
     // regfile is only needed when building YARA syscall buffers
     RegisterFile* regfile_ptr = has_yara ? &ctx.regfile() : nullptr;
-    PatternCollector collector(code_table, decoder, regfile_ptr, has_yara, constmat);
+    PatternCollector collector(code_table, decoder, regfile_ptr, has_yara, constmat,
+                               static_cast<uint32_t>(reader.header().target_os));
 
     auto* engine = ctx.scan_engine();
     if (engine) {

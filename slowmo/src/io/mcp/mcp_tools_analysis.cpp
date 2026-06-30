@@ -336,9 +336,9 @@ void TenetMcpService::register_analysis_tools() {
     // ── syscall_intercept ─────────────────────────────────────────────────
     register_tool(
         {"syscall_intercept",
-         "Extract iOS system API call parameters (CommonCrypto, "
-         "Security.framework, CryptoKit). Captures key material, "
-         "IV, input/output data from crypto API calls.",
+         "Extract crypto/system API call parameters (auto-selects per platform: "
+         "CommonCrypto/Security.framework on iOS, BoringSSL/OpenSSL on Android). "
+         "Captures key material, IV, input/output data from crypto API calls.",
          {{"type", "object"},
           {"properties", {
               {"capture_bytes", {{"type", "integer"}, {"description", "Bytes per pointer arg"}, {"default", 64}}}

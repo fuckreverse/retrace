@@ -586,6 +586,13 @@ inline size_t objc_raw_record_size(const uint8_t* ptr, uint32_t num_gpr, bool is
 
 PassResult ObjcPass::run(PassContext& ctx) {
     auto& reader  = ctx.reader();
+
+    // ObjC messages only exist on Darwin targets.  Skip on Android/Linux.
+    if (!is_darwin(reader.header().target_os) &&
+        reader.header().target_os != TargetOS::Unknown) {
+        return PassResult::success(ObjcResult{});
+    }
+
     auto& index   = ctx.index();
     auto& memory  = ctx.memory();
     auto& regfile = ctx.regfile();

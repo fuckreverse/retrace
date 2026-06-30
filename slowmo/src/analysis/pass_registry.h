@@ -27,7 +27,7 @@ enum class PassCategory : uint8_t {
     Taint,       ///< taint / backward_taint / slice / producer_chain / taint_source_annotation
     Crypto,      ///< pattern / constant_materialization / loop_semantics / algorithm_summary / objc_crypto / symbol_annotation
     Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / literal_search / yara_mem_scan
-    ObjcSyscall, ///< objc / syscall_intercept
+    PlatformApi,  ///< objc / syscall_intercept
     Profile,     ///< trace_fold / reg_timeline / call_context / window_stats / cache_sim / trace_diff / dataflow_graph
     Misc,        ///< thread / thread_filter
 };

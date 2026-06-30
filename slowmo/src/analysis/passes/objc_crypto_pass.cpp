@@ -1,6 +1,7 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/passes/objc_pass.h"
+#include "io/trace_reader.h"
 #include "io/index_builder.h"
 
 #include <fmt/core.h>
@@ -250,6 +251,12 @@ std::string ObjcCryptoResult::to_json() const {
 // ─── ObjcCryptoPass::run ──────────────────────────────────────────────────
 
 PassResult ObjcCryptoPass::run(PassContext& ctx) {
+    // ObjC×Crypto correlation only makes sense on Darwin targets.
+    auto os = ctx.reader().header().target_os;
+    if (!is_darwin(os) && os != TargetOS::Unknown) {
+        return PassResult::success(ObjcCryptoResult{});
+    }
+
     auto& index = ctx.index();
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
