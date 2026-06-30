@@ -55,6 +55,7 @@ tenet_add_test(test_core_register_file     unit/test_core_register_file.cpp)
 tenet_add_test(test_core_instruction_decoder unit/test_core_instruction_decoder.cpp)
 tenet_add_test(test_core_memory_model      unit/test_core_memory_model.cpp)
 tenet_add_test(test_core_breakpoint_engine unit/test_core_breakpoint_engine.cpp)
+tenet_add_test(test_gui_metal_ownership    unit/test_gui_metal_ownership.cpp)
 
 # ─── Unit tests: analysis passes ────────────────────────────────────────────
 tenet_add_test(test_pass_xref              unit/test_pass_xref.cpp)

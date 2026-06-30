@@ -227,6 +227,12 @@ public:
     /// Returns the number of entries deleted.
     size_t delete_all_pass_blobs();
 
+    /// Return the absolute filesystem path where a pass blob would be stored.
+    /// Useful when a pass wants to write an uncompressed side-car file to the
+    /// same directory without going through save_pass_blob's zstd compressor.
+    /// Returns an empty path if the index has no db_path.
+    std::filesystem::path pass_blob_file_path(std::string_view pass_name) const;
+
 private:
     TraceIndex() = default;
 

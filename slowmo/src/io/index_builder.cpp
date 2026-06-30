@@ -2366,4 +2366,15 @@ size_t TraceIndex::delete_all_pass_blobs() {
     return count;
 }
 
+std::filesystem::path TraceIndex::pass_blob_file_path(std::string_view pass_name) const {
+    if (db_path_.empty()) return {};
+    // Ensure the pass_cache directory exists before returning the path,
+    // so callers can immediately open the file for writing.
+    auto dir = pass_cache_dir(db_path_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+    return pass_blob_path(db_path_, pass_name);
+}
+
 }  // namespace tenet

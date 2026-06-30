@@ -81,18 +81,11 @@ bool GuiApp::init_sdl() {
         return false;
     }
 
-    // Create Metal renderer (SDL3 manages the Metal layer and command encoder)
-    renderer_ = SDL_CreateRenderer(window_, "metal");
-    if (!renderer_) {
-        fmt::print(stderr, "SDL_CreateRenderer failed: {}\n", SDL_GetError());
+    metal_view_ = SDL_Metal_CreateView(window_);
+    if (!metal_view_) {
+        fmt::print(stderr, "SDL_Metal_CreateView failed: {}\n", SDL_GetError());
         return false;
     }
-
-    // Enable VSync to cap frame rate at display refresh rate.
-    // Without this the render loop runs unbounded, causing Metal to allocate
-    // hundreds of 128 MB IOAccelerator buffers (command buffers pile up faster
-    // than the GPU can retire them), leading to 30+ GB memory bloat.
-    SDL_SetRenderVSync(renderer_, 1);
 
     // Get DPI scale
     dpi_scale_ = SDL_GetWindowDisplayScale(window_);
@@ -123,27 +116,33 @@ bool GuiApp::init_imgui() {
     // Setup platform/renderer backends
     ImGui_ImplSDL3_InitForMetal(window_);
 
-    // Get CAMetalLayer from SDL renderer and init ImGui Metal backend
-    CAMetalLayer* layer = (__bridge CAMetalLayer*)SDL_GetRenderMetalLayer(renderer_);
-    if (!layer) {
-        fmt::print(stderr, "Failed to get CAMetalLayer from SDL renderer\n");
+    // Get CAMetalLayer from the explicit SDL metal view and keep ownership local
+    // to GuiApp instead of mixing SDL's Metal renderer with our own command queue.
+    metal_layer_ = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(metal_view_);
+    if (!metal_layer_) {
+        fmt::print(stderr, "Failed to get CAMetalLayer from SDL_MetalView\n");
         return false;
     }
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metal_layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+    metal_device_ = MTLCreateSystemDefaultDevice();
+    if (!metal_device_) {
+        fmt::print(stderr, "MTLCreateSystemDefaultDevice failed\n");
+        return false;
+    }
+    metal_layer_.device = metal_device_;
 
     // Keep the default maximumDrawableCount (3) to match kMaxInflightFrames.
     // Apple recommends aligning these values — the semaphore count should equal
     // the drawable count to avoid one throttle mechanism shadowing the other.
 
-    // Ensure the layer syncs to display refresh (belt-and-suspenders with
-    // SDL_SetRenderVSync above — SDL may not always propagate vsync to the
-    // underlying CAMetalLayer on all driver versions).
-    layer.displaySyncEnabled = YES;
+    // Ensure the layer syncs to display refresh so we do not outrun the GPU.
+    metal_layer_.displaySyncEnabled = YES;
 
-    ImGui_ImplMetal_Init(layer.device);
+    ImGui_ImplMetal_Init(metal_device_);
 
-    // Create our own command queue for ImGui rendering
-    metal_command_queue_ = [layer.device newCommandQueue];
+    // Create our own command queue for ImGui rendering.
+    metal_command_queue_ = [metal_device_ newCommandQueue];
     metal_render_pass_desc_ = [MTLRenderPassDescriptor new];
 
     // Create the in-flight frame semaphore (triple buffering).
@@ -338,9 +337,13 @@ void GuiApp::shutdown() {
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 
-    if (renderer_) {
-        SDL_DestroyRenderer(renderer_);
-        renderer_ = nullptr;
+    metal_render_pass_desc_ = nil;
+    metal_command_queue_ = nil;
+    metal_layer_ = nil;
+    metal_device_ = nil;
+    if (metal_view_) {
+        SDL_Metal_DestroyView(metal_view_);
+        metal_view_ = nullptr;
     }
     if (window_) {
         SDL_DestroyWindow(window_);
@@ -1432,6 +1435,15 @@ int GuiApp::run() {
     // macOS from processing AppKit events and delays the menu bar appearance.
 
     while (running_) {
+        // ─── 0. Per-frame autorelease pool ──────────────────────────
+        // SDL3's SDL_PollEvent() calls Cocoa's nextEventMatchingMask: which
+        // creates autorelease ObjC objects (NSCGEventBuffer, NSEvent, etc.)
+        // every mouse/keyboard event.  Without a local pool these accumulate
+        // indefinitely — SDL3 Issue #14256.  The inner @autoreleasepool around
+        // Metal rendering (below) does NOT cover SDL event polling, so we add
+        // an outer pool spanning the entire loop iteration.
+        @autoreleasepool {
+
         // ─── 1. Poll SDL events ─────────────────────────────────────
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -1527,23 +1539,39 @@ int GuiApp::run() {
             apply_pending_results();
         }
 
+        // ─── 2.5. Rebuild fonts if needed (must happen BEFORE acquiring
+        //         the drawable / creating the render encoder).
+        // ImGui_ImplMetal_DestroyFontsTexture() enqueues GPU work and must
+        // not be called while a render pass is already open.  Doing it here
+        // — before dispatch_semaphore_wait — guarantees no render pass is
+        // in flight when the old texture is destroyed.
+        if (settings_font_dirty_) {
+            rebuild_fonts();
+            settings_font_dirty_ = false;
+        }
+
         // ─── 2. Acquire Metal drawable and begin render pass ─────────
+        // The entire Metal rendering block (semaphore wait → drawable acquire
+        // → submit → commit) is wrapped in a SINGLE @autoreleasepool.
+        // This ensures the CAMetalDrawable (and its backing texture) are
+        // released immediately at the end of the block — not delayed until
+        // the outer per-frame pool drains.  Holding a drawable too long
+        // prevents Metal from reusing it and causes unbounded VRAM growth.
+        @autoreleasepool {
+
         // Throttle: wait until the GPU has finished one of the in-flight
         // frames before submitting another.  This caps memory usage to
         // kMaxInflightFrames worth of GPU resources (~a few hundred MB)
         // instead of letting hundreds of command buffers pile up (30+ GB).
         dispatch_semaphore_wait(frame_semaphore_, DISPATCH_TIME_FOREVER);
 
-        @autoreleasepool {
-            CAMetalLayer* layer = (__bridge CAMetalLayer*)SDL_GetRenderMetalLayer(renderer_);
-            id<CAMetalDrawable> drawable = [layer nextDrawable];
-            if (!drawable) {
-                // No drawable available — signal semaphore back so we don't
-                // permanently consume a slot, then retry next iteration.
-                dispatch_semaphore_signal(frame_semaphore_);
-                continue;
-            }
-
+        id<CAMetalDrawable> drawable = [metal_layer_ nextDrawable];
+        if (!drawable) {
+            // No drawable available — signal semaphore back so we don't
+            // permanently consume a slot, then retry next iteration.
+            dispatch_semaphore_signal(frame_semaphore_);
+            // Pool drains here — no drawable was retained.
+        } else {
             // Configure render pass descriptor
             metal_render_pass_desc_.colorAttachments[0].texture = drawable.texture;
             metal_render_pass_desc_.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1553,15 +1581,6 @@ int GuiApp::run() {
             id<MTLCommandBuffer> commandBuffer = [metal_command_queue_ commandBuffer];
             id<MTLRenderCommandEncoder> renderEncoder =
                 [commandBuffer renderCommandEncoderWithDescriptor:metal_render_pass_desc_];
-
-            // ─── 2.5. Rebuild fonts if needed (must happen before NewFrame) ──
-            // Font rebuilding is deferred here from render_settings_window()
-            // because calling rebuild_fonts() mid-frame destroys the active ImFont,
-            // causing SIGSEGV in subsequent ImGui text rendering calls.
-            if (settings_font_dirty_) {
-                rebuild_fonts();
-                settings_font_dirty_ = false;
-            }
 
             // ─── 3. Start ImGui frame ────────────────────────────────
             ImGui_ImplMetal_NewFrame(metal_render_pass_desc_);
@@ -1589,7 +1608,22 @@ int GuiApp::run() {
             }];
 
             [commandBuffer commit];
+
+            // ─── 7. Release the drawable texture reference immediately ──
+            // metal_render_pass_desc_ is a long-lived GuiApp member.  Its
+            // colorAttachments[0].texture property holds a strong ARC reference
+            // to the drawable's backing texture.  If we leave it set, the
+            // drawable cannot be returned to Metal's reuse pool until the next
+            // frame overwrites it — effectively keeping TWO drawables live at
+            // all times instead of one, doubling peak VRAM pressure.
+            // Clearing to nil here releases the reference immediately after
+            // commit, allowing Metal to recycle the drawable right away.
+            metal_render_pass_desc_.colorAttachments[0].texture = nil;
         }
+
+        } // @autoreleasepool (Metal rendering — drawable released here)
+
+        } // @autoreleasepool (outer per-frame pool — SDL event ObjC objects)
     }
 
     return 0;

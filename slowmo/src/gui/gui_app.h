@@ -21,6 +21,7 @@
 #include "io/mcp/mcp_server.h"
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_metal.h>
 #include <imgui.h>
 
 #ifdef __OBJC__
@@ -91,7 +92,7 @@ private:
 
     // ─── SDL / ImGui state ────────────────────────────────────────────
     SDL_Window* window_ = nullptr;
-    SDL_Renderer* renderer_ = nullptr;
+    SDL_MetalView metal_view_ = nullptr;
     bool running_ = true;
     float dpi_scale_ = 1.0f;
     bool first_frame_ = true;  // Used to set up default dock layout
@@ -120,9 +121,13 @@ private:
 
     // ─── Metal rendering state ──────────────────────────────────────
 #ifdef __OBJC__
+    id<MTLDevice> metal_device_ = nil;
+    CAMetalLayer* metal_layer_ = nil;
     id<MTLCommandQueue> metal_command_queue_ = nil;
     MTLRenderPassDescriptor* metal_render_pass_desc_ = nil;
 #else
+    void* metal_device_ = nullptr;
+    void* metal_layer_ = nullptr;
     void* metal_command_queue_ = nullptr;
     void* metal_render_pass_desc_ = nullptr;
 #endif
