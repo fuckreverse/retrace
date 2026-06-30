@@ -203,78 +203,349 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
 
 } // anonymous namespace
 
-// ─── XrefResult serialization helpers ────────────────────────────────────────
+// ─── XrefBitmapLoader implementation ─────────────────────────────────────────
 //
-// Blob format (little-endian unless noted):
-//   u32  magic         = 0x58524546 ("XREF")
-//   u32  version       = 1
+// xref_bitmaps.bin format (little-endian, UNCOMPRESSED, random-access):
+//
+//  Header (28 bytes):
+//   u32  magic         = 0x58524249 ("XRBI")
+//   u32  version       = 2
 //   u64  total_indexed
-//   u64  unique_pc_count
+//   u64  unique_pc_count   (= num_entries)
 //   u64  num_entries
-//   for each entry:
+//
+//  Offset Table (num_entries × 24 bytes, sorted by pc ASC):
+//   for each entry i:
 //     u64  pc
 //     u64  exec_count
-//     u64  bitmap_bytes          (portable Roaring64Map size)
-//     u8[] bitmap_data[bitmap_bytes]
+//     u64  bitmap_offset    (absolute byte offset in file where bitmap_bytes field starts)
 //
-// Roaring64Map portable serialisation is endian-safe and cross-platform.
+//  Bitmap Data (variable):
+//   for each entry (in same order as offset table):
+//     u64  bitmap_bytes
+//     u8[] bitmap_data[bitmap_bytes]   (Roaring64Map portable format)
+//
+// The offset table enables O(log N) lookup by PC (binary search), then a
+// single fseek + fread loads exactly one bitmap.  The file is uncompressed
+// so fseek into the middle works without decompressing the whole file.
+
+static constexpr uint32_t XRBI_MAGIC   = 0x58524249u;  // "XRBI"
+static constexpr uint32_t XRBI_VERSION = 2u;
+
+// Lightweight header-only blob stored via save_pass_blob (zstd-compressed).
+// Contains everything needed to reconstruct XrefResult except the bitmaps.
+//
+//  u32  magic         = 0x58524548 ("XREH")
+//  u32  version       = 1
+//  u64  total_indexed
+//  u64  unique_pc_count
+//  u64  num_entries
+//  for each entry:
+//    u64  pc
+//    u64  exec_count
+static constexpr uint32_t XREH_MAGIC   = 0x58524548u;  // "XREH"
+static constexpr uint32_t XREH_VERSION = 1u;
+
+// Legacy v1 blob format (used for backward compat detection).
+static constexpr uint32_t XREF_BLOB_MAGIC_V1   = 0x58524546u;  // "XREF"
+static constexpr uint32_t XREF_BLOB_VERSION_V1 = 1u;
+
+// ─── XrefBitmapLoader ────────────────────────────────────────────────────────
+
+bool XrefBitmapLoader::open(const std::filesystem::path& p) {
+    path = p;
+    valid = false;
+    table.clear();
+
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    // Read header
+    uint32_t magic = 0, version = 0;
+    uint64_t total_indexed = 0, unique_pc_count = 0, num_entries = 0;
+    if (std::fread(&magic,          4, 1, f) != 1 || magic   != XRBI_MAGIC)   { std::fclose(f); return false; }
+    if (std::fread(&version,        4, 1, f) != 1 || version != XRBI_VERSION)  { std::fclose(f); return false; }
+    if (std::fread(&total_indexed,  8, 1, f) != 1) { std::fclose(f); return false; }
+    if (std::fread(&unique_pc_count,8, 1, f) != 1) { std::fclose(f); return false; }
+    if (std::fread(&num_entries,    8, 1, f) != 1) { std::fclose(f); return false; }
+
+    // Read offset table
+    table.resize(static_cast<size_t>(num_entries));
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        if (std::fread(&table[i].pc,            8, 1, f) != 1) { std::fclose(f); table.clear(); return false; }
+        if (std::fread(&table[i].exec_count,    8, 1, f) != 1) { std::fclose(f); table.clear(); return false; }
+        if (std::fread(&table[i].bitmap_offset, 8, 1, f) != 1) { std::fclose(f); table.clear(); return false; }
+    }
+    std::fclose(f);
+
+    // Keep file open for later bitmap reads
+    valid = true;
+    return true;
+}
+
+FILE* XrefBitmapLoader::ensure_open() const {
+    if (!file_) {
+        file_ = std::fopen(path.c_str(), "rb");
+    }
+    return file_;
+}
+
+std::vector<uint64_t> XrefBitmapLoader::load_inst_ids(uint64_t pc) const {
+    if (!valid) return {};
+    // Binary search in offset table
+    auto it = std::lower_bound(table.begin(), table.end(), pc,
+        [](const Entry& e, uint64_t v){ return e.pc < v; });
+    if (it == table.end() || it->pc != pc) return {};
+
+    std::lock_guard<std::mutex> lk(file_mutex_);
+    FILE* f = ensure_open();
+    if (!f) return {};
+
+    // Seek to bitmap_bytes field
+    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0) return {};
+
+    uint64_t bm_bytes = 0;
+    if (std::fread(&bm_bytes, 8, 1, f) != 1 || bm_bytes == 0) return {};
+
+    std::vector<char> buf(static_cast<size_t>(bm_bytes));
+    if (std::fread(buf.data(), 1, buf.size(), f) != buf.size()) return {};
+
+    roaring::Roaring64Map bm = roaring::Roaring64Map::readSafe(buf.data(), buf.size());
+    std::vector<uint64_t> result;
+    result.reserve(static_cast<size_t>(bm.cardinality()));
+    for (uint64_t id : bm) result.push_back(id);
+    return result;
+}
+
+roaring::Roaring64Map XrefBitmapLoader::load_bitmap(uint64_t pc) const {
+    if (!valid) return {};
+    auto it = std::lower_bound(table.begin(), table.end(), pc,
+        [](const Entry& e, uint64_t v){ return e.pc < v; });
+    if (it == table.end() || it->pc != pc) return {};
+
+    std::lock_guard<std::mutex> lk(file_mutex_);
+    FILE* f = ensure_open();
+    if (!f) return {};
+
+    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0) return {};
+
+    uint64_t bm_bytes = 0;
+    if (std::fread(&bm_bytes, 8, 1, f) != 1 || bm_bytes == 0) return {};
+
+    std::vector<char> buf(static_cast<size_t>(bm_bytes));
+    if (std::fread(buf.data(), 1, buf.size(), f) != buf.size()) return {};
+
+    return roaring::Roaring64Map::readSafe(buf.data(), buf.size());
+}
+
+uint64_t XrefBitmapLoader::exec_count(uint64_t pc) const {
+    if (!valid) return 0;
+    auto it = std::lower_bound(table.begin(), table.end(), pc,
+        [](const Entry& e, uint64_t v){ return e.pc < v; });
+    if (it == table.end() || it->pc != pc) return 0;
+    return it->exec_count;
+}
+
+// ─── XrefResult::inst_ids_at / bitmap_at ─────────────────────────────────────
+
+std::vector<uint64_t> XrefResult::inst_ids_at(uint64_t pc) const {
+    // Fast path: in-memory map (partial traces or freshly computed)
+    if (!pc_to_inst_ids.empty()) {
+        auto it = pc_to_inst_ids.find(pc);
+        if (it == pc_to_inst_ids.end()) return {};
+        std::vector<uint64_t> result;
+        result.reserve(static_cast<size_t>(it->second.cardinality()));
+        for (auto val : it->second) result.push_back(val);
+        return result;
+    }
+    // Lazy path: read from file
+    if (lazy_loader && lazy_loader->valid) {
+        return lazy_loader->load_inst_ids(pc);
+    }
+    return {};
+}
+
+roaring::Roaring64Map XrefResult::bitmap_at(uint64_t pc) const {
+    if (!pc_to_inst_ids.empty()) {
+        auto it = pc_to_inst_ids.find(pc);
+        if (it == pc_to_inst_ids.end()) return {};
+        return it->second;  // copy
+    }
+    if (lazy_loader && lazy_loader->valid) {
+        return lazy_loader->load_bitmap(pc);
+    }
+    return {};
+}
+
+// ─── Serialization helpers ────────────────────────────────────────────────────
 
 namespace {
 
-static constexpr uint32_t XREF_BLOB_MAGIC   = 0x58524546u;  // "XREF"
-static constexpr uint32_t XREF_BLOB_VERSION = 1u;
+/// Write the xref_bitmaps.bin file (random-access, uncompressed).
+/// Returns the path to the written file.
+bool xref_write_bitmaps_file(
+    const std::filesystem::path& bitmaps_path,
+    const XrefResult& res)
+{
+    // Sort PCs for deterministic binary-search in the offset table
+    std::vector<uint64_t> sorted_pcs;
+    sorted_pcs.reserve(res.pc_to_inst_ids.size());
+    for (const auto& [pc, _] : res.pc_to_inst_ids) sorted_pcs.push_back(pc);
+    std::sort(sorted_pcs.begin(), sorted_pcs.end());
 
-/// Serialise an XrefResult into a byte buffer.
-std::string xref_serialize(const XrefResult& res) {
-    // ── compute total size first (one-pass) ───────────────────────────────
-    size_t total = 4 + 4 + 8 + 8 + 8;  // header
-    for (const auto& [pc, bm] : res.pc_to_inst_ids) {
-        total += 8 + 8 + 8 + bm.getSizeInBytes(true);
+    const uint64_t num_entries = sorted_pcs.size();
+
+    // ── Compute offset table ──────────────────────────────────────────────
+    // Header: 4+4+8+8+8 = 32 bytes
+    // Offset table: num_entries * 24 bytes
+    const uint64_t header_size = 32;
+    const uint64_t table_size  = num_entries * 24;
+    const uint64_t data_start  = header_size + table_size;
+
+    // First pass: compute bitmap sizes to fill offset table
+    struct TableEntry { uint64_t pc; uint64_t exec_count; uint64_t bitmap_offset; };
+    std::vector<TableEntry> table(num_entries);
+    uint64_t cur_offset = data_start;
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        const uint64_t pc = sorted_pcs[i];
+        const auto& bm = res.pc_to_inst_ids.at(pc);
+        auto exec_it = res.pc_exec_count.find(pc);
+        table[i].pc            = pc;
+        table[i].exec_count    = (exec_it != res.pc_exec_count.end()) ? exec_it->second : 0;
+        table[i].bitmap_offset = cur_offset;
+        cur_offset += 8 + bm.getSizeInBytes(true);  // u64 bm_bytes + data
     }
 
+    // Write file
+    auto tmp_path = bitmaps_path;
+    tmp_path += ".tmp";
+    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (!f) return false;
+
+    auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto write_u64 = [&](uint64_t v) { std::fwrite(&v, 8, 1, f); };
+
+    // Header
+    write_u32(XRBI_MAGIC);
+    write_u32(XRBI_VERSION);
+    write_u64(res.total_indexed);
+    write_u64(static_cast<uint64_t>(res.unique_pc_count));
+    write_u64(num_entries);
+
+    // Offset table
+    for (const auto& e : table) {
+        write_u64(e.pc);
+        write_u64(e.exec_count);
+        write_u64(e.bitmap_offset);
+    }
+
+    // Bitmap data
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        const auto& bm = res.pc_to_inst_ids.at(sorted_pcs[i]);
+        uint64_t bm_bytes = bm.getSizeInBytes(true);
+        write_u64(bm_bytes);
+        // Write bitmap data via a temporary buffer
+        std::vector<char> bmbuf(static_cast<size_t>(bm_bytes));
+        bm.write(bmbuf.data(), true);
+        std::fwrite(bmbuf.data(), 1, bmbuf.size(), f);
+    }
+
+    std::fflush(f);
+    int ferr = std::ferror(f);
+    std::fclose(f);
+    if (ferr) {
+        std::filesystem::remove(tmp_path);
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, bitmaps_path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+    return true;
+}
+
+/// Serialize the lightweight header (exec_count only, no bitmaps) into a buffer
+/// for storage via save_pass_blob (zstd-compressed).
+std::string xref_serialize_header(const XrefResult& res) {
+    const uint64_t n = res.pc_exec_count.size();
+    // Header: 4+4+8+8+8 = 32 bytes; each entry: 8+8 = 16 bytes
+    size_t total = 32 + n * 16;
     std::string buf(total, '\0');
     char* p = buf.data();
 
     auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
     auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
 
-    write_u32(XREF_BLOB_MAGIC);
-    write_u32(XREF_BLOB_VERSION);
+    write_u32(XREH_MAGIC);
+    write_u32(XREH_VERSION);
     write_u64(res.total_indexed);
     write_u64(static_cast<uint64_t>(res.unique_pc_count));
-    write_u64(static_cast<uint64_t>(res.pc_to_inst_ids.size()));
+    write_u64(n);
 
-    for (const auto& [pc, bm] : res.pc_to_inst_ids) {
-        uint64_t bm_bytes = static_cast<uint64_t>(bm.getSizeInBytes(true));
-        auto exec_it = res.pc_exec_count.find(pc);
-        uint64_t exec_count = (exec_it != res.pc_exec_count.end()) ? exec_it->second : 0;
+    // Sort PCs for deterministic iteration
+    std::vector<uint64_t> sorted_pcs;
+    sorted_pcs.reserve(n);
+    for (const auto& [pc, _] : res.pc_exec_count) sorted_pcs.push_back(pc);
+    std::sort(sorted_pcs.begin(), sorted_pcs.end());
 
+    for (uint64_t pc : sorted_pcs) {
+        auto it = res.pc_exec_count.find(pc);
         write_u64(pc);
-        write_u64(exec_count);
-        write_u64(bm_bytes);
-        bm.write(p, true);
-        p += bm_bytes;
+        write_u64(it != res.pc_exec_count.end() ? it->second : 0);
     }
-
     return buf;
 }
 
-/// Deserialise an XrefResult from a byte buffer.
-/// Returns false on format mismatch.
-bool xref_deserialize(const std::string& blob, XrefResult& out) {
+/// Deserialize the lightweight header blob back into an XrefResult
+/// (only populates pc_exec_count / unique_pc_count / total_indexed).
+bool xref_deserialize_header(const std::string& blob, XrefResult& out) {
+    if (blob.size() < 32) return false;
+    const char* p = blob.data();
+
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+
+    uint32_t magic   = read_u32();
+    uint32_t version = read_u32();
+
+    // Accept both the new XREH format and the legacy XREF v1 format so that
+    // old cache blobs still trigger a graceful fallback to the v1 path.
+    if (magic == XREF_BLOB_MAGIC_V1 && version == XREF_BLOB_VERSION_V1) {
+        // Legacy v1 blob — caller should fall back to full v1 deserialisation.
+        return false;
+    }
+    if (magic != XREH_MAGIC || version != XREH_VERSION) return false;
+
+    out.total_indexed   = read_u64();
+    out.unique_pc_count = static_cast<size_t>(read_u64());
+    uint64_t n_entries  = read_u64();
+
+    if (blob.size() < 32 + n_entries * 16) return false;
+
+    out.pc_exec_count.reserve(static_cast<size_t>(n_entries));
+    for (uint64_t i = 0; i < n_entries; ++i) {
+        uint64_t pc         = read_u64();
+        uint64_t exec_count = read_u64();
+        out.pc_exec_count.emplace(pc, exec_count);
+    }
+    return true;
+}
+
+/// Legacy v1 full deserialisation (in-memory bitmaps).  Used as fallback
+/// when the xref_bitmaps.bin file is missing (e.g. first run after upgrade).
+bool xref_deserialize_v1(const std::string& blob, XrefResult& out) {
     if (blob.size() < 4 + 4 + 8 + 8 + 8) return false;
     const char* p = blob.data();
     const char* end = p + blob.size();
 
-    auto read_u32 = [&]() -> uint32_t {
-        uint32_t v; std::memcpy(&v, p, 4); p += 4; return v;
-    };
-    auto read_u64 = [&]() -> uint64_t {
-        uint64_t v; std::memcpy(&v, p, 8); p += 8; return v;
-    };
+    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
 
-    if (read_u32() != XREF_BLOB_MAGIC)   return false;
-    if (read_u32() != XREF_BLOB_VERSION) return false;
+    if (read_u32() != XREF_BLOB_MAGIC_V1)   return false;
+    if (read_u32() != XREF_BLOB_VERSION_V1) return false;
 
     out.total_indexed   = read_u64();
     out.unique_pc_count = static_cast<size_t>(read_u64());
@@ -289,14 +560,11 @@ bool xref_deserialize(const std::string& blob, XrefResult& out) {
         uint64_t exec_count = read_u64();
         uint64_t bm_bytes   = read_u64();
         if (p + bm_bytes > end) return false;
-
         roaring::Roaring64Map bm = roaring::Roaring64Map::readSafe(p, bm_bytes);
         p += bm_bytes;
-
         out.pc_to_inst_ids.emplace(pc, std::move(bm));
         out.pc_exec_count.emplace(pc, exec_count);
     }
-
     return true;
 }
 
@@ -310,13 +578,41 @@ PassResult XrefPass::run(PassContext& ctx) {
     const auto& range = ctx.range();
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
-    // Only cache the full-trace result (range.is_full_trace()) because partial
-    // ranges are rarely re-run and are cheap (proportionally smaller scan).
+    // We maintain two cache files:
+    //  1. "xref" blob (zstd-compressed): lightweight header — pc_exec_count only.
+    //  2. "xref_bitmaps" file (uncompressed): offset table + bitmap data for
+    //     random-access lazy loading.  This file may be large but is only
+    //     accessed on demand (inst_ids_at calls), never loaded fully into RAM.
     if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("xref", blob)) {
+        std::string header_blob;
+        if (index.load_pass_blob("xref", header_blob)) {
             XrefResult cached;
-            if (xref_deserialize(blob, cached)) {
+            bool header_ok = xref_deserialize_header(header_blob, cached);
+
+            // Try to attach the lazy loader (xref_bitmaps.bin).
+            // If xref_bitmaps.bin exists, we go fully lazy (no in-memory bitmaps).
+            // If not, we fall back to v1 full deserialisation.
+            if (header_ok) {
+                // Load the bitmaps file path from the "xref_bitmaps_path" blob,
+                // which was stored as a tiny string by a previous run.
+                std::string path_blob;
+                if (index.load_pass_blob("xref_bitmaps_path", path_blob) && !path_blob.empty()) {
+                    std::filesystem::path bm_path(path_blob);
+                    auto loader = std::make_shared<XrefBitmapLoader>();
+                    if (loader->open(bm_path)) {
+                        cached.lazy_loader = std::move(loader);
+                        // pc_to_inst_ids stays empty — all bitmap access goes through loader
+                        ctx.progress(1.0f, fmt::format(
+                            "Xref: {} unique PCs, {} instructions (from cache, lazy)",
+                            cached.unique_pc_count, cached.total_indexed));
+                        return PassResult::success(std::move(cached));
+                    }
+                }
+                // bitmaps file missing or corrupt — fall through to recompute
+            }
+
+            // Legacy v1 full blob fallback (old cache from before this change).
+            if (xref_deserialize_v1(header_blob, cached)) {
                 ctx.progress(1.0f, fmt::format(
                     "Xref: {} unique PCs, {} instructions (from cache)",
                     cached.unique_pc_count, cached.total_indexed));
@@ -447,35 +743,33 @@ PassResult XrefPass::run(PassContext& ctx) {
 
     ctx.progress(0.85f, "Xref: building result...");
 
-    // ─── Phase 3: Convert to XrefResult (Roaring64Map wrapper) ────────────
+    // ─── Phase 3: Convert to XrefResult ──────────────────────────────────
+    // Build pc_exec_count + pc_to_inst_ids (needed for serialization).
+    // For full-trace runs we will immediately serialize to disk then drop the
+    // in-memory bitmaps from the returned result to save RAM.
 
     XrefResult result;
-    result.pc_to_inst_ids.reserve(merged.pc_bitmaps.size());
     result.pc_exec_count.reserve(merged.pc_bitmaps.size());
+
+    // We also need pc_to_inst_ids populated for xref_write_bitmaps_file.
+    // Use a temporary Roaring64Map wrapper per PC.
+    result.pc_to_inst_ids.reserve(merged.pc_bitmaps.size());
 
     uint64_t total_indexed = 0;
 
     for (auto& [pc, bm] : merged.pc_bitmaps) {
-        // Run-optimize for better compression and iteration
         roaring64_bitmap_run_optimize(bm);
-
         uint64_t card = roaring64_bitmap_get_cardinality(bm);
         result.pc_exec_count[pc] = card;
         total_indexed += card;
 
-        // Move the C bitmap into a Roaring64Map by serialization roundtrip.
-        // Unfortunately Roaring64Map doesn't expose a "take ownership of C bitmap"
-        // API, so we use addMany with the values.
-        // For large bitmaps, iterate and addMany in chunks.
+        // Build Roaring64Map wrapper from the C bitmap.
         auto& dst_map = result.pc_to_inst_ids[pc];
-
         if (card <= 8192) {
-            // Small bitmap: extract all values and addMany
             std::vector<uint64_t> vals(card);
             roaring64_bitmap_to_uint64_array(bm, vals.data());
             dst_map.addMany(card, vals.data());
         } else {
-            // Large bitmap: iterate in chunks to avoid huge allocation
             constexpr size_t CHUNK = 65536;
             std::vector<uint64_t> chunk_buf(CHUNK);
             roaring64_iterator_t* iter = roaring64_iterator_create(bm);
@@ -486,8 +780,6 @@ PassResult XrefPass::run(PassContext& ctx) {
             }
             roaring64_iterator_free(iter);
         }
-
-        // Run-optimize the final Roaring64Map too
         dst_map.runOptimize();
     }
 
@@ -503,12 +795,48 @@ PassResult XrefPass::run(PassContext& ctx) {
     // Restore madvise
     reader.advise_random();
 
-    // ─── Persist result for future sessions ───────────────────────────────
-    // Only cache full-trace results (same restriction as the load path).
+    // ─── Persist result for future sessions & switch to lazy mode ─────────
+    // For full-trace results:
+    //  1. Write xref_bitmaps.bin (uncompressed, random-access)
+    //  2. Write xref blob (lightweight header — exec_count only, zstd)
+    //  3. Drop pc_to_inst_ids from the returned result; attach lazy_loader instead.
+    //
+    // This means after construction the returned XrefResult uses ~32 MB (exec_count
+    // map only) instead of several GB for a 1.3B-instruction trace.
     if (range.is_full_trace()) {
-        std::string blob = xref_serialize(result);
-        if (!blob.empty()) {
-            index.save_pass_blob("xref", blob.data(), blob.size());
+        ctx.progress(0.95f, "Xref: writing bitmap index to disk...");
+
+        // ── Determine path for xref_bitmaps.bin ────────────────────────────
+        // We piggyback on save_pass_blob to find the pass_cache directory:
+        // write a tiny sentinel to get the directory, then construct the path.
+        // Simpler: write the absolute path of xref_bitmaps.bin into a tiny blob.
+
+        // Write the lightweight header blob (pc_exec_count)
+        std::string header_blob = xref_serialize_header(result);
+        index.save_pass_blob("xref", header_blob.data(), header_blob.size());
+
+        // Derive the bitmaps file path via the newly-added pass_blob_file_path()
+        // helper, which returns <db_path>/pass_cache/xref_bitmaps.bin.
+        std::filesystem::path bm_path = index.pass_blob_file_path("xref_bitmaps");
+        if (!bm_path.empty()) {
+            if (xref_write_bitmaps_file(bm_path, result)) {
+                // Store the path so the loader can find it after restart.
+                std::string path_str = bm_path.string();
+                index.save_pass_blob("xref_bitmaps_path",
+                                     path_str.data(), path_str.size());
+
+                // Attach lazy loader and drop in-memory bitmaps.
+                auto loader = std::make_shared<XrefBitmapLoader>();
+                if (loader->open(bm_path)) {
+                    result.lazy_loader = std::move(loader);
+                    // Clear the in-memory bitmap map — all future access goes
+                    // through lazy_loader.  This is the memory-saving step.
+                    { decltype(result.pc_to_inst_ids) empty; empty.swap(result.pc_to_inst_ids); }
+                }
+            } else {
+                // Failed to write bitmaps file — keep in-memory bitmaps.
+                // pc_to_inst_ids remains populated (fallback to full RAM).
+            }
         }
     }
 

@@ -9,13 +9,81 @@
 #include <roaring/roaring64.h>
 #include <ankerl/unordered_dense.h>
 
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <cstdio>
+
 namespace tenet {
+
+// ─── Xref lazy bitmap loader ──────────────────────────────────────────────
+//
+// xref_bitmaps.bin format (little-endian, uncompressed):
+//   u32  magic         = 0x58524249 ("XRBI")
+//   u32  version       = 2
+//   u64  num_entries
+//   -- Offset Table (num_entries entries, fixed 24 bytes each) --
+//   for each entry:
+//     u64  pc
+//     u64  exec_count
+//     u64  bitmap_offset   (byte offset from start-of-file to bitmap_bytes field)
+//   -- Bitmap Data --
+//   for each entry (in same order as offset table):
+//     u64  bitmap_bytes
+//     u8[] bitmap_data[bitmap_bytes]
+//
+// The offset table enables O(1) lookup: binary-search by PC, then fseek to
+// bitmap_offset and read exactly that bitmap.  No decompression needed.
+// The file is written once at analysis time; subsequent runs load from it.
+
+struct XrefBitmapLoader {
+    // Offset table entry (24 bytes, packed)
+    struct Entry {
+        uint64_t pc;
+        uint64_t exec_count;
+        uint64_t bitmap_offset;  // byte offset of the u64 bitmap_bytes field
+    };
+
+    std::filesystem::path  path;          // xref_bitmaps.bin path
+    std::vector<Entry>     table;         // loaded offset table, sorted by pc
+    bool                   valid = false; // true if file exists and table loaded
+
+    /// Try to open and parse the offset table from the file.
+    /// Does NOT load any bitmap data — just the header + table.
+    bool open(const std::filesystem::path& p);
+
+    /// Load the bitmap for the given PC. Returns empty vector on miss.
+    /// Thread-safe: serialises file reads through an internal mutex.
+    std::vector<uint64_t> load_inst_ids(uint64_t pc) const;
+
+    /// Same as load_inst_ids but loads into a Roaring64Map.
+    roaring::Roaring64Map load_bitmap(uint64_t pc) const;
+
+    /// Find the exec_count for a given PC from the table (no file I/O).
+    uint64_t exec_count(uint64_t pc) const;
+
+private:
+    mutable std::mutex file_mutex_;
+    mutable FILE*      file_ = nullptr;   // kept open for reuse; guarded by file_mutex_
+
+    FILE* ensure_open() const;
+};
 
 // ─── Xref pass result ─────────────────────────────────────────────────────
 
 /// PC → compressed bitmap of inst_ids that executed at that PC.
+///
+/// Memory layout:
+///   - pc_exec_count: always in RAM (~32 MB for large traces)
+///   - pc_to_inst_ids: EMPTY in normal operation; populated only for small/partial traces
+///     or during pass construction (immediately cleared after serialisation)
+///   - lazy_loader: if non-null, inst_ids_at() reads from xref_bitmaps.bin on demand
 struct XrefResult {
-    /// Forward index: PC → compressed bitmap of inst_ids that executed this PC.
+    /// Forward index: PC → compressed bitmap.
+    /// ONLY populated for partial traces (range != full trace) or for in-memory
+    /// passes that haven't been persisted yet.
+    /// For full-trace results loaded from cache, this map is EMPTY; use
+    /// inst_ids_at() which calls through lazy_loader instead.
     ankerl::unordered_dense::map<uint64_t, roaring::Roaring64Map> pc_to_inst_ids;
 
     /// Fast execution count per PC (avoids calling cardinality() on bitmap).
@@ -26,6 +94,9 @@ struct XrefResult {
 
     /// Total inst_ids indexed.
     uint64_t total_indexed = 0;
+
+    /// Lazy loader for full-trace results (non-null = use file-backed storage).
+    std::shared_ptr<XrefBitmapLoader> lazy_loader;
 
     /// How many times was this PC executed?
     uint64_t execution_count(uint64_t pc) const {
@@ -54,17 +125,31 @@ struct XrefResult {
         return entries;
     }
 
-    /// Iterate all inst_ids at a given PC (for backward compat).
-    /// Returns empty vector if PC not found. Use sparingly for large sets.
-    std::vector<uint64_t> inst_ids_at(uint64_t pc) const {
-        auto it = pc_to_inst_ids.find(pc);
-        if (it == pc_to_inst_ids.end()) return {};
-        std::vector<uint64_t> result;
-        result.reserve(it->second.cardinality());
-        for (auto val : it->second) {
-            result.push_back(val);
+    /// Get all inst_ids at a given PC.
+    ///
+    /// For full-trace results (lazy_loader != null):
+    ///   reads from the xref_bitmaps.bin file (a few ms per call, cached).
+    ///
+    /// For small/partial traces (pc_to_inst_ids populated):
+    ///   returns data directly from the in-memory map.
+    ///
+    /// Returns empty vector if PC not found in either store.
+    std::vector<uint64_t> inst_ids_at(uint64_t pc) const;
+
+    /// Load the full bitmap for a PC (same backing store as inst_ids_at).
+    roaring::Roaring64Map bitmap_at(uint64_t pc) const;
+
+    /// Returns true if the bitmap for this PC is available (in-memory or on disk).
+    bool has_bitmap(uint64_t pc) const {
+        if (!pc_to_inst_ids.empty()) return pc_to_inst_ids.count(pc) > 0;
+        if (lazy_loader && lazy_loader->valid) {
+            // Check offset table (no I/O)
+            const auto& tbl = lazy_loader->table;
+            auto it = std::lower_bound(tbl.begin(), tbl.end(), pc,
+                [](const XrefBitmapLoader::Entry& e, uint64_t v){ return e.pc < v; });
+            return it != tbl.end() && it->pc == pc;
         }
-        return result;
+        return false;
     }
 };
 
