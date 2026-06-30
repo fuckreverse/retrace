@@ -302,6 +302,30 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     reader.header_.flags = raw_hdr->flags;
     reader.header_.module_name = std::string(raw_hdr->module_name);
 
+    // ── Target OS: read from header, fall back to heuristic for old traces ──
+    {
+        uint32_t raw_os = raw_hdr->target_os;
+        if (raw_os >= static_cast<uint32_t>(TargetOS::iOS) &&
+            raw_os <= static_cast<uint32_t>(TargetOS::Linux)) {
+            reader.header_.target_os = static_cast<TargetOS>(raw_os);
+        } else {
+            // Heuristic fallback for pre-target_os traces (target_os == 0):
+            // infer from module_name path patterns.
+            const auto& mn = reader.header_.module_name;
+            if (mn.find("/data/") == 0 || mn.find("/system/") == 0 ||
+                mn.find(".so") != std::string::npos) {
+                reader.header_.target_os = TargetOS::Android;
+            } else if (mn.find("/var/") == 0 || mn.find("/private/") == 0 ||
+                       mn.find("/Library/") != std::string::npos ||
+                       mn.find(".dylib") != std::string::npos ||
+                       mn.find(".app/") != std::string::npos) {
+                reader.header_.target_os = TargetOS::iOS;
+            } else {
+                reader.header_.target_os = TargetOS::Unknown;
+            }
+        }
+    }
+
     // ── Handle block-compressed traces (new path) ─────────────────────────
     if (reader.header_.is_block_compressed()) {
 #if TENET_HAS_ZSTD

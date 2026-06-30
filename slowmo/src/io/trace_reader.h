@@ -243,6 +243,32 @@ struct RecordView {
 
 // ─── File header wrapper ──────────────────────────────────────────────────
 
+/// Target OS of the traced process (matches qbditrace_target_os_t).
+enum class TargetOS : uint32_t {
+    Unknown = 0,
+    iOS     = 1,   // iOS / macOS (Darwin)
+    Android = 2,   // Android (Linux kernel, Bionic libc)
+    Linux   = 3,   // Desktop / server Linux
+};
+
+/// Returns a short display string for a TargetOS value.
+inline const char* target_os_name(TargetOS os) {
+    switch (os) {
+        case TargetOS::iOS:     return "iOS";
+        case TargetOS::Android: return "Android";
+        case TargetOS::Linux:   return "Linux";
+        default:                return "Unknown";
+    }
+}
+
+/// Whether the target OS uses Darwin conventions (Mach-O, ObjC, x16 syscall).
+inline bool is_darwin(TargetOS os) { return os == TargetOS::iOS; }
+
+/// Whether the target OS uses Linux conventions (ELF, x8 syscall).
+inline bool is_linux_like(TargetOS os) {
+    return os == TargetOS::Android || os == TargetOS::Linux;
+}
+
 struct FileHeader {
     uint32_t magic;
     uint32_t version;
@@ -254,6 +280,7 @@ struct FileHeader {
     uint64_t trace_end;
     uint64_t flags;
     std::string module_name;
+    TargetOS target_os = TargetOS::Unknown;
 
     bool has_mem() const       { return flags & qbditrace::QBDITRACE_HF_HAS_MEM; }
     bool has_nzcv() const      { return flags & qbditrace::QBDITRACE_HF_HAS_NZCV; }

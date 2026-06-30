@@ -92,6 +92,17 @@ typedef enum {
   QBDITRACE_ARCH_X86_64 = 2,
 } qbditrace_arch_t;
 
+/* Target OS tags — identifies the OS on which the trace was recorded.
+ * Stored in the first 4 bytes of the file header's reserved[] area so that
+ * older readers (which zero-fill reserved[]) silently treat new traces as
+ * QBDITRACE_OS_UNKNOWN. */
+typedef enum {
+  QBDITRACE_OS_UNKNOWN = 0,  /* pre-target_os traces (reserved[] was all zeros) */
+  QBDITRACE_OS_IOS     = 1,  /* iOS / macOS (Darwin kernel) */
+  QBDITRACE_OS_ANDROID = 2,  /* Android (Linux kernel, Bionic libc) */
+  QBDITRACE_OS_LINUX   = 3,  /* Desktop / server Linux */
+} qbditrace_target_os_t;
+
 /*
  * File header. Written once at the start of trace.bin. Contains everything the
  * decoder needs to relocate addresses back to the static (on-disk) image and to
@@ -113,7 +124,8 @@ typedef struct {
   uint64_t trace_end;    /* runtime end address (excluded) of the traced range */
   uint64_t flags;        /* qbditrace_header_flags */
   char module_name[256]; /* NUL-terminated, best-effort module path */
-  uint8_t reserved[224]; /* pad header to 536 bytes for easy hex inspection */
+  uint32_t target_os;    /* qbditrace_target_os_t — 0 for old traces (was reserved[0..3]) */
+  uint8_t reserved[220]; /* pad header to 536 bytes for easy hex inspection */
 } qbditrace_file_header_t;
 
 typedef enum {
@@ -435,13 +447,15 @@ typedef struct {
 } qbditrace_event_head_t;
 
 /* ---- QBDITRACE_REC_SVC ----
- * Emitted just before an `svc #0` executes. Captures the Linux/XNU syscall
- * selector (x16 on Darwin arm64) plus the first six argument registers so the
- * decoder can name the syscall and show its arguments.
+ * Emitted just before an `svc #0` executes. Captures the syscall number plus
+ * the first six argument registers so the decoder can name the syscall and show
+ * its arguments.
+ *   - Darwin arm64: syscall number is in x16.
+ *   - Linux/Android arm64: syscall number is in x8.
  *   u8  kind            (== QBDITRACE_REC_SVC)
  *   u8  reserved[3]
  *   u64 pc              (address of the svc instruction)
- *   u64 syscall_no      (x16)
+ *   u64 syscall_no      (x16 on Darwin, x8 on Linux/Android)
  *   u64 args[6]         (x0..x5)
  */
 typedef struct {
