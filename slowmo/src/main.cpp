@@ -94,6 +94,16 @@ int main(int argc, char** argv) {
          cur_speed = 0.0]
         (uint64_t processed, uint64_t total) mutable {
             if (total == 0) return;
+
+            // Phase 2 sentinel: processed > total means compaction step.
+            // Display "Compacting index (N/3)..." instead of a percentage.
+            if (processed > total) {
+                uint64_t step = processed - total;  // 1, 2, or 3
+                fmt::print(info_out, "\r  Compacting index ({}/3)...   ", step);
+                fflush(info_out);
+                return;
+            }
+
             auto now = std::chrono::steady_clock::now();
             double elapsed_total = std::chrono::duration<double>(now - t_start).count();
             // Update speed every 200ms to avoid flicker
