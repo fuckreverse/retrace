@@ -281,6 +281,22 @@ public:
     rocksdb::ColumnFamilyHandle* mem_write_cf() const { return get_cf(cf::MEM_WRITE); }
     rocksdb::ColumnFamilyHandle* mem_read_cf() const { return get_cf(cf::MEM_READ); }
     rocksdb::ColumnFamilyHandle* code_bytes_cf() const { return get_cf(cf::CODE_BYTES); }
+
+    /// Expose the in-memory anchor table for parallel shard partitioning.
+    /// Each entry stores (inst_id, file_offset) at an ANCHOR boundary.
+    /// Used by MemoryModel::build() to divide the trace into segments with
+    /// pre-known inst_id starting points, enabling parallel scanning.
+    struct AnchorView {
+        uint64_t inst_id;
+        uint64_t file_offset;
+    };
+    size_t anchor_table_size() const { return anchors_.size(); }
+    AnchorView anchor_table_at(size_t i) const {
+        return {anchors_[i].inst_id, anchors_[i].file_offset};
+    }
+
+    /// Return the DB path on disk (used by MemoryModel for SST temp directory).
+    const std::filesystem::path& db_path() const { return db_path_; }
 };
 
 }  // namespace tenet

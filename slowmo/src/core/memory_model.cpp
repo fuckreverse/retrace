@@ -7,12 +7,17 @@
 #include <rocksdb/table.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
+#include <rocksdb/sst_file_writer.h>
 
 #include <algorithm>
 #include <condition_variable>
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+#include <tbb/parallel_sort.h>
+#endif
 
 namespace tenet {
 
@@ -276,224 +281,361 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         return;
     }
 
-    // ─── RocksDB path: store one KV pair per write (not per byte) ─────────
-    // Key: [page BE(8)] [page_offset_of_first_byte BE(2)] [inst_id BE(8)]
-    // Value: [write_size(1)] [raw_data(write_size)]
+    // ─── RocksDB path: parallel SST bulk-load ────────────────────────────
     //
-    // Cross-page writes are split into two KV pairs at the page boundary.
+    // Strategy: divide the trace into shards at ANCHOR boundaries (using the
+    // already-built TraceIndex anchor table), scan each shard in parallel with
+    // independent ThreadReaders, buffer KV entries in flat arrays, sort by key,
+    // write sorted SST files via SstFileWriter, and bulk-ingest via
+    // IngestExternalFile().  This bypasses the MemTable SkipList entirely,
+    // which was the dominant bottleneck (~60% of build time) in the previous
+    // double-buffered WriteBatch approach.
+    //
+    // Key format: [page BE(8)] [page_offset BE(2)] [inst_id BE(8)] = 18 bytes
+    // Value format: [write_size(1)] [raw_data(write_size)]
 
-    // Opt #4: Collect page activity data during build to avoid later full scan.
-    // Pre-size to reduce rehash (typical trace has 10-50K pages).
-    ankerl::unordered_dense::map<uint64_t, PageActivity> build_page_map;
-    build_page_map.reserve(65536);
+    // ── Compact KV entry for buffering + sorting ────────────────────────
+    // 36 bytes per entry: 18B key + 1B val_size + 16B val_data + 1B is_read
+    struct alignas(4) KVEntry {
+        char     key[KEY_SIZE];   // 18 bytes, big-endian encoded
+        uint8_t  val_size;        // 1-16 (number of data bytes in val_data)
+        uint8_t  val_data[16];    // written/read bytes
+        uint8_t  is_read;         // 0 = write (mem_cf_), 1 = read (mem_read_cf_)
+    };
+    static_assert(sizeof(KVEntry) == 36, "KVEntry must be 36 bytes");
 
-    // Use a local write counter to avoid 200M+ atomic fetch_add calls.
-    uint64_t local_writes_persisted = 0;
-
-    // ─── Double-buffered pipeline ─────────────────────────────────────────
-    // Front thread (this): parses trace → fills batch_front
-    // Back thread: writes batch_back to RocksDB
-    // When batch_front is full, swap with batch_back (which has been flushed).
-    // This overlaps RocksDB I/O with trace parsing for ~2x speedup.
-
-    rocksdb::WriteBatch batch_a, batch_b;
-    rocksdb::WriteBatch* batch_front = &batch_a;  // currently being filled
-    rocksdb::WriteBatch* batch_back  = &batch_b;  // being written by bg thread
-    uint64_t inst_id = 0;
-    uint64_t batch_count = 0;
-
-    // Threshold per batch: 2M entries × ~30 bytes ≈ 60MB.
-    static constexpr uint64_t kBatchFlushThreshold = 2'000'000;
-
-    rocksdb::WriteOptions wo;
-    wo.disableWAL = true;
-    wo.no_slowdown = false;
-
-    // Background writer state
-    std::mutex writer_mu;
-    std::condition_variable writer_cv;
-    bool writer_has_work = false;
-    bool writer_done = false;
-    rocksdb::WriteBatch* writer_batch = nullptr;  // batch to write (set by producer)
-
-    std::thread writer_thread([&]() {
-        while (true) {
-            std::unique_lock<std::mutex> lk(writer_mu);
-            writer_cv.wait(lk, [&]{ return writer_has_work || writer_done; });
-            if (writer_done && !writer_has_work) break;
-            rocksdb::WriteBatch* wb = writer_batch;
-            lk.unlock();
-
-            db_->Write(wo, wb);
-            wb->Clear();
-
-            // Signal completion AFTER the write finishes, not before.
-            // This ensures flush_batch()'s wait on !writer_has_work only
-            // returns when the batch is truly safe to reuse.
-            {
-                std::lock_guard<std::mutex> lk2(writer_mu);
-                writer_has_work = false;
-            }
-            writer_cv.notify_one();
-        }
-    });
-
-    // Helper: submit current batch_front to background writer, then swap.
-    auto flush_batch = [&]() {
-        // Wait until writer finishes previous batch_back.
-        {
-            std::unique_lock<std::mutex> lk(writer_mu);
-            writer_cv.wait(lk, [&]{ return !writer_has_work; });
-            writer_batch = batch_front;
-            writer_has_work = true;
-        }
-        writer_cv.notify_one();
-        // Swap: next fill goes into the (now-free) other buffer.
-        std::swap(batch_front, batch_back);
-        batch_count = 0;
+    // ── Shard boundary computation from TraceIndex anchors ──────────────
+    struct ShardBounds {
+        uint64_t file_start;      // inclusive file offset
+        uint64_t file_end;        // exclusive file offset
+        uint64_t inst_id_start;   // known inst_id at shard start
     };
 
-    // Hint the OS to prefetch trace pages sequentially.
+    const size_t num_anchors = index_.anchor_table_size();
+    const uint64_t file_size = reader_.file_size();
+    const uint64_t header_size = sizeof(qbditrace::qbditrace_file_header_t);
+
+    // Determine number of shards: min(hw_threads, 8), need ≥4 anchors/shard.
+    uint32_t hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    uint32_t num_shards = std::min(hw_threads, 8u);
+    if (num_anchors < num_shards * 4) {
+        num_shards = std::max(1u, static_cast<uint32_t>(num_anchors / 4));
+    }
+    if (num_shards == 0) num_shards = 1;
+
+    std::vector<ShardBounds> shard_bounds;
+    if (num_shards == 1 || num_anchors == 0) {
+        shard_bounds.push_back({header_size, file_size, 0});
+        num_shards = 1;
+    } else {
+        size_t anchors_per_shard = num_anchors / num_shards;
+        for (uint32_t s = 0; s < num_shards; s++) {
+            size_t anchor_idx = s * anchors_per_shard;
+            auto anchor = index_.anchor_table_at(anchor_idx);
+            uint64_t fstart = (s == 0) ? header_size : anchor.file_offset;
+            uint64_t fend = (s + 1 < num_shards)
+                ? index_.anchor_table_at((s + 1) * anchors_per_shard).file_offset
+                : file_size;
+            uint64_t id_start = (s == 0) ? 0 : anchor.inst_id;
+            shard_bounds.push_back({fstart, fend, id_start});
+        }
+    }
+
+    LOG_INFO("MemoryModel::build: {} shards, {} anchors", num_shards, num_anchors);
+
+    // ── Per-shard result container ──────────────────────────────────────
+    struct ShardResult {
+        std::vector<KVEntry> write_entries;  // for mem_write CF
+        std::vector<KVEntry> read_entries;   // for mem_read CF
+        ankerl::unordered_dense::map<uint64_t, PageActivity> page_map;
+        uint64_t writes_persisted = 0;
+        uint64_t insts_scanned = 0;
+        std::vector<std::string> write_ssts;
+        std::vector<std::string> read_ssts;
+        std::string error;
+    };
+
+    std::vector<ShardResult> shard_results(num_shards);
+    std::atomic<uint64_t> progress_insts{0};
+
+    // SST temp directory: inside the RocksDB index folder
+    auto sst_dir = std::filesystem::path(db_->GetName()) / "_mem_sst_tmp";
+    std::filesystem::create_directories(sst_dir);
+
+    bool has_read_cf = (mem_read_cf_ != nullptr);
+
+    // ── Shard processor: scan → buffer → sort → SST ────────────────────
+    auto process_shard = [&](uint32_t shard_idx) {
+        auto& result = shard_results[shard_idx];
+        const auto& bounds = shard_bounds[shard_idx];
+
+        result.page_map.reserve(16384);
+
+        // Reserve estimated capacity: ~1.5 mem accesses per instruction,
+        // shard covers (total_insts / num_shards) instructions.
+        uint64_t est_insts = total_insts / num_shards;
+        uint64_t est_entries = est_insts * 2;  // slight overestimate
+        result.write_entries.reserve(est_entries);
+        if (has_read_cf) result.read_entries.reserve(est_entries / 2);
+
+        // Create a thread-local reader for lock-free access.
+        auto thread_reader = reader_.create_thread_reader(8);
+
+        // Create an iterator starting at shard's file offset.
+        auto it = TraceReader::Iterator(&reader_, bounds.file_start, &thread_reader);
+        auto it_end = TraceReader::Iterator(&reader_, bounds.file_end, &thread_reader);
+
+        uint64_t inst_id = bounds.inst_id_start;
+
+        for (; it != it_end; ++it) {
+            auto rec = *it;
+            if (rec.kind != RecordKind::Inst) continue;
+
+            auto inst = rec.as_inst();
+            for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                auto mem = inst.mem_access(m);
+                bool is_write = (mem.type & 0x02) != 0;
+                if (!is_write && !has_read_cf) continue;
+
+                uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
+
+                // Extract data bytes
+                uint8_t all_data[16];
+                std::memcpy(all_data, &mem.value, 8);
+                std::memcpy(all_data + 8, &mem.value_hi, 8);
+
+                uint64_t acc_addr = mem.addr;
+                uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (kPageSize - 1));
+                uint16_t bytes_in_first_page = static_cast<uint16_t>(
+                    std::min<uint64_t>(kPageSize - first_page_offset, total_size));
+
+                // Helper: emit one KV entry + track page activity
+                auto emit_entry = [&](uint64_t page, uint16_t offset,
+                                      const uint8_t* data, uint8_t size, bool is_rd) {
+                    KVEntry e;
+                    encode_key_to(page, offset, inst_id, e.key);
+                    e.val_size = size;
+                    std::memcpy(e.val_data, data, size);
+                    if (size < 16) std::memset(e.val_data + size, 0, 16 - size);
+                    e.is_read = is_rd ? 1 : 0;
+
+                    if (is_rd) {
+                        result.read_entries.push_back(e);
+                    } else {
+                        result.write_entries.push_back(e);
+                    }
+
+                    // Track page activity
+                    auto [it_pa, inserted] = result.page_map.try_emplace(page, PageActivity{});
+                    auto& pa = it_pa->second;
+                    if (inserted) {
+                        pa.page_addr = page << kPageShift;
+                        pa.first_inst_id = inst_id;
+                        pa.last_inst_id = inst_id;
+                        pa.write_count = 0;
+                        pa.read_count = 0;
+                    } else {
+                        pa.last_inst_id = inst_id;
+                    }
+                    if (is_rd) pa.read_count++;
+                    else pa.write_count++;
+                };
+
+                // First (possibly only) page
+                emit_entry(page_of(acc_addr), first_page_offset,
+                           all_data, bytes_in_first_page, !is_write);
+
+                // Second page (cross-page boundary — rare)
+                if (__builtin_expect(bytes_in_first_page < total_size, 0)) {
+                    uint8_t remaining = total_size - bytes_in_first_page;
+                    emit_entry(page_of(acc_addr + bytes_in_first_page), 0,
+                               all_data + bytes_in_first_page, remaining, !is_write);
+                }
+
+                if (is_write) result.writes_persisted++;
+            }
+
+            inst_id++;
+            result.insts_scanned++;
+
+            if ((inst_id & 0xFFFFF) == 0) {
+                progress_insts.fetch_add(0x100000, std::memory_order_relaxed);
+            }
+        }
+        // Flush residual progress
+        progress_insts.fetch_add(result.insts_scanned & 0xFFFFF, std::memory_order_relaxed);
+
+        // ── Sort entries by key (required by SstFileWriter) ─────────────
+        auto key_less = [](const KVEntry& a, const KVEntry& b) noexcept {
+            return std::memcmp(a.key, b.key, KEY_SIZE) < 0;
+        };
+
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+        tbb::parallel_sort(result.write_entries.begin(), result.write_entries.end(), key_less);
+        if (!result.read_entries.empty())
+            tbb::parallel_sort(result.read_entries.begin(), result.read_entries.end(), key_less);
+#else
+        std::sort(result.write_entries.begin(), result.write_entries.end(), key_less);
+        if (!result.read_entries.empty())
+            std::sort(result.read_entries.begin(), result.read_entries.end(), key_less);
+#endif
+
+        // ── Write sorted SST files ──────────────────────────────────────
+        auto write_sst = [&](const std::vector<KVEntry>& entries,
+                             const char* tag,
+                             std::vector<std::string>& out_ssts) -> rocksdb::Status {
+            if (entries.empty()) return rocksdb::Status::OK();
+
+            rocksdb::Options sst_opts;
+            sst_opts.compression = rocksdb::kLZ4Compression;
+            rocksdb::SstFileWriter writer(rocksdb::EnvOptions(), sst_opts);
+
+            auto path = sst_dir / (std::string(tag) + "_s"
+                        + std::to_string(shard_idx) + ".sst");
+            auto s = writer.Open(path.string());
+            if (!s.ok()) return s;
+
+            for (const auto& e : entries) {
+                // Value: [val_size(1)] [val_data(val_size)]
+                uint8_t val_buf[17];
+                val_buf[0] = e.val_size;
+                std::memcpy(val_buf + 1, e.val_data, e.val_size);
+
+                s = writer.Put(
+                    rocksdb::Slice(e.key, KEY_SIZE),
+                    rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
+                                   1 + e.val_size));
+                if (!s.ok()) return s;
+            }
+
+            s = writer.Finish();
+            if (s.ok()) out_ssts.push_back(path.string());
+            return s;
+        };
+
+        auto s = write_sst(result.write_entries, "memw", result.write_ssts);
+        if (!s.ok()) { result.error = s.ToString(); return; }
+
+        s = write_sst(result.read_entries, "memr", result.read_ssts);
+        if (!s.ok()) { result.error = s.ToString(); return; }
+
+        // Free entry buffers now that SSTs are written.
+        { std::vector<KVEntry>().swap(result.write_entries); }
+        { std::vector<KVEntry>().swap(result.read_entries); }
+
+        LOG_DEBUG("MemoryModel shard {}: {} insts, {} writes, {} write SSTs, {} read SSTs",
+                  shard_idx, result.insts_scanned, result.writes_persisted,
+                  result.write_ssts.size(), result.read_ssts.size());
+    };
+
+    // ── Launch parallel shards ──────────────────────────────────────────
+    reader_.pin_all();  // prevent LRU eviction during parallel scans
     reader_.advise_sequential();
 
-    for (auto it = reader_.begin(); it != reader_.end(); ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;  // skip non-INST early
-
-        auto inst = rec.as_inst();
-        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-            auto mem = inst.mem_access(m);
-            bool is_write = (mem.type & 0x02) != 0;
-            // Route writes to mem_write CF, reads to mem_read CF.
-            rocksdb::ColumnFamilyHandle* target_cf = is_write ? mem_cf_ : mem_read_cf_;
-            if (!target_cf) continue;  // skip reads when mem_read CF absent
-
-            uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
-
-            // Extract all data bytes (branchless: always copy full 16 bytes)
-            uint8_t all_data[16];
-            std::memcpy(all_data, &mem.value, 8);
-            std::memcpy(all_data + 8, &mem.value_hi, 8);
-
-            uint64_t acc_addr = mem.addr;
-            uint16_t first_page_offset = static_cast<uint16_t>(acc_addr & (kPageSize - 1));
-
-            // Check if access crosses a page boundary
-            uint16_t bytes_in_first_page = static_cast<uint16_t>(
-                std::min<uint64_t>(kPageSize - first_page_offset, total_size));
-
-            // First (possibly only) KV pair: bytes in the first page
-            {
-                uint64_t page = page_of(acc_addr);
-                char key_buf[KEY_SIZE];
-                auto key = encode_key_to(page, first_page_offset, inst_id, key_buf);
-
-                // Value: [size(1)] [data(size)]
-                uint8_t val_buf[17]; // max 1 + 16
-                val_buf[0] = bytes_in_first_page;
-                std::memcpy(val_buf + 1, all_data, bytes_in_first_page);
-
-                batch_front->Put(target_cf, key,
-                                 rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
-                                                1 + bytes_in_first_page));
-                batch_count++;
-
-                // Track page activity
-                auto [it_pa, inserted] = build_page_map.try_emplace(page, PageActivity{});
-                auto& pa = it_pa->second;
-                if (inserted) {
-                    pa.page_addr = page << kPageShift;
-                    pa.first_inst_id = inst_id;
-                    pa.last_inst_id = inst_id;
-                    pa.write_count = 0;
-                    pa.read_count = 0;
-                } else {
-                    pa.last_inst_id = inst_id;
-                }
-                if (is_write) pa.write_count++;
-                else pa.read_count++;
-            }
-
-            // Second KV pair (if access crosses page boundary — rare)
-            if (__builtin_expect(bytes_in_first_page < total_size, 0)) {
-                uint8_t remaining = total_size - bytes_in_first_page;
-                uint64_t second_page_addr = acc_addr + bytes_in_first_page;
-                uint64_t second_page = page_of(second_page_addr);
-                uint16_t second_offset = 0;
-
-                char key_buf2[KEY_SIZE];
-                auto key2 = encode_key_to(second_page, second_offset, inst_id, key_buf2);
-
-                uint8_t val_buf2[17];
-                val_buf2[0] = remaining;
-                std::memcpy(val_buf2 + 1, all_data + bytes_in_first_page, remaining);
-
-                batch_front->Put(target_cf, key2,
-                                 rocksdb::Slice(reinterpret_cast<const char*>(val_buf2),
-                                                1 + remaining));
-                batch_count++;
-
-                // Track page activity for second page
-                auto [it_pa2, ins2] = build_page_map.try_emplace(second_page, PageActivity{});
-                auto& pa2 = it_pa2->second;
-                if (ins2) {
-                    pa2.page_addr = second_page << kPageShift;
-                    pa2.first_inst_id = inst_id;
-                    pa2.last_inst_id = inst_id;
-                    pa2.write_count = 0;
-                    pa2.read_count = 0;
-                } else {
-                    pa2.last_inst_id = inst_id;
-                }
-                if (is_write) pa2.write_count++;
-                else pa2.read_count++;
-            }
-
-            if (is_write) {
-                local_writes_persisted++;
-            }
+    if (num_shards == 1) {
+        process_shard(0);
+        if (progress_fn) progress_fn(total_insts, total_insts);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(num_shards);
+        for (uint32_t s = 0; s < num_shards; s++) {
+            workers.emplace_back([&, s]() { process_shard(s); });
         }
-
-        // Flush batch to background writer when threshold reached
-        if (batch_count >= kBatchFlushThreshold) {
-            flush_batch();
+        // Progress reporting while workers run
+        if (progress_fn) {
+            while (progress_insts.load(std::memory_order_relaxed) < total_insts) {
+                uint64_t done = progress_insts.load(std::memory_order_relaxed);
+                progress_fn(done, total_insts);
+                LOG_INFO("MemoryModel::build (parallel): {}/{}  ({:.0f}%)",
+                         done, total_insts,
+                         100.0 * static_cast<double>(done) / static_cast<double>(total_insts));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            progress_fn(total_insts, total_insts);
         }
+        for (auto& w : workers) w.join();
+    }
 
-        inst_id++;
-        if ((inst_id & 0xFFFFF) == 0) {  // every ~1M instructions
-            LOG_INFO("MemoryModel::build (RocksDB): {}/{}  ({:.0f}%)",
-                     inst_id, total_insts,
-                     100.0 * static_cast<double>(inst_id) / static_cast<double>(total_insts));
-            if (progress_fn) progress_fn(inst_id, total_insts);
+    reader_.unpin_all();
+
+    // ── Check for shard errors ──────────────────────────────────────────
+    for (const auto& r : shard_results) {
+        if (!r.error.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(sst_dir, ec);
+            LOG_ERROR("MemoryModel::build shard failed: {}", r.error);
+            built_ = true;  // mark built to prevent retry loops
+            return;
         }
     }
 
-    // Final flush: write remaining entries
-    if (batch_front->Count() > 0) {
-        // Wait for any in-progress background write to finish
-        {
-            std::unique_lock<std::mutex> lk(writer_mu);
-            writer_cv.wait(lk, [&]{ return !writer_has_work; });
-        }
-        db_->Write(wo, batch_front);
-        batch_front->Clear();
-    }
-
-    // Shut down writer thread
+    // ── Phase 2: Ingest SST files into RocksDB ─────────────────────────
+    // IngestExternalFile() moves SSTs directly into L0, bypassing MemTable,
+    // WAL, and compaction.  O(N) in file count, not entry count.
     {
-        std::lock_guard<std::mutex> lk(writer_mu);
-        writer_done = true;
+        rocksdb::IngestExternalFileOptions ingest_opts;
+        ingest_opts.move_files = true;
+        ingest_opts.snapshot_consistency = false;
+        ingest_opts.allow_global_seqno = true;
+        ingest_opts.allow_blocking_flush = false;
+
+        // Helper: collect SST paths from all shards, filter empty files, ingest.
+        auto ingest_cf = [&](rocksdb::ColumnFamilyHandle* cf_handle,
+                             auto sst_getter) -> rocksdb::Status {
+            if (!cf_handle) return rocksdb::Status::OK();
+            std::vector<std::string> all_ssts;
+            for (auto& r : shard_results) {
+                for (auto& p : sst_getter(r)) {
+                    std::error_code fec;
+                    auto fsize = std::filesystem::file_size(p, fec);
+                    if (!fec && fsize > 0) all_ssts.push_back(std::move(p));
+                }
+            }
+            if (all_ssts.empty()) return rocksdb::Status::OK();
+            return db_->IngestExternalFile(cf_handle, all_ssts, ingest_opts);
+        };
+
+        auto s = ingest_cf(mem_cf_,
+                           [](ShardResult& r) -> auto& { return r.write_ssts; });
+        if (!s.ok()) {
+            LOG_ERROR("MemoryModel::build: ingest mem_write failed: {}", s.ToString());
+        }
+
+        s = ingest_cf(mem_read_cf_,
+                      [](ShardResult& r) -> auto& { return r.read_ssts; });
+        if (!s.ok()) {
+            LOG_ERROR("MemoryModel::build: ingest mem_read failed: {}", s.ToString());
+        }
     }
-    writer_cv.notify_one();
-    writer_thread.join();
 
-    // Publish the local write counter to the atomic stat.
-    stats_.total_writes_persisted.store(local_writes_persisted, std::memory_order_relaxed);
+    // Clean up temp SST directory
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(sst_dir, ec);
+    }
 
-    // Opt #4: Store page activity cache
-    page_activity_cache_.reserve(build_page_map.size());
-    for (auto& [_, pa] : build_page_map) {
-        page_activity_cache_.push_back(pa);
+    // ── Phase 3: Merge page activity from all shards ────────────────────
+    uint64_t total_writes_persisted = 0;
+    {
+        ankerl::unordered_dense::map<uint64_t, PageActivity> merged_map;
+        merged_map.reserve(65536);
+        for (auto& r : shard_results) {
+            total_writes_persisted += r.writes_persisted;
+            for (auto& [page, pa] : r.page_map) {
+                auto [it_m, inserted] = merged_map.try_emplace(page, pa);
+                if (!inserted) {
+                    auto& m = it_m->second;
+                    m.first_inst_id = std::min(m.first_inst_id, pa.first_inst_id);
+                    m.last_inst_id = std::max(m.last_inst_id, pa.last_inst_id);
+                    m.write_count += pa.write_count;
+                    m.read_count += pa.read_count;
+                }
+            }
+        }
+        page_activity_cache_.reserve(merged_map.size());
+        for (auto& [_, pa] : merged_map) {
+            page_activity_cache_.push_back(pa);
+        }
     }
     std::sort(page_activity_cache_.begin(), page_activity_cache_.end(),
               [](const PageActivity& a, const PageActivity& b) {
@@ -501,11 +643,15 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
               });
     page_activity_cached_ = true;
 
+    stats_.total_writes_persisted.store(total_writes_persisted, std::memory_order_relaxed);
+
     // Opt #1: Write sentinel so next session skips rebuild
     write_persisted_sentinel();
 
-    LOG_INFO("MemoryModel::build: complete ({} instructions, {} writes persisted, {} pages)",
-             inst_id, local_writes_persisted, page_activity_cache_.size());
+    LOG_INFO("MemoryModel::build: complete ({} instructions, {} writes persisted, "
+             "{} pages, {} shards)",
+             total_insts, total_writes_persisted,
+             page_activity_cache_.size(), num_shards);
 
     built_ = true;
 }

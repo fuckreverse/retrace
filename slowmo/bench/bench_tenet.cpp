@@ -309,8 +309,9 @@ static TraceBenchResult benchmark_trace(const fs::path& trace_path,
     InstructionDecoder decoder;
     decoder.init();
 
-    // MemoryModel build
-    MemoryModel memory(reader, index);
+    // MemoryModel build (RocksDB-backed for accurate benchmarking)
+    MemoryModel memory(reader, index,
+                       index.raw_db(), index.mem_write_cf(), index.mem_read_cf());
     timer.start();
     memory.build();
     result.memory_build_ms = timer.elapsed_ms();
