@@ -322,12 +322,19 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             writer_cv.wait(lk, [&]{ return writer_has_work || writer_done; });
             if (writer_done && !writer_has_work) break;
             rocksdb::WriteBatch* wb = writer_batch;
-            writer_has_work = false;
             lk.unlock();
-            writer_cv.notify_one();  // signal producer that batch_back is free
 
             db_->Write(wo, wb);
             wb->Clear();
+
+            // Signal completion AFTER the write finishes, not before.
+            // This ensures flush_batch()'s wait on !writer_has_work only
+            // returns when the batch is truly safe to reuse.
+            {
+                std::lock_guard<std::mutex> lk2(writer_mu);
+                writer_has_work = false;
+            }
+            writer_cv.notify_one();
         }
     });
 
