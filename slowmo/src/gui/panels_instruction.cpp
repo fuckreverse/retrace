@@ -13,6 +13,7 @@
 #include "analysis/passes/cfg_layout_pass.h"
 
 #include <imgui.h>
+#include "gui/icons/IconsFontAwesome6.h"
 
 #include <fmt/core.h>
 
@@ -34,9 +35,9 @@ void GuiApp::render_instruction_panel() {
         ImGui::BeginChild("##search_strip", ImVec2(0, ImGui::GetFrameHeightWithSpacing()), false,
                           ImGuiWindowFlags_NoScrollbar);
         ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
-            "\xE2\x8C\x95  %zu results", search_results_.size());  // ⌕
+            ICON_FA_MAGNIFYING_GLASS "  %zu results", search_results_.size());  // ⌕
         ImGui::SameLine(0, 10.0f);
-        if (ImGui::SmallButton("\xe2\x97\x81##sprev")) {  // ◁
+        if (ImGui::SmallButton(ICON_FA_CARET_LEFT "##sprev")) {  // ◁
             if (search_current_ > 0) search_current_--;
             else search_current_ = search_results_.size() - 1;
             navigate_to(search_results_[search_current_]);
@@ -44,13 +45,13 @@ void GuiApp::render_instruction_panel() {
         ImGui::SameLine(0, 2.0f);
         ImGui::TextDisabled("%zu / %zu", search_current_ + 1, search_results_.size());
         ImGui::SameLine(0, 2.0f);
-        if (ImGui::SmallButton("\xe2\x96\xb7##snext")) {  // ▷
+        if (ImGui::SmallButton(ICON_FA_CARET_RIGHT "##snext")) {  // ▷
             search_current_++;
             if (search_current_ >= search_results_.size()) search_current_ = 0;
             navigate_to(search_results_[search_current_]);
         }
         ImGui::SameLine(0, 12.0f);
-        if (ImGui::SmallButton("  \xc3\x97  ")) {  // ×
+        if (ImGui::SmallButton("  " ICON_FA_XMARK "  ")) {  // ×
             search_active_ = false;
             search_results_.clear();
         }
@@ -62,7 +63,7 @@ void GuiApp::render_instruction_panel() {
     if (!bookmarks_.empty()) {
         // Small right-aligned bookmark count
         char bm_label[32];
-        snprintf(bm_label, sizeof(bm_label), "\xe2\x98\x86 %zu bookmarks", bookmarks_.size());  // ☆
+        snprintf(bm_label, sizeof(bm_label), ICON_FA_STAR "  %zu bookmarks", bookmarks_.size());
         float text_w = ImGui::CalcTextSize(bm_label).x;
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - text_w + ImGui::GetCursorPosX());
         ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.20f, 0.70f), "%s", bm_label);
@@ -171,15 +172,15 @@ void GuiApp::render_instruction_panel() {
                 // detection without shifting any column layout.
                 ImGui::TableNextColumn();
                 if (is_current && is_bookmarked) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), "\xe2\x98\x85\xe2\x96\xb6");  // ★▶
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), ICON_FA_STAR ICON_FA_PLAY);
                 } else if (is_current) {
-                    ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), " \xe2\x96\xb6");  // ▶
+                    ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), " " ICON_FA_PLAY);
                 } else if (is_bookmarked) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), "\xe2\x98\x85 ");  // ★
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.15f, 1.0f), ICON_FA_STAR " ");
                 } else if (is_loop_header) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), "\xe2\x87\x86 ");   // ⇆
+                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), ICON_FA_ARROW_RIGHT_ARROW_LEFT " ");
                 } else if (is_in_loop) {
-                    ImGui::TextColored(ImVec4(0.72f, 0.43f, 0.1f, 0.75f), "\xe2\x86\xba ");  // ↺
+                    ImGui::TextColored(ImVec4(0.72f, 0.43f, 0.1f, 0.75f), ICON_FA_ARROW_ROTATE_LEFT " ");
                 } else {
                     ImGui::TextDisabled("  ");
                 }
@@ -338,7 +339,7 @@ void GuiApp::render_inst_context_menu_contents() {
     // Bookmark toggle
     bool is_bookmarked = std::binary_search(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
     if (is_bookmarked) {
-        if (ImGui::MenuItem("\xe2\x98\x85 Remove Bookmark")) {  // ★
+        if (ImGui::MenuItem(ICON_FA_STAR " Remove Bookmark")) {
             auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
             if (it != bookmarks_.end() && *it == ctx_inst_id_) {
                 bookmarks_.erase(it);
@@ -346,7 +347,7 @@ void GuiApp::render_inst_context_menu_contents() {
             }
         }
     } else {
-        if (ImGui::MenuItem("\xe2\x98\x86 Add Bookmark (B)")) {  // ☆
+        if (ImGui::MenuItem(ICON_FA_STAR " Add Bookmark (B)")) {
             auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), ctx_inst_id_);
             bookmarks_.insert(it, ctx_inst_id_);
             row_cache_.invalidate(ctx_inst_id_);

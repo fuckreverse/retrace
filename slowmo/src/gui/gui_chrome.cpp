@@ -12,6 +12,8 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 #include <fmt/core.h>
 
 #include <ctime>
@@ -285,8 +287,8 @@ void GuiApp::render_menu_bar() {
                 ImGui::EndMenu();
             }
 
-            // ── ObjC / iOS ────────────────────────────────────────────────
-            if (ImGui::BeginMenu("ObjC / iOS")) {
+            // ── ObjC / Platform API ─────────────────────────────────────────
+            if (ImGui::BeginMenu("ObjC / API")) {
                 if (ImGui::MenuItem("ObjC Messages")) {
                     run_pass_by_name("objc"); show_objc_ = true;
                 }
@@ -433,7 +435,7 @@ void GuiApp::render_toolbar() {
         bool can_fwd  = can_nav_forward();
 
         if (!can_back) ImGui::BeginDisabled();
-        if (ImGui::Button("\xe2\x86\x90##navback", ImVec2(26.0f, btn_h)))  // ← (UTF-8 U+2190)
+        if (ImGui::Button(ICON_FA_ARROW_LEFT "##navback", ImVec2(26.0f, btn_h)))
             nav_back();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Back  Alt+\xe2\x86\x90\nHistory: [%zu/%zu]",
@@ -443,7 +445,7 @@ void GuiApp::render_toolbar() {
         ImGui::SameLine();
 
         if (!can_fwd) ImGui::BeginDisabled();
-        if (ImGui::Button("\xe2\x86\x92##navfwd", ImVec2(26.0f, btn_h)))   // → (UTF-8 U+2192)
+        if (ImGui::Button(ICON_FA_ARROW_RIGHT "##navfwd", ImVec2(26.0f, btn_h)))
             nav_forward();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Forward  Alt+\xe2\x86\x92\nHistory: [%zu/%zu]",
@@ -464,13 +466,13 @@ void GuiApp::render_toolbar() {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("First instruction  Home");
     ImGui::SameLine();
 
-    if (ImGui::Button("\xe2\x96\xb2##stepup", ImVec2(26.0f, btn_h))) {  // ▲
+    if (ImGui::Button(ICON_FA_CARET_UP "##stepup", ImVec2(26.0f, btn_h))) {
         if (current_inst_ > 0) navigate_to(current_inst_ - 1);
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous instruction  \xe2\x86\x91");
     ImGui::SameLine();
 
-    if (ImGui::Button("\xe2\x96\xbc##stepdn", ImVec2(26.0f, btn_h))) {  // ▼
+    if (ImGui::Button(ICON_FA_CARET_DOWN "##stepdn", ImVec2(26.0f, btn_h))) {
         navigate_to(current_inst_ + 1);
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next instruction  \xe2\x86\x93");
@@ -494,7 +496,7 @@ void GuiApp::render_toolbar() {
                          !current_call_stack().empty());
 
         if (!has_call) ImGui::BeginDisabled();
-        if (ImGui::Button("\xe2\x86\xb3 Enter", ImVec2(0, btn_h))) {  // ↳
+        if (ImGui::Button(ICON_FA_RIGHT_TO_BRACKET " Enter", ImVec2(0, btn_h))) {
             auto* evt = function_result_->call_at(current_inst_);
             if (evt && evt->call_inst_id + 1 < total_inst_)
                 navigate_to(evt->call_inst_id + 1);
@@ -506,7 +508,7 @@ void GuiApp::render_toolbar() {
         ImGui::SameLine();
 
         if (!has_ret) ImGui::BeginDisabled();
-        if (ImGui::Button("\xe2\x86\xb5 Return", ImVec2(0, btn_h))) {  // ↵
+        if (ImGui::Button(ICON_FA_RIGHT_FROM_BRACKET " Return", ImVec2(0, btn_h))) {
             auto* evt = function_result_->return_at(current_inst_);
             if (evt) {
                 navigate_to(evt->call_inst_id);
@@ -534,14 +536,14 @@ void GuiApp::render_toolbar() {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.28f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.40f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.50f, 0.20f, 1.0f));
-            if (ImGui::Button("\xe2\x97\x81 T", ImVec2(0, btn_h))) jump_taint_prev();  // ◁
+            if (ImGui::Button(ICON_FA_CARET_LEFT " T", ImVec2(0, btn_h))) jump_taint_prev();
             ImGui::PopStyleColor(3);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev tainted inst ([)");
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.28f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.40f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.50f, 0.20f, 1.0f));
-            if (ImGui::Button("T \xe2\x96\xb7", ImVec2(0, btn_h))) jump_taint_next();  // ▷
+            if (ImGui::Button("T " ICON_FA_CARET_RIGHT, ImVec2(0, btn_h))) jump_taint_next();
             ImGui::PopStyleColor(3);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next tainted inst (])");
             ImGui::SameLine();
@@ -550,14 +552,14 @@ void GuiApp::render_toolbar() {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.28f, 0.08f, 0.08f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.12f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.15f, 0.15f, 1.0f));
-            if (ImGui::Button("\xe2\x97\x81 BT", ImVec2(0, btn_h))) jump_backward_taint_prev();  // ◁
+            if (ImGui::Button(ICON_FA_CARET_LEFT " BT", ImVec2(0, btn_h))) jump_backward_taint_prev();
             ImGui::PopStyleColor(3);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Prev backward-tainted inst");
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.28f, 0.08f, 0.08f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.12f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.15f, 0.15f, 1.0f));
-            if (ImGui::Button("BT \xe2\x96\xb7", ImVec2(0, btn_h))) jump_backward_taint_next();  // ▷
+            if (ImGui::Button("BT " ICON_FA_CARET_RIGHT, ImVec2(0, btn_h))) jump_backward_taint_next();
             ImGui::PopStyleColor(3);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next backward-tainted inst");
             ImGui::SameLine();
@@ -639,8 +641,8 @@ void GuiApp::render_toolbar() {
                 badge("SLICE", ImVec4(0.40f, 0.10f, 0.42f, 0.90f));
             if (show_loops_ && loop_result_) {
                 char loop_label[32];
-                snprintf(loop_label, sizeof(loop_label), "\xe2\x86\xba %zu LOOPS",
-                         loop_result_->loops.size());  // ↺
+                snprintf(loop_label, sizeof(loop_label), ICON_FA_ARROW_ROTATE_LEFT " %zu LOOPS",
+                         loop_result_->loops.size());
                 badge(loop_label, ImVec4(0.38f, 0.20f, 0.03f, 0.90f));
             }
         }

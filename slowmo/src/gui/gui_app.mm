@@ -26,6 +26,10 @@
 
 #include <fmt/core.h>
 
+// FontAwesome 6 icon font (embedded as compressed C array)
+#include "gui/icons/IconsFontAwesome6.h"
+#include "gui/icons/fa_solid_900_ttf.h"
+
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -519,6 +523,27 @@ void GuiApp::setup_fonts() {
         }
     }
 
+    // ── Extended glyph range for the primary font ─────────────────────────
+    // The primary monospace font (SF Mono / Menlo) already contains many
+    // useful Unicode glyphs (✓, ✗, ✕, ·, ×, —, …) beyond ASCII.
+    // Load them upfront so they render from the primary font directly.
+    // Remaining symbols (arrows, geometric, Braille, etc.) are merged from
+    // Apple Symbols as a fallback below.
+    static const ImWchar primary_ranges[] = {
+        0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement (default)
+        0x00B7, 0x00B7,   // · (middle dot, used as separator)
+        0x00D7, 0x00D7,   // × (multiplication sign)
+        0x2013, 0x2026,   // General Punctuation (–, —, …)
+        0x2190, 0x21FF,   // Arrows (←→↑↓↺↳↵⇆ etc.)
+        0x2200, 0x22FF,   // Mathematical Operators (≥ etc.)
+        0x2300, 0x23FF,   // Misc Technical (⌕⌛⌘ etc.)
+        0x2500, 0x25FF,   // Box Drawing + Block Elements + Geometric Shapes
+        0x2600, 0x26FF,   // Misc Symbols (★☆⚠⚙⚡ etc.)
+        0x2700, 0x27FF,   // Dingbats (✂✓✕✗ etc.)
+        0x2800, 0x28FF,   // Braille Patterns (spinner: ⣾⣽⣻⢿⡿⣟⣯⣷)
+        0,
+    };
+
     bool font_loaded = false;
     if (!font_to_load.empty()) {
         if (FILE* f = fopen(font_to_load.c_str(), "rb")) {
@@ -527,6 +552,7 @@ void GuiApp::setup_fonts() {
             config.OversampleH = settings_.oversample_h;  // typically 3 for HiDPI
             config.OversampleV = settings_.oversample_v;  // typically 2 for HiDPI
             config.PixelSnapH  = settings_.pixel_snap;    // keep OFF on Retina
+            config.GlyphRanges = primary_ranges;
             io.Fonts->AddFontFromFileTTF(font_to_load.c_str(), font_size, &config);
             font_loaded = true;
         }
@@ -536,29 +562,36 @@ void GuiApp::setup_fonts() {
         ImFontConfig config;
         config.SizePixels = font_size;
         io.Fonts->AddFontDefault(&config);
+        // Merge extended ranges from a system fallback font
+        ImFontConfig fallback_cfg;
+        fallback_cfg.MergeMode   = true;
+        fallback_cfg.GlyphRanges = primary_ranges;
+        fallback_cfg.SizePixels  = font_size;
+        static const char* fallback_paths[] = {
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/SFNSMono.ttf",
+            nullptr
+        };
+        for (int i = 0; fallback_paths[i]; i++) {
+            if (FILE* fb = fopen(fallback_paths[i], "rb")) {
+                fclose(fb);
+                io.Fonts->AddFontFromFileTTF(fallback_paths[i], font_size, &fallback_cfg, primary_ranges);
+                break;
+            }
+        }
     }
 
-    // ── Merge Unicode symbol ranges from Apple Symbols ───────────────────
-    // The primary monospace font (SF Mono / Menlo) only covers ASCII + Latin-1.
-    // UI chrome uses Unicode glyphs: arrows (←→▲▼↺↳↵⇆), geometric shapes
-    // (▶▷◁▸░▒▓─), stars (★☆), dingbats (⚠✂✓✗⚙), punctuation (…—),
-    // Misc Technical (⌕⌛⌘), Braille spinner (⣾⣽⣻⢿⡿⣟⣯⣷) etc.
-    // We merge these ranges from Apple Symbols so they render correctly.
-    // NOTE: All icon characters must exist in Apple Symbols — avoid PUA (U+E000+)
-    // and Emoji (U+1F3xx+) ranges as Apple Symbols does not cover them.
+    // ── Merge additional symbols from Apple Symbols ──────────────────────
+    // Apple Symbols provides high-quality glyphs for arrows, geometric shapes,
+    // Braille patterns, and misc symbols. It does NOT cover Dingbats well
+    // (✓✕✗✂ are missing), so those come from the primary font above.
+    // This merge fills gaps for glyphs the primary monospace font may lack
+    // (e.g. Braille, some arrows, geometric shapes).
     static const char* symbol_font = "/System/Library/Fonts/Apple Symbols.ttf";
     if (FILE* sf = fopen(symbol_font, "rb")) {
         fclose(sf);
 
-        // Custom glyph range table covering all UI symbols used in tenet:
-        //   U+00D7        × (multiplication sign, used for close button)
-        //   U+2013–U+2026 General Punctuation (—, …)
-        //   U+2190–U+21FF Arrows (←→↑↓↺↳↵⇆ and friends)
-        //   U+2300–U+23FF Misc Technical (⌕⌛⌘ and various)
-        //   U+2500–U+25FF Box Drawing + Block Elements + Geometric Shapes (▶▷◁▲▼▸░▒▓─ etc.)
-        //   U+2600–U+26FF Misc Symbols (★☆⚠⚙ etc.)
-        //   U+2700–U+27FF Dingbats + Misc Math (✂✓✗ etc.)
-        //   U+2800–U+28FF Braille Patterns (⣾⣽⣻⢿⡿ spinner animation)
+        // Ranges where Apple Symbols is known to have good coverage:
         static const ImWchar symbol_ranges[] = {
             0x00D7, 0x00D7,   // ×
             0x2013, 0x2026,   // —…
@@ -566,7 +599,6 @@ void GuiApp::setup_fonts() {
             0x2300, 0x23FF,   // Misc Technical (⌕⌛⌘⌦ etc.)
             0x2500, 0x25FF,   // Box Drawing + Block Elements + Geometric Shapes
             0x2600, 0x26FF,   // Misc Symbols (★☆⚠⚙ etc.)
-            0x2700, 0x27FF,   // Dingbats + Supplemental Arrows-B
             0x2800, 0x28FF,   // Braille Patterns (spinner: ⣾⣽⣻⢿⡿⣟⣯⣷)
             0,
         };
@@ -577,6 +609,51 @@ void GuiApp::setup_fonts() {
         sym_cfg.OversampleV = 1;
         sym_cfg.GlyphOffset = ImVec2(0.0f, 1.0f);  // minor baseline alignment
         io.Fonts->AddFontFromFileTTF(symbol_font, font_size, &sym_cfg, symbol_ranges);
+    }
+
+    // ── Merge Dingbats from Menlo (fallback for ✓✕✗✂) ────────────────────
+    // Apple Symbols lacks most of the Dingbats range (U+2700–U+27FF).
+    // Menlo and Arial Unicode have them. Merge only Dingbats from Menlo.
+    static const char* dingbat_fonts[] = {
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        nullptr
+    };
+    static const ImWchar dingbat_ranges[] = {
+        0x2700, 0x27FF,   // Dingbats (✂✓✕✗ etc.)
+        0,
+    };
+    for (int i = 0; dingbat_fonts[i]; i++) {
+        if (FILE* df = fopen(dingbat_fonts[i], "rb")) {
+            fclose(df);
+            ImFontConfig ding_cfg;
+            ding_cfg.MergeMode   = true;
+            ding_cfg.OversampleH = 1;
+            ding_cfg.OversampleV = 1;
+            ding_cfg.GlyphOffset = ImVec2(0.0f, 1.0f);
+            io.Fonts->AddFontFromFileTTF(dingbat_fonts[i], font_size, &ding_cfg, dingbat_ranges);
+            break;
+        }
+    }
+
+    // ── Merge FontAwesome 6 Solid icons ─────────────────────────────────
+    // Embedded as compressed C array — no file path dependency at runtime.
+    // Covers PUA range U+E005–U+F8FF used by FA6 solid icons.
+    {
+        static const ImWchar fa_ranges[] = {
+            ICON_MIN_FA, ICON_MAX_FA,
+            0,
+        };
+        ImFontConfig fa_cfg;
+        fa_cfg.MergeMode   = true;
+        fa_cfg.OversampleH = 1;
+        fa_cfg.OversampleV = 1;
+        fa_cfg.GlyphOffset = ImVec2(0.0f, 1.0f);  // baseline alignment tweak
+        fa_cfg.FontDataOwnedByAtlas = false;       // we manage the static data
+        io.Fonts->AddFontFromMemoryCompressedTTF(
+            FontAwesomeSolid_compressed_data,
+            FontAwesomeSolid_compressed_size,
+            font_size, &fa_cfg, fa_ranges);
     }
 
     io.FontGlobalScale = 1.0f;
@@ -1276,8 +1353,8 @@ void tenet::GuiApp::setup_native_menu() {
         [cpMenu addItem:mk(@"Algorithm Summary",   @"", 0, kTagAnaAlgoSummary)];
         [cpMenu addItem:mk(@"ObjC Crypto",         @"", 0, kTagAnaObjCCrypto)];
 
-        // ── ObjC / iOS ────────────────────────────────────────────────
-        NSMenu* objcMenu = mksub(anaMenu, @"ObjC / iOS");
+        // ── ObjC / Platform API ─────────────────────────────────────────
+        NSMenu* objcMenu = mksub(anaMenu, @"ObjC / API");
         [objcMenu addItem:mk(@"ObjC Messages",     @"", 0, kTagAnaObjC)];
         [objcMenu addItem:mk(@"API Intercepts",    @"", 0, kTagAnaAPIIntercepts)];
 
@@ -1734,10 +1811,8 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderSplitNode(dock_center, ImGuiDir_Down, 0.28f,
                                     &dock_center_bottom_full, &dock_center_main);
 
-        // ── Step 3b: split bottom area: output panels (60%) | log (40%) ──
-        ImGuiID dock_center_bottom, dock_log;
-        ImGui::DockBuilderSplitNode(dock_center_bottom_full, ImGuiDir_Right, 0.40f,
-                                    &dock_log, &dock_center_bottom);
+        // ── Step 3b: bottom area is a single tab group (no left/right split) ──
+        ImGuiID dock_center_bottom = dock_center_bottom_full;
 
         // ── Step 4: split right vertically: registers (62%) | right-bottom (38%) ──
         ImGuiID dock_right_regs, dock_right_bottom;
@@ -1772,14 +1847,12 @@ void GuiApp::render_frame() {
         ImGui::DockBuilderDockWindow("Strings",             dock_center_main);
         ImGui::DockBuilderDockWindow("Instructions",        dock_center_main);  // ← default active
 
-        // Center bottom: Analysis (default active) + secondary panels
+        // Center bottom: all secondary panels in a single tab group
         ImGui::DockBuilderDockWindow("Call Stack",  dock_center_bottom);
         ImGui::DockBuilderDockWindow("Hex Dump",    dock_center_bottom);
+        ImGui::DockBuilderDockWindow("Output",      dock_center_bottom);
         ImGui::DockBuilderDockWindow("Minimap",     dock_center_bottom);
         ImGui::DockBuilderDockWindow("Analysis",    dock_center_bottom);  // ← default active
-
-        // Bottom right: Log / Output panel (IDA-style)
-        ImGui::DockBuilderDockWindow("Output",  dock_log);
 
         // Right top: Registers
         ImGui::DockBuilderDockWindow("Registers", dock_right_regs);

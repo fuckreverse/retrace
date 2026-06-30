@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -82,12 +83,12 @@ void GuiApp::render_memory_strings_panel() {
 
     // ── Summary header ─────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x8c\x95  %zu strings  |  %zu unique",   // ⌕ U+2315 (was fa-font U+F0C2 PUA)
+        ICON_FA_MAGNIFYING_GLASS "  %zu strings  |  %zu unique",
         mem_string_result_->total(),
         mem_string_result_->unique_count());
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {   // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("memory_strings");
     }
     if (ImGui::IsItemHovered())
@@ -218,7 +219,7 @@ void GuiApp::render_memory_strings_panel() {
                     ImGui::TextDisabled("inst #%llu",
                                         (unsigned long long)ms.discovered_at);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(ms.discovered_at);
                     }
                     if (ImGui::IsItemHovered())

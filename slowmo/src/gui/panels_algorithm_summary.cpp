@@ -15,6 +15,7 @@
 
 #include <string>
 #include <vector>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -43,13 +44,13 @@ void GuiApp::render_algorithm_summary_panel() {
     float panel_w = ImGui::GetContentRegionAvail().x;
 
     // ── Summary header ─────────────────────────────────────────────────────
-    const char* crypto_badge = res.has_crypto() ? "  \xe2\x9a\xa0 CRYPTO" : "";  // ⚠
+    const char* crypto_badge = res.has_crypto() ? "  " ICON_FA_TRIANGLE_EXCLAMATION " CRYPTO" : "";
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x8c\x95  %zu candidate(s)%s",   // ⌕ U+2315 (was 🔍 U+1F50D emoji)
+        ICON_FA_MAGNIFYING_GLASS "  %zu candidate(s)%s",
         res.total(), crypto_badge);
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("algorithm_summary");
     }
     if (ImGui::IsItemHovered())

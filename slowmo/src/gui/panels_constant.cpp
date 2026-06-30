@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -64,12 +66,12 @@ void GuiApp::render_constant_panel() {
 
     // ── Summary header ───────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x97\x89  %zu total,  %zu identified",   // ◉ U+25C9 (was 🔐 U+1F510 emoji)
+        ICON_FA_CIRCLE_DOT "  %zu total,  %zu identified",   // ◉ U+25C9 (was 🔐 U+1F510 emoji)
         constant_result_->total(),
         constant_result_->identified_count());
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {        // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {        // ↺
         run_pass_by_name("constant_materialization");
     }
     if (ImGui::IsItemHovered())
@@ -225,7 +227,7 @@ void GuiApp::render_constant_panel() {
                         ImGui::TextDisabled("%s:%s", c.known_match->algorithm.c_str(),
                                             c.known_match->name.c_str());
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(c.first_inst_id);
                     }
                     if (ImGui::IsItemHovered())

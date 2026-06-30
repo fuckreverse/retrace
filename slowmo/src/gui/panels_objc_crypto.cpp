@@ -18,6 +18,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -95,7 +96,7 @@ void GuiApp::render_objc_crypto_panel() {
 
     // ── Summary header ────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.70f, 1.0f),
-        "\xe2\x97\x89  %zu hits",          // ◉ U+25C9 (was fa-lock U+F1FB PUA)
+        ICON_FA_CIRCLE_DOT "  %zu hits",
         objc_crypto_result_->total());
     ImGui::SameLine(0, 12);
     ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.00f, 1.0f),
@@ -105,7 +106,7 @@ void GuiApp::render_objc_crypto_panel() {
         "Bare: %zu", objc_crypto_result_->bare_count());
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("objc_crypto");
     }
     if (ImGui::IsItemHovered())
@@ -240,7 +241,7 @@ void GuiApp::render_objc_crypto_panel() {
                                         (unsigned long long)hit.pattern_start_inst,
                                         (unsigned long long)hit.pattern_end_inst);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(hit.pattern_start_inst);
                     }
                     if (ImGui::IsItemHovered())
@@ -298,7 +299,7 @@ void GuiApp::render_objc_crypto_panel() {
                             char frame_label[256];
                             snprintf(frame_label, sizeof(frame_label),
                                      "%s[%s %s] @ #%llu (0x%llx)",
-                                     is_inner ? "\xe2\x86\x92 " : "  ",   // → or spaces
+                                     is_inner ? ICON_FA_ARROW_RIGHT " " : "  ",
                                      frame.class_name.c_str(),
                                      frame.selector_name.c_str(),
                                      (unsigned long long)frame.inst_id,

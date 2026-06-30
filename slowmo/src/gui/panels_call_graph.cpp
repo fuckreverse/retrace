@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -69,14 +70,14 @@ void GuiApp::render_call_graph_panel() {
 
     // ── Summary header ─────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x96\xb8  %zu nodes  |  %zu edges  |  %llu calls  |  depth %llu",
+        ICON_FA_DIAGRAM_PROJECT "  %zu nodes  |  %zu edges  |  %llu calls  |  depth %llu",
         cg.nodes.size(),
         cg.edges.size(),
         (unsigned long long)cg.total_call_events,
         (unsigned long long)cg.max_depth);
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {   // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_call_graph_analysis();
     }
     if (ImGui::IsItemHovered())

@@ -22,6 +22,8 @@
 #include <cstring>
 #include <string>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 
 // ============================================================================
 // Color Constants
@@ -1173,7 +1175,7 @@ void GuiApp::render_status_bar() {
     // ─── Left section: position + current instruction ────────────────
     // Instruction index / total (IDA style: "0001234 / 0056789")
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.65f, 0.85f, 1.0f));
-    ImGui::TextUnformatted("\xe2\x96\xb6");   // ▶
+    ImGui::TextUnformatted(ICON_FA_PLAY);   // ▶
     ImGui::PopStyleColor();
     ImGui::SameLine(0, 4.0f);
 
@@ -1216,7 +1218,7 @@ void GuiApp::render_status_bar() {
 
     // Bookmarks count
     if (!bookmarks_.empty()) {
-        right += fmt::format("  \xe2\x98\x85 {} bkm", bookmarks_.size());  // ★
+        right += fmt::format("  " ICON_FA_STAR " {} bkm", bookmarks_.size());
     }
 
     // Active analyses badges
@@ -1230,7 +1232,7 @@ void GuiApp::render_status_bar() {
         right += "  [SLICE]";
     }
     if (show_loops_ && loop_result_) {
-        right += fmt::format("  [\xe2\x86\xba {}L]", loop_result_->loops.size());  // ↺
+        right += fmt::format("  [" ICON_FA_ARROW_ROTATE_LEFT " {}L]", loop_result_->loops.size());
     }
     if (analysis_running_.load() && pass_manager_) {
         // Find running passes and show the first one's name + progress.

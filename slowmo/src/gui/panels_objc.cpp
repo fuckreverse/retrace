@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 void GuiApp::render_objc_panel() {
@@ -44,12 +46,12 @@ void GuiApp::render_objc_panel() {
 
     // ── Summary header ─────────────────────────────────────────────────────
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x8c\x98  %zu messages  |  %zu classes",   // ⌘ U+2318 (was Apple logo U+F8FF PUA)
+        ICON_FA_MESSAGE "  %zu messages  |  %zu classes",   // ⌘ U+2318 (was Apple logo U+F8FF PUA)
         objc_result_->total_messages(),
         objc_result_->unique_classes());
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {  // ↺
         run_pass_by_name("objc");
     }
     if (ImGui::IsItemHovered())
@@ -195,7 +197,7 @@ void GuiApp::render_objc_panel() {
                                            "%s", msg.selector_name.c_str());
                         ImGui::TextDisabled("inst #%llu", (unsigned long long)msg.inst_id);
                         ImGui::Separator();
-                        if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                        if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                             navigate_to_instructions(msg.inst_id);
                         }
                         if (ImGui::IsItemHovered())

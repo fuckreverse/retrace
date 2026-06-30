@@ -15,6 +15,8 @@
 #include <sstream>
 #include <charconv>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 // ─── Open hex dump at address ────────────────────────────────────────────────
@@ -409,7 +411,7 @@ void GuiApp::render_hex_dump_panel() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Follow current instruction's memory access");
     ImGui::SameLine();
-    if (ImGui::Button("Watch\xe2\x8c\x95##watchaddr") && has_addr) {  // ⌕ U+2315 (was 🔭 U+1F52D emoji)
+    if (ImGui::Button("Watch" ICON_FA_MAGNIFYING_GLASS "##watchaddr") && has_addr) {  // ⌕ U+2315 (was 🔭 U+1F52D emoji)
         timeline_watch_addr_ = display_addr;
     }
     if (ImGui::IsItemHovered())
@@ -424,7 +426,7 @@ void GuiApp::render_hex_dump_panel() {
 
     ImGui::SameLine(0, 16);
     if (timeline_watch_addr_ == display_addr) {
-        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), "\xe2\x97\x89 Watching in Timeline");
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), ICON_FA_CIRCLE_DOT " Watching in Timeline");
     } else if (timeline_watch_addr_ != 0) {
         ImGui::TextDisabled("(watching 0x%llx)", (unsigned long long)timeline_watch_addr_);
     }

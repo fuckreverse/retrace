@@ -17,6 +17,7 @@
 
 #include <string>
 #include <vector>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -90,11 +91,11 @@ void GuiApp::render_loop_semantics_panel() {
     size_t crypto_count = res.crypto_loops().size();
 
     ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f),
-        "\xe2\x86\xba  %zu loops  |  %zu crypto",  // ↺ U+21BA (was 🔄 U+1F504 emoji)
+        ICON_FA_ARROW_ROTATE_LEFT "  %zu loops  |  %zu crypto",
         total_loops, crypto_count);
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("loop_semantics");
     }
     if (ImGui::IsItemHovered())
@@ -175,7 +176,7 @@ void GuiApp::render_loop_semantics_panel() {
                     ImGui::TextDisabled("%s  ×%llu", loop_kind_name(loop.kind),
                                         (unsigned long long)loop.iteration_count);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions",
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions",
                                         nullptr, false,
                                         loop.sample_iter_start != 0)) {
                         navigate_to_instructions(loop.sample_iter_start);

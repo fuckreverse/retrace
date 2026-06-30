@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -57,12 +58,12 @@ void GuiApp::render_trace_fold_panel() {
     float ratio = trace_fold_result_->compression_ratio;
 
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        "\xe2\x9c\x82  %s \xe2\x86\x92 %s  (\xc3\x97%.1f compression)  |  %zu regions folded",
+        ICON_FA_SCISSORS "  %s " ICON_FA_ARROW_RIGHT " %s  (\xc3\x97%.1f compression)  |  %zu regions folded",
         orig_str.c_str(), fold_str.c_str(), ratio,
         trace_fold_result_->folded_regions.size());
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("trace_fold");
     }
     if (ImGui::IsItemHovered())
@@ -162,7 +163,7 @@ void GuiApp::render_trace_fold_panel() {
                                         (unsigned long long)fr.first_inst_id,
                                         (unsigned long long)fr.last_inst_id);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(fr.first_inst_id);
                     }
                     if (ImGui::IsItemHovered())

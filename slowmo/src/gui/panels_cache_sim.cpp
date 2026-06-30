@@ -18,6 +18,8 @@
 #include <vector>
 #include <algorithm>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ void GuiApp::render_cache_sim_panel() {
     // ── Summary header ─────────────────────────────────────────────────────
     double omr = cache_sim_result_->overall_miss_rate();
     ImGui::TextColored(miss_rate_color(omr),
-        "\xe2\x96\xa4  Overall miss rate: %.1f%%  |  %s instructions",  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
+        ICON_FA_CHART_BAR "  Overall miss rate: %.1f%%  |  %s instructions",  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
         omr * 100.0,
         fmt_count(cache_sim_result_->total_instructions).c_str());
 
@@ -85,12 +87,12 @@ void GuiApp::render_cache_sim_panel() {
     if (!cache_sim_result_->sidechannels.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.1f, 1.0f),
-            "  \xe2\x9a\xa0  %zu side-channel(s)",   // ⚠
+            "  " ICON_FA_TRIANGLE_EXCLAMATION "  %zu side-channel(s)",   // ⚠
             cache_sim_result_->sidechannels.size());
     }
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {   // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {   // ↺
         run_pass_by_name("cache_sim");
     }
     if (ImGui::IsItemHovered())
@@ -162,7 +164,7 @@ void GuiApp::render_cache_sim_panel() {
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.1f, 1.0f),
-                "\xe2\x9a\xa0  %zu timing side-channel candidate(s) detected!",
+                ICON_FA_TRIANGLE_EXCLAMATION "  %zu timing side-channel candidate(s) detected!",
                 cache_sim_result_->sidechannels.size());
             ImGui::TextDisabled("  Switch to \"Side Channels\" view for details.");
         }
@@ -266,11 +268,11 @@ void GuiApp::render_cache_sim_panel() {
         if (cache_sim_result_->sidechannels.empty()) {
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.35f, 1.0f),
-                "\xe2\x9c\x93  No timing side-channels detected");   // ✓
+                ICON_FA_CHECK "  No timing side-channels detected");   // ✓
             ImGui::TextDisabled("  All functions show low variation in cache miss counts.");
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.1f, 1.0f),
-                "\xe2\x9a\xa0  %zu candidate(s)",
+                ICON_FA_TRIANGLE_EXCLAMATION "  %zu candidate(s)",
                 cache_sim_result_->sidechannels.size());
             ImGui::Separator();
 
@@ -304,7 +306,7 @@ void GuiApp::render_cache_sim_panel() {
                         ImGui::TableSetColumnIndex(0);
                         char sel_id[128];
                         snprintf(sel_id, sizeof(sel_id),
-                            "\xe2\x9a\xa0 %s##cssc%d",   // ⚠
+                            ICON_FA_TRIANGLE_EXCLAMATION " %s##cssc%d",   // ⚠
                             sc.function_name.empty()
                                 ? fmt::format("0x{:x}", sc.entry_pc).c_str()
                                 : sc.function_name.c_str(),

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "gui/icons/IconsFontAwesome6.h"
 
 namespace tenet {
 
@@ -96,7 +97,8 @@ void GuiApp::render_syscall_intercept_panel() {
             run_pass_by_name("syscall_intercept");
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Intercept and decode iOS system API calls in the trace.\n"
+            ImGui::SetTooltip("Intercept and decode crypto/system API calls in the trace.\n"
+                              "Auto-selects API table per platform (CommonCrypto / BoringSSL).\n"
                               "Extracts crypto keys, IV, data lengths, and decoded summaries.");
         }
         ImGui::End();
@@ -111,13 +113,19 @@ void GuiApp::render_syscall_intercept_panel() {
     if (cc_it != syscall_result_->by_category.end())
         crypto_count += cc_it->second.size();
 
+    // Count BoringSSL calls as well for Android traces
+    size_t boring_count = 0;
+    const auto& bs_it = syscall_result_->by_category.find(ApiCategory::BoringSSL);
+    if (bs_it != syscall_result_->by_category.end())
+        boring_count = bs_it->second.size();
+
     ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
-        "\xe2\x9a\x99  %zu calls  |  %zu CommonCrypto",   // ⚙ U+2699 (was lock U+F8E8 PUA)
+        ICON_FA_GEAR "  %zu calls  |  %zu crypto",
         syscall_result_->total(),
-        crypto_count);
+        crypto_count + boring_count);
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
         run_pass_by_name("syscall_intercept");
     }
     if (ImGui::IsItemHovered())
@@ -264,7 +272,7 @@ void GuiApp::render_syscall_intercept_panel() {
                                         category_label(call.category),
                                         (unsigned long long)call.inst_id);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(call.inst_id);
                     }
                     if (ImGui::IsItemHovered())

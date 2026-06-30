@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 // ─── Category helpers ────────────────────────────────────────────────────────
@@ -101,12 +103,12 @@ void GuiApp::render_pattern_panel() {
     }
 
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-        "\xe2\x97\x86  %zu matches   "     // ◆ U+25C6 (was fa-shield U+F2DB PUA)
+        ICON_FA_DIAMOND "  %zu matches   "     // ◆ U+25C6 (was fa-shield U+F2DB PUA)
         "Crypto:%zu  AntiDebug:%zu  Other:%zu",
         pattern_result_->total(), n_crypto, n_antidebug, n_other);
 
     ImGui::SameLine(panel_w - 90.0f);
-    if (ImGui::SmallButton("\xe2\x86\xba Rerun")) {  // ↺
+    if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {  // ↺
         run_pass_by_name("pattern");
     }
     if (ImGui::IsItemHovered())
@@ -248,7 +250,7 @@ void GuiApp::render_pattern_panel() {
                                         (unsigned long long)m.start_inst_id,
                                         (unsigned long long)m.end_inst_id);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("\xe2\x86\x92 Jump to Instructions")) {
+                    if (ImGui::MenuItem(ICON_FA_ARROW_RIGHT " Jump to Instructions")) {
                         navigate_to_instructions(m.start_inst_id);
                     }
                     if (ImGui::IsItemHovered())

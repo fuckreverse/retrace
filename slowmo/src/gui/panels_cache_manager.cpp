@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "gui/icons/IconsFontAwesome6.h"
+
 namespace tenet {
 
 // ─── Size formatting helper ──────────────────────────────────────────────────
@@ -90,11 +92,11 @@ void GuiApp::render_cache_manager_panel() {
 
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
         ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f),
-            "\xe2\x96\xa4  Pass Cache Manager");  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
+            ICON_FA_DATABASE "  Pass Cache Manager");  // ▤ U+25A4 (was 🗄 U+1F5C4 emoji)
 
         // Reload button (refresh cache info list)
         ImGui::SameLine(panel_w - 120.0f);
-        if (ImGui::SmallButton("\xe2\x86\xbb Refresh")) {  // ↻
+        if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_RIGHT " Refresh")) {  // ↻
             cache_manager_dirty_ = true;
         }
         if (ImGui::IsItemHovered())
@@ -132,7 +134,7 @@ void GuiApp::render_cache_manager_panel() {
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.10f, 0.10f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.15f, 0.15f, 1.0f));
-    if (ImGui::Button("  \xe2\x9c\x95  Delete All Caches  ")) {  // ✕
+    if (ImGui::Button("  " ICON_FA_XMARK "  Delete All Caches  ")) {  // ✕
         if (pass_manager_) {
             size_t n = pass_manager_->clear_all_blobs();
             cache_manager_entries_.clear();
@@ -155,7 +157,7 @@ void GuiApp::render_cache_manager_panel() {
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.20f, 0.05f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.28f, 0.07f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.36f, 0.10f, 1.0f));
-    if (ImGui::Button("  \xe2\x86\xba  Invalidate All  ")) {  // ↺
+    if (ImGui::Button("  " ICON_FA_ARROW_ROTATE_LEFT "  Invalidate All  ")) {  // ↺
         if (pass_manager_) {
             // Invalidate in-memory result AND delete blob for each cached pass.
             for (const auto& e : cache_manager_entries_) {
@@ -229,7 +231,7 @@ void GuiApp::render_cache_manager_panel() {
             {
                 ImVec4 col = state_color(e.state, e.in_memory);
                 const char* dot = e.in_memory
-                    ? "\xe2\x97\x89"   // ◉ (filled circle: in memory)
+                    ? ICON_FA_CIRCLE   // ◉ (filled circle: in memory)
                     : "\xe2\x97\x8b";  // ○ (empty circle: disk only)
                 ImGui::TextColored(col, "%s", dot);
                 if (ImGui::IsItemHovered()) {
@@ -289,7 +291,7 @@ void GuiApp::render_cache_manager_panel() {
             ImGui::TableSetColumnIndex(4);
             {
                 // [↺] Force re-run (invalidate both disk + memory)
-                if (ImGui::SmallButton("\xe2\x86\xba##inv")) {  // ↺
+                if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT "##inv")) {  // ↺
                     pending_invalidate = e.name;
                 }
                 if (ImGui::IsItemHovered())
@@ -305,7 +307,7 @@ void GuiApp::render_cache_manager_panel() {
                     ImVec4(0.50f, 0.12f, 0.12f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                     ImVec4(0.65f, 0.16f, 0.16f, 1.0f));
-                if (ImGui::SmallButton("\xe2\x9c\x95##del")) {  // ✕
+                if (ImGui::SmallButton(ICON_FA_XMARK "##del")) {  // ✕
                     pending_delete = e.name;
                 }
                 ImGui::PopStyleColor(3);

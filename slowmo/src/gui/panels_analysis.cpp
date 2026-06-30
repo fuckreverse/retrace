@@ -29,6 +29,7 @@
 #include "analysis/passes/trace_fold_pass.h"
 
 #include <imgui.h>
+#include "gui/icons/IconsFontAwesome6.h"
 
 #include <fmt/core.h>
 
@@ -746,6 +747,7 @@ void GuiApp::clear_analysis() {
 }
 
 // ─── Analysis Panel ─────────────────────────────────────────────────────────
+// Flat list of ALL catalog passes with per-pass Run / Stop / Rerun controls.
 
 void GuiApp::render_analysis_panel() {
     if (!ImGui::Begin("Analysis", &show_analysis_)) {
@@ -755,124 +757,68 @@ void GuiApp::render_analysis_panel() {
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     float panel_w = ImGui::GetContentRegionAvail().x;
+    bool running = analysis_running_.load();
 
-    // ── Pass Progress ───────────────────────────────────────────────
-    // Live view of every registered pass: state icon + progress bar +
-    // message.  Includes a Stop button for cancellation.
-    if (pass_manager_) {
-        bool running = analysis_running_.load();
-        auto all = pass_manager_->all_passes();
+    // ── Banner ──────────────────────────────────────────────────────
+    {
+        ImVec2 banner_p0 = ImGui::GetCursorScreenPos();
+        float banner_h = ImGui::GetFrameHeightWithSpacing();
+        draw->AddRectFilled(banner_p0,
+            ImVec2(banner_p0.x + panel_w, banner_p0.y + banner_h),
+            running ? IM_COL32(140, 110, 0, 60) : IM_COL32(20, 80, 30, 40));
 
-        if (running || !all.empty()) {
-            // Banner with spinner + Stop button
-            ImVec2 banner_p0 = ImGui::GetCursorScreenPos();
-            float banner_h = ImGui::GetFrameHeightWithSpacing();
-            draw->AddRectFilled(banner_p0,
-                ImVec2(banner_p0.x + panel_w, banner_p0.y + banner_h),
-                running ? IM_COL32(140, 110, 0, 60) : IM_COL32(20, 80, 30, 40));
+        if (running) {
+            static const char* spinner[] = {
+                "\xe2\xa3\xbe","\xe2\xa3\xbd","\xe2\xa3\xbb","\xe2\xa2\xbf",
+                "\xe2\xa1\xbf","\xe2\xa3\x9f","\xe2\xa3\xaf","\xe2\xa3\xb7"
+            };
+            static int spin_frame = 0;
+            spin_frame = (spin_frame + 1) % 8;
+            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f),
+                " %s  Analyzing...", spinner[spin_frame]);
 
-            if (running) {
-                static const char* spinner[] = {
-                    "\xe2\xa3\xbe","\xe2\xa3\xbd","\xe2\xa3\xbb","\xe2\xa2\xbf",
-                    "\xe2\xa1\xbf","\xe2\xa3\x9f","\xe2\xa3\xaf","\xe2\xa3\xb7"
-                };
-                static int spin_frame = 0;
-                spin_frame = (spin_frame + 1) % 8;
-                ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f),
-                    " %s  Analyzing...", spinner[spin_frame]);
-            } else {
-                ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f),
-                    " \xe2\x9c\x93  Analysis ready");
+            // Stop All button (right-aligned)
+            float btn_w = ImGui::CalcTextSize(" Stop All ").x + 20.0f;
+            ImGui::SameLine(panel_w - btn_w);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.75f, 0.20f, 0.20f, 1.0f));
+            if (ImGui::SmallButton(ICON_FA_STOP " Stop All")) {
+                if (pass_manager_) pass_manager_->cancel_all();
             }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Cancel all in-flight passes");
+        } else {
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f),
+                " " ICON_FA_CHECK "  Analysis ready");
 
-            // Stop button (right-aligned in the banner)
-            if (running) {
-                float btn_w = ImGui::CalcTextSize(" Stop ").x + 20.0f;
-                ImGui::SameLine(panel_w - btn_w);
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.75f, 0.20f, 0.20f, 1.0f));
-                if (ImGui::SmallButton("\xe2\x96\xa0 Stop")) {  // ■ (U+25A0, was ⏹ U+23F9 not in Apple Symbols)
-                    pass_manager_->cancel_all();
-                }
-                ImGui::PopStyleColor(3);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Cancel all in-flight passes");
+            // Clear All button (right-aligned)
+            float btn_w = ImGui::CalcTextSize(" Clear All ").x + 20.0f;
+            ImGui::SameLine(panel_w - btn_w);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.10f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::SmallButton(ICON_FA_XMARK " Clear All")) {
+                clear_analysis();
             }
-        }
-
-        // Per-pass progress list
-        for (auto name : all) {
-            auto st = pass_manager_->state(name);
-            float pct = pass_manager_->progress_of(name);
-
-            // Look up display name from catalog
-            std::string_view display = name;
-            if (auto* cat = tenet::find_pass_catalog_entry(name))
-                display = cat->display_name;
-
-            // State icon + name
-            const char* icon;
-            ImVec4 icon_color;
-            if (st == PassManager::PassState::Running) {
-                icon = "\xe2\x96\xb6";  // ▶
-                icon_color = ImVec4(1.0f, 0.9f, 0.2f, 1.0f);
-            } else if (st == PassManager::PassState::Completed) {
-                icon = "\xe2\x9c\x93";  // ✓
-                icon_color = ImVec4(0.35f, 0.90f, 0.45f, 1.0f);
-            } else if (st == PassManager::PassState::Failed) {
-                icon = "\xe2\x9c\x97";  // ✗
-                icon_color = ImVec4(0.90f, 0.30f, 0.30f, 1.0f);
-            } else {
-                icon = "\xe2\x8c\x9b";  // ⌛ (U+231B, was ⏳ U+23F3 not in Apple Symbols)
-                icon_color = ImVec4(0.45f, 0.50f, 0.60f, 1.0f);
-            }
-
-            ImGui::TextColored(icon_color, "%s", icon);
-            ImGui::SameLine(0, 4);
-            ImGui::TextUnformatted(std::string(display).c_str());
-
-            // Progress bar or status on the right
-            if (st == PassManager::PassState::Running) {
-                // Progress bar
-                float bar_w = 80.0f;
-                ImGui::SameLine(panel_w - bar_w - 50);
-                ImGui::ProgressBar(pct, ImVec2(bar_w, ImGui::GetFrameHeight() * 0.6f), "");
-                // Percentage text
-                ImGui::SameLine(0, 4);
-                ImGui::TextDisabled("%d%%", (int)(pct * 100));
-                // Progress message on next line (indented)
-                auto msg = pass_manager_->progress_msg_of(name);
-                if (!msg.empty()) {
-                    ImGui::Indent(16.0f);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.65f, 1.0f));
-                    ImGui::TextWrapped("%s", msg.c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::Unindent(16.0f);
-                }
-            } else if (st == PassManager::PassState::Completed) {
-                // Show summary
-                auto* raw = completed_result(name);
-                if (raw) {
-                    std::string summary = tenet::summarize_pass_result(name, *raw);
-                    if (!summary.empty() && summary != "ok") {
-                        ImGui::SameLine(panel_w - ImGui::CalcTextSize(summary.c_str()).x - 8);
-                        ImGui::TextDisabled("%s", summary.c_str());
-                    }
-                }
-            } else if (st == PassManager::PassState::Failed) {
-                // Per-pass cancel button for running passes
-                ImGui::SameLine(panel_w - 30);
-                if (ImGui::SmallButton(fmt::format("x##{}", name).c_str())) {
-                    pass_manager_->cancel(name);
-                }
-            }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Clear all analysis results and overlays");
         }
     }
 
-    ImGui::Dummy(ImVec2(0, 3));
+    ImGui::Dummy(ImVec2(0, 2));
 
-    // ── Section helper ──────────────────────────────────────────────
+    // ── Status line (last manual pass result) ───────────────────────
+    if (!last_pass_status_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+        ImGui::TextWrapped("%s", last_pass_status_.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2));
+    }
+
+    // ── Category header helper ──────────────────────────────────────
     auto section_header = [&](const char* title, ImVec4 color) {
         ImVec2 hp = ImGui::GetCursorScreenPos();
         draw->AddRectFilled(hp, ImVec2(hp.x + panel_w, hp.y + ImGui::GetFrameHeight()),
@@ -884,312 +830,172 @@ void GuiApp::render_analysis_panel() {
         ImGui::TextColored(color, "%s", title);
     };
 
-    // ── GROUP 1: Taint analysis ─────────────────────────────────────
-    section_header("  Taint Analysis", ImVec4(0.20f, 0.82f, 0.35f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 3));
+    // ── Category colors ─────────────────────────────────────────────
+    auto category_color = [](tenet::PassCategory c) -> ImVec4 {
+        switch (c) {
+            case tenet::PassCategory::Structure:   return {0.35f, 0.62f, 1.0f, 1.0f};
+            case tenet::PassCategory::Taint:       return {0.20f, 0.82f, 0.35f, 1.0f};
+            case tenet::PassCategory::Crypto:      return {0.90f, 0.70f, 0.20f, 1.0f};
+            case tenet::PassCategory::Memory:      return {0.75f, 0.55f, 1.0f, 1.0f};
+            case tenet::PassCategory::PlatformApi:  return {1.0f, 0.55f, 0.40f, 1.0f};
+            case tenet::PassCategory::Profile:     return {0.55f, 0.80f, 0.75f, 1.0f};
+            case tenet::PassCategory::Misc:        return {0.55f, 0.55f, 0.62f, 1.0f};
+        }
+        return {0.55f, 0.55f, 0.62f, 1.0f};
+    };
 
-    // Forward taint
-    {
-        bool active = show_taint_ && taint_result_;
-        if (active) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.35f, 0.12f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.45f, 0.15f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.12f, 0.55f, 0.18f, 1.0f));
+    auto category_label = [](tenet::PassCategory c) -> const char* {
+        switch (c) {
+            case tenet::PassCategory::Structure:   return "  Structure";
+            case tenet::PassCategory::Taint:       return "  Taint";
+            case tenet::PassCategory::Crypto:      return "  Crypto / Pattern";
+            case tenet::PassCategory::Memory:      return "  Memory / String";
+            case tenet::PassCategory::PlatformApi:  return "  ObjC / Platform API";
+            case tenet::PassCategory::Profile:     return "  Profile / Trace";
+            case tenet::PassCategory::Misc:        return "  Misc";
         }
-        if (ImGui::Button("Run Taint##fwd")) {
-            run_taint_analysis();
+        return "  Misc";
+    };
+
+    // ── Flat pass list (all catalog entries) ────────────────────────
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 2));
+
+    int cur_cat = -1;
+    for (const auto& entry : tenet::pass_catalog()) {
+        int ci = static_cast<int>(entry.category);
+        if (ci != cur_cat) {
+            cur_cat = ci;
+            if (ci != 0) ImGui::Dummy(ImVec2(0, 2));
+            section_header(category_label(entry.category),
+                           category_color(entry.category));
         }
-        if (active) ImGui::PopStyleColor(3);
+
+        // Determine pass state
+        auto st = PassManager::PassState::NotRun;
+        float pct = 0.0f;
+        if (pass_manager_) {
+            st = pass_manager_->state(entry.name);
+            pct = pass_manager_->progress_of(entry.name);
+        }
+
+        // State icon
+        const char* icon;
+        ImVec4 icon_color;
+        switch (st) {
+            case PassManager::PassState::Running:
+                icon = ICON_FA_PLAY;
+                icon_color = ImVec4(1.0f, 0.9f, 0.2f, 1.0f);
+                break;
+            case PassManager::PassState::Completed:
+                icon = ICON_FA_CHECK;
+                icon_color = ImVec4(0.35f, 0.90f, 0.45f, 1.0f);
+                break;
+            case PassManager::PassState::Failed:
+                icon = ICON_FA_XMARK;
+                icon_color = ImVec4(0.90f, 0.30f, 0.30f, 1.0f);
+                break;
+            default:  // NotRun
+                icon = "\xc2\xb7";  // · (middle dot)
+                icon_color = ImVec4(0.40f, 0.42f, 0.48f, 1.0f);
+                break;
+        }
+
+        ImGui::TextColored(icon_color, "%s", icon);
+        ImGui::SameLine(0, 4);
+
+        // Display name
+        ImGui::TextUnformatted(std::string(entry.display_name).c_str());
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Forward taint from selected register\nAnalysis > Taint to choose source");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.35f, 1.0f), "\xe2\x9c\x93");
+            ImGui::SetTooltip("%s\n(pass: %s%s)", entry.description.data(),
+                              entry.name.data(),
+                              entry.default_for_ui == tenet::PassDefault::Yes
+                                  ? ", auto" : "");
+
+        // ── Right-side controls ─────────────────────────────────────
+        // Lay out from right to left: [▶ Run] or [■ Stop] + [↺ Rerun]
+        // We use a fixed region at the right edge of the panel.
+
+        if (st == PassManager::PassState::Running) {
+            // Progress bar + percentage
+            float bar_w = 60.0f;
+            float stop_btn_w = ImGui::CalcTextSize(" " ICON_FA_STOP " ").x + 12.0f;
+            ImGui::SameLine(panel_w - bar_w - 50 - stop_btn_w);
+            ImGui::ProgressBar(pct, ImVec2(bar_w, ImGui::GetFrameHeight() * 0.6f), "");
             ImGui::SameLine(0, 4);
-            ImGui::Text("%llu tainted", (unsigned long long)taint_result_->tainted_inst_count());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##clrtaint")) {
-                show_taint_ = false;
+            ImGui::TextDisabled("%d%%", (int)(pct * 100));
+
+            // Stop button
+            ImGui::SameLine(0, 6);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.75f, 0.20f, 0.20f, 1.0f));
+            std::string stop_label = fmt::format(ICON_FA_STOP "##stop_{}", entry.name);
+            if (ImGui::SmallButton(stop_label.c_str())) {
+                if (pass_manager_) pass_manager_->cancel(entry.name);
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear taint overlay");
-        } else {
-            ImGui::TextDisabled("(not active)");
-        }
-    }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Cancel %s", entry.display_name.data());
 
-    // Backward taint
-    {
-        bool active = show_backward_taint_ && backward_taint_result_;
-        if (active) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f, 0.08f, 0.08f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.10f, 0.10f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
-        }
-        if (ImGui::Button("Run BackTaint")) {
-            run_backward_taint_analysis();
-        }
-        if (active) ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Backward taint from current instruction");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "\xe2\x9c\x93 active");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##clrbt")) {
-                show_backward_taint_ = false;
+            // Progress message on next line
+            if (pass_manager_) {
+                auto msg = pass_manager_->progress_msg_of(entry.name);
+                if (!msg.empty()) {
+                    ImGui::Indent(16.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.65f, 1.0f));
+                    ImGui::TextWrapped("%s", msg.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::Unindent(16.0f);
+                }
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear backward-taint overlay");
-        } else {
-            ImGui::TextDisabled("(not active)");
-        }
-    }
 
-    // Slice
-    {
-        bool active = show_slice_ && slice_result_;
-        if (ImGui::Button("Run Slice##slc")) {
-            run_slice_analysis();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Program slice for current instruction");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.80f, 0.25f, 0.80f, 1.0f), "\xe2\x9c\x93 active");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##clrslc")) { show_slice_ = false; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear slice overlay");
-        } else {
-            ImGui::TextDisabled("(not active)");
-        }
-    }
+        } else if (st == PassManager::PassState::Completed) {
+            // Summary text
+            auto* raw = completed_result(entry.name);
+            if (raw) {
+                std::string summary = tenet::summarize_pass_result(entry.name, *raw);
+                if (!summary.empty() && summary != "ok") {
+                    ImGui::SameLine(0, 8);
+                    ImGui::TextDisabled("%s", summary.c_str());
+                }
+            }
 
-    ImGui::Dummy(ImVec2(0, 4));
-
-    // ── GROUP 2: Code Structure ─────────────────────────────────────
-    section_header("  Code Structure", ImVec4(0.35f, 0.62f, 1.0f, 1.0f));
-
-    // Functions
-    {
-        bool active = (function_result_ != nullptr);
-        if (ImGui::Button("Run Functions##fn")) {
-            run_pass_by_name("function");
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Discover call/return pairs, build function list");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
-                "\xe2\x9c\x93 %zu functions", function_result_->functions.size());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("\xe2\x86\xba##rerun_fn")) {  // ↺
-                force_rerun_pass("function");
+            // Rerun button
+            float rerun_w = ImGui::CalcTextSize(" " ICON_FA_ARROW_ROTATE_LEFT " ").x + 12.0f;
+            ImGui::SameLine(panel_w - rerun_w);
+            std::string rerun_label = fmt::format(ICON_FA_ARROW_ROTATE_LEFT "##rerun_{}", entry.name);
+            if (ImGui::SmallButton(rerun_label.c_str())) {
+                force_rerun_pass(entry.name);
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Force re-run (discard disk cache)");
-        } else {
-            ImGui::TextDisabled("(not run)");
-        }
-    }
+                ImGui::SetTooltip("Force re-run %s (discard cache)", entry.display_name.data());
 
-    // Loops
-    {
-        bool active = show_loops_ && loop_result_;
-        if (active) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.35f, 0.18f, 0.02f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.25f, 0.03f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.30f, 0.04f, 1.0f));
-        }
-        if (ImGui::Button("Run Loops##lp")) {
-            run_pass_by_name("loop");
-        }
-        if (active) ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Detect loops (back-edges in CFG)");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.12f, 1.0f),
-                "\xe2\x9c\x93 %zu loops", loop_result_->loops.size());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x##clrlp")) { show_loops_ = false; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear loop overlay");
-        } else {
-            ImGui::TextDisabled("(not active)");
-        }
-    }
+        } else if (st == PassManager::PassState::Failed) {
+            // Error indicator + Run button to retry
+            ImGui::SameLine(0, 8);
+            ImGui::TextDisabled("failed");
 
-    // XRef
-    {
-        bool active = (xref_result_ != nullptr);
-        if (ImGui::Button("Run XRef##xref")) {
-            run_pass_by_name("xref");
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Build cross-reference index (PC → inst_ids)");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.65f, 0.75f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("\xe2\x86\xba##rerun_xref")) {  // ↺
-                force_rerun_pass("xref");
+            float run_w = ImGui::CalcTextSize(" " ICON_FA_PLAY " ").x + 12.0f;
+            ImGui::SameLine(panel_w - run_w);
+            std::string run_label = fmt::format(ICON_FA_PLAY "##run_{}", entry.name);
+            if (ImGui::SmallButton(run_label.c_str())) {
+                force_rerun_pass(entry.name);
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Force re-run (discard disk cache)");
+                ImGui::SetTooltip("Retry %s", entry.display_name.data());
+
         } else {
-            ImGui::TextDisabled("(not run)");
-        }
-    }
-
-    // CFG
-    {
-        bool active = (cfg_result_ != nullptr);
-        if (ImGui::Button("Run CFG##cfg")) {
-            run_cfg_layout();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Compute control-flow graph + layout for CFG view");
-        ImGui::SameLine();
-        if (active) {
-            ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
-        } else {
-            ImGui::TextDisabled("(not run)");
-        }
-    }
-
-    ImGui::Dummy(ImVec2(0, 4));
-
-    // ── GROUP 3: String & Call Graph ───────────────────────────────
-    section_header("  Strings / Calls", ImVec4(0.75f, 0.55f, 1.0f, 1.0f));
-
-    {
-        bool has_str = (string_result_ != nullptr);
-        if (ImGui::Button("Run Strings##str")) {
-            run_pass_by_name("strings");
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Find string accesses in the trace");
-        ImGui::SameLine();
-        if (has_str) {
-            ImGui::TextColored(ImVec4(0.78f, 0.62f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
-        } else {
-            ImGui::TextDisabled("(not run)");
-        }
-    }
-
-    {
-        bool has_cg = (call_graph_result_ != nullptr);
-        if (ImGui::Button("Run CallGraph##cg")) {
-            run_call_graph_analysis();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Build call graph across functions");
-        ImGui::SameLine();
-        if (has_cg) {
-            ImGui::TextColored(ImVec4(0.78f, 0.62f, 1.0f, 1.0f), "\xe2\x9c\x93 ready");
-        } else {
-            ImGui::TextDisabled("(not run)");
-        }
-    }
-
-    ImGui::Dummy(ImVec2(0, 6));
-
-    // ── GROUP 4: All Passes (full catalog) ─────────────────────────────
-    // Every pass in the registry is reachable here, so nothing is
-    // "GUI-only" or hidden. Default passes show ✓ once run at startup.
-    section_header("  All Passes", ImVec4(0.55f, 0.55f, 0.62f, 1.0f));
-    {
-        static bool show_all = false;
-        ImGui::Checkbox("Show full catalog", &show_all);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Expand to run any of the %d passes (incl. those without a dedicated button).",
-                              (int)tenet::pass_catalog().size());
-
-        if (!last_pass_status_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
-            ImGui::TextWrapped("%s", last_pass_status_.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        if (show_all) {
-            const char* cat_names[] = {
-                "Structure", "Taint", "Crypto/Pattern", "Memory/String",
-                "ObjC/Syscall", "Profile/Trace", "Misc"
-            };
-            auto cat_to_idx = [](tenet::PassCategory c) -> int {
-                switch (c) {
-                    case tenet::PassCategory::Structure:  return 0;
-                    case tenet::PassCategory::Taint:      return 1;
-                    case tenet::PassCategory::Crypto:     return 2;
-                    case tenet::PassCategory::Memory:     return 3;
-                    case tenet::PassCategory::ObjcSyscall:return 4;
-                    case tenet::PassCategory::Profile:    return 5;
-                    case tenet::PassCategory::Misc:       return 6;
-                }
-                return 6;
-            };
-
-            // Passes that persist results to the RocksDB blob cache.
-            // These get an extra ↺ button to force re-computation.
-            static constexpr std::string_view kBlobCachedPasses[] = {
-                "xref", "function", "constant_materialization"
-            };
-            auto has_blob_cache = [](std::string_view name) {
-                for (auto n : kBlobCachedPasses) if (n == name) return true;
-                return false;
-            };
-
-            int cur_cat = -1;
-            for (const auto& e : tenet::pass_catalog()) {
-                int ci = cat_to_idx(e.category);
-                if (ci != cur_cat) {
-                    cur_cat = ci;
-                    ImGui::Dummy(ImVec2(0, 2));
-                    ImGui::TextDisabled("%s", cat_names[ci]);
-                }
-                // Status indicator: ✓ if completed, · if not run.
-                bool done = pass_manager_ &&
-                            pass_manager_->state(e.name) ==
-                                PassManager::PassState::Completed;
-                std::string label = fmt::format("{}##cat", e.display_name);
-                if (done) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.30f, 0.16f, 1.0f));
-                }
-                if (ImGui::SmallButton(label.c_str())) {
-                    run_pass_by_name(e.name);
-                }
-                if (done) ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s\n(pass: %s%s)", e.description.data(),
-                                      e.name.data(),
-                                      e.default_for_ui == tenet::PassDefault::Yes
-                                          ? ", default" : "");
-                // For blob-cached passes that completed, show a ↺ re-run button.
-                if (done && has_blob_cache(e.name)) {
-                    ImGui::SameLine(0, 2);
-                    std::string rerun_label = fmt::format("\xe2\x86\xba##rerun_cat_{}", e.name);
-                    if (ImGui::SmallButton(rerun_label.c_str())) {
-                        force_rerun_pass(e.name);
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Force re-run %s (discard disk cache)", e.name.data());
-                }
-                ImGui::SameLine();
+            // NotRun — show Run button
+            float run_w = ImGui::CalcTextSize(" " ICON_FA_PLAY " ").x + 12.0f;
+            ImGui::SameLine(panel_w - run_w);
+            std::string run_label = fmt::format(ICON_FA_PLAY "##run_{}", entry.name);
+            if (ImGui::SmallButton(run_label.c_str())) {
+                run_pass_by_name(entry.name);
             }
-            ImGui::NewLine();  // wrap last row
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Run %s", entry.display_name.data());
         }
     }
-
-    ImGui::Dummy(ImVec2(0, 6));
-
-    // ── Clear All ───────────────────────────────────────────────────
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.10f, 0.10f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.15f, 0.15f, 1.0f));
-    if (ImGui::Button("  \xe2\x9c\x95  Clear All  ")) {  // ✕
-        clear_analysis();
-    }
-    ImGui::PopStyleColor(3);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Clear all analysis results and overlays");
 
     ImGui::PopStyleVar();  // ItemSpacing
     ImGui::End();
