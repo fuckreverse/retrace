@@ -61,6 +61,10 @@ public:
     /// Optional Basic Auth.  Empty strings = no auth required.
     void set_auth(const std::string& username, const std::string& password);
 
+    /// Enable/disable session ID requirement (default: false = no session needed).
+    /// When disabled, Mcp-Session-Id header is neither issued nor checked.
+    void set_require_session(bool require) { require_session_ = require; }
+
     /// Start listener thread (non-blocking).
     bool start();
 
@@ -117,6 +121,7 @@ private:
     bool        auth_enabled_ = false;
 
     // Session: single active session (tenet is single-trace, single-session)
+    bool        require_session_ = false;  // when false, skip session ID check entirely
     std::mutex  session_mutex_;
     std::string session_id_;          // empty = no active session
     bool        session_ever_created_ = false; // true once first initialize completes

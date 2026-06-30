@@ -117,9 +117,11 @@ bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
     if (!cfg.username.empty()) {
         http_transport_->set_auth(cfg.username, cfg.password);
     }
+    http_transport_->set_require_session(cfg.require_session);
     bool ok = http_transport_->start();
     if (ok) {
-        mcp_log(fmt::format("Streamable HTTP server started on {}:{}", cfg.host, cfg.port));
+        mcp_log(fmt::format("Streamable HTTP server started on {}:{} (session: {})",
+                            cfg.host, cfg.port, cfg.require_session ? "required" : "disabled"));
     }
     return ok;
 }

@@ -42,6 +42,7 @@ struct McpHttpConfig {
     uint16_t    port     = 7080;
     std::string username;                ///< Basic Auth username (empty = no auth)
     std::string password;
+    bool require_session = false;        ///< Require Mcp-Session-Id header (default: disabled)
 };
 
 // ─── MCP Protocol over stdio ───────────────────────────────────────────────

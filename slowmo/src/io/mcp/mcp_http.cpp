@@ -444,41 +444,44 @@ void McpHttpTransport::handle_client(int client_fd) {
             // Dispatch to handler (initialize is inherently single-shot)
             json response = handler_(msg);
 
-            // Assign a new session ID
-            std::string new_session_id = generate_uuid();
-            {
-                std::lock_guard<std::mutex> lk(session_mutex_);
-                session_id_ = new_session_id;
-                session_ever_created_ = true;
+            std::string session_hdr;
+            if (require_session_) {
+                // Assign a new session ID
+                std::string new_session_id = generate_uuid();
+                {
+                    std::lock_guard<std::mutex> lk(session_mutex_);
+                    session_id_ = new_session_id;
+                    session_ever_created_ = true;
+                }
+                mcp_http_log(fmt::format("Session created: {}", new_session_id));
+                session_hdr = fmt::format("Mcp-Session-Id: {}", new_session_id);
             }
 
-            mcp_http_log(fmt::format("Session created: {}", new_session_id));
-
-            // Send response with Mcp-Session-Id header
-            std::string session_hdr = fmt::format("Mcp-Session-Id: {}", new_session_id);
             send_http_response(client_fd, 200, "application/json",
                                response.dump(), session_hdr);
             return;
         }
 
-        // ── All other requests: require valid session ──────────────────
-        if (!check_session(req, client_fd)) return;
+        // ── All other requests: require valid session (if enabled) ─────
+        if (require_session_) {
+            if (!check_session(req, client_fd)) return;
 
-        // If there is still no active session after check_session (e.g. after
-        // a DELETE terminated the session and no initialize was sent), return a
-        // helpful error that guides the client to re-initialize.
-        {
-            std::lock_guard<std::mutex> lk(session_mutex_);
-            if (session_id_.empty()) {
-                auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
-                json err_resp = {
-                    {"jsonrpc", "2.0"},
-                    {"id", msg_id},
-                    {"error", {{"code", -32600},
-                               {"message", "No active session. Send initialize to start a new session."}}}
-                };
-                send_http_response(client_fd, 400, "application/json", err_resp.dump());
-                return;
+            // If there is still no active session after check_session (e.g. after
+            // a DELETE terminated the session and no initialize was sent), return a
+            // helpful error that guides the client to re-initialize.
+            {
+                std::lock_guard<std::mutex> lk(session_mutex_);
+                if (session_id_.empty()) {
+                    auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
+                    json err_resp = {
+                        {"jsonrpc", "2.0"},
+                        {"id", msg_id},
+                        {"error", {{"code", -32600},
+                                   {"message", "No active session. Send initialize to start a new session."}}}
+                    };
+                    send_http_response(client_fd, 400, "application/json", err_resp.dump());
+                    return;
+                }
             }
         }
 
@@ -503,9 +506,9 @@ void McpHttpTransport::handle_client(int client_fd) {
             return;
         }
 
-        // Return Mcp-Session-Id in all responses
+        // Return Mcp-Session-Id in all responses (only when session is enabled)
         std::string session_hdr;
-        {
+        if (require_session_) {
             std::lock_guard<std::mutex> lk(session_mutex_);
             if (!session_id_.empty()) {
                 session_hdr = fmt::format("Mcp-Session-Id: {}", session_id_);
@@ -518,16 +521,22 @@ void McpHttpTransport::handle_client(int client_fd) {
 
     // ── DELETE /mcp — terminate session ───────────────────────────────
     if (req.path == "/mcp" && req.method == "DELETE") {
-        if (!check_session(req, client_fd)) return;
+        if (require_session_) {
+            if (!check_session(req, client_fd)) return;
 
-        {
-            std::lock_guard<std::mutex> lk(session_mutex_);
-            mcp_http_log(fmt::format("Session terminated: {}", session_id_));
-            session_id_.clear();
+            {
+                std::lock_guard<std::mutex> lk(session_mutex_);
+                mcp_http_log(fmt::format("Session terminated: {}", session_id_));
+                session_id_.clear();
+            }
+
+            send_http_response(client_fd, 200, "application/json",
+                               R"({"status":"session_terminated"})");
+        } else {
+            // Session management disabled — DELETE is a no-op
+            send_http_response(client_fd, 200, "application/json",
+                               R"({"status":"ok","message":"Session management disabled"})");
         }
-
-        send_http_response(client_fd, 200, "application/json",
-                           R"({"status":"session_terminated"})");
         return;
     }
 
