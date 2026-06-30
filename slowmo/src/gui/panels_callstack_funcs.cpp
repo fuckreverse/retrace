@@ -346,11 +346,11 @@ void GuiApp::render_functions_panel() {
     // Table
     ImGuiTableFlags table_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+        ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
 
     if (ImGui::BeginTable("FunctionsTable", 3, table_flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, 1);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
         ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 50.0f, 0);
         ImGui::TableSetupColumn("Insts", ImGuiTableColumnFlags_WidthFixed, 60.0f, 3);
         ImGui::TableHeadersRow();

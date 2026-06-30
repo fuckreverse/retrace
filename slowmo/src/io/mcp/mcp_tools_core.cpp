@@ -175,12 +175,12 @@ void TenetMcpService::register_query_tools() {
                     const auto& xref_raw = require_pass_nb(pm_, "xref");
                     if (xref_raw.ok()) {
                         const auto& xref = xref_raw.get<XrefResult>();
-                        auto ids = xref.inst_ids_at(runtime_pc);
-                        if (ids.empty())
+                        uint64_t first = xref.first_inst_id_at(runtime_pc);
+                        if (first == UINT64_MAX)
                             throw std::runtime_error(fmt::format(
                                 "No instruction found at PC {}. Use search_pc to check execution history.",
                                 args.at("pc").get<std::string>()));
-                        inst_id = ids.front();
+                        inst_id = first;
                     }
                 }
             } else {

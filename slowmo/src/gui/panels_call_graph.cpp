@@ -37,9 +37,7 @@ static std::string node_label(const CallGraphNode& node) {
 /// Returns UINT64_MAX when navigation is not possible.
 static uint64_t pc_to_inst_id(const XrefResult* xref, uint64_t pc) {
     if (!xref) return UINT64_MAX;
-    auto ids = xref->inst_ids_at(pc);
-    if (ids.empty()) return UINT64_MAX;
-    return ids.front();
+    return xref->first_inst_id_at(pc);
 }
 
 // ── Panel ───────────────────────────────────────────────────────────────────

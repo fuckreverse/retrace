@@ -198,7 +198,6 @@ private:
     GuiSettings settings_;
     bool settings_font_dirty_ = false;   // Font needs rebuild
     std::vector<std::string> available_fonts_;  // Cached list
-    std::string imgui_ini_path_;          // Persistent path for io.IniFilename
 
     // ─── MCP HTTP SSE server (in-GUI mode) ───────────────────────────
     // When the user starts the MCP server from the Settings panel, the

@@ -415,8 +415,8 @@ void GuiApp::render_cfg_panel() {
             cfg_block_cursor_   = 0;
             // Auto-navigate to first execution of this block
             if (xref_result_) {
-                auto ids = xref_result_->inst_ids_at(clicked_block);
-                if (!ids.empty()) navigate_to(ids[0]);
+                uint64_t first = xref_result_->first_inst_id_at(clicked_block);
+                if (first != UINT64_MAX) navigate_to(first);
             }
         }
     }
@@ -689,11 +689,11 @@ void GuiApp::render_cfg_panel() {
         // Navigation
         if (ImGui::MenuItem("Navigate to Block Entry")) {
             if (xref_result_) {
-                auto ids = xref_result_->inst_ids_at(ctx_inst_pc_);
-                if (!ids.empty()) {
+                uint64_t first = xref_result_->first_inst_id_at(ctx_inst_pc_);
+                if (first != UINT64_MAX) {
                     cfg_selected_block_ = ctx_inst_pc_;
                     cfg_block_cursor_ = 0;
-                    navigate_to(ids[0]);
+                    navigate_to(first);
                 }
             }
         }

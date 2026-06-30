@@ -59,6 +59,10 @@ struct XrefBitmapLoader {
     /// Same as load_inst_ids but loads into a Roaring64Map.
     roaring::Roaring64Map load_bitmap(uint64_t pc) const;
 
+    /// Return the minimum inst_id for the given PC (O(1) on Roaring bitmap).
+    /// Returns UINT64_MAX on miss.
+    uint64_t first_inst_id(uint64_t pc) const;
+
     /// Find the exec_count for a given PC from the table (no file I/O).
     uint64_t exec_count(uint64_t pc) const;
 
@@ -135,6 +139,12 @@ struct XrefResult {
     ///
     /// Returns empty vector if PC not found in either store.
     std::vector<uint64_t> inst_ids_at(uint64_t pc) const;
+
+    /// Return the first (minimum) inst_id at a given PC.
+    /// O(1) for in-memory bitmaps, O(bitmap_bytes) for lazy-loaded but avoids
+    /// expanding the full bitmap into a vector.
+    /// Returns UINT64_MAX if PC not found.
+    uint64_t first_inst_id_at(uint64_t pc) const;
 
     /// Load the full bitmap for a PC (same backing store as inst_ids_at).
     roaring::Roaring64Map bitmap_at(uint64_t pc) const;

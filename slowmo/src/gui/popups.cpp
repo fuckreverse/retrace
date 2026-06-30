@@ -91,9 +91,9 @@ void GuiApp::goto_commit(const char* buf) {
 
         // Try xref index first (exact PC hit)
         if (xref_result_) {
-            auto ids = xref_result_->inst_ids_at(runtime);
-            if (!ids.empty()) {
-                navigate_to(ids[0]);
+            uint64_t first = xref_result_->first_inst_id_at(runtime);
+            if (first != UINT64_MAX) {
+                navigate_to(first);
                 return true;
             }
         }

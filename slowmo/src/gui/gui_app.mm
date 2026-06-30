@@ -108,14 +108,9 @@ bool GuiApp::init_imgui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
-    // Pin imgui.ini to ~/.config/tenet/ so it doesn't land in the CWD
-    {
-        std::string dir = GuiSettings::default_path();
-        auto sep = dir.rfind('/');
-        if (sep != std::string::npos) dir.resize(sep);
-        imgui_ini_path_ = dir + "/imgui.ini";
-        io.IniFilename = imgui_ini_path_.c_str();
-    }
+    // Disable imgui.ini persistence — window/table layout is fully managed
+    // by our own GuiSettings and code-side TableSetupColumn defaults.
+    io.IniFilename = nullptr;
 
     // Setup platform/renderer backends
     ImGui_ImplSDL3_InitForMetal(window_);

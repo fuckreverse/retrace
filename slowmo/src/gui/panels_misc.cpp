@@ -312,7 +312,7 @@ void GuiApp::render_strings_panel() {
     if (ImGui::BeginTable("StringsTable", 5,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_SizingStretchProp)) {
+            ImGuiTableFlags_SizingFixedFit)) {
 
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 120.0f);
@@ -736,9 +736,8 @@ void GuiApp::render_progress_overlay() {
             loop_header_cache_.first_inst_ids.clear();
             loop_header_cache_.first_inst_ids.reserve(loop_result_->loops.size());
             for (const auto& loop : loop_result_->loops) {
-                auto inst_ids = xref_result_->inst_ids_at(loop.header_pc);
                 loop_header_cache_.first_inst_ids.push_back(
-                    inst_ids.empty() ? UINT64_MAX : inst_ids.front());
+                    xref_result_->first_inst_id_at(loop.header_pc));
             }
             loop_header_cache_.loop_src = loop_result_;
             loop_header_cache_.xref_src = xref_result_;

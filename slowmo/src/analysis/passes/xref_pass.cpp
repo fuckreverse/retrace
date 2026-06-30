@@ -346,7 +346,33 @@ uint64_t XrefBitmapLoader::exec_count(uint64_t pc) const {
     return it->exec_count;
 }
 
-// ─── XrefResult::inst_ids_at / bitmap_at ─────────────────────────────────────
+uint64_t XrefBitmapLoader::first_inst_id(uint64_t pc) const {
+    if (!valid) return UINT64_MAX;
+    auto it = std::lower_bound(table.begin(), table.end(), pc,
+        [](const Entry& e, uint64_t v){ return e.pc < v; });
+    if (it == table.end() || it->pc != pc) return UINT64_MAX;
+
+    std::lock_guard<std::mutex> lk(file_mutex_);
+    FILE* f = ensure_open();
+    if (!f) return UINT64_MAX;
+
+    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0)
+        return UINT64_MAX;
+
+    uint64_t bm_bytes = 0;
+    if (std::fread(&bm_bytes, 8, 1, f) != 1 || bm_bytes == 0)
+        return UINT64_MAX;
+
+    std::vector<char> buf(static_cast<size_t>(bm_bytes));
+    if (std::fread(buf.data(), 1, buf.size(), f) != buf.size())
+        return UINT64_MAX;
+
+    roaring::Roaring64Map bm = roaring::Roaring64Map::readSafe(buf.data(), buf.size());
+    if (bm.isEmpty()) return UINT64_MAX;
+    return bm.minimum();
+}
+
+// ─── XrefResult::inst_ids_at / first_inst_id_at / bitmap_at ──────────────────
 
 std::vector<uint64_t> XrefResult::inst_ids_at(uint64_t pc) const {
     // Fast path: in-memory map (partial traces or freshly computed)
@@ -363,6 +389,21 @@ std::vector<uint64_t> XrefResult::inst_ids_at(uint64_t pc) const {
         return lazy_loader->load_inst_ids(pc);
     }
     return {};
+}
+
+uint64_t XrefResult::first_inst_id_at(uint64_t pc) const {
+    // Fast path: in-memory map
+    if (!pc_to_inst_ids.empty()) {
+        auto it = pc_to_inst_ids.find(pc);
+        if (it == pc_to_inst_ids.end()) return UINT64_MAX;
+        if (it->second.isEmpty()) return UINT64_MAX;
+        return it->second.minimum();  // O(1) on Roaring bitmap
+    }
+    // Lazy path: read from file
+    if (lazy_loader && lazy_loader->valid) {
+        return lazy_loader->first_inst_id(pc);
+    }
+    return UINT64_MAX;
 }
 
 roaring::Roaring64Map XrefResult::bitmap_at(uint64_t pc) const {
