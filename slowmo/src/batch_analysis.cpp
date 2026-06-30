@@ -819,27 +819,33 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             rc |= 1;
         } else {
             const auto& td_result = td_raw.get<TraceDiffResult>();
-            fmt::print(stderr, "[trace-diff] {} diverged, {} register diffs, {} control-flow diffs\n",
-                       td_result.diverged_count, td_result.register_value_diffs().size(),
-                       td_result.control_flow_diffs().size());
+            fmt::print(stderr, "[trace-diff] {} total_diverged, {} segments\n",
+                       td_result.total_diverged, td_result.segments.size());
             json td_json;
-            td_json["diverged_count"] = td_result.diverged_count;
-            td_json["matched_count"] = td_result.matched_count;
-            td_json["has_divergence"] = td_result.has_divergence();
-            json diffs_arr = json::array();
-            size_t limit = std::min(td_result.diffs.size(), size_t(500));
+            td_json["matched_count"]   = td_result.matched_count;
+            td_json["total_diverged"]  = td_result.total_diverged;
+            td_json["resync_count"]    = td_result.resync_count;
+            td_json["truncated"]       = td_result.truncated;
+            json segs_arr = json::array();
+            size_t limit = std::min(td_result.segments.size(), size_t(500));
             for (size_t i = 0; i < limit; i++) {
-                const auto& d = td_result.diffs[i];
-                diffs_arr.push_back({
-                    {"pc", fmt::format("0x{:X}", d.pc)},
-                    {"offset_a", d.inst_offset_a},
-                    {"offset_b", d.inst_offset_b},
-                    {"type", static_cast<int>(d.type)},
-                    {"detail", d.detail}
+                const auto& s = td_result.segments[i];
+                segs_arr.push_back({
+                    {"start_inst_a", s.start_inst_a},
+                    {"start_inst_b", s.start_inst_b},
+                    {"start_pc", fmt::format("0x{:X}", s.start_pc)},
+                    {"type", std::string(diff_type_name(s.start_type))},
+                    {"detail", s.start_detail},
+                    {"resynced", s.resynced},
+                    {"resync_inst_a", s.resync_inst_a},
+                    {"resync_inst_b", s.resync_inst_b},
+                    {"resync_pc", fmt::format("0x{:X}", s.resync_pc)},
+                    {"skip_a", s.skip_a},
+                    {"skip_b", s.skip_b}
                 });
             }
-            td_json["diffs"] = std::move(diffs_arr);
-            if (td_result.diffs.size() > 500) td_json["truncated"] = true;
+            td_json["segments"] = std::move(segs_arr);
+            if (td_result.segments.size() > 500) td_json["truncated"] = true;
             fmt::print("{}\n", td_json.dump(2));
         }
     }

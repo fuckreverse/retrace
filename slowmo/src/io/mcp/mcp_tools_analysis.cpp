@@ -963,23 +963,30 @@ void TenetMcpService::register_pass_tools() {
             pm_->register_pass(std::make_unique<TraceDiffPass>(std::move(cfg)));
             const auto& result = require_pass<TraceDiffResult>(pm_, "trace_diff", "Trace diff failed");
 
-            json diffs_arr = json::array();
-            size_t limit = std::min(result.diffs.size(), size_t(200));
+            json segs_arr = json::array();
+            size_t limit = std::min(result.segments.size(), size_t(200));
             for (size_t i = 0; i < limit; i++) {
-                const auto& d = result.diffs[i];
-                diffs_arr.push_back({
-                    {"pc", fmt::format("0x{:X}", rebase(d.pc))},
-                    {"inst_offset_a", d.inst_offset_a},
-                    {"inst_offset_b", d.inst_offset_b},
-                    {"type", static_cast<int>(d.type)},
-                    {"detail", d.detail}
+                const auto& s = result.segments[i];
+                segs_arr.push_back({
+                    {"start_inst_a", s.start_inst_a},
+                    {"start_inst_b", s.start_inst_b},
+                    {"start_pc", fmt::format("0x{:X}", rebase(s.start_pc))},
+                    {"type", std::string(diff_type_name(s.start_type))},
+                    {"detail", s.start_detail},
+                    {"resynced", s.resynced},
+                    {"resync_inst_a", s.resync_inst_a},
+                    {"resync_inst_b", s.resync_inst_b},
+                    {"resync_pc", fmt::format("0x{:X}", rebase(s.resync_pc))},
+                    {"skip_a", s.skip_a},
+                    {"skip_b", s.skip_b}
                 });
             }
-            return {{"diffs", std::move(diffs_arr)},
+            return {{"segments", std::move(segs_arr)},
                     {"matched_count", result.matched_count},
-                    {"diverged_count", result.diverged_count},
+                    {"total_diverged", result.total_diverged},
+                    {"resync_count", result.resync_count},
                     {"has_divergence", result.has_divergence()},
-                    {"truncated", result.diffs.size() > limit}};
+                    {"truncated", result.truncated}};
         }
     );
 

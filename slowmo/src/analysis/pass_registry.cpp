@@ -530,7 +530,7 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
     if (name == "trace_diff") {
         if (auto* r = try_get<TraceDiffResult>(result))
             return fmt::format("diverged: {}, matched: {}",
-                               r->diverged_count, r->matched_count);
+                               r->total_diverged, r->matched_count);
     }
     if (name == "dataflow_graph") {
         if (auto* r = try_get<DataflowGraphResult>(result))

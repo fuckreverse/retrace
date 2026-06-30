@@ -165,18 +165,10 @@ void GuiApp::render_trace_diff_panel() {
                            (unsigned long long)dr.matched_count);
     } else {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                           "⚡  %llu divergences found   |   %llu matched",
-                           (unsigned long long)dr.diverged_count,
-                           (unsigned long long)dr.matched_count);
-    }
-
-    if (!dr.diverge_points.empty()) {
-        ImGui::SameLine(0, 16);
-        char dp_str[64];
-        snprintf(dp_str, sizeof(dp_str), "%zu diverge PCs", dr.diverge_points.size());
-        if (ImGui::SmallButton(dp_str)) {
-            // TODO: show diverge-point list popup
-        }
+                           "⚡  %llu diverged   |   %llu matched   |   %llu segments",
+                           (unsigned long long)dr.total_diverged,
+                           (unsigned long long)dr.matched_count,
+                           (unsigned long long)dr.segments.size());
     }
 
     ImGui::Separator();
@@ -200,14 +192,14 @@ void GuiApp::render_trace_diff_panel() {
     // ── Main diff table ──────────────────────────────────────────────────
 
     // Build filtered list
-    static std::vector<const DiffEntry*> filtered;
+    static std::vector<const DivergeSegment*> filtered;
     filtered.clear();
-    for (const auto& d : dr.diffs) {
-        if (!show_cf     && d.type == DiffType::ControlFlow)   continue;
-        if (!show_reg    && d.type == DiffType::RegisterValue)  continue;
-        if (!show_mem    && d.type == DiffType::MemoryValue)    continue;
-        if (!show_opcode && d.type == DiffType::OpcodeChange)   continue;
-        filtered.push_back(&d);
+    for (const auto& s : dr.segments) {
+        if (!show_cf     && s.start_type == DiffType::ControlFlow)   continue;
+        if (!show_reg    && s.start_type == DiffType::RegisterValue)  continue;
+        if (!show_mem    && s.start_type == DiffType::MemoryValue)    continue;
+        if (!show_opcode && s.start_type == DiffType::OpcodeChange)   continue;
+        filtered.push_back(&s);
     }
 
     const float avail_h = ImGui::GetContentRegionAvail().y - 4.0f;
@@ -218,8 +210,8 @@ void GuiApp::render_trace_diff_panel() {
             ImVec2(0, avail_h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Type",      ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn("Offset A",  ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Offset B",  ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Inst A",    ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Inst B",    ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("PC",        ImGuiTableColumnFlags_WidthFixed, 140.0f);
         ImGui::TableSetupColumn("Detail",    ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
@@ -229,13 +221,13 @@ void GuiApp::render_trace_diff_panel() {
         clipper.Begin((int)filtered.size());
         while (clipper.Step()) {
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
-                const DiffEntry* e = filtered[i];
+                const DivergeSegment* s = filtered[i];
                 ImGui::TableNextRow();
 
                 // Row background based on type
                 ImVec4 type_col;
                 const char* type_str;
-                switch (e->type) {
+                switch (s->start_type) {
                     case DiffType::ControlFlow:
                         type_col = ImVec4(1.0f, 0.5f, 0.2f, 1.0f);
                         type_str = "ControlFlow";
@@ -261,25 +253,24 @@ void GuiApp::render_trace_diff_panel() {
                 ImGui::TextColored(type_col, "%s", type_str);
 
                 ImGui::TableNextColumn();
-                ImGui::Text("%llu", (unsigned long long)e->inst_offset_a);
+                ImGui::Text("%llu", (unsigned long long)s->start_inst_a);
 
                 ImGui::TableNextColumn();
-                ImGui::Text("%llu", (unsigned long long)e->inst_offset_b);
+                ImGui::Text("%llu", (unsigned long long)s->start_inst_b);
 
                 ImGui::TableNextColumn();
                 char pc_str[24];
-                snprintf(pc_str, sizeof(pc_str), "0x%llx", (unsigned long long)e->pc);
+                snprintf(pc_str, sizeof(pc_str), "0x%llx", (unsigned long long)s->start_pc);
                 bool sel = ((size_t)i == diff_cursor_);
                 if (ImGui::Selectable(pc_str, sel,
                         ImGuiSelectableFlags_SpanAllColumns)) {
                     diff_cursor_ = (size_t)i;
-                    // Navigate to region A offset
-                    uint64_t target = diff_region_a_start_ + e->inst_offset_a;
-                    if (target < total_inst_) navigate_to(target);
+                    // Navigate to divergence start in trace A
+                    if (s->start_inst_a < total_inst_) navigate_to(s->start_inst_a);
                 }
 
                 ImGui::TableNextColumn();
-                ImGui::TextDisabled("%s", e->detail.c_str());
+                ImGui::TextDisabled("%s", s->start_detail.c_str());
             }
         }
         clipper.End();
