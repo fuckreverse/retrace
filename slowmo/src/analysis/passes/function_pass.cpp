@@ -92,7 +92,8 @@ std::string function_serialize(const FunctionResult& res) {
     return buf;
 }
 
-bool function_deserialize(const std::string& blob, FunctionResult& out) {
+bool function_deserialize(const std::string& blob, FunctionResult& out,
+                          bool full_mode = false) {
     if (blob.size() < 4 + 4 + 8) return false;
     const char* p = blob.data();
     const char* end = p + blob.size();
@@ -105,7 +106,14 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
     if (read_u32() != FUNC_BLOB_VERSION) return false;
 
     uint64_t n_events = read_u64();
-    out.call_events.reserve(static_cast<size_t>(n_events));
+    // In default mode: apply the same cap as during live analysis so loading a
+    // legacy blob (written before the cap was in place) does not exhaust memory.
+    // In full_mode: load everything.
+    static constexpr size_t kMaxCallEvents = 20'000'000;
+    const uint64_t load_events = full_mode
+        ? n_events
+        : std::min(n_events, (uint64_t)kMaxCallEvents);
+    out.call_events.reserve(static_cast<size_t>(load_events));
 
     for (uint64_t i = 0; i < n_events; i++) {
         if (p + 48 > end) return false;
@@ -117,7 +125,10 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
         evt.depth          = read_u64();
         evt.is_tail_call   = read_u8() != 0;
         p += 7;  // skip padding
-        out.call_events.push_back(evt);
+        // Only store events within the cap; consume the bytes regardless.
+        if (i < load_events) {
+            out.call_events.push_back(evt);
+        }
     }
 
     if (p + 8 > end) return false;
@@ -136,10 +147,27 @@ bool function_deserialize(const std::string& blob, FunctionResult& out) {
         p += name_len;
         if (p + 8 > end) return false;
         uint64_t n_idx = read_u64();
-        fi.call_event_indices.reserve(static_cast<size_t>(n_idx));
         if (p + n_idx * 8 > end) return false;
+        // In default mode: apply the same cap as end() so deserialized data
+        // doesn't exceed the in-memory limit even with legacy blobs.
+        // In full_mode: load all indices (filtered only for validity).
+        static constexpr size_t kMaxCallEventIndices = 1000;
+        const uint64_t load_idx = full_mode
+            ? n_idx
+            : std::min(n_idx, (uint64_t)kMaxCallEventIndices);
+        fi.call_event_indices.reserve(static_cast<size_t>(load_idx));
+        // How many valid call_event_indices to keep (capped and within bounds)
+        size_t loaded_idx_count = 0;
         for (uint64_t j = 0; j < n_idx; j++) {
-            fi.call_event_indices.push_back(static_cast<size_t>(read_u64()));
+            uint64_t idx_val = read_u64();  // must consume all bytes
+            // Filter: only include indices that are within the loaded
+            // call_events array.  This handles legacy blobs that were written
+            // before the cap existed.
+            if (loaded_idx_count < load_idx &&
+                idx_val < out.call_events.size()) {
+                fi.call_event_indices.push_back(static_cast<size_t>(idx_val));
+                ++loaded_idx_count;
+            }
         }
         out.functions.emplace(fi.entry_pc, std::move(fi));
     }
@@ -371,11 +399,13 @@ const FunctionInfo* FunctionResult::function_at(uint64_t inst_id) const {
 FunctionCollector::FunctionCollector(CodeTable& code_table,
                                      uint64_t module_slide,
                                      uint32_t num_gpr,
-                                     bool has_branch_hint)
+                                     bool has_branch_hint,
+                                     bool full_mode)
     : code_table_(code_table)
     , module_slide_(module_slide)
     , num_gpr_(num_gpr)
     , has_branch_hint_(has_branch_hint)
+    , full_mode_(full_mode)
 {}
 
 // ── Phase-1 helper: binary-search lookup in sorted flat array ────────────
@@ -436,7 +466,13 @@ bool FunctionCollector::begin(uint64_t /*start_inst_id*/, uint64_t /*end_inst_id
 
     // Pre-size branch_events_ — heuristic: branch instructions are ~10-20% of
     // unique PCs; their execution count is ~2-5% of total instructions.
-    branch_events_.reserve(std::max(pc_kind_sorted_.size() * 8, size_t(4096)));
+    // In default (capped) mode: cap at 4M entries (~192 MB) to avoid
+    // over-committing on huge traces.  In full_mode the cap is lifted.
+    const size_t raw_reserve = std::max(pc_kind_sorted_.size() * 8, size_t(4096));
+    static constexpr size_t kMaxBranchReserve = 4 * 1024 * 1024;  // 4M entries
+    branch_events_.reserve(
+        full_mode_ ? raw_reserve
+                   : std::min(raw_reserve, kMaxBranchReserve));
 
     return true;
 }
@@ -527,11 +563,19 @@ void FunctionCollector::on_inst(uint64_t inst_id, const InstView& inst) {
 void FunctionCollector::handle_deferred_ret(uint64_t ret_dest_pc, uint64_t ret_inst_id) {
     if (call_stack_.empty()) return;
 
+    // Helper: fill return_inst_id only when the frame was actually recorded
+    // (call_event_idx != SIZE_MAX).  Frames above the cap are sentinel-only.
+    auto fill_return = [&](const StackFrame& frame) {
+        if (frame.call_event_idx != SIZE_MAX) {
+            result_.call_events[frame.call_event_idx].return_inst_id = ret_inst_id;
+            result_.return_site_map_[ret_inst_id] = frame.call_event_idx;
+        }
+    };
+
     if (call_stack_.back().return_pc == ret_dest_pc) {
         // Fast path: top of stack matches (most common case).
         auto& top = call_stack_.back();
-        result_.call_events[top.call_event_idx].return_inst_id = ret_inst_id;
-        result_.return_site_map_[ret_inst_id] = top.call_event_idx;
+        fill_return(top);
         auto rc_it = ret_pc_refcount_.find(top.return_pc);
         if (rc_it != ret_pc_refcount_.end()) {
             if (--rc_it->second == 0) ret_pc_refcount_.erase(rc_it);
@@ -546,7 +590,7 @@ void FunctionCollector::handle_deferred_ret(uint64_t ret_dest_pc, uint64_t ret_i
                     // Non-local unwind: pop all frames above i.
                     for (int j = static_cast<int>(call_stack_.size()) - 1; j > i; --j) {
                         auto& frame = call_stack_[j];
-                        result_.call_events[frame.call_event_idx].return_inst_id = ret_inst_id;
+                        fill_return(frame);
                         auto rc2 = ret_pc_refcount_.find(frame.return_pc);
                         if (rc2 != ret_pc_refcount_.end()) {
                             if (--rc2->second == 0) ret_pc_refcount_.erase(rc2);
@@ -555,9 +599,7 @@ void FunctionCollector::handle_deferred_ret(uint64_t ret_dest_pc, uint64_t ret_i
                         non_local_unwinds_++;
                     }
                     // Pop frame i itself.
-                    result_.call_events[call_stack_[i].call_event_idx].return_inst_id = ret_inst_id;
-                    result_.return_site_map_[ret_inst_id] =
-                        static_cast<size_t>(call_stack_[i].call_event_idx);
+                    fill_return(call_stack_[i]);
                     auto rc3 = ret_pc_refcount_.find(call_stack_[i].return_pc);
                     if (rc3 != ret_pc_refcount_.end()) {
                         if (--rc3->second == 0) ret_pc_refcount_.erase(rc3);
@@ -569,8 +611,7 @@ void FunctionCollector::handle_deferred_ret(uint64_t ret_dest_pc, uint64_t ret_i
         } else {
             // Destination not in stack — fallback: pop top frame.
             auto& top = call_stack_.back();
-            result_.call_events[top.call_event_idx].return_inst_id = ret_inst_id;
-            result_.return_site_map_[ret_inst_id] = top.call_event_idx;
+            fill_return(top);
             auto rc2 = ret_pc_refcount_.find(top.return_pc);
             if (rc2 != ret_pc_refcount_.end()) {
                 if (--rc2->second == 0) ret_pc_refcount_.erase(rc2);
@@ -611,19 +652,36 @@ void FunctionCollector::handle_branch_event(const BranchEvent& ev) {
         // target_pc was resolved in Phase 1 and stored in ev.target_pc.
         const uint64_t tgt = ev.target_pc;
 
-        CallEvent cevt;
-        cevt.call_inst_id   = ev.inst_id;
-        cevt.return_inst_id = 0;
-        cevt.call_site_pc   = ev.pc;
-        cevt.target_pc      = tgt;
-        cevt.depth          = call_stack_.size();
-        cevt.is_tail_call   = false;
+        // ── Cap call_events to avoid unbounded memory on huge traces ─────
+        // In default (capped) mode: on a 1.3B-instruction trace call_events
+        // can exceed 30M entries (1.5 GB+).  Beyond kMaxCallEvents we still
+        // track call_stack_ (needed for correct RET pairing) and function
+        // stats (total_calls / total_instructions), but we skip appending to
+        // call_events / call_site_map_ / call_event_indices.
+        // In full_mode all events are recorded without truncation.
+        static constexpr size_t kMaxCallEvents = 20'000'000;  // 20M ≈ 960 MB
+        const bool record_event = full_mode_
+            ? true
+            : (result_.call_events.size() < kMaxCallEvents);
 
-        const size_t idx = result_.call_events.size();
-        result_.call_site_map_[ev.inst_id] = idx;
-        result_.call_events.push_back(cevt);
+        size_t idx = SIZE_MAX;  // sentinel: not recorded
+        if (record_event) {
+            CallEvent cevt;
+            cevt.call_inst_id   = ev.inst_id;
+            cevt.return_inst_id = 0;
+            cevt.call_site_pc   = ev.pc;
+            cevt.target_pc      = tgt;
+            cevt.depth          = call_stack_.size();
+            cevt.is_tail_call   = false;
+
+            idx = result_.call_events.size();
+            result_.call_site_map_[ev.inst_id] = idx;
+            result_.call_events.push_back(cevt);
+        }
 
         const uint64_t ret_pc = ev.pc + 4;
+        // Always push a stack frame so RET matching stays correct even when
+        // we stopped recording events.  Use SIZE_MAX as a sentinel index.
         call_stack_.push_back({idx, ret_pc, ev.sp_valid ? ev.sp : 0});
         // Use try_emplace to avoid a double hash lookup: insert-or-increment
         // in a single operation instead of operator[] (find + insert) + ++.
@@ -641,7 +699,10 @@ void FunctionCollector::handle_branch_event(const BranchEvent& ev) {
                 // name is left empty; generated in batch at end()
             }
             func.total_calls++;
-            func.call_event_indices.push_back(idx);
+            // Only record the index if within the cap.
+            if (record_event) {
+                func.call_event_indices.push_back(idx);
+            }
         }
 
     } else if (is_ret) {
@@ -675,7 +736,14 @@ void FunctionCollector::end() {
     // a vector/map reallocation, eliminating the memmove traffic that showed
     // up as the #1 hot spot in sampling (383 memmove samples in 10 s).
     if (!branch_events_.empty()) {
-        const size_t call_est = branch_events_.size() / 2 + 64;
+        // In default mode: cap the call_events reserve at kMaxCallEvents so we
+        // don't commit gigabytes up front on huge traces before the state machine
+        // starts dropping events.  In full_mode the reserve is uncapped.
+        static constexpr size_t kMaxCallEventsReserve = 20'000'000;
+        const size_t raw_call_est = branch_events_.size() / 2 + 64;
+        const size_t call_est = full_mode_
+            ? raw_call_est
+            : std::min(raw_call_est, kMaxCallEventsReserve);
         result_.call_events.reserve(call_est);
         result_.call_site_map_.reserve(call_est);
         result_.return_site_map_.reserve(call_est);
@@ -711,8 +779,12 @@ void FunctionCollector::end() {
     // ── Handle trailing deferred RET ─────────────────────────────────────
     if (p2_prev_was_ret_ && !call_stack_.empty()) {
         auto& top = call_stack_.back();
-        result_.call_events[top.call_event_idx].return_inst_id = p2_prev_ret_inst_id_;
-        result_.return_site_map_[p2_prev_ret_inst_id_] = top.call_event_idx;
+        // Guard against sentinel frames (call_event_idx == SIZE_MAX) that
+        // were pushed when the kMaxCallEvents cap was reached.
+        if (top.call_event_idx != SIZE_MAX) {
+            result_.call_events[top.call_event_idx].return_inst_id = p2_prev_ret_inst_id_;
+            result_.return_site_map_[p2_prev_ret_inst_id_] = top.call_event_idx;
+        }
         call_stack_.pop_back();
     }
 
@@ -786,6 +858,24 @@ void FunctionCollector::end() {
 
     if (is_cancelled()) return;
 
+    // ── Truncate call_event_indices to a bounded size (default mode only) ───
+    // On large traces a single hot function can accumulate millions of call
+    // event indices (one per invocation).  The UI only ever shows the first
+    // ~10 for navigation; keeping millions wastes hundreds of MB of RAM.
+    // Cap at kMaxCallEventIndices — well above any UI need but low enough to
+    // bound memory: 1000 × 8 bytes × N functions ≪ N × total_calls × 8 bytes.
+    // In full_mode the truncation is skipped so every call event remains
+    // reachable through call_event_indices for complete per-call navigation.
+    if (!full_mode_) {
+        static constexpr size_t kMaxCallEventIndices = 1000;
+        for (auto& [entry_pc, func] : result_.functions) {
+            if (func.call_event_indices.size() > kMaxCallEventIndices) {
+                func.call_event_indices.resize(kMaxCallEventIndices);
+                func.call_event_indices.shrink_to_fit();
+            }
+        }
+    }
+
     // ── Generate deferred function names ──────────────────────────────────
     // Batching fmt::format calls here avoids per-call heap allocation in
     // the hot scan path.
@@ -809,6 +899,25 @@ void FunctionCollector::end() {
 
     // Build depth table for fast O(log N) depth_at() queries.
     result_.build_depth_table();
+
+    // ── Release temporary Phase-1/2 structures ────────────────────────────
+    // On large traces (e.g. 1.3B instructions) these can reach several GB:
+    //   branch_events_  : ~2-5% of total insts × 48 bytes = up to 3 GB
+    //   tail_candidates_: proportional to unconditional branches
+    //   call_stack_     : proportional to max call depth × frames in flight
+    //   ret_pc_refcount_: proportional to unique return PCs
+    // All are Phase-1/2 scratch — neither FunctionResult nor the caller needs
+    // them after end() returns.  Swap-with-empty is the only reliable way to
+    // free the underlying heap block (clear() leaves capacity intact).
+    { std::vector<BranchEvent>       tmp; tmp.swap(branch_events_); }
+    { std::vector<TailCallCandidate> tmp; tmp.swap(tail_candidates_); }
+    { std::vector<StackFrame>        tmp; tmp.swap(call_stack_); }
+    {
+        ankerl::unordered_dense::map<uint64_t, uint32_t> tmp;
+        tmp.swap(ret_pc_refcount_);
+    }
+    // pc_kind_sorted_ is also no longer needed after Phase 2.
+    { std::vector<PcKindEntry> tmp; tmp.swap(pc_kind_sorted_); }
 }
 
 // ─── FunctionPass::run — now delegates to FunctionCollector ───────────────
@@ -831,8 +940,19 @@ PassResult FunctionPass::run(PassContext& ctx) {
         std::string blob;
         if (index.load_pass_blob("function", blob)) {
             FunctionResult cached;
-            if (function_deserialize(blob, cached)) {
+            if (function_deserialize(blob, cached, config_.full_mode)) {
                 cached.build_depth_table();
+                // Release the blob string now that we have the deserialized data.
+                // On a large trace this blob can be hundreds of MB.
+                { std::string tmp; tmp.swap(blob); }
+                // Compact all containers so the loaded result is as lean as a
+                // freshly-computed one (avoids the 2× over-reservation that
+                // vector::reserve() can leave behind).
+                cached.call_events.shrink_to_fit();
+                cached.depth_table_.shrink_to_fit();
+                cached.sorted_call_indices_.shrink_to_fit();
+                cached.call_site_map_.rehash(0);
+                cached.return_site_map_.rehash(0);
                 ctx.progress(1.0f, fmt::format(
                     "Functions: {} unique, {} call events (from cache)",
                     cached.functions.size(), cached.call_events.size()));
@@ -853,7 +973,8 @@ PassResult FunctionPass::run(PassContext& ctx) {
     ctx.progress(0.0f, "Function analysis: scanning trace...");
 
     FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr,
-                                 hdr.has_branch_hint());
+                                 hdr.has_branch_hint(),
+                                 config_.full_mode);
 
     // Phase 2 progress: map [0,1] → [kPhase1End, kPhase2End]
     collector.set_progress_fn([&](float p2_pct) {
@@ -903,6 +1024,17 @@ PassResult FunctionPass::run(PassContext& ctx) {
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
+
+    // ── Compact result containers to exactly-fit sizes ────────────────────
+    // After construction, vectors may hold up to 2× their logical size worth
+    // of capacity (from reserve() heuristics + geometric growth).  On a 1.3B-
+    // instruction trace, call_events alone can be 600MB+ over-reserved.
+    // shrink_to_fit() reclaims the unused half of each allocation.
+    result.call_events.shrink_to_fit();
+    result.depth_table_.shrink_to_fit();
+    result.sorted_call_indices_.shrink_to_fit();
+    result.call_site_map_.rehash(0);    // unordered_dense: shrink to min load
+    result.return_site_map_.rehash(0);
 
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {

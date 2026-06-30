@@ -100,7 +100,11 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
                                                   const PassRunCtx& ctx) {
     // ── No-config / default-config passes ──────────────────────────────
     // Structure
-    if (name == "function")                return std::make_unique<FunctionPass>();
+    if (name == "function") {
+        FunctionConfig cfg;
+        cfg.full_mode = ctx.function_full_mode;
+        return std::make_unique<FunctionPass>(std::move(cfg));
+    }
     if (name == "xref")                    return std::make_unique<XrefPass>();
     if (name == "cfg")                     return std::make_unique<CFGPass>();
     if (name == "cfg_layout")              return std::make_unique<CFGLayoutPass>();

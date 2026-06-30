@@ -99,6 +99,22 @@ struct FunctionResult {
     mutable bool call_index_built_ = false;
 };
 
+// ─── FunctionConfig ──────────────────────────────────────────────────────
+
+/// Configuration for FunctionPass / FunctionCollector.
+struct FunctionConfig {
+    /// When false (default), memory-usage caps are applied so that analysis of
+    /// very large traces stays within a bounded memory budget:
+    ///   • call_events     — capped at 20 million entries
+    ///   • call_event_indices per function — capped at 1 000 entries
+    ///   • branch_events_ reserve — capped at 4 M entries
+    /// When true, all caps are removed and the full call-event history is
+    /// recorded without truncation.  Use this only when complete per-call
+    /// navigation is required and the trace is known to be small enough to
+    /// fit in available RAM.
+    bool full_mode = false;
+};
+
 // ─── FunctionCollector ────────────────────────────────────────────────────
 
 /// TraceCollector that implements function call/return pairing via a state machine.
@@ -118,7 +134,12 @@ public:
     /// on_inst can skip the binary-search pc_kind lookup for the vast majority of
     /// instructions (ordinary ones) using the cheap bit-shift path instead.
     FunctionCollector(CodeTable& code_table, uint64_t module_slide, uint32_t num_gpr,
-                      bool has_branch_hint = false);
+                      bool has_branch_hint = false,
+                      bool full_mode = false);
+
+    /// Enable or disable the memory-usage caps (see FunctionConfig::full_mode).
+    /// Must be called before begin().
+    void set_full_mode(bool full) { full_mode_ = full; }
 
     std::string_view name() const override { return "FunctionCollector"; }
 
@@ -199,6 +220,8 @@ private:
     /// before falling back to the binary-search pc_kind table.  Set when the
     /// trace file has HF_BRANCH_HINT (qbditrace records branch class inline).
     bool has_branch_hint_ = false;
+    /// When true, all memory-usage caps are removed (see FunctionConfig::full_mode).
+    bool full_mode_ = false;
 
     // ── Pre-built PC classification table (sorted flat array) ──────────
     // Replaces ankerl::unordered_dense::map<uint64_t, uint8_t>:
@@ -264,6 +287,8 @@ private:
 /// Result type: FunctionResult
 class FunctionPass final : public AnalysisPass {
 public:
+    explicit FunctionPass(FunctionConfig cfg = {}) : config_(std::move(cfg)) {}
+
     std::string_view name() const override { return "function"; }
     std::string_view description() const override {
         return "Function identification via call/return pairing";
@@ -276,6 +301,9 @@ public:
     PassResult run(PassContext& ctx) override;
 
     float estimated_cost() const override { return 7.0f; }
+
+private:
+    FunctionConfig config_;
 };
 
 }  // namespace tenet
