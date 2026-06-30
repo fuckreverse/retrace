@@ -181,11 +181,12 @@ TEST_CASE("verify_evidence: instruction PC check passes",
           "[unit][mcp][verify_evidence]") {
     auto ctx = make_mcp_env();
 
-    // inst 0 is at static 0x1000, runtime = 0x1000 + slide(0x4000) = 0x5000
-    auto result = ctx.mcp->call_tool("verify_evidence", {
-        {"checks", json::array({
-            {{"type", "instruction"}, {"inst_id", 0},
-             {"expected_pc", "0x5000"}}
+// inst 0 is at static 0x1000, runtime = 0x1000 + slide(0x4000) = 0x5000
+// rebased with default image_base=0x100000000: 0x1000 + 0x100000000 = 0x100001000
+auto result = ctx.mcp->call_tool("verify_evidence", {
+{"checks", json::array({
+{{"type", "instruction"}, {"inst_id", 0},
+{"expected_pc", "0x100001000"}}
         })}
     });
 
@@ -254,9 +255,9 @@ TEST_CASE("verify_evidence: multiple checks, mixed pass/fail",
             // Check 1: fails (wrong register value)
             {{"type", "register"}, {"inst_id", 1}, {"register", "x1"},
              {"expected_value", "0xFFFF"}},
-            // Check 2: passes (correct PC)
+            // Check 2: passes (correct PC, rebased: 0x100001000)
             {{"type", "instruction"}, {"inst_id", 0},
-             {"expected_pc", "0x5000"}}
+             {"expected_pc", "0x100001000"}}
         })}
     });
 
