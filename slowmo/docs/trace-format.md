@@ -41,7 +41,8 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 | 0x28 | 8 | trace_end | 追踪范围结束地址（excluded） |
 | 0x30 | 8 | flags | `qbditrace_header_flags` 位组合 |
 | 0x38 | 256 | module_name | NUL 终止的模块路径 |
-| 0x138 | 224 | reserved | 填充至 536 字节 |
+| 0x138 | 4 | target_os | `qbditrace_target_os_t`（见下方），旧 trace 为 0 (Unknown) |
+| 0x13C | 220 | reserved | 填充至 536 字节 |
 
 **Header Flags**：
 
@@ -55,6 +56,17 @@ tenet 依赖 `TraceFormat.h` (v4) 定义的格式读取 `.bin` trace 文件。
 | OLD_VALUE | bit 5 | v6: 内存写操作记录旧值（memacc 48B） |
 | HAS_FPR | bit 6 | v7: ANCHOR/INST 包含 FPR (NEON v0-v31) |
 | COMPRESSED | bit 7 | Header 后所有数据为 zstd 压缩流（见下方"压缩格式"节） |
+
+**Target OS**：
+
+| 值 | 枚举 | 说明 |
+|------|------|------|
+| 0 | UNKNOWN | 旧 trace（reserved 全零），tenet 会根据 module_name 路径启发式推断 |
+| 1 | iOS | iOS / macOS (Darwin) |
+| 2 | Android | Android (Linux kernel + Bionic) |
+| 3 | Linux | Linux (glibc) |
+
+qbditrace 在录制时通过编译期宏自动填写此字段。tenet 读取时会校验值是否在 0-3 范围，超过则回退为 Unknown。
 
 **tenet 要求**：magic == 0x51424454, version >= 4, flags 必须包含 REG_DIFF | HAS_CODE。
 
@@ -226,7 +238,7 @@ Total: 24 字节 (`sizeof(qbditrace_event_head_t)`，含对齐 padding)
 │ u8  kind (=4)                                                  │
 │ u8  reserved[3]                                                │
 │ u64 pc              ← svc 指令地址                             │
-│ u64 syscall_no      ← x16 (Darwin arm64 syscall selector)     │
+│ u64 syscall_no      ← x16 (Darwin) 或 x8 (Linux/Android)       │
 │ u64 args[6]         ← x0-x5                                   │
 └────────────────────────────────────────────────────────────────┘
 Total: 72 字节 (`sizeof(qbditrace_svc_head_t)`，含对齐 padding)

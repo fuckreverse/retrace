@@ -170,9 +170,9 @@ mindmap
 | 常量物化 | `--constants`, `constants_scan` | 找 movz+movk 构造的算法常量 |
 | 循环语义 | `--loop-semantics`, `loop_semantics` | 识别 Feistel / SPN / ARX / memcpy-like |
 | 算法摘要 | `--algorithm-summary`, `algorithm_summary` | 汇总 pattern + constants + loop + call graph |
-| ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点 |
-| ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑 |
-| 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 提取 CommonCrypto / Security.framework 参数 |
+| ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点（仅 Darwin 目标） |
+| ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑（仅 Darwin 目标） |
+| 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL） |
 
 典型命令：
 
@@ -270,4 +270,5 @@ mindmap
 | 我想知道某段内存当时的值 | `memread`, `memory_snapshot`, `memory_strings` |
 | 我想让 AI 自动分析 | `--mcp` 或 `--mcp-http` |
 | 我想边录边看 | `--streaming` |
+| 我在分析 Android trace | `syscall_intercept`（BoringSSL）, `pattern`, `taint` — ObjC 相关 pass 自动跳过 |
 | 我想优化 tenet 本身 | `profiling.md` |

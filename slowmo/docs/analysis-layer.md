@@ -109,7 +109,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `pattern` | 模式检测：crypto / anti-debug / obfuscation / networking |
+| `pattern` | 模式检测：crypto / anti-debug / obfuscation / networking（syscall 寄存器按 target_os 自动选择 x16/x8） |
 | `constant_materialization` | 识别 movz+movk 常量链 |
 | `loop_semantics` | 判断循环是否像 Feistel / SPN / ARX / memcpy |
 | `algorithm_summary` | 汇总模式、常量、循环、调用图做算法识别 |
@@ -128,12 +128,12 @@ Collector 可按记录类型覆写回调：
 | `literal_search` | 搜索常量字面值 |
 | `yara_mem_scan` | 在内存页上跑 YARA 规则 |
 
-### 5. ObjC / Syscall
+### 5. Platform API
 
 | pass | 主要用途 |
 |------|----------|
-| `objc` | ObjC 消息发送解析 |
-| `syscall_intercept` | CommonCrypto / Security.framework 等系统调用参数提取 |
+| `objc` | ObjC 消息发送解析（仅 Darwin 目标；Android/Linux 自动跳过，Unknown 时尽力运行） |
+| `syscall_intercept` | 按 target_os 自动选择 API 表（Darwin→CommonCrypto/Security.framework，Android/Linux→BoringSSL/OpenSSL，Unknown→两者都加载） |
 
 ### 6. Profile / Trace
 
@@ -194,6 +194,9 @@ flowchart LR
 - `symbol_annotation` 聚合的是 `function + loop + constant_materialization + pattern`。
 - `trace_fold` 依赖 `loop + xref`。
 - `taint_source_annotation` 依赖 `backward_taint + objc`。
+- `objc` 和 `objc_crypto` 在 target_os 为 Android/Linux 时自动跳过（返回空结果）。
+- `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
+- `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
 
 ## pass_registry.cpp 的作用
 
