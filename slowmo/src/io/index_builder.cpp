@@ -356,6 +356,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
 
         rocksdb::Options opts;
         opts.create_if_missing = false;
+        opts.max_open_files = 1024;  // match build-time setting (see build path)
 
         // MEM_WRITE/MEM_READ CF options must match build-time settings
         // (prefix extractor, block cache, bloom filter) for correct operation.
@@ -697,6 +698,12 @@ Result<TraceIndex> TraceIndex::build(
     opts.level0_slowdown_writes_trigger = 1024;
     opts.level0_stop_writes_trigger = 1024;
     opts.max_write_buffer_number = 4;
+    // Cap open file handles to avoid EMFILE ("Too many open files") on large
+    // traces.  With 8 CFs × hundreds of SSTs from parallel shard ingestion,
+    // the default -1 (keep all open) can exceed macOS's 256 per-process limit
+    // or even higher custom limits.  1024 lets RocksDB LRU-evict cold SSTs
+    // from the table cache while still keeping hot ones pinned.
+    opts.max_open_files = 1024;
 
     rocksdb::BlockBasedTableOptions table_opts;
     table_opts.block_cache = rocksdb::NewLRUCache(128 * 1024 * 1024);

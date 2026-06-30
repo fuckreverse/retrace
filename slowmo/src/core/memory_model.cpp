@@ -345,8 +345,6 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
 
     // ── Per-shard result container ──────────────────────────────────────
     struct ShardResult {
-        std::vector<KVEntry> write_entries;  // for mem_write CF
-        std::vector<KVEntry> read_entries;   // for mem_read CF
         ankerl::unordered_dense::map<uint64_t, PageActivity> page_map;
         uint64_t writes_persisted = 0;
         uint64_t insts_scanned = 0;
@@ -371,12 +369,62 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
 
         result.page_map.reserve(16384);
 
-        // Reserve estimated capacity: ~1.5 mem accesses per instruction,
-        // shard covers (total_insts / num_shards) instructions.
-        uint64_t est_insts = total_insts / num_shards;
-        uint64_t est_entries = est_insts * 2;  // slight overestimate
-        result.write_entries.reserve(est_entries);
-        if (has_read_cf) result.read_entries.reserve(est_entries / 2);
+        // ── Batched SST generation ─────────────────────────────────────
+        // To prevent memory blow-up on large traces, we cap in-memory entry
+        // buffers and flush them as sorted SST files periodically.  Each
+        // batch of 4M entries × 36 bytes = ~144 MB per vector — bounded.
+        static constexpr size_t kSstBatchSize = 4'000'000;
+
+        std::vector<KVEntry> write_entries;
+        std::vector<KVEntry> read_entries;
+        write_entries.reserve(std::min<size_t>(kSstBatchSize, 1'000'000));
+        if (has_read_cf) read_entries.reserve(std::min<size_t>(kSstBatchSize, 500'000));
+
+        uint32_t batch_seq = 0;  // SST filename sequence within this shard
+
+        auto key_less = [](const KVEntry& a, const KVEntry& b) noexcept {
+            return std::memcmp(a.key, b.key, KEY_SIZE) < 0;
+        };
+
+        // Helper: sort a buffer, write one SST file, clear the buffer.
+        auto flush_entries = [&](std::vector<KVEntry>& entries,
+                                 const char* tag,
+                                 std::vector<std::string>& out_ssts) -> rocksdb::Status {
+            if (entries.empty()) return rocksdb::Status::OK();
+
+#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
+            tbb::parallel_sort(entries.begin(), entries.end(), key_less);
+#else
+            std::sort(entries.begin(), entries.end(), key_less);
+#endif
+
+            rocksdb::Options sst_opts;
+            sst_opts.compression = rocksdb::kLZ4Compression;
+            rocksdb::SstFileWriter writer(rocksdb::EnvOptions(), sst_opts);
+
+            auto path = sst_dir / (std::string(tag) + "_s"
+                        + std::to_string(shard_idx) + "_b"
+                        + std::to_string(batch_seq) + ".sst");
+            auto s = writer.Open(path.string());
+            if (!s.ok()) return s;
+
+            for (const auto& e : entries) {
+                uint8_t val_buf[17];
+                val_buf[0] = e.val_size;
+                std::memcpy(val_buf + 1, e.val_data, e.val_size);
+
+                s = writer.Put(
+                    rocksdb::Slice(e.key, KEY_SIZE),
+                    rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
+                                   1 + e.val_size));
+                if (!s.ok()) return s;
+            }
+
+            s = writer.Finish();
+            if (s.ok()) out_ssts.push_back(path.string());
+            entries.clear();
+            return s;
+        };
 
         // Create a thread-local reader for lock-free access.
         auto thread_reader = reader_.create_thread_reader(8);
@@ -420,9 +468,9 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                     e.is_read = is_rd ? 1 : 0;
 
                     if (is_rd) {
-                        result.read_entries.push_back(e);
+                        read_entries.push_back(e);
                     } else {
-                        result.write_entries.push_back(e);
+                        write_entries.push_back(e);
                     }
 
                     // Track page activity
@@ -458,6 +506,16 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             inst_id++;
             result.insts_scanned++;
 
+            // Flush buffers when batch threshold reached (prevents OOM on large traces)
+            if (write_entries.size() >= kSstBatchSize ||
+                read_entries.size() >= kSstBatchSize) {
+                auto s = flush_entries(write_entries, "memw", result.write_ssts);
+                if (!s.ok()) { result.error = s.ToString(); return; }
+                s = flush_entries(read_entries, "memr", result.read_ssts);
+                if (!s.ok()) { result.error = s.ToString(); return; }
+                batch_seq++;
+            }
+
             if ((inst_id & 0xFFFFF) == 0) {
                 progress_insts.fetch_add(0x100000, std::memory_order_relaxed);
             }
@@ -465,63 +523,13 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         // Flush residual progress
         progress_insts.fetch_add(result.insts_scanned & 0xFFFFF, std::memory_order_relaxed);
 
-        // ── Sort entries by key (required by SstFileWriter) ─────────────
-        auto key_less = [](const KVEntry& a, const KVEntry& b) noexcept {
-            return std::memcmp(a.key, b.key, KEY_SIZE) < 0;
-        };
-
-#if defined(TENET_HAS_TBB) && TENET_HAS_TBB
-        tbb::parallel_sort(result.write_entries.begin(), result.write_entries.end(), key_less);
-        if (!result.read_entries.empty())
-            tbb::parallel_sort(result.read_entries.begin(), result.read_entries.end(), key_less);
-#else
-        std::sort(result.write_entries.begin(), result.write_entries.end(), key_less);
-        if (!result.read_entries.empty())
-            std::sort(result.read_entries.begin(), result.read_entries.end(), key_less);
-#endif
-
-        // ── Write sorted SST files ──────────────────────────────────────
-        auto write_sst = [&](const std::vector<KVEntry>& entries,
-                             const char* tag,
-                             std::vector<std::string>& out_ssts) -> rocksdb::Status {
-            if (entries.empty()) return rocksdb::Status::OK();
-
-            rocksdb::Options sst_opts;
-            sst_opts.compression = rocksdb::kLZ4Compression;
-            rocksdb::SstFileWriter writer(rocksdb::EnvOptions(), sst_opts);
-
-            auto path = sst_dir / (std::string(tag) + "_s"
-                        + std::to_string(shard_idx) + ".sst");
-            auto s = writer.Open(path.string());
-            if (!s.ok()) return s;
-
-            for (const auto& e : entries) {
-                // Value: [val_size(1)] [val_data(val_size)]
-                uint8_t val_buf[17];
-                val_buf[0] = e.val_size;
-                std::memcpy(val_buf + 1, e.val_data, e.val_size);
-
-                s = writer.Put(
-                    rocksdb::Slice(e.key, KEY_SIZE),
-                    rocksdb::Slice(reinterpret_cast<const char*>(val_buf),
-                                   1 + e.val_size));
-                if (!s.ok()) return s;
-            }
-
-            s = writer.Finish();
-            if (s.ok()) out_ssts.push_back(path.string());
-            return s;
-        };
-
-        auto s = write_sst(result.write_entries, "memw", result.write_ssts);
-        if (!s.ok()) { result.error = s.ToString(); return; }
-
-        s = write_sst(result.read_entries, "memr", result.read_ssts);
-        if (!s.ok()) { result.error = s.ToString(); return; }
-
-        // Free entry buffers now that SSTs are written.
-        { std::vector<KVEntry>().swap(result.write_entries); }
-        { std::vector<KVEntry>().swap(result.read_entries); }
+        // ── Flush remaining entries ─────────────────────────────────────
+        {
+            auto s = flush_entries(write_entries, "memw", result.write_ssts);
+            if (!s.ok()) { result.error = s.ToString(); return; }
+            s = flush_entries(read_entries, "memr", result.read_ssts);
+            if (!s.ok()) { result.error = s.ToString(); return; }
+        }
 
         LOG_DEBUG("MemoryModel shard {}: {} insts, {} writes, {} write SSTs, {} read SSTs",
                   shard_idx, result.insts_scanned, result.writes_persisted,
