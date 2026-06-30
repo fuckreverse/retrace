@@ -9,17 +9,25 @@ Usage:
     python3 qbditrace_runner.py [options]
 
 Examples:
-    # Trace a function by offset in the main executable
+    # iOS: Trace a function by offset in the main executable
     python3 qbditrace_runner.py \\
         --target com.example.app \\
         --entry 0xEE91EC \\
         --output /var/mobile/Documents/trace.bin
 
-    # Trace an exported symbol
+    # iOS: Trace an exported symbol
     python3 qbditrace_runner.py \\
         --target com.example.app \\
         --entry _CCCrypt \\
         --output /var/mobile/Documents/cccrypt.bin
+
+    # Android: Trace a native library function
+    python3 qbditrace_runner.py \\
+        --target com.example.app \\
+        --android \\
+        --module libnative.so \\
+        --entry 0x1234 \\
+        --output /data/local/tmp/trace.bin
 
     # Trace a function in a specific framework module
     python3 qbditrace_runner.py \\
@@ -35,7 +43,7 @@ Examples:
         --trace-mode 5 \\
         --output /var/mobile/Documents/trace.bin
 
-    # With GCD block tracing enabled
+    # With GCD block tracing enabled (iOS only)
     python3 qbditrace_runner.py \\
         --target com.example.app \\
         --entry 0xABC \\
@@ -76,6 +84,8 @@ def parse_args():
                       help='Frida remote device address (default: 127.0.0.1:27042)')
     conn.add_argument('--usb', action='store_true',
                       help='Use USB device instead of remote')
+    conn.add_argument('--android', action='store_true',
+                      help='Target is an Android device (adjusts default paths)')
 
     # --- Target ---
     tgt = p.add_argument_group('Target')
@@ -109,9 +119,10 @@ def parse_args():
     out.add_argument('--output', '-o', required=True,
                      help='Path on device to write the trace file '
                           '(e.g. /var/mobile/Documents/trace.bin)')
-    out.add_argument('--dylib', default='/var/jb/usr/lib/libqbditrace.dylib',
-                     help='Path to libqbditrace.dylib on device '
-                          '(default: /var/jb/usr/lib/libqbditrace.dylib)')
+    out.add_argument('--dylib', default=None,
+                     help='Path to the tracer library on device. '
+                          'Default: /var/jb/usr/lib/libqbditrace.dylib (iOS) '
+                          'or /data/local/tmp/libqbditrace.so (Android)')
 
     # --- Recording options ---
     rec = p.add_argument_group('Recording options')
@@ -145,9 +156,9 @@ def parse_args():
                       help='Do not re-install hook between captures (multi mode)')
 
     # --- GCD ---
-    gcd = p.add_argument_group('GCD block tracing')
+    gcd = p.add_argument_group('GCD block tracing (iOS only)')
     gcd.add_argument('--trace-gcd', action='store_true',
-                     help='Enable GCD block tracing (dispatch_async etc.)')
+                     help='Enable GCD block tracing (dispatch_async etc., iOS only)')
     gcd.add_argument('--gcd-no-filter', action='store_true',
                      help='Trace ALL GCD blocks, not just those in target module')
     gcd.add_argument('--gcd-max', type=int, default=0,
@@ -162,6 +173,13 @@ def parse_args():
                          '(default in "once" mode)')
 
     args = p.parse_args()
+
+    # Apply platform-specific defaults
+    if args.dylib is None:
+        if args.android:
+            args.dylib = '/data/local/tmp/libqbditrace.so'
+        else:
+            args.dylib = '/var/jb/usr/lib/libqbditrace.dylib'
 
     # Parse --entry: detect if it's a hex offset or a symbol name
     args._entry_is_offset = False

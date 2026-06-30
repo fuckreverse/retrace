@@ -65,6 +65,9 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#elif defined(__linux__)
+#include <sys/uio.h>       /* process_vm_readv (Linux 3.2+ / Android API 23+) */
+#include <sys/syscall.h>   /* __NR_gettid */
 #endif
 
 /* Weak reference to the Objective-C runtime so the tracer can resolve a
@@ -107,6 +110,14 @@ inline bool safeRead(uint64_t addr, void *out, size_t len) {
       mach_task_self(), (vm_address_t)addr, (vm_size_t)len,
       (vm_address_t)out, &got);
   return kr == KERN_SUCCESS && got == (vm_size_t)len;
+#elif defined(__linux__)
+  /* process_vm_readv (Linux 3.2+, Android API 23+) reads from our own address
+   * space and returns an error instead of trapping when the source page is not
+   * readable (guard page, unmapped, MMIO, etc.). */
+  struct iovec local  = { out, len };
+  struct iovec remote = { reinterpret_cast<void *>(addr), len };
+  ssize_t nr = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+  return nr == static_cast<ssize_t>(len);
 #else
   (void)addr;
   (void)out;
@@ -350,7 +361,13 @@ private:
     if (home && *home) {
       return std::string(home) + "/Documents/qbditrace.bin";
     }
+#if defined(__ANDROID__)
+    /* Android: HOME is often unset; /data/local/tmp is always writable for
+     * shell/root and is the conventional staging directory for Frida payloads. */
+    return "/data/local/tmp/qbditrace.bin";
+#else
     return "/tmp/qbditrace.bin";
+#endif
   }
 
   void writeFileHeader() {
@@ -395,6 +412,15 @@ private:
       h.flags |= QBDITRACE_HF_BRANCH_HINT;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
+#if defined(__APPLE__)
+    h.target_os = QBDITRACE_OS_IOS;
+#elif defined(__ANDROID__)
+    h.target_os = QBDITRACE_OS_ANDROID;
+#elif defined(__linux__)
+    h.target_os = QBDITRACE_OS_LINUX;
+#else
+    h.target_os = QBDITRACE_OS_UNKNOWN;
+#endif
     writer_.writeHeaderRaw(&h, sizeof(h));
   }
 
@@ -569,9 +595,15 @@ struct ThreadCtx {
 thread_local ThreadCtx *g_tctx = nullptr;
 
 uint64_t currentThreadId() {
+#if defined(__APPLE__)
   uint64_t tid = 0;
   pthread_threadid_np(nullptr, &tid);
   return tid;
+#elif defined(__linux__)
+  return static_cast<uint64_t>(::syscall(__NR_gettid));
+#else
+  return 0;
+#endif
 }
 
 ThreadCtx *ensureThreadCtx() {
@@ -838,6 +870,8 @@ void faultHandler(int sig, siginfo_t *info, void *ucv) {
     if (uc->uc_mcontext) {
       fault_pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
     }
+#elif defined(__linux__) && defined(__aarch64__)
+    fault_pc = (uint64_t)uc->uc_mcontext.pc;
 #endif
   }
   static const char pcl[] = " ctx_pc=";
@@ -1441,8 +1475,9 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
 }
 
 /* PREINST callback bound to the SVC mnemonic. On Darwin arm64 the syscall
- * selector is in x16 and the arguments are x0..x5. We snapshot them before the
- * trap executes so the decoder can name the syscall and show its arguments. */
+ * selector is in x16; on Linux/Android arm64 the syscall number is in x8.
+ * Arguments are x0..x5 on both platforms. We snapshot them before the trap
+ * executes so the decoder can name the syscall and show its arguments. */
 QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
                      QBDI::FPRState * /*fpr*/, void * /*data*/) {
   ThreadCtx *c = ensureThreadCtx();
@@ -1452,7 +1487,13 @@ QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
   sh.kind = QBDITRACE_REC_SVC;
   sh.reserved[0] = sh.reserved[1] = sh.reserved[2] = 0;
   sh.pc = QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_PC);
+#if defined(__APPLE__)
   sh.syscall_no = QBDI_GPR_GET(gpr, 16); /* x16 = Darwin syscall selector */
+#elif defined(__linux__)
+  sh.syscall_no = QBDI_GPR_GET(gpr, 8);  /* x8 = Linux syscall number */
+#else
+  sh.syscall_no = QBDI_GPR_GET(gpr, 16);
+#endif
   for (int i = 0; i < 6; ++i) {
     sh.args[i] = QBDI_GPR_GET(gpr, i); /* x0..x5 */
   }

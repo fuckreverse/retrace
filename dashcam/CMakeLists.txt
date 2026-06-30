@@ -15,6 +15,7 @@
 #   ──────────────────────  ───────────────────────────────── ─────────────
 #   build/                  Host tests + decoder (default)   cmake ..
 #   build-ios/              iOS dylib (cross-compile)        (see below)
+#   build-android/          Android .so (cross-compile)      (see below)
 #
 # All FetchContent sources are cached in _deps/ (shared across all build
 # dirs).  Never delete _deps/ — it avoids re-downloading zstd, Catch2, etc.
@@ -45,6 +46,22 @@
 #         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF \
 #         -DQBDITRACE_BUILD_TESTS=OFF
 #   cmake --build tools/qbditrace/build-ios
+#
+# Android .so cross-compile (from repo root):
+#
+#   bash tools/qbditrace/build-qbditrace-android.sh
+#
+# Or manually:
+#
+#   cmake -S tools/qbditrace -B tools/qbditrace/build-android -G Ninja \
+#         -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
+#         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 \
+#         -DQBDI_INCLUDE_DIR=$PWD/include \
+#         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-android/include;$PWD/build-android/include-static" \
+#         -DQBDI_STATIC_LIB=$PWD/build-android/libQBDI.a \
+#         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF \
+#         -DQBDITRACE_BUILD_TESTS=OFF
+#   cmake --build tools/qbditrace/build-android
 
 cmake_minimum_required(VERSION 3.16)
 project(qbditrace C CXX)
@@ -140,8 +157,10 @@ if(QBDITRACE_BUILD_DYLIB)
   endif()
 
   set_target_properties(qbditrace PROPERTIES
-    OUTPUT_NAME qbditrace
-    MACOSX_RPATH ON)
+    OUTPUT_NAME qbditrace)
+  if(APPLE)
+    set_target_properties(qbditrace PROPERTIES MACOSX_RPATH ON)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

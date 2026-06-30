@@ -1,10 +1,11 @@
 /*
  * qbditrace - Frida agent for the QBDI-based high-performance tracer.
  *
- * This script is intentionally thin: it only loads the native tracer dylib,
- * resolves addresses, and diverts the target function into the QBDI VM. Every
- * per-instruction operation happens in native code, so this JS has ZERO impact
- * on tracing speed (it runs once at setup, and once per traced call).
+ * This script is intentionally thin: it only loads the native tracer library
+ * (.dylib on iOS, .so on Android), resolves addresses, and diverts the target
+ * function into the QBDI VM. Every per-instruction operation happens in native
+ * code, so this JS has ZERO impact on tracing speed (it runs once at setup,
+ * and once per traced call).
  *
  * IMPORTANT: This script MUST be loaded via the Python runner (qbditrace_runner.py).
  * Do NOT use `frida -l qbditrace.js` directly — the CONFIG is injected by the
@@ -71,7 +72,7 @@ function loadDylib(path) {
   if (!m) {
     fail('dlopen succeeded but module not found by name: ' + path);
   }
-  log('loaded dylib: ' + path + ' @ ' + m.base + ' (via dlopen)');
+  log('loaded library: ' + path + ' @ ' + m.base + ' (via dlopen)');
   return m;
 }
 
@@ -179,6 +180,10 @@ function buildConfigStruct(opts) {
   return cfg;
 }
 
+function isAndroid() {
+  return Process.platform === 'linux';
+}
+
 function resolveObjcDispatchers() {
   const out = {
     objcMsgSend: NULL,
@@ -186,6 +191,13 @@ function resolveObjcDispatchers() {
     objcMsgSendSuper2: NULL,
     objcMsgSendStret: NULL,
   };
+  /* ObjC runtime is only available on iOS/macOS. On Android/Linux there is no
+   * libobjc and no ObjC dispatchers to resolve — all pointers stay NULL, which
+   * causes the native tracer to skip OBJC record emission automatically. */
+  if (isAndroid()) {
+    log('Android target — skipping ObjC dispatcher resolution');
+    return out;
+  }
   const map = {
     objcMsgSend: 'objc_msgSend',
     objcMsgSendSuper: 'objc_msgSendSuper',
@@ -569,24 +581,28 @@ function main() {
         '. Trigger the entry function to trace.');
   }
 
-  // --- Optional: GCD block tracing ---
+  // --- Optional: GCD block tracing (iOS/macOS only) ---
   if (CONFIG.traceGCD) {
-    function makeGCDOutputPath(gcdIndex) {
-      const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
-      const base = CONFIG.outputPath;
-      const dot = base.lastIndexOf('.');
-      if (dot > 0 && dot > base.lastIndexOf('/')) {
-        return base.slice(0, dot) + suffix + base.slice(dot);
+    if (isAndroid()) {
+      log('WARNING: GCD block tracing is not available on Android — skipping');
+    } else {
+      function makeGCDOutputPath(gcdIndex) {
+        const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
+        const base = CONFIG.outputPath;
+        const dot = base.lastIndexOf('.');
+        if (dot > 0 && dot > base.lastIndexOf('/')) {
+          return base.slice(0, dot) + suffix + base.slice(dot);
+        }
+        return base + suffix;
       }
-      return base + suffix;
-    }
 
-    installGCDHooks({
-      fn: fn,
-      mod: mod,
-      baseOpts: baseOpts,
-      makeGCDOutputPath: makeGCDOutputPath,
-    });
+      installGCDHooks({
+        fn: fn,
+        mod: mod,
+        baseOpts: baseOpts,
+        makeGCDOutputPath: makeGCDOutputPath,
+      });
+    }
   }
 }
 
