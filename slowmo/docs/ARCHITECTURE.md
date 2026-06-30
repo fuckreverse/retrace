@@ -146,10 +146,13 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | 文档 | 关注点 |
 |------|--------|
 | [`docs/README.md`](README.md) | 文档导航与阅读路径 |
+| [`USAGE.md`](USAGE.md) | **端到端入门**：环境安装 → 编译 → 录制 → 分析 |
 | [`../README.md`](../README.md) | 项目入口与快速开始 |
 | [`capabilities.md`](capabilities.md) | 按能力看 tenet 能做什么 |
 | [`io-layer.md`](io-layer.md) | trace / index / code / streaming |
 | [`core-layer.md`](core-layer.md) | 寄存器 / 内存 / 解码 / Triton |
 | [`analysis-layer.md`](analysis-layer.md) | pass 分类、依赖、调度、融合 |
+| [`pass-cookbook.md`](pass-cookbook.md) | 新增 pass 的实操开发指南 |
 | [`ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP |
 | [`trace-format.md`](trace-format.md) | 与 qbditrace 的格式契约 |
+| [`profiling.md`](profiling.md) | 性能分析、Instruments、优化方法论 |

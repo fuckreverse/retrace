@@ -54,15 +54,23 @@ flowchart LR
 - **记录视图不复制数据**：`InstView.raw_diffs` / `raw_mems` 都直接指向 mmap 区域。
 - **顺序访问最自然**：`begin()/end()` 提供按记录大小推进的迭代器。
 - **随机访问也支持**：结合 `TraceIndex::offset_of()` / `offset_of_with_pc()` 可以直接跳到某条 INST。
-- **支持格式变体**：v4 / v5 / v6 的 PC 表示和内存布局不同，但对上层隐藏了大部分差异。
+- **支持格式变体**：v4 / v5 / v6 / v7 的 PC 表示、内存布局和 FPR 记录不同，但对上层隐藏了大部分差异。
 
-### v4 / v5 / v6 兼容要点
+### v4 / v5 / v6 / v7 兼容要点
 
 | 版本 | 关键差异 | IO 层怎么处理 |
 |------|----------|----------------|
-| v4 | INST 里直接存绝对 PC | 直接读取 |
-| v5 | INST 里存 `pc_delta` | 迭代器累计 `current_pc_`，随机访问需 `offset_of_with_pc()` 提供 seed PC |
-| v6 | 内存访问带 old value | `InstView` 根据 flags 解释更宽结构体 |
+| v4 | INST 里直接存绝对 PC；ANCHOR 288B | 直接读取 |
+| v5 | INST 里存 `pc_delta` (int16)；INST 头缩至 6B | 迭代器累计 `current_pc_`，随机访问需 `offset_of_with_pc()` 提供 seed PC |
+| v6 | 内存访问带旧值（memacc 48B） | `InstView` 根据 `HF_OLD_VALUE` flag 解释更宽结构体；writer 已不再写 v6 |
+| v7 | INST 头新增 `n_fprdiff` 字段；ANCHOR 800B（含 512B FPR 快照） | `AnchorView` 根据 `HF_HAS_FPR` flag 决定 FPR 区域偏移；`InstView` 额外迭代 FPR diff 列表 |
+
+**压缩格式兼容要点**：
+
+| Flag | 含义 | IO 层怎么处理 |
+|------|------|----------------|
+| `HF_COMPRESSED` (bit 7) | 全文件单个 zstd 流 | `TraceReader::open()` 流式解压到临时文件再 mmap；`close()` 时清理临时文件 |
+| `HF_BLOCK_COMPRESSED` (bit 8) | 多个独立 zstd frame + 尾部索引 | `TraceReader` 读取末尾 16B footer，加载 block index table，随机访问时按需解压单块；不需要临时文件 |
 
 ## 2. TraceIndex：把顺序流变成可查数据库
 
@@ -223,6 +231,8 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 这个能力是顺序扫描型，还是需要新倒排索引？
 - key 设计是否会导致 RocksDB 膨胀过快？
 - 是否会破坏 v5 `pc_delta` 随机访问语义？
+- 是否正确处理了 v7 的 FPR diff 和 800B ANCHOR？
+- 是否兼容 `HF_BLOCK_COMPRESSED` 的按块随机访问模式？
 - 是否真的需要新增 CF，还是复用现有索引就够？
 - 是否要同步更新 `trace-format.md` 或与 `qbditrace` 的格式契约？
 

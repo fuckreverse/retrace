@@ -15,6 +15,7 @@
 
 | 文档 | 适合场景 | 内容 |
 |------|----------|------|
+| [`docs/USAGE.md`](docs/USAGE.md) | **从零开始** | 环境安装、编译、录制 trace、分析全流程 |
 | [`docs/README.md`](docs/README.md) | 先找入口 | 文档地图、按模块/按能力索引 |
 | [`docs/capabilities.md`](docs/capabilities.md) | 按能力使用 | 交互、批处理、自动化、AI、流式分析能力总览 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 看整体设计 | 启动流程、层次边界、运行时装配、扩展点 |
