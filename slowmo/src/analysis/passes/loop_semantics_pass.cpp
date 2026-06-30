@@ -412,10 +412,9 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
 
         for (const auto& loop : loop_result.loops) {
             if (loop.iteration_count < 2) continue;
-            auto xr_it = xref.pc_to_inst_ids.find(loop.header_pc);
-            if (xr_it == xref.pc_to_inst_ids.end()) continue;
+            if (!xref.has_pc(loop.header_pc)) continue;
             size_t collected = 0;
-            for (uint64_t iid : xr_it->second) {
+            for (uint64_t iid : xref.inst_ids_at(loop.header_pc)) {
                 if (iid < range.start_inst_id) continue;
                 if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
                 warm_ids.push_back(iid);
@@ -482,16 +481,12 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
         std::vector<uint64_t> header_inst_ids;
         header_inst_ids.reserve(MAX_SAMPLE_ITERATIONS + 1);
 
-        auto xr_it = xref.pc_to_inst_ids.find(loop.header_pc);
-        if (xr_it != xref.pc_to_inst_ids.end()) {
-            const auto& bitmap = xr_it->second;
-            for (uint64_t iid : bitmap) {
-                // Respect the analysis range
-                if (iid < range.start_inst_id) continue;
-                if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
-                header_inst_ids.push_back(iid);
-                if (header_inst_ids.size() > MAX_SAMPLE_ITERATIONS) break;
-            }
+        for (uint64_t iid : xref.inst_ids_at(loop.header_pc)) {
+            // Respect the analysis range
+            if (iid < range.start_inst_id) continue;
+            if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
+            header_inst_ids.push_back(iid);
+            if (header_inst_ids.size() > MAX_SAMPLE_ITERATIONS) break;
         }
 
         if (header_inst_ids.size() < 2) {

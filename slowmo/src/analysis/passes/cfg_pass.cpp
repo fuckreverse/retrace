@@ -273,7 +273,7 @@ PassResult CFGPass::run(PassContext& ctx) {
 
     std::vector<uint64_t> sorted_pcs;
     sorted_pcs.reserve(xref.unique_pc_count);
-    for (const auto& [pc, _] : xref.pc_to_inst_ids) {
+    for (const auto& [pc, _] : xref.pc_exec_count) {
         sorted_pcs.push_back(pc);
     }
     std::sort(sorted_pcs.begin(), sorted_pcs.end());
@@ -315,7 +315,7 @@ PassResult CFGPass::run(PassContext& ctx) {
 
         // The instruction after a branch/call/return starts a new block
         uint64_t fallthrough_pc = pc + 4;
-        if (xref.pc_to_inst_ids.count(fallthrough_pc)) {
+        if (xref.has_pc(fallthrough_pc)) {
             block_leaders.insert(fallthrough_pc);
         }
 
@@ -327,7 +327,7 @@ PassResult CFGPass::run(PassContext& ctx) {
             auto d = decoder.decode(pc, *opcode);
             if (d) {
                 auto target = extract_branch_target(d->op_str);
-                if (target && xref.pc_to_inst_ids.count(*target)) {
+                if (target && xref.has_pc(*target)) {
                     block_leaders.insert(*target);
                 }
             }

@@ -39,15 +39,10 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
         if (loop.iteration_count < cfg_.min_iterations_to_fold) continue;
 
         // Get all execution instances of the loop header
-        auto header_it = xref.pc_to_inst_ids.find(loop.header_pc);
-        if (header_it == xref.pc_to_inst_ids.end()) continue;
+        if (!xref.has_pc(loop.header_pc)) continue;
 
         // Get sorted inst_ids where the header was executed (= iteration starts)
-        std::vector<uint64_t> iteration_starts;
-        iteration_starts.reserve(loop.iteration_count + 1);
-        for (uint64_t id : header_it->second) {
-            iteration_starts.push_back(id);
-        }
+        std::vector<uint64_t> iteration_starts = xref.inst_ids_at(loop.header_pc);
         if (!std::is_sorted(iteration_starts.begin(), iteration_starts.end())) {
             std::sort(iteration_starts.begin(), iteration_starts.end());
         }
