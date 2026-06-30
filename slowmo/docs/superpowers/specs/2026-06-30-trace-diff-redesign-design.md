@@ -29,23 +29,36 @@
 
 ### 2.1 Pass 自治模式
 
-TraceDiffPass 在 config 中携带 `trace_b_path`。`run()` 中自行打开 trace B 的 `TraceReader`，通过 `TraceIndex::open_or_build()` 构建索引（首次约 60s，之后秒开）。Pass 持有 trace B 的 reader + index 生命周期，`run()` 结束后释放。不修改 `PassContext` 或 `PassManager` 接口。
+TraceDiffPass 在 config 中携带 `trace_b_path`。`run()` 中自行打开 trace B 的 `TraceReader`，并按需构建索引（见 2.2）。Pass 持有 trace B 的 reader + index 生命周期，`run()` 结束后释放。不修改 `PassContext` 或 `PassManager` 接口。
 
 如果 `trace_b_path` 为空，退回同 trace 区域比较模式（完全向后兼容）。
 
-### 2.2 地址归一化
+### 2.2 Trace B 按需索引策略
+
+索引在 trace diff 中只有一个用途：将 `trace_b_start` 转为文件偏移量以跳过前段指令。跳转完成后，后续全部是 Iterator 顺序前进，不再访问索引。因此索引的构建策略取决于 `trace_b_start`：
+
+| trace_b_start | 策略 | 启动开销 |
+|---------------|------|----------|
+| 0（默认全量） | 不需要索引，直接 `reader_b.begin()` | 0 |
+| > 0 且缓存命中 | `TraceIndex::open_or_build()` 加载已有缓存 | <50ms |
+| > 0 且无缓存 | 先尝试加载缓存（<50ms 判断），缓存不存在时顺序扫描到目标位置 | O(target_inst_id) 线性扫描，但无磁盘开销 |
+
+无缓存时不强制构建完整 RocksDB 索引——顺序扫描到 `trace_b_start` 只是一次性线性读取 mmap，完成后即丢弃，不产生持久化索引文件。这对十亿级 trace 的全量比较场景（`trace_b_start=0`）将启动时间从 60 秒降为零。
+
+### 2.3 地址归一化
 
 两条 trace 来自同一二进制但 ASLR slide 不同。比较前统一减去各自的 `module_slide`，转换为静态地址。如果 `module_name` 不一致，发出警告但仍继续（用户可能在比较不同版本）。
 
-### 2.3 数据流
+### 2.4 数据流
 
 ```
 TraceDiffConfig (trace_b_path, ranges, window_size, max_diffs)
         |
 TraceDiffPass::run()
-    +-- 打开 trace B (TraceReader::open + TraceIndex::open_or_build)
+    +-- 打开 trace B (TraceReader::open)
     +-- 地址归一化 (减去各自 module_slide)
-    +-- 获取两条 trace 的起始 offset (通过各自 sparse index)
+    +-- 获取 trace A 起始 offset (通过已有 index)
+    +-- 获取 trace B 起始 offset (按需索引策略，见 2.2)
     +-- 创建双迭代器 (create_thread_reader for lock-free)
     +-- 流式比较循环 (lockstep + resync)
     +-- 输出 TraceDiffResult
@@ -153,11 +166,15 @@ struct TraceDiffResult {
 ```
 1. 如果 trace_b_path 非空：
    a. TraceReader::open(trace_b_path) -> reader_b
-   b. TraceIndex::open_or_build(reader_b) -> index_b（带进度回调）
-   c. 验证两条 trace 的 arch、num_gpr 一致
+   b. 验证两条 trace 的 arch、num_gpr 一致
+   c. 获取 trace B 起始 offset（按需索引策略，见 2.2）：
+      - trace_b_start == 0: offset = 0, 直接 reader_b.begin()
+      - trace_b_start > 0: 尝试 open_or_build 加载缓存索引
+        - 缓存命中: index_b.offset_of(trace_b_start, reader_b)
+        - 无缓存: 顺序扫描到 trace_b_start（不构建索引）
 2. 计算 slide_a = reader_a.header().module_slide
         slide_b = reader_b.header().module_slide
-3. 对 trace A 和 B 分别通过 index.offset_of() 跳到起始位置
+3. trace A 通过已有 ctx.index().offset_of() 跳到起始位置
 4. 创建各自的 ThreadReader（lock-free 读取）
 5. 初始化两个 Iterator
 ```
@@ -247,8 +264,9 @@ std::vector<InstDataDiff> compare_inst_data(
 
 ### 4.5 进度报告
 
-- 0-30%：trace B 索引构建（跨文件模式时）
-- 30-100%：流式比较，按 `(inst_a_progress + inst_b_progress) / 2` 计算
+- 0-5%：trace B 打开 + 起始 offset 定位（大多数场景 <1s）
+  - 如果 trace_b_start > 0 且无缓存索引，顺序扫描期间报告 0-5% 的子进度
+- 5-100%：流式比较，按 `(inst_a_progress + inst_b_progress) / 2` 计算
 - 每 `max(region_len / 100, 10000)` 条指令报告一次
 - 取消检查同样每 10000 条一次，减少原子读开销
 
@@ -319,7 +337,7 @@ std::vector<InstDataDiff> compare_inst_data(
 
 Trace Diff 面板重新设计：
 
-- **顶部**：Trace B 文件选择器（File Dialog + 路径显示 + 索引构建进度条）
+- **顶部**：Trace B 文件选择器（File Dialog + 路径显示）。trace_b_start=0 时无等待；trace_b_start>0 且无缓存索引时显示顺序扫描进度
 - **Region 输入**：Region A / Region B 各两组 start/end，加 "Full Trace" 和 "Set = current" 快捷按钮
 - **参数**：重同步窗口大小输入框（默认 16384）
 - **Run Diff 按钮**
@@ -360,7 +378,7 @@ uint32_t diff_window_size_ = 16384;      // 重同步窗口大小
 std::unique_ptr<TraceDiffResult> trace_diff_result_owned_;
 ```
 
-Trace B 的 reader 和 index 由 Pass 内部管理（run() 中打开，run() 结束后释放）。GUI 只持有路径和结果，不持有 trace B 的 IO 对象。trace B 的索引在 Pass 运行期间构建，进度通过 PassContext::progress 回调显示。
+Trace B 的 reader 和 index 由 Pass 内部管理（run() 中打开，run() 结束后释放）。GUI 只持有路径和结果，不持有 trace B 的 IO 对象。trace B 按需索引策略（见 2.2）确保 trace_b_start=0 时零启动延迟。
 
 移除 `panels_trace_diff.cpp` 中的 `static TraceDiffResult s_result`，改为 `GuiApp` 成员变量 `trace_diff_result_owned_`。
 
@@ -393,7 +411,7 @@ Trace B 的 reader 和 index 由 Pass 内部管理（run() 中打开，run() 结
 | 组件 | 大小 | 说明 |
 |------|------|------|
 | Trace B Reader | ~0 | mmap 零拷贝，仅文件描述符 |
-| Trace B Index | ~50-100MB | RocksDB，首次构建后秒级加载 |
+| Trace B Index | 0（trace_b_start=0）/ ~50-100MB（缓存命中时） | 按需索引策略：全量比较不加载索引 |
 | 重同步哈希表 | 128KB-512KB | window_size x 8B，用完即释放 |
 | DivergeSegment 列表 | ~1KB/段 | 通常 <100 段 = 100KB |
 | 流式比较缓冲 | 0 | 两个 Iterator 各自前进，不预读 |
@@ -412,12 +430,14 @@ Trace B 的 reader 和 index 由 Pass 内部管理（run() 中打开，run() 结
 
 ### 9.3 十亿级 trace 时间估算
 
-两条 trace 各 10 亿条指令，PC 匹配率 99.9%（约 1000 个分叉点）：
+两条 trace 各 10 亿条指令，PC 匹配率 99.9%（约 1000 个分叉点），trace_b_start=0（全量比较）：
 
-- 索引构建（trace B）：~60s（首次）/ ~2s（缓存命中）
+- trace B 打开 + 起始定位：~10ms（mmap open，无索引构建）
 - Lockstep 比较：10 亿 x ~100ns/条 = ~100s（mmap 顺序读取，CPU 缓存友好）
 - 重同步：1000 次 x 16K x ~100ns = ~1.6s
-- **总计**：~102s（缓存命中）/ ~162s（首次）
+- **总计**：~102s
+
+对比旧设计：trace_b_start=0 时无需索引构建，启动时间从 60s 降为 ~10ms。trace_b_start>0 且缓存命中时为 ~50ms；无缓存时顺序扫描的耗时取决于 start 位置（每 100 万条约 ~0.1s），但仍远低于完整索引构建的 60s，且不产生磁盘文件。
 
 ## 10. 测试策略
 
