@@ -56,6 +56,15 @@ bool PassContext::cancelled() const {
 void PassContext::cancel() { manager_.cancel_all(); }
 
 TraceScanEngine* PassContext::scan_engine() { return manager_.scan_engine(); }
+
+TraceScanEngine PassContext::make_scan_engine() {
+    TraceScanEngine engine(reader(), index().inst_count(), &index());
+    if (!range_.exclude_pc_ranges.empty()) {
+        engine.set_exclude_pc_ranges(range_.exclude_pc_ranges);
+    }
+    return engine;
+}
+
 bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan(); }
 
 // ─── PassManager ──────────────────────────────────────────────────────────

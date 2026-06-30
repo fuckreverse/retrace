@@ -79,6 +79,14 @@ Collector 可按记录类型覆写回调：
 - 如果 collector 声明 `supports_parallel()` 且支持 `clone()` / `merge()`，引擎会按 ANCHOR 边界切分并行扫描。
 - 典型受益者：`xref` 这类大范围统计型 pass。
 
+### 排除范围过滤（`--exclude-range`）
+
+- `--exclude-range <start_hex> <end_hex>` 可重复指定，运行时地址。
+- PC 落入排除区间的指令不会传递给分析 pass（visibility filter）。
+- `RegisterFile` 和 `MemoryModel` 的状态重建不受影响——它们仍回放所有记录。
+- 实现在 `TraceScanEngine`（覆盖大多数 pass）和 `XrefPass` 的自定义扫描器中。
+- 典型用法：先录制完整 trace，再在离线分析时逐步排除噪声区间。
+
 ## Pass 分类总览
 
 当前 `pass_catalog()` 注册了 **36 个 pass**，分成 7 类。

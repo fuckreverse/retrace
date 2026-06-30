@@ -276,6 +276,21 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --entry 0xABC \
     --timeout 30 \
     --output /var/mobile/Documents/trace.bin
+
+# 排除内存校验循环（静态偏移 0x12000-0x13500），大幅减少 trace 体积
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --exclude-range 12000-13500 \
+    --output /var/mobile/Documents/trace.bin
+
+# 排除多个区域（最多 8 个）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --exclude-range 12000-13500 \
+    --exclude-range A0000:200 \
+    --output /var/mobile/Documents/trace.bin
 ```
 
 ### 2.3 完整参数列表
@@ -312,6 +327,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--anchor-interval` | 0 (默认1024) | 每 N 条指令打全量快照 |
 | `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
 | `--no-embed-code` | off | 关闭内嵌码表 |
+| `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。可多次指定，最多 8 个。该区间内代码以原生速度执行，不产生 trace 记录。适用于排除大循环（如内存校验） |
 
 **Trace 模式：**
 
@@ -525,6 +541,8 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 | `extra_range_start` | `uint64_t` | 第二插桩区间起始（0 = 未用） |
 | `extra_range_end` | `uint64_t` | 第二插桩区间结束 |
 | `disable_embed_code` | `uint32_t` | 非零关闭内嵌码表（默认 0 = 开启，反转语义） |
+| `n_exclude_ranges` | `uint32_t` | 排除区间数量（0..8） |
+| `exclude_ranges[8]` | `struct{u64,u64}` | 排除区间数组，每项 {start, end}（运行时地址）。区间内代码以原生速度执行，不产生 trace 记录。最多 8 个 |
 
 **`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
 `run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。

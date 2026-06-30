@@ -178,6 +178,8 @@ struct Config {
   uint64_t objc_msgSend_stret = 0;
   uint64_t extra_range_start = 0;
   uint64_t extra_range_end = 0;
+  uint32_t n_exclude_ranges = 0;
+  struct { uint64_t start; uint64_t end; } exclude_ranges[QBDITRACE_MAX_EXCLUDE_RANGES] = {};
   /* When set, emit a REC_CODE (raw instruction bytes) the first time each PC is
    * seen, so the offline decoder can disassemble without an external --image.
    * On by default; the only cost is one extra small record per *distinct*
@@ -1668,6 +1670,17 @@ static bool setupVM(QBDI::VM &vm) {
     vm.addInstrumentedRange(cfg.extra_range_start, cfg.extra_range_end);
   }
 
+  /* Remove excluded ranges from the instrumented set. Code in these regions
+   * will execute natively at full speed without producing trace records.
+   * The QBDI VM automatically writes an ANCHOR when execution re-enters the
+   * instrumented range, so the decoder can reconstruct register state. */
+  for (uint32_t i = 0; i < cfg.n_exclude_ranges; ++i) {
+    if (cfg.exclude_ranges[i].end > cfg.exclude_ranges[i].start) {
+      vm.removeInstrumentedRange(cfg.exclude_ranges[i].start,
+                                 cfg.exclude_ranges[i].end);
+    }
+  }
+
   /* Register the memory-access recorder before callbacks that read it. */
   if (cfg.record & QBDITRACE_REC_MEM) {
     vm.recordMemoryAccess(QBDI::MEMORY_READ_WRITE);
@@ -1938,6 +1951,13 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   cfg.objc_msgSend_stret = in->objc_msgSend_stret;
   cfg.extra_range_start = in->extra_range_start;
   cfg.extra_range_end = in->extra_range_end;
+  cfg.n_exclude_ranges = in->n_exclude_ranges;
+  if (cfg.n_exclude_ranges > QBDITRACE_MAX_EXCLUDE_RANGES)
+    cfg.n_exclude_ranges = QBDITRACE_MAX_EXCLUDE_RANGES;
+  for (uint32_t i = 0; i < cfg.n_exclude_ranges; ++i) {
+    cfg.exclude_ranges[i].start = in->exclude_ranges[i].start;
+    cfg.exclude_ranges[i].end = in->exclude_ranges[i].end;
+  }
   /* Inverted ABI sense: 0 (the zero-initialized default) keeps embedding on. */
   cfg.embed_code = (in->disable_embed_code == 0);
   /* v5 PC-delta mode: non-zero enables it (normal positive sense). */

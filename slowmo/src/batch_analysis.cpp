@@ -508,6 +508,13 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     pm.set_decoder(&decoder);
     pm.set_no_parallel_scan(opts.opt_no_parallel_scan);
 
+    // Apply exclude ranges to analysis
+    if (!opts.exclude_pc_ranges.empty()) {
+        AnalysisRange range;
+        range.exclude_pc_ranges = opts.exclude_pc_ranges;
+        pm.set_range(range);
+    }
+
     // Register passes needed by the requested options
     // --export-cfg needs xref -> cfg -> cfg_layout
     if (!opts.export_cfg_path.empty()) {

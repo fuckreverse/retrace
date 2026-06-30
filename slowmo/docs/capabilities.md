@@ -271,4 +271,5 @@ mindmap
 | 我想让 AI 自动分析 | `--mcp` 或 `--mcp-http` |
 | 我想边录边看 | `--streaming` |
 | 我在分析 Android trace | `syscall_intercept`（BoringSSL）, `pattern`, `taint` — ObjC 相关 pass 自动跳过 |
+| 我想排除噪声代码区间 | qbditrace `--exclude-range`（录制时排除），tenet `--exclude-range`（分析时过滤） |
 | 我想优化 tenet 本身 | `profiling.md` |

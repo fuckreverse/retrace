@@ -25,6 +25,9 @@
 extern "C" {
 #endif
 
+/* Maximum number of address ranges that can be excluded from tracing. */
+#define QBDITRACE_MAX_EXCLUDE_RANGES 8
+
 /* Bit flags controlling what the tracer records (qbditrace_config.record). */
 enum {
   QBDITRACE_REC_NZCV = 1u << 0,    /* capture NZCV flags per instruction */
@@ -140,6 +143,37 @@ typedef struct {
    * Set to non-zero only to produce traces compatible with very old readers
    * that might misinterpret a non-zero high nibble in nzcv. */
   uint32_t disable_branch_hint;
+
+  /* Exclude ranges: up to QBDITRACE_MAX_EXCLUDE_RANGES pairs of
+   * [start, end) that are *removed* from the instrumented set after the main
+   * range (and extra_range) are added.  Code within excluded regions executes
+   * natively at full speed without producing any trace records (no REC_INST,
+   * no regdiff, no memacc).
+   *
+   * Use case: large loops (e.g. memory integrity checks, CRC computations) that
+   * dominate the trace but are not relevant to the analysis.  Excluding them
+   * dramatically reduces trace size and recording overhead.
+   *
+   * Behaviour at boundaries:
+   *   - When execution enters an excluded region, QBDI transfers control
+   *     natively (no instrumentation overhead).
+   *   - When execution returns from an excluded region back to the instrumented
+   *     range, the QBDI SEQUENCE_ENTRY event fires and a fresh ANCHOR is
+   *     written, so the decoder can reconstruct the full register state.
+   *   - Memory writes performed inside excluded regions are NOT recorded;
+   *     if the excluded code mutates state used by downstream analysis (e.g.
+   *     writes a flag), those writes will be invisible to tenet's MemoryModel.
+   *
+   * n_exclude_ranges: number of valid entries in exclude_ranges[] (0..8).
+   * exclude_ranges[]: each entry is {start, end} in runtime addresses.
+   * Entries where end <= start are silently skipped.
+   * All zeros => unused (zero-initialized default). */
+  uint32_t n_exclude_ranges;
+  uint32_t _pad_exclude;  /* alignment padding */
+  struct {
+    uint64_t start;
+    uint64_t end;
+  } exclude_ranges[QBDITRACE_MAX_EXCLUDE_RANGES];
 } qbditrace_config_t;
 
 /*

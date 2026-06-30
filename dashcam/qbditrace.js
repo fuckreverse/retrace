@@ -120,33 +120,37 @@ function buildNativeFunctions(ex) {
 }
 
 function buildConfigStruct(opts) {
-  /* Must match sizeof(qbditrace_config_t) — 140 bytes, rounded up to 144
-   * for 8-byte alignment.  See QBDITrace.h for the canonical layout.
+  /* Must match sizeof(qbditrace_config_t) — see QBDITrace.h for the canonical
+   * layout.
    *
-   * offset   0  struct_size         u32
-   * offset   4  _reserved0          u32
-   * offset   8  trace_start         u64
-   * offset  16  trace_end           u64
-   * offset  24  module_base         u64
-   * offset  32  module_slide        u64
-   * offset  40  module_name         ptr
-   * offset  48  output_path         ptr
-   * offset  56  record              u32
-   * offset  60  anchor_interval     u32
-   * offset  64  ring_bytes          u64
-   * offset  72  objc_msgSend        u64
-   * offset  80  objc_msgSendSuper   u64
-   * offset  88  objc_msgSendSuper2  u64
-   * offset  96  objc_msgSend_stret  u64
-   * offset 104  extra_range_start   u64
-   * offset 112  extra_range_end     u64
-   * offset 120  disable_embed_code  u32
-   * offset 124  enable_pc_delta     u32
-   * offset 128  _reserved_old_value u32  (deprecated, ignored)
-   * offset 132  enable_fpr          u32
-   * offset 136  disable_compress    u32
+   * offset   0  struct_size          u32
+   * offset   4  _reserved0           u32
+   * offset   8  trace_start          u64
+   * offset  16  trace_end            u64
+   * offset  24  module_base          u64
+   * offset  32  module_slide         u64
+   * offset  40  module_name          ptr
+   * offset  48  output_path          ptr
+   * offset  56  record               u32
+   * offset  60  anchor_interval      u32
+   * offset  64  ring_bytes           u64
+   * offset  72  objc_msgSend         u64
+   * offset  80  objc_msgSendSuper    u64
+   * offset  88  objc_msgSendSuper2   u64
+   * offset  96  objc_msgSend_stret   u64
+   * offset 104  extra_range_start    u64
+   * offset 112  extra_range_end      u64
+   * offset 120  disable_embed_code   u32
+   * offset 124  enable_pc_delta      u32
+   * offset 128  _reserved_old_value  u32  (deprecated, ignored)
+   * offset 132  enable_fpr           u32
+   * offset 136  disable_compress     u32
+   * offset 140  disable_branch_hint  u32
+   * offset 144  n_exclude_ranges     u32
+   * offset 148  _pad_exclude         u32
+   * offset 152  exclude_ranges[0..7] 8×{u64 start, u64 end} = 128 bytes
    */
-  const SIZE = 144;
+  const SIZE = 280;
   const cfg = Memory.alloc(SIZE);
   for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
@@ -177,6 +181,16 @@ function buildConfigStruct(opts) {
   cfg.add(128).writeU32(0); /* _reserved_old_value: deprecated, always 0 */
   cfg.add(132).writeU32(opts.fpr        ? 1 : 0);
   cfg.add(136).writeU32(opts.noCompress ? 1 : 0);
+  cfg.add(140).writeU32(opts.noBranchHint ? 1 : 0);
+  /* Exclude ranges array: up to 8 entries */
+  const excludes = opts.excludeRanges || [];
+  cfg.add(144).writeU32(excludes.length);
+  /* offset 148 is _pad_exclude, already zeroed */
+  for (let i = 0; i < excludes.length && i < 8; i++) {
+    const base = 152 + i * 16;
+    cfg.add(base).writePointer(excludes[i].start);
+    cfg.add(base + 8).writePointer(excludes[i].end);
+  }
   return cfg;
 }
 
@@ -416,6 +430,14 @@ function main() {
 
   log('entry = ' + funcStart + '  fallback end = ' + funcEnd);
   log('module base = ' + moduleBase + '  slide = ' + moduleSlide);
+  if (CONFIG.excludeRanges && CONFIG.excludeRanges.length > 0) {
+    CONFIG.excludeRanges.forEach(function(r, idx) {
+      log('exclude[' + idx + '] = ' + moduleBase.add(r.start) +
+          ' - ' + moduleBase.add(r.end) +
+          ' (offset 0x' + r.start.toString(16) +
+          ' - 0x' + r.end.toString(16) + ')');
+    });
+  }
 
   const objc = CONFIG.resolveObjc ? resolveObjcDispatchers() : {
     objcMsgSend: NULL, objcMsgSendSuper: NULL,
@@ -447,6 +469,15 @@ function main() {
     anchorInterval: CONFIG.anchorInterval,
     ringBytes: CONFIG.ringBytes,
     embedCode: CONFIG.embedCode,
+    pcDelta: CONFIG.pcDelta,
+    fpr: CONFIG.fpr,
+    noCompress: CONFIG.noCompress,
+    noBranchHint: CONFIG.noBranchHint,
+    extraRangeStart: CONFIG.extraRangeStart ? ptr(CONFIG.extraRangeStart) : NULL,
+    extraRangeEnd: CONFIG.extraRangeEnd ? ptr(CONFIG.extraRangeEnd) : NULL,
+    excludeRanges: (CONFIG.excludeRanges || []).map(function(r) {
+      return { start: moduleBase.add(r.start), end: moduleBase.add(r.end) };
+    }),
     objcMsgSend: objc.objcMsgSend,
     objcMsgSendSuper: objc.objcMsgSendSuper,
     objcMsgSendSuper2: objc.objcMsgSendSuper2,

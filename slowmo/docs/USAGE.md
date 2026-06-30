@@ -301,6 +301,14 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --entry 0xABC \
     --anchor-interval 512 \
     --output /var/mobile/Documents/trace.bin
+
+# 排除噪声区间（静态偏移，格式 START-END 或 START:SIZE，最多 8 个）
+# 排除区域原生执行不产生 trace 记录
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --exclude-range 0x1000-0x2000 --exclude-range 0x3000:0x400 \
+    --output /var/mobile/Documents/trace.bin
 ```
 
 ### 3.6 后台录制
@@ -497,6 +505,15 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 
 # 缓存模拟（cache miss 分析）
 ./tenet trace.bin --cache-sim
+```
+
+**排除噪声区间（分析时过滤）：**
+
+```bash
+# 排除区间内的指令不传递给分析 pass（运行时地址，可重复）
+# 不影响寄存器/内存状态重建
+./tenet trace.bin --exclude-range 0x1001000 0x1002000 --pattern
+./tenet trace.bin --exclude-range 0x1001000 0x1002000 --exclude-range 0x1003000 0x1003400 --xref
 ```
 
 ---

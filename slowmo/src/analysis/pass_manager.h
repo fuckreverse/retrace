@@ -64,7 +64,21 @@ struct AnalysisRange {
     uint64_t start_inst_id = 0;
     uint64_t end_inst_id = UINT64_MAX;
 
+    /// PC address ranges to exclude from analysis [start, end).
+    /// Instructions with PC in any of these ranges are skipped by the scan engine.
+    /// The excluded instructions still exist in the trace (RegisterFile/MemoryModel
+    /// state reconstruction is unaffected) — they are simply not delivered to passes.
+    std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges;
+
     bool is_full_trace() const { return start_inst_id == 0 && end_inst_id == UINT64_MAX; }
+
+    /// Check if a PC falls within any excluded range.
+    bool is_pc_excluded(uint64_t pc) const {
+        for (const auto& [start, end] : exclude_pc_ranges) {
+            if (pc >= start && pc < end) return true;
+        }
+        return false;
+    }
 };
 
 // ─── Pass context ─────────────────────────────────────────────────────────
@@ -119,6 +133,10 @@ public:
 
     /// Access the shared trace scan engine (for passes that want to run collectors).
     TraceScanEngine* scan_engine();
+
+    /// Create a new TraceScanEngine pre-configured with exclude ranges from AnalysisRange.
+    /// Passes should prefer this over constructing TraceScanEngine directly.
+    TraceScanEngine make_scan_engine();
 
     /// Whether parallel trace scanning is disabled at runtime.
     bool no_parallel_scan() const;

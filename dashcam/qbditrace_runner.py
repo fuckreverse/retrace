@@ -147,6 +147,11 @@ def parse_args():
                           '(128-bit vector regs, essential for AES/SHA analysis)')
     rec.add_argument('--no-compress', action='store_true',
                      help='Disable zstd stream compression (compression is ON by default)')
+    rec.add_argument('--exclude-range', type=str, action='append', default=[],
+                     help='Exclude address range from tracing (format: START-END or '
+                          'START:SIZE, hex). Can be specified multiple times (max 8). '
+                          'Code in excluded ranges executes natively without recording. '
+                          'Example: --exclude-range 0x1234-0x5678 --exclude-range 0xA000:0x200')
 
     # --- Trace mode ---
     mode = p.add_argument_group('Trace mode')
@@ -209,6 +214,33 @@ def parse_args():
         except ValueError:
             p.error('--trace-mode must be "once", "multi", or a positive integer')
 
+    # Parse --exclude-range (can be specified multiple times): "START-END" or "START:SIZE"
+    args._exclude_ranges = []
+    if len(args.exclude_range) > 8:
+        p.error('--exclude-range: maximum 8 ranges supported')
+    for er_raw in args.exclude_range:
+        er = er_raw.strip().lstrip('0x').lstrip('0X')
+        # Re-parse from the original to handle "0x" prefix properly
+        er = er_raw.strip()
+        try:
+            if '-' in er and ':' not in er:
+                parts = er.split('-', 1)
+                start = int(parts[0], 16)
+                end = int(parts[1], 16)
+            elif ':' in er:
+                parts = er.split(':', 1)
+                start = int(parts[0], 16)
+                size = int(parts[1], 16)
+                end = start + size
+            else:
+                p.error(f'--exclude-range "{er_raw}": must be START-END or START:SIZE (hex)')
+                return  # unreachable
+            if end <= start:
+                p.error(f'--exclude-range "{er_raw}": end must be greater than start')
+            args._exclude_ranges.append({'start': start, 'end': end})
+        except ValueError:
+            p.error(f'--exclude-range "{er_raw}": invalid hex address format')
+
     return args
 
 
@@ -242,6 +274,7 @@ def build_config(args):
         'pcDelta': args.pc_delta,
         'fpr': args.fpr,
         'noCompress': args.no_compress,
+        'excludeRanges': args._exclude_ranges,
         'argCount': args.arg_count,
         'traceMode': args.trace_mode,
         'rehook': not args.no_rehook,
@@ -454,6 +487,9 @@ def main():
     if args.no_compress: extras.append('no-compress')
     else:                extras.append('zstd-compress')
     print(f'  Features:    {" | ".join(extras)}')
+    for i, er in enumerate(args._exclude_ranges):
+        print(f'  Exclude[{i}]:  0x{er["start"]:X} - 0x{er["end"]:X} '
+              f'(size 0x{er["end"] - er["start"]:X})')
     print(f'  Trace mode:  {args.trace_mode}')
     if args.trace_gcd:
         print(f'  GCD trace:   ON (filter={not args.gcd_no_filter}, max={args.gcd_max})')

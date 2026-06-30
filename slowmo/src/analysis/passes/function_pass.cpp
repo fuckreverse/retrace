@@ -998,6 +998,9 @@ PassResult FunctionPass::run(PassContext& ctx) {
         ctx.progress(kPhase2End, "Function analysis: finalising...");
     } else {
         TraceScanEngine local_engine(reader, total_insts, &index);
+        if (!ctx.range().exclude_pc_ranges.empty()) {
+            local_engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
+        }
         // Phase 1: map engine progress [0,1] → [0, kPhase1End]
         local_engine.set_progress([&](uint64_t processed, uint64_t total) {
             if (total > 0) {

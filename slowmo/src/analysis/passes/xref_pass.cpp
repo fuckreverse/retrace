@@ -141,7 +141,8 @@ struct ShardResult {
 void scan_shard(const Shard& shard, uint32_t num_gpr,
                 bool is_v5, bool is_v6, ShardResult& out,
                 const TraceReader::ThreadReader& thread_reader,
-                const std::atomic<bool>& cancelled) {
+                const std::atomic<bool>& cancelled,
+                const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges = {}) {
     uint64_t offset = shard.file_start;
     const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
@@ -159,6 +160,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     uint64_t last_pc = UINT64_MAX;
     roaring64_bitmap_t* last_bm = nullptr;
     roaring64_bulk_context_t last_ctx = {};
+    const bool has_excludes = !exclude_ranges.empty();
 
     while (offset < end_offset) {
         // Check for cancellation every 64K instructions to allow
@@ -174,7 +176,15 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
         if (kind == 0) { // INST — the hot path (>95% of records)
             uint64_t pc = is_v5 ? 0 : raw_inst_pc(ptr);
 
-            if (!is_v5) {
+            // Skip excluded PC ranges
+            bool excluded = false;
+            if (has_excludes && !is_v5) {
+                for (const auto& [s, e] : exclude_ranges) {
+                    if (pc >= s && pc < e) { excluded = true; break; }
+                }
+            }
+
+            if (!is_v5 && !excluded) {
                 if (__builtin_expect(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
@@ -741,15 +751,16 @@ PassResult XrefPass::run(PassContext& ctx) {
 
     // Get cancellation flag reference for shard threads.
     const std::atomic<bool>& cancel_flag = ctx.global_cancel_flag();
+    const auto& excludes = range.exclude_pc_ranges;
 
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, num_gpr, xref_is_v5, xref_is_v6, i]() {
-            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], thread_readers[i], cancel_flag);
+        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, &excludes, num_gpr, xref_is_v5, xref_is_v6, i]() {
+            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], thread_readers[i], cancel_flag, excludes);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], thread_readers[0], cancel_flag);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], thread_readers[0], cancel_flag, excludes);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 

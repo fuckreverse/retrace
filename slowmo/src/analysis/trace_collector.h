@@ -6,6 +6,7 @@
 #include <functional>
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 namespace tenet {
 
@@ -126,11 +127,28 @@ public:
     /// When set, parallel shard threads check this flag periodically.
     void set_cancel_token(const std::atomic<bool>* token) { cancel_token_ = token; }
 
+    /// Set PC address ranges to exclude from delivery to collectors.
+    /// Instructions whose PC falls in any [start, end) range are silently skipped.
+    /// This does NOT affect the trace file or indexing — only analysis visibility.
+    void set_exclude_pc_ranges(std::vector<std::pair<uint64_t, uint64_t>> ranges) {
+        exclude_pc_ranges_ = std::move(ranges);
+    }
+
 private:
+    /// Check if a PC is in any excluded range. Inline for hot-path performance.
+    bool is_pc_excluded(uint64_t pc) const {
+        for (const auto& [start, end] : exclude_pc_ranges_) {
+            if (pc >= start && pc < end) return true;
+        }
+        return false;
+    }
+
+
     const TraceReader& reader_;
     uint64_t inst_count_;
     const TraceIndex* index_ = nullptr;
     std::vector<TraceCollector*> collectors_;
+    std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges_;
     ProgressFn progress_fn_;
     std::function<bool()> cancel_fn_;
     const std::atomic<bool>* cancel_token_ = nullptr;

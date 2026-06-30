@@ -113,6 +113,7 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --yara-min-entropy <N>            Skip pages with Shannon entropy < N (default: 0)\n");
     fmt::print(stderr, "  --yara-scan-code                  Also scan code bytes buffer\n");
     fmt::print(stderr, "  --thread-filter [tid1,tid2,...]   Build per-thread instruction bitmaps\n");
+    fmt::print(stderr, "  --exclude-range <start> <end>     Exclude PC range [start,end) from analysis (hex, repeatable)\n");
     fmt::print(stderr, "  --rpc [socket_path]               Start JSON-RPC server over Unix socket\n");
     fmt::print(stderr, "                                    (blocks until client disconnects)\n");
     fmt::print(stderr, "  --mcp                             Start MCP server over stdio (JSON-RPC 2.0)\n");
@@ -351,6 +352,15 @@ CliOptions parse_args(int argc, char** argv) {
                         tok.push_back(c);
                     }
                 }
+            }
+        } else if (arg == "--exclude-range" && i + 2 < argc) {
+            // --exclude-range <start_hex> <end_hex>
+            uint64_t start = std::stoull(argv[++i], nullptr, 16);
+            uint64_t end = std::stoull(argv[++i], nullptr, 16);
+            if (end > start) {
+                opts.exclude_pc_ranges.emplace_back(start, end);
+            } else {
+                fmt::print(stderr, "[!] --exclude-range: end (0x{:X}) must be > start (0x{:X}), ignored\n", end, start);
             }
         } else if (arg == "--cache-list") {
             opts.opt_cache_list = true;

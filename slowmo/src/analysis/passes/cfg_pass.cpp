@@ -495,6 +495,9 @@ PassResult CFGPass::run(PassContext& ctx) {
 
     CFGEdgeCollector collector(&result);
     TraceScanEngine engine(reader, index.inst_count(), &index);
+    if (!ctx.range().exclude_pc_ranges.empty()) {
+        engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
+    }
     engine.add_collector(&collector);
     engine.set_progress([&](uint64_t processed, uint64_t total) {
         ctx.progress(static_cast<float>(processed) / static_cast<float>(total));

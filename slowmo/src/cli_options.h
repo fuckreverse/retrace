@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tenet {
@@ -145,6 +146,11 @@ struct CliOptions {
     // --- P3: Thread filter ---
     bool opt_thread_filter = false;
     std::vector<uint64_t> thread_filter_ids;
+
+    // --- Exclude ranges (analysis-level filtering) ---
+    /// PC address ranges to exclude from analysis. Instructions whose PC falls
+    /// in any [start, end) range are not delivered to passes. Repeatable.
+    std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges;
 
     // --- Generic pass runner ---
     bool opt_index_build = false;

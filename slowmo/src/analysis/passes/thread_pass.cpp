@@ -321,6 +321,9 @@ PassResult ThreadPass::run(PassContext& ctx) {
 
     ThreadCollector collector;
     TraceScanEngine engine(reader, index.inst_count());
+    if (!ctx.range().exclude_pc_ranges.empty()) {
+        engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
+    }
     engine.add_collector(&collector);
     engine.set_progress([&ctx, total = end - start](uint64_t processed, uint64_t /*total_arg*/) {
         if (total > 0) {
