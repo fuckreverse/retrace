@@ -622,6 +622,40 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         std::filesystem::remove_all(sst_dir, ec);
     }
 
+    // ── Phase 2b: Compact MEM_WRITE and MEM_READ CFs ───────────────────
+    // After SST ingest, all data sits in L0 where key ranges overlap across
+    // shards.  Each prefix-seek query must check every L0 file, causing
+    // massive read amplification.  CompactRange merges L0 into leveled SSTs
+    // with non-overlapping key ranges, reducing query cost to 1 file/level.
+    // This also consolidates many small SST files into fewer large ones,
+    // keeping the total open-file count well within max_open_files.
+    {
+        rocksdb::CompactRangeOptions cro;
+        cro.bottommost_level_compaction =
+            rocksdb::BottommostLevelCompaction::kForceOptimized;
+
+        // Run both compactions in parallel (each can take seconds on large traces).
+        auto compact_cf = [&](rocksdb::ColumnFamilyHandle* cf) {
+            if (cf) {
+                auto cs = db_->CompactRange(cro, cf, nullptr, nullptr);
+                if (!cs.ok()) {
+                    LOG_WARN("MemoryModel CompactRange failed: {}", cs.ToString());
+                }
+            }
+        };
+
+        if (mem_cf_ && mem_read_cf_) {
+            std::thread t1([&]() { compact_cf(mem_cf_); });
+            compact_cf(mem_read_cf_);
+            t1.join();
+        } else {
+            compact_cf(mem_cf_);
+            compact_cf(mem_read_cf_);
+        }
+
+        LOG_INFO("MemoryModel::build: compaction complete");
+    }
+
     // ── Phase 3: Merge page activity from all shards ────────────────────
     uint64_t total_writes_persisted = 0;
     {
