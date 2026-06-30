@@ -8,10 +8,12 @@
 #include "analysis/passes/pattern_pass.h"
 
 #include <fmt/core.h>
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <string_view>
 #include <cstdint>
+#include <cctype>
 #include <stdexcept>
 
 namespace tenet {
@@ -161,6 +163,42 @@ inline uint64_t parse_hex(const std::string& s) {
         clean = clean.substr(2);
     }
     return std::stoull(clean, nullptr, 16);
+}
+
+// ─── Helper: parse a register index from a JSON value ────────────────────
+//
+// Accepts either:
+//   - integer:  {"reg_index": 0}  (0 = x0)
+//   - string:   {"reg_index": "x0"}  or  {"reg_index": "0"}
+//
+// Returns the 0-based register index [0,33].
+// Throws std::runtime_error on unrecognised names or out-of-range indices.
+
+inline uint8_t parse_reg(const nlohmann::json& val) {
+    if (val.is_number_integer()) {
+        int idx = val.get<int>();
+        if (idx < 0 || idx > 33)
+            throw std::runtime_error("Register index out of range [0,33]: " + std::to_string(idx));
+        return static_cast<uint8_t>(idx);
+    }
+    if (val.is_string()) {
+        std::string s = val.get<std::string>();
+        // Try numeric string first ("0", "30", etc.)
+        bool all_digit = !s.empty();
+        for (char c : s) { if (!std::isdigit(static_cast<unsigned char>(c))) { all_digit = false; break; } }
+        if (all_digit) {
+            int idx = std::stoi(s);
+            if (idx < 0 || idx > 33)
+                throw std::runtime_error("Register index out of range [0,33]: " + s);
+            return static_cast<uint8_t>(idx);
+        }
+        // Try register name ("x0", "fp", "lr", "sp", "pc", "nzcv", "x29", "x30")
+        int idx = reg_name_to_idx(s);
+        if (idx < 0)
+            throw std::runtime_error("Unknown register name: '" + s + "'. Use x0-x28, fp(x29), lr(x30), sp, nzcv, or pc.");
+        return static_cast<uint8_t>(idx);
+    }
+    throw std::runtime_error("reg_index must be an integer or register name string");
 }
 
 }  // namespace tenet

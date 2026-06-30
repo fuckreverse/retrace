@@ -193,6 +193,21 @@ private:
     CodeTable* code_table_;
     InstructionDecoder* decoder_;
 
+    // ── Image base for PC display ──────────────────────────────────────
+    // All PCs returned by MCP tools are rebased:
+    //   displayed_pc = runtime_pc - module_slide + image_base_
+    // Default is IDA's default image base (0x100000000).
+    // Set to 0 to get slide-relative (static) addresses.
+    // Set to module_slide to get raw runtime addresses.
+    // Adjustable at runtime via the set_image_base tool.
+    std::atomic<uint64_t> image_base_{0x100000000ULL};
+
+    /// Convert a runtime PC to the displayed (rebased) address.
+    uint64_t rebase(uint64_t runtime_pc) const noexcept;
+
+    /// Convert a displayed (rebased) address back to a runtime PC.
+    uint64_t unrebase(uint64_t displayed_pc) const noexcept;
+
     std::vector<McpToolSchema> tool_schemas_;
     std::unordered_map<std::string, McpToolHandler> tool_handlers_;
 

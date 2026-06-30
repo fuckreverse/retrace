@@ -282,6 +282,18 @@ json TenetMcpService::process_message(const json& msg) {
     };
 }
 
+// ─── rebase / unrebase ──────────────────────────────────────────────────
+
+uint64_t TenetMcpService::rebase(uint64_t runtime_pc) const noexcept {
+    return runtime_pc - reader_.header().module_slide
+           + image_base_.load(std::memory_order_relaxed);
+}
+
+uint64_t TenetMcpService::unrebase(uint64_t displayed_pc) const noexcept {
+    return displayed_pc - image_base_.load(std::memory_order_relaxed)
+           + reader_.header().module_slide;
+}
+
 // ─── Tool Registration ──────────────────────────────────────────────────
 
 void TenetMcpService::register_all_tools() {
@@ -296,11 +308,44 @@ void TenetMcpService::register_all_tools() {
     register_batch_tools();
     register_hypothesis_tools();
 
+    // ── set_image_base ────────────────────────────────────────────────────
+    // Registered here (not in mcp_tools_core.cpp) because it directly mutates
+    // service state (image_base_) and needs access to both reader_ and image_base_.
+    register_tool(
+        {"set_image_base",
+         "Set the image base used for all PC addresses returned by MCP tools. "
+         "All PCs are rebased as: displayed_pc = runtime_pc - module_slide + image_base. "
+         "Default is 0x100000000 (IDA's default for ARM64 Mach-O binaries). "
+         "Use 0 to get slide-relative static offsets. "
+         "Use module_slide (from trace_info) to get raw runtime addresses. "
+         "Input PCs (e.g. for search_pc, stop_pcs) must also use the rebased space.",
+         {{"type", "object"},
+          {"properties", {
+              {"image_base", {{"type", "string"},
+                              {"description", "New image base as hex string (e.g. '0x100000000')"}}}
+          }},
+          {"required", json::array({"image_base"})}}},
+        [this](const json& args) -> json {
+            uint64_t new_base = parse_hex(args.at("image_base").get<std::string>());
+            uint64_t old_base = image_base_.exchange(new_base, std::memory_order_relaxed);
+            uint64_t slide    = reader_.header().module_slide;
+            return {
+                {"ok", true},
+                {"old_image_base", fmt::format("0x{:X}", old_base)},
+                {"new_image_base", fmt::format("0x{:X}", new_base)},
+                {"module_slide",   fmt::format("0x{:X}", slide)},
+                {"note", "All subsequent PC values from MCP tools will use the new image base."}
+            };
+        }
+    );
+
     // Classify write tools: hypothesis_* tools mutate HypothesisLedger state.
+    // set_image_base mutates image_base_ (atomic, but logically a write).
     // All other tools are read-only (or their data structures have internal
     // synchronisation) and can execute concurrently.
     for (const auto& schema : tool_schemas_) {
-        if (schema.name.rfind("hypothesis_", 0) == 0) {
+        if (schema.name.rfind("hypothesis_", 0) == 0 ||
+            schema.name == "set_image_base") {
             write_tools_.insert(schema.name);
         }
     }

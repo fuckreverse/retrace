@@ -1484,3 +1484,86 @@ TEST_CASE("MCP HTTP: mixed read/write workload is safe",
     CHECK(read_ok == 7);
     CHECK(write_ok == 3);
 }
+
+// ── pc-based parameter tests ──────────────────────────────────────────────
+// These tests verify that tools accept a 'pc' hex string in place of 'inst_id'.
+//
+// Address conventions (same as the MCP 'search_pc' tool):
+//   displayed_pc = static_pc + image_base       (image_base default: 0x100000000)
+//   runtime_pc   = static_pc + module_slide     (slide: 0x4000)
+//   unrebase(displayed_pc) = runtime_pc
+//
+// So for static 0x1008 → displayed 0x100001008 → runtime 0x5008.
+// For static 0x2000 → displayed 0x100002000.
+// For static 0x200C → displayed 0x10000200C.
+
+static constexpr uint64_t kImageBase = 0x100000000ULL;
+
+TEST_CASE("MCP HTTP: get_regs via pc parameter", "[integration][mcp][http]") {
+    auto& ctx = shared_env();
+    auto client = make_client(ctx);
+
+    // static 0x1008 (inst 2: movz x0, 0x42) → displayed 0x100001008
+    uint64_t disp_pc = 0x1008ULL + kImageBase;
+    auto resp = client.send_rpc_retry(make_tool_call("get_regs", 200, {
+        {"pc", fmt::format("0x{:X}", disp_pc)}
+    }));
+    REQUIRE_HTTP_RESPONSE(resp);
+    CHECK(resp["result"]["isError"] == false);
+
+    auto text = resp["result"]["content"][0]["text"].get<std::string>();
+    auto result = json::parse(text);
+    REQUIRE(result.contains("regs"));
+    // inst_id must be filled in by the server
+    REQUIRE(result.contains("inst_id"));
+}
+
+TEST_CASE("MCP HTTP: call_context via pc parameter", "[integration][mcp][http]") {
+    auto& ctx = shared_env();
+    auto client = make_client(ctx);
+
+    // xor_decrypt entry (static 0x2000) → displayed 0x100002000
+    uint64_t disp_pc = 0x2000ULL + kImageBase;
+    auto resp = client.send_rpc_retry(make_tool_call("call_context", 201, {
+        {"pc", fmt::format("0x{:X}", disp_pc)}
+    }));
+    REQUIRE_HTTP_RESPONSE(resp);
+    CHECK(resp["result"]["isError"] == false);
+
+    auto text = resp["result"]["content"][0]["text"].get<std::string>();
+    auto result = json::parse(text);
+    REQUIRE(result.contains("call_stack"));
+    REQUIRE(result.contains("target_inst_id"));
+}
+
+TEST_CASE("MCP HTTP: producer_chain via pc parameter", "[integration][mcp][http]") {
+    auto& ctx = shared_env();
+    auto client = make_client(ctx);
+
+    // xor_decrypt body (static 0x200C) → displayed 0x10000200C, reg x3
+    uint64_t disp_xor_body = 0x200CULL + kImageBase;
+    auto resp = client.send_rpc_retry(make_tool_call("producer_chain", 202, {
+        {"pc",        fmt::format("0x{:X}", disp_xor_body)},
+        {"reg_index", "x3"}
+    }));
+    REQUIRE_HTTP_RESPONSE(resp);
+    CHECK(resp["result"]["isError"] == false);
+
+    auto text = resp["result"]["content"][0]["text"].get<std::string>();
+    auto result = json::parse(text);
+    REQUIRE(result.contains("chain"));
+}
+
+TEST_CASE("MCP HTTP: get_regs via unknown pc returns error", "[integration][mcp][http]") {
+    auto& ctx = shared_env();
+    auto client = make_client(ctx);
+
+    // A PC that was never executed should return isError=true with a clear message
+    auto resp = client.send_rpc_retry(make_tool_call("get_regs", 203, {
+        {"pc", "0xDEADBEEF"}
+    }));
+    REQUIRE_HTTP_RESPONSE(resp);
+    CHECK(resp["result"]["isError"] == true);
+    auto text = resp["result"]["content"][0]["text"].get<std::string>();
+    CHECK(text.find("No instruction found") != std::string::npos);
+}

@@ -11,6 +11,7 @@
 #include "core/memory_model.h"
 #include "core/instruction_decoder.h"
 #include "analysis/pass_manager.h"
+#include "analysis/pass_registry.h"
 
 #include "analysis/passes/xref_pass.h"
 #include "analysis/passes/cfg_pass.h"
@@ -61,7 +62,7 @@ void TenetMcpService::register_analysis_tools() {
          "instruction ranges.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<PatternPass>());
+            tenet::register_pass_by_name(*pm_, "pattern");
             const auto& result = require_pass<PatternResult>(pm_, "pattern", "Pattern pass failed");
 
             json matches = json::array();
@@ -72,7 +73,7 @@ void TenetMcpService::register_analysis_tools() {
                     {"confidence",    pattern_confidence_str(m.confidence)},
                     {"start_inst_id", m.start_inst_id},
                     {"end_inst_id",   m.end_inst_id},
-                    {"anchor_pc",     fmt::format("0x{:X}", m.anchor_pc)},
+                    {"anchor_pc",     fmt::format("0x{:X}", rebase(m.anchor_pc))},
                     {"description",   m.description}
                 });
             }
@@ -83,15 +84,24 @@ void TenetMcpService::register_analysis_tools() {
     // ── strings_scan ──────────────────────────────────────────────────────
     register_tool(
         {"strings_scan",
-         "Discover printable strings in traced memory accesses.",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<StringPass>());
+         "Discover printable strings in traced memory accesses. "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more results).",
+         {{"type", "object"},
+          {"properties", {
+              {"offset", {{"type", "integer"}, {"description", "Pagination: skip first N strings"}, {"default", 0}}},
+              {"limit",  {{"type", "integer"}, {"description", "Pagination: max strings per page (max 500)"}, {"default", 500}}}
+          }}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "strings");
             const auto& result = require_pass<StringResult>(pm_, "strings", "String pass failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit = std::min(args.value("limit", size_t(500)), size_t(500));
             json strings = json::array();
-            size_t limit = std::min(result.strings.size(), size_t(500));
-            for (size_t i = 0; i < limit; i++) {
+            size_t start_i = std::min(offset, result.strings.size());
+            size_t end_i = std::min(start_i + limit, result.strings.size());
+            for (size_t i = start_i; i < end_i; i++) {
                 const auto& s = result.strings[i];
                 strings.push_back({
                     {"addr", fmt::format("0x{:X}", s.addr)},
@@ -102,8 +112,13 @@ void TenetMcpService::register_analysis_tools() {
                     {"ref_count", s.references.size()}
                 });
             }
-            return {{"total", result.total()}, {"strings", std::move(strings)},
-                    {"truncated", result.strings.size() > limit}};
+            bool has_more = end_i < result.strings.size();
+            return {{"total", result.total()},
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
+                    {"strings", std::move(strings)}};
         }
     );
 
@@ -153,16 +168,16 @@ void TenetMcpService::register_analysis_tools() {
          "Feistel rounds, SPN rounds, ARX patterns, S-box lookups, etc.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
-            pm_->register_pass(std::make_unique<LoopSemanticsPass>());
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "loop");
+            tenet::register_pass_by_name(*pm_, "loop_semantics");
             const auto& result = require_pass<LoopSemanticsResult>(pm_, "loop_semantics", "Loop semantics failed");
 
             json loops = json::array();
             for (const auto& l : result.loop_semantics) {
                 loops.push_back({
-                    {"pc", fmt::format("0x{:X}", l.header_pc)},
+                    {"pc", fmt::format("0x{:X}", rebase(l.header_pc))},
                     {"iteration_count", l.iteration_count},
                     {"kind", loop_kind_name(l.kind)},
                     {"confidence", l.confidence},
@@ -185,15 +200,15 @@ void TenetMcpService::register_analysis_tools() {
          "analysis to identify cryptographic algorithms in the trace.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<PatternPass>());
-            pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
-            pm_->register_pass(std::make_unique<LoopSemanticsPass>());
-            pm_->register_pass(std::make_unique<FunctionPass>());
-            pm_->register_pass(std::make_unique<CallGraphPass>());
-            pm_->register_pass(std::make_unique<AlgorithmSummaryPass>());
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "pattern");
+            tenet::register_pass_by_name(*pm_, "constant_materialization");
+            tenet::register_pass_by_name(*pm_, "loop");
+            tenet::register_pass_by_name(*pm_, "loop_semantics");
+            tenet::register_pass_by_name(*pm_, "function");
+            tenet::register_pass_by_name(*pm_, "call_graph");
+            tenet::register_pass_by_name(*pm_, "algorithm_summary");
             const auto& result = require_pass<AlgorithmSummaryResult>(pm_, "algorithm_summary", "Algorithm summary failed");
             return result.summary_json;
         }
@@ -223,25 +238,35 @@ void TenetMcpService::register_analysis_tools() {
     register_tool(
         {"symbol_annotation",
          "Generate symbol annotations for all PCs (function labels, loop "
-         "indicators, constant markers, pattern identifiers).",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<FunctionPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
-            pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
-            pm_->register_pass(std::make_unique<PatternPass>());
-            pm_->register_pass(std::make_unique<SymbolAnnotationPass>());
+         "indicators, constant markers, pattern identifiers). "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more PCs).",
+         {{"type", "object"},
+          {"properties", {
+              {"offset", {{"type", "integer"}, {"description", "Pagination: skip first N annotated PCs"}, {"default", 0}}},
+              {"limit",  {{"type", "integer"}, {"description", "Pagination: max PCs per page (max 1000)"}, {"default", 1000}}}
+          }}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "function");
+            tenet::register_pass_by_name(*pm_, "loop");
+            tenet::register_pass_by_name(*pm_, "constant_materialization");
+            tenet::register_pass_by_name(*pm_, "pattern");
+            tenet::register_pass_by_name(*pm_, "symbol_annotation");
             const auto& result = require_pass<AnnotationResult>(pm_, "symbol_annotation", "Annotation pass failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit = std::min(args.value("limit", size_t(1000)), size_t(1000));
             json annotations = json::array();
             size_t count = 0;
+            size_t skipped = 0;
             for (const auto& [pc, anns] : result.by_pc) {
-                if (count >= 1000) break;
+                if (skipped < offset) { skipped++; continue; }
+                if (count >= limit) break;
                 for (const auto& a : anns) {
                     annotations.push_back({
-                        {"pc", fmt::format("0x{:X}", pc)},
+                        {"pc", fmt::format("0x{:X}", rebase(pc))},
                         {"label", a.label},
                         {"detail", a.detail},
                         {"kind", static_cast<int>(a.kind)}
@@ -249,9 +274,13 @@ void TenetMcpService::register_analysis_tools() {
                 }
                 count++;
             }
+            bool has_more = (offset + count) < result.by_pc.size();
             return {{"total_pcs", result.by_pc.size()},
-                    {"annotations", std::move(annotations)},
-                    {"truncated", result.by_pc.size() > 1000}};
+                    {"offset", offset},
+                    {"returned", count},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? offset + count : offset},
+                    {"annotations", std::move(annotations)}};
         }
     );
 
@@ -295,10 +324,10 @@ void TenetMcpService::register_analysis_tools() {
          "Shows which ObjC methods are active when crypto operations occur.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<ObjcPass>());
-            pm_->register_pass(std::make_unique<ConstantMaterializationPass>());
-            pm_->register_pass(std::make_unique<PatternPass>());
-            pm_->register_pass(std::make_unique<ObjcCryptoPass>());
+            tenet::register_pass_by_name(*pm_, "objc");
+            tenet::register_pass_by_name(*pm_, "constant_materialization");
+            tenet::register_pass_by_name(*pm_, "pattern");
+            tenet::register_pass_by_name(*pm_, "objc_crypto");
             const auto& result = require_pass<ObjcCryptoResult>(pm_, "objc_crypto", "ObjC crypto failed");
             return json::parse(result.to_json());
         }
@@ -317,7 +346,7 @@ void TenetMcpService::register_analysis_tools() {
         [this](const json& args) -> json {
             SyscallInterceptConfig cfg;
             cfg.capture_bytes = args.value("capture_bytes", uint32_t(64));
-            pm_->register_pass(std::make_unique<ObjcPass>());
+            tenet::register_pass_by_name(*pm_, "objc");
             pm_->register_pass(std::make_unique<SyscallInterceptPass>(std::move(cfg)));
             const auto& result = require_pass<SyscallInterceptResult>(pm_, "syscall_intercept", "Syscall intercept failed");
             return json::parse(result.to_json());
@@ -332,9 +361,9 @@ void TenetMcpService::register_analysis_tools() {
          "I/O, and other common source points.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<ObjcPass>());
-            pm_->register_pass(std::make_unique<FunctionPass>());
-            pm_->register_pass(std::make_unique<TaintSourceAnnotationPass>());
+            tenet::register_pass_by_name(*pm_, "objc");
+            tenet::register_pass_by_name(*pm_, "function");
+            tenet::register_pass_by_name(*pm_, "taint_source_annotation");
             const auto& result = require_pass<TaintSourceAnnotationResult>(pm_, "taint_source_annotation", "Taint source annotation failed");
             return json::parse(result.to_json());
         }
@@ -345,34 +374,46 @@ void TenetMcpService::register_analysis_tools() {
         {"trace_fold",
          "Fold (compress) the trace by merging repeated call sequences. "
          "Shows a high-level summary of function call patterns and their "
-         "repetition counts.",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
-            pm_->register_pass(std::make_unique<FunctionPass>());
-            pm_->register_pass(std::make_unique<TraceFoldPass>());
+         "repetition counts. Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more regions).",
+         {{"type", "object"},
+          {"properties", {
+              {"offset", {{"type", "integer"}, {"description", "Pagination: skip first N folded regions"}, {"default", 0}}},
+              {"limit",  {{"type", "integer"}, {"description", "Pagination: max regions per page (max 500)"}, {"default", 500}}}
+          }}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "loop");
+            tenet::register_pass_by_name(*pm_, "function");
+            tenet::register_pass_by_name(*pm_, "trace_fold");
             const auto& result = require_pass<TraceFoldResult>(pm_, "trace_fold", "Trace fold failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit = std::min(args.value("limit", size_t(500)), size_t(500));
             json regions = json::array();
-            size_t limit = std::min(result.folded_regions.size(), size_t(500));
-            for (size_t i = 0; i < limit; i++) {
+            size_t start_i = std::min(offset, result.folded_regions.size());
+            size_t end_i = std::min(start_i + limit, result.folded_regions.size());
+            for (size_t i = start_i; i < end_i; i++) {
                 const auto& r = result.folded_regions[i];
                 regions.push_back({
-                    {"header_pc", fmt::format("0x{:X}", r.header_pc)},
+                    {"header_pc", fmt::format("0x{:X}", rebase(r.header_pc))},
                     {"total_iterations", r.total_iterations},
                     {"instructions_per_iteration", r.instructions_per_iteration},
                     {"total_instructions_folded", r.total_instructions_folded},
                     {"inst_range", {r.first_inst_id, r.last_inst_id}}
                 });
             }
+            bool has_more = end_i < result.folded_regions.size();
             return {{"total_regions", result.folded_regions.size()},
                     {"original_inst_count", result.original_inst_count},
                     {"folded_inst_count", result.folded_inst_count},
                     {"compression_ratio", result.compression_ratio},
-                    {"regions", std::move(regions)},
-                    {"truncated", result.folded_regions.size() > limit}};
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
+                    {"regions", std::move(regions)}};
         }
     );
 }
@@ -436,7 +477,7 @@ void TenetMcpService::register_search_tools() {
                 hits.push_back({
                     {"addr", fmt::format("0x{:X}", m.addr)},
                     {"inst_id", m.inst_id},
-                    {"pc", fmt::format("0x{:X}", m.pc)},
+                    {"pc", fmt::format("0x{:X}", rebase(m.pc))},
                     {"source", m.source == MemSearchMatch::MemWrite ? "mem_write" : "reg_diff"},
                     {"pattern_index", m.pattern_index}
                 });
@@ -451,38 +492,52 @@ void TenetMcpService::register_search_tools() {
     register_tool(
         {"reg_timeline",
          "Show how a register's value changes over time. Returns a timeline "
-         "of (inst_id, pc, old_value, new_value) entries for the specified register.",
+         "of (inst_id, pc, old_value, new_value) entries for the specified register. "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more entries).",
          {{"type", "object"},
           {"properties", {
-              {"reg_index",     {{"type", "integer"}, {"description", "Register index (0-33)"}}},
+              {"reg_index",     {{"type", json::array({"integer", "string"})}, {"description", "Register: integer index (0-33) OR name string ('x0','lr','sp', etc.)"}}},
               {"start_inst_id", {{"type", "integer"}, {"description", "Start from this instruction"}, {"default", 0}}},
               {"end_inst_id",   {{"type", "integer"}, {"description", "End at this instruction (0=end)"}, {"default", 0}}},
-              {"limit",         {{"type", "integer"}, {"description", "Max timeline entries"}, {"default", 200}}}
+              {"offset",        {{"type", "integer"}, {"description", "Pagination: skip first N entries"}, {"default", 0}}},
+              {"limit",         {{"type", "integer"}, {"description", "Pagination: max entries per page (max 2000)"}, {"default", 500}}}
           }},
           {"required", json::array({"reg_index"})}}},
         [this](const json& args) -> json {
+            uint8_t target_reg = parse_reg(args.at("reg_index"));
             RegTimelineConfig cfg;
-            cfg.target_reg = args.at("reg_index").get<uint8_t>();
+            cfg.target_reg = target_reg;
             cfg.start_inst_id = args.value("start_inst_id", uint64_t(0));
             cfg.end_inst_id = args.value("end_inst_id", uint64_t(0));
-            cfg.max_entries = args.value("limit", uint64_t(200));
+            cfg.max_entries = 0; // fetch all; pagination happens in output stage
 
             pm_->register_pass(std::make_unique<RegTimelinePass>(std::move(cfg)));
             const auto& result = require_pass<RegTimelineResult>(pm_, "reg_timeline", "Reg timeline failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit  = std::min(args.value("limit", size_t(500)), size_t(2000));
+            size_t start_i = std::min(offset, result.entries.size());
+            size_t end_i   = std::min(start_i + limit, result.entries.size());
+
             json timeline = json::array();
-            for (const auto& e : result.entries) {
+            for (size_t i = start_i; i < end_i; i++) {
+                const auto& e = result.entries[i];
                 timeline.push_back({
                     {"inst_id", e.inst_id},
-                    {"pc",  fmt::format("0x{:X}", e.pc)},
+                    {"pc",  fmt::format("0x{:X}", rebase(e.pc))},
                     {"old", fmt::format("0x{:X}", e.old_value)},
                     {"new", fmt::format("0x{:X}", e.new_value)}
                 });
             }
-            return {{"reg", kRegNames[cfg.target_reg]},
+            bool has_more = end_i < result.entries.size();
+            return {{"reg", kRegNames[target_reg]},
                     {"total_writes", result.total_writes},
-                    {"timeline", std::move(timeline)},
-                    {"entry_count", result.entries.size()}};
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
+                    {"timeline", std::move(timeline)}};
         }
     );
 
@@ -511,7 +566,7 @@ void TenetMcpService::register_search_tools() {
                                   (h.source == LiteralHit::MemWrite) ? "mem" : "imm";
                 hits.push_back({
                     {"inst_id",  h.inst_id},
-                    {"pc",       fmt::format("0x{:X}", h.pc)},
+                    {"pc",       fmt::format("0x{:X}", rebase(h.pc))},
                     {"source",   src},
                     {"matched_value", fmt::format("0x{:X}", h.matched_value)}
                 });
@@ -527,18 +582,38 @@ void TenetMcpService::register_search_tools() {
         {"producer_chain",
          "Find the chain of producers for a register at a given instruction. "
          "Walks backward through register assignments and memory loads to "
-         "build a compact chain showing where the value originated.",
+         "build a compact chain showing where the value originated. "
+         "Provide EITHER inst_id OR pc (hex string) to identify the instruction.",
          {{"type", "object"},
           {"properties", {
-              {"inst_id",   {{"type", "integer"}, {"description", "Instruction ID to start from"}}},
-              {"reg_index", {{"type", "integer"}, {"description", "Register index"}}},
+              {"inst_id",   {{"type", "integer"}, {"description", "Instruction ID to start from (preferred if known)"}}},
+              {"pc",        {{"type", "string"},  {"description", "PC address (hex string). Used when inst_id is not provided."}}},
+              {"reg_index", {{"type", json::array({"integer", "string"})}, {"description", "Register: integer index OR name string ('x0','lr', etc.)"}}},
               {"max_depth", {{"type", "integer"}, {"description", "Max chain depth"}, {"default", 20}}}
           }},
-          {"required", json::array({"inst_id", "reg_index"})}}},
+          {"required", json::array({"reg_index"})}}},
         [this](const json& args) -> json {
             ProducerChainConfig cfg;
-            cfg.start_inst_id = args.at("inst_id").get<uint64_t>();
-            cfg.start_reg = args.at("reg_index").get<uint8_t>();
+            // Resolve inst_id
+            if (args.contains("inst_id")) {
+                cfg.start_inst_id = args.at("inst_id").get<uint64_t>();
+            } else if (args.contains("pc")) {
+                uint64_t runtime_pc = unrebase(parse_hex(args.at("pc").get<std::string>()));
+                tenet::register_pass_by_name(*pm_, "xref");
+                const auto& xref_raw = require_pass_nb(pm_, "xref");
+                if (!xref_raw.ok())
+                    throw std::runtime_error("xref pass failed: " + xref_raw.error_message);
+                const auto& xref = xref_raw.get<XrefResult>();
+                auto ids = xref.inst_ids_at(runtime_pc);
+                if (ids.empty())
+                    throw std::runtime_error(fmt::format(
+                        "No instruction found at PC {}. Use search_pc to check execution history.",
+                        args.at("pc").get<std::string>()));
+                cfg.start_inst_id = ids.front();
+            } else {
+                throw std::runtime_error("Provide 'inst_id' or 'pc'.");
+            }
+            cfg.start_reg = parse_reg(args.at("reg_index"));
             cfg.max_depth = args.value("max_depth", uint32_t(20));
 
             pm_->register_pass(std::make_unique<ProducerChainPass>(std::move(cfg)));
@@ -548,7 +623,7 @@ void TenetMcpService::register_search_tools() {
             for (const auto& link : result.chain) {
                 json lk = {
                     {"inst_id", link.inst_id},
-                    {"pc",      fmt::format("0x{:X}", link.pc)},
+                    {"pc",      fmt::format("0x{:X}", rebase(link.pc))},
                     {"produced_reg", link.produced_reg},
                     {"value", fmt::format("0x{:X}", link.value)},
                     {"is_memory_load", link.is_memory_load}
@@ -566,34 +641,58 @@ void TenetMcpService::register_search_tools() {
     // ── call_context ──────────────────────────────────────────────────────
     register_tool(
         {"call_context",
-         "Show the function call context (call stack) at a given instruction.",
+         "Show the function call context (call stack) at a given instruction. "
+         "Provide EITHER inst_id (exact instruction index) OR pc (address, hex string). "
+         "When pc is given, the first inst_id that executed at that address is used. "
+         "The 'depth' parameter is silently ignored (kept for forward compatibility).",
          {{"type", "object"},
           {"properties", {
-              {"inst_id", {{"type", "integer"}, {"description", "Instruction ID"}}}
-          }},
-          {"required", json::array({"inst_id"})}}},
+              {"inst_id", {{"type", "integer"}, {"description", "Instruction ID (preferred if known)"}}},
+              {"pc",      {{"type", "string"},  {"description", "PC address (hex string, e.g. '0x100A92E54'). Used when inst_id is not provided."}}}
+          }}}},
         [this](const json& args) -> json {
-            CallContextConfig cfg;
-            cfg.target_inst_id = args.at("inst_id").get<uint64_t>();
+            // Resolve target inst_id from inst_id or pc
+            uint64_t target_inst_id = 0;
+            if (args.contains("inst_id")) {
+                target_inst_id = args.at("inst_id").get<uint64_t>();
+            } else if (args.contains("pc")) {
+                uint64_t runtime_pc = unrebase(parse_hex(args.at("pc").get<std::string>()));
+                tenet::register_pass_by_name(*pm_, "xref");
+                const auto& xref_raw = require_pass_nb(pm_, "xref");
+                if (!xref_raw.ok())
+                    throw std::runtime_error("xref pass failed: " + xref_raw.error_message);
+                const auto& xref = xref_raw.get<XrefResult>();
+                auto ids = xref.inst_ids_at(runtime_pc);
+                if (ids.empty())
+                    throw std::runtime_error(fmt::format(
+                        "No instruction found at PC {}. Use search_pc to check if this address was executed.",
+                        args.at("pc").get<std::string>()));
+                target_inst_id = ids.front();
+            } else {
+                throw std::runtime_error("Provide 'inst_id' or 'pc' to identify the target instruction.");
+            }
 
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
-            pm_->register_pass(std::make_unique<FunctionPass>());
+            CallContextConfig cfg;
+            cfg.target_inst_id = target_inst_id;
+
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "loop");
+            tenet::register_pass_by_name(*pm_, "function");
             pm_->register_pass(std::make_unique<CallContextPass>(std::move(cfg)));
             const auto& result = require_pass<CallContextResult>(pm_, "call_context", "Call context failed");
 
             json frames = json::array();
             for (const auto& f : result.call_stack) {
                 frames.push_back({
-                    {"call_site_pc", fmt::format("0x{:X}", f.call_site_pc)},
-                    {"callee_pc",    fmt::format("0x{:X}", f.callee_pc)},
+                    {"call_site_pc", fmt::format("0x{:X}", rebase(f.call_site_pc))},
+                    {"callee_pc",    fmt::format("0x{:X}", rebase(f.callee_pc))},
                     {"call_inst_id", f.call_inst_id},
-                    {"return_addr",  fmt::format("0x{:X}", f.return_addr)}
+                    {"return_addr",  fmt::format("0x{:X}", rebase(f.return_addr))}
                 });
             }
             return {{"target_inst_id", result.target_inst_id},
-                    {"target_pc", fmt::format("0x{:X}", result.target_pc)},
+                    {"target_pc", fmt::format("0x{:X}", rebase(result.target_pc))},
                     {"call_stack_depth", result.call_stack.size()},
                     {"call_stack", std::move(frames)}};
         }
@@ -603,12 +702,16 @@ void TenetMcpService::register_search_tools() {
     register_tool(
         {"window_stats",
          "Compute instruction-mix statistics over a window of instructions. "
-         "Counts branches, loads, stores, arithmetic, crypto ops, etc.",
+         "Counts branches, loads, stores, arithmetic, crypto ops, etc. "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more windows).",
          {{"type", "object"},
           {"properties", {
               {"start_inst_id", {{"type", "integer"}, {"description", "Start instruction ID"}, {"default", 0}}},
               {"end_inst_id",   {{"type", "integer"}, {"description", "End instruction ID (0=end)"}, {"default", 0}}},
-              {"window_size",   {{"type", "integer"}, {"description", "Sliding window size"}, {"default", 1000}}}
+              {"window_size",   {{"type", "integer"}, {"description", "Sliding window size"}, {"default", 1000}}},
+              {"offset",        {{"type", "integer"}, {"description", "Pagination: skip first N windows"}, {"default", 0}}},
+              {"limit",         {{"type", "integer"}, {"description", "Pagination: max windows per page (max 500)"}, {"default", 100}}}
           }}}},
         [this](const json& args) -> json {
             WindowStatsConfig cfg;
@@ -617,9 +720,13 @@ void TenetMcpService::register_search_tools() {
             pm_->register_pass(std::make_unique<WindowStatsPass>(std::move(cfg)));
             const auto& result = require_pass<WindowStatsResult>(pm_, "window_stats", "Window stats failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit  = std::min(args.value("limit", size_t(100)), size_t(500));
+            size_t start_i = std::min(offset, result.windows.size());
+            size_t end_i   = std::min(start_i + limit, result.windows.size());
+
             json windows = json::array();
-            size_t limit = std::min(result.windows.size(), size_t(100));
-            for (size_t i = 0; i < limit; i++) {
+            for (size_t i = start_i; i < end_i; i++) {
                 const auto& w = result.windows[i];
                 windows.push_back({
                     {"start", w.start_inst_id},
@@ -632,10 +739,14 @@ void TenetMcpService::register_search_tools() {
                     {"mnemonic_entropy", w.mnemonic_entropy}
                 });
             }
+            bool has_more = end_i < result.windows.size();
             return {{"total_windows", result.total_windows},
                     {"window_size", result.window_size},
-                    {"windows", std::move(windows)},
-                    {"truncated", result.windows.size() > limit}};
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
+                    {"windows", std::move(windows)}};
         }
     );
 
@@ -643,15 +754,25 @@ void TenetMcpService::register_search_tools() {
     register_tool(
         {"entropy_analysis",
          "Compute Shannon entropy over memory write patterns. High-entropy "
-         "regions often indicate encryption or compression output.",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<EntropyPass>());
+         "regions often indicate encryption or compression output. "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more blocks).",
+         {{"type", "object"},
+          {"properties", {
+              {"offset", {{"type", "integer"}, {"description", "Pagination: skip first N blocks"}, {"default", 0}}},
+              {"limit",  {{"type", "integer"}, {"description", "Pagination: max blocks per page (max 500)"}, {"default", 100}}}
+          }}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "entropy");
             const auto& result = require_pass<EntropyResult>(pm_, "entropy", "Entropy failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit  = std::min(args.value("limit", size_t(100)), size_t(500));
+            size_t start_i = std::min(offset, result.blocks.size());
+            size_t end_i   = std::min(start_i + limit, result.blocks.size());
+
             json blocks_arr = json::array();
-            size_t limit = std::min(result.blocks.size(), size_t(100));
-            for (size_t i = 0; i < limit; i++) {
+            for (size_t i = start_i; i < end_i; i++) {
                 const auto& b = result.blocks[i];
                 blocks_arr.push_back({
                     {"offset",  b.offset},
@@ -660,14 +781,19 @@ void TenetMcpService::register_search_tools() {
                     {"is_known", b.is_known}
                 });
             }
+            bool has_more = end_i < result.blocks.size();
             const char* cls_names[] = {"Unknown", "Plaintext", "Compressed", "Encrypted", "KeyMaterial"};
             return {{"addr", fmt::format("0x{:X}", result.addr)},
                     {"overall_entropy", result.overall_entropy},
                     {"classification", cls_names[static_cast<int>(result.classification)]},
                     {"region_size", result.region_size},
                     {"known_bytes", result.known_bytes},
-                    {"blocks", std::move(blocks_arr)},
-                    {"truncated", result.blocks.size() > limit}};
+                    {"total_blocks", result.blocks.size()},
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
+                    {"blocks", std::move(blocks_arr)}};
         }
     );
 
@@ -719,22 +845,41 @@ void TenetMcpService::register_pass_tools() {
     register_tool(
         {"functions",
          "List all detected functions in the trace. Returns function PCs, "
-         "names (if available), instruction ranges, and call counts.",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<FunctionPass>());
+         "names (if available), instruction ranges, and call counts. "
+         "Supports pagination via offset/limit "
+         "(use has_more + next_offset to fetch more functions).",
+         {{"type", "object"},
+          {"properties", {
+              {"offset", {{"type", "integer"}, {"description", "Pagination: skip first N functions"}, {"default", 0}}},
+              {"limit",  {{"type", "integer"}, {"description", "Pagination: max functions per page (max 500)"}, {"default", 500}}}
+          }}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "function");
             const auto& result = require_pass<FunctionResult>(pm_, "function", "Function pass failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit = std::min(args.value("limit", size_t(500)), size_t(500));
             json funcs = json::array();
+            size_t count = 0;
+            size_t skipped = 0;
             for (const auto& [pc, info] : result.functions) {
+                if (skipped < offset) { skipped++; continue; }
+                if (count >= limit) break;
                 funcs.push_back({
-                    {"pc",          fmt::format("0x{:X}", info.entry_pc)},
+                    {"pc",          fmt::format("0x{:X}", rebase(info.entry_pc))},
                     {"name",        info.name},
                     {"total_calls", info.total_calls},
                     {"total_instructions", info.total_instructions}
                 });
+                count++;
             }
-            return {{"total", result.functions.size()}, {"functions", std::move(funcs)}};
+            bool has_more = (offset + count) < result.functions.size();
+            return {{"total", result.functions.size()},
+                    {"offset", offset},
+                    {"returned", count},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? offset + count : offset},
+                    {"functions", std::move(funcs)}};
         }
     );
 
@@ -745,16 +890,16 @@ void TenetMcpService::register_pass_tools() {
          "counts, body sizes, and nesting information.",
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
-            pm_->register_pass(std::make_unique<CFGPass>());
-            pm_->register_pass(std::make_unique<LoopPass>());
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "loop");
             const auto& result = require_pass<LoopResult>(pm_, "loop", "Loop pass failed");
 
             json loops = json::array();
             for (const auto& l : result.loops) {
                 loops.push_back({
-                    {"header_pc",       fmt::format("0x{:X}", l.header_pc)},
-                    {"back_edge_pc",    fmt::format("0x{:X}", l.back_edge_pc)},
+                    {"header_pc",       fmt::format("0x{:X}", rebase(l.header_pc))},
+                    {"back_edge_pc",    fmt::format("0x{:X}", rebase(l.back_edge_pc))},
                     {"iteration_count", l.iteration_count},
                     {"body_pc_count",   l.body_pcs.size()},
                     {"nesting_depth",   l.nesting_depth}
@@ -776,7 +921,7 @@ void TenetMcpService::register_pass_tools() {
               {"top_n", {{"type", "integer"}, {"description", "Top N hot PCs"}, {"default", 20}}}
           }}}},
         [this](const json& args) -> json {
-            pm_->register_pass(std::make_unique<XrefPass>());
+            tenet::register_pass_by_name(*pm_, "xref");
             const auto& xref = require_pass<XrefResult>(pm_, "xref", "XRef pass failed");
 
             size_t top_n = args.value("top_n", 20);
@@ -784,7 +929,7 @@ void TenetMcpService::register_pass_tools() {
             json hot_arr = json::array();
             for (const auto& [pc, count] : hot) {
                 hot_arr.push_back({
-                    {"pc",    fmt::format("0x{:X}", pc)},
+                    {"pc",    fmt::format("0x{:X}", rebase(pc))},
                     {"count", count}
                 });
             }
@@ -823,7 +968,7 @@ void TenetMcpService::register_pass_tools() {
             for (size_t i = 0; i < limit; i++) {
                 const auto& d = result.diffs[i];
                 diffs_arr.push_back({
-                    {"pc", fmt::format("0x{:X}", d.pc)},
+                    {"pc", fmt::format("0x{:X}", rebase(d.pc))},
                     {"inst_offset_a", d.inst_offset_a},
                     {"inst_offset_b", d.inst_offset_b},
                     {"type", static_cast<int>(d.type)},
@@ -856,8 +1001,8 @@ void TenetMcpService::register_pass_tools() {
               {"limit",      {{"type", "integer"}, {"description", "Max results for name search"}, {"default", 10}}}
           }}}},
         [this](const json& args) -> json {
-            pm_->register_pass(std::make_unique<FunctionPass>());
-            pm_->register_pass(std::make_unique<XrefPass>());
+            tenet::register_pass_by_name(*pm_, "function");
+            tenet::register_pass_by_name(*pm_, "xref");
             const auto& fn_result = require_pass<FunctionResult>(pm_, "function", "Function pass failed");
 
             // XRef for inst_id lookup
@@ -868,7 +1013,7 @@ void TenetMcpService::register_pass_tools() {
 
             auto make_entry = [&](const FunctionInfo& info) -> json {
                 json e = {
-                    {"pc",          fmt::format("0x{:X}", info.entry_pc)},
+                    {"pc",          fmt::format("0x{:X}", rebase(info.entry_pc))},
                     {"name",        info.name},
                     {"total_calls", info.total_calls},
                     {"total_instructions", info.total_instructions}
@@ -894,11 +1039,11 @@ void TenetMcpService::register_pass_tools() {
 
             // Lookup by exact PC
             if (args.contains("pc")) {
-                uint64_t target_pc = parse_hex(args["pc"].get<std::string>());
+                uint64_t target_pc = unrebase(parse_hex(args["pc"].get<std::string>()));
                 auto it = fn_result.functions.find(target_pc);
                 if (it == fn_result.functions.end()) {
                     return {{"found", false},
-                            {"error", fmt::format("No function at PC 0x{:X}", target_pc)}};
+                            {"error", fmt::format("No function at PC 0x{:X}", rebase(target_pc))}};
                 }
                 return {{"found", true}, {"function", make_entry(it->second)}};
             }

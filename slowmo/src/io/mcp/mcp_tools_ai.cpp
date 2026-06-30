@@ -144,7 +144,7 @@ void TenetMcpService::register_evidence_tools() {
 
                     if (rv.kind == RecordKind::Inst) {
                         auto inst = rv.as_inst();
-                        actual_pc_str = fmt::format("0x{:X}", inst.pc);
+                        actual_pc_str = fmt::format("0x{:X}", rebase(inst.pc));
 
                         if (code_table_ && decoder_) {
                             auto opcode = code_table_->opcode_at(inst.pc);
@@ -164,11 +164,11 @@ void TenetMcpService::register_evidence_tools() {
                             }
                         }
                         if (!expected_pc.empty()) {
-                            uint64_t exp_pc_val = parse_hex(expected_pc);
+                            uint64_t exp_pc_val = unrebase(parse_hex(expected_pc));
                             if (inst.pc != exp_pc_val) {
                                 valid = false;
                                 reasons.push_back(fmt::format("PC mismatch: expected {}, actual 0x{:X}",
-                                                              expected_pc, inst.pc));
+                                                              expected_pc, rebase(inst.pc)));
                             }
                         }
                     } else {

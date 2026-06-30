@@ -203,25 +203,23 @@ bool McpHttpTransport::check_auth(const HttpRequest& req) const {
 bool McpHttpTransport::check_session(const HttpRequest& req, int client_fd) {
     std::lock_guard<std::mutex> lk(session_mutex_);
     if (session_id_.empty()) {
-        if (session_ever_created_) {
-            // Session was terminated — reject until re-initialized
-            send_http_response(client_fd, 400, "application/json",
-                R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Session terminated. Send initialize to start a new session."}})");
-            return false;
-        }
-        // No session yet (fresh start) — only initialize is allowed.
-        // The caller (handle_client) deals with this by checking if the method is "initialize".
+        // No active session (either fresh start or after DELETE).
+        // Allow the request through — handle_client will check if the method
+        // is "initialize" and reject non-initialize calls gracefully.
         return true;
     }
     auto it = req.headers.find("mcp-session-id");
     if (it == req.headers.end()) {
+        // Client forgot the session header.  Give a helpful error rather than
+        // a silent 400: mention that initialize can be used to get a new one.
         send_http_response(client_fd, 400, "application/json",
-                           R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Missing Mcp-Session-Id header"}})");
+                           R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Missing Mcp-Session-Id header. Send initialize to obtain a session ID."}})");
         return false;
     }
     if (it->second != session_id_) {
+        // Stale session from a previous connection.  Let the client re-initialize.
         send_http_response(client_fd, 400, "application/json",
-                           R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Mcp-Session-Id"}})");
+                           R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid or expired Mcp-Session-Id. Send initialize to start a new session."}})");
         return false;
     }
     return true;
@@ -358,9 +356,17 @@ void McpHttpTransport::listener_loop() {
                                  &client_len);
         if (client_fd < 0) continue;
 
-        // Set a receive timeout on client fd
-        struct timeval recv_tv{5, 0};
+        // Receive timeout: give the client up to 10 seconds to send the full
+        // HTTP request headers+body.  We do NOT set a send timeout here because
+        // tool handlers (taint, algorithm_summary, etc.) may legitimately block
+        // for tens of seconds before the response is ready — a send timeout
+        // would disconnect the client mid-computation.
+        struct timeval recv_tv{10, 0};
         ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+        // TCP keepalive: keeps the connection alive when the server is computing
+        // a long-running pass (the connection goes idle from the network's view).
+        int ka = 1;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 
         // Spawn a per-client thread
         std::lock_guard<std::mutex> lk(clients_mutex_);
@@ -457,6 +463,24 @@ void McpHttpTransport::handle_client(int client_fd) {
 
         // ── All other requests: require valid session ──────────────────
         if (!check_session(req, client_fd)) return;
+
+        // If there is still no active session after check_session (e.g. after
+        // a DELETE terminated the session and no initialize was sent), return a
+        // helpful error that guides the client to re-initialize.
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            if (session_id_.empty()) {
+                auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
+                json err_resp = {
+                    {"jsonrpc", "2.0"},
+                    {"id", msg_id},
+                    {"error", {{"code", -32600},
+                               {"message", "No active session. Send initialize to start a new session."}}}
+                };
+                send_http_response(client_fd, 400, "application/json", err_resp.dump());
+                return;
+            }
+        }
 
         // Dispatch to handler — concurrency managed by TenetMcpService
         // (read tools run in parallel, write tools acquire exclusive lock).
