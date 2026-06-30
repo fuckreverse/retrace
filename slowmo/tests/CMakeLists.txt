@@ -78,6 +78,7 @@ tenet_add_test(test_pass_loop_semantics    unit/test_pass_loop_semantics.cpp)
 tenet_add_test(test_pass_pattern           unit/test_pass_pattern.cpp)
 tenet_add_test(test_pass_thread_filter     unit/test_pass_thread_filter.cpp)
 tenet_add_test(test_pass_yara_mem_scan     unit/test_pass_yara_mem_scan.cpp)
+tenet_add_test(test_pass_trace_diff        unit/test_pass_trace_diff.cpp)
 tenet_add_test(test_dbg_loop               unit/test_dbg_loop.cpp)
 
 # ─── Unit tests: iOS-specific analysis passes ────────────────────────────────

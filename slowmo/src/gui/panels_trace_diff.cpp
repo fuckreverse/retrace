@@ -40,6 +40,8 @@ void GuiApp::run_trace_diff() {
     cfg.trace_a_end   = diff_region_a_end_;
     cfg.trace_b_start = diff_region_b_start_;
     cfg.trace_b_end   = diff_region_b_end_;
+    cfg.trace_b_path  = diff_trace_b_path_buf_;
+    cfg.resync_window = diff_window_size_;
 
     auto pass = std::make_unique<TraceDiffPass>(cfg);
     // Run in a private PassManager so it doesn't conflict with startup analysis
@@ -76,7 +78,25 @@ void GuiApp::render_trace_diff_panel() {
     }
 
     // ── Region input ─────────────────────────────────────────────────────
-    ImGui::TextUnformatted("Compare two execution regions within this trace:");
+    ImGui::TextUnformatted("Compare two execution regions (same trace or cross-file):");
+    ImGui::Spacing();
+
+    // Trace B file path (cross-file mode)
+    ImGui::TextUnformatted("Trace B file:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(300.0f);
+    ImGui::InputText("##trace_b_path", diff_trace_b_path_buf_, sizeof(diff_trace_b_path_buf_));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(empty = same trace)");
+
+    // Resync window
+    ImGui::TextUnformatted("Resync window:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.0f);
+    int win_val = static_cast<int>(diff_window_size_);
+    if (ImGui::InputInt("##diff_window", &win_val, 1024, 4096)) {
+        diff_window_size_ = static_cast<uint32_t>(std::max(win_val, 1024));
+    }
     ImGui::Spacing();
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));

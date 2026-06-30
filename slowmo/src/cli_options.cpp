@@ -76,6 +76,9 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  --backward-taint-graph <file>     Export dataflow graph (.dot or .json)\n");
     fmt::print(stderr, "  --critical-path                   Compute forward+backward intersection\n");
     fmt::print(stderr, "  --trace-diff <a_start> <a_end> <b_start> <b_end>  Differential trace analysis\n");
+fmt::print(stderr, "  --trace-diff-file <path>          Cross-file trace B for comparison\n");
+fmt::print(stderr, "  --trace-diff-window <n>           Resync window size (default 16384)\n");
+fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments (default 100000)\n");
     fmt::print(stderr, "  --loop-semantics              Identify round functions / crypto loop semantics\n");
     fmt::print(stderr, "  --symbol-annotation           Generate symbol annotations for all PCs\n");
     fmt::print(stderr, "  --memory-snapshot <inst_id>    Capture memory snapshot (repeatable)\n");
@@ -200,6 +203,12 @@ CliOptions parse_args(int argc, char** argv) {
             opts.trace_diff_a_end = std::stoull(argv[++i]);
             opts.trace_diff_b_start = std::stoull(argv[++i]);
             opts.trace_diff_b_end = std::stoull(argv[++i]);
+        } else if (arg == "--trace-diff-file" && i + 1 < argc) {
+            opts.trace_diff_file = argv[++i];
+        } else if (arg == "--trace-diff-window" && i + 1 < argc) {
+            opts.trace_diff_window = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--trace-diff-max-diffs" && i + 1 < argc) {
+            opts.trace_diff_max_diffs = std::stoull(argv[++i]);
         } else if (arg == "--loop-semantics") {
             opts.opt_loop_semantics = true;
         } else if (arg == "--symbol-annotation") {

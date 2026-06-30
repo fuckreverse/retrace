@@ -52,6 +52,9 @@ struct CliOptions {
     bool opt_trace_diff = false;
     uint64_t trace_diff_a_start = 0, trace_diff_a_end = 0;
     uint64_t trace_diff_b_start = 0, trace_diff_b_end = 0;
+    std::string trace_diff_file;               ///< --trace-diff-file: cross-file trace B path
+    uint32_t trace_diff_window = 16384;        ///< --trace-diff-window: resync window size
+    size_t trace_diff_max_diffs = 100000;      ///< --trace-diff-max-diffs: segment cap
     bool opt_loop_semantics = false;
     bool opt_symbol_annotation = false;
     bool opt_memory_snapshot = false;

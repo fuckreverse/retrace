@@ -578,6 +578,9 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         td_cfg.trace_a_end = opts.trace_diff_a_end;
         td_cfg.trace_b_start = opts.trace_diff_b_start;
         td_cfg.trace_b_end = opts.trace_diff_b_end;
+        td_cfg.trace_b_path = opts.trace_diff_file;
+        td_cfg.resync_window = opts.trace_diff_window;
+        td_cfg.max_diffs = opts.trace_diff_max_diffs;
         pm.register_pass(std::make_unique<TraceDiffPass>(std::move(td_cfg)));
     }
 

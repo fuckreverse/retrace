@@ -583,6 +583,8 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     char diff_a_end_buf_[32]   = {};
     char diff_b_start_buf_[32] = {};
     char diff_b_end_buf_[32]   = {};
+    char diff_trace_b_path_buf_[512] = {};  ///< Cross-file trace B path input
+    uint32_t diff_window_size_ = 16384;     ///< Resync window size
     const TraceDiffResult* trace_diff_result_ = nullptr;
     size_t diff_cursor_ = 0;
     void run_trace_diff();

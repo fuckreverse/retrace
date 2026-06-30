@@ -950,7 +950,8 @@ void TenetMcpService::register_pass_tools() {
               {"range_a_start", {{"type", "integer"}, {"description", "First range start inst_id"}}},
               {"range_a_end",   {{"type", "integer"}, {"description", "First range end inst_id"}}},
               {"range_b_start", {{"type", "integer"}, {"description", "Second range start inst_id"}}},
-              {"range_b_end",   {{"type", "integer"}, {"description", "Second range end inst_id"}}}
+              {"range_b_end",   {{"type", "integer"}, {"description", "Second range end inst_id"}}},
+              {"trace_b_path",  {{"type", "string"},  {"description", "Optional: path to trace B file for cross-file comparison. Empty = same trace."}}}
           }},
           {"required", json::array({"range_a_start", "range_a_end", "range_b_start", "range_b_end"})}}},
         [this](const json& args) -> json {
@@ -959,6 +960,9 @@ void TenetMcpService::register_pass_tools() {
             cfg.trace_a_end   = args.at("range_a_end").get<uint64_t>();
             cfg.trace_b_start = args.at("range_b_start").get<uint64_t>();
             cfg.trace_b_end   = args.at("range_b_end").get<uint64_t>();
+            if (args.contains("trace_b_path")) {
+                cfg.trace_b_path = args.at("trace_b_path").get<std::string>();
+            }
 
             pm_->register_pass(std::make_unique<TraceDiffPass>(std::move(cfg)));
             const auto& result = require_pass<TraceDiffResult>(pm_, "trace_diff", "Trace diff failed");
