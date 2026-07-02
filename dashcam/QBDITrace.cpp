@@ -22,6 +22,13 @@
  * the hot path.
  */
 
+/* _DARWIN_C_SOURCE exposes non-POSIX Darwin extensions (RTLD_DEFAULT, MAP_ANON,
+ * etc.) that are hidden when _XOPEN_SOURCE / _POSIX_C_SOURCE are set strictly.
+ * Must be defined before any system header. */
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+
 /* Required so <ucontext.h> exposes the (otherwise deprecated) ucontext_t /
  * mcontext routines used by the diagnostic fault handler to read the faulting
  * PC. Must be defined before any system header is included. */
@@ -65,9 +72,11 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#include <dlfcn.h>
 #elif defined(__linux__)
 #include <sys/uio.h>       /* process_vm_readv (Linux 3.2+ / Android API 23+) */
 #include <sys/syscall.h>   /* __NR_gettid */
+#include <dlfcn.h>
 #endif
 
 /* Weak reference to the Objective-C runtime so the tracer can resolve a
@@ -80,9 +89,15 @@ typedef struct objc_object *id;
 const char *object_getClassName(id obj) __attribute__((weak_import));
 }
 
+/* Internal types (Config, classifySyscall, classifyObjcTarget, lookupCApiFunc)
+ * shared with the unit test suite.  Must be included before the anonymous
+ * namespace so the definitions are visible at file scope. */
+#include "QBDITraceInternal.h"
+
 namespace {
 
 using namespace qbditrace;
+using namespace qbditrace_internal;
 
 /* ----------------------------------------------------------------------------
  * Fault-tolerant memory probe.
@@ -160,81 +175,312 @@ static constexpr uint32_t kDefaultAnchorInterval = 1024;
 
 /* ----------------------------------------------------------------------------
  * Global tracer state (configuration + shared writer + per-PC write-reg cache)
- * ------------------------------------------------------------------------- */
+ *
+ * Config, classifyObjcTarget, lookupCApiFunc, and classifySyscall are defined
+ * in QBDITraceInternal.h (included above the anonymous namespace) and brought
+ * into scope via `using namespace qbditrace_internal`.
+ * --------------------------------------------------------------------------- */
 
-struct Config {
-  uint64_t trace_start = 0;
-  uint64_t trace_end = 0;
-  uint64_t module_base = 0;
-  uint64_t module_slide = 0;
-  std::string module_name;
-  std::string output_path;
-  uint32_t record = QBDITRACE_REC_DEFAULT;
-  uint32_t anchor_interval = 0;
-  size_t ring_bytes = 64u * 1024u * 1024u;
-  uint64_t objc_msgSend = 0;
-  uint64_t objc_msgSendSuper = 0;
-  uint64_t objc_msgSendSuper2 = 0;
-  uint64_t objc_msgSend_stret = 0;
-  uint64_t extra_range_start = 0;
-  uint64_t extra_range_end = 0;
-  uint32_t n_exclude_ranges = 0;
-  struct { uint64_t start; uint64_t end; } exclude_ranges[QBDITRACE_MAX_EXCLUDE_RANGES] = {};
-  /* When set, emit a REC_CODE (raw instruction bytes) the first time each PC is
-   * seen, so the offline decoder can disassemble without an external --image.
-   * On by default; the only cost is one extra small record per *distinct*
-   * executed instruction (deduplicated), nothing on the steady-state hot path. */
-  bool embed_code = true;
+/* ---------------------------------------------------------------------------
+ * Native C API address auto-resolution.
+ *
+ * When the caller (JS Frida agent) does NOT provide capi_funcs[] entries
+ * (n_capi_funcs == 0), the tracer resolves the well-known function addresses
+ * itself at configure() time using dlsym(RTLD_DEFAULT, name).  This makes the
+ * tracer self-contained: even a minimal JS loader that only sets the trace
+ * range and output path gets full C API interception automatically.
+ *
+ * The function fills as many slots in cfg.capi_funcs[] as fit up to
+ * Config::kMaxCapiFuncs, updating cfg.n_capi_funcs accordingly.
+ *
+ * Thread safety: called only from configure(), which holds setup_mtx_.
+ * dlsym(RTLD_DEFAULT) is async-signal-unsafe but safe from a mutex-protected
+ * setup path.  The results are cached in cfg_ for the tracer's lifetime.
+ * --------------------------------------------------------------------------- */
 
-  /* When set, write v5 INST records using PC delta encoding (int16 pc_delta
-   * instead of uint64 absolute pc). Saves ~40-60% file size for sequential code
-   * (AArch64: +4 delta every instruction). Writers must emit an ANCHOR before
-   * any instruction where |delta| > 32767 and reset delta to 0.
-   *
-   * Activates QBDITRACE_HF_PC_DELTA in the file header and bumps version to
-   * QBDITRACE_VERSION_V5_PC_DELTA. Off by default for backward compatibility. */
-  bool pc_delta_mode = false;
-
-  /* [REMOVED] old_value_mode has been eliminated.  The offline analyser can
-   * infer old values from its MemoryModel write history, so the per-instruction
-   * safeRead() overhead in preInstCB is no longer justified. */
-
-  /* When set, capture 128-bit FPR (NEON v0..v31) diffs per instruction and
-   * include a 512-byte FPR snapshot in every ANCHOR.  Activates
-   * QBDITRACE_HF_HAS_FPR and bumps version to QBDITRACE_VERSION_V7_HAS_FPR.
-   * Off by default. */
-  bool fpr_mode = false;
-
-  /* When set, compress all data after the file header using zstd streaming
-   * compression.  Activates QBDITRACE_HF_COMPRESSED.  On by default (inverted
-   * ABI: disable_compress == 0 ⇒ compressed). */
-  bool compress = true;
-
-  /* When set, encode the AArch64 branch class (CALL/RET/BRANCH) in the high
-   * nibble (bits[7:4]) of the nzcv byte of every REC_INST record, activating
-   * QBDITRACE_HF_BRANCH_HINT.  The low nibble retains the normal N/Z/C/V flags.
-   * This allows offline decoders (e.g. tenet FunctionPass) to avoid per-
-   * instruction binary-search in the pc_kind table — a bit-shift suffices.
-   * On by default; the only cost is 3-5 bitmask comparisons per instruction
-   * (pure arithmetic, no memory access, < 1 ns hot-path overhead). */
-  bool branch_hint_mode = true;
+struct NativeCApiEntry {
+  const char  *name;
+  uint16_t     api_id;   /* qbditrace_capi_id_t (uint16 to hold ids > 255) */
+  uint8_t      n_args;
+  uint8_t      str_args; /* bitmask */
 };
 
-/* Classify a transfer target against the configured objc_msgSend family.
- * Returns -1 if not an objc dispatcher, else the qbditrace_objc_variant_t. */
-inline int classifyObjcTarget(const Config &c, uint64_t target) {
-  if (target == 0)
-    return -1;
-  if (c.objc_msgSend && target == c.objc_msgSend)
-    return QBDITRACE_OBJC_MSGSEND;
-  if (c.objc_msgSendSuper && target == c.objc_msgSendSuper)
-    return QBDITRACE_OBJC_MSGSEND_SUPER;
-  if (c.objc_msgSendSuper2 && target == c.objc_msgSendSuper2)
-    return QBDITRACE_OBJC_MSGSEND_SUPER2;
-  if (c.objc_msgSend_stret && target == c.objc_msgSend_stret)
-    return QBDITRACE_OBJC_MSGSEND_STRET;
-  return -1;
+/* Resolve and append one entry to cfg.capi_funcs[].
+ * Returns true if added, false if table is full or symbol not found. */
+static bool appendCApiEntry(Config &cfg, const char *name,
+                             uint16_t api_id, uint8_t n_args, uint8_t str_args) {
+if (cfg.n_capi_funcs >= Config::kMaxCapiFuncs) return false;
+void *p = ::dlsym(RTLD_DEFAULT, name);
+if (!p) return false;
+  uint32_t idx = cfg.n_capi_funcs++;
+  cfg.capi_funcs[idx].addr     = reinterpret_cast<uint64_t>(p);
+  cfg.capi_funcs[idx].api_id   = api_id;
+  cfg.capi_funcs[idx].n_args   = n_args;
+  cfg.capi_funcs[idx].str_args = str_args;
+  return true;
 }
+
+/* Try to resolve via an explicit handle (for Android linker namespace).
+ * handle == RTLD_DEFAULT is legal: dlsym(RTLD_DEFAULT, name) searches all
+ * already-loaded libraries (same as appendCApiEntry).  We must NOT reject it
+ * with !handle because RTLD_DEFAULT is defined as (void*)0 on Linux/Android. */
+static bool appendCApiEntryFromHandle(Config &cfg, void *handle,
+                                      const char *name,
+                                      uint16_t api_id, uint8_t n_args,
+                                      uint8_t str_args) {
+  /* Note: handle may be RTLD_DEFAULT (== (void*)0 on Linux/Android), which is
+   * a valid pseudo-handle for dlsym.  Do NOT check !handle here. */
+  if (cfg.n_capi_funcs >= Config::kMaxCapiFuncs) return false;
+  void *p = ::dlsym(handle, name);
+  if (!p) return false;
+  uint32_t idx = cfg.n_capi_funcs++;
+  cfg.capi_funcs[idx].addr     = reinterpret_cast<uint64_t>(p);
+  cfg.capi_funcs[idx].api_id   = api_id;
+  cfg.capi_funcs[idx].n_args   = n_args;
+  cfg.capi_funcs[idx].str_args = str_args;
+  return true;
+}
+
+/* Macro helpers: capi ID constants from TraceFormat.h */
+#define CAPI_(name, id, na, sa) appendCApiEntry(cfg, name, id, na, sa)
+#define CAPI_H(handle, name, id, na, sa) appendCApiEntryFromHandle(cfg, handle, name, id, na, sa)
+
+static void resolveCApiAddrsIntoConfig(Config &cfg) {
+  using namespace qbditrace;
+
+  /* ── Common: memory ─────────────────────────────────────────────── */
+  CAPI_("memcpy",        QBDITRACE_CAPI_MEMCPY,         3, 0x06);
+  CAPI_("memmove",       QBDITRACE_CAPI_MEMMOVE,        3, 0x06);
+  CAPI_("memset",        QBDITRACE_CAPI_MEMSET,         3, 0x00);
+  CAPI_("memcmp",        QBDITRACE_CAPI_MEMCMP,         3, 0x03);
+  CAPI_("memchr",        QBDITRACE_CAPI_MEMCHR,         3, 0x01);
+  CAPI_("bcopy",         QBDITRACE_CAPI_BCOPY,          3, 0x02);
+  CAPI_("bzero",         QBDITRACE_CAPI_BZERO,          2, 0x00);
+
+  /* ── Common: string ─────────────────────────────────────────────── */
+  CAPI_("strlen",        QBDITRACE_CAPI_STRLEN,         1, 0x01);
+  CAPI_("strnlen",       QBDITRACE_CAPI_STRNLEN,        2, 0x01);
+  CAPI_("strcmp",        QBDITRACE_CAPI_STRCMP,         2, 0x03);
+  CAPI_("strncmp",       QBDITRACE_CAPI_STRNCMP,        3, 0x03);
+  CAPI_("strcasecmp",    QBDITRACE_CAPI_STRCASECMP,     2, 0x03);
+  CAPI_("strncasecmp",   QBDITRACE_CAPI_STRNCASECMP,    3, 0x03);
+  CAPI_("strcpy",        QBDITRACE_CAPI_STRCPY,         2, 0x02);
+  CAPI_("strncpy",       QBDITRACE_CAPI_STRNCPY,        3, 0x02);
+  CAPI_("strlcpy",       QBDITRACE_CAPI_STRLCPY,        3, 0x02);
+  CAPI_("strcat",        QBDITRACE_CAPI_STRCAT,         2, 0x02);
+  CAPI_("strncat",       QBDITRACE_CAPI_STRNCAT,        3, 0x02);
+  CAPI_("strlcat",       QBDITRACE_CAPI_STRLCAT,        3, 0x02);
+  CAPI_("strdup",        QBDITRACE_CAPI_STRDUP,         1, 0x01);
+  CAPI_("strndup",       QBDITRACE_CAPI_STRNDUP,        2, 0x01);
+  CAPI_("strchr",        QBDITRACE_CAPI_STRCHR,         2, 0x01);
+  CAPI_("strrchr",       QBDITRACE_CAPI_STRRCHR,        2, 0x01);
+  CAPI_("strstr",        QBDITRACE_CAPI_STRSTR,         2, 0x03);
+  CAPI_("sprintf",       QBDITRACE_CAPI_SPRINTF,        2, 0x02);
+  CAPI_("snprintf",      QBDITRACE_CAPI_SNPRINTF,       3, 0x04);
+  CAPI_("atoi",          QBDITRACE_CAPI_ATOI,           1, 0x01);
+  CAPI_("strtol",        QBDITRACE_CAPI_STRTOL,         3, 0x01);
+  CAPI_("strtoul",       QBDITRACE_CAPI_STRTOUL,        3, 0x01);
+  CAPI_("strtoll",       QBDITRACE_CAPI_STRTOLL,        3, 0x01);
+  CAPI_("strtoull",      QBDITRACE_CAPI_STRTOULL,       3, 0x01);
+
+  /* ── Common: heap ───────────────────────────────────────────────── */
+  CAPI_("malloc",        QBDITRACE_CAPI_MALLOC,         1, 0x00);
+  CAPI_("calloc",        QBDITRACE_CAPI_CALLOC,         2, 0x00);
+  CAPI_("realloc",       QBDITRACE_CAPI_REALLOC,        2, 0x00);
+  CAPI_("free",          QBDITRACE_CAPI_FREE,           1, 0x00);
+
+  /* ── Common: I/O ────────────────────────────────────────────────── */
+  CAPI_("fopen",         QBDITRACE_CAPI_FOPEN,          2, 0x01);
+  CAPI_("fclose",        QBDITRACE_CAPI_FCLOSE,         1, 0x00);
+  CAPI_("fread",         QBDITRACE_CAPI_FREAD,          4, 0x00);
+  CAPI_("fwrite",        QBDITRACE_CAPI_FWRITE,         4, 0x00);
+  CAPI_("open",          QBDITRACE_CAPI_OPEN,           2, 0x01);
+  CAPI_("close",         QBDITRACE_CAPI_CLOSE,          1, 0x00);
+  CAPI_("read",          QBDITRACE_CAPI_READ,           3, 0x00);
+  CAPI_("write",         QBDITRACE_CAPI_WRITE,          3, 0x00);
+
+  /* ── Common: anti-debug ─────────────────────────────────────────── */
+  CAPI_("ptrace",        QBDITRACE_CAPI_PTRACE,         4, 0x00);
+  CAPI_("getenv",        QBDITRACE_CAPI_GETENV,         1, 0x01);
+  CAPI_("access",        QBDITRACE_CAPI_ACCESS,         2, 0x01);
+  CAPI_("kill",          QBDITRACE_CAPI_KILL,           2, 0x00);
+  CAPI_("getpid",        QBDITRACE_CAPI_GETPID,         0, 0x00);
+  CAPI_("stat",          QBDITRACE_CAPI_STAT,           2, 0x01);
+  CAPI_("lstat",         QBDITRACE_CAPI_STAT,           2, 0x01);
+
+  /* ── Common: network ────────────────────────────────────────────── */
+  CAPI_("socket",        QBDITRACE_CAPI_SOCKET,         3, 0x00);
+  CAPI_("connect",       QBDITRACE_CAPI_CONNECT,        3, 0x00);
+  CAPI_("send",          QBDITRACE_CAPI_SEND,           4, 0x00);
+  CAPI_("recv",          QBDITRACE_CAPI_RECV,           4, 0x00);
+  CAPI_("sendto",        QBDITRACE_CAPI_SENDTO,         6, 0x00);
+  CAPI_("recvfrom",      QBDITRACE_CAPI_RECVFROM,       6, 0x00);
+
+  /* ── Common: dl* / pthread ──────────────────────────────────────── */
+  CAPI_("dlopen",        QBDITRACE_CAPI_DLOPEN,         2, 0x01);
+  CAPI_("dlsym",         QBDITRACE_CAPI_DLSYM,          2, 0x02);
+  CAPI_("pthread_create",         QBDITRACE_CAPI_PTHREAD_CREATE,       4, 0x00);
+  CAPI_("pthread_mutex_lock",     QBDITRACE_CAPI_PTHREAD_MUTEX_LOCK,   1, 0x00);
+  CAPI_("pthread_mutex_unlock",   QBDITRACE_CAPI_PTHREAD_MUTEX_UNLOCK, 1, 0x00);
+
+  /* ── Common: more file ops ──────────────────────────────────────── */
+  CAPI_("rename",        QBDITRACE_CAPI_RENAME,         2, 0x03);
+  CAPI_("unlink",        QBDITRACE_CAPI_UNLINK,         1, 0x01);
+  CAPI_("mkdir",         QBDITRACE_CAPI_MKDIR,          2, 0x01);
+  CAPI_("rmdir",         QBDITRACE_CAPI_RMDIR,          1, 0x01);
+  CAPI_("mmap",          QBDITRACE_CAPI_MMAP,           6, 0x00);
+  CAPI_("mprotect",      QBDITRACE_CAPI_MPROTECT,       3, 0x00);
+  CAPI_("munmap",        QBDITRACE_CAPI_MUNMAP,         2, 0x00);
+
+#if defined(__APPLE__)
+  /* ── iOS/macOS: sysctl / entropy ───────────────────────────────── */
+  CAPI_("sysctlbyname",  QBDITRACE_CAPI_SYSCTLBYNAME,   6, 0x01);
+  CAPI_("sysctl",        QBDITRACE_CAPI_SYSCTL,         6, 0x00);
+  CAPI_("isatty",        QBDITRACE_CAPI_ISATTY,         1, 0x00);
+
+  /* ── iOS/macOS: CommonCrypto (handle = self-dlopen RTLD_DEFAULT works since
+   * libcommonCrypto is re-exported by libSystem on iOS; RTLD_DEFAULT searches
+   * all loaded dylibs) ────────────────────────────────────────────── */
+  CAPI_("CCCrypt",                QBDITRACE_CAPI_CC_CRYPT,            7, 0x00);
+  CAPI_("CCHmac",                 QBDITRACE_CAPI_CC_HMAC,             6, 0x00);
+  CAPI_("CCHmacInit",             QBDITRACE_CAPI_CC_HMAC_INIT,        4, 0x00);
+  CAPI_("CCHmacUpdate",           QBDITRACE_CAPI_CC_HMAC_UPDATE,      3, 0x00);
+  CAPI_("CCHmacFinal",            QBDITRACE_CAPI_CC_HMAC_FINAL,       2, 0x00);
+  CAPI_("CCCryptorCreate",        QBDITRACE_CAPI_CC_CRYPTOR_CREATE,   7, 0x00);
+  CAPI_("CCCryptorUpdate",        QBDITRACE_CAPI_CC_CRYPTOR_UPDATE,   6, 0x00);
+  CAPI_("CCCryptorFinal",         QBDITRACE_CAPI_CC_CRYPTOR_FINAL,    3, 0x00);
+  CAPI_("CCCryptorRelease",       QBDITRACE_CAPI_CC_CRYPTOR_RELEASE,  1, 0x00);
+  CAPI_("CCRandomGenerateBytes",  QBDITRACE_CAPI_CC_RANDOM_GENERATE,  2, 0x00);
+  CAPI_("CCKeyDerivationPBKDF",   QBDITRACE_CAPI_CC_KEY_DERIVE_PBKDF, 8, 0x02);
+  CAPI_("CC_SHA1",                QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
+  CAPI_("CC_SHA224",              QBDITRACE_CAPI_CC_SHA224,           3, 0x00);
+  CAPI_("CC_SHA256",              QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
+  CAPI_("CC_SHA384",              QBDITRACE_CAPI_CC_SHA384,           3, 0x00);
+  CAPI_("CC_SHA512",              QBDITRACE_CAPI_CC_SHA512,           3, 0x00);
+  CAPI_("CC_MD5",                 QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
+  CAPI_("CC_SHA256_Init",         QBDITRACE_CAPI_CC_SHA256_INIT,      1, 0x00);
+  CAPI_("CC_SHA256_Update",       QBDITRACE_CAPI_CC_SHA256_UPDATE,    3, 0x00);
+  CAPI_("CC_SHA256_Final",        QBDITRACE_CAPI_CC_SHA256_FINAL,     2, 0x00);
+
+  /* ── iOS/macOS: CoreFoundation ──────────────────────────────────── */
+  CAPI_("CFStringCreateWithCString",  QBDITRACE_CAPI_CF_STR_CREATE_UTF8,  3, 0x02);
+  CAPI_("CFStringCreateWithBytes",    QBDITRACE_CAPI_CF_STR_CREATE_BYTES, 5, 0x00);
+  CAPI_("CFStringGetCString",         QBDITRACE_CAPI_CF_STR_GET_CSTR,     4, 0x00);
+  CAPI_("CFStringGetCStringPtr",      QBDITRACE_CAPI_CF_STR_GET_PTR,      2, 0x00);
+  CAPI_("CFStringCompare",            QBDITRACE_CAPI_CF_STR_COMPARE,      3, 0x00);
+  CAPI_("CFStringHasPrefix",          QBDITRACE_CAPI_CF_STR_HASPREFIX,    2, 0x00);
+  CAPI_("CFStringHasSuffix",          QBDITRACE_CAPI_CF_STR_HASSUFFIX,    2, 0x00);
+  CAPI_("CFDataCreate",               QBDITRACE_CAPI_CF_DATA_CREATE,      3, 0x00);
+  CAPI_("CFDataGetBytePtr",           QBDITRACE_CAPI_CF_DATA_GET_PTR,     1, 0x00);
+  CAPI_("CFDataGetLength",            QBDITRACE_CAPI_CF_DATA_GET_LEN,     1, 0x00);
+  CAPI_("CFDictionaryGetValue",       QBDITRACE_CAPI_CF_DICT_GET_VAL,     2, 0x00);
+  CAPI_("CFArrayGetValueAtIndex",     QBDITRACE_CAPI_CF_ARRAY_GET_VAL,    2, 0x00);
+  CAPI_("CFRelease",                  QBDITRACE_CAPI_CF_RELEASE,          1, 0x00);
+  CAPI_("CFRetain",                   QBDITRACE_CAPI_CF_RETAIN,           1, 0x00);
+  CAPI_("CFURLGetString",             QBDITRACE_CAPI_CF_URL_GET_STR,      1, 0x00);
+
+  /* ── iOS/macOS: Security framework ─────────────────────────────── */
+  CAPI_("SecItemCopyMatching",             QBDITRACE_CAPI_SEC_ITEM_COPY_MATCH, 2, 0x00);
+  CAPI_("SecItemAdd",                      QBDITRACE_CAPI_SEC_ITEM_ADD,        2, 0x00);
+  CAPI_("SecItemUpdate",                   QBDITRACE_CAPI_SEC_ITEM_UPDATE,     2, 0x00);
+  CAPI_("SecItemDelete",                   QBDITRACE_CAPI_SEC_ITEM_DELETE,     1, 0x00);
+  CAPI_("SecRandomCopyBytes",              QBDITRACE_CAPI_SEC_RAND_COPY_BYTES, 3, 0x00);
+  CAPI_("SecKeyCopyExternalRepresentation",QBDITRACE_CAPI_SEC_KEY_COPY_EXT,   2, 0x00);
+  CAPI_("SecKeyEncrypt",                   QBDITRACE_CAPI_SEC_KEY_ENCRYPT,     6, 0x00);
+  CAPI_("SecKeyDecrypt",                   QBDITRACE_CAPI_SEC_KEY_DECRYPT,     6, 0x00);
+  CAPI_("SecTrustEvaluate",                QBDITRACE_CAPI_SEC_TRUST_EVAL,      2, 0x00);
+
+  /* ── iOS/macOS: GCD / libdispatch ──────────────────────────────── */
+  CAPI_("dispatch_async",   QBDITRACE_CAPI_DISPATCH_ASYNC, 2, 0x00);
+  CAPI_("dispatch_sync",    QBDITRACE_CAPI_DISPATCH_SYNC,  2, 0x00);
+  CAPI_("dispatch_after",   QBDITRACE_CAPI_DISPATCH_AFTER, 3, 0x00);
+  CAPI_("dispatch_once",    QBDITRACE_CAPI_DISPATCH_ONCE,  2, 0x00);
+
+#elif defined(__ANDROID__) || defined(__linux__)
+  /* ── Android: system calls extras ─────────────────────────────── */
+  CAPI_("prctl",         QBDITRACE_CAPI_PRCTL,           5, 0x00);
+  CAPI_("getaddrinfo",   QBDITRACE_CAPI_GETADDRINFO,     4, 0x01);
+  CAPI_("inet_ntop",     QBDITRACE_CAPI_INET_NTOP,       4, 0x00);
+  CAPI_("getrandom",     QBDITRACE_CAPI_GETRANDOM,       3, 0x00);
+
+  /* ── Android: logging (liblog.so) ──────────────────────────────── */
+  {
+    /* Try to open liblog.so explicitly to reach namespace-private symbol. */
+    void *hlog = ::dlopen("liblog.so", RTLD_NOLOAD | RTLD_LAZY);
+    if (!hlog) hlog = ::dlopen("liblog.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (hlog) {
+      CAPI_H(hlog, "__android_log_print",     QBDITRACE_CAPI_ALOG_PRINT,  3, 0x06);
+      CAPI_H(hlog, "__android_log_write",     QBDITRACE_CAPI_ALOG_WRITE,  3, 0x06);
+      CAPI_H(hlog, "__android_log_buf_write", QBDITRACE_CAPI_ALOG_WRITE,  4, 0x0c);
+      /* Don't dlclose — we want the lib to stay loaded. */
+    } else {
+      /* Fallback: RTLD_DEFAULT may find it if already loaded. */
+      CAPI_("__android_log_print",  QBDITRACE_CAPI_ALOG_PRINT,  3, 0x06);
+      CAPI_("__android_log_write",  QBDITRACE_CAPI_ALOG_WRITE,  3, 0x06);
+    }
+  }
+
+  /* ── Android: OpenSSL / BoringSSL (libcrypto.so / libssl.so) ────── */
+  {
+    /* BoringSSL on Android is namespaced; try NOLOAD first then fallback. */
+    static const char *kCryptoLibs[] = {
+      "libcrypto.so", "libssl.so", "libcrypto.so.3",
+      "libcrypto_static.so", nullptr
+    };
+    void *hcrypto = nullptr;
+    for (int i = 0; kCryptoLibs[i] && !hcrypto; ++i) {
+      hcrypto = ::dlopen(kCryptoLibs[i], RTLD_NOLOAD | RTLD_LAZY);
+    }
+    if (!hcrypto) hcrypto = RTLD_DEFAULT;
+
+    CAPI_H(hcrypto, "EVP_EncryptInit_ex",  QBDITRACE_CAPI_EVP_ENCRYPT_INIT,   5, 0x00);
+    CAPI_H(hcrypto, "EVP_EncryptUpdate",   QBDITRACE_CAPI_EVP_ENCRYPT_UPDATE,  5, 0x00);
+    CAPI_H(hcrypto, "EVP_EncryptFinal_ex", QBDITRACE_CAPI_EVP_ENCRYPT_FINAL,   3, 0x00);
+    CAPI_H(hcrypto, "EVP_DecryptInit_ex",  QBDITRACE_CAPI_EVP_DECRYPT_INIT,    5, 0x00);
+    CAPI_H(hcrypto, "EVP_DecryptUpdate",   QBDITRACE_CAPI_EVP_DECRYPT_UPDATE,  5, 0x00);
+    CAPI_H(hcrypto, "EVP_DecryptFinal_ex", QBDITRACE_CAPI_EVP_DECRYPT_FINAL,   3, 0x00);
+    CAPI_H(hcrypto, "EVP_DigestInit_ex",   QBDITRACE_CAPI_EVP_DIGESTINIT,      3, 0x00);
+    CAPI_H(hcrypto, "EVP_DigestUpdate",    QBDITRACE_CAPI_EVP_DIGESTUPDATE,    3, 0x00);
+    CAPI_H(hcrypto, "EVP_DigestFinal_ex",  QBDITRACE_CAPI_EVP_DIGESTFINAL,     3, 0x00);
+    CAPI_H(hcrypto, "HMAC_Init_ex",        QBDITRACE_CAPI_HMAC_INIT_EX,        5, 0x00);
+    CAPI_H(hcrypto, "HMAC_Update",         QBDITRACE_CAPI_HMAC_UPDATE,         3, 0x00);
+    CAPI_H(hcrypto, "HMAC_Final",          QBDITRACE_CAPI_HMAC_FINAL,          3, 0x00);
+    CAPI_H(hcrypto, "SHA256_Init",         QBDITRACE_CAPI_SHA256_INIT,         1, 0x00);
+    CAPI_H(hcrypto, "SHA256_Update",       QBDITRACE_CAPI_SHA256_UPDATE,       3, 0x00);
+    CAPI_H(hcrypto, "SHA256_Final",        QBDITRACE_CAPI_SHA256_FINAL,        2, 0x00);
+    CAPI_H(hcrypto, "AES_set_encrypt_key", QBDITRACE_CAPI_AES_SET_ENC_KEY,    3, 0x01);
+    CAPI_H(hcrypto, "AES_set_decrypt_key", QBDITRACE_CAPI_AES_SET_DEC_KEY,    3, 0x01);
+    CAPI_H(hcrypto, "AES_cbc_encrypt",     QBDITRACE_CAPI_AES_CBC_ENCRYPT,    6, 0x00);
+    CAPI_H(hcrypto, "RSA_sign",            QBDITRACE_CAPI_RSA_SIGN,            6, 0x00);
+    CAPI_H(hcrypto, "RSA_verify",          QBDITRACE_CAPI_RSA_VERIFY,          6, 0x00);
+    CAPI_H(hcrypto, "RAND_bytes",          QBDITRACE_CAPI_RAND_BYTES,          2, 0x00);
+    CAPI_H(hcrypto, "BIO_new_mem_buf",     QBDITRACE_CAPI_BIO_NEW_MEM_BUF,     2, 0x00);
+  }
+
+  /* ── Android: SQLite (libsqlite3.so or embedded) ─────────────────── */
+  {
+    static const char *kSqliteLibs[] = {
+      "libsqlite3.so", "libsqlite.so", nullptr
+    };
+    void *hsql = nullptr;
+    for (int i = 0; kSqliteLibs[i] && !hsql; ++i) {
+      hsql = ::dlopen(kSqliteLibs[i], RTLD_NOLOAD | RTLD_LAZY);
+    }
+    if (hsql) {
+      CAPI_H(hsql, "sqlite3_open",        QBDITRACE_CAPI_SQLITE3_OPEN,        2, 0x01);
+      CAPI_H(hsql, "sqlite3_open_v2",     QBDITRACE_CAPI_SQLITE3_OPEN,        4, 0x01);
+      CAPI_H(hsql, "sqlite3_prepare_v2",  QBDITRACE_CAPI_SQLITE3_PREPARE,     5, 0x02);
+      CAPI_H(hsql, "sqlite3_exec",        QBDITRACE_CAPI_SQLITE3_EXEC,        5, 0x02);
+      CAPI_H(hsql, "sqlite3_step",        QBDITRACE_CAPI_SQLITE3_STEP,        1, 0x00);
+      CAPI_H(hsql, "sqlite3_column_text", QBDITRACE_CAPI_SQLITE3_COLUMN_TEXT, 2, 0x00);
+      CAPI_H(hsql, "sqlite3_close",       QBDITRACE_CAPI_SQLITE3_CLOSE,       1, 0x00);
+    }
+  }
+#endif
+}
+
+#undef CAPI_
+#undef CAPI_H
 
 /* WriteRegList, FlatPcSet, FlatWriteRegCache are defined in FlatContainers.h
  * (extracted for independent unit testing). */
@@ -261,6 +507,34 @@ public:
     }
     if (cfg_.anchor_interval == 0) {
       cfg_.anchor_interval = kDefaultAnchorInterval;
+    }
+
+    /* Native auto-resolution: if the caller enabled C API interception but
+     * did not supply any capi_funcs[] entries (e.g. a minimal JS loader),
+     * fill the table ourselves using dlsym at configure time.  This makes
+     * the tracer fully self-contained — the JS agent only needs to set the
+     * trace range and output path; all common platform functions are
+     * intercepted automatically without requiring the JS side to enumerate
+     * and pass 100+ addresses. */
+    if (cfg_.capi_intercept && cfg_.n_capi_funcs == 0) {
+      resolveCApiAddrsIntoConfig(cfg_);
+    }
+
+    /* Build sorted C API lookup table from capi_funcs[].  Entries with
+     * addr == 0 are skipped.  The table is sorted by address so that
+     * lookupCApiFunc() can use binary search instead of linear scan. */
+    cfg_.capi_lookup.clear();
+    if (cfg_.capi_intercept && cfg_.n_capi_funcs > 0) {
+      cfg_.capi_lookup.reserve(cfg_.n_capi_funcs);
+      for (uint32_t i = 0; i < cfg_.n_capi_funcs; ++i) {
+        if (cfg_.capi_funcs[i].addr != 0) {
+          cfg_.capi_lookup.push_back({cfg_.capi_funcs[i].addr, i});
+        }
+      }
+      std::sort(cfg_.capi_lookup.begin(), cfg_.capi_lookup.end(),
+                [](const Config::CApiLookup &a, const Config::CApiLookup &b) {
+                  return a.addr < b.addr;
+                });
     }
 
     if (!writer_started_) {
@@ -1496,6 +1770,9 @@ QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
 #else
   sh.syscall_no = QBDI_GPR_GET(gpr, 16);
 #endif
+  /* Classify the syscall for fast routing in the decoder (e.g. detect
+   * Mach traps, binder ioctls, memory/file/network categories). */
+  sh.reserved[0] = classifySyscall(sh.syscall_no);
   for (int i = 0; i < 6; ++i) {
     sh.args[i] = QBDI_GPR_GET(gpr, i); /* x0..x5 */
   }
@@ -1582,6 +1859,156 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
       int variant = classifyObjcTarget(cfg, target);
       if (variant >= 0) {
         emitObjc(variant, site);
+      }
+    }
+    /* C API interception: if enabled and the target matches a known library
+     * function, emit a REC_CAPICALL record with the function identity,
+     * argument registers, and optional string/buffer captures from pointer
+     * arguments. */
+    if (cfg.capi_intercept && (cfg.record & QBDITRACE_REC_CAPI)) {
+      const Config::CApiFunc *cf = lookupCApiFunc(cfg, target);
+      if (cf != nullptr) {
+        /* --- Emit fixed header --- */
+        qbditrace_capicall_head_t ch;
+        std::memset(&ch, 0, sizeof(ch));
+        ch.kind      = QBDITRACE_REC_CAPICALL;
+        ch.api_id    = cf->api_id;
+        ch.arg_count = cf->n_args;
+        ch.pc        = site;
+        ch.target    = target;
+        /* Capture argument registers x0..x7. */
+        for (uint8_t i = 0; i < cf->n_args && i < 8; ++i) {
+          ch.args[i] = QBDI_GPR_GET(gpr, i);
+        }
+
+        /* --- Build variable-length string captures --- */
+        /* We collect up to QBDITRACE_CAPICALL_MAX_STR_CAPS string captures
+         * from pointer arguments indicated by the str_args bitmask.
+         * Each capture consists of a qbditrace_capicall_str_t header +
+         * NUL-terminated content padded to 4-byte alignment. */
+        uint8_t str_count = 0;
+        /* Stack-allocated scratch for one string capture at a time (max 256B
+         * payload + 1 NUL + 3 pad = 260). */
+        char str_buf[QBDITRACE_CAPICALL_MAX_STR_BYTES + 4];
+        /* We need to compute the total variable-length size for prepareRecord,
+         * so we do a two-pass approach: first pass computes sizes, second pass
+         * writes. To avoid two safeRead calls per string, we cache the results
+         * of the first pass into small on-stack descriptors. */
+        struct StrDesc {
+          uint8_t arg_idx;  /* which arg this string came from */
+          uint8_t str_len;  /* byte length of content (no NUL) */
+          uint8_t str_flags;
+          uint8_t _pad;
+          uint16_t total_bytes; /* total bytes for this capture (header + data + pad) */
+        } descs[QBDITRACE_CAPICALL_MAX_STR_CAPS];
+        uint16_t var_total = 0; /* total variable-length bytes */
+
+        for (uint8_t i = 0; i < 8 && str_count < QBDITRACE_CAPICALL_MAX_STR_CAPS; ++i) {
+          if (!(cf->str_args & (1u << i))) continue;
+          uint64_t ptr_val = ch.args[i];
+          if (ptr_val == 0) continue;
+
+          StrDesc &d = descs[str_count];
+          d.arg_idx  = i;
+          d.str_len  = 0;
+          d.str_flags = 0;
+          d._pad     = 0;
+
+          /* safeRead up to MAX_STR_BYTES + 1 (so we can detect truncation). */
+          bool ok = safeRead(ptr_val, str_buf, QBDITRACE_CAPICALL_MAX_STR_BYTES + 1);
+          if (!ok) {
+            /* If we can't read even one byte, try a smaller probe. */
+            ok = safeRead(ptr_val, str_buf, 1);
+            if (!ok) {
+              d.str_flags = QBDITRACE_SF_SAFE_READ_FAIL;
+              d.str_len   = 0;
+            }
+          }
+          if (ok) {
+            /* Find the string length by scanning for NUL up to MAX_STR_BYTES.
+             * If no NUL within MAX_STR_BYTES, mark as truncated. For binary
+             * buffers (mem*), the caller can set str_args on the size arg too,
+             * but we capture at most MAX_STR_BYTES of the pointed-to data. */
+            uint16_t slen = 0;
+            bool found_nul = false;
+            for (; slen < QBDITRACE_CAPICALL_MAX_STR_BYTES; ++slen) {
+              if (str_buf[slen] == '\0') { found_nul = true; break; }
+            }
+            if (!found_nul) {
+              /* No NUL terminator within MAX_STR_BYTES — truncate. */
+              d.str_flags |= QBDITRACE_SF_TRUNCATED;
+              d.str_len = QBDITRACE_CAPICALL_MAX_STR_BYTES;
+              /* Check if the content looks like binary data. */
+              bool has_binary = false;
+              for (uint16_t j = 0; j < d.str_len; ++j) {
+                unsigned char c = static_cast<unsigned char>(str_buf[j]);
+                if (c < 0x09 || (c > 0x0d && c < 0x20)) { has_binary = true; break; }
+              }
+              if (has_binary) d.str_flags |= QBDITRACE_SF_BINARY;
+            } else {
+              d.str_len = slen;
+              /* Check for binary content in the valid portion. */
+              bool has_binary = false;
+              for (uint16_t j = 0; j < d.str_len; ++j) {
+                unsigned char c = static_cast<unsigned char>(str_buf[j]);
+                if (c < 0x09 || (c > 0x0d && c < 0x20)) { has_binary = true; break; }
+              }
+              if (has_binary) d.str_flags |= QBDITRACE_SF_BINARY;
+            }
+          }
+          /* Compute total bytes for this capture:
+           *   qbditrace_capicall_str_t (4B) + str_len + 1(NUL) + pad to 4B */
+          uint16_t data_bytes = d.str_len + 1; /* content + NUL */
+          uint16_t padded = (data_bytes + 3u) & ~3u; /* 4-byte aligned */
+          d.total_bytes = sizeof(qbditrace_capicall_str_t) + padded;
+          var_total += d.total_bytes;
+          str_count++;
+        }
+
+        ch.str_count = str_count;
+        const uint16_t rec_total = sizeof(ch) + var_total;
+        prepareRecord(buf, rec_total);
+        uint8_t *p = buf->reserve(rec_total);
+        /* Write fixed header. */
+        std::memcpy(p, &ch, sizeof(ch));
+        p += sizeof(ch);
+        /* Write string captures. */
+        for (uint8_t si = 0; si < str_count; ++si) {
+          const StrDesc &d = descs[si];
+          /* Re-read the string data for this arg. We could cache the data from
+           * the first pass, but that would require 4 × 256B of stack. Instead,
+           * for low str_count (typically 1-2) the overhead of a second safeRead
+           * is negligible compared to the cost of the transfer itself. */
+          qbditrace_capicall_str_t sh;
+          sh.str_arg_idx = d.arg_idx;
+          sh.str_len     = d.str_len;
+          sh.str_flags   = d.str_flags;
+          sh._reserved   = 0;
+          std::memcpy(p, &sh, sizeof(sh));
+          p += sizeof(sh);
+
+          if (d.str_len > 0 && !(d.str_flags & QBDITRACE_SF_SAFE_READ_FAIL)) {
+            char tmp[QBDITRACE_CAPICALL_MAX_STR_BYTES + 1];
+            bool rd = safeRead(ch.args[d.arg_idx], tmp, d.str_len);
+            if (rd) {
+              std::memcpy(p, tmp, d.str_len);
+              p += d.str_len;
+            }
+            /* NUL terminator. */
+            *p++ = '\0';
+            /* Padding to 4-byte alignment. */
+            uint16_t data_bytes = d.str_len + 1;
+            uint16_t padded = (data_bytes + 3u) & ~3u;
+            uint16_t pad_bytes = padded - data_bytes;
+            for (uint16_t j = 0; j < pad_bytes; ++j) {
+              *p++ = '\0';
+            }
+          } else {
+            /* Empty capture: just NUL + 3 bytes padding (4 total). */
+            *p++ = '\0';
+            *p++ = '\0'; *p++ = '\0'; *p++ = '\0';
+          }
+        }
       }
     }
     emitEvent(QBDITRACE_EV_XFER_CALL, target, site);
@@ -1969,6 +2396,18 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
   cfg.compress = (in->disable_compress == 0);
   /* Branch-hint: inverted ABI sense (0 = enabled, the default). */
   cfg.branch_hint_mode = (in->disable_branch_hint == 0);
+  /* C API interception. */
+  cfg.capi_intercept = (in->enable_capi_intercept != 0);
+  cfg.n_capi_funcs = in->n_capi_funcs;
+  if (cfg.n_capi_funcs > Config::kMaxCapiFuncs) {
+    cfg.n_capi_funcs = Config::kMaxCapiFuncs;
+  }
+  for (uint32_t i = 0; i < cfg.n_capi_funcs; ++i) {
+    cfg.capi_funcs[i].addr     = in->capi_funcs[i].addr;
+    cfg.capi_funcs[i].api_id   = in->capi_funcs[i].api_id;
+    cfg.capi_funcs[i].n_args   = in->capi_funcs[i].n_args;
+    cfg.capi_funcs[i].str_args = in->capi_funcs[i].str_args;
+  }
   return Tracer::get().configure(cfg) ? 0 : -2;
 }
 

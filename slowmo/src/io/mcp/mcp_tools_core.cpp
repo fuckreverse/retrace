@@ -205,27 +205,24 @@ void TenetMcpService::register_query_tools() {
     register_tool(
         {"memread",
          "Read memory contents at a specific address and point in time. "
-         "Uses the MemoryModel's write-history tracking for time-travel reads.",
+         "Uses the MemoryModel's write-history tracking for time-travel reads. "
+         "For large reads (>4096 bytes), consider using batch_query with multiple "
+         "smaller memread calls if only partial regions are known.",
          {{"type", "object"},
           {"properties", {
               {"addr",       {{"type", "string"}, {"description", "Memory address (hex string, e.g. '0x16fdff200')"}}},
-              {"size",       {{"type", "integer"}, {"description", "Bytes to read (max 4096)"}, {"default", 16}}},
+              {"size",       {{"type", "integer"}, {"description", "Bytes to read (max 65536)"}, {"default", 16}}},
               {"at_inst_id", {{"type", "integer"}, {"description", "Read memory state as of this instruction"}}}
           }},
           {"required", json::array({"addr", "at_inst_id"})}}},
         [this](const json& args) -> json {
             uint64_t addr = parse_hex(args.at("addr").get<std::string>());
-            size_t size = std::min(args.value("size", 16), 4096);
+            size_t size = std::min(args.value("size", 16), 65536);
             uint64_t inst_id = args.at("at_inst_id").get<uint64_t>();
 
             auto rr = memory_.read_region(addr, size, inst_id);
-            json data_arr = json::array();
-            json known_arr = json::array();
-            for (size_t i = 0; i < rr.data.size(); i++) {
-                data_arr.push_back(rr.data[i]);
-                known_arr.push_back(rr.known[i]);
-            }
             std::string hex_str;
+            hex_str.reserve(size * 3);
             for (size_t i = 0; i < rr.data.size(); i++) {
                 if (rr.known[i]) {
                     hex_str += fmt::format("{:02X} ", rr.data[i]);
@@ -233,13 +230,26 @@ void TenetMcpService::register_query_tools() {
                     hex_str += "?? ";
                 }
             }
-            return {{"addr", fmt::format("0x{:X}", addr)},
-                    {"size", size},
-                    {"inst_id", inst_id},
-                    {"data", std::move(data_arr)},
-                    {"known", std::move(known_arr)},
-                    {"known_count", rr.known_count},
-                    {"hex", hex_str}};
+
+            json result = {{"addr", fmt::format("0x{:X}", addr)},
+                           {"size", size},
+                           {"inst_id", inst_id},
+                           {"known_count", rr.known_count},
+                           {"hex", hex_str}};
+
+            // Include byte-level arrays only for small reads (≤4096) to
+            // keep JSON response size manageable for large reads.
+            if (size <= 4096) {
+                json data_arr = json::array();
+                json known_arr = json::array();
+                for (size_t i = 0; i < rr.data.size(); i++) {
+                    data_arr.push_back(rr.data[i]);
+                    known_arr.push_back(rr.known[i]);
+                }
+                result["data"] = std::move(data_arr);
+                result["known"] = std::move(known_arr);
+            }
+            return result;
         }
     );
 

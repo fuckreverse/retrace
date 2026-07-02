@@ -259,12 +259,155 @@ if(QBDITRACE_BUILD_TESTS)
     target_link_libraries(test_flat_containers PRIVATE
         Catch2::Catch2WithMain)
     catch_discover_tests(test_flat_containers DISCOVERY_MODE PRE_TEST)
+
+    # test_qbditrace_ios: iOS/Darwin-specific logic — classifySyscall (Darwin
+    # BSD + Mach trap), classifyObjcTarget (msgSend family), lookupCApiFunc
+    # (binary-search table), TraceFormat iOS enum values, and Config defaults.
+    # Depends only on QBDITraceInternal.h (no QBDI, no Frida required).
+    add_executable(test_qbditrace_ios
+        tests/unit/test_qbditrace_ios.cpp)
+    target_include_directories(test_qbditrace_ios PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_qbditrace_ios PRIVATE
+        Catch2::Catch2WithMain)
+    catch_discover_tests(test_qbditrace_ios DISCOVERY_MODE PRE_TEST)
   endif()
 
   # ── macOS arm64 in-process integration test ─────────────────────────────────
   # Builds only on Apple arm64 when the QBDI static libs are present.
   # Optionally links against tenet_lib for full qbditrace+tenet joint tests
   # (QBDITRACE_TENET_INTEGRATION=1) when tenet is configured as a sibling.
+  #
+  # To enable the tenet joint tests, pass:
+  #   -DQBDITRACE_BUILD_TESTS_INTEGRATION=ON
+  #   -DTENET_BUILD_DIR=<path/to/tenet/build>   (e.g. tools/tenet/build)
+  #
+  # TENET_BUILD_DIR imports tenet_lib and its Catch2 from the existing tenet
+  # build tree without re-running tenet's own cmake or rebuilding from source.
+  set(TENET_BUILD_DIR "" CACHE PATH
+      "Path to an existing tenet build directory (for tenet_lib import)")
+
+  if(TENET_BUILD_DIR AND EXISTS "${TENET_BUILD_DIR}/build.ninja")
+    get_filename_component(_tenet_src_dir "${TENET_BUILD_DIR}/.." ABSOLUTE)
+
+    # Import Catch2 from tenet's pre-built _deps/ if not already available.
+    if(NOT TARGET Catch2::Catch2WithMain)
+      set(_c2src "${_tenet_src_dir}/_deps/catch2-src/src")
+      set(_c2gen "${_tenet_src_dir}/_deps/catch2-build/generated-includes")
+      set(_c2lib "${_tenet_src_dir}/_deps/catch2-build/src/libCatch2.a")
+      set(_c2mainlib "${_tenet_src_dir}/_deps/catch2-build/src/libCatch2Main.a")
+
+      if(EXISTS "${_c2lib}" AND EXISTS "${_c2mainlib}")
+        add_library(Catch2::Catch2 STATIC IMPORTED GLOBAL)
+        set_target_properties(Catch2::Catch2 PROPERTIES
+            IMPORTED_LOCATION "${_c2lib}")
+        if(EXISTS "${_c2src}" AND EXISTS "${_c2gen}")
+          set_target_properties(Catch2::Catch2 PROPERTIES
+              INTERFACE_INCLUDE_DIRECTORIES "${_c2src};${_c2gen}")
+        endif()
+
+        add_library(Catch2::Catch2WithMain STATIC IMPORTED GLOBAL)
+        set_target_properties(Catch2::Catch2WithMain PROPERTIES
+            IMPORTED_LOCATION "${_c2mainlib}"
+            INTERFACE_LINK_LIBRARIES "Catch2::Catch2")
+        if(EXISTS "${_c2src}" AND EXISTS "${_c2gen}")
+          set_target_properties(Catch2::Catch2WithMain PROPERTIES
+              INTERFACE_INCLUDE_DIRECTORIES "${_c2src};${_c2gen}")
+        endif()
+
+        # Provide include(Catch) module from tenet's Catch2 source.
+        list(APPEND CMAKE_MODULE_PATH "${_tenet_src_dir}/_deps/catch2-src/extras")
+        message(STATUS "qbditrace: imported Catch2::Catch2WithMain from tenet _deps")
+      endif()
+    endif()
+
+    if(NOT TARGET tenet_lib)
+      # Build the minimal imported target for tenet_lib.
+      # We need the static library path and tenet source include dirs.
+      set(_tenet_lib_path "${TENET_BUILD_DIR}/libtenet_lib.a")
+      if(NOT EXISTS "${_tenet_lib_path}")
+        # Try the non-lib prefix variant.
+        set(_tenet_lib_path "${TENET_BUILD_DIR}/tenet_lib.a")
+      endif()
+
+      if(EXISTS "${_tenet_lib_path}")
+        add_library(tenet_lib STATIC IMPORTED GLOBAL)
+        set_target_properties(tenet_lib PROPERTIES
+            IMPORTED_LOCATION "${_tenet_lib_path}")
+
+        # Collect include directories from tenet source + build trees.
+        # Directory names match the actual FetchContent naming in tenet's CMakeLists.
+        set(_tenet_inc_dirs
+            "${_tenet_src_dir}/src"
+            "${TENET_BUILD_DIR}"
+            "${_tenet_src_dir}/_deps/rocksdb-src/include"
+            "${_tenet_src_dir}/_deps/roaring-src/include"
+            "${_tenet_src_dir}/_deps/roaring-src/include/roaring"
+            "${_tenet_src_dir}/_deps/roaring-src/cpp"              # roaring64map.hh
+            "${_tenet_src_dir}/_deps/unordered_dense-src/include"  # ankerl::unordered_dense
+            "${_tenet_src_dir}/_deps/fmt-src/include"
+            "${_tenet_src_dir}/_deps/nlohmann_json-src/include"    # nlohmann::json
+            "${_tenet_src_dir}/_deps/capstone-src/include"
+        )
+        set_target_properties(tenet_lib PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${_tenet_inc_dirs}")
+
+        # tenet_lib depends on several 3rd-party libs already built.
+        # Paths match the actual layout of tools/tenet/_deps/.
+        set(_tenet_extra_libs "")
+
+        # rocksdb
+        set(_p "${_tenet_src_dir}/_deps/rocksdb-build/librocksdb.a")
+        if(EXISTS "${_p}")
+          list(APPEND _tenet_extra_libs "${_p}")
+        endif()
+
+        # roaring (library lives in src/ sub-directory)
+        set(_p "${_tenet_src_dir}/_deps/roaring-build/src/libroaring.a")
+        if(EXISTS "${_p}")
+          list(APPEND _tenet_extra_libs "${_p}")
+        endif()
+
+        # fmt (release build)
+        set(_p "${_tenet_src_dir}/_deps/fmt-build/libfmt.a")
+        if(NOT EXISTS "${_p}")
+          set(_p "${_tenet_src_dir}/_deps/fmt-build/libfmtd.a")
+        endif()
+        if(EXISTS "${_p}")
+          list(APPEND _tenet_extra_libs "${_p}")
+        endif()
+
+        # capstone
+        set(_p "${_tenet_src_dir}/_deps/capstone-build/libcapstone.a")
+        if(EXISTS "${_p}")
+          list(APPEND _tenet_extra_libs "${_p}")
+        endif()
+
+        # zstd (used by rocksdb internally, needed for link)
+        set(_p "${_tenet_src_dir}/_deps/zstd-build/lib/libzstd.a")
+        if(EXISTS "${_p}")
+          list(APPEND _tenet_extra_libs "${_p}")
+        endif()
+
+        # lz4 (used by rocksdb for compression, usually a system library)
+        find_library(_lz4_lib NAMES lz4)
+        if(_lz4_lib)
+          list(APPEND _tenet_extra_libs "${_lz4_lib}")
+        endif()
+        unset(_lz4_lib)
+
+        if(_tenet_extra_libs)
+          set_target_properties(tenet_lib PROPERTIES
+              INTERFACE_LINK_LIBRARIES "${_tenet_extra_libs}")
+        endif()
+
+        message(STATUS "qbditrace: imported tenet_lib from ${_tenet_lib_path}")
+      else()
+        message(STATUS "qbditrace: tenet_lib not found in TENET_BUILD_DIR=${TENET_BUILD_DIR} (libtenet_lib.a missing)")
+      endif()
+    endif()
+  endif()
+
   if(QBDITRACE_BUILD_TESTS_INTEGRATION AND APPLE AND
      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" AND
      QBDI_STATIC_LIB AND EXISTS "${QBDI_STATIC_LIB}")
@@ -291,7 +434,7 @@ if(QBDITRACE_BUILD_TESTS)
       list(APPEND _integ_libs tenet_lib Catch2::Catch2WithMain)
       list(APPEND _integ_defs QBDITRACE_TENET_INTEGRATION=1)
       # tenet source include dirs (for io/, core/, analysis/ headers)
-      get_target_property(_tenet_incs tenet_lib INCLUDE_DIRECTORIES)
+      get_target_property(_tenet_incs tenet_lib INTERFACE_INCLUDE_DIRECTORIES)
       if(_tenet_incs)
         list(APPEND _integ_include_dirs ${_tenet_incs})
       endif()
@@ -305,11 +448,22 @@ if(QBDITRACE_BUILD_TESTS)
 
     target_include_directories(test_qbditrace_macos PRIVATE
         ${_integ_include_dirs})
+    # zstd: the integration test embeds QBDITrace.cpp which uses zstd.
+    # Link the same libzstd that was built for qbditrace (or the one in tenet's _deps).
+    if(TARGET libzstd_static)
+      list(APPEND _integ_libs libzstd_static)
+      list(APPEND _integ_defs QBDITRACE_HAVE_ZSTD=1)
+    elseif(TARGET tenet_lib)
+      # tenet already has zstd in its INTERFACE_LINK_LIBRARIES; add the define.
+      list(APPEND _integ_defs QBDITRACE_HAVE_ZSTD=1)
+    endif()
+
     target_compile_definitions(test_qbditrace_macos PRIVATE
         ${_integ_defs})
     target_link_libraries(test_qbditrace_macos PRIVATE
         ${_integ_libs}
-        "-framework Foundation" "-framework CoreFoundation")
+        "-framework Foundation" "-framework CoreFoundation"
+        "-framework Security")
     target_compile_options(test_qbditrace_macos PRIVATE -O2)
 
     if(TARGET Catch2::Catch2WithMain)

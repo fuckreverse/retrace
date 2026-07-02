@@ -18,7 +18,7 @@ struct ObjcResult;
 
 // ─── Known cross-library API categories ──────────────────────────────────
 
-enum class ApiCategory {
+enum class ApiCategory : uint8_t {
     // ── iOS / macOS (Darwin) ──────────────────────────────────────────────
     CommonCrypto,
     SecurityFramework,
@@ -28,8 +28,34 @@ enum class ApiCategory {
     // ── Android / Linux ──────────────────────────────────────────────────
     BoringSSL,         // BoringSSL / OpenSSL (EVP_*, HMAC_*, AES_*)
     AndroidKeystore,   // Android Keystore JNI
-    // ── Cross-platform ───────────────────────────────────────────────────
+    // ── JNI (cross-platform) ─────────────────────────────────────────────
+    JNI,               // JNI env functions (GetStringUTFChars, FindClass, ...)
+    // ── Memory / String (cross-platform) ─────────────────────────────────
+    MemoryOps,         // memcpy, memmove, memset, memcmp, ...
+    StringOps,         // strlen, strcmp, strcpy, sprintf, ...
+    HeapAlloc,         // malloc, calloc, realloc, free, ...
+    // ── I/O / FS (cross-platform) ─────────────────────────────────────────
+    FileIO,            // fopen, fread, open, read, write, ...
+    Network,           // socket, connect, send, recv, getaddrinfo, ...
+    // ── Anti-debug / integrity ───────────────────────────────────────────
+    AntiDebug,         // ptrace, sysctl, prctl, getenv, access, isatty, ...
+    // ── Threading / sync ─────────────────────────────────────────────────
+    Threading,         // pthread_create/join/mutex, dispatch, ...
+    // ── Encoding ─────────────────────────────────────────────────────────
+    Encoding,          // base64_encode/decode, iconv, ...
+    // ── Compression ──────────────────────────────────────────────────────
     Compression,
+    // ── SQLite ───────────────────────────────────────────────────────────
+    SQLite,            // sqlite3_open, sqlite3_prepare, sqlite3_exec, ...
+    // ── Dynamic linking ───────────────────────────────────────────────────
+    DynLink,           // dlopen, dlsym, dlclose
+    // ── ObjC runtime / CF ─────────────────────────────────────────────────
+    ObjCRuntime,       // NSString UTF8String, CFStringCreate, CFDataCreate, ...
+    // ── Memory mapping ────────────────────────────────────────────────────
+    MemoryMap,         // mmap, munmap, mprotect
+    // ── Syscalls (SVC records) ────────────────────────────────────────────
+    Syscall,           // raw syscall number
+    // ── Fallback ─────────────────────────────────────────────────────────
     Custom,
 };
 
@@ -78,6 +104,15 @@ inline const char* cc_hmac_alg_name(uint32_t alg) {
     }
 }
 
+// ─── A captured inline string from CapiCallStrView ────────────────────────
+
+struct CapturedString {
+    uint8_t arg_idx   = 0;     // which x-register argument this came from
+    bool    truncated = false;
+    bool    binary    = false;
+    std::string value;         // UTF-8 content
+};
+
 // ─── A single API argument captured from the trace ───────────────────────
 
 struct ApiArg {
@@ -109,6 +144,16 @@ struct InterceptedCall {
     uint64_t return_value = 0;
     bool has_return = false;
     std::optional<std::string> objc_context;
+
+    /// Inline string captures directly from the CapiCall record (tracer-side).
+    /// Available only for REC_CAPICALL records; empty for Event-derived calls.
+    std::vector<CapturedString> captured_strings;
+
+    /// True when this call was created from a REC_CAPICALL record.
+    bool from_capicall_record = false;
+
+    /// SVC flags (QBDITRACE_SVC_FL_* bits) — non-zero only for Syscall category.
+    uint8_t svc_flags = 0;
 };
 
 // ─── Known API signatures ─────────────────────────────────────────────────
@@ -149,10 +194,14 @@ struct SyscallInterceptConfig {
 
 // ─── SyscallInterceptCollector ────────────────────────────────────────────
 
-/// TraceCollector that tracks register state (x0-x7), Objc messages,
-/// and Event records (XFER_CALL) to intercept cross-library API calls.
-/// The `target_os` parameter selects which API signature table to load
-/// (Darwin: CommonCrypto/Security.framework, Android: BoringSSL/OpenSSL).
+/// TraceCollector that handles three record sources for API interception:
+///
+///   1. REC_CAPICALL   — highest priority, tracer-side resolved with inline strings.
+///   2. REC_SVC        — raw syscall numbers, classified by flags and syscall_no.
+///   3. Event XFER_CALL — heuristic cross-library call detection (fallback).
+///
+/// The `target_os` parameter selects the API signature table:
+///   1=iOS/Darwin (CommonCrypto/Security), 2=Android (BoringSSL), 0=both.
 class SyscallInterceptCollector final : public TraceCollector {
 public:
     SyscallInterceptCollector(const SyscallInterceptConfig& config,
@@ -165,6 +214,8 @@ public:
 
     bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
     void on_inst(uint64_t inst_id, const InstView& inst) override;
+    void on_capicall(uint64_t inst_id, const CapiCallView& capi) override;
+    void on_svc(uint64_t inst_id, const SvcView& svc) override;
     void on_objc(uint64_t inst_id, const ObjcView& objc) override;
     void on_event(const EventView& ev) override;
     void end() override;
@@ -174,17 +225,29 @@ public:
 private:
     std::vector<uint8_t> read_memory_at(uint64_t addr, uint32_t max_bytes, uint64_t at_inst_id);
     void decode_known_api(InterceptedCall& call, const ApiSignature& sig);
+    void finalize_call(InterceptedCall call);
 
     static const std::vector<ApiSignature>& known_apis();
+    static const std::vector<ApiSignature>& known_android_apis();
+
+    struct CapiEntry {
+        const char* name = nullptr;
+        const ApiSignature* sig = nullptr;
+    };
+    static const CapiEntry& capi_entry(uint8_t api_id);
 
     // ── Configuration ──
     const SyscallInterceptConfig& config_;
     const CodeTable& code_table_;
     MemoryModel& memory_;
     const ObjcResult* objc_result_;
+    uint32_t target_os_;
 
     // ── Known API lookup ──
     ankerl::unordered_dense::map<std::string, const ApiSignature*> api_by_name_;
+
+    /// Set of callee PCs handled by on_capicall() to suppress duplicate Event matches.
+    ankerl::unordered_dense::map<uint64_t, uint64_t> capicall_seen_;
 
     // ── Rolling register state ──
     static constexpr uint32_t MAX_ARG_REGS = 8;

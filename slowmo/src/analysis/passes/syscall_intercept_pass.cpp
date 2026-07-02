@@ -406,7 +406,7 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
 // conscrypt, OkHttp, Chromium, ...).  Function signatures follow
 // the OpenSSL EVP interface — same argument positions on AArch64.
 
-static const std::vector<ApiSignature>& known_android_apis() {
+const std::vector<ApiSignature>& SyscallInterceptCollector::known_android_apis() {
     static const std::vector<ApiSignature> apis = {
         // ── BoringSSL / OpenSSL EVP symmetric cipher ──────────────────────
         {
@@ -755,6 +755,466 @@ void SyscallInterceptCollector::on_event(const EventView& ev) {
     result_.calls.push_back(std::move(call));
 }
 
+// ─── CapiCall ID → name / signature lookup ────────────────────────────────
+//
+// Maps qbditrace_capi_id_t (uint8_t, but stored as uint8_t in the record) to
+// a human-readable name and optionally the matching ApiSignature from the
+// known-API tables.  We use a flat switch for O(1) lookup; the compiler will
+// typically turn this into a jump table.
+
+const SyscallInterceptCollector::CapiEntry&
+SyscallInterceptCollector::capi_entry(uint8_t api_id) {
+    using namespace qbditrace;
+
+    // Each entry is { name, nullptr } — we set sig pointers lazily from the
+    // known_apis() / known_android_apis() tables in the constructor, but for
+    // the simple name lookup we just need the name string here.
+    static const CapiEntry kEntries[] = {
+        // 0
+        { nullptr,                           nullptr },  // UNKNOWN
+        // 1–8  Memory
+        { "memcpy",                          nullptr },
+        { "memmove",                         nullptr },
+        { "memset",                          nullptr },
+        { "memcmp",                          nullptr },
+        { "memchr",                          nullptr },
+        { "bcopy",                           nullptr },
+        { "bzero",                           nullptr },
+        { "memmem",                          nullptr },
+        // 9–19 reserved
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr },
+        // 20–48 Strings
+        { "strlen",          nullptr },  // 20
+        { "strnlen",         nullptr },  // 21
+        { "strcmp",          nullptr },  // 22
+        { "strncmp",         nullptr },  // 23
+        { "strcasecmp",      nullptr },  // 24
+        { "strncasecmp",     nullptr },  // 25
+        { "strcpy",          nullptr },  // 26
+        { "strncpy",         nullptr },  // 27
+        { "strlcpy",         nullptr },  // 28
+        { "strcat",          nullptr },  // 29
+        { "strncat",         nullptr },  // 30
+        { "strlcat",         nullptr },  // 31
+        { "strdup",          nullptr },  // 32
+        { "strndup",         nullptr },  // 33
+        { "strchr",          nullptr },  // 34
+        { "strrchr",         nullptr },  // 35
+        { "strstr",          nullptr },  // 36
+        { "strtok",          nullptr },  // 37
+        { "strtok_r",        nullptr },  // 38
+        { "sprintf",         nullptr },  // 39
+        { "snprintf",        nullptr },  // 40
+        { "sscanf",          nullptr },  // 41
+        { "atoi",            nullptr },  // 42
+        { "atol",            nullptr },  // 43
+        { "atoll",           nullptr },  // 44
+        { "strtol",          nullptr },  // 45
+        { "strtoll",         nullptr },  // 46
+        { "strtoul",         nullptr },  // 47
+        { "strtoull",        nullptr },  // 48
+        // 49–59 reserved (11 entries)
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr },
+        // 60–65 Heap alloc
+        { "malloc",          nullptr },  // 60
+        { "calloc",          nullptr },  // 61
+        { "realloc",         nullptr },  // 62
+        { "free",            nullptr },  // 63
+        { "posix_memalign",  nullptr },  // 64
+        { "valloc",          nullptr },  // 65
+        // 66–79 reserved (14 entries)
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        // 80–91 I/O
+        { "fopen",           nullptr },  // 80
+        { "fclose",          nullptr },  // 81
+        { "fread",           nullptr },  // 82
+        { "fwrite",          nullptr },  // 83
+        { "fgets",           nullptr },  // 84
+        { "fputs",           nullptr },  // 85
+        { "read",            nullptr },  // 86
+        { "write",           nullptr },  // 87
+        { "pread",           nullptr },  // 88
+        { "pwrite",          nullptr },  // 89
+        { "open",            nullptr },  // 90
+        { "close",           nullptr },  // 91
+        // 92–99 reserved (8 entries)
+        { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        // 100–102 Crypto libc
+        { "arc4random",         nullptr },  // 100
+        { "arc4random_buf",     nullptr },  // 101
+        { "getrandom",          nullptr },  // 102
+        // 103–129 reserved (27 entries)
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr }, { nullptr }, { nullptr }, { nullptr },
+        { nullptr }, { nullptr },
+        // 130–142 iOS platform APIs
+        { "CFStringCreateWithCString",      nullptr },  // 130
+        { "CFStringCreateWithBytes",        nullptr },  // 131
+        { "CFDataCreate",                   nullptr },  // 132
+        { "CFDataGetBytePtr",               nullptr },  // 133
+        { "CCCrypt",                        nullptr },  // 134
+        { "CCHmac",                         nullptr },  // 135
+        { "CC_SHA256",                      nullptr },  // 136
+        { "CCKeyDerivationPBKDF",           nullptr },  // 137
+        { "SecItemCopyMatching",            nullptr },  // 138
+        { "SecKeyCreateWithData",           nullptr },  // 139
+        { "SecTransformExecute",            nullptr },  // 140
+        { "CFURLCreateWithBytes",           nullptr },  // 141
+        { "NSURLSession_dataTask",          nullptr },  // 142
+    };
+
+    // kEntries covers indices 0..142 (143 entries).
+    static constexpr uint8_t kTableSize = 143;
+
+    if (api_id < kTableSize) {
+        return kEntries[api_id];
+    }
+
+    // For IDs not in the compact table, use a secondary switch for the extended
+    // ranges (200+, 280+, 360+, 380+, 400+, 420+, 450+, 470+, 600+, 700+).
+    // We return static locals to avoid allocations.
+
+    static const CapiEntry kFallback = { nullptr, nullptr };
+
+    // Extended table via switch.
+    switch (static_cast<uint16_t>(api_id)) {
+        // 200–207 Android
+        case 200: { static CapiEntry e{"strlcpy",               nullptr}; return e; }
+        case 201: { static CapiEntry e{"__android_log_print",   nullptr}; return e; }
+        case 202: { static CapiEntry e{"__android_log_write",   nullptr}; return e; }
+        case 203: { static CapiEntry e{"SharedPreferences_getString", nullptr}; return e; }
+        case 204: { static CapiEntry e{"SharedPreferences_putString", nullptr}; return e; }
+        case 205: { static CapiEntry e{"IBinder_transact",      nullptr}; return e; }
+        case 206: { static CapiEntry e{"dlopen",                nullptr}; return e; }
+        case 207: { static CapiEntry e{"dlsym",                 nullptr}; return e; }
+        // 280–300 JNI base
+        case 280: { static CapiEntry e{"GetStringUTFChars",     nullptr}; return e; }
+        case 281: { static CapiEntry e{"ReleaseStringUTFChars", nullptr}; return e; }
+        case 282: { static CapiEntry e{"NewStringUTF",          nullptr}; return e; }
+        case 283: { static CapiEntry e{"GetStringUTFLength",    nullptr}; return e; }
+        case 284: { static CapiEntry e{"GetByteArrayElements",  nullptr}; return e; }
+        case 285: { static CapiEntry e{"ReleaseByteArrayElements", nullptr}; return e; }
+        case 286: { static CapiEntry e{"GetByteArrayRegion",    nullptr}; return e; }
+        case 287: { static CapiEntry e{"SetByteArrayRegion",    nullptr}; return e; }
+        case 288: { static CapiEntry e{"NewByteArray",          nullptr}; return e; }
+        case 289: { static CapiEntry e{"FindClass",             nullptr}; return e; }
+        case 290: { static CapiEntry e{"GetMethodID",           nullptr}; return e; }
+        case 291: { static CapiEntry e{"GetStaticMethodID",     nullptr}; return e; }
+        case 292: { static CapiEntry e{"CallObjectMethod",      nullptr}; return e; }
+        case 293: { static CapiEntry e{"CallStaticObjectMethod",nullptr}; return e; }
+        case 294: { static CapiEntry e{"CallVoidMethod",        nullptr}; return e; }
+        case 295: { static CapiEntry e{"CallBooleanMethod",     nullptr}; return e; }
+        case 296: { static CapiEntry e{"CallIntMethod",         nullptr}; return e; }
+        case 297: { static CapiEntry e{"CallLongMethod",        nullptr}; return e; }
+        case 298: { static CapiEntry e{"ExceptionCheck",        nullptr}; return e; }
+        case 299: { static CapiEntry e{"ExceptionClear",        nullptr}; return e; }
+        case 300: { static CapiEntry e{"DefineClass",           nullptr}; return e; }
+        // 360–363 pthread
+        case 360: { static CapiEntry e{"pthread_create",        nullptr}; return e; }
+        case 361: { static CapiEntry e{"pthread_join",          nullptr}; return e; }
+        case 362: { static CapiEntry e{"pthread_mutex_lock",    nullptr}; return e; }
+        case 363: { static CapiEntry e{"pthread_mutex_unlock",  nullptr}; return e; }
+        // 380–385 Network
+        case 380: { static CapiEntry e{"socket",                nullptr}; return e; }
+        case 381: { static CapiEntry e{"connect",               nullptr}; return e; }
+        case 382: { static CapiEntry e{"send",                  nullptr}; return e; }
+        case 383: { static CapiEntry e{"recv",                  nullptr}; return e; }
+        case 384: { static CapiEntry e{"sendto",                nullptr}; return e; }
+        case 385: { static CapiEntry e{"recvfrom",              nullptr}; return e; }
+        // 400–401 Encoding
+        case 400: { static CapiEntry e{"base64_encode",         nullptr}; return e; }
+        case 401: { static CapiEntry e{"base64_decode",         nullptr}; return e; }
+        // 420–429 AntiDebug
+        case 420: { static CapiEntry e{"ptrace",                nullptr}; return e; }
+        case 421: { static CapiEntry e{"sysctl",                nullptr}; return e; }
+        case 422: { static CapiEntry e{"prctl",                 nullptr}; return e; }
+        case 423: { static CapiEntry e{"getenv",                nullptr}; return e; }
+        case 424: { static CapiEntry e{"access",                nullptr}; return e; }
+        case 425: { static CapiEntry e{"stat",                  nullptr}; return e; }
+        case 426: { static CapiEntry e{"kill",                  nullptr}; return e; }
+        case 427: { static CapiEntry e{"getpid",                nullptr}; return e; }
+        case 428: { static CapiEntry e{"sysctlbyname",          nullptr}; return e; }
+        case 429: { static CapiEntry e{"isatty",                nullptr}; return e; }
+        // 450–460 FS / mmap
+        case 450: { static CapiEntry e{"rename",                nullptr}; return e; }
+        case 451: { static CapiEntry e{"unlink",                nullptr}; return e; }
+        case 452: { static CapiEntry e{"mkdir",                 nullptr}; return e; }
+        case 453: { static CapiEntry e{"rmdir",                 nullptr}; return e; }
+        case 454: { static CapiEntry e{"openat",                nullptr}; return e; }
+        case 455: { static CapiEntry e{"pread64",               nullptr}; return e; }
+        case 456: { static CapiEntry e{"pwrite64",              nullptr}; return e; }
+        case 457: { static CapiEntry e{"lseek",                 nullptr}; return e; }
+        case 458: { static CapiEntry e{"mmap",                  nullptr}; return e; }
+        case 459: { static CapiEntry e{"munmap",                nullptr}; return e; }
+        case 460: { static CapiEntry e{"mprotect",              nullptr}; return e; }
+        // 470–526 iOS extended
+        case 470: { static CapiEntry e{"CC_SHA224",             nullptr}; return e; }
+        case 471: { static CapiEntry e{"CC_SHA384",             nullptr}; return e; }
+        case 472: { static CapiEntry e{"CC_SHA512",             nullptr}; return e; }
+        case 473: { static CapiEntry e{"CC_SHA256_Init",        nullptr}; return e; }
+        case 474: { static CapiEntry e{"CC_SHA256_Update",      nullptr}; return e; }
+        case 475: { static CapiEntry e{"CC_SHA256_Final",       nullptr}; return e; }
+        case 476: { static CapiEntry e{"CCHmacInit",            nullptr}; return e; }
+        case 477: { static CapiEntry e{"CCHmacUpdate",          nullptr}; return e; }
+        case 478: { static CapiEntry e{"CCHmacFinal",           nullptr}; return e; }
+        case 479: { static CapiEntry e{"CCCryptorCreate",       nullptr}; return e; }
+        case 480: { static CapiEntry e{"CCCryptorUpdate",       nullptr}; return e; }
+        case 481: { static CapiEntry e{"CCCryptorFinal",        nullptr}; return e; }
+        case 482: { static CapiEntry e{"CCCryptorRelease",      nullptr}; return e; }
+        case 483: { static CapiEntry e{"CCRandomGenerateBytes", nullptr}; return e; }
+        case 484: { static CapiEntry e{"CFStringGetCString",    nullptr}; return e; }
+        case 485: { static CapiEntry e{"CFStringGetCStringPtr", nullptr}; return e; }
+        case 486: { static CapiEntry e{"CFStringCompare",       nullptr}; return e; }
+        case 487: { static CapiEntry e{"CFStringHasPrefix",     nullptr}; return e; }
+        case 488: { static CapiEntry e{"CFStringHasSuffix",     nullptr}; return e; }
+        case 489: { static CapiEntry e{"CFDataGetBytePtr",      nullptr}; return e; }
+        case 490: { static CapiEntry e{"CFDataGetLength",       nullptr}; return e; }
+        case 491: { static CapiEntry e{"CFDictionaryGetValue",  nullptr}; return e; }
+        case 492: { static CapiEntry e{"CFDictionaryCreate",    nullptr}; return e; }
+        case 493: { static CapiEntry e{"CFArrayCreate",         nullptr}; return e; }
+        case 494: { static CapiEntry e{"CFArrayGetValueAtIndex",nullptr}; return e; }
+        case 495: { static CapiEntry e{"CFNumberCreate",        nullptr}; return e; }
+        case 496: { static CapiEntry e{"CFNumberGetValue",      nullptr}; return e; }
+        case 497: { static CapiEntry e{"CFPropertyListCreateWithData", nullptr}; return e; }
+        case 498: { static CapiEntry e{"CFPropertyListCreateXMLData",  nullptr}; return e; }
+        case 499: { static CapiEntry e{"CFRelease",             nullptr}; return e; }
+        case 500: { static CapiEntry e{"CFRetain",              nullptr}; return e; }
+        case 501: { static CapiEntry e{"SecRandomCopyBytes",    nullptr}; return e; }
+        case 502: { static CapiEntry e{"SecKeyCopyExternalRepresentation", nullptr}; return e; }
+        case 503: { static CapiEntry e{"SecKeyCreateFromData",  nullptr}; return e; }
+        case 504: { static CapiEntry e{"SecKeyEncrypt",         nullptr}; return e; }
+        case 505: { static CapiEntry e{"SecKeyDecrypt",         nullptr}; return e; }
+        case 506: { static CapiEntry e{"SecCertificateCreateWithData", nullptr}; return e; }
+        case 507: { static CapiEntry e{"SecIdentityCopyCertificate", nullptr}; return e; }
+        case 508: { static CapiEntry e{"SecTrustEvaluate",      nullptr}; return e; }
+        case 509: { static CapiEntry e{"SecItemAdd",            nullptr}; return e; }
+        case 510: { static CapiEntry e{"SecItemUpdate",         nullptr}; return e; }
+        case 511: { static CapiEntry e{"SecItemDelete",         nullptr}; return e; }
+        case 512: { static CapiEntry e{"CFURLGetString",        nullptr}; return e; }
+        case 513: { static CapiEntry e{"CFHTTPMessageCreateRequest",  nullptr}; return e; }
+        case 514: { static CapiEntry e{"CFHTTPMessageSetHeaderFieldValue", nullptr}; return e; }
+        case 515: { static CapiEntry e{"CFHTTPMessageSetBody",  nullptr}; return e; }
+        case 516: { static CapiEntry e{"dispatch_async",        nullptr}; return e; }
+        case 517: { static CapiEntry e{"dispatch_sync",         nullptr}; return e; }
+        case 518: { static CapiEntry e{"dispatch_after",        nullptr}; return e; }
+        case 519: { static CapiEntry e{"dispatch_once",         nullptr}; return e; }
+        case 520: { static CapiEntry e{"NSString_UTF8String",   nullptr}; return e; }
+        case 521: { static CapiEntry e{"NSString_dataUsingEncoding", nullptr}; return e; }
+        case 522: { static CapiEntry e{"NSData_bytes",          nullptr}; return e; }
+        case 523: { static CapiEntry e{"b64_encode",            nullptr}; return e; }
+        case 524: { static CapiEntry e{"b64_decode",            nullptr}; return e; }
+        case 525: { static CapiEntry e{"iconv_open",            nullptr}; return e; }
+        case 526: { static CapiEntry e{"iconv",                 nullptr}; return e; }
+        // 600–644 Android extended
+        case 600: { static CapiEntry e{"EVP_EncryptInit_ex",    nullptr}; return e; }
+        case 601: { static CapiEntry e{"EVP_EncryptUpdate",     nullptr}; return e; }
+        case 602: { static CapiEntry e{"EVP_EncryptFinal_ex",   nullptr}; return e; }
+        case 603: { static CapiEntry e{"EVP_DecryptInit_ex",    nullptr}; return e; }
+        case 604: { static CapiEntry e{"EVP_DecryptUpdate",     nullptr}; return e; }
+        case 605: { static CapiEntry e{"EVP_DecryptFinal_ex",   nullptr}; return e; }
+        case 606: { static CapiEntry e{"EVP_DigestInit_ex",     nullptr}; return e; }
+        case 607: { static CapiEntry e{"EVP_DigestUpdate",      nullptr}; return e; }
+        case 608: { static CapiEntry e{"EVP_DigestFinal_ex",    nullptr}; return e; }
+        case 609: { static CapiEntry e{"HMAC_CTX_new",          nullptr}; return e; }
+        case 610: { static CapiEntry e{"HMAC_Init_ex",          nullptr}; return e; }
+        case 611: { static CapiEntry e{"HMAC_Update",           nullptr}; return e; }
+        case 612: { static CapiEntry e{"HMAC_Final",            nullptr}; return e; }
+        case 613: { static CapiEntry e{"SHA256_Init",           nullptr}; return e; }
+        case 614: { static CapiEntry e{"SHA256_Update",         nullptr}; return e; }
+        case 615: { static CapiEntry e{"SHA256_Final",          nullptr}; return e; }
+        case 616: { static CapiEntry e{"AES_set_encrypt_key",   nullptr}; return e; }
+        case 617: { static CapiEntry e{"AES_set_decrypt_key",   nullptr}; return e; }
+        case 618: { static CapiEntry e{"AES_cbc_encrypt",       nullptr}; return e; }
+        case 619: { static CapiEntry e{"RSA_sign",              nullptr}; return e; }
+        case 620: { static CapiEntry e{"RSA_verify",            nullptr}; return e; }
+        case 621: { static CapiEntry e{"RAND_bytes",            nullptr}; return e; }
+        case 622: { static CapiEntry e{"RAND_priv_bytes",       nullptr}; return e; }
+        case 623: { static CapiEntry e{"EVP_md5",               nullptr}; return e; }
+        case 624: { static CapiEntry e{"EVP_sha1",              nullptr}; return e; }
+        case 625: { static CapiEntry e{"EVP_sha256",            nullptr}; return e; }
+        case 626: { static CapiEntry e{"BIO_new_mem_buf",       nullptr}; return e; }
+        case 627: { static CapiEntry e{"PEM_read_bio_RSAPublicKey", nullptr}; return e; }
+        case 628: { static CapiEntry e{"Base64_encode",         nullptr}; return e; }
+        case 629: { static CapiEntry e{"Base64_decode",         nullptr}; return e; }
+        case 630: { static CapiEntry e{"sqlite3_open",          nullptr}; return e; }
+        case 631: { static CapiEntry e{"sqlite3_prepare_v2",    nullptr}; return e; }
+        case 632: { static CapiEntry e{"sqlite3_step",          nullptr}; return e; }
+        case 633: { static CapiEntry e{"sqlite3_column_text",   nullptr}; return e; }
+        case 634: { static CapiEntry e{"sqlite3_close",         nullptr}; return e; }
+        case 635: { static CapiEntry e{"sqlite3_exec",          nullptr}; return e; }
+        case 636: { static CapiEntry e{"Keymaster_importKey",   nullptr}; return e; }
+        case 637: { static CapiEntry e{"Keymaster_exportKey",   nullptr}; return e; }
+        case 638: { static CapiEntry e{"Keymaster_finish",      nullptr}; return e; }
+        case 639: { static CapiEntry e{"art_InvokeVirtual",     nullptr}; return e; }
+        case 640: { static CapiEntry e{"art_Thread_Current",    nullptr}; return e; }
+        case 641: { static CapiEntry e{"getaddrinfo",           nullptr}; return e; }
+        case 642: { static CapiEntry e{"getnameinfo",           nullptr}; return e; }
+        case 643: { static CapiEntry e{"inet_aton",             nullptr}; return e; }
+        case 644: { static CapiEntry e{"inet_ntop",             nullptr}; return e; }
+        // 700–726 JNI extended
+        case 700: { static CapiEntry e{"GetIntField",           nullptr}; return e; }
+        case 701: { static CapiEntry e{"GetLongField",          nullptr}; return e; }
+        case 702: { static CapiEntry e{"GetObjectField",        nullptr}; return e; }
+        case 703: { static CapiEntry e{"SetObjectField",        nullptr}; return e; }
+        case 704: { static CapiEntry e{"GetFieldID",            nullptr}; return e; }
+        case 705: { static CapiEntry e{"GetStaticFieldID",      nullptr}; return e; }
+        case 706: { static CapiEntry e{"GetStringUTFRegion",    nullptr}; return e; }
+        case 707: { static CapiEntry e{"GetArrayLength",        nullptr}; return e; }
+        case 708: { static CapiEntry e{"NewObjectArray",        nullptr}; return e; }
+        case 709: { static CapiEntry e{"GetObjectArrayElement", nullptr}; return e; }
+        case 710: { static CapiEntry e{"SetObjectArrayElement", nullptr}; return e; }
+        case 711: { static CapiEntry e{"NewIntArray",           nullptr}; return e; }
+        case 712: { static CapiEntry e{"GetIntArrayElements",   nullptr}; return e; }
+        case 713: { static CapiEntry e{"ReleaseIntArrayElements",nullptr}; return e; }
+        case 714: { static CapiEntry e{"CallStaticIntMethod",   nullptr}; return e; }
+        case 715: { static CapiEntry e{"CallStaticBooleanMethod",nullptr}; return e; }
+        case 716: { static CapiEntry e{"NewObject",             nullptr}; return e; }
+        case 717: { static CapiEntry e{"IsInstanceOf",          nullptr}; return e; }
+        case 718: { static CapiEntry e{"NewGlobalRef",          nullptr}; return e; }
+        case 719: { static CapiEntry e{"DeleteGlobalRef",       nullptr}; return e; }
+        case 720: { static CapiEntry e{"DeleteLocalRef",        nullptr}; return e; }
+        case 721: { static CapiEntry e{"PushLocalFrame",        nullptr}; return e; }
+        case 722: { static CapiEntry e{"PopLocalFrame",         nullptr}; return e; }
+        case 723: { static CapiEntry e{"GetVersion",            nullptr}; return e; }
+        case 724: { static CapiEntry e{"MonitorEnter",          nullptr}; return e; }
+        case 725: { static CapiEntry e{"MonitorExit",           nullptr}; return e; }
+        case 726: { static CapiEntry e{"GetJavaVM",             nullptr}; return e; }
+        default: break;
+    }
+    return kFallback;
+}
+
+void SyscallInterceptCollector::on_svc(uint64_t inst_id, const SvcView& svc) {
+    // Build an InterceptedCall for a raw syscall record.
+    InterceptedCall call;
+    call.inst_id      = inst_id;
+    call.call_site_pc = svc.pc;
+    call.callee_pc    = 0;  // no callee address for syscalls
+    call.callee_name  = fmt::format("syscall_{}", svc.syscall_no);
+    call.category     = ApiCategory::Syscall;
+    call.svc_flags    = 0;
+
+    // Copy up to 6 syscall arguments.
+    call.arg_count = 6;
+    for (uint8_t i = 0; i < 6 && i < static_cast<uint8_t>(call.raw_args.size()); ++i) {
+        call.raw_args[i] = svc.args[i];
+    }
+
+    call.decoded_summary = fmt::format("syscall #{}: x0=0x{:x} x1=0x{:x} x2=0x{:x}",
+        svc.syscall_no, svc.args[0], svc.args[1], svc.args[2]);
+
+    size_t idx = result_.calls.size();
+    result_.by_callee[call.callee_name].push_back(idx);
+    result_.by_category[call.category].push_back(idx);
+    result_.calls.push_back(std::move(call));
+}
+
+void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView& capi) {
+    // Look up the API name from the static entry table.
+    const CapiEntry& entry = capi_entry(capi.api_id);
+    const char* api_name = entry.name ? entry.name : nullptr;
+
+    // Suppress duplicate: if this callee was already handled, skip it.
+    // (The event-based on_event may also fire for the same call site.)
+    auto seen_it = capicall_seen_.find(capi.target);
+    if (seen_it != capicall_seen_.end()) {
+        // Already seen at a different inst_id — update dedup window.
+        if (seen_it->second + 4096 > inst_id) {
+            return;  // Duplicate within window.
+        }
+    }
+    capicall_seen_[capi.target] = inst_id;
+
+    InterceptedCall call;
+    call.inst_id           = inst_id;
+    call.call_site_pc      = capi.pc;
+    call.callee_pc         = capi.target;
+    call.from_capicall_record = true;
+
+    // Determine name: from table first, else synthetic.
+    if (api_name) {
+        call.callee_name = api_name;
+    } else {
+        call.callee_name = fmt::format("sub_{:x}", capi.target);
+    }
+
+    // Determine category from signature table.
+    call.category = ApiCategory::Custom;
+    if (entry.sig) {
+        call.category = entry.sig->category;
+    } else if (api_name) {
+        // Try to match against our known API tables.
+        auto ait = api_by_name_.find(call.callee_name);
+        if (ait != api_by_name_.end() && ait->second) {
+            call.category = ait->second->category;
+        }
+    }
+
+    // Copy raw args from CapiCallView.
+    call.arg_count = std::min<uint8_t>(capi.arg_count, static_cast<uint8_t>(call.raw_args.size()));
+    for (uint8_t i = 0; i < call.arg_count; ++i) {
+        call.raw_args[i] = capi.args[i];
+    }
+
+    // Copy captured inline strings from the record.
+    for (uint8_t si = 0; si < capi.str_count; ++si) {
+        auto sv = capi.str_at(si);
+        CapturedString cs;
+        cs.arg_idx   = sv.arg_idx;
+        cs.truncated = sv.is_truncated();
+        cs.binary    = sv.is_binary();
+        if (sv.data && sv.str_len > 0) {
+            cs.value.assign(sv.data, sv.str_len);
+        }
+        call.captured_strings.push_back(std::move(cs));
+    }
+
+    // Attach ObjC context if recent.
+    if (!last_objc_context_.empty() &&
+        cur_inst_id_ - last_objc_inst_id_ < 100000) {
+        call.objc_context = last_objc_context_;
+    }
+
+    // Build decoded summary — prefer captured strings.
+    if (!call.captured_strings.empty()) {
+        std::string summary = call.callee_name + ": ";
+        for (const auto& cs : call.captured_strings) {
+            summary += fmt::format("x{}=\"{}\"{}  ",
+                cs.arg_idx,
+                cs.value.substr(0, std::min<size_t>(cs.value.size(), 64)),
+                cs.truncated ? "…" : "");
+        }
+        call.decoded_summary = std::move(summary);
+    } else if (entry.sig) {
+        decode_known_api(call, *entry.sig);
+    } else {
+        auto ait = api_by_name_.find(call.callee_name);
+        if (ait != api_by_name_.end() && ait->second) {
+            decode_known_api(call, *ait->second);
+        } else {
+            call.decoded_summary = call.callee_name +
+                fmt::format(": x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x}",
+                    call.raw_args[0], call.raw_args[1],
+                    call.raw_args[2], call.raw_args[3]);
+        }
+    }
+
+    size_t idx = result_.calls.size();
+    result_.by_callee[call.callee_name].push_back(idx);
+    result_.by_category[call.category].push_back(idx);
+    result_.calls.push_back(std::move(call));
+}
+
 void SyscallInterceptCollector::end() {
     // Nothing to finalize — results are already accumulated.
 }
@@ -987,7 +1447,21 @@ static const char* api_category_str(ApiCategory cat) {
         case ApiCategory::LibSystem:         return "libSystem";
         case ApiCategory::BoringSSL:         return "BoringSSL";
         case ApiCategory::AndroidKeystore:   return "AndroidKeystore";
+        case ApiCategory::JNI:               return "JNI";
+        case ApiCategory::MemoryOps:         return "MemoryOps";
+        case ApiCategory::StringOps:         return "StringOps";
+        case ApiCategory::HeapAlloc:         return "HeapAlloc";
+        case ApiCategory::FileIO:            return "FileIO";
+        case ApiCategory::Network:           return "Network";
+        case ApiCategory::AntiDebug:         return "AntiDebug";
+        case ApiCategory::Threading:         return "Threading";
+        case ApiCategory::Encoding:          return "Encoding";
         case ApiCategory::Compression:       return "Compression";
+        case ApiCategory::SQLite:            return "SQLite";
+        case ApiCategory::DynLink:           return "DynLink";
+        case ApiCategory::ObjCRuntime:       return "ObjCRuntime";
+        case ApiCategory::MemoryMap:         return "MemoryMap";
+        case ApiCategory::Syscall:           return "Syscall";
         case ApiCategory::Custom:            return "Custom";
     }
     return "Unknown";

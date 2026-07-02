@@ -240,13 +240,14 @@ typedef struct {
  * variant; the remainder of the record depends on the kind.
  */
 typedef enum {
-  QBDITRACE_REC_INST = 0,   /* per-instruction diff record */
-  QBDITRACE_REC_ANCHOR = 1, /* full register snapshot (rebuild checkpoint) */
-  QBDITRACE_REC_THREAD = 2, /* thread context marker */
-  QBDITRACE_REC_EVENT = 3,  /* VM event (sequence/exec-transfer) */
-  QBDITRACE_REC_SVC = 4,    /* supervisor call (syscall) site */
-  QBDITRACE_REC_OBJC = 5,   /* objc_msgSend-family dispatch site */
-  QBDITRACE_REC_CODE = 6,   /* raw instruction bytes for one distinct PC */
+  QBDITRACE_REC_INST = 0,     /* per-instruction diff record */
+  QBDITRACE_REC_ANCHOR = 1,   /* full register snapshot (rebuild checkpoint) */
+  QBDITRACE_REC_THREAD = 2,   /* thread context marker */
+  QBDITRACE_REC_EVENT = 3,    /* VM event (sequence/exec-transfer) */
+  QBDITRACE_REC_SVC = 4,      /* supervisor call (syscall) site */
+  QBDITRACE_REC_OBJC = 5,     /* objc_msgSend-family dispatch site */
+  QBDITRACE_REC_CODE = 6,     /* raw instruction bytes for one distinct PC */
+  QBDITRACE_REC_CAPICALL = 7, /* C/platform API call site with semantic args */
 } qbditrace_record_kind_t;
 
 /* ---- QBDITRACE_REC_INST ----
@@ -518,6 +519,442 @@ typedef struct {
   /* followed by `size` raw bytes */
 } qbditrace_code_head_t;
 
+/* ---- QBDITRACE_REC_CAPICALL ----
+ * Emitted just before a call into a well-known C/platform API function exits
+ * the traced range (via EXEC_TRANSFER_CALL). Carries the function identity
+ * (api_id), the raw argument registers (x0..x7), and an optional inline string
+ * payload for pointer-argument dereferencing (e.g. the content of the src/dst
+ * buffers for mem*, the string passed to strcmp, etc.).
+ *
+ * This record enables tenet to answer "what did memcpy/memset/strcmp/strlen/
+ * fopen/... actually receive?" without having to symbolicate a library address
+ * offline and without per-instruction instrumentation of the library itself.
+ *
+ * On-disk layout:
+ *   u8  kind            (== QBDITRACE_REC_CAPICALL)
+ *   u8  api_id          (qbditrace_capi_id_t, 0 = unknown)
+ *   u8  arg_count       (number of valid entries in args[], 0..8)
+ *   u8  str_count       (number of inline C-string captures, 0..4)
+ *   u64 pc              (call-site PC inside the traced range)
+ *   u64 target          (runtime address of the called function)
+ *   u64 args[8]         (x0..x7 at call time; only arg_count entries are valid)
+ *   --- followed by str_count variable-length C strings ---
+ *   For each string capture:
+ *     u8  str_arg_idx   (which arg index this string came from, 0..7)
+ *     u8  str_len       (length of string content in bytes, not counting NUL)
+ *     u8  str_flags     (QBDITRACE_SF_* bits)
+ *     u8  _reserved
+ *     char str_data[str_len + 1]  (NUL-terminated; padded to 4-byte alignment)
+ *
+ * The fixed portion is sizeof(qbditrace_capicall_head_t) bytes (88 bytes);
+ * variable string captures are appended immediately after and are parsed by
+ * the decoder using str_count as the loop bound.
+ *
+ * str_flags bits:
+ *   bit 0 (QBDITRACE_SF_TRUNCATED): string was longer than CAPICALL_MAX_STR_BYTES
+ *          and was truncated; the stored content is the first str_len bytes.
+ *   bit 1 (QBDITRACE_SF_BINARY):    string contains non-printable bytes; content
+ *          is the raw memory bytes (may not be valid UTF-8 / C string).
+ *   bit 2 (QBDITRACE_SF_SAFE_READ_FAIL): the memory probe returned an error;
+ *          str_len is 0 and str_data is empty (capture failed gracefully).
+ *
+ * Maximum single string payload: QBDITRACE_CAPICALL_MAX_STR_BYTES = 256 bytes
+ * Maximum string captures per record: 4 (str_count <= 4)
+ * Maximum total per-record variable bytes: 4 × (4 + 256 + 1 + pad) ≈ 1 KB
+ */
+
+/* Maximum bytes captured from a single string/buffer argument.
+ * Must fit in uint8_t str_len field (max 255). */
+#define QBDITRACE_CAPICALL_MAX_STR_BYTES 255u
+/* Maximum number of string captures per REC_CAPICALL record. */
+#define QBDITRACE_CAPICALL_MAX_STR_CAPS  4u
+
+/* Bit flags for per-string capture status (str_flags field). */
+#define QBDITRACE_SF_TRUNCATED      (1u << 0) /* content truncated at MAX_STR_BYTES */
+#define QBDITRACE_SF_BINARY         (1u << 1) /* raw bytes, not a C string */
+#define QBDITRACE_SF_SAFE_READ_FAIL (1u << 2) /* safeRead failed; capture is empty */
+
+/* Fixed header for REC_CAPICALL. Variable-length string captures follow. */
+typedef struct {
+  uint8_t  kind;       /* == QBDITRACE_REC_CAPICALL */
+  uint8_t  api_id;     /* qbditrace_capi_id_t */
+  uint8_t  arg_count;  /* number of valid entries in args[] (0..8) */
+  uint8_t  str_count;  /* number of inline string captures that follow (0..4) */
+  uint64_t pc;         /* call-site PC (inside the traced range) */
+  uint64_t target;     /* runtime address of the called function */
+  uint64_t args[8];    /* x0..x7 at call time */
+} qbditrace_capicall_head_t;
+
+/* Per-string capture header (precedes the str_data bytes). */
+typedef struct {
+  uint8_t str_arg_idx; /* index into args[] (0..7) that this string came from */
+  uint8_t str_len;     /* byte length of str_data (not counting trailing NUL) */
+  uint8_t str_flags;   /* QBDITRACE_SF_* bits */
+  uint8_t _reserved;
+  /* followed by str_len + 1 bytes of NUL-terminated content, padded to 4B alignment */
+} qbditrace_capicall_str_t;
+
+/* ---- qbditrace_capi_id_t ----
+ * Stable numeric identifiers for well-known C / platform API functions.
+ * Grouped by category; new entries must be appended (never reorder existing
+ * entries — the IDs are stored in binary traces and must remain stable across
+ * tracer versions). tenet uses these IDs to route records to the correct
+ * semantic analysis without doing a string comparison per record.
+ *
+ * Platform annotation:
+ *   [common]  — present on both iOS and Android (libc / standard)
+ *   [ios]     — iOS / macOS only (libSystem / libobjc / CoreFoundation)
+ *   [android] — Android / Bionic only
+ *   [jni]     — JNI functions (Android, via art/libjni.so)
+ */
+typedef enum {
+  /* ── 0: unknown / unclassified ─────────────────────────────────── */
+  QBDITRACE_CAPI_UNKNOWN = 0,
+
+  /* ── Memory copy / move / set (1–19) [common] ───────────────────── */
+  QBDITRACE_CAPI_MEMCPY          = 1,   /* void *memcpy(dst, src, n)          */
+  QBDITRACE_CAPI_MEMMOVE         = 2,   /* void *memmove(dst, src, n)         */
+  QBDITRACE_CAPI_MEMSET          = 3,   /* void *memset(dst, c, n)            */
+  QBDITRACE_CAPI_MEMCMP          = 4,   /* int   memcmp(a, b, n)              */
+  QBDITRACE_CAPI_MEMCHR          = 5,   /* void *memchr(s, c, n)              */
+  QBDITRACE_CAPI_BCOPY           = 6,   /* void  bcopy(src, dst, n) [BSD]     */
+  QBDITRACE_CAPI_BZERO           = 7,   /* void  bzero(s, n)       [BSD]      */
+  QBDITRACE_CAPI_MEMMEM          = 8,   /* void *memmem(hay,hl,ndl,nl)        */
+  /* 9–19 reserved for future mem* variants */
+
+  /* ── String operations (20–59) [common] ─────────────────────────── */
+  QBDITRACE_CAPI_STRLEN          = 20,  /* size_t strlen(s)                   */
+  QBDITRACE_CAPI_STRNLEN         = 21,  /* size_t strnlen(s, n)               */
+  QBDITRACE_CAPI_STRCMP          = 22,  /* int    strcmp(a, b)                */
+  QBDITRACE_CAPI_STRNCMP         = 23,  /* int    strncmp(a, b, n)            */
+  QBDITRACE_CAPI_STRCASECMP      = 24,  /* int    strcasecmp(a, b)            */
+  QBDITRACE_CAPI_STRNCASECMP     = 25,  /* int    strncasecmp(a, b, n)        */
+  QBDITRACE_CAPI_STRCPY          = 26,  /* char  *strcpy(dst, src)            */
+  QBDITRACE_CAPI_STRNCPY         = 27,  /* char  *strncpy(dst, src, n)        */
+  QBDITRACE_CAPI_STRLCPY         = 28,  /* size_t strlcpy(dst, src, n) [BSD]  */
+  QBDITRACE_CAPI_STRCAT          = 29,  /* char  *strcat(dst, src)            */
+  QBDITRACE_CAPI_STRNCAT         = 30,  /* char  *strncat(dst, src, n)        */
+  QBDITRACE_CAPI_STRLCAT         = 31,  /* size_t strlcat(dst, src, n) [BSD]  */
+  QBDITRACE_CAPI_STRDUP          = 32,  /* char  *strdup(s)                   */
+  QBDITRACE_CAPI_STRNDUP         = 33,  /* char  *strndup(s, n)               */
+  QBDITRACE_CAPI_STRCHR          = 34,  /* char  *strchr(s, c)                */
+  QBDITRACE_CAPI_STRRCHR         = 35,  /* char  *strrchr(s, c)               */
+  QBDITRACE_CAPI_STRSTR          = 36,  /* char  *strstr(hay, ndl)            */
+  QBDITRACE_CAPI_STRTOK          = 37,  /* char  *strtok(str, delim)          */
+  QBDITRACE_CAPI_STRTOK_R        = 38,  /* char  *strtok_r(str, delim, save)  */
+  QBDITRACE_CAPI_SPRINTF         = 39,  /* int    sprintf(buf, fmt, ...)      */
+  QBDITRACE_CAPI_SNPRINTF        = 40,  /* int    snprintf(buf, n, fmt, ...)  */
+  QBDITRACE_CAPI_SSCANF          = 41,  /* int    sscanf(str, fmt, ...)       */
+  QBDITRACE_CAPI_ATOI            = 42,  /* int    atoi(s)                     */
+  QBDITRACE_CAPI_ATOL            = 43,  /* long   atol(s)                     */
+  QBDITRACE_CAPI_ATOLL           = 44,  /* long long atoll(s)                 */
+  QBDITRACE_CAPI_STRTOL          = 45,  /* long   strtol(s, ep, base)         */
+  QBDITRACE_CAPI_STRTOLL         = 46,  /* long long strtoll(s, ep, base)     */
+  QBDITRACE_CAPI_STRTOUL         = 47,  /* unsigned long strtoul(s, ep, base) */
+  QBDITRACE_CAPI_STRTOULL        = 48,  /* unsigned long long strtoull(...)   */
+  /* 49–59 reserved for future str* variants */
+
+  /* ── Heap allocation (60–79) [common] ───────────────────────────── */
+  QBDITRACE_CAPI_MALLOC          = 60,  /* void *malloc(size)                 */
+  QBDITRACE_CAPI_CALLOC          = 61,  /* void *calloc(nmemb, size)          */
+  QBDITRACE_CAPI_REALLOC         = 62,  /* void *realloc(ptr, size)           */
+  QBDITRACE_CAPI_FREE            = 63,  /* void  free(ptr)                    */
+  QBDITRACE_CAPI_POSIX_MEMALIGN  = 64,  /* int   posix_memalign(pp,align,sz)  */
+  QBDITRACE_CAPI_VALLOC          = 65,  /* void *valloc(size)                 */
+  /* 66–79 reserved */
+
+  /* ── I/O (80–99) [common] ───────────────────────────────────────── */
+  QBDITRACE_CAPI_FOPEN           = 80,  /* FILE *fopen(path, mode)            */
+  QBDITRACE_CAPI_FCLOSE          = 81,  /* int   fclose(FILE*)                */
+  QBDITRACE_CAPI_FREAD           = 82,  /* size_t fread(ptr,sz,nmemb,FILE*)   */
+  QBDITRACE_CAPI_FWRITE          = 83,  /* size_t fwrite(ptr,sz,nmemb,FILE*)  */
+  QBDITRACE_CAPI_FGETS           = 84,  /* char  *fgets(s, n, FILE*)          */
+  QBDITRACE_CAPI_FPUTS           = 85,  /* int    fputs(s, FILE*)             */
+  QBDITRACE_CAPI_READ            = 86,  /* ssize_t read(fd, buf, n)           */
+  QBDITRACE_CAPI_WRITE           = 87,  /* ssize_t write(fd, buf, n)          */
+  QBDITRACE_CAPI_PREAD           = 88,  /* ssize_t pread(fd, buf, n, off)     */
+  QBDITRACE_CAPI_PWRITE          = 89,  /* ssize_t pwrite(fd, buf, n, off)    */
+  QBDITRACE_CAPI_OPEN            = 90,  /* int    open(path, flags, ...)      */
+  QBDITRACE_CAPI_CLOSE           = 91,  /* int    close(fd)                   */
+  /* 92–99 reserved */
+
+  /* ── Crypto (libc-level) (100–129) [common] ─────────────────────── */
+  QBDITRACE_CAPI_ARC4RANDOM      = 100, /* uint32_t arc4random()              */
+  QBDITRACE_CAPI_ARC4RANDOM_BUF  = 101, /* void arc4random_buf(buf, nbytes)   */
+  QBDITRACE_CAPI_GETRANDOM       = 102, /* ssize_t getrandom(buf, n, flags)   */
+
+  /* ── iOS / macOS platform APIs (130–199) [ios] ───────────────────── */
+  /* CoreFoundation string */
+  QBDITRACE_CAPI_CF_STR_CREATE_UTF8  = 130, /* CFStringCreateWithCString(...UTF8) */
+  QBDITRACE_CAPI_CF_STR_CREATE_BYTES = 131, /* CFStringCreateWithBytes(...)        */
+  QBDITRACE_CAPI_CF_DATA_CREATE      = 132, /* CFDataCreate(alloc, bytes, len)     */
+  QBDITRACE_CAPI_CF_DATA_GET_BYTES   = 133, /* CFDataGetBytePtr / GetLength        */
+  /* CommonCrypto */
+  QBDITRACE_CAPI_CC_CRYPT            = 134, /* CCCrypt(op,alg,opt,key,kl,iv,...) */
+  QBDITRACE_CAPI_CC_HMAC             = 135, /* CCHmac(alg,key,kl,data,dl,mac)    */
+  QBDITRACE_CAPI_CC_DIGEST           = 136, /* CC_SHA256/MD5/... (data,len,out)  */
+  QBDITRACE_CAPI_CC_KEY_DERIVE_PBKDF = 137, /* CCKeyDerivationPBKDF(...)          */
+  /* Security framework */
+  QBDITRACE_CAPI_SEC_ITEM_COPY_MATCH = 138, /* SecItemCopyMatching(query,result) */
+  QBDITRACE_CAPI_SEC_KEY_CREATE_RSA  = 139, /* SecKeyCreateWithData(...)          */
+  QBDITRACE_CAPI_SEC_TRANSFORM       = 140, /* SecTransformExecute / SetAttr      */
+  /* Network */
+  QBDITRACE_CAPI_CF_URL_CREATE       = 141, /* CFURLCreateWithBytes(...)          */
+  QBDITRACE_CAPI_NS_URL_SESSION_DT   = 142, /* NSURLSession dataTask (via msgSend)*/
+  /* 143–199 reserved for iOS */
+
+  /* ── Android / Bionic platform APIs (200–279) [android] ─────────── */
+  /* Bionic string extras */
+  QBDITRACE_CAPI_ANDROID_STRLCPY     = 200, /* strlcpy (Bionic re-export)          */
+  /* android_log */
+  QBDITRACE_CAPI_ALOG_PRINT          = 201, /* __android_log_print(prio,tag,fmt,...) */
+  QBDITRACE_CAPI_ALOG_WRITE          = 202, /* __android_log_write(prio,tag,text)  */
+  /* SharedPreferences / key-value (via JNI) */
+  QBDITRACE_CAPI_ANDROID_SP_GET      = 203, /* SharedPreferences.getString (JNI)   */
+  QBDITRACE_CAPI_ANDROID_SP_PUT      = 204, /* SharedPreferences.putString (JNI)   */
+  /* Binder */
+  QBDITRACE_CAPI_BINDER_TRANSACT     = 205, /* android::IBinder::transact(...)     */
+  /* dl* */
+  QBDITRACE_CAPI_DLOPEN              = 206, /* dlopen(path, flags)                 */
+  QBDITRACE_CAPI_DLSYM               = 207, /* dlsym(handle, symbol)               */
+  /* 208–279 reserved for Android */
+
+  /* ── JNI functions (280–359) [jni] ──────────────────────────────── */
+  QBDITRACE_CAPI_JNI_GET_STRING_UTF  = 280, /* GetStringUTFChars(env,jstr,copy)   */
+  QBDITRACE_CAPI_JNI_RELEASE_STR_UTF = 281, /* ReleaseStringUTFChars(env,jstr,cp) */
+  QBDITRACE_CAPI_JNI_NEW_STRING_UTF  = 282, /* NewStringUTF(env, bytes)            */
+  QBDITRACE_CAPI_JNI_GET_STR_LEN_UTF = 283, /* GetStringUTFLength(env, jstr)       */
+  QBDITRACE_CAPI_JNI_GET_BYTE_ARR    = 284, /* GetByteArrayElements(env,arr,copy) */
+  QBDITRACE_CAPI_JNI_REL_BYTE_ARR    = 285, /* ReleaseByteArrayElements(...)       */
+  QBDITRACE_CAPI_JNI_GET_BYTE_REG    = 286, /* GetByteArrayRegion(env,arr,s,l,buf)*/
+  QBDITRACE_CAPI_JNI_SET_BYTE_REG    = 287, /* SetByteArrayRegion(...)             */
+  QBDITRACE_CAPI_JNI_NEW_BYTE_ARR    = 288, /* NewByteArray(env, length)           */
+  QBDITRACE_CAPI_JNI_FIND_CLASS      = 289, /* FindClass(env, name)                */
+  QBDITRACE_CAPI_JNI_GET_METHOD_ID   = 290, /* GetMethodID(env,cls,name,sig)       */
+  QBDITRACE_CAPI_JNI_GET_STATIC_MID  = 291, /* GetStaticMethodID(env,cls,name,sig)*/
+  QBDITRACE_CAPI_JNI_CALL_OBJ_METHOD = 292, /* CallObjectMethod(env,obj,mid,...)   */
+  QBDITRACE_CAPI_JNI_CALL_STATIC_OBJ = 293, /* CallStaticObjectMethod(...)         */
+  QBDITRACE_CAPI_JNI_CALL_VOID       = 294, /* CallVoidMethod(env,obj,mid,...)     */
+  QBDITRACE_CAPI_JNI_CALL_BOOL       = 295, /* CallBooleanMethod(...)              */
+  QBDITRACE_CAPI_JNI_CALL_INT        = 296, /* CallIntMethod(...)                  */
+  QBDITRACE_CAPI_JNI_CALL_LONG       = 297, /* CallLongMethod(...)                 */
+  QBDITRACE_CAPI_JNI_EXCEPTION_CHECK = 298, /* ExceptionCheck(env)                 */
+  QBDITRACE_CAPI_JNI_EXCEPTION_CLEAR = 299, /* ExceptionClear(env)                 */
+  QBDITRACE_CAPI_JNI_DEFINE_CLASS    = 300, /* DefineClass(env,name,ld,buf,len)    */
+  /* 301–359 reserved for JNI */
+
+  /* ── pthread / synchronization (360–379) [common] ───────────────── */
+  QBDITRACE_CAPI_PTHREAD_CREATE      = 360, /* pthread_create(thr,attr,fn,arg)    */
+  QBDITRACE_CAPI_PTHREAD_JOIN        = 361, /* pthread_join(thread, retval)        */
+  QBDITRACE_CAPI_PTHREAD_MUTEX_LOCK  = 362, /* pthread_mutex_lock(mutex)           */
+  QBDITRACE_CAPI_PTHREAD_MUTEX_UNLOCK= 363, /* pthread_mutex_unlock(mutex)         */
+
+  /* ── Network (380–399) [common] ─────────────────────────────────── */
+  QBDITRACE_CAPI_SOCKET              = 380, /* socket(domain, type, proto)         */
+  QBDITRACE_CAPI_CONNECT             = 381, /* connect(fd, addr, addrlen)          */
+  QBDITRACE_CAPI_SEND                = 382, /* send(fd, buf, len, flags)           */
+  QBDITRACE_CAPI_RECV                = 383, /* recv(fd, buf, len, flags)           */
+  QBDITRACE_CAPI_SENDTO              = 384, /* sendto(fd,buf,n,fl,addr,al)        */
+  QBDITRACE_CAPI_RECVFROM            = 385, /* recvfrom(fd,buf,n,fl,addr,al)      */
+
+  /* ── Encoding helpers (400–419) [common] ────────────────────────── */
+  QBDITRACE_CAPI_BASE64_ENCODE       = 400, /* various base64 encoders             */
+  QBDITRACE_CAPI_BASE64_DECODE       = 401, /* various base64 decoders             */
+
+  /* ── Anti-debug / integrity checks (420–449) [common] ───────────── */
+  QBDITRACE_CAPI_PTRACE              = 420, /* ptrace(request,pid,addr,data)      */
+  QBDITRACE_CAPI_SYSCTL              = 421, /* sysctl(name,nlen,old,olen,new,nl)  */
+  QBDITRACE_CAPI_PRCTL               = 422, /* prctl(option, ...)  [linux/android]*/
+  QBDITRACE_CAPI_GETENV              = 423, /* getenv(name)                        */
+  QBDITRACE_CAPI_ACCESS              = 424, /* access(path, mode)                  */
+  QBDITRACE_CAPI_STAT                = 425, /* stat(path, stat_buf)                */
+  QBDITRACE_CAPI_KILL                = 426, /* kill(pid, sig)                      */
+  QBDITRACE_CAPI_GETPID              = 427, /* getpid()                            */
+  QBDITRACE_CAPI_SYSCTLBYNAME        = 428, /* sysctlbyname(name,old,olen,new,nl) [darwin/ios] */
+  QBDITRACE_CAPI_ISATTY              = 429, /* isatty(fd)                          */
+  /* 430–449 reserved */
+
+  /* ── More I/O / file system (450–469) [common] ───────────────────── */
+  QBDITRACE_CAPI_RENAME              = 450, /* rename(old, new)                    */
+  QBDITRACE_CAPI_UNLINK              = 451, /* unlink(path)                        */
+  QBDITRACE_CAPI_MKDIR               = 452, /* mkdir(path, mode)                   */
+  QBDITRACE_CAPI_RMDIR               = 453, /* rmdir(path)                         */
+  QBDITRACE_CAPI_OPENAT              = 454, /* openat(dirfd, path, flags, ...)     */
+  QBDITRACE_CAPI_PREAD64             = 455, /* pread64(fd, buf, n, off)            */
+  QBDITRACE_CAPI_PWRITE64            = 456, /* pwrite64(fd, buf, n, off)           */
+  QBDITRACE_CAPI_LSEEK               = 457, /* lseek(fd, off, whence)              */
+  QBDITRACE_CAPI_MMAP                = 458, /* mmap(addr,len,prot,flags,fd,off)    */
+  QBDITRACE_CAPI_MUNMAP              = 459, /* munmap(addr, len)                   */
+  QBDITRACE_CAPI_MPROTECT            = 460, /* mprotect(addr, len, prot)           */
+  /* 461–469 reserved */
+
+  /* ── iOS / macOS platform APIs — extended (470–599) [ios] ────────── */
+  /* CommonCrypto additional */
+  QBDITRACE_CAPI_CC_SHA224           = 470, /* CC_SHA224(data, len, out)           */
+  QBDITRACE_CAPI_CC_SHA384           = 471, /* CC_SHA384(data, len, out)           */
+  QBDITRACE_CAPI_CC_SHA512           = 472, /* CC_SHA512(data, len, out)           */
+  QBDITRACE_CAPI_CC_SHA256_INIT      = 473, /* CC_SHA256_Init(ctx)                 */
+  QBDITRACE_CAPI_CC_SHA256_UPDATE    = 474, /* CC_SHA256_Update(ctx,data,len)      */
+  QBDITRACE_CAPI_CC_SHA256_FINAL     = 475, /* CC_SHA256_Final(out, ctx)           */
+  QBDITRACE_CAPI_CC_HMAC_INIT        = 476, /* CCHmacInit(ctx, alg, key, kl)      */
+  QBDITRACE_CAPI_CC_HMAC_UPDATE      = 477, /* CCHmacUpdate(ctx, data, len)        */
+  QBDITRACE_CAPI_CC_HMAC_FINAL       = 478, /* CCHmacFinal(ctx, mac)               */
+  QBDITRACE_CAPI_CC_CRYPTOR_CREATE   = 479, /* CCCryptorCreate(op,alg,opt,key,...) */
+  QBDITRACE_CAPI_CC_CRYPTOR_UPDATE   = 480, /* CCCryptorUpdate(ref,in,il,out,ol,*) */
+  QBDITRACE_CAPI_CC_CRYPTOR_FINAL    = 481, /* CCCryptorFinal(ref, out, ol, *)     */
+  QBDITRACE_CAPI_CC_CRYPTOR_RELEASE  = 482, /* CCCryptorRelease(ref)               */
+  QBDITRACE_CAPI_CC_RANDOM_GENERATE  = 483, /* CCRandomGenerateBytes(buf, n)       */
+  /* CoreFoundation extended */
+  QBDITRACE_CAPI_CF_STR_GET_CSTR     = 484, /* CFStringGetCString(str,buf,n,enc)   */
+  QBDITRACE_CAPI_CF_STR_GET_PTR      = 485, /* CFStringGetCStringPtr(str, enc)     */
+  QBDITRACE_CAPI_CF_STR_COMPARE      = 486, /* CFStringCompare(a, b, opts)         */
+  QBDITRACE_CAPI_CF_STR_HASPREFIX    = 487, /* CFStringHasPrefix(str, prefix)      */
+  QBDITRACE_CAPI_CF_STR_HASSUFFIX    = 488, /* CFStringHasSuffix(str, suffix)      */
+  QBDITRACE_CAPI_CF_DATA_GET_PTR     = 489, /* CFDataGetBytePtr(data)              */
+  QBDITRACE_CAPI_CF_DATA_GET_LEN     = 490, /* CFDataGetLength(data)               */
+  QBDITRACE_CAPI_CF_DICT_GET_VAL     = 491, /* CFDictionaryGetValue(dict, key)     */
+  QBDITRACE_CAPI_CF_DICT_CREATE      = 492, /* CFDictionaryCreate(...)             */
+  QBDITRACE_CAPI_CF_ARRAY_CREATE     = 493, /* CFArrayCreate(alloc, vals, n, cbs)  */
+  QBDITRACE_CAPI_CF_ARRAY_GET_VAL    = 494, /* CFArrayGetValueAtIndex(arr, idx)    */
+  QBDITRACE_CAPI_CF_NUMBER_CREATE    = 495, /* CFNumberCreate(alloc, type, val)    */
+  QBDITRACE_CAPI_CF_NUMBER_GET_VAL   = 496, /* CFNumberGetValue(num, type, val)    */
+  QBDITRACE_CAPI_CF_PLIST_CREATE_DATA= 497, /* CFPropertyListCreateWithData(...)   */
+  QBDITRACE_CAPI_CF_PLIST_CREATE_XML = 498, /* CFPropertyListCreateXMLData(...)    */
+  QBDITRACE_CAPI_CF_RELEASE          = 499, /* CFRelease(cf)                       */
+  QBDITRACE_CAPI_CF_RETAIN           = 500, /* CFRetain(cf)                        */
+  /* Security framework extended */
+  QBDITRACE_CAPI_SEC_RAND_COPY_BYTES = 501, /* SecRandomCopyBytes(rnd, n, bytes)   */
+  QBDITRACE_CAPI_SEC_KEY_COPY_EXT    = 502, /* SecKeyCopyExternalRepresentation(k,e)*/
+  QBDITRACE_CAPI_SEC_KEY_CREATE_FROM = 503, /* SecKeyCreateFromData / SecKeyCreate  */
+  QBDITRACE_CAPI_SEC_KEY_ENCRYPT     = 504, /* SecKeyEncrypt(key,pad,pt,pl,ct,cl)  */
+  QBDITRACE_CAPI_SEC_KEY_DECRYPT     = 505, /* SecKeyDecrypt(key,pad,ct,cl,pt,pl)  */
+  QBDITRACE_CAPI_SEC_CERT_CREATE     = 506, /* SecCertificateCreateWithData(...)   */
+  QBDITRACE_CAPI_SEC_IDENTITY_COPY   = 507, /* SecIdentityCopyCertificate(id, cert)*/
+  QBDITRACE_CAPI_SEC_TRUST_EVAL      = 508, /* SecTrustEvaluate(trust, result)     */
+  QBDITRACE_CAPI_SEC_ITEM_ADD        = 509, /* SecItemAdd(attrs, result)           */
+  QBDITRACE_CAPI_SEC_ITEM_UPDATE     = 510, /* SecItemUpdate(query, attrs)         */
+  QBDITRACE_CAPI_SEC_ITEM_DELETE     = 511, /* SecItemDelete(query)                */
+  /* URL / Network CF */
+  QBDITRACE_CAPI_CF_URL_GET_STR      = 512, /* CFURLGetString(url)                 */
+  QBDITRACE_CAPI_CF_HTTP_MSG_CREATE  = 513, /* CFHTTPMessageCreateRequest(...)     */
+  QBDITRACE_CAPI_CF_HTTP_MSG_SET_HDR = 514, /* CFHTTPMessageSetHeaderFieldValue(...)*/
+  QBDITRACE_CAPI_CF_HTTP_MSG_SET_BODY= 515, /* CFHTTPMessageSetBody(msg, body)     */
+  /* dispatch / GCD */
+  QBDITRACE_CAPI_DISPATCH_ASYNC      = 516, /* dispatch_async(queue, block)        */
+  QBDITRACE_CAPI_DISPATCH_SYNC       = 517, /* dispatch_sync(queue, block)         */
+  QBDITRACE_CAPI_DISPATCH_AFTER      = 518, /* dispatch_after(when, queue, block)  */
+  QBDITRACE_CAPI_DISPATCH_ONCE       = 519, /* dispatch_once(pred, block)          */
+  /* NSString bridging */
+  QBDITRACE_CAPI_NS_STR_UTF8         = 520, /* -[NSString UTF8String]  (via msgSend)*/
+  QBDITRACE_CAPI_NS_STR_ENCODE       = 521, /* -[NSString dataUsingEncoding:]      */
+  QBDITRACE_CAPI_NS_DATA_BYTES       = 522, /* -[NSData bytes]                     */
+  /* Base64 (iOS libSystem) */
+  QBDITRACE_CAPI_IOS_BASE64_ENCODE   = 523, /* b64_encode / SecBase64Encode        */
+  QBDITRACE_CAPI_IOS_BASE64_DECODE   = 524, /* b64_decode / SecBase64Decode        */
+  /* Encoding */
+  QBDITRACE_CAPI_ICONV_OPEN          = 525, /* iconv_open(to, from)                */
+  QBDITRACE_CAPI_ICONV               = 526, /* iconv(cd, in, il, out, ol)          */
+  /* 527–599 reserved for iOS */
+
+  /* ── Android / Bionic platform APIs — extended (600–699) [android] ── */
+  /* OpenSSL / BoringSSL (libcrypto.so / libssl.so) */
+  QBDITRACE_CAPI_EVP_ENCRYPT_INIT    = 600, /* EVP_EncryptInit_ex(ctx,type,eng,k,iv) */
+  QBDITRACE_CAPI_EVP_ENCRYPT_UPDATE  = 601, /* EVP_EncryptUpdate(ctx,out,ol,in,il)  */
+  QBDITRACE_CAPI_EVP_ENCRYPT_FINAL   = 602, /* EVP_EncryptFinal_ex(ctx, out, ol)    */
+  QBDITRACE_CAPI_EVP_DECRYPT_INIT    = 603, /* EVP_DecryptInit_ex(...)              */
+  QBDITRACE_CAPI_EVP_DECRYPT_UPDATE  = 604, /* EVP_DecryptUpdate(...)               */
+  QBDITRACE_CAPI_EVP_DECRYPT_FINAL   = 605, /* EVP_DecryptFinal_ex(...)             */
+  QBDITRACE_CAPI_EVP_DIGESTINIT      = 606, /* EVP_DigestInit_ex(ctx, type, eng)    */
+  QBDITRACE_CAPI_EVP_DIGESTUPDATE    = 607, /* EVP_DigestUpdate(ctx, data, cnt)     */
+  QBDITRACE_CAPI_EVP_DIGESTFINAL     = 608, /* EVP_DigestFinal_ex(ctx, md, s)       */
+  QBDITRACE_CAPI_HMAC_CTX_NEW        = 609, /* HMAC_CTX_new()                       */
+  QBDITRACE_CAPI_HMAC_INIT_EX        = 610, /* HMAC_Init_ex(ctx,key,kl,md,eng)     */
+  QBDITRACE_CAPI_HMAC_UPDATE         = 611, /* HMAC_Update(ctx, data, len)          */
+  QBDITRACE_CAPI_HMAC_FINAL          = 612, /* HMAC_Final(ctx, md, len)             */
+  QBDITRACE_CAPI_SHA256_INIT         = 613, /* SHA256_Init(ctx)                     */
+  QBDITRACE_CAPI_SHA256_UPDATE       = 614, /* SHA256_Update(ctx, data, len)        */
+  QBDITRACE_CAPI_SHA256_FINAL        = 615, /* SHA256_Final(md, ctx)                */
+  QBDITRACE_CAPI_AES_SET_ENC_KEY     = 616, /* AES_set_encrypt_key(key,bits,ks)    */
+  QBDITRACE_CAPI_AES_SET_DEC_KEY     = 617, /* AES_set_decrypt_key(key,bits,ks)    */
+  QBDITRACE_CAPI_AES_CBC_ENCRYPT     = 618, /* AES_cbc_encrypt(in,out,l,ks,iv,enc) */
+  QBDITRACE_CAPI_RSA_SIGN            = 619, /* RSA_sign(type,m,ml,sig,sl,rsa)      */
+  QBDITRACE_CAPI_RSA_VERIFY          = 620, /* RSA_verify(type,m,ml,sig,sl,rsa)    */
+  QBDITRACE_CAPI_RAND_BYTES          = 621, /* RAND_bytes(buf, num)                 */
+  QBDITRACE_CAPI_RAND_PRIV_BYTES     = 622, /* RAND_priv_bytes(buf, num)            */
+  QBDITRACE_CAPI_EVP_MD5             = 623, /* EVP_md5()                            */
+  QBDITRACE_CAPI_EVP_SHA1            = 624, /* EVP_sha1()                           */
+  QBDITRACE_CAPI_EVP_SHA256          = 625, /* EVP_sha256()                         */
+  QBDITRACE_CAPI_BIO_NEW_MEM_BUF     = 626, /* BIO_new_mem_buf(buf, len)            */
+  QBDITRACE_CAPI_PEM_READ_BIO        = 627, /* PEM_read_bio_RSAPublicKey / PrivKey  */
+  /* Base64 (Android) */
+  QBDITRACE_CAPI_ANDROID_BASE64_ENC  = 628, /* android.util.Base64.encode (JNI)    */
+  QBDITRACE_CAPI_ANDROID_BASE64_DEC  = 629, /* android.util.Base64.decode (JNI)    */
+  /* SQLite (Android apps often embed libsqlite3.so) */
+  QBDITRACE_CAPI_SQLITE3_OPEN        = 630, /* sqlite3_open(filename, ppDb)         */
+  QBDITRACE_CAPI_SQLITE3_PREPARE     = 631, /* sqlite3_prepare_v2(db,sql,n,stmt,t) */
+  QBDITRACE_CAPI_SQLITE3_STEP        = 632, /* sqlite3_step(stmt)                   */
+  QBDITRACE_CAPI_SQLITE3_COLUMN_TEXT = 633, /* sqlite3_column_text(stmt, col)       */
+  QBDITRACE_CAPI_SQLITE3_CLOSE       = 634, /* sqlite3_close(db)                    */
+  QBDITRACE_CAPI_SQLITE3_EXEC        = 635, /* sqlite3_exec(db,sql,cb,arg,errmsg)  */
+  /* Android KeyStore / Keymaster (native side, libkeystore*.so) */
+  QBDITRACE_CAPI_KEYMASTER_IMPORT    = 636, /* importKey / importWrappedKey         */
+  QBDITRACE_CAPI_KEYMASTER_EXPORT    = 637, /* exportKey                            */
+  QBDITRACE_CAPI_KEYMASTER_FINISH    = 638, /* finish(op,input,sig,out)             */
+  /* ART runtime helpers (libart.so) */
+  QBDITRACE_CAPI_ART_INVOKE_VIRTUAL  = 639, /* art::InvokeVirtual (JNI bridge)      */
+  QBDITRACE_CAPI_ART_THREAD_SELF     = 640, /* art::Thread::Current()               */
+  /* Networking (Android extras) */
+  QBDITRACE_CAPI_GETADDRINFO         = 641, /* getaddrinfo(node, serv, hints, res)  */
+  QBDITRACE_CAPI_GETNAMEINFO         = 642, /* getnameinfo(sa,sl,host,hl,serv,sl,f) */
+  QBDITRACE_CAPI_INET_ATON           = 643, /* inet_aton(cp, inp)                   */
+  QBDITRACE_CAPI_INET_NTOP           = 644, /* inet_ntop(af, src, dst, size)        */
+  /* 645–699 reserved for Android */
+
+  /* ── JNI functions — extended (700–799) [jni] ───────────────────── */
+  QBDITRACE_CAPI_JNI_GET_INT_FIELD   = 700, /* GetIntField(env, obj, fid)           */
+  QBDITRACE_CAPI_JNI_GET_LONG_FIELD  = 701, /* GetLongField(env, obj, fid)          */
+  QBDITRACE_CAPI_JNI_GET_OBJ_FIELD   = 702, /* GetObjectField(env, obj, fid)        */
+  QBDITRACE_CAPI_JNI_SET_OBJ_FIELD   = 703, /* SetObjectField(env, obj, fid, val)   */
+  QBDITRACE_CAPI_JNI_GET_FIELD_ID    = 704, /* GetFieldID(env, cls, name, sig)      */
+  QBDITRACE_CAPI_JNI_GET_STATIC_FIELD= 705, /* GetStaticFieldID(env,cls,name,sig)  */
+  QBDITRACE_CAPI_JNI_GET_STR_REG     = 706, /* GetStringUTFRegion(env,s,st,l,buf)  */
+  QBDITRACE_CAPI_JNI_GET_ARR_LEN     = 707, /* GetArrayLength(env, array)           */
+  QBDITRACE_CAPI_JNI_NEW_OBJ_ARR     = 708, /* NewObjectArray(env,len,cls,init)    */
+  QBDITRACE_CAPI_JNI_GET_OBJ_ARR_EL  = 709, /* GetObjectArrayElement(env,arr,idx)  */
+  QBDITRACE_CAPI_JNI_SET_OBJ_ARR_EL  = 710, /* SetObjectArrayElement(env,arr,i,v)  */
+  QBDITRACE_CAPI_JNI_NEW_INT_ARR     = 711, /* NewIntArray(env, length)             */
+  QBDITRACE_CAPI_JNI_GET_INT_ARR     = 712, /* GetIntArrayElements(env, arr, copy) */
+  QBDITRACE_CAPI_JNI_REL_INT_ARR     = 713, /* ReleaseIntArrayElements(...)         */
+  QBDITRACE_CAPI_JNI_CALL_STATIC_INT = 714, /* CallStaticIntMethod(env,cls,mid,...) */
+  QBDITRACE_CAPI_JNI_CALL_STATIC_BOOL= 715, /* CallStaticBooleanMethod(...)         */
+  QBDITRACE_CAPI_JNI_NEW_OBJ         = 716, /* NewObject(env, cls, mid, ...)        */
+  QBDITRACE_CAPI_JNI_IS_INST_OF      = 717, /* IsInstanceOf(env, obj, cls)          */
+  QBDITRACE_CAPI_JNI_NEW_GLOBAL_REF  = 718, /* NewGlobalRef(env, lobj)              */
+  QBDITRACE_CAPI_JNI_DELETE_GLOBAL   = 719, /* DeleteGlobalRef(env, gref)           */
+  QBDITRACE_CAPI_JNI_DELETE_LOCAL    = 720, /* DeleteLocalRef(env, lref)            */
+  QBDITRACE_CAPI_JNI_PUSH_LOCAL_FRAME= 721, /* PushLocalFrame(env, capacity)        */
+  QBDITRACE_CAPI_JNI_POP_LOCAL_FRAME = 722, /* PopLocalFrame(env, result)           */
+  QBDITRACE_CAPI_JNI_GET_VERSION     = 723, /* GetVersion(env)                      */
+  QBDITRACE_CAPI_JNI_MONITOR_ENTER   = 724, /* MonitorEnter(env, obj)               */
+  QBDITRACE_CAPI_JNI_MONITOR_EXIT    = 725, /* MonitorExit(env, obj)                */
+  QBDITRACE_CAPI_JNI_GET_JAVA_VM     = 726, /* GetJavaVM(env, vm)                   */
+  /* 727–799 reserved for JNI */
+
+} qbditrace_capi_id_t;
+
+/* ---- SVC extended flags ----
+ * Stored in svc_head_t.reserved[0] (previously always 0) to encode extra
+ * platform-specific metadata about the syscall site without changing the
+ * fixed struct layout. tenet uses these to quickly route the record to the
+ * right analysis pass without re-inspecting syscall_no.
+ */
+#define QBDITRACE_SVC_FL_MACH_TRAP  (1u << 0) /* Darwin: Mach trap (x16 > 0 & MSB) */
+#define QBDITRACE_SVC_FL_BINDER_IOC (1u << 1) /* Android: ioctl on /dev/binder fd   */
+#define QBDITRACE_SVC_FL_MEM_OP     (1u << 2) /* syscall is a mem r/w (read/write/mmap/mprotect) */
+#define QBDITRACE_SVC_FL_FILE_OP    (1u << 3) /* syscall is a file-system op         */
+#define QBDITRACE_SVC_FL_NET_OP     (1u << 4) /* syscall is a network op             */
+#define QBDITRACE_SVC_FL_CRYPTO_OP  (1u << 5) /* syscall touches a crypto primitive  */
+
 /* GPR ordering constants (AArch64), mirroring QBDI's State.h layout. */
 #define QBDITRACE_AARCH64_NUM_GPR 34 /* x0..x28, fp, lr, sp, nzcv, pc */
 #define QBDITRACE_AARCH64_IDX_LR 30
@@ -568,6 +1005,10 @@ static_assert(sizeof(qbditrace_objc_head_t) == 80,
               "objc head must be 80 bytes (4B + 4B pad + 3x8B + 48B cls)");
 static_assert(sizeof(qbditrace_code_head_t) == 16,
               "code head must be 16 bytes (4B kind+size+reserved + 4B pad + 8B pc)");
+static_assert(sizeof(qbditrace_capicall_head_t) == 88,
+              "capicall head must be 88 bytes (4B header + 4B pad + 8B pc + 8B target + 8*8B args)");
+static_assert(sizeof(qbditrace_capicall_str_t) == 4,
+              "capicall str must be 4 bytes (4 × u8)");
 #endif
 
 #ifdef __cplusplus

@@ -152,6 +152,13 @@ struct CliOptions {
     /// in any [start, end) range are not delivered to passes. Repeatable.
     std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges;
 
+    // --- VM abstract ---
+    bool opt_vm_abstract = false;
+    uint64_t vm_dispatcher_pc = 0;         // --vm-dispatcher <hex>
+    uint64_t vm_indirect_br_pc = 0;        // --vm-indirect-br <hex>
+    uint8_t  vm_pc_reg = 0xFF;             // --vm-pc-reg <index>
+    std::vector<uint64_t> vm_handler_pcs;  // --vm-handler <hex> (repeatable)
+
     // --- Generic pass runner ---
     bool opt_index_build = false;
     std::vector<std::string> run_pass_names;

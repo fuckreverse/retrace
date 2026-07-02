@@ -29,7 +29,40 @@ static ImVec4 category_color(ApiCategory cat) {
             return ImVec4(0.9f, 0.3f, 0.3f, 1.0f);   // red
         case ApiCategory::CryptoKit:
             return ImVec4(1.0f, 0.5f, 0.7f, 1.0f);   // pink
+        case ApiCategory::BoringSSL:
+            return ImVec4(1.0f, 0.4f, 0.4f, 1.0f);   // salmon red (Android crypto)
+        case ApiCategory::AndroidKeystore:
+            return ImVec4(0.9f, 0.5f, 0.1f, 1.0f);   // amber
+        case ApiCategory::JNI:
+            return ImVec4(0.4f, 0.9f, 0.6f, 1.0f);   // green
+        case ApiCategory::MemoryOps:
+            return ImVec4(0.7f, 0.7f, 0.9f, 1.0f);   // lavender
+        case ApiCategory::StringOps:
+            return ImVec4(0.6f, 0.9f, 0.9f, 1.0f);   // cyan
+        case ApiCategory::HeapAlloc:
+            return ImVec4(0.5f, 0.8f, 0.7f, 1.0f);   // teal
+        case ApiCategory::FileIO:
+            return ImVec4(0.8f, 0.7f, 0.4f, 1.0f);   // gold
+        case ApiCategory::Network:
+            return ImVec4(0.3f, 0.7f, 1.0f, 1.0f);   // sky blue
+        case ApiCategory::AntiDebug:
+            return ImVec4(1.0f, 0.3f, 0.3f, 1.0f);   // bright red
+        case ApiCategory::Threading:
+            return ImVec4(0.8f, 0.5f, 1.0f, 1.0f);   // purple
+        case ApiCategory::Encoding:
+            return ImVec4(0.6f, 1.0f, 0.4f, 1.0f);   // lime green
         case ApiCategory::Compression:
+            return ImVec4(0.7f, 0.85f, 0.5f, 1.0f);  // yellow-green
+        case ApiCategory::SQLite:
+            return ImVec4(0.9f, 0.75f, 0.3f, 1.0f);  // yellow
+        case ApiCategory::DynLink:
+            return ImVec4(0.9f, 0.6f, 0.9f, 1.0f);   // mauve
+        case ApiCategory::ObjCRuntime:
+            return ImVec4(0.5f, 0.8f, 1.0f, 1.0f);   // light blue
+        case ApiCategory::MemoryMap:
+            return ImVec4(0.65f, 0.65f, 0.8f, 1.0f); // steel blue
+        case ApiCategory::Syscall:
+            return ImVec4(0.7f, 0.7f, 0.7f, 1.0f);   // grey
         case ApiCategory::CocoaFoundation:
         case ApiCategory::LibSystem:
         case ApiCategory::Custom:
@@ -41,14 +74,30 @@ static ImVec4 category_color(ApiCategory cat) {
 /// Return a short label for each ApiCategory.
 static const char* category_label(ApiCategory cat) {
     switch (cat) {
-        case ApiCategory::CommonCrypto:     return "CC";
-        case ApiCategory::SecurityFramework:return "Sec";
-        case ApiCategory::CryptoKit:        return "CKit";
-        case ApiCategory::Compression:      return "Comp";
-        case ApiCategory::CocoaFoundation:  return "Cocoa";
-        case ApiCategory::LibSystem:        return "LibSys";
-        case ApiCategory::Custom:           return "Custom";
-        default:                            return "?";
+        case ApiCategory::CommonCrypto:      return "CC";
+        case ApiCategory::SecurityFramework: return "Sec";
+        case ApiCategory::CryptoKit:         return "CKit";
+        case ApiCategory::BoringSSL:         return "SSL";
+        case ApiCategory::AndroidKeystore:   return "Keystore";
+        case ApiCategory::JNI:               return "JNI";
+        case ApiCategory::MemoryOps:         return "Mem";
+        case ApiCategory::StringOps:         return "Str";
+        case ApiCategory::HeapAlloc:         return "Heap";
+        case ApiCategory::FileIO:            return "IO";
+        case ApiCategory::Network:           return "Net";
+        case ApiCategory::AntiDebug:         return "Anti";
+        case ApiCategory::Threading:         return "Thread";
+        case ApiCategory::Encoding:          return "Enc";
+        case ApiCategory::Compression:       return "Comp";
+        case ApiCategory::SQLite:            return "SQL";
+        case ApiCategory::DynLink:           return "Dyn";
+        case ApiCategory::ObjCRuntime:       return "ObjC";
+        case ApiCategory::MemoryMap:         return "Mmap";
+        case ApiCategory::Syscall:           return "SVC";
+        case ApiCategory::CocoaFoundation:   return "Cocoa";
+        case ApiCategory::LibSystem:         return "LibSys";
+        case ApiCategory::Custom:            return "Custom";
+        default:                             return "?";
     }
 }
 
@@ -78,7 +127,9 @@ static std::string truncate(const std::string& s, size_t max_chars) {
 static bool is_crypto(const InterceptedCall& call) {
     return call.category == ApiCategory::CommonCrypto ||
            call.category == ApiCategory::SecurityFramework ||
-           call.category == ApiCategory::CryptoKit;
+           call.category == ApiCategory::CryptoKit ||
+           call.category == ApiCategory::BoringSSL ||
+           call.category == ApiCategory::AndroidKeystore;
 }
 
 // ── Main panel ────────────────────────────────────────────────────────────────
@@ -255,8 +306,22 @@ void GuiApp::render_syscall_intercept_panel() {
                     if (call.has_return) {
                         tip += fmt::format("\n\nReturn: 0x{:x}", call.return_value);
                     }
+                    if (!call.captured_strings.empty()) {
+                        tip += "\n\nCaptured Strings (tracer-side):";
+                        for (const auto& cs : call.captured_strings) {
+                            std::string val = cs.value;
+                            // Limit display length
+                            if (val.size() > 80) { val.resize(80); val += "\xe2\x80\xa6"; }
+                            tip += fmt::format("\n  x{}: \"{}\"{}",
+                                cs.arg_idx, val,
+                                cs.truncated ? " [truncated]" : "");
+                        }
+                    }
                     if (call.objc_context.has_value()) {
                         tip += fmt::format("\n\nObjC: {}", *call.objc_context);
+                    }
+                    if (call.from_capicall_record) {
+                        tip += "\n\n[CAPICALL record — tracer-resolved]";
                     }
 
                     tip += "\n\nRight-click for more options";

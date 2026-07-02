@@ -117,13 +117,14 @@ constexpr uint8_t IDX_PC   = 33;
 // ─── Record kinds (mirrors TraceFormat.h) ──────────────────────────────────
 
 enum class RecordKind : uint8_t {
-    Inst   = 0,
-    Anchor = 1,
-    Thread = 2,
-    Event  = 3,
-    Svc    = 4,
-    Objc   = 5,
-    Code   = 6,
+    Inst     = 0,
+    Anchor   = 1,
+    Thread   = 2,
+    Event    = 3,
+    Svc      = 4,
+    Objc     = 5,
+    Code     = 6,
+    CapiCall = 7,   /* C/platform API call with semantic args (mem*, str*, JNI, etc.) */
 };
 
 // ─── FPR value (128-bit vector register) ─────────────────────────────────

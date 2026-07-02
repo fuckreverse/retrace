@@ -30,14 +30,19 @@ extern "C" {
 
 /* Bit flags controlling what the tracer records (qbditrace_config.record). */
 enum {
-  QBDITRACE_REC_NZCV = 1u << 0,    /* capture NZCV flags per instruction */
+  QBDITRACE_REC_NZCV    = 1u << 0, /* capture NZCV flags per instruction */
   QBDITRACE_REC_REGDIFF = 1u << 1, /* capture written-register diffs */
-  QBDITRACE_REC_MEM = 1u << 2,     /* capture memory accesses (read/write) */
+  QBDITRACE_REC_MEM     = 1u << 2, /* capture memory accesses (read/write) */
   QBDITRACE_REC_SYSCALL = 1u << 3, /* capture svc (syscall) sites */
   QBDITRACE_REC_MSGSEND = 1u << 4, /* capture objc_msgSend dispatch sites */
+  QBDITRACE_REC_CAPI    = 1u << 5, /* capture C/platform API call sites
+                                    * (mem*, str*, JNI, CommonCrypto, etc.)
+                                    * Requires enable_capi_intercept != 0 to
+                                    * also enable the address-resolution step;
+                                    * this bit gates the actual record emission. */
   QBDITRACE_REC_DEFAULT =
       QBDITRACE_REC_NZCV | QBDITRACE_REC_REGDIFF | QBDITRACE_REC_MEM |
-      QBDITRACE_REC_SYSCALL | QBDITRACE_REC_MSGSEND,
+      QBDITRACE_REC_SYSCALL | QBDITRACE_REC_MSGSEND | QBDITRACE_REC_CAPI,
 };
 
 /*
@@ -174,6 +179,48 @@ typedef struct {
     uint64_t start;
     uint64_t end;
   } exclude_ranges[QBDITRACE_MAX_EXCLUDE_RANGES];
+
+  /* ---- C API interception ----
+   *
+   * When QBDITRACE_REC_CAPI is set in the record bitmask AND
+   * enable_capi_intercept is non-zero, the tracer will match each
+   * EXEC_TRANSFER_CALL target against the list of known C / platform API
+   * function addresses provided in capi_funcs[].  A match emits a
+   * REC_CAPICALL record carrying the function's api_id, the call-site PC,
+   * the target address, the argument registers (x0..x7), and optionally
+   * dereferenced string/buffer content from pointer arguments.
+   *
+   * The caller (typically the Frida JS loader) populates capi_funcs[] by
+   * resolving each well-known function's runtime address via
+   * Module.findExportByName / Process.getModuleByName(...).findExportByName.
+   * The tracer performs a simple O(n) linear scan; for the expected
+   * n_capi_funcs count (~50-100) this is negligible compared to the
+   * per-instruction overhead.
+   *
+   * When enable_capi_intercept == 0 (the zero-initialized default), the
+   * tracer does NOT emit REC_CAPICALL records even if QBDITRACE_REC_CAPI
+   * is set. This allows the caller to gate the feature independently of the
+   * record bitmask.
+   *
+   * ABI forward-compatibility: callers that zero-initialize the struct get
+   * n_capi_funcs == 0 (no interception), which is safe and produces no
+   * extra records.
+   */
+  uint32_t enable_capi_intercept; /* non-zero to enable C API interception */
+  uint32_t n_capi_funcs;          /* number of entries in capi_funcs[] (0..QBDITRACE_MAX_CAPI_FUNCS) */
+
+  /* Maximum number of C API function entries that can be registered. */
+#define QBDITRACE_MAX_CAPI_FUNCS 128
+
+  struct {
+    uint64_t addr;     /* runtime address of the function (0 = unused slot) */
+    uint16_t api_id;   /* qbditrace_capi_id_t (uint16 to hold all ids up to ~700) */
+    uint8_t  n_args;   /* number of meaningful argument registers (0..8) */
+    uint8_t  str_args; /* bitmask: bit i set => args[i] is a pointer to capture */
+                       /* e.g. memcpy: str_args = 0x06 (args[1]=src, args[2] size-hint) */
+                       /*      strcmp:  str_args = 0x03 (args[0]=a, args[1]=b) */
+    /* Total: 8+2+1+1 = 12 bytes; no explicit pad needed for natural alignment. */
+  } capi_funcs[QBDITRACE_MAX_CAPI_FUNCS];
 } qbditrace_config_t;
 
 /*

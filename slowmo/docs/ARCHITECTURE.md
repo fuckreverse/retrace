@@ -121,7 +121,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 ## 当前实现规模
 
-- `src/analysis/pass_registry.cpp` 当前维护 **36 个 pass**。
+- `src/analysis/pass_registry.cpp` 当前维护 **37 个 pass**。
 - `src/io/mcp/` 当前维护 **46 个 MCP 工具**。
 - CLI 参数集中在 `src/cli_options.cpp`，批处理执行集中在 `src/batch_analysis.cpp`。
 

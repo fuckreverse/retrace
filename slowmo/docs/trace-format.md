@@ -169,6 +169,7 @@ struct RegState {
 | SVC | 4 | `qbditrace_svc_head_t` | 系统调用 |
 | OBJC | 5 | `qbditrace_objc_head_t` | ObjC 消息发送 |
 | CODE | 6 | `qbditrace_code_head_t` + bytes[] | 指令原始字节 |
+| CAPICALL | 7 | `qbditrace_capicall_head_t` + str_caps[] | C/平台 API 调用（含参数快照） |
 
 > **磁盘布局说明**：所有记录以 C struct 自然对齐方式存储（writer 用 `memcpy(p, &struct, sizeof)`），
 > 磁盘大小 = `sizeof(struct)`，**含对齐 padding**。下方各记录的 "Total" 均为 sizeof 口径，
@@ -449,6 +450,103 @@ Total: 16 + size 字节 (`sizeof(qbditrace_code_head_t)` + size，含对齐 padd
 
 ---
 
+## REC_CAPICALL — C/平台 API 调用记录
+
+当 QBDI `EXEC_TRANSFER_CALL` 目标匹配 `capi_funcs[]` 中的已注册地址时发射。
+携带被调用函数的语义标识（`api_id`）、调用点 PC、目标地址、参数寄存器（x0..x7），
+以及可选的指针参数内联字符串捕获。
+
+> **写入条件**：`qbditrace_config_t.record` 含 `QBDITRACE_REC_CAPI` **且**
+> `enable_capi_intercept != 0` **且** `n_capi_funcs > 0`。
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ u8  kind (=7)                                                  │
+│ u8  api_id        ← qbditrace_capi_id_t（0=unknown）          │
+│ u8  arg_count     ← args[] 中有效项数（0..8）                  │
+│ u8  str_count     ← 紧随其后的字符串捕获条数（0..4）           │
+│ u64 pc            ← 调用点 PC（位于被追踪范围内）              │
+│ u64 target        ← 被调用函数的运行时地址                     │
+│ u64 args[8]       ← x0..x7（仅前 arg_count 项有效）           │
+├────────────────────────────────────────────────────────────────┤
+│ 对每个字符串捕获（str_count 次）：                              │
+│   u8  str_arg_idx ← 来自 args[] 的哪个索引（0..7）            │
+│   u8  str_len     ← 字符串内容字节数（不含 NUL）              │
+│   u8  str_flags   ← QBDITRACE_SF_* 位标志                     │
+│   u8  _reserved                                                │
+│   u8  str_data[str_len + 1]  ← NUL 终止，补齐到 4 字节对齐   │
+└────────────────────────────────────────────────────────────────┘
+Fixed header: sizeof(qbditrace_capicall_head_t) = 88 字节
+Variable tail: str_count × (4 + str_len + 1 + pad)，最多 ≈ 1 KB
+```
+
+**str_flags 位定义**：
+
+| 位 | 宏 | 含义 |
+|----|----|------|
+| bit 0 | `SF_TRUNCATED` | 字符串超过 255 字节被截断 |
+| bit 1 | `SF_BINARY` | 内容为原始字节（含不可打印字符） |
+| bit 2 | `SF_SAFE_READ_FAIL` | safeRead 失败，str_len=0，捕获为空 |
+
+**api_id 分组速览**（来自 `qbditrace_capi_id_t`）：
+
+| 范围 | 分类 | 平台 |
+|------|------|------|
+| 0 | Unknown | — |
+| 1–19 | 内存操作（memcpy/memmove/memset/…） | 通用 |
+| 20–59 | 字符串操作（strlen/strcmp/strcpy/…） | 通用 |
+| 60–79 | 堆分配（malloc/calloc/free/…） | 通用 |
+| 80–99 | 文件 I/O（fopen/read/write/…） | 通用 |
+| 100–129 | libc 级 Crypto（arc4random/getrandom） | 通用 |
+| 130–199 | iOS/macOS 平台 API（CommonCrypto/Security.framework/CF） | [ios] |
+| 200–279 | Android/Bionic 平台 API（BoringSSL/android_log/Binder） | [android] |
+| 280–359 | JNI 函数（GetStringUTFChars/FindClass/…） | [jni] |
+| 360–379 | pthread / 同步原语 | 通用 |
+| 380–399 | 网络（socket/connect/send/recv/…） | 通用 |
+| 400–419 | 编码（base64_encode/decode） | 通用 |
+| 420–449 | 反调试/完整性（ptrace/sysctl/isatty/…） | 通用 |
+| 450–469 | 扩展文件系统（mmap/mprotect/…） | 通用 |
+| 470–599 | iOS/macOS 扩展（CCHmac*/CCCryptorCreate*/CFString*…） | [ios] |
+| 600–699 | Android/Bionic 扩展（EVP_Encrypt*/HMAC_*/AES_*…） | [android] |
+
+**关键 iOS crypto api_id**：
+
+| api_id | 常量 | 函数签名 |
+|--------|------|---------|
+| 134 | `CAPI_CC_CRYPT` | `CCCrypt(op,alg,opt,key,kl,iv,pt,pl,ct,cl,ml)` |
+| 135 | `CAPI_CC_HMAC` | `CCHmac(alg,key,kl,data,dl,mac)` |
+| 136 | `CAPI_CC_DIGEST` | `CC_SHA256/MD5/…(data,len,out)` |
+| 137 | `CAPI_CC_KEY_DERIVE_PBKDF` | `CCKeyDerivationPBKDF(…)` |
+| 476 | `CAPI_CC_HMAC_INIT` | `CCHmacInit(ctx,alg,key,kl)` |
+| 479 | `CAPI_CC_CRYPTOR_CREATE` | `CCCryptorCreate(op,alg,opt,key,kl,iv,ref)` |
+
+**记录大小计算**：
+
+```cpp
+// capicall 记录大小：固定头 + 可变字符串尾
+size_t capicall_record_size(const uint8_t* ptr) {
+    const auto* h = (const qbditrace_capicall_head_t*)ptr;
+    size_t sz = sizeof(qbditrace_capicall_head_t);
+    const uint8_t* p = ptr + sz;
+    for (uint8_t i = 0; i < h->str_count; ++i) {
+        const auto* s = (const qbditrace_capicall_str_t*)p;
+        // 4 字节 header + str_len + 1 NUL，补齐到 4 字节
+        size_t entry = 4 + s->str_len + 1;
+        entry = (entry + 3) & ~3u;  // round up to 4
+        p += entry;
+        sz += entry;
+    }
+    return sz;
+}
+```
+
+**tenet 使用**：
+- `SyscallInterceptCollector::on_capicall()` 处理此记录，优先级高于 Event XFER_CALL 启发式检测
+- `from_capicall_record = true` 的 `InterceptedCall` 含有 `captured_strings` 内联字符串向量
+- 已处理的 callee PC 被记录进 `capicall_seen_`，阻止后续重复的 Event 路径生成冗余记录
+
+---
+
 ## Branch Hint 编码（HF_BRANCH_HINT）
 
 当 `HF_BRANCH_HINT` (bit 9) 设置时，每条 REC_INST 的 `nzcv` 字节高 4 位编码分支类别：
@@ -491,6 +589,7 @@ runtime_address = static_address + module_slide
 | 6 | ANCHOR 间隔 ≤ 65536 条 INST | 超过则性能退化 |
 | 7 | 每条记录大小可从头部字段确定 | 向前兼容跳过未知记录 |
 | 8 | num_gpr = 34 (AArch64) | 其他值按 header 声明处理 |
+| 9 | CAPICALL 记录（若存在）紧随对应 XFER_CALL Event 之前 | SyscallInterceptCollector 用 capicall_seen_ 去重 |
 
 ---
 
@@ -544,6 +643,20 @@ size_t record_size(const uint8_t* ptr, const TraceFlags& flags, uint32_t num_gpr
         return sizeof(qbditrace_objc_head_t);
     case QBDITRACE_REC_CODE:
         return sizeof(qbditrace_code_head_t) + ptr[1]; // ptr[1] = size
+    case QBDITRACE_REC_CAPICALL: {
+        // Fixed header + variable-length string captures
+        const auto* h = (const qbditrace_capicall_head_t*)ptr;
+        size_t sz = sizeof(qbditrace_capicall_head_t);
+        const uint8_t* sp = ptr + sz;
+        for (uint8_t i = 0; i < h->str_count; ++i) {
+            const auto* s = (const qbditrace_capicall_str_t*)sp;
+            size_t entry = 4 + s->str_len + 1;
+            entry = (entry + 3) & ~3u;  // 4-byte aligned
+            sp += entry;
+            sz += entry;
+        }
+        return sz;
+    }
     default:
         return 0; // 未知记录，无法跳过
     }

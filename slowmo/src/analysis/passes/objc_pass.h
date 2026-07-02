@@ -133,11 +133,15 @@ public:
     /// Optional: filter results to only include messages for this class.
     void set_class_filter(const std::string& cls) { class_filter_ = cls; }
 
+    /// Optional: filter results to only include messages matching this selector substring.
+    void set_selector_filter(const std::string& sel) { selector_filter_ = sel; }
+
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 4.0f; }
 
 private:
-    std::string class_filter_;  // empty = no filter
+    std::string class_filter_;     // empty = no filter
+    std::string selector_filter_;  // empty = no filter
 };
 
 }  // namespace tenet

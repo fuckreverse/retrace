@@ -199,6 +199,59 @@ struct ObjcView {
     }
 };
 
+struct CapiCallStrView {
+    uint8_t  arg_idx;    // which arg index this string came from
+    uint8_t  str_len;    // byte length of content (not counting NUL)
+    uint8_t  str_flags;  // QBDITRACE_SF_* bits
+    const char* data;    // pointer to NUL-terminated content in mmap/cache
+
+    bool is_truncated()      const { return str_flags & 0x01; }
+    bool is_binary()         const { return str_flags & 0x02; }
+    bool is_safe_read_fail() const { return str_flags & 0x04; }
+};
+
+struct CapiCallView {
+    uint8_t  api_id;     // qbditrace_capi_id_t
+    uint8_t  arg_count;  // number of valid entries in args[]
+    uint8_t  str_count;  // number of inline string captures
+    uint64_t pc;         // call-site PC
+    uint64_t target;     // runtime address of called function
+    const uint64_t* args; // pointer to args[8] in mmap/cache
+
+    size_t byte_size() const {
+        size_t total = sizeof(qbditrace::qbditrace_capicall_head_t);
+        // Variable-length string captures follow the fixed header.
+        // Parse them to compute total record size.
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(args) + 8 * 8;
+        for (uint8_t i = 0; i < str_count; ++i) {
+            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(p);
+            uint16_t data_bytes = sh->str_len + 1; // content + NUL
+            uint16_t padded = (data_bytes + 3u) & ~3u; // pad to 4-byte alignment
+            total += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            p += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        }
+        return total;
+    }
+
+    /// Access the i-th string capture (0 <= i < str_count).
+    CapiCallStrView str_at(uint8_t i) const {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(args) + 8 * 8;
+        for (uint8_t j = 0; j < i; ++j) {
+            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(p);
+            uint16_t data_bytes = sh->str_len + 1;
+            uint16_t padded = (data_bytes + 3u) & ~3u;
+            p += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        }
+        const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(p);
+        CapiCallStrView sv;
+        sv.arg_idx   = sh->str_arg_idx;
+        sv.str_len   = sh->str_len;
+        sv.str_flags = sh->str_flags;
+        sv.data      = reinterpret_cast<const char*>(p + sizeof(qbditrace::qbditrace_capicall_str_t));
+        return sv;
+    }
+};
+
 struct ThreadView {
     uint64_t thread_id;
 
@@ -235,6 +288,7 @@ struct RecordView {
     EventView as_event() const;
     SvcView as_svc() const;
     ObjcView as_objc() const;
+    CapiCallView as_capicall() const;
     ThreadView as_thread() const;
 
     /// Compute the byte size of this record (needed to advance to next)

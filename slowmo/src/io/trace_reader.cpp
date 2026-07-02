@@ -130,6 +130,18 @@ ObjcView RecordView::as_objc() const {
     return v;
 }
 
+CapiCallView RecordView::as_capicall() const {
+    const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(raw_ptr);
+    CapiCallView v;
+    v.api_id    = hdr->api_id;
+    v.arg_count = hdr->arg_count;
+    v.str_count = hdr->str_count;
+    v.pc        = hdr->pc;
+    v.target    = hdr->target;
+    v.args      = hdr->args;
+    return v;
+}
+
 ThreadView RecordView::as_thread() const {
     const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(raw_ptr);
     ThreadView v;
@@ -181,6 +193,10 @@ size_t RecordView::byte_size(uint32_t num_gpr) const {
         return sizeof(qbditrace::qbditrace_svc_head_t);
     case RecordKind::Objc:
         return sizeof(qbditrace::qbditrace_objc_head_t);
+    case RecordKind::CapiCall: {
+        auto cc = as_capicall();
+        return cc.byte_size();
+    }
     case RecordKind::Code: {
         auto code = as_code();
         return code.byte_size();
@@ -705,6 +721,22 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
     case RecordKind::Objc:
         rec_size = sizeof(qbditrace::qbditrace_objc_head_t);
         break;
+    case RecordKind::CapiCall: {
+        // Fixed header + variable-length string captures.
+        // capicall_head_t is 88 bytes; after it, str_count variable-length
+        // captures follow, each: capicall_str_t (4B) + padded content.
+        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+        rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
+        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+        for (uint8_t s = 0; s < cc->str_count; ++s) {
+            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+            uint16_t data_bytes = sh->str_len + 1; // content + NUL
+            uint16_t padded = (data_bytes + 3u) & ~3u; // 4-byte alignment
+            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        }
+        break;
+    }
     case RecordKind::Code:
         rec_size = sizeof(qbditrace::qbditrace_code_head_t)
             + ptr[1]; // code_size is the 2nd byte

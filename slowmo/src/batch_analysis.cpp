@@ -20,6 +20,7 @@
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
+#include "analysis/passes/vm_abstract_pass.h"
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
@@ -669,6 +670,29 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<SyscallInterceptPass>(std::move(si_cfg)));
     }
 
+    // --vm-abstract: VM dispatcher detection + handler extraction
+    if (opts.opt_vm_abstract) {
+        VMConfig vm_cfg;
+        if (opts.vm_dispatcher_pc != 0) {
+            DispatcherHint dh;
+            dh.loop_header_pc = opts.vm_dispatcher_pc;
+            dh.indirect_branch_pc = opts.vm_indirect_br_pc;
+            vm_cfg.dispatcher = dh;
+        }
+        if (opts.vm_pc_reg != 0xFF) {
+            VMPCHint vph;
+            vph.reg = opts.vm_pc_reg;
+            vm_cfg.vm_pc = vph;
+        }
+        for (uint64_t hpc : opts.vm_handler_pcs) {
+            vm_cfg.handler_entry_pcs.push_back(hpc);
+        }
+        pm.register_pass(std::make_unique<XrefPass>());
+        pm.register_pass(std::make_unique<CFGPass>());
+        pm.register_pass(std::make_unique<LoopPass>());
+        pm.register_pass(std::make_unique<VMAbstractPass>(std::move(vm_cfg)));
+    }
+
     // --taint-source-annotation: annotate backward taint sources with ObjC context
     if (opts.opt_taint_source_annotation) {
         // Needs backward_taint (already registered if --backward-taint) and objc
@@ -1072,6 +1096,47 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             fmt::print(stderr, "[syscall-intercept] {} calls intercepted ({} unique APIs)\n",
                        si_result.total(), si_result.by_callee.size());
             fmt::print("{}\n", si_result.to_json());
+        }
+    }
+
+    // --vm-abstract: VM abstraction output
+    if (opts.opt_vm_abstract) {
+        const auto& vm_raw = pm.require("vm_abstract");
+        if (!vm_raw.ok()) {
+            fmt::print(stderr, "[vm-abstract] Pass failed: {}\n", vm_raw.error_message);
+            rc |= 1;
+        } else {
+            const auto& vm_result = vm_raw.get<VMAbstractResult>();
+            fmt::print(stderr, "[vm-abstract] dispatcher at 0x{:X}, {} handlers, {} steps\n",
+                       vm_result.dispatcher.loop_header_pc,
+                       vm_result.handlers.size(),
+                       vm_result.steps.size());
+            json vm_json;
+            // Dispatcher
+            json dj;
+            dj["header_pc"] = fmt::format("0x{:X}", vm_result.dispatcher.loop_header_pc);
+            dj["indirect_branch_pc"] = fmt::format("0x{:X}", vm_result.dispatcher.indirect_branch_pc);
+            dj["dispatch_type"] = dispatch_type_name(vm_result.dispatcher.dispatch_type);
+            dj["iterations"] = vm_result.dispatcher.iteration_count;
+            dj["confidence"] = vm_result.dispatcher.confidence;
+            vm_json["dispatcher"] = dj;
+            // Handlers
+            json handlers_arr = json::array();
+            for (const auto& h : vm_result.handlers) {
+                json hj;
+                hj["entry_pc"] = fmt::format("0x{:X}", h.entry_pc);
+                hj["label"] = h.label;
+                hj["execution_count"] = h.execution_count;
+                hj["body_pc_count"] = h.body_pcs.size();
+                handlers_arr.push_back(hj);
+            }
+            vm_json["handlers"] = handlers_arr;
+            vm_json["arch_type"] = vm_arch_name(vm_result.arch_type);
+            if (vm_result.vm_pc_reg != 0xFF) {
+                vm_json["vm_pc_reg"] = vm_result.vm_pc_reg;
+            }
+            vm_json["total_steps"] = vm_result.steps.size();
+            fmt::print("{}\n", vm_json.dump(2));
         }
     }
 

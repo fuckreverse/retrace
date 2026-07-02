@@ -29,6 +29,7 @@ bool CliOptions::has_analysis_option() const {
            opt_rpc || opt_mcp || opt_mcp_http || opt_streaming || opt_stats_only ||
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
+           opt_vm_abstract ||
            opt_index_build ||
            !run_pass_names.empty() ||
            opt_cache_list ||
@@ -95,6 +96,11 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --syscall-intercept           Extract crypto/system API call params (auto-selects per platform)\n");
     fmt::print(stderr, "  --syscall-intercept-bytes <N> Bytes to capture per pointer arg (default: 64)\n");
     fmt::print(stderr, "  --taint-source-annotation     Annotate backward taint leaf sources with ObjC getter context\n");
+    fmt::print(stderr, "  --vm-abstract                 Detect VM dispatcher, extract handlers, abstract execution\n");
+    fmt::print(stderr, "  --vm-dispatcher <hex>         Hint: dispatcher loop header PC (hex)\n");
+    fmt::print(stderr, "  --vm-indirect-br <hex>        Hint: indirect branch PC inside dispatcher (hex)\n");
+    fmt::print(stderr, "  --vm-pc-reg <index>           Hint: VM program counter register index (0-28)\n");
+    fmt::print(stderr, "  --vm-handler <hex>            Hint: handler entry PC (hex, repeatable)\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
     fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
     fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
@@ -247,6 +253,22 @@ CliOptions parse_args(int argc, char** argv) {
             opts.syscall_intercept_capture_bytes = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--taint-source-annotation") {
             opts.opt_taint_source_annotation = true;
+        } else if (arg == "--vm-abstract") {
+            opts.opt_vm_abstract = true;
+        } else if (arg == "--vm-dispatcher" && i + 1 < argc) {
+            opts.vm_dispatcher_pc = std::stoull(argv[++i], nullptr, 16);
+        } else if (arg == "--vm-indirect-br" && i + 1 < argc) {
+            opts.vm_indirect_br_pc = std::stoull(argv[++i], nullptr, 16);
+        } else if (arg == "--vm-pc-reg" && i + 1 < argc) {
+            auto val = std::stoul(argv[++i]);
+            if (val > 28) {
+                fmt::print(stderr, "Error: --vm-pc-reg must be 0-28 (x0-x28)\n");
+                opts.parse_status = 1;
+                return opts;
+            }
+            opts.vm_pc_reg = static_cast<uint8_t>(val);
+        } else if (arg == "--vm-handler" && i + 1 < argc) {
+            opts.vm_handler_pcs.push_back(std::stoull(argv[++i], nullptr, 16));
         } else if (arg == "--memread" && i + 3 < argc) {
             opts.opt_memread = true;
             opts.memread_addr = std::stoull(argv[++i], nullptr, 16);

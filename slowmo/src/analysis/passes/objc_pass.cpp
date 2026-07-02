@@ -232,12 +232,14 @@ public:
     ObjcCollector(MemoryModel& memory, RegisterFile& regfile,
                   CodeTable& code_table,
                   const std::string& class_filter,
+                  const std::string& selector_filter,
                   uint64_t start_inst_id, uint64_t end_inst_id,
                   ProgressFn progress_fn = nullptr)
         : memory_(memory)
         , regfile_(regfile)
         , code_table_(code_table)
         , class_filter_(class_filter)
+        , selector_filter_(selector_filter)
         , range_start_(start_inst_id)
         , range_end_(end_inst_id)
         , progress_fn_(std::move(progress_fn))
@@ -311,6 +313,12 @@ public:
             }
         }
         msg.selector_name = sel_it->second;  // cheap copy from cache
+
+        // Apply selector filter if set (substring match)
+        if (!selector_filter_.empty() &&
+            msg.selector_name.find(selector_filter_) == std::string::npos) {
+            return;
+        }
 
         // ─── Extract method arguments (x2-x7) ────────────────────────────
         uint8_t sel_arg_count = count_selector_args(msg.selector_name);
@@ -398,6 +406,7 @@ private:
     RegisterFile& regfile_;
     CodeTable& code_table_;
     const std::string& class_filter_;
+    const std::string& selector_filter_;
     uint64_t range_start_;
     uint64_t range_end_;
     ProgressFn progress_fn_;
@@ -604,7 +613,8 @@ PassResult ObjcPass::run(PassContext& ctx) {
     if (end == 0) end = index.inst_count();
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (class_filter_.empty() && range.is_full_trace()) {
+    const bool has_filter = !class_filter_.empty() || !selector_filter_.empty();
+    if (!has_filter && range.is_full_trace()) {
         std::string blob;
         if (index.load_pass_blob("objc", blob)) {
             ObjcResult cached;
@@ -710,7 +720,14 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     }
                     msg.selector_name = sel_it->second;
 
+                    // Apply selector filter if set (substring match)
+                    if (!selector_filter_.empty() &&
+                        msg.selector_name.find(selector_filter_) == std::string::npos) {
+                        goto skip_objc;
+                    }
+
                     // Extract arguments (x2-x7)
+                    {
                     uint8_t sel_arg_count = count_selector_args(msg.selector_name);
                     if (sel_arg_count == 0 && msg.selector_name.find("0x") == 0) {
                         sel_arg_count = OBJC_MAX_ARGS;
@@ -757,6 +774,8 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
                     // Store message
                     result.messages.push_back(std::move(msg));
+                    }  // end argument extraction scope
+                skip_objc:;
                 }
             }
             offset += sizeof(qbditrace::qbditrace_objc_head_t);
@@ -773,7 +792,7 @@ PassResult ObjcPass::run(PassContext& ctx) {
     }
 
     // ─── Persist result for future sessions ───────────────────────────────
-    if (class_filter_.empty() && range.is_full_trace()) {
+    if (!has_filter && range.is_full_trace()) {
         std::string blob = objc_serialize(result);
         if (!blob.empty()) {
             index.save_pass_blob("objc", blob.data(), blob.size());

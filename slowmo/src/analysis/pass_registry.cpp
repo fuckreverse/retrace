@@ -44,6 +44,7 @@
 #include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
+#include "analysis/passes/vm_abstract_pass.h"
 
 #include "io/index_builder.h"  // IndexStats (for index_build summary)
 
@@ -228,6 +229,7 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
                             : ctx.range_end;
         return std::make_unique<DataflowGraphPass>(std::move(c));
     }
+    if (name == "vm_abstract")         return std::make_unique<VMAbstractPass>();
 
     // Should be unreachable: catalog promises a case for every entry.
     return nullptr;
@@ -288,6 +290,7 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         // — Misc —
         {"thread",                "Threads",       "Thread timeline / switching",                            PassCategory::Misc,      PassDefault::Yes},
         {"thread_filter",         "Thread Filter", "Per-thread instruction bitmaps for filtering",           PassCategory::Misc,      PassDefault::No},
+        {"vm_abstract",           "VM Abstract",   "VM dispatcher detection, handler extraction, execution abstraction", PassCategory::Structure, PassDefault::No},
     };
     return catalog;
 }
@@ -547,6 +550,12 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
         if (auto* r = try_get<ThreadFilterResult>(result))
             return fmt::format("threads: {}, filtered: {}",
                                r->thread_count, r->is_filtered ? "yes" : "no");
+    }
+    if (name == "vm_abstract") {
+        if (auto* r = try_get<VMAbstractResult>(result))
+            return fmt::format("dispatcher: {:#x}, {} handlers, {} steps",
+                               r->dispatcher.loop_header_pc,
+                               r->handlers.size(), r->total_vm_steps);
     }
 
     return "ok";

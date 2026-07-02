@@ -156,6 +156,14 @@ namespace enc {
     static uint32_t svc(uint16_t imm) {
         return 0xD4000001u | ((uint32_t)imm << 5);
     }
+    // BR Xn — unconditional indirect branch (register)
+    static uint32_t br(int rn) {
+        return 0xD61F0000u | (rn << 5);
+    }
+    // BLR Xn — branch with link to register
+    static uint32_t blr(int rn) {
+        return 0xD63F0000u | (rn << 5);
+    }
 } // namespace enc
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -338,6 +346,64 @@ struct TraceWriter {
         h.kind = QBDITRACE_REC_SVC; h.pc = pc; h.syscall_no = no;
         h.args[0] = a0; h.args[1] = a1;
         fwrite(&h, sizeof(h), 1, fp);
+    }
+
+    /// Represents a single inline string capture to be written with emit_capicall().
+    struct CapiStr {
+        uint8_t     arg_idx  = 0;
+        uint8_t     flags    = 0;   // QBDITRACE_SF_* bits
+        std::string value;          // content (without trailing NUL)
+    };
+
+    /// Emit a REC_CAPICALL record with optional inline string captures.
+    /// @param api_id  qbditrace_capi_id_t value (0 = unknown)
+    /// @param pc      call-site PC inside the traced range
+    /// @param target  runtime address of the called function
+    /// @param args    up to 8 argument register values (x0..x7)
+    /// @param strs    optional inline string captures (up to 4)
+    void emit_capicall(uint8_t api_id, uint64_t pc, uint64_t target,
+                       const std::vector<uint64_t>& args,
+                       const std::vector<CapiStr>& strs = {}) {
+        // Cap counts at format limits.
+        uint8_t arg_count = static_cast<uint8_t>(std::min<size_t>(args.size(), 8));
+        uint8_t str_count = static_cast<uint8_t>(
+            std::min<size_t>(strs.size(), QBDITRACE_CAPICALL_MAX_STR_CAPS));
+
+        qbditrace::qbditrace_capicall_head_t h = {};
+        h.kind      = QBDITRACE_REC_CAPICALL;
+        h.api_id    = api_id;
+        h.arg_count = arg_count;
+        h.str_count = str_count;
+        h.pc        = pc;
+        h.target    = target;
+        for (uint8_t i = 0; i < arg_count; ++i) h.args[i] = args[i];
+        fwrite(&h, sizeof(h), 1, fp);
+
+        // Write variable-length string payloads.
+        for (uint8_t si = 0; si < str_count; ++si) {
+            const auto& s = strs[si];
+            uint8_t slen = static_cast<uint8_t>(
+                std::min<size_t>(s.value.size(), QBDITRACE_CAPICALL_MAX_STR_BYTES));
+
+            qbditrace::qbditrace_capicall_str_t sh = {};
+            sh.str_arg_idx = s.arg_idx;
+            sh.str_len     = slen;
+            sh.str_flags   = s.flags;
+            sh._reserved   = 0;
+            fwrite(&sh, sizeof(sh), 1, fp);
+
+            // Write content bytes + NUL, padded to 4-byte alignment.
+            uint16_t data_bytes = static_cast<uint16_t>(slen + 1);  // content + NUL
+            uint16_t padded = (data_bytes + 3u) & ~3u;
+
+            // Write content + NUL
+            fwrite(s.value.data(), 1, slen, fp);
+            char nul = '\0';
+            fwrite(&nul, 1, 1, fp);
+            // Padding bytes
+            uint16_t pad = padded - data_bytes;
+            for (uint16_t p = 0; p < pad; ++p) fwrite(&nul, 1, 1, fp);
+        }
     }
 
     void emit_objc(uint64_t pc, uint64_t recv, uint64_t sel, const char* cls) {

@@ -35,6 +35,8 @@ mindmap
       loop_semantics
       algorithm_summary
       objc_crypto
+    混淆/VM保护
+      vm_abstract
     自动化接入
       CLI
       RPC
@@ -173,6 +175,7 @@ mindmap
 | ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点（仅 Darwin 目标） |
 | ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑（仅 Darwin 目标） |
 | 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL） |
+| VMP 抽象 | `--vm-abstract`, `vm_abstract` | 检测虚拟机 dispatcher、提取 handler、推断 VM-PC、解码 opcode、推断架构类型 |
 
 典型命令：
 
@@ -224,7 +227,7 @@ mindmap
 
 ### MCP 工具分组
 
-当前实现共 **46 个工具**，分为：
+当前实现共 **47 个工具**，分为：
 
 - Core / trace / query / taint / graph：基础 trace 查询与图分析
 - Analysis / search / pass：高层分析与 pass 封装
@@ -267,6 +270,7 @@ mindmap
 | 我想知道输入往哪流了 | `taint`, `critical_path`, `dataflow_graph` |
 | 我想知道代码结构 | `function`, `xref`, `cfg`, `call_graph`, `loops` |
 | 我想知道是不是某个算法 | `pattern`, `constants`, `loop_semantics`, `algorithm_summary` |
+| 我想知道代码是不是被 VM 保护了 | `vm_abstract` |
 | 我想知道某段内存当时的值 | `memread`, `memory_snapshot`, `memory_strings` |
 | 我想让 AI 自动分析 | `--mcp` 或 `--mcp-http` |
 | 我想边录边看 | `--streaming` |

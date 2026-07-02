@@ -214,6 +214,15 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
             }
             break;
         }
+        case RecordKind::CapiCall: {
+            if (inst_id >= start_inst_id) {
+                auto capi = rec.as_capicall();
+                for (auto* c : active) {
+                    c->on_capicall(inst_id, capi);
+                }
+            }
+            break;
+        }
         case RecordKind::Objc: {
             if (inst_id >= start_inst_id) {
                 auto objc = rec.as_objc();

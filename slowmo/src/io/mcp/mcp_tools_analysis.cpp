@@ -39,6 +39,7 @@
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/literal_search_pass.h"
+#include "analysis/passes/vm_abstract_pass.h"
 
 #include <fmt/core.h>
 
@@ -218,15 +219,20 @@ void TenetMcpService::register_analysis_tools() {
     register_tool(
         {"objc_messages",
          "Analyze Objective-C message sends (objc_msgSend calls) in the "
-         "trace. Returns class names, selectors, arguments, and return values.",
+         "trace. Returns class names, selectors, arguments, and return values. "
+         "Both filters use substring matching and can be combined.",
          {{"type", "object"},
           {"properties", {
-              {"class_filter", {{"type", "string"}, {"description", "Filter by class name (optional)"}}}
+              {"class_filter",    {{"type", "string"}, {"description", "Filter by class name (exact match, optional)"}}},
+              {"selector_filter", {{"type", "string"}, {"description", "Filter by selector name substring (e.g. 'encryptData' matches 'encryptData:withKey:', optional)"}}}
           }}}},
         [this](const json& args) -> json {
             auto pass = std::make_unique<ObjcPass>();
             if (args.contains("class_filter")) {
                 pass->set_class_filter(args["class_filter"].get<std::string>());
+            }
+            if (args.contains("selector_filter")) {
+                pass->set_selector_filter(args["selector_filter"].get<std::string>());
             }
             pm_->register_pass(std::move(pass));
             const auto& result = require_pass<ObjcResult>(pm_, "objc", "ObjC pass failed");
@@ -944,14 +950,17 @@ void TenetMcpService::register_pass_tools() {
         {"trace_diff",
          "Compare two instruction ranges in the trace. Shows register and "
          "memory state differences, useful for analyzing different loop "
-         "iterations or comparing function calls.",
+         "iterations or comparing function calls. "
+         "Supports pagination via offset/limit on the divergence segments.",
          {{"type", "object"},
           {"properties", {
               {"range_a_start", {{"type", "integer"}, {"description", "First range start inst_id"}}},
               {"range_a_end",   {{"type", "integer"}, {"description", "First range end inst_id"}}},
               {"range_b_start", {{"type", "integer"}, {"description", "Second range start inst_id"}}},
               {"range_b_end",   {{"type", "integer"}, {"description", "Second range end inst_id"}}},
-              {"trace_b_path",  {{"type", "string"},  {"description", "Optional: path to trace B file for cross-file comparison. Empty = same trace."}}}
+              {"trace_b_path",  {{"type", "string"},  {"description", "Optional: path to trace B file for cross-file comparison. Empty = same trace."}}},
+              {"offset",        {{"type", "integer"}, {"description", "Pagination: skip first N divergence segments"}, {"default", 0}}},
+              {"limit",         {{"type", "integer"}, {"description", "Pagination: max segments per page (max 1000)"}, {"default", 200}}}
           }},
           {"required", json::array({"range_a_start", "range_a_end", "range_b_start", "range_b_end"})}}},
         [this](const json& args) -> json {
@@ -967,9 +976,13 @@ void TenetMcpService::register_pass_tools() {
             pm_->register_pass(std::make_unique<TraceDiffPass>(std::move(cfg)));
             const auto& result = require_pass<TraceDiffResult>(pm_, "trace_diff", "Trace diff failed");
 
+            size_t offset = args.value("offset", size_t(0));
+            size_t limit = std::min(args.value("limit", size_t(200)), size_t(1000));
+            size_t start_i = std::min(offset, result.segments.size());
+            size_t end_i = std::min(start_i + limit, result.segments.size());
+
             json segs_arr = json::array();
-            size_t limit = std::min(result.segments.size(), size_t(200));
-            for (size_t i = 0; i < limit; i++) {
+            for (size_t i = start_i; i < end_i; i++) {
                 const auto& s = result.segments[i];
                 segs_arr.push_back({
                     {"start_inst_a", s.start_inst_a},
@@ -985,7 +998,13 @@ void TenetMcpService::register_pass_tools() {
                     {"skip_b", s.skip_b}
                 });
             }
+            bool has_more = end_i < result.segments.size();
             return {{"segments", std::move(segs_arr)},
+                    {"total_segments", result.segments.size()},
+                    {"offset", offset},
+                    {"returned", end_i - start_i},
+                    {"has_more", has_more},
+                    {"next_offset", has_more ? end_i : offset},
                     {"matched_count", result.matched_count},
                     {"total_diverged", result.total_diverged},
                     {"resync_count", result.resync_count},
@@ -1080,6 +1099,175 @@ void TenetMcpService::register_pass_tools() {
             return {{"total_functions", fn_result.functions.size()},
                     {"matches", std::move(matches)},
                     {"truncated", fn_result.functions.size() > limit && query.empty()}};
+        }
+    );
+
+    // ── vm_abstract ──────────────────────────────────────────────────────
+    register_tool(
+        {"vm_abstract",
+         "Detect and analyze Virtual Machine (VM) based obfuscation in the trace. "
+         "Identifies the VM dispatcher loop, extracts handler set, decodes VM opcodes, "
+         "and reconstructs the VM execution trace (bytecode → handler mapping). "
+         "Accepts optional static hints from IDA (dispatcher PC, handler entries, "
+         "VM-PC register, opcode format) to improve accuracy. Without hints, "
+         "auto-detects dispatcher via loop + indirect-branch heuristics. "
+         "Use this when you suspect VM/VMP protection (large while-switch pattern, "
+         "many indirect branches from a hot loop).",
+         {{"type", "object"},
+          {"properties", {
+              {"dispatcher_pc",      {{"type", "string"},  {"description", "Hint: PC of the dispatch loop header (hex). From IDA static analysis."}}},
+              {"indirect_branch_pc", {{"type", "string"},  {"description", "Hint: PC of the BR/BLR instruction that selects handlers (hex)."}}},
+              {"handler_entry_pcs",  {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: known handler entry PCs (hex array). From IDA jump table analysis."}}},
+              {"vm_pc_reg",          {{"type", "string"},  {"description", "Hint: host register holding VM program counter (e.g. 'x19', 'x20')."}}},
+              {"bytecode_base",      {{"type", "string"},  {"description", "Hint: base address of bytecode buffer (hex)."}}},
+              {"opcode_size",        {{"type", "integer"}, {"description", "Hint: bytes per opcode (1, 2, or 4)."}}},
+              {"opcode_mask",        {{"type", "string"},  {"description", "Hint: mask applied to extract opcode from loaded word (hex, e.g. '0xFF')."}}},
+              {"opcode_shift",       {{"type", "integer"}, {"description", "Hint: right-shift after masking to get opcode index."}}},
+              {"ctx_base_reg",       {{"type", "string"},  {"description", "Hint: register holding VM context struct pointer (e.g. 'x21')."}}},
+              {"auto_detect",        {{"type", "boolean"}, {"description", "Auto-detect dispatcher if no hint provided"}, {"default", true}}},
+              {"steps_offset",       {{"type", "integer"}, {"description", "Pagination: skip first N VM steps"}, {"default", 0}}},
+              {"steps_limit",        {{"type", "integer"}, {"description", "Pagination: max VM steps per page (max 2000)"}, {"default", 500}}}
+          }}}},
+        [this](const json& args) -> json {
+            if (!pm_) throw std::runtime_error("PassManager not available");
+
+            VMConfig cfg;
+            cfg.auto_detect = args.value("auto_detect", true);
+
+            // ── Static hints from IDA ──
+            if (args.contains("dispatcher_pc")) {
+                DispatcherHint dh;
+                dh.loop_header_pc = unrebase(parse_hex(args["dispatcher_pc"].get<std::string>()));
+                if (args.contains("indirect_branch_pc")) {
+                    dh.indirect_branch_pc = unrebase(parse_hex(args["indirect_branch_pc"].get<std::string>()));
+                }
+                cfg.dispatcher = dh;
+            }
+
+            if (args.contains("handler_entry_pcs")) {
+                for (const auto& pc_str : args["handler_entry_pcs"]) {
+                    cfg.handler_entry_pcs.push_back(unrebase(parse_hex(pc_str.get<std::string>())));
+                }
+            }
+
+            if (args.contains("vm_pc_reg")) {
+                VMPCHint vph;
+                vph.reg = parse_reg(args.at("vm_pc_reg"));
+                if (args.contains("bytecode_base")) {
+                    vph.bytecode_base = parse_hex(args["bytecode_base"].get<std::string>());
+                }
+                cfg.vm_pc = vph;
+            }
+
+            if (args.contains("opcode_size")) {
+                OpcodeFormatHint ofh;
+                ofh.opcode_size = static_cast<uint8_t>(args["opcode_size"].get<int>());
+                if (args.contains("opcode_mask")) {
+                    ofh.opcode_mask = parse_hex(args["opcode_mask"].get<std::string>());
+                }
+                ofh.opcode_shift = static_cast<uint8_t>(args.value("opcode_shift", 0));
+                cfg.opcode_format = ofh;
+            }
+
+            if (args.contains("ctx_base_reg")) {
+                VMContextHint vch;
+                vch.ctx_base_reg = parse_reg(args.at("ctx_base_reg"));
+                cfg.vm_context = vch;
+            }
+
+            // ── Run the pass ──
+            tenet::register_pass_by_name(*pm_, "xref");
+            tenet::register_pass_by_name(*pm_, "cfg");
+            tenet::register_pass_by_name(*pm_, "loop");
+            pm_->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
+            const auto& result = require_pass<VMAbstractResult>(pm_, "vm_abstract", "VM abstract pass failed");
+
+            // ── Build response ──
+            json output;
+
+            // Dispatcher info
+            output["dispatcher"] = {
+                {"loop_header_pc",     fmt::format("0x{:X}", rebase(result.dispatcher.loop_header_pc))},
+                {"indirect_branch_pc", fmt::format("0x{:X}", rebase(result.dispatcher.indirect_branch_pc))},
+                {"dispatch_type",      dispatch_type_name(result.dispatcher.dispatch_type)},
+                {"iteration_count",    result.dispatcher.iteration_count},
+                {"confidence",         result.dispatcher.confidence}
+            };
+
+            // State registers
+            {
+                json state_regs_arr = json::array();
+                for (uint8_t r : result.dispatcher.state_regs) {
+                    state_regs_arr.push_back(kRegNames[r]);
+                }
+                output["dispatcher"]["state_regs"] = std::move(state_regs_arr);
+            }
+
+            // Architecture
+            output["arch_type"] = vm_arch_name(result.arch_type);
+            if (result.vm_pc_reg != 0xFF) {
+                output["vm_pc_reg"] = std::string(kRegNames[result.vm_pc_reg]);
+            }
+            if (result.bytecode_base != 0) {
+                output["bytecode_range"] = {
+                    {"start", fmt::format("0x{:X}", result.bytecode_base)},
+                    {"end",   fmt::format("0x{:X}", result.bytecode_end)}
+                };
+            }
+
+            // Handlers
+            json handlers_arr = json::array();
+            for (const auto& h : result.handlers) {
+                json hj = {
+                    {"entry_pc",        fmt::format("0x{:X}", rebase(h.entry_pc))},
+                    {"execution_count", h.execution_count},
+                    {"label",           h.label}
+                };
+                if (!h.opcode_values.empty()) {
+                    json opcodes = json::array();
+                    for (auto ov : h.opcode_values) opcodes.push_back(fmt::format("0x{:X}", ov));
+                    hj["opcode_values"] = std::move(opcodes);
+                }
+                handlers_arr.push_back(std::move(hj));
+            }
+            output["handlers"] = std::move(handlers_arr);
+            output["handler_count"] = result.handlers.size();
+
+            // VM execution steps (paginated)
+            size_t steps_offset = args.value("steps_offset", size_t(0));
+            size_t steps_limit = std::min(args.value("steps_limit", size_t(500)), size_t(2000));
+            size_t steps_start = std::min(steps_offset, result.steps.size());
+            size_t steps_end = std::min(steps_start + steps_limit, result.steps.size());
+
+            json steps_arr = json::array();
+            for (size_t i = steps_start; i < steps_end; i++) {
+                const auto& s = result.steps[i];
+                json sj = {
+                    {"inst_id_start",   s.inst_id_start},
+                    {"inst_id_end",     s.inst_id_end},
+                    {"handler_entry_pc", fmt::format("0x{:X}", rebase(s.handler_entry_pc))}
+                };
+                if (s.opcode_valid) sj["opcode"] = fmt::format("0x{:X}", s.opcode_value);
+                if (s.vm_pc_valid) sj["vm_pc"] = fmt::format("0x{:X}", s.vm_pc_value);
+
+                // Add handler label if available
+                const VMHandler* handler = result.handler_at(s.handler_entry_pc);
+                if (handler && !handler->label.empty()) sj["label"] = handler->label;
+
+                steps_arr.push_back(std::move(sj));
+            }
+            output["steps"] = std::move(steps_arr);
+            output["total_vm_steps"] = result.total_vm_steps;
+            output["steps_offset"] = steps_offset;
+            output["steps_returned"] = steps_end - steps_start;
+            bool has_more_steps = steps_end < result.steps.size();
+            output["has_more_steps"] = has_more_steps;
+            if (has_more_steps) output["next_steps_offset"] = steps_end;
+
+            // Statistics
+            output["total_native_instructions"] = result.total_native_instructions;
+
+            return output;
         }
     );
 }

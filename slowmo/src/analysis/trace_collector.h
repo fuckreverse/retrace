@@ -41,6 +41,11 @@ public:
     /// Called for Svc records.
     virtual void on_svc(uint64_t inst_id, const SvcView& svc) { (void)inst_id; (void)svc; }
 
+    /// Called for CapiCall records (C/platform API interception with inline strings).
+    virtual void on_capicall(uint64_t inst_id, const CapiCallView& capi) {
+        (void)inst_id; (void)capi;
+    }
+
     /// Called for Objc records (Objective-C message sends).
     /// inst_id is the current instruction counter at the point of the record.
     virtual void on_objc(uint64_t inst_id, const ObjcView& objc) {

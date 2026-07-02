@@ -580,6 +580,7 @@ function resolveCApiFunctions() {
   var seen = {};  /* addr string => true, dedup */
 
   function addEntry(addrPtr, apiId, nArgs, strArgs) {
+    if (!addrPtr || addrPtr.isNull()) return;  /* skip NULL/invalid addresses */
     var key = addrPtr.toString();
     if (seen[key]) return;
     seen[key] = true;
@@ -850,6 +851,17 @@ function installGCDHooks(opts) {
 // ---------------------------------------------------------------------------
 
 function main() {
+  try {
+    mainImpl();
+  } catch (e) {
+    /* Top-level guard: catch any unhandled exception so Python always
+     * receives a structured error message instead of a silent crash. */
+    logError('fatal exception in main: ' + e.message + (e.stack ? '\n' + e.stack : ''));
+    send({ type: 'error', text: 'qbditrace agent fatal: ' + e.message });
+  }
+}
+
+function mainImpl() {
   status('initializing');
 
   const dylib = loadDylib(CONFIG.dylibPath);
@@ -984,7 +996,16 @@ function main() {
     const cfg = buildConfigStruct(Object.assign({}, baseOpts, { outputPath: outPath }));
     const rc = fn.configure(cfg);
     if (rc !== 0) {
-      fail('qbditrace_configure failed (trace #' + traceIndex + '), rc=' + rc);
+      /* First trace: fatal — cannot proceed without a valid configuration.
+       * Subsequent traces in multi mode: warn and keep the old config active
+       * so previous traces are not lost. */
+      if (traceIndex <= 1) {
+        fail('qbditrace_configure failed (trace #' + traceIndex + '), rc=' + rc);
+      } else {
+        logError('qbditrace_configure failed for trace #' + traceIndex +
+                 ', rc=' + rc + ' — skipping this trace');
+        return null;
+      }
     }
     log('configured trace #' + traceIndex +
         '. output = ' + fn.outputPath().readUtf8String());
@@ -1129,9 +1150,18 @@ function main() {
 
         const wantMore = (traceCount < maxTraces);
         if (wantMore && CONFIG.rehook !== false) {
-          currentCfg = configureForTrace(traceCount + 1);
-          installHook();
-          log('hook re-installed for trace #' + (traceCount + 1));
+          const nextCfg = configureForTrace(traceCount + 1);
+          if (nextCfg) {
+            currentCfg = nextCfg;
+            installHook();
+            log('hook re-installed for trace #' + (traceCount + 1));
+          } else {
+            /* configure failed for next trace — stop gracefully */
+            removeHook();
+            log('configure failed for trace #' + (traceCount + 1) +
+                ', stopping after ' + traceCount + ' trace(s).');
+            status('all_done', { total: traceCount });
+          }
         } else {
           removeHook();
           log('all ' + traceCount + ' trace(s) captured. Hook permanently removed.');
@@ -1190,9 +1220,16 @@ function main() {
 // ===========================================================================
 
 recv('config', function (message) {
-  CONFIG = message.payload;
-  log('config received from Python loader');
-  main();
+  try {
+    CONFIG = message.payload;
+    log('config received from Python loader');
+    main();
+  } catch (e) {
+    /* Catch any exception that escapes even the main() guard (e.g. during
+     * CONFIG parsing itself), so Python always gets a structured error. */
+    logError('fatal exception in recv handler: ' + e.message);
+    send({ type: 'error', text: 'qbditrace agent fatal: ' + e.message });
+  }
 });
 
 status('agent_loaded');

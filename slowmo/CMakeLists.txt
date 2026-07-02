@@ -376,6 +376,7 @@ src/core/register_file.cpp
     src/analysis/passes/constant_materialization_pass.cpp
     src/analysis/passes/loop_pass.cpp
     src/analysis/passes/loop_semantics_pass.cpp
+    src/analysis/passes/vm_abstract_pass.cpp
     src/analysis/passes/algorithm_summary_pass.cpp
     src/analysis/passes/trace_diff_pass.cpp
     src/analysis/passes/symbol_annotation_pass.cpp

@@ -476,6 +476,16 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 
 # 全部算法分析一次跑完
 ./tenet trace.bin --pattern --constants --loop-semantics --algorithm-summary
+
+# VMP（虚拟机保护）执行抽象
+./tenet trace.bin --vm-abstract
+
+# 带静态 hint（dispatcher + VM-PC 寄存器 + handler 地址）
+./tenet trace.bin --vm-abstract \
+    --vm-dispatcher-pc 0x100005000 \
+    --vm-indirect-br-pc 0x100005014 \
+    --vm-pc-reg 19 \
+    --vm-handler-pc 0x100006000 --vm-handler-pc 0x100007000
 ```
 
 **内存与字符串：**
@@ -674,7 +684,7 @@ cat /tmp/pcring.txt
 | [`qbditrace/README.md`](../../qbditrace/README.md) | tracer 详细设计、C ABI 参考、Benchmark 套件 |
 | [`docs/capabilities.md`](capabilities.md) | tenet 全部能力按场景的导航地图 |
 | [`docs/trace-format.md`](trace-format.md) | 二进制格式完整规范（v4/v5/v7/flags） |
-| [`docs/analysis-layer.md`](analysis-layer.md) | 36 个 Pass 的分类、依赖和调度 |
+| [`docs/analysis-layer.md`](analysis-layer.md) | 37 个 Pass 的分类、依赖和调度 |
 | [`docs/ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP 详细说明 |
 | [`docs/pass-cookbook.md`](pass-cookbook.md) | 新增自定义 Pass 的开发指南 |
 | [`docs/profiling.md`](profiling.md) | 性能调优与 Instruments 使用 |

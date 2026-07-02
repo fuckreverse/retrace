@@ -350,8 +350,9 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--record` | 31 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC |
+| `--record` | 63 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC, 32=CAPI |
 | `--no-objc` | off | 关闭 ObjC msgSend 解析 |
+| `--capi` | off | 启用 C API 拦截（自动解析常见函数地址并填入 `capi_funcs[]`）。配合 `--record 32` 或默认 `--record 63` 生效 |
 | `--anchor-interval` | 0 (默认1024) | 每 N 条指令打全量快照 |
 | `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
 | `--no-embed-code` | off | 关闭内嵌码表 |
@@ -602,6 +603,9 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 | `disable_embed_code` | `uint32_t` | 非零关闭内嵌码表（默认 0 = 开启，反转语义） |
 | `n_exclude_ranges` | `uint32_t` | 排除区间数量（0..8） |
 | `exclude_ranges[8]` | `struct{u64,u64}` | 排除区间数组，每项 {start, end}（运行时地址）。区间内代码以原生速度执行，不产生 trace 记录。最多 8 个 |
+| `enable_capi_intercept` | `uint32_t` | 非零启用 C API 拦截（需同时在 `record` 中设置 `QBDITRACE_REC_CAPI`）。Frida loader 负责将已知函数地址填入 `capi_funcs[]`；拦截命中时发射 REC_CAPICALL 记录 |
+| `n_capi_funcs` | `uint32_t` | `capi_funcs[]` 中有效项数（0..128） |
+| `capi_funcs[128]` | `struct{addr,api_id,n_args,str_args}` | C API 函数表。每项：运行时地址 / api_id / 参数数量 / 字符串参数位掩码（bit i 表示 args[i] 是指针需解引用捕获）。由 Frida loader 在 `qbditrace_configure()` 前通过 `Module.findExportByName` 填充 |
 
 **`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
 `run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。
@@ -674,6 +678,11 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
   - `OBJC (5)`：`{variant, pc, recv(self), sel, cls[48]}`（cls 为运行时类名，
     最多 47 字符，NUL 结尾；tagged pointer / normal object 均可解析）
   - `CODE (6)`：`{kind,size,pc}` + size 个原始指令字节（AArch64 = 4B）
+  - `CAPICALL (7)`：`{api_id, arg_count, str_count, pc, target, args[8]}` +
+    str_count 个可变长字符串捕获（88 字节固定头 + 可变尾）。当 `enable_capi_intercept != 0`
+    且 XFER_CALL 目标命中 `capi_funcs[]` 时发射；携带调用点的参数寄存器与指针参数的
+    内联字符串内容（最多 4 个，每个最多 255 字节）。`api_id` 来自 `qbditrace_capi_id_t`
+    枚举（134=CCCrypt，135=CCHmac，1=memcpy，22=strcmp 等）
 - 寄存器索引采用 QBDI GPR 顺序：0..28=x0..x28，29=fp，30=lr，31=sp，
   32=nzcv，33=pc。
 - 内存访问含 `value`（低 8B）+ `value_hi`（高 8B，用于 stp/NEON 9-16B store）。

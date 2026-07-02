@@ -64,6 +64,7 @@ Collector 可按记录类型覆写回调：
 - `on_code()`
 - `on_svc()`
 - `on_objc()`
+- `on_capicall()` — 处理 REC_CAPICALL（kind=7）记录；仅 `enable_capi_intercept` 开启时出现
 - `on_thread()`
 - `on_event()`
 
@@ -89,7 +90,7 @@ Collector 可按记录类型覆写回调：
 
 ## Pass 分类总览
 
-当前 `pass_catalog()` 注册了 **36 个 pass**，分成 7 类。
+当前 `pass_catalog()` 注册了 **37 个 pass**，分成 8 类。
 
 ### 1. Structure
 
@@ -124,6 +125,12 @@ Collector 可按记录类型覆写回调：
 | `objc_crypto` | 把密码学命中与 ObjC 调用上下文关联 |
 | `symbol_annotation` | 汇总结构与模式注释成统一标签层 |
 
+### 3b. Obfuscation / VM
+
+| pass | 主要用途 |
+|------|----------|
+| `vm_abstract` | VMP（虚拟机保护）执行抽象：检测 dispatcher 循环、提取 handler、推断 VM-PC、解码 opcode、推断架构类型、读取 VM context |
+
 ### 4. Memory / String
 
 | pass | 主要用途 |
@@ -141,7 +148,7 @@ Collector 可按记录类型覆写回调：
 | pass | 主要用途 |
 |------|----------|
 | `objc` | ObjC 消息发送解析（仅 Darwin 目标；Android/Linux 自动跳过，Unknown 时尽力运行） |
-| `syscall_intercept` | 按 target_os 自动选择 API 表（Darwin→CommonCrypto/Security.framework，Android/Linux→BoringSSL/OpenSSL，Unknown→两者都加载） |
+| `syscall_intercept` | 按 target_os 自动选择 API 表（Darwin→CommonCrypto/Security.framework，Android/Linux→BoringSSL/OpenSSL，Unknown→两者都加载）。三路数据来源（优先级递降）：① REC_CAPICALL（tracer 侧已解析，含内联字符串捕获，`from_capicall_record=true`）② REC_SVC（系统调用号分类）③ Event XFER_CALL 启发式（地址匹配 API 签名表） |
 
 ### 6. Profile / Trace
 
@@ -192,6 +199,9 @@ flowchart LR
     loop_semantics --> algorithm_summary
     function --> algorithm_summary
     call_graph --> algorithm_summary
+    xref --> vm_abstract
+    cfg --> vm_abstract
+    loop --> vm_abstract
 ```
 
 ### 当前实现注意点
@@ -204,7 +214,9 @@ flowchart LR
 - `taint_source_annotation` 依赖 `backward_taint + objc`。
 - `objc` 和 `objc_crypto` 在 target_os 为 Android/Linux 时自动跳过（返回空结果）。
 - `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
+- `syscall_intercept` 优先消费 REC_CAPICALL 记录（`on_capicall()`），已处理的 callee PC 写入 `capicall_seen_` 防止后续 XFER_CALL Event 重复生成记录；无 REC_CAPICALL 时降级为 XFER_CALL 启发式。
 - `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
+- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；支持 hint-driven 和 auto-detect 两种模式；通过 `VMConfig` 接收静态分析提供的 dispatcher / VM-PC / opcode format / context 等 hint。
 
 ## pass_registry.cpp 的作用
 
