@@ -291,6 +291,34 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --exclude-range 12000-13500 \
     --exclude-range A0000:200 \
     --output /var/mobile/Documents/trace.bin
+
+# ── Invoke 模式（主动调用） ──────────────────────────────
+# 直接调用目标函数并 trace，无需等待 App 触发
+
+# 传入 buffer + length，主动调用加密函数
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --attach \
+    --entry 0xEE91EC \
+    --invoke \
+    --args "bytes:aabbccdd0011" "int:6" "buf:64" \
+    --output /var/mobile/Documents/trace.bin
+
+# 用导出符号名 + 完整参数调用 CCCrypt
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --attach \
+    --entry _CCCrypt \
+    --invoke \
+    --args "int:0" "int:0" "str:mykey" "int:5" \
+           "str:plaintext" "int:9" "buf:64" "buf:8" \
+    --output /var/mobile/Documents/cccrypt.bin
+
+# ObjC 类型参数（iOS）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --attach \
+    --entry 0x1234 \
+    --invoke \
+    --args "nsstr:hello" "nsdata:aabbccdd" "int:0" \
+    --output /var/mobile/Documents/trace.bin
 ```
 
 ### 2.3 完整参数列表
@@ -329,7 +357,30 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--no-embed-code` | off | 关闭内嵌码表 |
 | `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。可多次指定，最多 8 个。该区间内代码以原生速度执行，不产生 trace 记录。适用于排除大循环（如内存校验） |
 
-**Trace 模式：**
+**Invoke 模式（主动调用）：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--invoke` | off | 主动调用入口函数并 trace，而非 hook 等待被动触发。需配合 `--args` 提供参数 |
+| `--args` | 无 | 类型化参数列表（最多 8 个），语法为 `TYPE:VALUE`。支持的类型见下表 |
+
+`--args` 支持的参数类型：
+
+| 类型 | 语法 | 说明 | 平台 |
+|------|------|------|------|
+| `int` | `int:42` 或 `int:0x1234` | 整数/指针立即数 | 全平台 |
+| `str` | `str:hello` | UTF-8 C 字符串（自动分配内存，传指针） | 全平台 |
+| `bytes` | `bytes:aabbccdd` | 原始字节 buffer（hex 编码，自动分配） | 全平台 |
+| `buf` | `buf:64` 或 `buf:0x100` | 零填充输出 buffer（指定大小），调用后自动 dump 前 64 字节 | 全平台 |
+| `nullptr` | `nullptr` | 空指针（无需值） | 全平台 |
+| `nsstr` | `nsstr:hello` | ObjC `NSString`（自动创建，传 handle） | iOS |
+| `nsdata` | `nsdata:aabbccdd` | ObjC `NSData`（从 hex 创建，传 handle） | iOS |
+| `nsnum` | `nsnum:42` | ObjC `NSNumber`（自动创建，传 handle） | iOS |
+| (裸整数) | `0x1234` 或 `42` | 不带前缀的数字自动当作 `int` | 全平台 |
+
+使用 `--invoke` 时，`--arg-count` 会从 `--args` 数量自动推断，`--trace-mode` 强制为 `once`。
+
+**Trace 模式（hook 被动模式）：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -366,14 +417,22 @@ Python loader 的执行流程：
 7. 等待 trace 完成或超时
 8. 清理退出
 
-JS agent 收到配置后：加载 dylib → 解析模块信息 → 对整个模块插桩 →
-`Interceptor.replace` 接管入口函数。当入口函数被调用时，agent 先
+JS agent 收到配置后，根据模式走不同路径：
+
+**Hook 模式**（默认）：加载 dylib → 解析模块信息 → 对整个模块插桩 →
+`Interceptor.replace` 接管入口函数。当入口函数被 App 调用时，agent 先
 `Interceptor.revert` 还原原始字节（确保 QBDI 读到真实指令而非 Frida 跳板），
 再用 QBDI 接管执行并 trace。执行期间，模块内的所有子调用、分支、循环全部被记录；
 模块外的系统库调用原生透传。入口函数返回后 `qbditrace_stop` 把 trace 刷盘。
 
 > 为什么先 revert：`Interceptor.replace` 会在函数入口写跳板，而 QBDI 直接从内存
 > 读指令执行。若不还原，QBDI 会 trace 到 Frida 跳板。
+
+**Invoke 模式**（`--invoke`）：加载 dylib → 解析模块信息 → 配置 tracer →
+`materializeArgs()` 将类型化参数描述符转换为 Frida `NativePointer`（分配内存、
+创建 ObjC 对象等）→ 直接调用 `qbditrace_run_call(retOut, func, argc, argv)`
+→ `qbditrace_stop()` 刷盘。不走 `Interceptor.replace`，不需要等待 App 触发。
+调用完成后自动 dump `buf` 类型参数的前 64 字节，方便快速查看输出结果。
 
 ### 2.5 --entry 偏移怎么取
 

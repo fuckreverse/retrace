@@ -56,6 +56,33 @@ Examples:
         --attach \\
         --entry 0xABC \\
         --output /var/mobile/Documents/trace.bin
+
+    # Invoke mode: actively call a function with typed arguments
+    python3 qbditrace_runner.py \\
+        --target com.example.app \\
+        --attach \\
+        --entry 0xEE91EC \\
+        --invoke \\
+        --args "bytes:aabbccdd0011" "int:32" "buf:64" \\
+        --output /var/mobile/Documents/trace.bin
+
+    # Invoke with ObjC types (iOS)
+    python3 qbditrace_runner.py \\
+        --target com.example.app \\
+        --attach \\
+        --entry 0x1234 \\
+        --invoke \\
+        --args "nsstr:hello" "nsdata:aabbccdd" "int:0" \\
+        --output /var/mobile/Documents/trace.bin
+
+    # Invoke with string and nullptr
+    python3 qbditrace_runner.py \\
+        --target com.example.app \\
+        --attach \\
+        --entry _CCCrypt \\
+        --invoke \\
+        --args "int:0" "int:0" "str:mykey" "int:5" "str:plaintext" "int:9" "buf:64" "buf:8" \\
+        --output /var/mobile/Documents/cccrypt.bin
 """
 
 import argparse
@@ -65,6 +92,96 @@ import signal
 import sys
 import threading
 import time
+
+
+# =============================================================================
+# Typed argument parsing for --invoke mode
+# =============================================================================
+
+# Supported argument types:
+#   int:N        — integer or pointer value (hex with 0x prefix, or decimal)
+#   str:TEXT      — UTF-8 C string, JS allocates and passes pointer
+#   bytes:HEX    — raw byte buffer from hex (e.g. bytes:aabbccdd)
+#   buf:SIZE     — zero-filled output buffer, size in decimal or 0xHex
+#   nullptr      — null pointer (0x0)
+#   nsstr:TEXT    — ObjC NSString (iOS only)
+#   nsdata:HEX   — ObjC NSData from hex bytes (iOS only)
+#   nsnum:N      — ObjC NSNumber from integer (iOS only)
+#   Bare value   — treated as int (e.g. 0x1234 or 42)
+
+def _parse_typed_arg(raw, parser):
+    """Parse a single TYPE:VALUE argument spec into {'type': ..., 'value': ...}."""
+    raw = raw.strip()
+
+    # nullptr is special — no colon, no value
+    if raw.lower() == 'nullptr':
+        return {'type': 'nullptr', 'value': None}
+
+    # Check for TYPE:VALUE syntax
+    if ':' in raw:
+        type_name, _, value = raw.partition(':')
+        type_name = type_name.lower().strip()
+
+        if type_name == 'int':
+            try:
+                return {'type': 'int', 'value': str(int(value.strip(), 0))}
+            except ValueError:
+                parser.error(f'--args: invalid int value: "{value}"')
+
+        elif type_name == 'str':
+            return {'type': 'str', 'value': value}
+
+        elif type_name == 'bytes':
+            # Validate hex string
+            hex_val = value.strip().replace(' ', '')
+            if len(hex_val) % 2 != 0:
+                parser.error(f'--args: bytes hex must have even length: "{value}"')
+            try:
+                bytes.fromhex(hex_val)
+            except ValueError:
+                parser.error(f'--args: invalid hex in bytes: "{value}"')
+            return {'type': 'bytes', 'value': hex_val}
+
+        elif type_name == 'buf':
+            try:
+                size = int(value.strip(), 0)
+                if size <= 0:
+                    parser.error(f'--args: buf size must be positive: "{value}"')
+                return {'type': 'buf', 'value': str(size)}
+            except ValueError:
+                parser.error(f'--args: invalid buf size: "{value}"')
+
+        elif type_name == 'nsstr':
+            return {'type': 'nsstr', 'value': value}
+
+        elif type_name == 'nsdata':
+            hex_val = value.strip().replace(' ', '')
+            if len(hex_val) % 2 != 0:
+                parser.error(f'--args: nsdata hex must have even length: "{value}"')
+            try:
+                bytes.fromhex(hex_val)
+            except ValueError:
+                parser.error(f'--args: invalid hex in nsdata: "{value}"')
+            return {'type': 'nsdata', 'value': hex_val}
+
+        elif type_name == 'nsnum':
+            try:
+                return {'type': 'nsnum', 'value': str(int(value.strip(), 0))}
+            except ValueError:
+                parser.error(f'--args: invalid nsnum value: "{value}"')
+
+        else:
+            # Unknown type prefix — might be a bare hex value with 0x: prefix
+            # (e.g. someone typed "0x1234" which has "0x1234" with partition "0x":"1234")
+            pass
+
+    # Bare value — try parsing as integer
+    try:
+        return {'type': 'int', 'value': str(int(raw, 0))}
+    except ValueError:
+        parser.error(f'--args: cannot parse argument: "{raw}". '
+                     f'Use TYPE:VALUE syntax (int:, str:, bytes:, buf:, nullptr, '
+                     f'nsstr:, nsdata:, nsnum:) or a bare integer.')
 
 
 # =============================================================================
@@ -106,9 +223,9 @@ def parse_args():
                             '(2) an exported symbol name like _CCCrypt. '
                             'Tracing starts when this function is called and ends '
                             'when it returns. All execution within --module is recorded.')
-    trace.add_argument('--arg-count', type=int, default=1,
+    trace.add_argument('--arg-count', type=int, default=None,
                        help='Number of integer arguments the entry function takes '
-                            '(default: 1, max: 8)')
+                            '(default: 1, max: 8). Auto-inferred from --args in invoke mode.')
     trace.add_argument('--range-size', type=lambda x: int(x, 0), default=None,
                        help='[Advanced] Fallback range size in bytes if module '
                             'resolution fails (hex). Normally not needed — the '
@@ -152,6 +269,25 @@ def parse_args():
                           'START:SIZE, hex). Can be specified multiple times (max 8). '
                           'Code in excluded ranges executes natively without recording. '
                           'Example: --exclude-range 0x1234-0x5678 --exclude-range 0xA000:0x200')
+
+    # --- Invoke mode ---
+    inv = p.add_argument_group('Invoke mode (active call)')
+    inv.add_argument('--invoke', action='store_true',
+                     help='Invoke the entry function immediately with the given '
+                          'arguments instead of hooking and waiting for a passive call. '
+                          'Requires --args to supply typed argument values.')
+    inv.add_argument('--args', nargs='+', default=[],
+                     help='Typed arguments for --invoke mode (max 8). Each argument '
+                          'uses TYPE:VALUE syntax. Supported types: '
+                          'int:N (integer/pointer, hex with 0x prefix), '
+                          'str:TEXT (UTF-8 string, passed as pointer), '
+                          'bytes:HEXDATA (raw byte buffer, e.g. bytes:aabbccdd), '
+                          'buf:SIZE (zero-filled output buffer, size in decimal or 0xHex), '
+                          'nullptr (null pointer, no value needed), '
+                          'nsstr:TEXT (ObjC NSString, iOS only), '
+                          'nsdata:HEXDATA (ObjC NSData from hex, iOS only), '
+                          'nsnum:N (ObjC NSNumber, iOS only). '
+                          'Bare integers (0x1234 or 42) without prefix are treated as int.')
 
     # --- Trace mode ---
     mode = p.add_argument_group('Trace mode')
@@ -198,6 +334,27 @@ def parse_args():
     except ValueError:
         # It's a symbol name
         args._entry_name = entry
+
+    # Validate and parse --invoke / --args
+    args._invoke_args = []
+    if args.invoke:
+        if len(args.args) > 8:
+            p.error('--args: maximum 8 arguments supported')
+        for raw in args.args:
+            args._invoke_args.append(_parse_typed_arg(raw, p))
+        # Auto-infer arg-count from --args if not explicitly set
+        if args.arg_count is None:
+            args.arg_count = len(args._invoke_args)
+        elif args.arg_count != len(args._invoke_args):
+            p.error(f'--arg-count ({args.arg_count}) does not match '
+                    f'number of --args ({len(args._invoke_args)})')
+        # Invoke mode forces trace-mode to "once" — no multi-trace
+        if args.trace_mode != 'once':
+            print('[!] WARNING: --invoke forces --trace-mode once', file=sys.stderr)
+            args.trace_mode = 'once'
+    else:
+        if args.arg_count is None:
+            args.arg_count = 1
 
     # Parse trace-mode
     if args.trace_mode == 'once':
@@ -281,6 +438,10 @@ def build_config(args):
         'traceGCD': args.trace_gcd,
         'gcdFilterByModule': not args.gcd_no_filter,
         'gcdMaxCaptures': args.gcd_max,
+
+        # Invoke mode
+        'invoke': args.invoke,
+        'invokeArgs': args._invoke_args,
     }
     return cfg
 
@@ -426,6 +587,10 @@ class TracerSession:
             pass  # Agent is ready, config will be sent
         elif event == 'initializing':
             print('[*] Agent initializing...')
+        elif event == 'invoke_start':
+            func_start = detail.get('funcStart', '?')
+            argc = detail.get('argc', '?')
+            print(f'[*] Invoking {func_start} with {argc} arg(s)...')
         elif event == 'hook_installed':
             func_start = detail.get('funcStart', '?')
             mode = detail.get('mode', '?')
@@ -490,7 +655,15 @@ def main():
     for i, er in enumerate(args._exclude_ranges):
         print(f'  Exclude[{i}]:  0x{er["start"]:X} - 0x{er["end"]:X} '
               f'(size 0x{er["end"] - er["start"]:X})')
-    print(f'  Trace mode:  {args.trace_mode}')
+    if args.invoke:
+        print(f'  Mode:        INVOKE (active call)')
+        for i, a in enumerate(args._invoke_args):
+            if a['value'] is not None:
+                print(f'  Arg[{i}]:      {a["type"]}:{a["value"]}')
+            else:
+                print(f'  Arg[{i}]:      {a["type"]}')
+    else:
+        print(f'  Mode:        HOOK (passive, trace-mode={args.trace_mode})')
     if args.trace_gcd:
         print(f'  GCD trace:   ON (filter={not args.gcd_no_filter}, max={args.gcd_max})')
     if args.timeout:

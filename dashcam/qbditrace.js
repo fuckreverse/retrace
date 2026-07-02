@@ -17,13 +17,20 @@
  *   ends when it returns. All execution within the module during that window is
  *   recorded; calls to system libraries run natively and are logged as transfer events.
  *
- * Workflow:
+ * Workflow (hook mode — default):
  *   1. Python loader spawns/attaches to the target, loads this script.
  *   2. Python sends CONFIG via script.post({ type: 'config', payload: {...} }).
  *   3. This script receives CONFIG, loads libqbditrace.dylib, resolves addresses.
  *   4. Interceptor.replace(entryFunc) -> qbditrace_run_call(retOut, func, args)
  *   5. After the call returns, qbditrace_stop() flushes the trace to disk.
  *   6. Script sends status messages back to Python via send().
+ *
+ * Workflow (invoke mode — CONFIG.invoke=true):
+ *   1-3. Same as hook mode.
+ *   4. materializeArgs() converts typed argument descriptors into NativePointer
+ *      values (int, str, bytes, buf, nullptr, nsstr, nsdata, nsnum).
+ *   5. Directly calls qbditrace_run_call(retOut, func, argc, argv) — no hook.
+ *   6. qbditrace_stop() + report buf outputs + send trace_done/all_done.
  */
 
 'use strict';
@@ -149,8 +156,13 @@ function buildConfigStruct(opts) {
    * offset 144  n_exclude_ranges     u32
    * offset 148  _pad_exclude         u32
    * offset 152  exclude_ranges[0..7] 8×{u64 start, u64 end} = 128 bytes
+   * offset 280  enable_capi_intercept u32
+   * offset 284  n_capi_funcs          u32
+   * offset 288  capi_funcs[0..127]   128×{u64 addr, u8 api_id, u8 n_args, u8 str_args, u8 _reserved} = 128×16 = 2048 bytes
+   *
+   * Total: 280 + 4 + 4 + 2048 = 2336 bytes
    */
-  const SIZE = 280;
+  const SIZE = 2336;
   const cfg = Memory.alloc(SIZE);
   for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
@@ -190,6 +202,27 @@ function buildConfigStruct(opts) {
     const base = 152 + i * 16;
     cfg.add(base).writePointer(excludes[i].start);
     cfg.add(base + 8).writePointer(excludes[i].end);
+  }
+
+  /* C API interception */
+  const capiFuncs = opts.capiFuncs || [];
+  cfg.add(280).writeU32(opts.enableCapiIntercept ? 1 : 0);
+  cfg.add(284).writeU32(capiFuncs.length);
+  /* Each capi_funcs entry is 16 bytes:
+   *   u64 addr      (offset 0)
+   *   u8  api_id    (offset 8)
+   *   u8  n_args    (offset 9)
+   *   u8  str_args  (offset 10)
+   *   u8  _reserved (offset 11)
+   *   u32 padding   (offset 12)
+   */
+  for (let i = 0; i < capiFuncs.length && i < 128; i++) {
+    const base = 288 + i * 16;
+    cfg.add(base).writePointer(capiFuncs[i].addr || NULL);
+    cfg.add(base + 8).writeU8(capiFuncs[i].apiId || 0);
+    cfg.add(base + 9).writeU8(capiFuncs[i].nArgs || 0);
+    cfg.add(base + 10).writeU8(capiFuncs[i].strArgs || 0);
+    cfg.add(base + 11).writeU8(0); /* _reserved */
   }
   return cfg;
 }
@@ -234,6 +267,455 @@ function resolveObjcDispatchers() {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// C API function resolution
+// ---------------------------------------------------------------------------
+
+/* Standard platform functions (memcpy, strcmp, CC_SHA256, EVP_*, sqlite3_*, etc.)
+ * are resolved by the native tracer's resolveCApiAddrsIntoConfig() at configure()
+ * time via dlsym.  The JS side only handles two things that native cannot:
+ *
+ *   1. JNI vtable functions — not exported symbols; must be read from the
+ *      JNINativeInterface_ function-pointer table at runtime.
+ *   2. User-supplied custom addresses — passed in via CONFIG.capiJniFuncs
+ *      from the Python runner (--capi-funcs).
+ *
+ * When capiFuncs is non-empty the native side appends them to its own table;
+ * when capiFuncs is empty but enableCapiIntercept is true, the native side
+ * resolves everything itself.
+ */
+
+/* ---------------------------------------------------------------------------
+ * JNI vtable auto-resolution.
+ *
+ * JNI functions (FindClass, GetMethodID, CallObjectMethod, etc.) are NOT
+ * exported symbols — they live in a virtual function pointer table pointed to
+ * by JNIEnv->functions. The vtable layout is fixed by the JNI spec
+ * (jni.h / JNINativeInterface_), so we can read function pointers directly.
+ *
+ * Strategy:
+ *   1. Locate a JNIEnv pointer. On Android the JavaVM is available via
+ *      `JNI_GetCreatedJavaVMs` (exported from libart.so or libjvm.so).
+ *      Calling GetEnv() on the JavaVM gives us the JNIEnv for the current
+ *      thread.
+ *   2. Dereference env->functions (pointer at offset 0 of JNIEnv struct).
+ *   3. Index into the vtable using the well-known slot offsets from jni.h.
+ *
+ * All offsets are for 64-bit AArch64 (8 bytes per pointer slot).
+ * The JNINativeInterface_ vtable layout (jni.h, AArch64 LP64):
+ *   slot  0: reserved0
+ *   slot  1: reserved1
+ *   slot  2: reserved2
+ *   slot  3: reserved3
+ *   slot  4: GetVersion
+ *   slot  5: DefineClass
+ *   slot  6: FindClass
+ *   slot  7: FromReflectedMethod
+ *   slot  8: FromReflectedField
+ *   slot  9: ToReflectedMethod
+ *   slot 10: GetSuperclass
+ *   slot 11: IsAssignableFrom
+ *   slot 12: ToReflectedField
+ *   slot 13: Throw
+ *   slot 14: ThrowNew
+ *   slot 15: ExceptionOccurred
+ *   slot 16: ExceptionDescribe
+ *   slot 17: ExceptionClear
+ *   slot 18: FatalError
+ *   slot 19: PushLocalFrame
+ *   slot 20: PopLocalFrame
+ *   slot 21: NewGlobalRef
+ *   slot 22: DeleteGlobalRef
+ *   slot 23: DeleteLocalRef
+ *   slot 24: IsSameObject
+ *   slot 25: NewLocalRef
+ *   slot 26: EnsureLocalCapacity
+ *   slot 27: AllocObject
+ *   slot 28: NewObject
+ *   slot 29: NewObjectV
+ *   slot 30: NewObjectA
+ *   slot 31: GetObjectClass
+ *   slot 32: IsInstanceOf
+ *   slot 33: GetMethodID
+ *   slot 34: CallObjectMethod
+ *   slot 36: CallObjectMethodA
+ *   slot 37: CallBooleanMethod
+ *   slot 40: CallBooleanMethodA
+ *   slot 41: CallByteMethod
+ *   slot 43: CallByteMethodA
+ *   slot 44: CallCharMethod
+ *   slot 47: CallIntMethod
+ *   slot 50: CallLongMethod
+ *   slot 53: CallFloatMethod
+ *   slot 56: CallDoubleMethod
+ *   slot 59: CallVoidMethod
+ *   slot 62: CallVoidMethodA
+ *   slot 63: CallNonvirtualObjectMethod
+ *   slot 72: GetFieldID
+ *   slot 73: GetObjectField
+ *   slot 74: GetBooleanField
+ *   slot 75: GetByteField
+ *   slot 76: GetCharField
+ *   slot 77: GetShortField
+ *   slot 78: GetIntField
+ *   slot 79: GetLongField
+ *   slot 80: GetFloatField
+ *   slot 81: GetDoubleField
+ *   slot 82: SetObjectField
+ *   slot 85: SetIntField
+ *   slot 87: SetLongField
+ *   slot 90: GetStaticMethodID
+ *   slot 91: CallStaticObjectMethod
+ *   slot 95: CallStaticBooleanMethod
+ *   slot 99: CallStaticIntMethod
+ *   slot 103: CallStaticLongMethod
+ *   slot 107: CallStaticVoidMethod
+ *   slot 110: GetStaticFieldID
+ *   slot 111: GetStaticObjectField
+ *   slot 119: SetStaticObjectField
+ *   slot 124: NewString
+ *   slot 125: GetStringLength
+ *   slot 126: GetStringChars
+ *   slot 127: ReleaseStringChars
+ *   slot 128: NewStringUTF
+ *   slot 129: GetStringUTFLength
+ *   slot 130: GetStringUTFChars
+ *   slot 131: ReleaseStringUTFChars
+ *   slot 132: GetArrayLength
+ *   slot 133: NewObjectArray
+ *   slot 134: GetObjectArrayElement
+ *   slot 135: SetObjectArrayElement
+ *   slot 136: NewBooleanArray
+ *   slot 137: NewByteArray
+ *   slot 140: NewIntArray
+ *   slot 152: GetByteArrayElements
+ *   slot 156: GetIntArrayElements
+ *   slot 162: ReleaseBooleanArrayElements
+ *   slot 163: ReleaseByteArrayElements
+ *   slot 167: ReleaseIntArrayElements
+ *   slot 175: GetByteArrayRegion
+ *   slot 179: GetIntArrayRegion
+ *   slot 185: SetByteArrayRegion
+ *   slot 189: SetIntArrayRegion
+ *   slot 195: RegisterNatives
+ *   slot 196: UnregisterNatives
+ *   slot 197: MonitorEnter
+ *   slot 198: MonitorExit
+ *   slot 199: GetJavaVM
+ *   slot 200: GetStringRegion
+ *   slot 201: GetStringUTFRegion
+ *   slot 204: NewWeakGlobalRef
+ *   slot 205: DeleteWeakGlobalRef
+ *   slot 206: ExceptionCheck
+ *   slot 209: ExceptionClear (duplicate in some impls)
+ *   slot 212: GetVersion (duplicate in some impls)
+ */
+var JNI_VTABLE_SLOTS = [
+  { slot:   4, apiId: 723, nArgs: 1, strArgs: 0x00, name: 'GetVersion' },
+  { slot:   5, apiId: 300, nArgs: 4, strArgs: 0x03, name: 'DefineClass' },  // a1=name, a2=loader
+  { slot:   6, apiId: 289, nArgs: 2, strArgs: 0x02, name: 'FindClass' },    // a1=name
+  { slot:  19, apiId: 721, nArgs: 2, strArgs: 0x00, name: 'PushLocalFrame' },
+  { slot:  20, apiId: 722, nArgs: 2, strArgs: 0x00, name: 'PopLocalFrame' },
+  { slot:  21, apiId: 718, nArgs: 2, strArgs: 0x00, name: 'NewGlobalRef' },
+  { slot:  22, apiId: 719, nArgs: 2, strArgs: 0x00, name: 'DeleteGlobalRef' },
+  { slot:  23, apiId: 720, nArgs: 2, strArgs: 0x00, name: 'DeleteLocalRef' },
+  { slot:  28, apiId: 716, nArgs: 3, strArgs: 0x00, name: 'NewObject' },
+  { slot:  32, apiId: 717, nArgs: 3, strArgs: 0x00, name: 'IsInstanceOf' },
+  { slot:  33, apiId: 290, nArgs: 4, strArgs: 0x06, name: 'GetMethodID' },  // a2=name,a3=sig
+  { slot:  34, apiId: 292, nArgs: 3, strArgs: 0x00, name: 'CallObjectMethod' },
+  { slot:  37, apiId: 295, nArgs: 3, strArgs: 0x00, name: 'CallBooleanMethod' },
+  { slot:  47, apiId: 296, nArgs: 3, strArgs: 0x00, name: 'CallIntMethod' },
+  { slot:  50, apiId: 297, nArgs: 3, strArgs: 0x00, name: 'CallLongMethod' },
+  { slot:  59, apiId: 294, nArgs: 3, strArgs: 0x00, name: 'CallVoidMethod' },
+  { slot:  72, apiId: 704, nArgs: 4, strArgs: 0x06, name: 'GetFieldID' },   // a2=name,a3=sig
+  { slot:  73, apiId: 702, nArgs: 3, strArgs: 0x00, name: 'GetObjectField' },
+  { slot:  78, apiId: 700, nArgs: 3, strArgs: 0x00, name: 'GetIntField' },
+  { slot:  79, apiId: 701, nArgs: 3, strArgs: 0x00, name: 'GetLongField' },
+  { slot:  82, apiId: 703, nArgs: 4, strArgs: 0x00, name: 'SetObjectField' },
+  { slot:  90, apiId: 291, nArgs: 4, strArgs: 0x06, name: 'GetStaticMethodID' }, // a2=name,a3=sig
+  { slot:  91, apiId: 293, nArgs: 3, strArgs: 0x00, name: 'CallStaticObjectMethod' },
+  { slot:  95, apiId: 715, nArgs: 3, strArgs: 0x00, name: 'CallStaticBooleanMethod' },
+  { slot:  99, apiId: 714, nArgs: 3, strArgs: 0x00, name: 'CallStaticIntMethod' },
+  { slot: 107, apiId: 294, nArgs: 3, strArgs: 0x00, name: 'CallStaticVoidMethod' },
+  { slot: 110, apiId: 705, nArgs: 4, strArgs: 0x06, name: 'GetStaticFieldID' },
+  { slot: 124, apiId: 282, nArgs: 2, strArgs: 0x00, name: 'NewStringUTF' },
+  { slot: 128, apiId: 282, nArgs: 2, strArgs: 0x02, name: 'NewStringUTF' }, // a1=bytes
+  { slot: 129, apiId: 283, nArgs: 2, strArgs: 0x00, name: 'GetStringUTFLength' },
+  { slot: 130, apiId: 280, nArgs: 3, strArgs: 0x00, name: 'GetStringUTFChars' },
+  { slot: 131, apiId: 281, nArgs: 3, strArgs: 0x00, name: 'ReleaseStringUTFChars' },
+  { slot: 132, apiId: 707, nArgs: 2, strArgs: 0x00, name: 'GetArrayLength' },
+  { slot: 133, apiId: 708, nArgs: 4, strArgs: 0x00, name: 'NewObjectArray' },
+  { slot: 134, apiId: 709, nArgs: 3, strArgs: 0x00, name: 'GetObjectArrayElement' },
+  { slot: 135, apiId: 710, nArgs: 4, strArgs: 0x00, name: 'SetObjectArrayElement' },
+  { slot: 137, apiId: 288, nArgs: 2, strArgs: 0x00, name: 'NewByteArray' },
+  { slot: 140, apiId: 711, nArgs: 2, strArgs: 0x00, name: 'NewIntArray' },
+  { slot: 152, apiId: 284, nArgs: 3, strArgs: 0x00, name: 'GetByteArrayElements' },
+  { slot: 156, apiId: 712, nArgs: 3, strArgs: 0x00, name: 'GetIntArrayElements' },
+  { slot: 163, apiId: 285, nArgs: 4, strArgs: 0x00, name: 'ReleaseByteArrayElements' },
+  { slot: 167, apiId: 713, nArgs: 4, strArgs: 0x00, name: 'ReleaseIntArrayElements' },
+  { slot: 175, apiId: 286, nArgs: 5, strArgs: 0x00, name: 'GetByteArrayRegion' },
+  { slot: 179, apiId: 712, nArgs: 5, strArgs: 0x00, name: 'GetIntArrayRegion' },
+  { slot: 185, apiId: 287, nArgs: 5, strArgs: 0x00, name: 'SetByteArrayRegion' },
+  { slot: 189, apiId: 713, nArgs: 5, strArgs: 0x00, name: 'SetIntArrayRegion' },
+  { slot: 197, apiId: 724, nArgs: 2, strArgs: 0x00, name: 'MonitorEnter' },
+  { slot: 198, apiId: 725, nArgs: 2, strArgs: 0x00, name: 'MonitorExit' },
+  { slot: 199, apiId: 726, nArgs: 2, strArgs: 0x00, name: 'GetJavaVM' },
+  { slot: 201, apiId: 706, nArgs: 5, strArgs: 0x00, name: 'GetStringUTFRegion' },
+  { slot: 206, apiId: 298, nArgs: 1, strArgs: 0x00, name: 'ExceptionCheck' },
+];
+
+/* Attempt to obtain a JNIEnv pointer via JNI_GetCreatedJavaVMs (libart.so).
+ * Returns a NativePointer to the JNINativeInterface_ vtable, or null. */
+function resolveJniVtable() {
+  if (!isAndroid()) return null;
+
+  /* Step 1: find JNI_GetCreatedJavaVMs in libart.so (or libjvm.so). */
+  var getVMsFn = null;
+  var artLibs = ['libart.so', 'libjvm.so', 'libdvm.so'];
+  for (var i = 0; i < artLibs.length; i++) {
+    try {
+      var p = Process.findModuleByName(artLibs[i]);
+      if (p) {
+        var ep = p.findExportByName('JNI_GetCreatedJavaVMs');
+        if (ep && !ep.isNull()) { getVMsFn = ep; break; }
+      }
+    } catch (e) {}
+  }
+  if (!getVMsFn) {
+    /* Fallback: global search */
+    try { getVMsFn = Module.getGlobalExportByName('JNI_GetCreatedJavaVMs'); } catch (e) {}
+  }
+  if (!getVMsFn || getVMsFn.isNull()) {
+    log('JNI vtable: JNI_GetCreatedJavaVMs not found — skipping vtable resolution');
+    return null;
+  }
+
+  try {
+    /* JNI_GetCreatedJavaVMs(JavaVM** vmBuf, jsize bufLen, jsize* nVMs) */
+    var vmBuf = Memory.alloc(8);   /* one pointer */
+    var nVMs  = Memory.alloc(4);
+    var fn = new NativeFunction(getVMsFn, 'int', ['pointer', 'int', 'pointer']);
+    var rc = fn(vmBuf, 1, nVMs);
+    if (rc !== 0 || nVMs.readU32() === 0) {
+      log('JNI vtable: JNI_GetCreatedJavaVMs returned rc=' + rc + ' nVMs=' + nVMs.readU32());
+      return null;
+    }
+    var vm = vmBuf.readPointer();  /* JavaVM* */
+    if (vm.isNull()) return null;
+
+    /* Step 2: JavaVM->GetEnv(JavaVM*, void**, jint version) */
+    /* JavaVM vtable layout: [0]=DestroyJavaVM,[1]=AttachCurrentThread,
+     *                        [2]=DetachCurrentThread,[3]=GetEnv,
+     *                        [4]=AttachCurrentThreadAsDaemon */
+    var vmVtable = vm.readPointer();  /* JNIInvokeInterface_ * */
+    var getEnvFnPtr = vmVtable.add(3 * Process.pointerSize).readPointer();
+    if (getEnvFnPtr.isNull()) return null;
+
+    var getEnvFn = new NativeFunction(getEnvFnPtr, 'int', ['pointer', 'pointer', 'int']);
+    var envBuf = Memory.alloc(8);
+    var JNI_VERSION_1_6 = 0x00010006;
+    rc = getEnvFn(vm, envBuf, JNI_VERSION_1_6);
+    if (rc !== 0) {
+      log('JNI vtable: GetEnv failed rc=' + rc);
+      return null;
+    }
+    var env = envBuf.readPointer();   /* JNIEnv* */
+    if (env.isNull()) return null;
+
+    /* Step 3: vtable = *env (pointer to JNINativeInterface_) */
+    var vtable = env.readPointer();
+    if (vtable.isNull()) return null;
+
+    log('JNI vtable resolved @ ' + vtable + ' (via JNIEnv @ ' + env + ')');
+    return vtable;
+  } catch (e) {
+    log('JNI vtable: exception during resolution: ' + e.message);
+    return null;
+  }
+}
+
+/* Read function pointers from the JNI vtable for each slot in JNI_VTABLE_SLOTS.
+ * Deduplicates by address (some vtable slots alias the same implementation). */
+function resolveJniFunctions(vtable) {
+  if (!vtable) return [];
+  var result = [];
+  var seen = {};  /* addr string => true, for dedup */
+  var ptrSize = Process.pointerSize;
+
+  for (var i = 0; i < JNI_VTABLE_SLOTS.length; i++) {
+    var s = JNI_VTABLE_SLOTS[i];
+    try {
+      var fnPtr = vtable.add(s.slot * ptrSize).readPointer();
+      if (fnPtr.isNull()) continue;
+      var key = fnPtr.toString();
+      if (seen[key]) continue;  /* skip duplicate implementations */
+      seen[key] = true;
+      result.push({
+        addr: fnPtr,
+        apiId: s.apiId,
+        nArgs: s.nArgs,
+        strArgs: s.strArgs,
+      });
+    } catch (e) {
+      /* unreadable slot — skip */
+    }
+  }
+  log('JNI vtable: resolved ' + result.length + ' unique function pointers');
+  return result;
+}
+
+/* Collect the extra function addresses that native dlsym cannot reach:
+ *   - JNI vtable pointers (Android only; these are not exported symbols)
+ *   - User-supplied custom addresses from CONFIG.capiJniFuncs
+ *
+ * Standard platform functions (memcpy, strcmp, CC_SHA256, EVP_*, …) are
+ * resolved by resolveCApiAddrsIntoConfig() inside the native tracer at
+ * configure() time.  We pass an empty list here (or just the extras above)
+ * and native handles the rest automatically when n_capi_funcs == 0.
+ */
+function resolveCApiFunctions() {
+  var resolved = [];
+  var seen = {};  /* addr string => true, dedup */
+
+  function addEntry(addrPtr, apiId, nArgs, strArgs) {
+    var key = addrPtr.toString();
+    if (seen[key]) return;
+    seen[key] = true;
+    resolved.push({ addr: addrPtr, apiId: apiId, nArgs: nArgs, strArgs: strArgs });
+  }
+
+  /* 1. JNI vtable (Android only) */
+  if (isAndroid()) {
+    var jniVtable = resolveJniVtable();
+    var jniFuncs = resolveJniFunctions(jniVtable);
+    for (var j = 0; j < jniFuncs.length; j++) {
+      var jf = jniFuncs[j];
+      addEntry(jf.addr, jf.apiId, jf.nArgs, jf.strArgs);
+    }
+  }
+
+  /* 2. User-supplied custom addresses (--capi-funcs from Python runner) */
+  if (CONFIG.capiJniFuncs && CONFIG.capiJniFuncs.length > 0) {
+    for (var i = 0; i < CONFIG.capiJniFuncs.length; i++) {
+      var jf = CONFIG.capiJniFuncs[i];
+      if (jf.addr) {
+        addEntry(ptr(jf.addr), jf.apiId || 0, jf.nArgs || 0, jf.strArgs || 0);
+      }
+    }
+  }
+
+  log('C API interception: ' + resolved.length + ' extra addresses passed to native' +
+      ' (standard functions resolved by native dlsym)' +
+      (isAndroid() ? ' [Android]' : ' [iOS]'));
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Invoke mode: typed argument materialization
+// ---------------------------------------------------------------------------
+
+/* Materialize a list of typed argument descriptors (from Python's --args) into
+ * an array of NativePointer values ready to write into the argv buffer.
+ *
+ * Each descriptor is { type: string, value: string|null }.
+ * Allocated memory (strings, buffers) is kept alive via the returned _keep array.
+ *
+ * Supported types:
+ *   int:N       — immediate integer/pointer value
+ *   str:TEXT    — UTF-8 C string (Memory.allocUtf8String)
+ *   bytes:HEX  — raw byte buffer from hex
+ *   buf:SIZE   — zero-filled output buffer
+ *   nullptr    — NULL pointer
+ *   nsstr:TEXT  — ObjC NSString (iOS only)
+ *   nsdata:HEX — ObjC NSData from hex (iOS only)
+ *   nsnum:N    — ObjC NSNumber (iOS only)
+ */
+function materializeArgs(argDescs) {
+  var pointers = [];
+  var keep = [];  // prevent GC of allocated memory
+
+  for (var i = 0; i < argDescs.length; i++) {
+    var desc = argDescs[i];
+    var t = desc.type;
+    var v = desc.value;
+
+    if (t === 'int') {
+      pointers.push(ptr(v));
+
+    } else if (t === 'nullptr') {
+      pointers.push(NULL);
+
+    } else if (t === 'str') {
+      var s = Memory.allocUtf8String(v);
+      keep.push(s);
+      pointers.push(s);
+
+    } else if (t === 'bytes') {
+      // v is a hex string like "aabbccdd"
+      var byteArr = [];
+      for (var j = 0; j < v.length; j += 2) {
+        byteArr.push(parseInt(v.substr(j, 2), 16));
+      }
+      var buf = Memory.alloc(byteArr.length);
+      buf.writeByteArray(byteArr);
+      keep.push(buf);
+      pointers.push(buf);
+
+    } else if (t === 'buf') {
+      var size = parseInt(v, 10);
+      var zbuf = Memory.alloc(size);
+      // Memory.alloc returns zeroed memory in Frida
+      keep.push(zbuf);
+      pointers.push(zbuf);
+
+    } else if (t === 'nsstr') {
+      // ObjC NSString — requires ObjC runtime (iOS/macOS)
+      if (isAndroid()) {
+        fail('nsstr type is not supported on Android');
+      }
+      var nsObj = ObjC.classes.NSString.stringWithUTF8String_(
+          Memory.allocUtf8String(v));
+      keep.push(nsObj);
+      pointers.push(nsObj.handle);
+
+    } else if (t === 'nsdata') {
+      // ObjC NSData from hex bytes
+      if (isAndroid()) {
+        fail('nsdata type is not supported on Android');
+      }
+      var dataBytes = [];
+      for (var j = 0; j < v.length; j += 2) {
+        dataBytes.push(parseInt(v.substr(j, 2), 16));
+      }
+      var dataBuf = Memory.alloc(dataBytes.length);
+      dataBuf.writeByteArray(dataBytes);
+      keep.push(dataBuf);
+      var nsData = ObjC.classes.NSData.dataWithBytes_length_(
+          dataBuf, dataBytes.length);
+      keep.push(nsData);
+      pointers.push(nsData.handle);
+
+    } else if (t === 'nsnum') {
+      // ObjC NSNumber from integer
+      if (isAndroid()) {
+        fail('nsnum type is not supported on Android');
+      }
+      var nsNum = ObjC.classes.NSNumber.numberWithLongLong_(
+          parseInt(v, 10));
+      keep.push(nsNum);
+      pointers.push(nsNum.handle);
+
+    } else {
+      fail('unknown invoke arg type: ' + t);
+    }
+
+    log('invoke arg[' + i + '] = ' + t + ':' +
+        (v !== null ? v : '(null)') + ' -> ' + pointers[pointers.length - 1]);
+  }
+
+  return { pointers: pointers, _keep: keep };
 }
 
 function buildIndexedOutputPath(template, index) {
@@ -444,6 +926,10 @@ function main() {
     objcMsgSendSuper2: NULL, objcMsgSendStret: NULL,
   };
 
+  // --- Resolve C API function addresses ---
+  const capiIntercept = CONFIG.enableCapiIntercept !== false;  // on by default
+  const capiFuncs = capiIntercept ? resolveCApiFunctions() : [];
+
   let maxTraces;
   const mode = CONFIG.traceMode;
   if (mode === 'once' || mode === 1) {
@@ -482,6 +968,8 @@ function main() {
     objcMsgSendSuper: objc.objcMsgSendSuper,
     objcMsgSendSuper2: objc.objcMsgSendSuper2,
     objcMsgSendStret: objc.objcMsgSendStret,
+    enableCapiIntercept: capiIntercept,  /* native resolves standard funcs when capiFuncs is empty */
+    capiFuncs: capiFuncs,
   };
 
   function makeOutputPath(traceIndex) {
@@ -503,136 +991,196 @@ function main() {
     return cfg;
   }
 
-  let currentCfg = configureForTrace(1);
-  let traceCount = 0;
-  let inTrace = false;
-  let hookActive = false;
+  // ==========================================================================
+  // Branch: INVOKE mode vs HOOK mode
+  // ==========================================================================
 
-  const retOut = Memory.alloc(8);
-  const argc = CONFIG.argCount >>> 0;
-  const argv = argc > 0 ? Memory.alloc(8 * argc) : NULL;
+  if (CONFIG.invoke) {
+    // --- INVOKE MODE: actively call the entry function with supplied args ---
+    log('invoke mode: preparing to call ' + funcStart + ' with ' +
+        CONFIG.invokeArgs.length + ' typed argument(s)');
 
-  // We need to keep a reference to the original function so we can call it
-  // natively during re-entrant calls (when the entry function calls itself).
-  const origFunc = new NativeFunction(funcStart, 'pointer',
-      (function () { var t = []; for (var i = 0; i < argc; i++) t.push('pointer'); return t; })());
+    configureForTrace(1);
 
-  function buildArgTypes(n) {
-    const t = [];
-    for (let i = 0; i < n; i++) t.push('pointer');
-    return t;
-  }
-
-  function removeHook() {
-    if (hookActive) {
-      Interceptor.revert(funcStart);
-      Interceptor.flush();
-      hookActive = false;
+    var matResult = materializeArgs(CONFIG.invokeArgs);
+    var argPtrs = matResult.pointers;
+    var invokeArgc = argPtrs.length;
+    var invokeArgv = invokeArgc > 0 ? Memory.alloc(8 * invokeArgc) : NULL;
+    for (var ia = 0; ia < invokeArgc; ia++) {
+      invokeArgv.add(ia * 8).writePointer(argPtrs[ia]);
     }
-  }
 
-  function installHook() {
-    removeHook();  // safety: ensure no stale hook
-    hookActive = true;
+    var invokeRetOut = Memory.alloc(8);
 
-    Interceptor.replace(funcStart, new NativeCallback(function () {
-      // --- Re-entrant guard ---
-      // If we are already inside a trace (QBDI VM is running and the traced
-      // code calls the entry function again, e.g. recursion), we MUST NOT
-      // start another trace. Just call the original function natively.
-      if (inTrace) {
-        log('WARNING: re-entrant call to entry during trace — calling original natively');
-        // Collect args from registers and forward to the original function
-        var nativeArgs = [];
-        for (var i = 0; i < argc; i++) {
-          nativeArgs.push(this.context['x' + i]);
+    status('invoke_start', {
+      funcStart: funcStart.toString(),
+      argc: invokeArgc,
+    });
+
+    log('-> invoking entry function @ ' + funcStart +
+        ' with ' + invokeArgc + ' args...');
+
+    var invokeRc = fn.runCall(invokeRetOut, funcStart, invokeArgc, invokeArgv);
+    if (invokeRc !== 0) {
+      log('qbditrace_run_call returned error rc=' + invokeRc);
+    }
+    var invokeRet = invokeRetOut.readPointer();
+
+    fn.stop();
+    var invokeOutFile = fn.outputPath().readUtf8String();
+    log('<- invoke done, ret = ' + invokeRet + '. output = ' + invokeOutFile);
+
+    // Report buf-type output arguments (dump first 64 bytes for quick inspection)
+    for (var ib = 0; ib < CONFIG.invokeArgs.length; ib++) {
+      if (CONFIG.invokeArgs[ib].type === 'buf') {
+        var bufSize = parseInt(CONFIG.invokeArgs[ib].value, 10);
+        var dumpLen = Math.min(bufSize, 64);
+        var hexDump = '';
+        try {
+          var ba = argPtrs[ib].readByteArray(dumpLen);
+          var u8 = new Uint8Array(ba);
+          for (var hx = 0; hx < u8.length; hx++) {
+            hexDump += ('0' + u8[hx].toString(16)).slice(-2);
+          }
+        } catch (e) {
+          hexDump = '(read error: ' + e.message + ')';
         }
-        return origFunc.apply(null, nativeArgs);
+        log('output buf arg[' + ib + '] (' + bufSize + ' bytes, first ' +
+            dumpLen + '): ' + hexDump);
       }
+    }
 
-      inTrace = true;
-      traceCount++;
-      const thisTrace = traceCount;
+    status('trace_done', {
+      index: 1,
+      ret: invokeRet.toString(),
+      output: invokeOutFile,
+    });
+    status('all_done', { total: 1 });
 
-      log('-> entering entry function (trace #' + thisTrace + ') with ' + argc + ' args');
-      status('trace_start', { index: thisTrace });
-
-      for (let i = 0; i < argc; i++) {
-        argv.add(i * 8).writePointer(this.context['x' + i]);
-      }
-
-      // Revert the hook so QBDI can execute the original code.
-      // After runCall returns we decide whether to re-install.
-      removeHook();
-
-      const r = fn.runCall(retOut, funcStart, argc, argv);
-      if (r !== 0) {
-        log('qbditrace_run_call returned error rc=' + r);
-      }
-      const ret = retOut.readPointer();
-
-      fn.stop();
-      const outFile = fn.outputPath().readUtf8String();
-      log('<- trace #' + thisTrace + ' done, ret = ' + ret + '. output = ' + outFile);
-      status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });
-
-      inTrace = false;
-
-      // --- Decide whether to hook again ---
-      const wantMore = (traceCount < maxTraces);
-      if (wantMore && CONFIG.rehook !== false) {
-        currentCfg = configureForTrace(traceCount + 1);
-        installHook();
-        log('hook re-installed for trace #' + (traceCount + 1));
-      } else {
-        // Ensure the hook is definitively removed.
-        removeHook();
-        log('all ' + traceCount + ' trace(s) captured. Hook permanently removed.');
-        status('all_done', { total: traceCount });
-      }
-
-      return ret;
-    }, 'pointer', buildArgTypes(argc)));
-  }
-
-  installHook();
-  status('hook_installed', {
-    funcStart: funcStart.toString(),
-    moduleName: mod.name,
-    moduleSize: '0x' + mod.size.toString(16),
-    mode: CONFIG.traceMode,
-    maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
-  });
-
-  if (multiMode) {
-    log('hook installed on ' + funcStart + ' (mode=' + CONFIG.traceMode +
-        ', max=' + maxTraces + '). Trigger the entry function to trace.');
   } else {
-    log('hook installed on ' + funcStart +
-        '. Trigger the entry function to trace.');
-  }
+    // --- HOOK MODE: passive interception (existing behavior) ---
+    let currentCfg = configureForTrace(1);
+    let traceCount = 0;
+    let inTrace = false;
+    let hookActive = false;
 
-  // --- Optional: GCD block tracing (iOS/macOS only) ---
-  if (CONFIG.traceGCD) {
-    if (isAndroid()) {
-      log('WARNING: GCD block tracing is not available on Android — skipping');
-    } else {
-      function makeGCDOutputPath(gcdIndex) {
-        const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
-        const base = CONFIG.outputPath;
-        const dot = base.lastIndexOf('.');
-        if (dot > 0 && dot > base.lastIndexOf('/')) {
-          return base.slice(0, dot) + suffix + base.slice(dot);
-        }
-        return base + suffix;
+    const retOut = Memory.alloc(8);
+    const argc = CONFIG.argCount >>> 0;
+    const argv = argc > 0 ? Memory.alloc(8 * argc) : NULL;
+
+    // We need a reference to the original function for re-entrant calls.
+    const origFunc = new NativeFunction(funcStart, 'pointer',
+        (function () { var t = []; for (var i = 0; i < argc; i++) t.push('pointer'); return t; })());
+
+    function buildArgTypes(n) {
+      const t = [];
+      for (let i = 0; i < n; i++) t.push('pointer');
+      return t;
+    }
+
+    function removeHook() {
+      if (hookActive) {
+        Interceptor.revert(funcStart);
+        Interceptor.flush();
+        hookActive = false;
       }
+    }
 
-      installGCDHooks({
-        fn: fn,
-        mod: mod,
-        baseOpts: baseOpts,
-        makeGCDOutputPath: makeGCDOutputPath,
-      });
+    function installHook() {
+      removeHook();  // safety: ensure no stale hook
+      hookActive = true;
+
+      Interceptor.replace(funcStart, new NativeCallback(function () {
+        // --- Re-entrant guard ---
+        if (inTrace) {
+          log('WARNING: re-entrant call to entry during trace — calling original natively');
+          var nativeArgs = [];
+          for (var i = 0; i < argc; i++) {
+            nativeArgs.push(this.context['x' + i]);
+          }
+          return origFunc.apply(null, nativeArgs);
+        }
+
+        inTrace = true;
+        traceCount++;
+        const thisTrace = traceCount;
+
+        log('-> entering entry function (trace #' + thisTrace + ') with ' + argc + ' args');
+        status('trace_start', { index: thisTrace });
+
+        for (let i = 0; i < argc; i++) {
+          argv.add(i * 8).writePointer(this.context['x' + i]);
+        }
+
+        removeHook();
+
+        const r = fn.runCall(retOut, funcStart, argc, argv);
+        if (r !== 0) {
+          log('qbditrace_run_call returned error rc=' + r);
+        }
+        const ret = retOut.readPointer();
+
+        fn.stop();
+        const outFile = fn.outputPath().readUtf8String();
+        log('<- trace #' + thisTrace + ' done, ret = ' + ret + '. output = ' + outFile);
+        status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });
+
+        inTrace = false;
+
+        const wantMore = (traceCount < maxTraces);
+        if (wantMore && CONFIG.rehook !== false) {
+          currentCfg = configureForTrace(traceCount + 1);
+          installHook();
+          log('hook re-installed for trace #' + (traceCount + 1));
+        } else {
+          removeHook();
+          log('all ' + traceCount + ' trace(s) captured. Hook permanently removed.');
+          status('all_done', { total: traceCount });
+        }
+
+        return ret;
+      }, 'pointer', buildArgTypes(argc)));
+    }
+
+    installHook();
+    status('hook_installed', {
+      funcStart: funcStart.toString(),
+      moduleName: mod.name,
+      moduleSize: '0x' + mod.size.toString(16),
+      mode: CONFIG.traceMode,
+      maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
+    });
+
+    if (multiMode) {
+      log('hook installed on ' + funcStart + ' (mode=' + CONFIG.traceMode +
+          ', max=' + maxTraces + '). Trigger the entry function to trace.');
+    } else {
+      log('hook installed on ' + funcStart +
+          '. Trigger the entry function to trace.');
+    }
+
+    // --- Optional: GCD block tracing (iOS/macOS only) ---
+    if (CONFIG.traceGCD) {
+      if (isAndroid()) {
+        log('WARNING: GCD block tracing is not available on Android — skipping');
+      } else {
+        function makeGCDOutputPath(gcdIndex) {
+          const suffix = '_gcd_' + String(gcdIndex).padStart(3, '0');
+          const base = CONFIG.outputPath;
+          const dot = base.lastIndexOf('.');
+          if (dot > 0 && dot > base.lastIndexOf('/')) {
+            return base.slice(0, dot) + suffix + base.slice(dot);
+          }
+          return base + suffix;
+        }
+
+        installGCDHooks({
+          fn: fn,
+          mod: mod,
+          baseOpts: baseOpts,
+          makeGCDOutputPath: makeGCDOutputPath,
+        });
+      }
     }
   }
 }
