@@ -292,6 +292,24 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --exclude-range A0000:200 \
     --output /var/mobile/Documents/trace.bin
 
+# ── Pre-trace 内存 patch ──────────────────────────────────
+# 在 trace 开始前修改目标进程内存（清除缓存/标志/修改常量），trace 完成后自动恢复
+
+# 用偏移地址（+前缀）清零 4 字节缓存标志，确保 trace 走完整计算路径
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --patch +0x1abc:00000000 \
+    --output /var/mobile/Documents/trace.bin
+
+# 多个 patch 叠加使用（绝对地址 + 偏移地址混用）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --attach \
+    --entry 0xABC \
+    --patch +0x1abc:00000000 \
+    --patch +0x2def:01 \
+    --output /var/mobile/Documents/trace.bin
+
 # ── Invoke 模式（主动调用） ──────────────────────────────
 # 直接调用目标函数并 trace，无需等待 App 触发
 
@@ -357,6 +375,12 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
 | `--no-embed-code` | off | 关闭内嵌码表 |
 | `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。可多次指定，最多 8 个。该区间内代码以原生速度执行，不产生 trace 记录。适用于排除大循环（如内存校验） |
+
+**Pre-trace 内存 patch：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--patch` | 无 | trace 前向目标进程内存写入指定字节。格式：`ADDR:HEXBYTES`（绝对运行时地址）或 `+OFFSET:HEXBYTES`（模块基址偏移）。可多次指定。trace 完成后自动恢复原始字节。适用于清除缓存标志、修改分支条件等场景 |
 
 **Invoke 模式（主动调用）：**
 
@@ -430,10 +454,17 @@ JS agent 收到配置后，根据模式走不同路径：
 > 读指令执行。若不还原，QBDI 会 trace 到 Frida 跳板。
 
 **Invoke 模式**（`--invoke`）：加载 dylib → 解析模块信息 → 配置 tracer →
-`materializeArgs()` 将类型化参数描述符转换为 Frida `NativePointer`（分配内存、
-创建 ObjC 对象等）→ 直接调用 `qbditrace_run_call(retOut, func, argc, argv)`
-→ `qbditrace_stop()` 刷盘。不走 `Interceptor.replace`，不需要等待 App 触发。
+apply patches（如有）→ `materializeArgs()` 将类型化参数描述符转换为 Frida
+`NativePointer`（分配内存、创建 ObjC 对象等）→ 直接调用
+`qbditrace_run_call(retOut, func, argc, argv)` → `qbditrace_stop()` 刷盘 →
+restore patches（恢复原始字节）。不走 `Interceptor.replace`，不需要等待 App 触发。
 调用完成后自动 dump `buf` 类型参数的前 64 字节，方便快速查看输出结果。
+
+**Pre-trace patch 机制**：`--patch` 指定的内存修改在 `qbditrace_configure()` 之后、
+`qbditrace_run_call()` 之前通过 Frida 的 `Memory.writeByteArray()` 执行。apply 前
+先读取并保存原始字节，trace 完成后写回恢复。hook 多次 trace 模式下，每次 trace 都会
+重新 apply patch，确保每次从预期状态开始。该功能完全在 Frida JS 层实现，不涉及
+`qbditrace_config_t` 结构体变更，也不需要重新编译 dylib。
 
 ### 2.5 --entry 偏移怎么取
 

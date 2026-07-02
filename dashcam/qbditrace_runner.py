@@ -109,6 +109,49 @@ import time
 #   nsnum:N      — ObjC NSNumber from integer (iOS only)
 #   Bare value   — treated as int (e.g. 0x1234 or 42)
 
+def _parse_patch_spec(raw, parser):
+    """Parse a single --patch ADDR:HEXBYTES spec.
+
+    Formats:
+        0x100abc:00112233         — absolute runtime address
+        +0x1abc:00112233          — offset from module base ('+' prefix)
+    Returns {'addr': str, 'hex': str, 'is_offset': bool}.
+    """
+    raw = raw.strip()
+    if ':' not in raw:
+        parser.error(f'--patch: missing colon separator in "{raw}". '
+                     f'Format: ADDR:HEXBYTES or +OFFSET:HEXBYTES')
+
+    addr_part, _, hex_part = raw.partition(':')
+    addr_part = addr_part.strip()
+    hex_part = hex_part.strip().replace(' ', '')
+
+    # Validate hex data
+    if len(hex_part) == 0:
+        parser.error(f'--patch: empty hex data in "{raw}"')
+    if len(hex_part) % 2 != 0:
+        parser.error(f'--patch: hex data must have even length in "{raw}"')
+    try:
+        bytes.fromhex(hex_part)
+    except ValueError:
+        parser.error(f'--patch: invalid hex data in "{raw}"')
+
+    # Parse address (with optional '+' prefix for offset mode)
+    is_offset = addr_part.startswith('+')
+    if is_offset:
+        addr_part = addr_part[1:]
+    try:
+        addr_val = int(addr_part, 0)
+    except ValueError:
+        parser.error(f'--patch: invalid address "{addr_part}" in "{raw}"')
+
+    return {
+        'addr': hex(addr_val),
+        'hex': hex_part,
+        'is_offset': is_offset,
+    }
+
+
 def _parse_typed_arg(raw, parser):
     """Parse a single TYPE:VALUE argument spec into {'type': ..., 'value': ...}."""
     raw = raw.strip()
@@ -270,6 +313,16 @@ def parse_args():
                           'Code in excluded ranges executes natively without recording. '
                           'Example: --exclude-range 0x1234-0x5678 --exclude-range 0xA000:0x200')
 
+    # --- Pre-trace memory patches ---
+    patch = p.add_argument_group('Pre-trace memory patches')
+    patch.add_argument('--patch', type=str, action='append', default=[],
+                       help='Write bytes to target process memory before tracing starts. '
+                            'Format: ADDR:HEXBYTES (absolute runtime address) or '
+                            '+OFFSET:HEXBYTES (offset from module base). '
+                            'Can be specified multiple times. Original bytes are '
+                            'saved and restored after tracing completes. '
+                            'Example: --patch 0x100abc:00000000 --patch +0x1abc:01')
+
     # --- Invoke mode ---
     inv = p.add_argument_group('Invoke mode (active call)')
     inv.add_argument('--invoke', action='store_true',
@@ -371,6 +424,11 @@ def parse_args():
         except ValueError:
             p.error('--trace-mode must be "once", "multi", or a positive integer')
 
+    # Parse --patch specs
+    args._patches = []
+    for patch_raw in args.patch:
+        args._patches.append(_parse_patch_spec(patch_raw, p))
+
     # Parse --exclude-range (can be specified multiple times): "START-END" or "START:SIZE"
     args._exclude_ranges = []
     if len(args.exclude_range) > 8:
@@ -442,6 +500,9 @@ def build_config(args):
         # Invoke mode
         'invoke': args.invoke,
         'invokeArgs': args._invoke_args,
+
+        # Pre-trace memory patches
+        'patches': args._patches,
     }
     return cfg
 
@@ -473,9 +534,24 @@ class TracerSession:
     def start(self):
         """Spawn or attach to the target process."""
         if self.args.attach:
-            self.session = self.device.attach(self.args.target)
-            self.pid = self.session.pid
-            print(f'[*] Attached to "{self.args.target}" (PID={self.pid})')
+            # Resolve target name to PID first (Frida Session has no .pid)
+            procs = self.device.enumerate_processes()
+            match = None
+            for p in procs:
+                if p.name == self.args.target or str(p.pid) == self.args.target:
+                    match = p
+                    break
+            if match is None:
+                # Try case-insensitive partial match
+                for p in procs:
+                    if self.args.target.lower() in p.name.lower():
+                        match = p
+                        break
+            if match is None:
+                raise RuntimeError(f'Process "{self.args.target}" not found')
+            self.pid = match.pid
+            self.session = self.device.attach(self.pid)
+            print(f'[*] Attached to "{match.name}" (PID={self.pid})')
         else:
             self.pid = self.device.spawn([self.args.target])
             self.session = self.device.attach(self.pid)
@@ -655,6 +731,11 @@ def main():
     for i, er in enumerate(args._exclude_ranges):
         print(f'  Exclude[{i}]:  0x{er["start"]:X} - 0x{er["end"]:X} '
               f'(size 0x{er["end"] - er["start"]:X})')
+    for i, p in enumerate(args._patches):
+        prefix = '+' if p['is_offset'] else ''
+        nbytes = len(p['hex']) // 2
+        preview = p['hex'][:32] + ('...' if len(p['hex']) > 32 else '')
+        print(f'  Patch[{i}]:    {prefix}{p["addr"]} <- {preview} ({nbytes} byte(s))')
     if args.invoke:
         print(f'  Mode:        INVOKE (active call)')
         for i, a in enumerate(args._invoke_args):

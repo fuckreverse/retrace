@@ -309,6 +309,14 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --entry 0xABC \
     --exclude-range 0x1000-0x2000 --exclude-range 0x3000:0x400 \
     --output /var/mobile/Documents/trace.bin
+
+# Pre-trace 内存 patch：清除缓存/标志以获取完整 trace
+# +偏移 = 模块基址偏移，绝对地址也支持。trace 后自动恢复原始字节
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --patch +0x1abc:00000000 \
+    --output /var/mobile/Documents/trace.bin
 ```
 
 ### 3.6 后台录制

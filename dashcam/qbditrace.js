@@ -614,6 +614,100 @@ function resolveCApiFunctions() {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-trace memory patches
+// ---------------------------------------------------------------------------
+
+/* Apply memory patches before tracing starts.
+ * Each patch descriptor: { addr: "0x...", hex: "aabb...", is_offset: bool }
+ *
+ * When is_offset is true, addr is treated as an offset from moduleBase.
+ * Original bytes are saved so they can be restored after tracing.
+ *
+ * Returns an array of { addr: NativePointer, original: ArrayBuffer, len: number }
+ * for use by restorePatches(). */
+function applyPatches(patches, moduleBase) {
+  if (!patches || patches.length === 0) return [];
+
+  var saved = [];
+  for (var i = 0; i < patches.length; i++) {
+    var p = patches[i];
+    var target;
+    if (p.is_offset) {
+      target = moduleBase.add(ptr(p.addr));
+    } else {
+      target = ptr(p.addr);
+    }
+
+    var hexStr = p.hex;
+    var len = hexStr.length / 2;
+    var byteArr = [];
+    for (var j = 0; j < hexStr.length; j += 2) {
+      byteArr.push(parseInt(hexStr.substr(j, 2), 16));
+    }
+
+    // Save original bytes
+    var original;
+    try {
+      original = target.readByteArray(len);
+    } catch (e) {
+      logError('patch[' + i + ']: failed to read original bytes at ' +
+               target + ' (' + len + ' bytes): ' + e.message);
+      continue;
+    }
+
+    // Make memory writable if needed, then write
+    try {
+      Memory.protect(target, len, 'rwx');
+    } catch (e) {
+      /* Some regions are already writable, or protection change is not needed.
+       * On failure, still try the write — Frida may handle it. */
+    }
+    try {
+      target.writeByteArray(byteArr);
+    } catch (e) {
+      logError('patch[' + i + ']: failed to write ' + len +
+               ' bytes at ' + target + ': ' + e.message);
+      continue;
+    }
+
+    saved.push({ addr: target, original: original, len: len });
+
+    // Log: show hex preview (first 16 bytes)
+    var preview = hexStr.length > 32 ? hexStr.substr(0, 32) + '...' : hexStr;
+    var addrLabel = p.is_offset
+        ? target + ' (+' + p.addr + ')'
+        : target.toString();
+    log('patch[' + i + ']: wrote ' + len + ' byte(s) at ' +
+        addrLabel + ' <- ' + preview);
+  }
+
+  if (saved.length > 0) {
+    log(saved.length + ' memory patch(es) applied (originals saved for restore)');
+  }
+  return saved;
+}
+
+/* Restore original bytes after tracing completes. */
+function restorePatches(saved) {
+  if (!saved || saved.length === 0) return;
+
+  for (var i = 0; i < saved.length; i++) {
+    var s = saved[i];
+    try {
+      Memory.protect(s.addr, s.len, 'rwx');
+    } catch (e) { /* best effort */ }
+    try {
+      s.addr.writeByteArray(s.original);
+    } catch (e) {
+      logError('restore patch[' + i + ']: failed to restore ' + s.len +
+               ' bytes at ' + s.addr + ': ' + e.message);
+      continue;
+    }
+  }
+  log(saved.length + ' memory patch(es) restored');
+}
+
+// ---------------------------------------------------------------------------
 // Invoke mode: typed argument materialization
 // ---------------------------------------------------------------------------
 
@@ -1023,6 +1117,9 @@ function mainImpl() {
 
     configureForTrace(1);
 
+    // Apply pre-trace memory patches
+    var savedPatches = applyPatches(CONFIG.patches, moduleBase);
+
     var matResult = materializeArgs(CONFIG.invokeArgs);
     var argPtrs = matResult.pointers;
     var invokeArgc = argPtrs.length;
@@ -1048,6 +1145,10 @@ function mainImpl() {
     var invokeRet = invokeRetOut.readPointer();
 
     fn.stop();
+
+    // Restore patched memory
+    restorePatches(savedPatches);
+
     var invokeOutFile = fn.outputPath().readUtf8String();
     log('<- invoke done, ret = ' + invokeRet + '. output = ' + invokeOutFile);
 
@@ -1084,6 +1185,9 @@ function mainImpl() {
     let traceCount = 0;
     let inTrace = false;
     let hookActive = false;
+
+    // Apply pre-trace memory patches (hook mode: applied once before first trace)
+    var savedPatches = applyPatches(CONFIG.patches, moduleBase);
 
     const retOut = Memory.alloc(8);
     const argc = CONFIG.argCount >>> 0;
@@ -1153,17 +1257,22 @@ function mainImpl() {
           const nextCfg = configureForTrace(traceCount + 1);
           if (nextCfg) {
             currentCfg = nextCfg;
+            // Re-apply patches for next trace (in case previous restore changed them)
+            restorePatches(savedPatches); // restore first
+            savedPatches = applyPatches(CONFIG.patches, moduleBase);
             installHook();
             log('hook re-installed for trace #' + (traceCount + 1));
           } else {
             /* configure failed for next trace — stop gracefully */
             removeHook();
+            restorePatches(savedPatches);
             log('configure failed for trace #' + (traceCount + 1) +
                 ', stopping after ' + traceCount + ' trace(s).');
             status('all_done', { total: traceCount });
           }
         } else {
           removeHook();
+          restorePatches(savedPatches);
           log('all ' + traceCount + ' trace(s) captured. Hook permanently removed.');
           status('all_done', { total: traceCount });
         }
