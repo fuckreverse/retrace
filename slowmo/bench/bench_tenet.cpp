@@ -40,6 +40,10 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef __APPLE__
+#include <sys/resource.h>
+#endif
+
 using namespace tenet;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -480,6 +484,9 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+#ifdef __APPLE__
+    { struct rlimit rl; if (getrlimit(RLIMIT_NOFILE, &rl) == 0) { rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 65536); setrlimit(RLIMIT_NOFILE, &rl); } }
+#endif
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;

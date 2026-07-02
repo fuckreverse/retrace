@@ -26,6 +26,10 @@
 #include <memory>
 #include <string>
 
+#ifdef __APPLE__
+#include <sys/resource.h>
+#endif
+
 using namespace tenet;
 
 
@@ -36,6 +40,19 @@ using namespace tenet;
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
+    // ─── Raise file descriptor limit ────────────────────────────────────
+    // RocksDB's parallel SST ingest + CompactRange on large traces can open
+    // thousands of files simultaneously.  macOS defaults to 256 for GUI apps.
+#ifdef __APPLE__
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 65536);
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+#endif
+
     // ─── Initialize logging ─────────────────────────────────────────────
     tenet::log::init();
 

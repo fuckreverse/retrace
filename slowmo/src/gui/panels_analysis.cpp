@@ -821,10 +821,11 @@ void GuiApp::render_analysis_panel() {
     // ── Category header helper ──────────────────────────────────────
     auto section_header = [&](const char* title, ImVec4 color) {
         ImVec2 hp = ImGui::GetCursorScreenPos();
-        draw->AddRectFilled(hp, ImVec2(hp.x + panel_w, hp.y + ImGui::GetFrameHeight()),
+        float h = ImGui::GetTextLineHeightWithSpacing();
+        draw->AddRectFilled(hp, ImVec2(hp.x + panel_w, hp.y + h),
                             ImGui::ColorConvertFloat4ToU32(
                                 ImVec4(color.x*0.4f, color.y*0.4f, color.z*0.4f, 0.55f)));
-        draw->AddRectFilled(hp, ImVec2(hp.x + 3.0f, hp.y + ImGui::GetFrameHeight()),
+        draw->AddRectFilled(hp, ImVec2(hp.x + 3.0f, hp.y + h),
                             ImGui::ColorConvertFloat4ToU32(color));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f);
         ImGui::TextColored(color, "%s", title);
