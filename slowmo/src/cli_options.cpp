@@ -54,7 +54,7 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "\nAnalysis options (batch mode, suppress interactive):\n");
     fmt::print(stderr, "  --run-pass <name>         Run any catalog pass (repeatable). Names: see --list-passes\n");
     fmt::print(stderr, "  --list-passes             List all available pass names and exit\n");
-    fmt::print(stderr, "  --index-build             (Re)build the RocksDB trace index\n");
+    fmt::print(stderr, "  --index-build             Report RocksDB trace index stats (index is auto-built on load)\n");
   fmt::print(stderr, "  --cache-list              List all persisted pass blob caches (name + size)\n");
   fmt::print(stderr, "  --cache-delete <pass|all> Delete a pass blob cache (use 'all' to clear all)\n");
   fmt::print(stderr, "                            Repeatable. Exits after deletion.\n");

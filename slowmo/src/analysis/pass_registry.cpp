@@ -21,8 +21,6 @@
 #include "analysis/passes/taint_source_annotation_pass.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
-#include "analysis/passes/index_build_pass.h"
-
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/slice_pass.h"
@@ -45,8 +43,6 @@
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
-
-#include "io/index_builder.h"  // IndexStats (for index_build summary)
 
 #include <fmt/core.h>
 
@@ -111,7 +107,6 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
     if (name == "cfg_layout")              return std::make_unique<CFGLayoutPass>();
     if (name == "call_graph")              return std::make_unique<CallGraphPass>();
     if (name == "loop")                    return std::make_unique<LoopPass>();
-    if (name == "index_build")             return std::make_unique<IndexBuildPass>();
     // Crypto
     if (name == "pattern")                 return std::make_unique<PatternPass>();
     if (name == "constant_materialization")return std::make_unique<ConstantMaterializationPass>();
@@ -248,8 +243,6 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"cfg_layout",            "CFG Layout",    "Graph layout coordinates for CFG view",                  PassCategory::Structure, PassDefault::No},
         {"call_graph",            "Call Graph",    "Inter-function call graph",                              PassCategory::Structure, PassDefault::Yes},
         {"loop",                  "Loops",         "Detect loops via back-edges in CFG",                     PassCategory::Structure, PassDefault::Yes},
-        {"index_build",           "Index Build",   "(Re)build the RocksDB trace index",                      PassCategory::Structure, PassDefault::No},
-
         // — Taint —
         {"taint",                 "Taint",         "Forward taint from current register",                    PassCategory::Taint,     PassDefault::No},
         {"backward_taint",        "Back Taint",    "Backward taint from current instruction",                PassCategory::Taint,     PassDefault::No},
@@ -402,11 +395,6 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
     if (name == "loop") {
         if (auto* r = try_get<LoopResult>(result))
             return cat_count("loops", r->loops.size());
-    }
-    if (name == "index_build") {
-        if (auto* r = try_get<IndexStats>(result))
-            return fmt::format("insts: {}, anchors: {}, built in {:.1f}s",
-                               r->inst_count, r->anchor_count, r->build_seconds);
     }
 
     // Taint

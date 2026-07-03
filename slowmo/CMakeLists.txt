@@ -361,7 +361,6 @@ src/core/register_file.cpp
     src/analysis/pass_manager.cpp
     src/analysis/pass_registry.cpp
     src/analysis/trace_collector.cpp
-    src/analysis/passes/index_build_pass.cpp
     src/analysis/passes/taint_pass.cpp
     src/analysis/passes/slice_pass.cpp
     src/analysis/passes/backward_taint_pass.cpp

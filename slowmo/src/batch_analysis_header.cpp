@@ -36,7 +36,6 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
-#include "analysis/passes/index_build_pass.h"
 #include "io/rpc_server.h"
 #include "io/mcp/mcp_server.h"
 #include "io/streaming_index.h"

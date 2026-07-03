@@ -449,7 +449,7 @@ ninja -j$(nproc) tenet
 
 - **`PassManager`**：TBB `task_group` 实现 DAG 调度，依赖满足的 Pass 并行执行；lock-free CAS ready-queue 消除调度开销。
 - **`xref_pass`**：最典型案例。将 trace 分成 N 个 shard（N = CPU 核数），每 shard 独立扫描。每个 shard 直接用原始指针算术解析 trace 字节（消除虚函数调用），扫完 `merge()` 合并。
-- **`index_build_pass`**（`IndexBuilder`）：`parallel_sort` 对地址/PC 数组排序（TBB 实现，O(N log N / P)）。
+- **`IndexBuilder`**（索引构建，位于 `io/index_builder.cpp`，非 pass）：`parallel_sort` 对地址/PC 数组排序（TBB 实现，O(N log N / P)）。
 
 **可推广的 Pass**：
 

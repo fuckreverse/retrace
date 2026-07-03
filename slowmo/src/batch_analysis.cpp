@@ -37,7 +37,6 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
-#include "analysis/passes/index_build_pass.h"
 #include "io/rpc_server.h"
 #include "io/mcp/mcp_server.h"
 #include "io/streaming_index.h"
@@ -1982,19 +1981,14 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         return rc;
     }
 
-    // ── --index-build: (re)build the RocksDB trace index ──────────────
+    // ── --index-build: report RocksDB trace index stats ────────────────
+    // The index itself is already open/built by this point (see main.cpp),
+    // so this just surfaces its stats — no pass machinery needed.
     if (opts.opt_index_build) {
-        pm.register_pass(std::make_unique<IndexBuildPass>());
-        const auto& raw = pm.require("index_build");
-        if (!raw.ok()) {
-            fmt::print(stderr, "[index-build] Pass failed: {}\n", raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& stats = raw.get<IndexStats>();
-            fmt::print(stderr, "[index-build] {} insts, {} anchors, {} code, built in {:.1f}s\n",
-                       stats.inst_count, stats.anchor_count,
-                       stats.code_count, stats.build_seconds);
-        }
+        const auto& stats = index.stats();
+        fmt::print(stderr, "[index-build] {} insts, {} anchors, {} code, built in {:.1f}s\n",
+                   stats.inst_count, stats.anchor_count,
+                   stats.code_count, stats.build_seconds);
     }
 
     // ── --run-pass <name>: generic pass runner ────────────────────────
