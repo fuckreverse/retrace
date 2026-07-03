@@ -3,6 +3,7 @@
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
 #include "analysis/passes/string_pass.h"  // reuse StringRef, StringResult types
+#include "core/memory_model.h"            // MemoryModel::RegionReadResult
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,7 +35,10 @@ struct MemoryStringConfig {
     /// try earlier time points to find the complete version.
     bool deep_probe = true;
 
-    /// Maximum backward time steps for deep probe.
+    /// Maximum number of *actual writes* to walk backward through when deep
+    /// probing (via MemoryModel::last_writer() / write-history traversal),
+    /// not a fixed instruction-count stride — each step corresponds to one
+    /// real write that touched the probed address.
     size_t deep_probe_max_steps = 50;
 
     /// Minimum string length to report.
@@ -117,8 +121,11 @@ struct MemoryStringResult {
 
 // ─── MemoryStringCollector ────────────────────────────────────────────────
 
-/// TraceCollector that identifies call-site instructions (BL/BLR/SVC) during
-/// a single sequential scan. Collects (inst_id, pc) pairs.
+/// TraceCollector that identifies call-site instructions (BL/BLR/SVC) and
+/// Objective-C message sends (REC_OBJC) during a single sequential scan.
+/// Collects (inst_id, pc) pairs for both kinds of call sites — ObjC messages
+/// pass their arguments through the same x0-x7 GPR convention as a regular
+/// AArch64 call, so Phase 2's register/stack scan applies unchanged to them.
 ///
 /// The heavy analysis (regfile snapshot, memory read, string scanning) is done
 /// afterwards in MemoryStringPass::run(), since it requires random-access
@@ -138,6 +145,7 @@ public:
 
     bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
     void on_inst(uint64_t inst_id, const InstView& inst) override;
+    void on_objc(uint64_t inst_id, const ObjcView& objc) override;
     void end() override {}
 
     const std::vector<CallSite>& call_sites() const { return call_sites_; }
@@ -145,8 +153,12 @@ public:
 private:
     const CodeTable& code_table_;
     const MemoryStringConfig& config_;
-    uint64_t inst_id_ = 0;
     std::vector<CallSite> call_sites_;
+
+    /// Add a call site, respecting max_call_sites and de-duplicating
+    /// (an ObjC REC_OBJC record and its underlying BL to objc_msgSend can
+    /// both land on the same inst_id/pc in some trace configurations).
+    void add_call_site(uint64_t inst_id, uint64_t pc);
 };
 
 // ─── Pass ─────────────────────────────────────────────────────────────────
@@ -194,8 +206,22 @@ private:
                                            const std::vector<bool>& known,
                                            size_t min_len, size_t max_len);
 
+    /// Whether a hit was cut off by the edge of the scanned region (as
+    /// opposed to ending on a NUL terminator or non-printable byte found
+    /// *within* the region) — only such hits can possibly be extended by
+    /// deep_probe_string(), since anything ending mid-window is already
+    /// known-complete.
+    static bool is_hit_truncated(const ScanHit& hit, const MemoryModel::RegionReadResult& region);
+
     /// Try to find a more complete version of a partial string by probing
     /// earlier time points.
+    ///
+    /// Unlike a blind equidistant backward sweep, this walks the *actual*
+    /// write history of the byte range via MemoryModel::last_writer(),
+    /// so every probe point corresponds to a real write that touched this
+    /// address — no time is wasted sampling instants where nothing changed,
+    /// and no real "this is where the string was assembled" instant is
+    /// skipped over by a coarse fixed stride.
     std::string deep_probe_string(MemoryModel& memory, uint64_t addr,
                                    uint64_t current_inst_id,
                                    const std::string& current_content);

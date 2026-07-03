@@ -118,14 +118,19 @@ bool memory_string_deserialize(const std::string& blob, MemoryStringResult& out)
 
 bool MemoryStringCollector::begin(uint64_t /*start_inst_id*/,
                                    uint64_t /*end_inst_id*/) {
-    inst_id_ = 0;
     call_sites_.clear();
     return true;
 }
 
-void MemoryStringCollector::on_inst(uint64_t /*inst_id*/, const InstView& inst) {
-    inst_id_++;
+void MemoryStringCollector::add_call_site(uint64_t inst_id, uint64_t pc) {
+    if (config_.max_call_sites > 0 && call_sites_.size() >= config_.max_call_sites) return;
+    // De-dup: an ObjC message send and the BL/BLR to objc_msgSend it lowers
+    // to can both be observed at the same inst_id in some trace configs.
+    if (!call_sites_.empty() && call_sites_.back().inst_id == inst_id) return;
+    call_sites_.push_back({inst_id, pc});
+}
 
+void MemoryStringCollector::on_inst(uint64_t inst_id, const InstView& inst) {
     // Detect call instructions (BL/BLR) and SVC via opcode bitmask.
     auto opcode_opt = code_table_.opcode_at(inst.pc);
     if (!opcode_opt) return;
@@ -138,10 +143,18 @@ void MemoryStringCollector::on_inst(uint64_t /*inst_id*/, const InstView& inst) 
 
     if (!is_call && !is_svc) return;
 
-    // Rate limit
-    if (config_.max_call_sites > 0 && call_sites_.size() >= config_.max_call_sites) return;
+    add_call_site(inst_id, inst.pc);
+}
 
-    call_sites_.push_back({inst_id_, inst.pc});
+void MemoryStringCollector::on_objc(uint64_t inst_id, const ObjcView& objc) {
+    // ObjC message sends (objc_msgSend and friends) pass their arguments in
+    // x0 (receiver), x1 (selector), x2-x7 (method args) — the same GPR
+    // convention Phase 2 already scans for regular calls. Treating each
+    // REC_OBJC record as a call site lets MemoryStringPass discover strings
+    // passed as Objective-C method arguments (e.g. NSString* parameters),
+    // which the opcode-only BL/BLR/SVC detection in on_inst() cannot see
+    // since objc_msgSend is an external (non-traced) library call.
+    add_call_site(inst_id, objc.pc);
 }
 
 // ─── String scanning in a byte buffer ─────────────────────────────────────
@@ -152,6 +165,12 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
                                     size_t min_len, size_t max_len) {
     std::vector<ScanHit> hits;
     const size_t size = data.size();
+
+    // Tracks which offsets already produced an ASCII/UTF-8 hit, so the
+    // UTF-16LE pass below can skip duplicate-offset checks in O(1) instead
+    // of an O(hits) linear scan per candidate (this loop runs per call site,
+    // and there can be tens of thousands of call sites in a large trace).
+    ankerl::unordered_dense::set<size_t> ascii_hit_offsets;
 
     // ─── Phase 1: ASCII / UTF-8 scan ─────────────────────────────────────
     size_t i = 0;
@@ -197,6 +216,7 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
                     }
                 }
                 hit.encoding = has_multibyte ? MemoryString::UTF8 : MemoryString::ASCII;
+                ascii_hit_offsets.insert(start);
                 hits.push_back(std::move(hit));
             }
         }
@@ -226,14 +246,12 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
         }
 
         if (utf8_content.size() >= min_len) {
-            // Avoid duplicate if we already found this as ASCII at same offset
-            bool duplicate = false;
-            for (const auto& h : hits) {
-                if (h.offset == start && h.content == utf8_content) {
-                    duplicate = true;
-                    break;
-                }
-            }
+            // Avoid duplicate if we already found this exact run as ASCII at
+            // the same offset. O(1) set lookup instead of an O(hits) linear
+            // scan — this function runs once per call site (potentially
+            // tens of thousands of times per trace), so the difference
+            // between O(1) and O(hits) here is significant in aggregate.
+            bool duplicate = ascii_hit_offsets.count(start) != 0;
             if (!duplicate) {
                 ScanHit hit;
                 hit.offset = start;
@@ -247,7 +265,46 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
     return hits;
 }
 
+// ─── Truncation check ───────────────────────────────────────────────────
+
+bool MemoryStringPass::is_hit_truncated(const ScanHit& hit,
+                                         const MemoryModel::RegionReadResult& region) {
+    size_t byte_len = hit.content.size() * (hit.encoding == MemoryString::UTF16LE ? 2 : 1);
+    size_t end = hit.offset + byte_len;
+
+    // Ran off the end of the scanned window entirely — definitely truncated.
+    if (end >= region.data.size()) return true;
+
+    // Stopped because the next byte's value is unknown (not yet observed at
+    // this point in time) rather than because it was a NUL/non-printable
+    // byte — also worth a deep probe, since the "real" byte may simply not
+    // have been written yet from this vantage point.
+    if (!region.known[end]) return true;
+
+    return false;
+}
+
 // ─── Deep probe: find complete string at earlier time ─────────────────────
+
+namespace {
+
+/// Measure the length of a printable run at the start of a reconstructed
+/// region (stops at the first unknown byte, NUL terminator, or
+/// non-printable/non-whitespace byte).
+size_t printable_run_length(const MemoryModel::RegionReadResult& region) {
+    size_t len = 0;
+    for (size_t i = 0; i < region.data.size(); ++i) {
+        if (!region.known[i]) break;
+        uint8_t c = region.data[i];
+        if (c == 0) break;
+        if (!std::isprint(static_cast<unsigned char>(c)) &&
+            c != '\t' && c != '\n' && c != '\r') break;
+        len++;
+    }
+    return len;
+}
+
+}  // namespace
 
 std::string MemoryStringPass::deep_probe_string(MemoryModel& memory,
                                                  uint64_t addr,
@@ -262,59 +319,54 @@ std::string MemoryStringPass::deep_probe_string(MemoryModel& memory,
     size_t probe_size = std::min(config_.max_string_len, current_len + 128);
 
     auto region = memory.read_region(addr, probe_size, current_inst_id);
+    size_t actual_len = printable_run_length(region);
 
-    // Find the actual string length at this time point
-    size_t actual_len = 0;
-    for (size_t i = 0; i < region.data.size(); ++i) {
-        if (!region.known[i]) break;
-        uint8_t c = region.data[i];
-        if (c == 0) break;  // null terminator
-        if (!std::isprint(static_cast<unsigned char>(c)) &&
-            c != '\t' && c != '\n' && c != '\r') break;
-        actual_len++;
+    std::string best = current_content;
+    if (actual_len > best.size()) {
+        best = std::string(reinterpret_cast<const char*>(region.data.data()), actual_len);
     }
 
-    if (actual_len > current_len) {
-        return std::string(reinterpret_cast<const char*>(region.data.data()), actual_len);
-    }
-
-    // If still truncated (unknown bytes), try earlier time points
-    // by stepping backward in increments
-    if (actual_len < probe_size && current_inst_id > 0) {
-        uint64_t step = std::max<uint64_t>(1, current_inst_id / (config_.deep_probe_max_steps + 1));
-        std::string best = current_content;
+    // If the string is still truncated by unknown bytes, walk the *actual*
+    // write history of this byte range instead of sampling equidistant time
+    // points blindly. MemoryModel::last_writer() gives us the exact inst_id
+    // of the most recent write covering [addr, addr+probe_size) before a
+    // given point — following that chain backward visits only instants
+    // where this memory genuinely changed, so a narrow "the string was
+    // assembled over 3 instructions, 2M instructions ago" window is never
+    // skipped by a coarse fixed stride the way the old implementation could.
+    if (actual_len < probe_size) {
+        uint64_t probe_time = current_inst_id;
+        uint8_t probe_span = static_cast<uint8_t>(std::min<size_t>(probe_size, 16));
 
         for (size_t attempt = 0; attempt < config_.deep_probe_max_steps; attempt++) {
-            uint64_t probe_time = current_inst_id - std::min(current_inst_id, step * (attempt + 1));
-            if (probe_time == 0) break;
+            // NOTE: MemoryModel::last_writer() returns 0 both for "no write
+            // found" and for "the write happened at inst_id 0" — an
+            // inherent ambiguity in that API. In practice string-bearing
+            // writes essentially never occur at the very first instruction
+            // of a trace, so treating 0 as "stop" here is a safe simplification.
+            uint64_t writer = memory.last_writer(addr, probe_span, probe_time);
+            if (writer == 0 || writer >= probe_time) break;  // no earlier write found
 
-            auto probe_result = memory.read_region(addr, probe_size, probe_time);
-
-            size_t probe_len = 0;
-            for (size_t i = 0; i < probe_result.data.size(); ++i) {
-                if (!probe_result.known[i]) break;
-                uint8_t c = probe_result.data[i];
-                if (c == 0) break;
-                if (!std::isprint(static_cast<unsigned char>(c)) &&
-                    c != '\t' && c != '\n' && c != '\r') break;
-                probe_len++;
-            }
+            auto probe_result = memory.read_region(addr, probe_size, writer + 1);
+            size_t probe_len = printable_run_length(probe_result);
 
             if (probe_len > best.size()) {
                 best = std::string(reinterpret_cast<const char*>(probe_result.data.data()), probe_len);
             }
 
-            // If we found a null-terminated string longer than current, good enough
+            // Good enough: found a NUL-terminated string longer than the
+            // original truncated content.
             if (probe_len > current_len && probe_len < probe_result.data.size() &&
                 probe_result.known[probe_len] && probe_result.data[probe_len] == 0) {
                 break;
             }
-        }
 
-        return best;
+            // Continue walking backward from just before this write.
+            probe_time = writer;
+        }
     }
 
-    return current_content;
+    return best;
 }
 
 // ─── Pass implementation ──────────────────────────────────────────────────
@@ -433,9 +485,18 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
                                           config_.min_string_len, config_.max_string_len);
 
             for (auto& hit : hits) {
-                // Deep probe: try to get the complete string
+                // Deep probe: only worth attempting when this hit was
+                // actually truncated by the edge of the scanned window
+                // (i.e. it runs all the way to the last byte we read) —
+                // a hit that ends earlier already hit a NUL terminator or a
+                // non-printable byte within the window, so it is complete
+                // and re-probing would be wasted MemoryModel/RocksDB work.
+                // Applies to every hit in the window, not just offset==0:
+                // a register can point into the middle of a struct whose
+                // string field starts mid-window just as validly as one
+                // whose string starts at the pointer itself.
                 std::string full_content = hit.content;
-                if (config_.deep_probe && hit.offset == 0) {
+                if (config_.deep_probe && is_hit_truncated(hit, region)) {
                     full_content = deep_probe_string(memory, val + hit.offset,
                                                      site.inst_id, hit.content);
                 }
@@ -462,10 +523,16 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
                     auto hits = scan_for_strings(region.data, region.known,
                                                   config_.min_string_len, config_.max_string_len);
                     for (auto& hit : hits) {
+                        std::string full_content = hit.content;
+                        if (config_.deep_probe && is_hit_truncated(hit, region)) {
+                            full_content = deep_probe_string(memory, sp + hit.offset,
+                                                             site.inst_id, hit.content);
+                        }
+
                         MemoryString ms;
                         ms.addr = sp + hit.offset;
                         ms.discovered_at = site.inst_id;
-                        ms.content = std::move(hit.content);
+                        ms.content = std::move(full_content);
                         ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
                         ms.source = MemoryString::StackLocal;
                         ms.source_reg = 31;  // SP

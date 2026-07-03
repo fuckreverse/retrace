@@ -65,6 +65,7 @@ tenet_add_test(test_pass_loop              unit/test_pass_loop.cpp)
 tenet_add_test(test_pass_function          unit/test_pass_function.cpp)
 tenet_add_test(test_pass_call_graph        unit/test_pass_call_graph.cpp)
 tenet_add_test(test_pass_string            unit/test_pass_string.cpp)
+tenet_add_test(test_pass_memory_string     unit/test_pass_memory_string.cpp)
 tenet_add_test(test_pass_window_stats      unit/test_pass_window_stats.cpp)
 tenet_add_test(test_pass_objc              unit/test_pass_objc.cpp)
 

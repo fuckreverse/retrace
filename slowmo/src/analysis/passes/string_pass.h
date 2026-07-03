@@ -43,7 +43,10 @@ struct StringResult {
     static constexpr size_t MAX_STRING_LEN = 256;
     static constexpr size_t MIN_STRING_LEN = 4;    // Minimum 4 chars to qualify as a string
 
-    // Sentinel value in addr_to_index meaning "probed but not a string".
+    // Sentinel value in addr_to_index meaning "probed at this address but the
+    // bytes did not form a qualifying string". Lets the pass remember a
+    // negative probe result without re-scanning the same address on every
+    // subsequent memory access (see StringPass::run()).
     static constexpr size_t NOT_STRING = SIZE_MAX;
 
     /// Lookup a string by its start address.
@@ -75,12 +78,27 @@ struct StringResult {
 
 // ─── String pass ─────────────────────────────────────────────────────────
 
-/// Discovers printable strings in traced memory by scanning memory read events.
+/// Discovers printable strings in traced memory by scanning memory write
+/// events through the time-indexed MemoryModel.
 ///
-/// Strategy: for every memory read in the trace, probe the read address for a
-/// contiguous sequence of printable characters (ASCII or UTF-16LE).  This is
-/// more reliable than register-based heuristics because the trace already tells
-/// us which addresses were actually accessed.
+/// Strategy: for every memory *write* observed in the trace (reads are
+/// skipped — a read cannot introduce new byte content, so any string visible
+/// at a read was already produced by an earlier write and will be found
+/// there), reconstruct a small window of memory around the written address
+/// as it existed immediately after that instruction executed
+/// (`MemoryModel::read_region(addr, size, inst_id + 1)`), then scan the
+/// reconstructed window for printable ASCII/UTF-16LE runs.
+///
+/// Because every probe reads a single MemoryModel snapshot at one specific
+/// instant, all bytes considered for a given string are guaranteed to be
+/// mutually consistent in time — unlike a naive "last value seen at each
+/// address" byte cache, this cannot stitch together bytes that existed at
+/// different points in time into a bogus string.
+///
+/// Each time a string is (re)found at a given address, the discovering
+/// instruction is appended to the string's `references` list, so
+/// `StringResult::at_inst()` reflects every access that produced/observed
+/// that exact string, not just the first one.
 ///
 /// Result type: StringResult
 class StringPass final : public AnalysisPass {
@@ -96,6 +114,11 @@ public:
 
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 5.0f; }
+
+    /// Maximum bytes probed around a write's start address when looking for
+    /// a string boundary (the string may start before the write, e.g. when
+    /// only the NUL terminator byte of a pre-existing string is (re)written).
+    static constexpr size_t PROBE_WINDOW = 320;
 };
 
 }  // namespace tenet

@@ -31,6 +31,8 @@
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/memory_snapshot_pass.h"
+#include "analysis/passes/string_pass.h"
+#include "analysis/passes/memory_string_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -686,4 +688,158 @@ TEST_CASE("Integration: rolling state buffer — each round visible at correct t
             REQUIRE(actual == expected_writer);
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test H: StringPass + MemoryStringPass — Full Pipeline Cross-Component
+//
+// Regression coverage for a real bug: MemoryStringCollector::on_inst() used
+// to maintain its own pre-incremented local counter instead of the inst_id
+// handed to it by TraceScanEngine, so every BL/BLR/SVC call site it recorded
+// was off by one. That corrupted call_site_inst_id, which then fed a wrong
+// instant into RegisterFile::state_before()/MemoryModel::read_region() in
+// MemoryStringPass::run() — i.e. a bug that only manifests when the
+// TraceScanEngine → TraceCollector → RegisterFile → MemoryModel chain is
+// exercised together end-to-end, not in any single component's unit tests.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Trace with two independent call sites, each preceded by a register write
+/// that must NOT yet be visible at the *other* call site — this makes an
+/// off-by-one in call-site inst_id observable as either a missing string or
+/// the wrong register value being dereferenced.
+static void gen_two_call_sites(TraceWriter& tw) {
+    tw.anchor_interval = 256;
+    tw.write_header();
+    MachineState ms;
+    ms.sp() = 0x7F000000ULL;
+
+    constexpr uint64_t kAddrA = 0x300001000ULL;
+    constexpr uint64_t kAddrB = 0x300002000ULL;
+    uint64_t alpha_lo = 0;
+    std::memcpy(&alpha_lo, "ALPHA", 5);  // "ALPHA\0" (5 chars + NUL, zero-padded)
+
+    // inst 0: write "ALPHA" at kAddrA.
+    tw.emit(ms, 0x1000, enc::str_imm(0, 0, 0),
+            {{0, alpha_lo}, {33, tw.rt(0x1004)}},
+            {{kWrite, 8, kAddrA, alpha_lo}});
+
+    // inst 1: x0 = kAddrA (register set up right before the first call).
+    tw.emit(ms, 0x1004, enc::movz(0, 0),
+            {{0, kAddrA}, {33, tw.rt(0x1008)}}, {});
+
+    // inst 2: BL call site #1 — at this exact instant x0 == kAddrA and
+    // memory at kAddrA already contains "ALPHA". If call-site inst_id were
+    // off by one (recorded as 3 instead of 2), state_before(3) would
+    // observe x0 AFTER inst 2 executes as well as the state after inst 3
+    // (the BETA setup below), producing the wrong pointer entirely.
+    tw.emit(ms, 0x1008, enc::bl(0x5000 - 0x1008),
+            {{30, tw.rt(0x100C)}, {33, tw.rt(0x5000)}}, {});
+    tw.emit(ms, 0x5000, enc::ret(), {{33, tw.rt(0x100C)}}, {});
+
+    // inst 4: write "BETA" at kAddrB (happens strictly AFTER call site #1).
+    uint64_t beta_word = 0;
+    std::memcpy(&beta_word, "BETA", 4);
+    tw.emit(ms, 0x100C, enc::str_imm(1, 0, 0),
+            {{1, beta_word}, {33, tw.rt(0x1010)}},
+            {{kWrite, 8, kAddrB, beta_word}});
+
+    // inst 5: x0 = kAddrB.
+    tw.emit(ms, 0x1010, enc::movz(0, 0),
+            {{0, kAddrB}, {33, tw.rt(0x1014)}}, {});
+
+    // inst 6: BL call site #2 — x0 == kAddrB, memory at kAddrB has "BETA".
+    tw.emit(ms, 0x1014, enc::bl(0x6000 - 0x1014),
+            {{30, tw.rt(0x1018)}, {33, tw.rt(0x6000)}}, {});
+    tw.emit(ms, 0x6000, enc::ret(), {{33, tw.rt(0x1018)}}, {});
+
+    tw.emit_anchor(ms);
+}
+
+TEST_CASE("Integration: MemoryStringPass call sites see correct register state "
+          "(TraceScanEngine + RegisterFile + MemoryModel)",
+          "[integration][memory_model][memory_string_pass]") {
+    auto env = make_env(gen_two_call_sites, "mem_two_call_sites");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<MemoryStringPass>());
+
+    auto& result_raw = pm->require("memory_strings");
+    REQUIRE(result_raw.ok());
+    auto& mr = result_raw.get<MemoryStringResult>();
+
+    constexpr uint64_t kAddrA = 0x300001000ULL;
+    constexpr uint64_t kAddrB = 0x300002000ULL;
+
+    SECTION("call site #1 (inst_id=2) resolves x0 to ALPHA, not BETA") {
+        auto hits = mr.at_call_site(2);
+        bool found_alpha = false, found_beta = false;
+        for (auto* h : hits) {
+            if (h->content == "ALPHA") found_alpha = true;
+            if (h->content == "BETA") found_beta = true;
+        }
+        REQUIRE(found_alpha);
+        REQUIRE_FALSE(found_beta);
+    }
+
+    SECTION("call site #2 (inst_id=6) resolves x0 to BETA") {
+        auto hits = mr.at_call_site(6);
+        bool found_beta = false;
+        for (auto* h : hits) {
+            if (h->content == "BETA") found_beta = true;
+        }
+        REQUIRE(found_beta);
+    }
+
+    SECTION("ALPHA is recorded at kAddrA and BETA at kAddrB") {
+        auto a_hits = mr.at_addr(kAddrA);
+        auto b_hits = mr.at_addr(kAddrB);
+        bool a_ok = false, b_ok = false;
+        for (auto* h : a_hits) if (h->content == "ALPHA") a_ok = true;
+        for (auto* h : b_hits) if (h->content == "BETA") b_ok = true;
+        REQUIRE(a_ok);
+        REQUIRE(b_ok);
+    }
+
+    SECTION("no call site is off by one: inst_id=3 (BETA setup's write) "
+            "and inst_id=7 (past the trace) are not registered call sites") {
+        // inst 3 is the "ret" of the first callee — not a call site itself,
+        // so it must not accidentally carry ALPHA/BETA hits either.
+        REQUIRE(mr.at_call_site(3).empty());
+    }
+}
+
+/// Verify StringPass and MemoryStringPass can run together in one
+/// PassManager session without cross-contaminating each other's MemoryModel
+/// usage (both hold a reference to the same shared MemoryModel instance).
+TEST_CASE("Integration: StringPass and MemoryStringPass run together in one PassManager",
+          "[integration][memory_model][memory_string_pass][string_pass]") {
+    auto env = make_env(gen_two_call_sites, "mem_two_call_sites_multi");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    pm->register_pass(std::make_unique<MemoryStringPass>());
+
+    auto& sr = pm->require("strings").get<StringResult>();
+    auto& mr = pm->require("memory_strings").get<MemoryStringResult>();
+
+    constexpr uint64_t kAddrA = 0x300001000ULL;
+    constexpr uint64_t kAddrB = 0x300002000ULL;
+
+    // StringPass (write-driven) should find both strings directly at their
+    // write addresses.
+    REQUIRE(sr.at_addr(kAddrA) != nullptr);
+    REQUIRE(sr.at_addr(kAddrA)->content == "ALPHA");
+    REQUIRE(sr.at_addr(kAddrB) != nullptr);
+    REQUIRE(sr.at_addr(kAddrB)->content == "BETA");
+
+    // MemoryStringPass (call-site-driven) should independently find both via
+    // register dereference, confirming no shared-MemoryModel state leaks
+    // between the two passes' scans.
+    bool mr_a = false, mr_b = false;
+    for (auto* h : mr.at_addr(kAddrA)) if (h->content == "ALPHA") mr_a = true;
+    for (auto* h : mr.at_addr(kAddrB)) if (h->content == "BETA") mr_b = true;
+    REQUIRE(mr_a);
+    REQUIRE(mr_b);
 }

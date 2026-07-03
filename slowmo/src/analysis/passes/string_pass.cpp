@@ -2,6 +2,7 @@
 #include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "core/memory_model.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -113,7 +114,9 @@ static bool string_deserialize(const std::string& blob, StringResult& out) {
             s.references[j].pc      = read_u64();
         }
 
-        // Rebuild addr_to_index
+        // Rebuild addr_to_index — last-written entry for a given address wins,
+        // matching StringPass::run()'s "most recent content at this address"
+        // semantics (see the incremental construction in run()).
         out.addr_to_index[s.addr] = i;
         // Rebuild inst_to_strings
         for (const auto& r : s.references) {
@@ -157,21 +160,33 @@ std::vector<const StringRef*> StringResult::search(const std::string& pattern) c
     return hits;
 }
 
-// ─── StringCollector ──────────────────────────────────────────────────────
+// ─── WriteEventCollector ───────────────────────────────────────────────────
 
-/// Sequential TraceCollector that collects memory bytes from inst memory
-/// accesses, then (in end()) does a linear scan to extract printable strings.
-class StringCollector final : public TraceCollector {
+/// Sequential TraceCollector that records every memory *write* event
+/// (address, size, inst_id, pc). Reads are intentionally skipped: a read
+/// cannot introduce new byte content into memory, so any string visible at a
+/// read address was already produced by an earlier write and will already be
+/// discovered when that write is processed. Skipping reads avoids redundant
+/// re-scanning of unchanged memory (which dominates most traces — the same
+/// buffer is typically read far more often than it is written).
+class WriteEventCollector final : public TraceCollector {
 public:
-    StringCollector(uint64_t start_inst_id, uint64_t end_inst_id)
+    struct WriteEvent {
+        uint64_t inst_id;
+        uint64_t pc;
+        uint64_t addr;
+        uint16_t size;
+        uint64_t value;     // low 8 bytes of the written value (for dedup)
+        uint64_t value_hi;  // high bytes for 9-16 byte stores
+    };
+
+    WriteEventCollector(uint64_t start_inst_id, uint64_t end_inst_id)
         : range_start_(start_inst_id), range_end_(end_inst_id) {}
 
-    std::string_view name() const override { return "StringCollector"; }
+    std::string_view name() const override { return "WriteEventCollector"; }
 
     bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
-        bytes_.clear();
-        addr_first_inst_.clear();
-        result_ = StringResult{};
+        events_.clear();
         return true;
     }
 
@@ -181,155 +196,104 @@ public:
         for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
             auto mem = inst.mem_access(m);
             if (mem.addr == 0) continue;
+            // mem_type: bit0 = read, bit1 = write (QBDI::MemoryAccessType).
+            bool is_write = (mem.type & 0x02) != 0;
+            if (!is_write) continue;
 
-            // Record bytes
-            uint8_t buf[16];
-            std::memcpy(buf, &mem.value, 8);
-            std::memcpy(buf + 8, &mem.value_hi, 8);
-            uint16_t actual_size = std::min<uint16_t>(mem.size, 16);
-
-            for (uint16_t i = 0; i < actual_size; ++i) {
-                uint64_t addr = mem.addr + i;
-                bytes_[addr] = buf[i];
-
-                // Track first instruction that touched each byte
-                if (addr_first_inst_.find(addr) == addr_first_inst_.end()) {
-                    addr_first_inst_[addr] = inst_id;
-                }
-            }
+            events_.push_back({inst_id, inst.pc, mem.addr, mem.size, mem.value, mem.value_hi});
         }
     }
 
-    void end() override {
-        // Phase 2: Linear scan for strings (same logic as original StringPass)
-        std::vector<uint64_t> all_addrs;
-        all_addrs.reserve(bytes_.size());
-        for (const auto& [addr, _] : bytes_) {
-            all_addrs.push_back(addr);
-        }
-        std::sort(all_addrs.begin(), all_addrs.end());
+    void end() override {}
 
-        size_t i = 0;
-        size_t n = all_addrs.size();
-
-        while (i < n) {
-            uint64_t run_start = all_addrs[i];
-            std::string run_content;
-            run_content.reserve(64);
-
-            size_t j = i;
-            while (j < n) {
-                uint64_t expected_addr = run_start + (j - i);
-                if (all_addrs[j] != expected_addr) break;
-
-                auto it = bytes_.find(all_addrs[j]);
-                uint8_t byte = (it != bytes_.end()) ? it->second : 0xFF;
-
-                if (byte == 0) {
-                    j++;
-                    break;
-                }
-                if (!is_printable(byte)) break;
-
-                run_content.push_back(static_cast<char>(byte));
-                j++;
-
-                if (run_content.size() >= StringResult::MAX_STRING_LEN) break;
-            }
-
-            if (run_content.size() >= StringResult::MIN_STRING_LEN) {
-                uint64_t str_addr = run_start;
-                auto first_it = addr_first_inst_.find(str_addr);
-                uint64_t disc_inst = (first_it != addr_first_inst_.end())
-                                     ? first_it->second : 0;
-
-                size_t idx = result_.strings.size();
-                StringRef ref;
-                ref.addr          = str_addr;
-                ref.discovered_at = disc_inst;
-                ref.content       = std::move(run_content);
-                ref.encoding      = StringRef::ASCII;
-                ref.references.push_back({disc_inst, 0});
-                result_.strings.push_back(std::move(ref));
-                result_.addr_to_index[str_addr] = idx;
-            }
-
-            if (j > i) i = j;
-            else        i++;
-        }
-
-        // ─── UTF-16LE scan ────────────────────────────────────────────
-        // Look for sequences of [printable_byte, 0x00] pairs. The ASCII scan
-        // above breaks on 0x00, so genuine UTF-16LE strings are invisible to
-        // it; there is no overlap. We walk every observed address as a candidate
-        // start and extend while pairs remain (printable lo, 0x00 hi).
-        for (size_t k = 0; k < n; ++k) {
-            uint64_t start = all_addrs[k];
-
-            // Skip if an ASCII string was already recorded at this address —
-            // ASCII takes priority (a real ASCII run would have consumed these
-            // bytes already, so this is mostly defensive).
-            auto existing = result_.addr_to_index.find(start);
-            if (existing != result_.addr_to_index.end() &&
-                existing->second != StringResult::NOT_STRING) {
-                continue;
-            }
-
-            auto it_lo = bytes_.find(start);
-            auto it_hi = bytes_.find(start + 1);
-            if (it_lo == bytes_.end() || it_hi == bytes_.end()) continue;
-            if (it_hi->second != 0x00) continue;
-            if (!is_printable(it_lo->second)) continue;
-
-            // Extend the run of [printable, 0x00] pairs.
-            std::string run_content;
-            run_content.push_back(static_cast<char>(it_lo->second));
-            uint64_t addr = start + 2;
-            while (run_content.size() < StringResult::MAX_STRING_LEN) {
-                auto lo = bytes_.find(addr);
-                auto hi = bytes_.find(addr + 1);
-                if (lo == bytes_.end() || hi == bytes_.end()) break;
-                if (hi->second != 0x00) break;
-                if (!is_printable(lo->second)) break;
-                run_content.push_back(static_cast<char>(lo->second));
-                addr += 2;
-            }
-
-            if (run_content.size() >= StringResult::MIN_STRING_LEN) {
-                auto first_it = addr_first_inst_.find(start);
-                uint64_t disc_inst = (first_it != addr_first_inst_.end())
-                                     ? first_it->second : 0;
-
-                size_t idx = result_.strings.size();
-                StringRef ref;
-                ref.addr          = start;
-                ref.discovered_at = disc_inst;
-                ref.content       = std::move(run_content);
-                ref.encoding      = StringRef::UTF16LE;
-                ref.references.push_back({disc_inst, 0});
-                result_.strings.push_back(std::move(ref));
-                result_.addr_to_index[start] = idx;
-            }
-        }
-    }
-
-    StringResult take_result() { return std::move(result_); }
-    size_t byte_cache_size() const { return bytes_.size(); }
+    const std::vector<WriteEvent>& events() const { return events_; }
+    std::vector<WriteEvent> take_events() { return std::move(events_); }
 
 private:
     uint64_t range_start_;
     uint64_t range_end_;
-
-    ankerl::unordered_dense::map<uint64_t, uint8_t> bytes_;
-    ankerl::unordered_dense::map<uint64_t, uint64_t> addr_first_inst_;
-    StringResult result_;
+    std::vector<WriteEvent> events_;
 };
+
+// ─── Local string scan over a reconstructed byte window ────────────────────
+
+namespace {
+
+struct WindowHit {
+    size_t offset;       // offset within the scanned window
+    std::string content;
+    StringRef::Encoding encoding;
+};
+
+/// Scan a reconstructed memory window for printable ASCII and UTF-16LE runs.
+/// Mirrors MemoryStringPass::scan_for_strings but returns StringRef::Encoding.
+std::vector<WindowHit> scan_window(const std::vector<uint8_t>& data,
+                                    const std::vector<bool>& known,
+                                    size_t min_len, size_t max_len) {
+    std::vector<WindowHit> hits;
+    const size_t size = data.size();
+
+    // ─── ASCII scan ────────────────────────────────────────────────────
+    size_t i = 0;
+    while (i < size) {
+        if (!known[i] || !is_printable(data[i])) {
+            i++;
+            continue;
+        }
+        size_t start = i;
+        while (i < size && known[i] && is_printable(data[i])) i++;
+
+        size_t len = i - start;
+        if (len >= min_len) {
+            WindowHit hit;
+            hit.offset = start;
+            hit.content.assign(reinterpret_cast<const char*>(data.data() + start),
+                                std::min(len, max_len));
+            hit.encoding = StringRef::ASCII;
+            hits.push_back(std::move(hit));
+        }
+    }
+
+    // ─── UTF-16LE scan ──────────────────────────────────────────────────
+    // Sequences of [printable_byte, 0x00] pairs. No overlap with the ASCII
+    // scan above since ASCII runs stop at the first 0x00 byte.
+    i = 0;
+    while (i + 1 < size) {
+        if (!known[i] || !known[i + 1] || data[i + 1] != 0x00 || !is_printable(data[i])) {
+            i++;
+            continue;
+        }
+        size_t start = i;
+        std::string content;
+        while (i + 1 < size && known[i] && known[i + 1] &&
+               data[i + 1] == 0x00 && is_printable(data[i]) &&
+               content.size() < max_len) {
+            content.push_back(static_cast<char>(data[i]));
+            i += 2;
+        }
+
+        if (content.size() >= min_len) {
+            WindowHit hit;
+            hit.offset = start;
+            hit.content = std::move(content);
+            hit.encoding = StringRef::UTF16LE;
+            hits.push_back(std::move(hit));
+        } else {
+            i = start + 1;
+        }
+    }
+
+    return hits;
+}
+
+}  // namespace
 
 // ─── StringPass::run ─────────────────────────────────────────────────────
 
 PassResult StringPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
     auto& index  = ctx.index();
+    auto& memory = ctx.memory();
     const auto& range = ctx.range();
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
@@ -350,15 +314,15 @@ PassResult StringPass::run(PassContext& ctx) {
     uint64_t end   = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
-    // ─── Phase 1 via TraceScanEngine ─────────────────────────────────────
-    StringCollector collector(start, end);
+    // ─── Phase 1: collect all memory write events via a single scan ──────
+    WriteEventCollector collector(start, end);
 
     TraceScanEngine local_engine(reader, index.inst_count(), &index);
     local_engine.set_progress([&](uint64_t processed, uint64_t total) {
         if (total > 0) {
-            // Phase 1 is 40% of total work (matches original progress weights)
+            // Phase 1 is 40% of total work.
             ctx.progress(0.4f * static_cast<float>(processed) / static_cast<float>(total),
-                         "Collecting memory bytes...");
+                         "Collecting memory write events...");
         }
     });
     local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
@@ -370,18 +334,158 @@ PassResult StringPass::run(PassContext& ctx) {
         return PassResult::failed("cancelled by user");
     }
 
-    ctx.progress(0.4f, fmt::format("Collected {} unique byte addresses from trace",
-                                    collector.byte_cache_size()));
+    auto events = collector.take_events();
+    ctx.progress(0.4f, fmt::format("Collected {} memory write events", events.size()));
 
-    // Phase 2 happens inside collector.end() which was called by the engine.
-    // The result is now ready.
+    // ─── Phase 2: for each write, reconstruct a time-consistent window ────
+    // via MemoryModel and scan it for strings. Using MemoryModel guarantees
+    // every byte considered together for one string was observed at the
+    // exact same instant — unlike a flat "last value per address" byte
+    // cache, this cannot stitch bytes from different points in time into a
+    // bogus string.
+    StringResult result;
 
-    size_t byte_cache_size = collector.byte_cache_size();
+    // Tracks write-addr -> last written 64-bit value at that address, so
+    // that a run of consecutive writes carrying the *same* bytes to the
+    // *same* address (spinlocks, refcounts, hot counters) only pays for one
+    // read_region + scan instead of re-probing on every single write.
+    // Only used for writes of size <= 8 (value_hi covers 9-16 byte stores,
+    // which are rare for string-bearing data and not worth the extra key
+    // width).
+    ankerl::unordered_dense::map<uint64_t, uint64_t> last_write_value;
 
-    ctx.progress(0.5f, fmt::format("Sorted {} addresses, scanning for strings...",
-                                    byte_cache_size));
+    // Tracks write-addr -> the strings[] index that the most recent probe at
+    // this write address resolved to (SIZE_MAX if the probe touched no
+    // string). NOTE: this is keyed by the *write* address (ev.addr), which
+    // may differ from the string's own start address (str_addr) when the
+    // string begins a few bytes before the write — addr_to_index alone can't
+    // be reused here for that reason.
+    ankerl::unordered_dense::map<uint64_t, size_t> last_write_hit;
 
-    StringResult result = collector.take_result();
+    const size_t half_window = StringPass::PROBE_WINDOW / 2;
+
+    size_t processed = 0;
+    for (const auto& ev : events) {
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+
+        processed++;
+        if ((processed & 0x3FF) == 0) {
+            float pct = 0.4f + 0.6f * static_cast<float>(processed) /
+                        static_cast<float>(events.size());
+            ctx.progress(pct, "Scanning memory writes for strings...");
+        }
+
+        // Skip the expensive read_region()+scan when this write repeats the
+        // exact same value already probed at this address (e.g. spinlocks,
+        // refcounts, hot counters written in a loop): the reconstructed
+        // window would be byte-identical to the previous probe, so it would
+        // always re-discover the exact same string(s). We still want that
+        // string's `references` to reflect this instruction though, so if
+        // the previous probe at this write address resolved to a live
+        // string entry, append a reference for it directly without
+        // re-touching MemoryModel.
+        if (ev.size > 0 && ev.size <= 8) {
+            auto val_it = last_write_value.find(ev.addr);
+            if (val_it != last_write_value.end() && val_it->second == ev.value) {
+                auto hit_it = last_write_hit.find(ev.addr);
+                if (hit_it != last_write_hit.end() && hit_it->second != StringResult::NOT_STRING) {
+                    result.strings[hit_it->second].references.push_back({ev.inst_id, ev.pc});
+                    result.inst_to_strings[ev.inst_id].push_back(hit_it->second);
+                }
+                continue;
+            }
+            last_write_value[ev.addr] = ev.value;
+        }
+
+        // Reconstruct memory as it existed immediately AFTER this write
+        // executed. MemoryModel::read_region()'s at_inst_id is exclusive
+        // ("state before instruction N"), so inst_id + 1 yields the
+        // post-write state.
+        uint64_t at_inst_id = ev.inst_id + 1;
+
+        // Probe a window straddling the write: the string may start before
+        // the written bytes (e.g. only the terminating NUL was (re)written)
+        // or extend after them.
+        uint64_t window_start = (ev.addr > half_window) ? ev.addr - half_window : 0;
+        size_t window_size = half_window + std::max<size_t>(ev.size, half_window);
+
+        auto region = memory.read_region(window_start, window_size, at_inst_id);
+        if (region.known_count < StringResult::MIN_STRING_LEN) {
+            if (ev.size > 0 && ev.size <= 8) last_write_hit[ev.addr] = StringResult::NOT_STRING;
+            continue;
+        }
+
+        auto hits = scan_window(region.data, region.known,
+                                 StringResult::MIN_STRING_LEN, StringResult::MAX_STRING_LEN);
+        if (hits.empty()) {
+            if (ev.size > 0 && ev.size <= 8) last_write_hit[ev.addr] = StringResult::NOT_STRING;
+            continue;
+        }
+
+        // Remember the first overlapping hit's resolved string index so a
+        // subsequent byte-identical write to the same address can shortcut
+        // straight to appending a reference (see last_write_hit above).
+        bool recorded_hit_for_dedup = false;
+
+        for (auto& hit : hits) {
+            uint64_t str_addr = window_start + hit.offset;
+
+            // Only record strings that overlap the byte range actually
+            // touched by this write — otherwise the same unrelated
+            // neighboring string would be re-discovered (and re-referenced)
+            // on every unrelated write within PROBE_WINDOW bytes of it.
+            uint64_t hit_end = str_addr + hit.content.size() *
+                                (hit.encoding == StringRef::UTF16LE ? 2 : 1);
+            uint64_t write_end = ev.addr + ev.size;
+            bool overlaps = str_addr < write_end && hit_end > ev.addr;
+            if (!overlaps) continue;
+
+            auto existing = result.addr_to_index.find(str_addr);
+            size_t resolved_idx;
+            if (existing != result.addr_to_index.end() &&
+                existing->second != StringResult::NOT_STRING &&
+                result.strings[existing->second].content == hit.content &&
+                result.strings[existing->second].encoding == hit.encoding) {
+                // Same content already recorded at this address — just add a
+                // reference for this instruction instead of duplicating.
+                resolved_idx = existing->second;
+                result.strings[resolved_idx].references.push_back({ev.inst_id, ev.pc});
+                result.inst_to_strings[ev.inst_id].push_back(resolved_idx);
+            } else {
+                // New content at this address (either first sighting, or
+                // memory reuse producing a different string than before) —
+                // append a fresh entry and make addr_to_index point at the
+                // most recent one.
+                resolved_idx = result.strings.size();
+                StringRef ref;
+                ref.addr          = str_addr;
+                ref.discovered_at = ev.inst_id;
+                ref.content       = hit.content;
+                ref.encoding      = hit.encoding;
+                ref.references.push_back({ev.inst_id, ev.pc});
+                result.strings.push_back(std::move(ref));
+                result.addr_to_index[str_addr] = resolved_idx;
+                result.inst_to_strings[ev.inst_id].push_back(resolved_idx);
+            }
+
+            // Record the dedup shortcut target using the first (typically
+            // only) hit that overlaps the write. If multiple distinct
+            // strings overlap the same write, later byte-identical writes
+            // will re-probe rather than pick an arbitrary one — favors
+            // correctness over the (rare) extra RocksDB lookup.
+            if (!recorded_hit_for_dedup && ev.size > 0 && ev.size <= 8) {
+                last_write_hit[ev.addr] = resolved_idx;
+                recorded_hit_for_dedup = true;
+            }
+        }
+
+        if (!recorded_hit_for_dedup && ev.size > 0 && ev.size <= 8) {
+            // No hit overlapped this write at all (hits existed but were all
+            // unrelated neighboring strings) — remember that so we don't
+            // treat it as "produces string X" on the next identical write.
+            last_write_hit[ev.addr] = StringResult::NOT_STRING;
+        }
+    }
 
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {
@@ -391,8 +495,8 @@ PassResult StringPass::run(PassContext& ctx) {
         }
     }
 
-    ctx.progress(1.0f, fmt::format("Strings: {} discovered from {} byte addresses",
-                                    result.total(), byte_cache_size));
+    ctx.progress(1.0f, fmt::format("Strings: {} discovered from {} write events",
+                                    result.total(), events.size()));
     return PassResult::success(std::move(result));
 }
 
