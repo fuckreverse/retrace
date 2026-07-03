@@ -353,9 +353,13 @@ void GuiApp::render_menu_bar() {
         // ║            Tools menu             ║
         // ╚═══════════════════════════════════╝
         if (ImGui::BeginMenu("Tools")) {
-            if (ImGui::MenuItem("Entropy at Cursor\xe2\x80\xa6")) {
-                run_pass_by_name("entropy"); show_analysis_ = true;
-            }
+if (ImGui::MenuItem("Entropy\xe2\x80\xa6")) {
+show_entropy_ = true;
+if (ctx_mem_addr_ != 0 && entropy_addr_buf_[0] == '\0') {
+    snprintf(entropy_addr_buf_, sizeof(entropy_addr_buf_),
+             "%llx", (unsigned long long)ctx_mem_addr_);
+}
+}
             if (ImGui::MenuItem("Memory Snapshot\xe2\x80\xa6")) {
                 run_pass_by_name("memory_snapshot"); show_analysis_ = true;
             }

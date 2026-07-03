@@ -163,6 +163,8 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
     if (name == "entropy") {
         EntropyConfig c;
         c.at_inst_id = ctx.current_inst;
+        c.addr       = ctx.entropy_addr;
+        c.size       = ctx.entropy_size;
         return std::make_unique<EntropyPass>(std::move(c));
     }
     if (name == "mem_search") {

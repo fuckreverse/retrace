@@ -291,6 +291,12 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         pending_focus_windows_.push_back("Memory Strings");
         return;
     }
+    if (name == "entropy") {
+        entropy_result_ = &raw->get<EntropyResult>();
+        show_entropy_   = true;
+        pending_focus_windows_.push_back("Entropy");
+        return;
+    }
     if (name == "syscall_intercept") {
         syscall_result_          = &raw->get<SyscallInterceptResult>();
         show_syscall_intercept_  = true;

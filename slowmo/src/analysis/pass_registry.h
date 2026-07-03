@@ -58,6 +58,10 @@ struct PassRunCtx {
     std::vector<uint64_t> thread_ids;             ///< for thread_filter (empty = all)
     std::vector<std::string> mem_search_patterns; ///< hex patterns for mem_search
     std::vector<uint64_t> literal_search_values;  ///< values for literal_search
+
+    // ── Entropy ──────────────────────────────────────────────────────
+    uint64_t entropy_addr = 0;       ///< memory region address for entropy analysis
+    uint32_t entropy_size = 256;     ///< memory region size for entropy analysis
     /// Enable full (uncapped) mode for FunctionPass.
     /// When true, all call-event memory caps are removed — use only for small
     /// traces where unbounded RAM usage is acceptable.  Default: false (capped).

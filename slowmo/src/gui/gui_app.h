@@ -17,6 +17,7 @@
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/memory_string_pass.h"
+#include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
 #include "io/mcp/mcp_server.h"
 
@@ -527,6 +528,14 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     std::string mem_string_filter_;
     int mem_string_view_mode_ = 0;   // 0=All, 1=RegPointer, 2=StackLocal
 
+    // ─── Entropy analysis state ──────────────────────────────────────────
+    const EntropyResult* entropy_result_ = nullptr;
+    bool show_entropy_ = false;
+    // Input state for the "no result yet" view (addr + size)
+    char entropy_addr_buf_[32] = {};     // hex address input
+    uint32_t entropy_size_input_ = 256;  // region size
+    bool entropy_timeline_input_ = false; // whether to compute timeline
+
 
     // ─── Syscall / API intercept analysis state ─────────────────────
     const SyscallInterceptResult* syscall_result_ = nullptr;
@@ -787,6 +796,8 @@ private:
     void render_loop_semantics_panel();        // Loop semantic classification
     void render_algorithm_summary_panel();     // Algorithm identification summary
     void render_memory_strings_panel();          // Time-aware memory string discovery
+    void render_entropy_panel();                    // Shannon entropy analysis of memory regions
+    void run_entropy_with_addr();                    // Trigger entropy analysis from the panel's input form
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
     void render_vm_abstract_panel();             // VM dispatcher / handler / step view (legacy single-panel)

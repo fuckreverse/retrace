@@ -113,6 +113,14 @@ void GuiApp::render_memory_panel() {
                     ImGui::SetClipboardText(buf);
                 }
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Entropy Analysis\xe2\x80\xa6")) {
+                show_entropy_ = true;
+                snprintf(entropy_addr_buf_, sizeof(entropy_addr_buf_),
+                         "%llx", (unsigned long long)mem.addr);
+                entropy_size_input_ = 256;
+                entropy_result_ = nullptr;
+            }
             ImGui::EndPopup();
         }
         ImGui::PopStyleColor();
@@ -757,6 +765,19 @@ void GuiApp::render_mem_context_menu() {
                 }
             }
         }
+
+        // ── Entropy Analysis ──────────────────────────────────────────────
+        ImGui::Separator();
+        if (ImGui::MenuItem("Entropy Analysis\xe2\x80\xa6")) {
+            show_entropy_ = true;
+            snprintf(entropy_addr_buf_, sizeof(entropy_addr_buf_),
+                     "%llx", (unsigned long long)ctx_mem_addr_);
+            entropy_size_input_ = 256;
+            entropy_result_ = nullptr;  // clear any previous result
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Compute Shannon entropy of this memory region");
+
         ImGui::EndPopup();
     }
 }
