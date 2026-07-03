@@ -15,8 +15,6 @@ struct CallContextConfig {
     /// Number of instructions before/after to include.
     uint32_t context_before = 10;
     uint32_t context_after = 10;
-    /// Maximum call stack depth to reconstruct.
-    uint32_t max_stack_depth = 32;
 };
 
 // ─── Context entry ─────────────────────────────────────────────────────────
@@ -27,14 +25,16 @@ struct ContextInstruction {
     std::string disassembly;      // Disassembled text
     bool is_target = false;        // Is this the target instruction?
     uint32_t loop_depth = 0;       // Nesting depth at this point
-    uint64_t loop_iteration = 0;   // Which iteration of innermost loop
 };
 
+/// A single frame of the reconstructed call stack, derived from
+/// FunctionResult::call_stack_at() (see function_pass.h). Outermost first.
 struct CallStackFrame {
     uint64_t call_site_pc;         // PC of the BL/BLR instruction
-    uint64_t callee_pc;            // PC of the function entry
+    uint64_t callee_pc;            // PC of the function entry (target_pc of the call)
     uint64_t call_inst_id;         // inst_id of the call instruction
-    uint64_t return_addr;          // LR value (expected return address)
+    uint64_t return_inst_id;       // inst_id of the matching RET (0 if not yet returned)
+    bool     is_tail_call = false; // Whether this frame was entered via a tail call
 };
 
 // ─── Result ────────────────────────────────────────────────────────────────
@@ -43,15 +43,15 @@ struct CallContextResult {
     /// Instructions surrounding the target (before + target + after).
     std::vector<ContextInstruction> instructions;
 
-    /// Reconstructed call stack at the target instruction.
+    /// Reconstructed call stack at the target instruction (outermost first).
+    /// Derived from the "function" pass result — see CallContextPass::run().
     std::vector<CallStackFrame> call_stack;
 
     /// Loop context: which loops contain the target instruction.
     struct LoopContext {
         uint64_t header_pc;
         uint32_t nesting_depth;
-        uint64_t current_iteration;    // Which iteration we're in
-        uint64_t total_iterations;     // Total observed iterations
+        uint64_t total_iterations;     // Total observed iterations of this loop
     };
     std::vector<LoopContext> loop_contexts;
 
@@ -65,7 +65,14 @@ struct CallContextResult {
 /// Provides rich context for a given instruction: surrounding instructions,
 /// call stack reconstruction, and loop position information.
 ///
-/// Dependencies: "loop" (for loop context), "xref" (for PC resolution).
+/// This pass is a thin aggregation layer: the call stack is NOT reconstructed
+/// independently (that would duplicate "function"'s call/return state
+/// machine); instead it is derived from FunctionResult::call_stack_at(),
+/// which already performs a well-tested, O(log N), tail-call-aware
+/// reconstruction over the whole trace. Loop membership is likewise derived
+/// from LoopResult::innermost_loop_at() rather than re-deriving it here.
+///
+/// Dependencies: "function" (call stack), "loop" (loop context).
 ///
 /// Result type: CallContextResult
 class CallContextPass final : public AnalysisPass {
@@ -77,17 +84,13 @@ public:
         return "Rich context for instruction: call stack + loop position + neighbors";
     }
     std::vector<std::string_view> dependencies() const override {
-        return { "loop" };
+        return { "function", "loop" };
     }
     PassResult run(PassContext& ctx) override;
-    float estimated_cost() const override { return 2.0f; }
+    float estimated_cost() const override { return 1.0f; }
 
 private:
     CallContextConfig cfg_;
-
-    /// Reconstruct call stack by scanning backwards for BL/BLR + matching returns.
-    std::vector<CallStackFrame> reconstruct_call_stack(
-        PassContext& ctx, uint64_t target_inst_id);
 };
 
 }  // namespace tenet

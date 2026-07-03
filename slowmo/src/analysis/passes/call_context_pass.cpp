@@ -1,112 +1,24 @@
 #include "analysis/passes/call_context_pass.h"
+#include "analysis/passes/function_pass.h"
 #include "analysis/passes/loop_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
-#include "core/register_file.h"
 #include "core/instruction_decoder.h"
 
 #include <algorithm>
-#include <cstring>
 
 namespace tenet {
 
-// ─── Call stack reconstruction (index-accelerated) ─────────────────────────
+// ─── Main pass execution ───────────────────────────────────────────────────
 //
-// Old approach: reader.begin() → scan forward to target → O(target_inst_id)
-// New approach: index.offset_of(scan_start) → scan only last 100K → O(100K)
-
-std::vector<CallStackFrame> CallContextPass::reconstruct_call_stack(
-    PassContext& ctx, uint64_t target_inst_id) {
-
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-
-    std::vector<CallStackFrame> stack;
-    stack.reserve(cfg_.max_stack_depth);
-
-    // Limit scan to last 100K instructions for efficiency
-    uint64_t scan_start = (target_inst_id > 100000) ? target_inst_id - 100000 : 0;
-
-    // Use index to seek directly to scan_start
-    uint64_t start_offset = 0;
-    if (scan_start > 0) {
-        start_offset = index.offset_of(scan_start, reader);
-    }
-
-    std::vector<CallStackFrame> shadow_stack;
-    shadow_stack.reserve(64);
-
-    uint64_t inst_id = scan_start;
-
-    auto it_start = (start_offset > 0)
-        ? TraceReader::Iterator(&reader, start_offset)
-        : reader.begin();
-
-    uint64_t rs_progress_interval = std::max((target_inst_id - scan_start) / 100, uint64_t(1));
-    for (auto it = it_start; it != reader.end(); ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-
-        inst_id++;
-        if (inst_id > target_inst_id) break;
-
-        if ((inst_id - scan_start) % rs_progress_interval == 0 && ctx.cancelled()) {
-            return {};  // cancelled — return empty stack
-        }
-
-        auto inst = rec.as_inst();
-
-        // Get instruction bytes from code table
-        auto raw_opcode = code_table.opcode_at(inst.pc);
-        if (!raw_opcode) continue;
-        uint32_t opcode = *raw_opcode;
-
-        // Detect BL (immediate): 1001 01 [imm26]
-        bool is_bl = (opcode & 0xFC000000u) == 0x94000000u;
-        // Detect BLR: 1101 0110 0011 1111 0000 00 [Rn] 00000
-        bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
-        // Detect RET: 1101 0110 0101 1111 0000 00 [Rn] 00000
-        bool is_ret = (opcode & 0xFFFFFC1Fu) == 0xD65F0000u;
-
-        if (is_bl || is_blr) {
-            // Push call frame
-            CallStackFrame frame;
-            frame.call_site_pc = inst.pc;
-            frame.call_inst_id = inst_id;
-            frame.return_addr = inst.pc + 4;
-            frame.callee_pc = 0;
-            // Get LR value from reg_diff
-            for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-                auto diff = inst.reg_diff(d);
-                if (diff.index == 30) {  // LR is index 30
-                    frame.return_addr = diff.value;
-                }
-            }
-            shadow_stack.push_back(frame);
-            // Use pop_front via swap instead of erase(begin) which is O(K)
-            if (shadow_stack.size() > cfg_.max_stack_depth) {
-                // Shift all elements left by 1 (more efficient than erase(begin))
-                shadow_stack.erase(shadow_stack.begin());
-            }
-        } else if (is_ret && !shadow_stack.empty()) {
-            shadow_stack.pop_back();
-        }
-    }
-
-    // The shadow_stack now represents the call stack at target_inst_id
-    stack = std::move(shadow_stack);
-    std::reverse(stack.begin(), stack.end());  // Innermost first
-    return stack;
-}
-
-// ─── Main pass execution (single merged scan) ─────────────────────────────
-//
-// Old approach: 2 separate reader.begin() scans (window + call stack).
-// New approach: single scan from index.offset_of(scan_start) that does both:
-//   1. Maintains shadow call stack
-//   2. Collects context window instructions
-// Both in one pass.
+// This pass does NOT reconstruct the call stack itself. Doing so would
+// duplicate "function"'s call/return state machine (which already handles
+// tail calls, non-local unwinds, and is O(log N) to query via
+// FunctionResult::call_stack_at()). Instead we:
+//   1. Require "function" and "loop" (both cheap once cached).
+//   2. Ask FunctionResult for the call stack at target_inst_id directly.
+//   3. Scan only the small [target - context_before, target + context_after]
+//      window to collect surrounding disassembly + loop depth.
 
 PassResult CallContextPass::run(PassContext& ctx) {
     if (cfg_.target_inst_id == 0) {
@@ -117,6 +29,7 @@ PassResult CallContextPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     auto& decoder = ctx.decoder();
     auto& code_table = ctx.code_table();
+    const auto& functions = ctx.require<FunctionResult>("function");
     const auto& loops = ctx.require<LoopResult>("loop");
 
     const uint64_t total_insts = index.inst_count();
@@ -127,129 +40,107 @@ PassResult CallContextPass::run(PassContext& ctx) {
     CallContextResult result;
     result.target_inst_id = cfg_.target_inst_id;
 
-    ctx.progress(0.0f, "CallContext: single-pass collection...");
+    ctx.progress(0.0f, "CallContext: reconstructing call stack...");
 
-    // Determine the earliest point we need to start scanning:
-    // - For call stack: target - 100K
-    // - For context window: target - context_before
-    uint64_t call_stack_start = (cfg_.target_inst_id > 100000)
-        ? cfg_.target_inst_id - 100000 : 0;
-    uint64_t window_start = (cfg_.target_inst_id > cfg_.context_before)
-        ? cfg_.target_inst_id - cfg_.context_before : 1;
-    uint64_t window_end = std::min(cfg_.target_inst_id + cfg_.context_after, total_insts);
-
-    // Scan start is the earlier of the two
-    uint64_t scan_start = std::min(call_stack_start, window_start);
-
-    // Use index to seek
-    uint64_t start_offset = 0;
-    if (scan_start > 0) {
-        start_offset = index.offset_of(scan_start, reader);
+    // ── Call stack: derived entirely from FunctionResult (O(log N)) ──────
+    // NOTE: cfg_.target_inst_id (like the rest of this pass's instruction
+    // window below) is 1-based, with inst_id 1 denoting the trace's first
+    // instruction. FunctionResult::call_stack_at() and CallEvent::
+    // call_inst_id/return_inst_id, however, use TraceScanEngine's 0-based
+    // convention (first instruction is inst_id 0). Convert here so both
+    // halves of this pass agree on which instruction is being queried.
+    const uint64_t functions_inst_id = cfg_.target_inst_id - 1;
+    auto stack_ptrs = functions.call_stack_at(functions_inst_id);
+    result.call_stack.reserve(stack_ptrs.size());
+    for (const auto* evt : stack_ptrs) {
+        CallStackFrame frame;
+        frame.call_site_pc   = evt->call_site_pc;
+        frame.callee_pc      = evt->target_pc;
+        // Convert back to this pass's 1-based inst_id convention so
+        // CallStackFrame::call_inst_id/return_inst_id are directly
+        // comparable to CallContextResult::instructions[].inst_id and
+        // target_inst_id (0 continues to mean "did not return yet").
+        frame.call_inst_id   = evt->call_inst_id + 1;
+        frame.return_inst_id = (evt->return_inst_id != 0) ? evt->return_inst_id + 1 : 0;
+        frame.is_tail_call   = evt->is_tail_call;
+        result.call_stack.push_back(frame);
     }
 
-    // Shadow call stack (maintained throughout the scan)
-    std::vector<CallStackFrame> shadow_stack;
-    shadow_stack.reserve(64);
+    if (ctx.cancelled()) return PassResult::failed("CallContext: cancelled by user");
+    ctx.progress(0.3f, "CallContext: collecting instruction window...");
 
-    uint64_t inst_id = scan_start;
+    // ── Instruction window: small scan around the target ─────────────────
+    // window_start is always >= 1, so window_start - 1 (the scan seed point)
+    // never underflows.
+    uint64_t window_start = (cfg_.target_inst_id > cfg_.context_before)
+        ? cfg_.target_inst_id - cfg_.context_before : 1;
+    uint64_t window_end = std::min<uint64_t>(cfg_.target_inst_id + cfg_.context_after, total_insts);
 
+    uint64_t scan_seed = window_start - 1;
+    uint64_t start_offset = (scan_seed > 0) ? index.offset_of(scan_seed, reader) : 0;
     auto it_start = (start_offset > 0)
         ? TraceReader::Iterator(&reader, start_offset)
         : reader.begin();
 
-    const uint64_t run_total = window_end - scan_start;
-    const uint64_t run_interval = std::max(run_total / 100, uint64_t(1));
-
+    uint64_t inst_id = scan_seed;
     for (auto it = it_start; it != reader.end(); ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
 
         inst_id++;
         if (inst_id > window_end) break;
-
-        if ((inst_id - scan_start) % run_interval == 0) {
-            ctx.progress(static_cast<float>(inst_id - scan_start) / static_cast<float>(run_total),
-                         "CallContext: single-pass collection...");
-            if (ctx.cancelled()) return PassResult::failed("CallContext: cancelled by user");
-        }
+        if (inst_id < window_start) continue;
 
         auto inst = rec.as_inst();
 
-        // ── Call stack tracking (always active) ──
-        auto raw_opcode2 = code_table.opcode_at(inst.pc);
-        if (raw_opcode2) {
-            uint32_t opcode = *raw_opcode2;
+        ContextInstruction ci;
+        ci.inst_id = inst_id;
+        ci.pc = inst.pc;
+        ci.is_target = (inst_id == cfg_.target_inst_id);
 
-            bool is_bl = (opcode & 0xFC000000u) == 0x94000000u;
-            bool is_blr = (opcode & 0xFFFFFC1Fu) == 0xD63F0000u;
-            bool is_ret = (opcode & 0xFFFFFC1Fu) == 0xD65F0000u;
+        if (ci.is_target) {
+            result.target_pc = inst.pc;
+        }
 
-            if (is_bl || is_blr) {
-                CallStackFrame frame;
-                frame.call_site_pc = inst.pc;
-                frame.call_inst_id = inst_id;
-                frame.return_addr = inst.pc + 4;
-                frame.callee_pc = 0;
-                for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
-                    auto diff = inst.reg_diff(d);
-                    if (diff.index == 30) {
-                        frame.return_addr = diff.value;
-                    }
-                }
-                shadow_stack.push_back(frame);
-                if (shadow_stack.size() > cfg_.max_stack_depth) {
-                    shadow_stack.erase(shadow_stack.begin());
-                }
-            } else if (is_ret && !shadow_stack.empty()) {
-                shadow_stack.pop_back();
+        auto raw_opcode = code_table.opcode_at(inst.pc);
+        if (raw_opcode) {
+            auto dis = decoder.decode(inst.pc, *raw_opcode);
+            if (dis) {
+                ci.disassembly = std::string(dis->mnemonic) + " " + dis->op_str;
             }
         }
 
-        // ── Context window collection (only when in range) ──
-        if (inst_id >= window_start && inst_id <= window_end) {
-            ContextInstruction ci;
-            ci.inst_id = inst_id;
-            ci.pc = inst.pc;
-            ci.is_target = (inst_id == cfg_.target_inst_id);
+        ci.loop_depth = loops.loop_depth_at(inst.pc);
 
-            if (ci.is_target) {
-                result.target_pc = inst.pc;
-            }
+        result.instructions.push_back(std::move(ci));
+    }
 
-            // Disassemble
-            if (raw_opcode2) {
-                auto dis = decoder.decode(inst.pc, *raw_opcode2);
-                if (dis) {
-                    ci.disassembly = std::string(dis->mnemonic) + " " + dis->op_str;
-                }
-            }
-
-            // Loop depth at this PC
-            ci.loop_depth = loops.loop_depth_at(inst.pc);
-
-            result.instructions.push_back(std::move(ci));
+    if (result.target_pc == 0 && !result.instructions.empty()) {
+        // Fallback: target fell outside the scanned window for some reason
+        // (shouldn't normally happen since window always includes target).
+        for (const auto& ci : result.instructions) {
+            if (ci.is_target) { result.target_pc = ci.pc; break; }
         }
     }
 
-    ctx.progress(0.7f, "CallContext: finalizing...");
+    if (ctx.cancelled()) return PassResult::failed("CallContext: cancelled by user");
+    ctx.progress(0.8f, "CallContext: resolving loop context...");
 
-    // The shadow_stack at this point is the call stack at target
-    result.call_stack = std::move(shadow_stack);
-    std::reverse(result.call_stack.begin(), result.call_stack.end());
-
-    // Determine loop contexts for the target
+    // ── Loop context: which loop(s) — including all enclosing ancestors —
+    // contain the target PC. LoopResult only indexes the innermost loop per
+    // PC (pc_innermost_loop), so to report the full nesting chain we still
+    // walk loops[] and test body_pcs membership; this is cheap (loop count
+    // is typically small, tens to low hundreds even for large traces).
     if (result.target_pc != 0) {
-        for (size_t i = 0; i < loops.loops.size(); i++) {
-            const auto& loop = loops.loops[i];
+        for (const auto& loop : loops.loops) {
             auto body_it = std::lower_bound(loop.body_pcs.begin(), loop.body_pcs.end(), result.target_pc);
-            if (body_it != loop.body_pcs.end() && *body_it == result.target_pc) {
-                CallContextResult::LoopContext lc;
-                lc.header_pc = loop.header_pc;
-                lc.nesting_depth = loop.nesting_depth;
-                lc.total_iterations = loop.iteration_count;
-                lc.current_iteration = 0;
-                result.loop_contexts.push_back(lc);
-            }
+            bool in_body = (body_it != loop.body_pcs.end() && *body_it == result.target_pc);
+            if (!in_body) continue;
+            CallContextResult::LoopContext lc;
+            lc.header_pc = loop.header_pc;
+            lc.nesting_depth = loop.nesting_depth;
+            lc.total_iterations = loop.iteration_count;
+            result.loop_contexts.push_back(lc);
         }
     }
 
