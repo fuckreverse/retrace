@@ -30,6 +30,7 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
+#include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/reg_timeline_pass.h"
@@ -363,14 +364,47 @@ void TenetMcpService::register_analysis_tools() {
     // ── taint_source_annotation ───────────────────────────────────────────
     register_tool(
         {"taint_source_annotation",
-         "Auto-detect potential taint sources in the trace. Identifies "
-         "function entry parameters, ObjC method arguments, memory-mapped "
-         "I/O, and other common source points.",
-         {{"type", "object"}, {"properties", json::object()}}},
-        [this](const json&) -> json {
+         "Run backward taint from (sink_inst_id, sink_reg) and annotate the "
+         "resulting leaf sources with ObjC getter/argument context, memory "
+         "load addresses, materialized constants, or callee return values. "
+         "Answers 'where did this register's value ultimately come from?' "
+         "-- e.g. '[CryptoManager secretKey]', 'constant 0xDEADBEEF', or "
+         "'return of CCCrypt()'.",
+         {{"type", "object"},
+          {"properties", {
+              {"sink_inst_id", {{"type", "integer"}, {"description", "Instruction ID where the value is observed (backward taint starting point)"}}},
+              {"sink_reg",     {{"type", json::array({"integer", "string"})}, {"description", "Sink register: integer index OR name string ('x0','lr','sp', etc.)"}, {"default", 0}}},
+              {"max_steps",    {{"type", "integer"}, {"description", "Max backward walk steps (0=unlimited)"}, {"default", 500000}}}
+          }},
+          {"required", json::array({"sink_inst_id"})}}},
+        [this](const json& args) -> json {
+            if (!pm_) throw std::runtime_error("PassManager not available");
+
+            BackwardTaintConfig bt_cfg;
+            bt_cfg.sink_inst_id = args.at("sink_inst_id").get<uint64_t>();
+            bt_cfg.add_sink_reg(args.contains("sink_reg") ? parse_reg(args.at("sink_reg")) : uint8_t(0));
+            bt_cfg.propagate_through_memory = true;
+            uint64_t max_steps = args.value("max_steps", uint64_t(500000));
+            if (max_steps > 0) bt_cfg.max_steps = max_steps;
+
+            pm_->register_pass(std::make_unique<BackwardTaintPass>(std::move(bt_cfg)));
             tenet::register_pass_by_name(*pm_, "objc");
+            // Optional: enables FunctionReturn source attribution (callee
+            // name/pc). taint_source_annotation degrades gracefully if this
+            // pass is absent -- see TaintSourceAnnotationPass::dependencies().
+            //
+            // NOTE: `function` is intentionally NOT a listed dependency of
+            // taint_source_annotation (see its dependencies() comment), so
+            // PassManager::execute_pass() will never run it automatically as
+            // part of resolving "taint_source_annotation" below -- it must be
+            // require()'d explicitly here so ctx.try_require<FunctionResult>()
+            // inside TaintSourceAnnotationPass::run() actually finds a
+            // Completed state instead of silently seeing "not run yet" and
+            // leaving callee_pc/callee_name empty on every FunctionReturn hit.
             tenet::register_pass_by_name(*pm_, "function");
-            tenet::register_pass_by_name(*pm_, "taint_source_annotation");
+            pm_->require("function");
+            pm_->register_pass(std::make_unique<TaintSourceAnnotationPass>());
+
             const auto& result = require_pass<TaintSourceAnnotationResult>(pm_, "taint_source_annotation", "Taint source annotation failed");
             return json::parse(result.to_json());
         }

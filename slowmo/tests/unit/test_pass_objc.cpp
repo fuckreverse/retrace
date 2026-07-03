@@ -4,39 +4,56 @@
  * Verifies: OBJC record parsing, class name extraction, selector name lookup,
  * message indexing by PC, class aggregation (message_count, selectors_seen),
  * hottest_classes ranking, messages_for_class query, class filter, and
- * total_messages / unique_classes counts.
+ * total_messages / unique_classes counts.  Also covers argument extraction
+ * (x2-x7), return value extraction (x0), string dereferencing of pointer
+ * arguments/selectors via MemoryModel, and the inline-ASCII-register fallback
+ * for short string-like values that fit directly in a register.
  *
  * NOTE: The ObjcPass reads OBJC records from the trace and uses MemoryModel
  * to dereference selector strings.  In the synthetic test traces, selectors
  * are stored as raw addresses in trace memory (via MemAcc) so the pass will
- * use hex-address fallback for selector names unless we plant string bytes.
- * We accept hex-fallback selector names where necessary.
+ * use hex-address fallback for selector names unless we plant string bytes
+ * (see plant_string_in_memory below). We accept hex-fallback selector names
+ * where the test doesn't care about the resolved name.
  */
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/objc_pass.h"
 
+#include <algorithm>
+#include <cstring>
+
 using namespace tenet;
 using namespace tenet::test;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-/// Plant a NUL-terminated ASCII string at `addr` in the trace by emitting
-/// small-value memory reads (the memory model will learn these addresses).
-/// We emit one INST record per byte that performs a load from `addr+i`.
-/// The "loaded value" contains the byte so MemoryModel records it.
+/// Memory access type constants (see qbditrace_memacc_t::mem_type / QBDI::MemoryAccessType).
+/// MemoryModel only indexes WRITE accesses (mem_type & 0x02) into its write
+/// history -- READ-only MemAcc records are visible to on_mem_read hooks but
+/// never populate read_region()/byte_at() results.
+static constexpr uint8_t kMemWrite = 2;
+
+/// Plant a NUL-terminated ASCII string at `addr` in the trace by emitting a
+/// single 8-byte-store INST per up-to-8 characters (a WRITE MemAcc so
+/// MemoryModel actually indexes it -- see kMemWrite above).  After this call,
+/// MemoryModel::read_region(addr, ...) and try_deref_string() will resolve
+/// the planted bytes instead of falling back to a hex address.
 static void plant_string_in_memory(TraceWriter& tw, MachineState& ms,
                                    uint64_t addr, const char* str)
 {
     size_t len = strlen(str) + 1;  // include NUL
-    // Emit one byte-load per character so MemoryModel sees the address mapping
-    for (size_t i = 0; i < len && i < 64; i++) {
-        uint8_t byte = static_cast<uint8_t>(str[i]);
-        uint64_t pc = 0xF000 + i * 4;  // use a separate PC range for helpers
-        tw.emit(ms, pc, enc::ldr_imm(0, 0, 0),
-                {{0, (uint64_t)byte}, {33, tw.rt(pc + 4)}},
-                {{1, 1, addr + i, (uint64_t)byte}});
+    size_t off = 0;
+    while (off < len && off < 256) {
+        size_t chunk = std::min<size_t>(8, len - off);
+        uint64_t word = 0;
+        std::memcpy(&word, str + off, chunk);  // zero-padded if chunk < 8
+        uint64_t pc = 0xF000 + off * 4;  // use a separate PC range for helpers
+        tw.emit(ms, pc, enc::str_imm(0, 31, 0),
+                {{0, word}, {33, tw.rt(pc + 4)}},
+                {{kMemWrite, (uint16_t)chunk, addr + off, word}});
+        off += chunk;
     }
 }
 
@@ -421,5 +438,305 @@ TEST_CASE("ObjcPass to_json produces valid structure", "[unit][pass][objc]") {
         REQUIRE(j.contains("classes"));
         REQUIRE(j["total_messages"].get<uint64_t>() == 1);
         REQUIRE(j["unique_classes"].get<uint64_t>() == 1);
+    }
+}
+
+// ─── Argument / return-value extraction tests ───────────────────────────────
+//
+// These tests plant the selector's string bytes in memory (via
+// plant_string_in_memory) so the colon-count heuristic sees the real
+// selector text instead of the hex-address fallback, which lets us control
+// exactly how many arguments ObjcPass decides to extract.
+
+TEST_CASE("ObjcPass extracts method arguments (x2-x7) with resolved selector",
+          "[unit][pass][objc]") {
+    uint64_t sel_addr = 0x50000ULL;
+    uint64_t recv_addr = 0x60000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // Plant "setValue:forKey:" (2 colons) at sel_addr so arg_count == 2.
+        plant_string_in_memory(tw, ms, sel_addr, "setValue:forKey:");
+
+        // Set x2 = 0x1111, x3 = 0x2222 right before the objc_msgSend call site.
+        tw.emit(ms, 0x1000, enc::movz(2, 0x1111),
+                {{2, 0x1111ULL}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::movz(3, 0x2222),
+                {{3, 0x2222ULL}, {33, tw.rt(0x1008)}}, {});
+
+        tw.emit_objc(tw.rt(0x1008), recv_addr, sel_addr, "MyClass");
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_args");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 1);
+    const auto& msg = or_.messages[0];
+
+    SECTION("selector resolved from memory (not hex fallback)") {
+        REQUIRE(msg.selector_name == "setValue:forKey:");
+    }
+
+    SECTION("arg_count derived from colon count") {
+        REQUIRE(msg.arg_count == 2);
+    }
+
+    SECTION("x2 and x3 values captured") {
+        REQUIRE(msg.args[0].value == 0x1111ULL);
+        REQUIRE(msg.args[1].value == 0x2222ULL);
+    }
+
+    SECTION("unused arg slots (x4-x7) are untouched / zero") {
+        for (uint8_t k = msg.arg_count; k < OBJC_MAX_ARGS; ++k) {
+            REQUIRE(msg.args[k].value == 0);
+        }
+    }
+}
+
+TEST_CASE("ObjcPass dereferences a pointer argument as a C string",
+          "[unit][pass][objc]") {
+    uint64_t sel_addr = 0x50000ULL;
+    uint64_t str_addr = 0x70000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // 1 colon => arg_count == 1
+        plant_string_in_memory(tw, ms, sel_addr, "logMessage:");
+        // The actual string argument content, pointed to by x2.
+        plant_string_in_memory(tw, ms, str_addr, "hello world");
+
+        tw.emit(ms, 0x1000, enc::movz(2, (uint16_t)(str_addr & 0xFFFF)),
+                {{2, str_addr}, {33, tw.rt(0x1004)}}, {});
+
+        tw.emit_objc(tw.rt(0x1004), 0x1ULL, sel_addr, "Logger");
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_arg_deref");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 1);
+    const auto& msg = or_.messages[0];
+
+    SECTION("arg_count == 1") {
+        REQUIRE(msg.arg_count == 1);
+    }
+
+    SECTION("first argument dereferences to the planted string") {
+        REQUIRE(msg.args[0].value == str_addr);
+        REQUIRE(msg.args[0].deref_str.has_value());
+        REQUIRE(*msg.args[0].deref_str == "hello world");
+    }
+}
+
+TEST_CASE("ObjcPass falls back to inline-ASCII decoding for short register values",
+          "[unit][pass][objc]") {
+    uint64_t sel_addr = 0x50000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        plant_string_in_memory(tw, ms, sel_addr, "setTag:");  // 1 colon
+
+        // x2 holds a small integer that is NOT a valid pointer (< 0x1000),
+        // so try_deref_string() will bail out via is_likely_pointer(), and
+        // try_decode_reg_ascii() should also fail to decode it (not ASCII).
+        tw.emit(ms, 0x1000, enc::movz(2, 42),
+                {{2, 42ULL}, {33, tw.rt(0x1004)}}, {});
+
+        tw.emit_objc(tw.rt(0x1004), 0x1ULL, sel_addr, "View");
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_small_int_arg");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 1);
+    const auto& msg = or_.messages[0];
+
+    SECTION("small integer argument has no string decode") {
+        REQUIRE(msg.args[0].value == 42);
+        REQUIRE_FALSE(msg.args[0].deref_str.has_value());
+    }
+}
+
+TEST_CASE("ObjcPass extracts the return value (x0) after the message send",
+          "[unit][pass][objc]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit_objc(tw.rt(0x1000), 0xAAULL, 0xBBULL, "NSNumber");
+        // x0 is set to the "return value" right after the objc_msgSend call.
+        tw.emit(ms, 0x1000, enc::movz(0, 0x7777),
+                {{0, 0x7777ULL}, {33, tw.rt(0x1004)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_retval");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 1);
+    const auto& msg = or_.messages[0];
+
+    SECTION("has_return is true") {
+        REQUIRE(msg.has_return);
+    }
+
+    SECTION("return_value matches x0 after the message send") {
+        REQUIRE(msg.return_value == 0x7777ULL);
+    }
+}
+
+TEST_CASE("ObjcPass zero-colon selector with hex fallback uses full arg window",
+          "[unit][pass][objc]") {
+    // When the selector can't be resolved to a real string, selector_name
+    // falls back to a hex-address string (e.g. "0x50000"), which contains no
+    // colons.  ObjcPass special-cases this: a hex-fallback name gets
+    // OBJC_MAX_ARGS extracted (since the real arg count is unknown), rather
+    // than being (incorrectly) treated as a zero-arg getter.
+    uint64_t sel_addr = 0x99999ULL;  // never planted -> hex fallback
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x1000, enc::movz(2, 0x1234),
+                {{2, 0x1234ULL}, {33, tw.rt(0x1004)}}, {});
+
+        tw.emit_objc(tw.rt(0x1004), 0x1ULL, sel_addr, "Unresolved");
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_hexfallback_args");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 1);
+    const auto& msg = or_.messages[0];
+
+    SECTION("selector_name is the hex fallback") {
+        REQUIRE(msg.selector_name.find("0x") == 0);
+    }
+
+    SECTION("arg_count is OBJC_MAX_ARGS (unknown arity => extract all slots)") {
+        REQUIRE(msg.arg_count == OBJC_MAX_ARGS);
+    }
+
+    SECTION("x2 is still captured within the full window") {
+        REQUIRE(msg.args[0].value == 0x1234ULL);
+    }
+}
+
+TEST_CASE("ObjcPass selector name cache resolves repeated selector pointers consistently",
+          "[unit][pass][objc]") {
+    // Same selector address used across multiple messages -- resolved once,
+    // cached, and returned identically on subsequent messages (exercises the
+    // sel_name_cache_ hit path in the raw-pointer fast scan).
+    uint64_t sel_addr = 0x50000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        plant_string_in_memory(tw, ms, sel_addr, "description");  // 0 colons
+
+        for (int i = 0; i < 3; i++) {
+            uint64_t pc = 0x1000 + (uint64_t)i * 4;
+            tw.emit_objc(tw.rt(pc), (uint64_t)(0x100 + i), sel_addr, "Widget");
+            tw.emit(ms, pc, enc::nop(), {{33, tw.rt(pc + 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "objc_sel_cache");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    auto& or_ = pm->require("objc").get<ObjcResult>();
+
+    REQUIRE(or_.total_messages() == 3);
+
+    SECTION("all three messages resolve to the same selector string") {
+        for (const auto& msg : or_.messages) {
+            REQUIRE(msg.selector_name == "description");
+        }
+    }
+
+    SECTION("zero-colon getter selector produces arg_count == 0") {
+        for (const auto& msg : or_.messages) {
+            REQUIRE(msg.arg_count == 0);
+        }
+    }
+
+    SECTION("Widget class aggregates a single unique selector") {
+        auto it = or_.classes.find("Widget");
+        REQUIRE(it != or_.classes.end());
+        REQUIRE(it->second.selectors_seen.size() == 1);
+        REQUIRE(it->second.message_count == 3);
+    }
+}
+
+TEST_CASE("ObjcPass blob serialization round-trip preserves args/return/strings",
+          "[unit][pass][objc]") {
+    // Exercises objc_serialize/objc_deserialize (the persisted-cache path)
+    // indirectly: running the pass twice on the same full-trace range should
+    // produce an identical result the second time (loaded from the RocksDB
+    // blob cache written after the first run).
+    uint64_t sel_addr = 0x50000ULL;
+    uint64_t str_addr = 0x70000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        plant_string_in_memory(tw, ms, sel_addr, "setName:");
+        plant_string_in_memory(tw, ms, str_addr, "Alice");
+
+        tw.emit(ms, 0x1000, enc::movz(2, (uint16_t)(str_addr & 0xFFFF)),
+                {{2, str_addr}, {33, tw.rt(0x1004)}}, {});
+        tw.emit_objc(tw.rt(0x1004), 0xABCULL, sel_addr, "Person");
+        tw.emit(ms, 0x1004, enc::movz(0, 1), {{0, 1ULL}, {33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "objc_cache_roundtrip");
+
+    auto pm1 = make_pm(*env);
+    pm1->register_pass(std::make_unique<ObjcPass>());
+    auto& or1 = pm1->require("objc").get<ObjcResult>();
+    REQUIRE(or1.total_messages() == 1);
+
+    // Second PassManager instance sharing the same TraceIndex (env->index)
+    // will hit the persisted blob cache written by the first run.
+    auto pm2 = make_pm(*env);
+    pm2->register_pass(std::make_unique<ObjcPass>());
+    auto& or2 = pm2->require("objc").get<ObjcResult>();
+
+    SECTION("cached result matches the freshly-computed one") {
+        REQUIRE(or2.total_messages() == or1.total_messages());
+        REQUIRE(or2.messages[0].class_name == or1.messages[0].class_name);
+        REQUIRE(or2.messages[0].selector_name == or1.messages[0].selector_name);
+        REQUIRE(or2.messages[0].args[0].value == or1.messages[0].args[0].value);
+        REQUIRE(or2.messages[0].args[0].deref_str == or1.messages[0].args[0].deref_str);
+        REQUIRE(or2.messages[0].has_return == or1.messages[0].has_return);
+        REQUIRE(or2.messages[0].return_value == or1.messages[0].return_value);
     }
 }

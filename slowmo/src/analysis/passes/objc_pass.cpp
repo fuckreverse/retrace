@@ -1,5 +1,4 @@
 #include "analysis/passes/objc_pass.h"
-#include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -208,227 +207,16 @@ nlohmann::json ObjcResult::to_json() const {
     return j;
 }
 
-// ─── ObjcCollector ───────────────────────────────────────────────────────
-
-/// Sequential TraceCollector that processes Objc records and builds
-/// the ObjcResult. Requires MemoryModel + RegisterFile for argument extraction.
-///
-/// Performance notes:
-///   - on_objc() calls regfile_.state_before() to extract arguments (x2-x7)
-///     and return value (x0).  Each EXEC_TRANSFER_CALL in qbditrace sets
-///     need_anchor=true, so an ANCHOR record is always written immediately
-///     before the instruction following an objc_msgSend.  This means
-///     nearest_anchor_before(inst_id) lands right next to the target, making
-///     rebuild() nearly free (0-few diffs to replay).  No warm_range() needed.
-///   - Selector name cache eliminates redundant image_read_cstring / memory reads
-///     (same selector pointer resolves to the same string every time).
-///   - String deref cache avoids repeated read_region() calls for the same
-///     pointer value within a trace range (pointer content is immutable for
-///     constant string objects like NSString literals / CFString).
-class ObjcCollector final : public TraceCollector {
-public:
-    using ProgressFn = std::function<void(uint64_t, uint64_t)>;
-
-    ObjcCollector(MemoryModel& memory, RegisterFile& regfile,
-                  CodeTable& code_table,
-                  const std::string& class_filter,
-                  const std::string& selector_filter,
-                  uint64_t start_inst_id, uint64_t end_inst_id,
-                  ProgressFn progress_fn = nullptr)
-        : memory_(memory)
-        , regfile_(regfile)
-        , code_table_(code_table)
-        , class_filter_(class_filter)
-        , selector_filter_(selector_filter)
-        , range_start_(start_inst_id)
-        , range_end_(end_inst_id)
-        , progress_fn_(std::move(progress_fn))
-    {}
-
-    std::string_view name() const override { return "ObjcCollector"; }
-
-    bool begin(uint64_t start, uint64_t end) override {
-        result_ = ObjcResult{};
-        processed_ = 0;
-        objc_count_ = 0;
-        last_reported_inst_ = 0;
-        range_total_ = (end > start) ? (end - start) : 1;
-
-        // No warm_range() needed: qbditrace writes an ANCHOR immediately
-        // before each objc_msgSend (EXEC_TRANSFER_CALL sets need_anchor),
-        // so state_before() rebuilds from a near-adjacent anchor with
-        // effectively zero replay cost.
-        return true;
-    }
-
-    void on_inst(uint64_t inst_id, const InstView& /*inst*/) override {
-        processed_++;
-
-        // Report progress based on instruction position — this is the primary
-        // progress metric since INST records are far more frequent than OBJC
-        // records.  Report every 64K instructions to avoid excessive callback
-        // overhead.
-        if (progress_fn_ && (processed_ & 0xFFFF) == 0) {
-            progress_fn_(processed_, range_total_);
-        }
-    }
-
-    void on_objc(uint64_t inst_id, const ObjcView& objc) override {
-        if (inst_id < range_start_ || inst_id >= range_end_) return;
-
-        objc_count_++;
-
-        // Report progress on each ObjC record (they are rare but expensive)
-        if (progress_fn_) {
-            // Blend inst progress with objc count for smooth reporting
-            progress_fn_(processed_, range_total_);
-        }
-
-        // Extract class name early for filtering
-        std::string cls_name = extract_class_name(objc.cls);
-
-        // Apply class filter if set
-        if (!class_filter_.empty() && cls_name != class_filter_) {
-            return;
-        }
-
-        ObjcMessage msg;
-        msg.inst_id   = inst_id;
-        msg.pc        = objc.pc;
-        msg.receiver  = objc.recv;
-        msg.selector  = objc.sel;
-        msg.variant   = objc.variant;
-        msg.class_name = std::move(cls_name);
-
-        // Resolve selector name — cached by address (same sel ptr → same string)
-        uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
-        auto [sel_it, sel_inserted] = sel_name_cache_.emplace(objc.sel, std::string{});
-        if (sel_inserted) {
-            // Cache miss: resolve and store
-            auto img_str = code_table_.image_read_cstring(objc.sel);
-            if (img_str.has_value()) {
-                sel_it->second = std::move(*img_str);
-            } else {
-                sel_it->second = read_cstring_from_memory(memory_, objc.sel, pre_inst_id);
-            }
-        }
-        msg.selector_name = sel_it->second;  // cheap copy from cache
-
-        // Apply selector filter if set (substring match)
-        if (!selector_filter_.empty() &&
-            msg.selector_name.find(selector_filter_) == std::string::npos) {
-            return;
-        }
-
-        // ─── Extract method arguments (x2-x7) ────────────────────────────
-        uint8_t sel_arg_count = count_selector_args(msg.selector_name);
-        if (sel_arg_count == 0 && msg.selector_name.find("0x") == 0) {
-            sel_arg_count = OBJC_MAX_ARGS;
-        }
-        msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
-
-        // Fetch the pre-instruction register state once — used for both
-        // argument extraction (x2-x7) and return value (x0 at inst_id).
-        // The return value is actually x0 AFTER the ObjC call executes,
-        // which corresponds to the register state at inst_id (before the
-        // next instruction).  If inst_id == pre_inst_id + 1, we can derive
-        // it from state_before(inst_id); otherwise we need two calls.
-        const RegState* pre_regs = nullptr;
-
-        if (msg.arg_count > 0) {
-            pre_regs = &regfile_.state_before(pre_inst_id);
-        }
-
-        if (pre_regs) {
-            for (uint8_t k = 0; k < msg.arg_count; ++k) {
-                uint64_t val = pre_regs->gpr[k + 2];  // x2=gpr[2], x3=gpr[3], ...
-                msg.args[k].value = val;
-                msg.args[k].deref_str = cached_deref_string(val, pre_inst_id);
-                if (!msg.args[k].deref_str.has_value()) {
-                    msg.args[k].deref_str = try_decode_reg_ascii(val);
-                }
-            }
-        }
-
-        // ─── Extract return value (x0 after the method returns) ──────────
-        {
-            const auto& inst_regs = regfile_.state_before(inst_id);
-            msg.return_value = inst_regs.gpr[0];
-            msg.return_deref_str = cached_deref_string(inst_regs.gpr[0], inst_id);
-            auto reg_str = try_decode_reg_ascii(inst_regs.gpr[0]);
-            if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
-                msg.return_deref_str = std::move(reg_str);
-            }
-            msg.has_return = true;
-        }
-
-        // Record message index
-        size_t msg_idx = result_.messages.size();
-
-        // Update class info
-        auto& cls_info = result_.classes[msg.class_name];
-        if (cls_info.name.empty()) {
-            cls_info.name = msg.class_name;
-        }
-        cls_info.message_count++;
-        cls_info.message_indices.push_back(msg_idx);
-
-        // Track unique selectors for this class (O(1) amortized via hash set)
-        cls_info.selectors_seen.insert(msg.selector_name);
-
-        // Index by PC
-        result_.by_pc[msg.pc].push_back(msg_idx);
-
-        // Store message
-        result_.messages.push_back(std::move(msg));
-    }
-
-    ObjcResult take_result() { return std::move(result_); }
-    uint64_t processed() const { return processed_; }
-    uint64_t objc_count() const { return objc_count_; }
-
-private:
-    /// Cached string dereference: avoids repeated read_region() calls for the
-    /// same pointer address.  Uses a sentinel entry to distinguish "looked up
-    /// but found no string" from "never looked up".
-    std::optional<std::string> cached_deref_string(uint64_t addr, uint64_t at_inst_id) {
-        if (!is_likely_pointer(addr)) return std::nullopt;
-
-        auto [it, inserted] = deref_cache_.emplace(addr, std::nullopt);
-        if (inserted) {
-            // Cache miss: perform actual deref
-            it->second = try_deref_string(memory_, addr, at_inst_id);
-        }
-        return it->second;
-    }
-
-    MemoryModel& memory_;
-    RegisterFile& regfile_;
-    CodeTable& code_table_;
-    const std::string& class_filter_;
-    const std::string& selector_filter_;
-    uint64_t range_start_;
-    uint64_t range_end_;
-    ProgressFn progress_fn_;
-
-    ObjcResult result_;
-    uint64_t processed_ = 0;
-    uint64_t objc_count_ = 0;
-    uint64_t last_reported_inst_ = 0;
-    uint64_t range_total_ = 1;
-
-    /// Selector name cache: sel pointer address → resolved string.
-    /// ObjC selectors are uniqued by the runtime, so the same pointer always
-    /// resolves to the same string — cache hit rate is ~95%+ in practice.
-    ankerl::unordered_dense::map<uint64_t, std::string> sel_name_cache_;
-
-    /// String deref cache: pointer value → dereferenced string (or nullopt).
-    /// Works well for NSString constants and CFString literals that are
-    /// passed as arguments repeatedly (e.g. dictionary keys, notification names).
-    ankerl::unordered_dense::map<uint64_t, std::optional<std::string>> deref_cache_;
-};
-
 // ─── ObjcResult serialization (for blob cache) ───────────────────────────
+//
+// NOTE: an earlier sequential TraceCollector-based implementation
+// ("ObjcCollector") used to live here.  ObjcPass::run() has since been
+// rewritten to use a raw-pointer fast scan (see below) that bypasses
+// TraceScanEngine/InstView entirely for ~1000x fewer virtual calls on large
+// traces.  The old collector class was never instantiated anywhere in the
+// codebase after that rewrite and has been removed as dead code; the
+// raw-pointer scan below is the sole implementation of the ObjC parsing
+// logic (class/selector resolution, arg/return extraction, caching).
 
 namespace {
 
@@ -707,15 +495,30 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     msg.variant   = oh->variant;
                     msg.class_name = std::move(cls_name);
 
-                    // Resolve selector name — cached by address
-                    uint64_t pre_inst_id = (inst_id > 0) ? inst_id - 1 : 0;
+                    // Resolve selector name — cached by address.
+                    //
+                    // `inst_id` here is the raw scan counter: the number of INST
+                    // records already processed when this OBJC record was
+                    // encountered, i.e. the index of the *next* instruction to
+                    // execute (the objc_msgSend call site itself, or the first
+                    // instruction of its effect in synthetic traces). Per
+                    // RegisterFile::state_before()'s contract ("state BEFORE
+                    // instruction N executes" = diffs of 0..N-1 already
+                    // applied), `state_before(inst_id)` is exactly "all
+                    // register/memory writes that happened before this
+                    // objc_msgSend fired" — which is what we want for both the
+                    // selector string and the argument registers (x2-x7) that
+                    // the caller set up right before the call. Using
+                    // `inst_id - 1` here (as a prior version of this code did)
+                    // under-counts by one instruction and silently drops the
+                    // most recently-written argument/selector-string byte.
                     auto [sel_it, sel_inserted] = sel_name_cache.emplace(oh->sel, std::string{});
                     if (sel_inserted) {
                         auto img_str = code_table.image_read_cstring(oh->sel);
                         if (img_str.has_value()) {
                             sel_it->second = std::move(*img_str);
                         } else {
-                            sel_it->second = read_cstring_from_memory(memory, oh->sel, pre_inst_id);
+                            sel_it->second = read_cstring_from_memory(memory, oh->sel, inst_id);
                         }
                     }
                     msg.selector_name = sel_it->second;
@@ -736,13 +539,13 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
                     const RegState* pre_regs = nullptr;
                     if (msg.arg_count > 0) {
-                        pre_regs = &regfile.state_before(pre_inst_id);
+                        pre_regs = &regfile.state_before(inst_id);
                     }
                     if (pre_regs) {
                         for (uint8_t k = 0; k < msg.arg_count; ++k) {
                             uint64_t val = pre_regs->gpr[k + 2];
                             msg.args[k].value = val;
-                            msg.args[k].deref_str = cached_deref(val, pre_inst_id);
+                            msg.args[k].deref_str = cached_deref(val, inst_id);
                             if (!msg.args[k].deref_str.has_value()) {
                                 msg.args[k].deref_str = try_decode_reg_ascii(val);
                             }

@@ -30,6 +30,7 @@
 #include "analysis/passes/taint_source_annotation_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/objc_pass.h"
+#include "analysis/passes/function_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -169,6 +170,42 @@ static std::unique_ptr<TraceEnv> make_bare_memory_trace() {
     }, "tsa_bare_mem");
 }
 
+/// Trace with a BL call to a named-looking callee whose RET leaves a value in
+/// x0 that is never subsequently overwritten before the sink instruction.
+///   inst 0: BL callee   (call_site_pc=0x1000, target_pc=0x2000)
+///   inst 1: (callee) MOVZ x0, #0x77   — callee "computes" its return value
+///   inst 2: (callee) RET              — returns to inst 3
+///   inst 3: NOP                       — back in caller; sink scans 0..2
+///
+/// FunctionPass pairs the BL (inst 0) with the RET (inst 2) as a CallEvent
+/// with call_inst_id=0, target_pc=callee's entry (0x2000 + slide).
+/// fill_function_return() looks up func->call_at(leaf.inst_id - 1): the leaf
+/// here is the MOVZ at inst_id=1, so call_at(0) must resolve to the BL event
+/// recorded at inst_id=0 — i.e. the leaf immediately follows the call site.
+static std::unique_ptr<TraceEnv> make_function_return_trace() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // inst 0: BL callee (0x1000 -> 0x2000)
+        tw.emit(ms, 0x1000, enc::bl(0x2000 - 0x1000),
+                {{30, tw.rt(0x1004)}, {33, tw.rt(0x2000)}}, {});
+
+        // inst 1: callee body — x0 = 0x77 (the "return value")
+        tw.emit(ms, 0x2000, enc::movz(0, 0x77),
+                {{0, 0x77ULL}, {33, tw.rt(0x2004)}}, {});
+
+        // inst 2: RET — back to caller (LR = 0x1004)
+        tw.emit(ms, 0x2004, enc::ret(), {{33, tw.rt(0x1004)}}, {});
+
+        // inst 3: NOP in caller — used as the sink instruction (sink_id=3
+        // scans inst_id 0..2 backward).
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "tsa_funcret");
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 TEST_CASE("TaintSourceAnnotationPass: empty backward taint → no sources",
@@ -215,6 +252,75 @@ TEST_CASE("TaintSourceAnnotationPass: constant source classified correctly",
     // at minimum no ObjC attribution.
     SECTION("no ObjC sources (no ObjC messages in trace)") {
         REQUIRE(res.objc_source_indices.empty());
+    }
+
+    SECTION("classified as ImmediateConstant with constant_value populated") {
+        // fill_constant_value() reads regfile().state_after(leaf.inst_id) —
+        // this exercises the real (non-manually-constructed) path end-to-end.
+        REQUIRE_FALSE(res.constant_source_indices.empty());
+        const auto& ann = res.sources[res.constant_source_indices[0]];
+        REQUIRE(ann.kind == TaintSourceKind::ImmediateConstant);
+        REQUIRE(ann.constant_value == 0x42ULL);
+        REQUIRE(ann.summary().find("0x42") != std::string::npos);
+    }
+}
+
+TEST_CASE("TaintSourceAnnotationPass: FunctionReturn source resolves callee_pc/callee_name",
+          "[unit][pass][taint_source_annotation]") {
+    // Real end-to-end exercise of fill_function_return(): register FunctionPass
+    // as well so `function` is available via try_require() in run().
+    auto env = make_function_return_trace();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<BackwardTaintPass>(make_bwt_cfg(/*sink=*/3, /*reg=*/0)));
+    pm->register_pass(std::make_unique<ObjcPass>());
+    pm->register_pass(std::make_unique<FunctionPass>());
+    pm->register_pass(std::make_unique<TaintSourceAnnotationPass>());
+
+    // `function` is a soft dependency (see TaintSourceAnnotationPass::
+    // dependencies()): it is NOT auto-scheduled by require("taint_source_
+    // annotation") below, since PassManager::execute_pass() only recurses
+    // into a pass's declared dependencies() list. It must be explicitly
+    // require()'d first so try_require<FunctionResult>() inside run() sees
+    // PassState::Completed instead of NotRun. (Same fix applied in the
+    // production MCP tool — see mcp_tools_analysis.cpp's taint_source_
+    // annotation handler.)
+    pm->require("function");
+
+    auto& raw = pm->require("taint_source_annotation");
+    REQUIRE(raw.ok());
+    const auto& res = raw.get<TaintSourceAnnotationResult>();
+
+    // The MOVZ x0,#0x77 inside the callee is the leaf (no src_regs, no mem).
+    // classify_source() falls through to the "has_dst_reg(0) → FunctionReturn"
+    // heuristic since there's no ObjC context.
+    REQUIRE_FALSE(res.sources.empty());
+
+    // Find the leaf with kind == FunctionReturn (there should be exactly one:
+    // the MOVZ x0,#0x77 at inst_id=1, immediately after the BL at inst_id=0).
+    const TaintSourceAnnotation* fret = nullptr;
+    for (const auto& s : res.sources) {
+        if (s.kind == TaintSourceKind::FunctionReturn) { fret = &s; break; }
+    }
+    REQUIRE(fret != nullptr);
+
+    SECTION("callee_pc resolved to the BL's target (callee entry)") {
+        REQUIRE(fret->callee_pc != 0);
+    }
+
+    SECTION("callee_name defaults to empty when no symbol info is present") {
+        // FunctionPass doesn't have symbol/name info for synthetic traces, so
+        // FunctionInfo::name falls back to "sub_XXXXXX" or stays whatever the
+        // pass populates — either way, summary() must not crash and must
+        // reflect whichever branch (named vs. sub_XXX) is taken.
+        auto s = fret->summary();
+        REQUIRE(s.find("return of") != std::string::npos);
+        if (fret->callee_name.empty()) {
+            REQUIRE(s.find("sub_") != std::string::npos);
+        } else {
+            REQUIRE(s.find(fret->callee_name) != std::string::npos);
+        }
     }
 }
 

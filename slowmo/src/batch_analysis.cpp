@@ -699,6 +699,12 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         if (!opts.opt_objc && !opts.opt_syscall_intercept) {
             pm.register_pass(std::make_unique<ObjcPass>());
         }
+        // Optional: FunctionPass enables FunctionReturn source attribution
+        // (callee_pc/callee_name). Registered here (rather than as a hard
+        // AnalysisPass dependency) so this feature degrades gracefully —
+        // taint_source_annotation still works fine without it, just without
+        // callee names on FunctionReturn-classified sources.
+        pm.register_pass(std::make_unique<FunctionPass>());
         pm.register_pass(std::make_unique<TaintSourceAnnotationPass>());
     }
 

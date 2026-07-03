@@ -11,6 +11,8 @@
 
 namespace tenet {
 
+struct FunctionResult;  // forward declaration (analysis/passes/function_pass.h)
+
 // ─── Taint Source Annotation ───────────────────────────────────────────────
 
 /// The origin category of a taint source — what ultimately produced the value.
@@ -166,6 +168,16 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
+        // NOTE: `function` is intentionally NOT listed as a hard dependency
+        // here, even though run() consults it (via ctx.try_require) to
+        // attribute FunctionReturn sources to a callee name/pc. Making it a
+        // hard dependency would cause this pass to fail outright whenever
+        // FunctionPass hasn't been registered/hasn't completed (e.g. in
+        // callers that only care about ObjC/memory/constant sources and
+        // never registered FunctionPass) — that's a worse failure mode than
+        // simply leaving callee_name empty. Callers that want FunctionReturn
+        // attribution should register FunctionPass themselves (pass_registry
+        // does this automatically for the production pass catalog).
         return {"backward_taint", "objc"};
     }
 
@@ -181,8 +193,16 @@ private:
                                          uint64_t inst_id) const;
 
     /// Determine the kind of a leaf event.
+    ///
+    /// `func` (optional, may be nullptr if FunctionPass wasn't registered) is
+    /// consulted to disambiguate FunctionReturn from ImmediateConstant: both
+    /// present identically at the BackwardTaintEvent level (no src_regs, no
+    /// memory access — e.g. a MOVZ or the register-diff left behind by a
+    /// RET/BLR), so the only reliable signal is whether the leaf instruction
+    /// immediately follows a recorded call site (func->call_at(ev.inst_id-1)).
     TaintSourceKind classify_source(const BackwardTaintEvent& ev,
-                                     const ObjcMessage* objc_msg) const;
+                                     const ObjcMessage* objc_msg,
+                                     const FunctionResult* func = nullptr) const;
 };
 
 }  // namespace tenet
