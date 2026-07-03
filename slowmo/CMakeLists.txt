@@ -361,6 +361,7 @@ src/core/register_file.cpp
     src/analysis/pass_manager.cpp
     src/analysis/pass_registry.cpp
     src/analysis/trace_collector.cpp
+    src/analysis/annotation_view.cpp
     src/analysis/passes/taint_pass.cpp
     src/analysis/passes/backward_taint_pass.cpp
     src/analysis/passes/xref_pass.cpp
@@ -371,14 +372,12 @@ src/core/register_file.cpp
     src/analysis/passes/GraphGridLayout.cpp
     src/analysis/passes/string_pass.cpp
     src/analysis/passes/pattern_pass.cpp
-    src/analysis/passes/constant_materialization_pass.cpp
     src/analysis/passes/loop_pass.cpp
     src/analysis/passes/loop_semantics_pass.cpp
     src/analysis/passes/vm_abstract_pass.cpp
     src/analysis/passes/vm_hints_json.cpp
     src/analysis/passes/algorithm_summary_pass.cpp
     src/analysis/passes/trace_diff_pass.cpp
-    src/analysis/passes/symbol_annotation_pass.cpp
     src/analysis/passes/memory_snapshot_pass.cpp
     src/analysis/passes/memory_string_pass.cpp
     src/analysis/passes/dataflow_graph_pass.cpp

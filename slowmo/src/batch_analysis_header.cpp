@@ -6,8 +6,7 @@
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/taint_pass.h"
@@ -15,7 +14,7 @@
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
+#include "analysis/annotation_view.h"
 #include "analysis/passes/memory_snapshot_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"

@@ -1023,7 +1023,7 @@ case kTagAnaRegTimeline:
 
         // ── Analysis — Crypto & Pattern ──────────────────────────────────
         case kTagAnaPattern:        action = [this]{ run_pass_by_name("pattern"); show_pattern_ = true; }; break;
-        case kTagAnaConstants:      action = [this]{ run_pass_by_name("constant_materialization"); show_constant_ = true; }; break;
+        case kTagAnaConstants:      action = [this]{ run_pass_by_name("pattern"); show_constant_ = true; }; break;
         case kTagAnaLoopSemantics:  action = [this]{ run_pass_by_name("loop_semantics"); show_loop_semantics_ = true; }; break;
         case kTagAnaAlgoSummary:    action = [this]{ run_pass_by_name("algorithm_summary"); show_algorithm_summary_ = true; }; break;
         case kTagAnaObjCCrypto:     action = [this]{ run_pass_by_name("objc_crypto"); show_objc_crypto_ = true; }; break;

@@ -1,6 +1,5 @@
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/call_graph_pass.h"
@@ -249,23 +248,26 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
     // ── Soft-require all dependencies ────────────────────────────────────
     // Each dependency is optional; we degrade gracefully.
 
-    const auto& pattern_raw      = ctx.require_raw("pattern");
-    const auto& const_raw        = ctx.require_raw("constant_materialization");
-    const auto& loop_sem_raw     = ctx.require_raw("loop_semantics");
-    const auto& function_raw     = ctx.require_raw("function");
-    const auto& call_graph_raw   = ctx.require_raw("call_graph");
+const auto& pattern_raw      = ctx.require_raw("pattern");
+const auto& loop_sem_raw     = ctx.require_raw("loop_semantics");
+const auto& function_raw     = ctx.require_raw("function");
+const auto& call_graph_raw   = ctx.require_raw("call_graph");
 
-    const PatternResult*                pattern_res = nullptr;
-    const ConstantMaterializationResult* const_res  = nullptr;
-    const LoopSemanticsResult*          loop_res    = nullptr;
-    const FunctionResult*               func_res    = nullptr;
-    const CallGraphResult*              cg_res      = nullptr;
+const PatternResult*                pattern_res = nullptr;
+// Constant-materialization data now lives inside PatternResult::constants
+// (the standalone constant_materialization pass was merged into pattern).
+const ConstantMaterializationResult* const_res  = nullptr;
+const LoopSemanticsResult*          loop_res    = nullptr;
+const FunctionResult*               func_res    = nullptr;
+const CallGraphResult*              cg_res      = nullptr;
 
-    if (pattern_raw.ok())    pattern_res = &pattern_raw.get<PatternResult>();
-    if (const_raw.ok())      const_res   = &const_raw.get<ConstantMaterializationResult>();
-    if (loop_sem_raw.ok())   loop_res    = &loop_sem_raw.get<LoopSemanticsResult>();
-    if (function_raw.ok())   func_res    = &function_raw.get<FunctionResult>();
-    if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
+if (pattern_raw.ok()) {
+pattern_res = &pattern_raw.get<PatternResult>();
+const_res   = &pattern_res->constants;
+}
+if (loop_sem_raw.ok())   loop_res    = &loop_sem_raw.get<LoopSemanticsResult>();
+if (function_raw.ok())   func_res    = &function_raw.get<FunctionResult>();
+if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
 
     // ── Phase 1: Accumulate per-algorithm evidence ───────────────────────
     // Key: normalised algorithm name → accumulator.
@@ -578,9 +580,9 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
 
     // Data source availability
     nlohmann::json sources;
-    sources["pattern"]                  = pattern_res != nullptr;
-    sources["constant_materialization"] = const_res   != nullptr;
-    sources["loop_semantics"]           = loop_res    != nullptr;
+sources["pattern"]                  = pattern_res != nullptr;
+sources["constant_materialization"] = const_res   != nullptr;  // absorbed into pattern
+sources["loop_semantics"]           = loop_res    != nullptr;
     sources["function"]                 = func_res    != nullptr;
     sources["call_graph"]               = cg_res      != nullptr;
     j["data_sources"] = std::move(sources);

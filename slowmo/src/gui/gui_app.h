@@ -59,7 +59,6 @@ struct ConstantMaterializationResult;
 struct PatternResult;
 struct LoopSemanticsResult;
 struct AlgorithmSummaryResult;
-struct AnnotationResult;
 struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
 struct CacheSimResult;           // defined in cache_sim_pass.h
 struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
@@ -485,11 +484,13 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     int string_max_len_ = 256;  // length filter upper bound (inclusive); 256 = MAX_STRING_LEN
 
     // ─── Startup deep-analysis results ────────────────────────────────
+    // constant_result_ points into pattern_result_->constants — constant
+    // materialization was merged into the "pattern" pass, it is no longer a
+    // standalone pass (see PatternResult::constants in pattern_pass.h).
     const ConstantMaterializationResult* constant_result_          = nullptr;
     const PatternResult*                 pattern_result_           = nullptr;
     const LoopSemanticsResult*           loop_semantics_result_    = nullptr;
     const AlgorithmSummaryResult*        algorithm_summary_result_ = nullptr;
-    const AnnotationResult*              annotation_result_        = nullptr;
 
     // ─── Constant materialization analysis state ─────────────────────
     bool show_constant_ = false;
@@ -854,7 +855,7 @@ private:
 
     /// Force re-run a pass by invalidating both its in-memory result and its
     /// persisted RocksDB blob, then enqueue it for execution.
-    /// Use for passes that have disk caches (xref, function, constant_materialization).
+    /// Use for passes that have disk caches (xref, function, pattern).
     void force_rerun_pass(std::string_view name);
 
     /// Last generic pass run summary (shown in the All Passes section).

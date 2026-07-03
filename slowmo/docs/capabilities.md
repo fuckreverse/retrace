@@ -30,8 +30,7 @@ mindmap
       memory_strings
       literal_search
     算法识别
-      pattern
-      constant_materialization
+      pattern（内嵌 constant_materialization）
       loop_semantics
       algorithm_summary
       objc_crypto
@@ -102,7 +101,8 @@ mindmap
 ./tenet trace.bin --symbol-annotation
 ```
 
-对应 pass：`function`, `xref`, `cfg`, `cfg_layout`, `call_graph`, `loop`, `symbol_annotation`
+对应 pass：`function`, `xref`, `cfg`, `cfg_layout`, `call_graph`, `loop`
+（`--symbol-annotation` 不是独立 pass，而是聚合以上结果的辅助函数 `build_annotation_view()`）
 
 参考：[`analysis-layer.md`](analysis-layer.md)
 
@@ -185,7 +185,7 @@ mindmap
 ./tenet trace.bin --objc-crypto --syscall-intercept
 ```
 
-对应 pass：`pattern`, `constant_materialization`, `loop_semantics`, `algorithm_summary`, `objc`, `objc_crypto`, `syscall_intercept`
+对应 pass：`pattern`（内嵌 constant_materialization）, `loop_semantics`, `algorithm_summary`, `objc`, `objc_crypto`, `syscall_intercept`
 
 参考：[`analysis-layer.md`](analysis-layer.md)
 

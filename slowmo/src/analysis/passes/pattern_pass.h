@@ -2,10 +2,11 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
-#include "analysis/passes/constant_materialization_pass.h"
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
+#include <optional>
 #include <ankerl/unordered_dense.h>
 #include <filesystem>
 
@@ -15,6 +16,82 @@ struct YR_RULES;
 #endif
 
 namespace tenet {
+
+// ─── Known constant database (movz+movk constant materialization) ────────
+//
+// Absorbed from the former standalone `constant_materialization` pass:
+// pattern's own instruction scan already visits every MOVZ/MOVK, so
+// tracking materialized constants here avoids a second full trace pass
+// and a duplicate MOVZ/MOVK decoder (see PatternCollector below).
+
+/// A known constant that can be identified in movz+movk sequences.
+struct KnownConstant {
+    uint64_t value;
+    std::string name;          // e.g. "SHA256_H0"
+    std::string algorithm;     // e.g. "SHA-256"
+    std::string description;   // e.g. "SHA-256 initial hash value H0"
+    bool is_32bit;             // true if only lower 32 bits are significant
+
+    KnownConstant(uint64_t v, std::string n, std::string algo,
+                  std::string desc, bool is_32 = false)
+        : value(v), name(std::move(n)), algorithm(std::move(algo)),
+          description(std::move(desc)), is_32bit(is_32) {}
+};
+
+/// A constant value fully materialized through a movz+movk sequence in the trace.
+struct MaterializedConstant {
+    uint64_t value;                 // The final 64-bit constant value
+    uint8_t dst_reg;                // Destination register index (x0-x28)
+    uint64_t first_inst_id;         // inst_id of the movz
+    uint64_t last_inst_id;          // inst_id of the last movk
+    uint64_t pc_first;              // PC of the movz
+    uint64_t pc_last;               // PC of the last movk
+    uint8_t num_parts;              // Number of instructions (1=movz only, 2-4=movz+movk)
+
+    // If identified, which known constant it matches
+    const KnownConstant* known_match = nullptr;
+
+    /// How many 16-bit slots were actually set (determines value width).
+    uint8_t width_slots() const { return num_parts; }
+
+    /// Is this a 32-bit constant (only hw0 and hw1 set)?
+    bool is_32bit() const { return num_parts <= 2; }
+};
+
+/// Result of scanning movz+movk constant-construction sequences and
+/// cross-referencing them against the known-constant database.
+///
+/// This used to be its own top-level pass result (`constant_materialization`);
+/// it is now a sub-result embedded in PatternResult (see PatternResult::constants)
+/// since PatternCollector computes it as part of its single trace scan.
+struct ConstantMaterializationResult {
+    /// All materialized constants found, sorted by first_inst_id.
+    std::vector<MaterializedConstant> constants;
+
+    /// Constants that matched a known algorithm constant.
+    std::vector<size_t> identified_indices;   // indices into constants[]
+
+    /// Group by algorithm: algorithm_name → indices into constants[]
+    ankerl::unordered_dense::map<std::string, std::vector<size_t>> by_algorithm;
+
+    /// Total number of materialized constants found.
+    size_t total() const { return constants.size(); }
+
+    /// Total number of identified (known) constants.
+    size_t identified_count() const { return identified_indices.size(); }
+
+    /// Get all constants matching a specific algorithm.
+    std::vector<const MaterializedConstant*> for_algorithm(const std::string& algo) const {
+        std::vector<const MaterializedConstant*> out;
+        auto it = by_algorithm.find(algo);
+        if (it != by_algorithm.end()) {
+            for (size_t idx : it->second) {
+                out.push_back(&constants[idx]);
+            }
+        }
+        return out;
+    }
+};
 
 // ─── Pattern category and confidence ──────────────────────────────────────
 
@@ -57,6 +134,15 @@ struct PatternResult {
     // Category index: category → indices into matches
     ankerl::unordered_dense::map<PatternCategory, std::vector<size_t>> by_category;
 
+    /// Materialized movz+movk constants found during the same scan (absorbed
+    /// from the former standalone `constant_materialization` pass). Populated
+    /// unconditionally by PatternCollector — every identified constant here
+    /// also has a corresponding entry in `matches` (KeySchedule category) for
+    /// uniform consumption, but code that wants the raw MaterializedConstant
+    /// records (value, dst_reg, num_parts, known_match, ...) should use this
+    /// field directly.
+    ConstantMaterializationResult constants;
+
     /// Get all crypto-related matches.
     std::vector<const PatternMatch*> crypto_matches() const;
 
@@ -71,8 +157,8 @@ struct PatternResult {
 
 /// TraceCollector that runs all mnemonic-based pattern detectors in a single
 /// sequential scan: HW crypto detection, XOR loop detection, and constant
-/// loading detection.  Also optionally builds YARA reg-value and syscall
-/// buffers during the same scan.
+/// materialization (movz+movk) tracking.  Also optionally builds YARA
+/// reg-value and syscall buffers during the same scan.
 class PatternCollector final : public TraceCollector {
 public:
     // ─── Public types (also used by PatternPass for YARA) ─────────────────
@@ -96,7 +182,7 @@ public:
                      InstructionDecoder& decoder,
                      RegisterFile* regfile,
                      bool build_yara_buffers,
-                     const ConstantMaterializationResult* constmat,
+                     uint8_t constmat_min_parts,
                      uint32_t target_os = 0);
 
     std::string_view name() const override { return "PatternCollector"; }
@@ -109,6 +195,17 @@ public:
     PatternResult take_result() { return std::move(result_); }
     RegValueBuffer take_reg_buf() { return std::move(reg_buf_); }
     SyscallBuffer take_sys_buf() { return std::move(sys_buf_); }
+
+    /// Build the known-constants database (once, lazily, process-wide).
+    /// Public + idempotent because the pattern-blob deserializer
+    /// (pattern_pass.cpp) may need the database populated before any
+    /// PatternCollector has been constructed (cache fast-path).
+    static void build_known_db();
+
+    /// Match a value against the known-constants database. Public because
+    /// the pattern-blob deserializer (pattern_pass.cpp) needs to rebuild
+    /// known_match pointers for cached MaterializedConstant entries.
+    static const KnownConstant* lookup_known_constant(uint64_t value);
 
 private:
     // ─── Mnemonic classification ──────────────────────────────────────────
@@ -137,15 +234,42 @@ private:
     /// to record (the instruction that broke the run, or 0 at end-of-trace).
     void flush_xor_loop_match(uint64_t end_pc);
 
-    /// Emit the currently-buffered movz/movk load-sequence candidate as a
-    /// PatternMatch. Always Low confidence: unlike constant_materialization
-    /// (which this detector only runs as a fallback for, see the "Skipped
-    /// when constmat result is available" comment at the call site), this
-    /// path never checks the *value* being loaded against a known
-    /// cryptographic constant table — it only knows "a register got
-    /// assembled from >=3 immediate parts", which any 32/64-bit literal
-    /// (pointer, offset, magic number, ...) can trigger.
-    void flush_const_load_match();
+    // ─── Constant materialization (movz+movk) helpers ──────────────────────
+
+    /// In-progress constant construction being tracked for a register.
+    struct PendingConstant {
+        uint64_t value = 0;             // Accumulated value
+        uint8_t dst_reg = 0;            // Register index
+        uint64_t first_inst_id = 0;     // inst_id of the movz
+        uint64_t last_inst_id = 0;      // inst_id of the latest movk
+        uint64_t pc_first = 0;          // PC of the movz
+        uint64_t pc_last = 0;           // PC of the latest movk
+        uint8_t num_parts = 0;          // Count of movz+movk instructions
+        uint16_t shift_mask = 0;        // Bitmask of which hw shifts have been set
+        bool active = false;            // Is this slot tracking a constant?
+    };
+
+    /// Decoded MOVZ/MOVK immediate + shift + destination register.
+    struct MovImm {
+        uint16_t imm16 = 0;
+        uint8_t hw = 0;         // shift = hw * 16  (0, 1, 2, 3)
+        uint8_t rd = 0;         // register index
+        bool is_64bit = false;  // true = Xd, false = Wd
+    };
+
+    /// Try to decode a MOVZ/MOVK instruction from a raw opcode.
+    /// Returns nullopt if the opcode is not a MOVZ or MOVK respectively.
+    static std::optional<MovImm> decode_movz(uint32_t opcode);
+    static std::optional<MovImm> decode_movk(uint32_t opcode);
+
+    /// Flush a completed pending constant into constmat_result_ (subject to
+    /// constmat_min_parts_).
+    void flush_pending_constant(PendingConstant& pending);
+
+    /// Build by_algorithm/identified_indices on constmat_result_, then
+    /// append one PatternMatch (KeySchedule category) per constant so the
+    /// unified `matches` view also reflects constant-materialization hits.
+    void finalize_constants();
 
     // ─── Configuration ───────────────────────────────────────────────────
 
@@ -153,7 +277,7 @@ private:
     InstructionDecoder& decoder_;
     RegisterFile* regfile_;          // nullable; only needed for syscall buffer
     bool build_yara_buffers_;
-    const ConstantMaterializationResult* constmat_;
+    uint8_t constmat_min_parts_;     // min movz+movk parts to report (see PatternPass::set_constants_min_parts)
 
     // ─── Pre-built PC classification ─────────────────────────────────────
 
@@ -230,14 +354,10 @@ private:
     /// instruction that triggered detection.
     void seed_xor_loop_from_ring();
 
-    // ─── Constant loading detector state ─────────────────────────────────
+    // ─── Constant materialization detector state (movz+movk) ──────────────
 
-    static constexpr size_t CONST_LOAD_THRESHOLD = 3;
-
-    bool in_load_seq_ = false;
-    uint64_t load_seq_start_ = 0;
-    std::vector<uint64_t> load_seq_insts_;
-    uint64_t last_movz_pc_ = 0;
+    std::array<PendingConstant, 31> constmat_pending_{};
+    ConstantMaterializationResult constmat_result_;
 
     // ─── YARA buffer state ───────────────────────────────────────────────
 
@@ -257,7 +377,10 @@ private:
 // ─── Pattern analysis pass (YARA-based) ───────────────────────────────────
 
 /// Detects cryptographic algorithm usage and anti-debug/anti-tamper patterns.
-/// Now delegates the trace scan to PatternCollector for scan fusion.
+/// Delegates the trace scan to PatternCollector for scan fusion. Also owns
+/// what used to be the standalone `constant_materialization` pass: movz+movk
+/// constant tracking is folded into the same single trace scan (see
+/// PatternResult::constants).
 ///
 /// Result type: PatternResult
 class PatternPass final : public AnalysisPass {
@@ -273,22 +396,23 @@ public:
 
     std::string_view name() const override { return "pattern"; }
     std::string_view description() const override {
-        return "Detect crypto, anti-debug, and obfuscation patterns via YARA rules";
+        return "Detect crypto constants, anti-debug, and obfuscation patterns via YARA rules";
     }
 
-    /// Optional soft dependency: if constant_materialization has already run,
-    /// PatternPass will use its results for Detector3 (constant loading)
-    /// instead of re-scanning the trace with the same logic.
     std::vector<std::string_view> dependencies() const override {
-        return {};  // Hard dependencies: none. constant_materialization is consumed
-                    // opportunistically via try_require() in run().
+        return {};  // No dependencies — operates directly on trace + code_table + decoder.
     }
 
     PassResult run(PassContext& ctx) override;
-    float estimated_cost() const override { return 10.0f; }
+    float estimated_cost() const override { return 12.0f; }
 
     /// Set the directory containing .yar rule files.
     void set_rules_dir(const std::filesystem::path& dir) { rules_dir_ = dir; }
+
+    /// Set minimum number of movz+movk parts to report for the absorbed
+    /// constant-materialization sub-detector (default: 2). Set to 1 to
+    /// include standalone movz instructions.
+    void set_constants_min_parts(uint8_t n) { constmat_min_parts_ = n; }
 
     /// Parse category string from YARA meta.
     static PatternCategory parse_category(const std::string& s);
@@ -314,10 +438,6 @@ private:
     };
     CodeBuffer build_code_buffer(PassContext& ctx);
 
-    /// Convert ConstantMaterializationResult entries into PatternMatch objects.
-    static void constmat_to_pattern_matches(const ConstantMaterializationResult& cm,
-                                             PatternResult& result);
-
     /// Build the by_category index from the matches vector.
     void build_category_index(PatternResult& result);
 
@@ -328,6 +448,7 @@ private:
     YR_RULES* yr_rules_ = nullptr;
 #endif
     bool rules_loaded_ = false;
+    uint8_t constmat_min_parts_ = 2;
 };
 
 }  // namespace tenet

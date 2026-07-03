@@ -271,7 +271,7 @@ void GuiApp::render_menu_bar() {
                     run_pass_by_name("pattern"); show_pattern_ = true;
                 }
                 if (ImGui::MenuItem("Constants")) {
-                    run_pass_by_name("constant_materialization"); show_constant_ = true;
+                    run_pass_by_name("pattern"); show_constant_ = true;
                 }
                 if (ImGui::MenuItem("Loop Semantics")) {
                     run_pass_by_name("loop_semantics"); show_loop_semantics_ = true;

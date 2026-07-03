@@ -16,11 +16,9 @@
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/thread_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
-#include "analysis/passes/pattern_pass.h"
+#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
@@ -243,15 +241,15 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         // Do NOT auto-focus — Instructions is the primary disasm view.
         return;
     }
-    if (name == "constant_materialization") {
-        constant_result_ = &raw->get<ConstantMaterializationResult>();
-        show_constant_   = true;
-        pending_focus_windows_.push_back("Constants");
-        return;
-    }
     if (name == "pattern") {
-        pattern_result_ = &raw->get<PatternResult>();
-        show_pattern_   = true;
+        pattern_result_  = &raw->get<PatternResult>();
+        // Constant materialization was merged into "pattern" — always
+        // update the pointer so the Constants panel has data as soon as
+        // pattern finishes, but don't force that window open (mirrors the
+        // old two-pass behavior where running just "pattern" wouldn't
+        // auto-show "Constants").
+        constant_result_ = &pattern_result_->constants;
+        show_pattern_    = true;
         pending_focus_windows_.push_back("Patterns");
         return;
     }
@@ -264,10 +262,6 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         algorithm_summary_result_ = &raw->get<AlgorithmSummaryResult>();
         show_algorithm_summary_   = true;
         pending_focus_windows_.push_back("Algorithm Summary");
-        return;
-    }
-    if (name == "symbol_annotation") {
-        annotation_result_ = &raw->get<AnnotationResult>();
         return;
     }
     if (name == "objc") {
@@ -653,7 +647,8 @@ void GuiApp::force_rerun_pass(std::string_view name) {
     } else if (name == "function") {
         function_result_ = nullptr;
         sparkline_cache_ = {};
-    } else if (name == "constant_materialization") {
+    } else if (name == "pattern") {
+        // constant_materialization was merged into pattern.
         constant_result_ = nullptr;
     }
 
@@ -716,7 +711,6 @@ void GuiApp::clear_analysis() {
     show_call_graph_          = false;
     std::memset(call_graph_filter_buf_, 0, sizeof(call_graph_filter_buf_));
     call_graph_filter_.clear();
-    annotation_result_        = nullptr;
     objc_result_ = nullptr;
     show_objc_   = false;
     std::memset(objc_class_filter_buf_, 0, sizeof(objc_class_filter_buf_));

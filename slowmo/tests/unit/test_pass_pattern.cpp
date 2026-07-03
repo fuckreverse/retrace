@@ -13,27 +13,18 @@
  *     executed) is reported at Medium confidence as "XOR loop"; dense EOR
  *     straight-line code (many unique PCs) is downgraded to Low confidence
  *     as "XOR-dense code (non-loop)".
- *   - Constant-loading fallback (no constant_materialization dependency
- *     available): movz/movk sequences are reported at Low confidence with
- *     an "unverified" label, since the loaded value is never checked
- *     against a known crypto constant table on this path.
- *   - Constant-loading via constant_materialization (dependency actually
- *     registered and run): a known crypto constant is reported at High
- *     confidence and the pattern name carries no "(unverified)" suffix.
+ *   - Constant materialization (movz+movk sequences) is tracked directly by
+ *     PatternCollector as part of its single trace scan (the former
+ *     standalone `constant_materialization` pass was merged into "pattern" —
+ *     see PatternResult::constants): sequences that match a known algorithm
+ *     constant are reported as a High-confidence "Known constant: ..."
+ *     match, and longer (>= 3 part) sequences that don't match anything are
+ *     still surfaced at Medium confidence as an unnamed "Constant loading
+ *     sequence".
  *
  * NOTE: PatternPass uses libyara (if compiled with TENET_HAS_YARA) and also
  * performs mnemonic-based detection.  These tests focus on the mnemonic-based
  * path (MOVZ+MOVK sequences) which is always active.
- *
- * IMPORTANT: PatternPass declares dependencies() as empty and consumes
- * constant_materialization opportunistically via PassContext::try_require(),
- * which only returns a result if that pass has ALREADY completed — it does
- * NOT trigger it to run. So in any test that only registers PatternPass
- * (without also registering+requiring ConstantMaterializationPass first),
- * PatternPass always takes the "no constmat" fallback path. Tests that want
- * to exercise the constmat-integrated (High confidence) path must explicitly
- * register and require "constant_materialization" before requiring
- * "pattern" — see the dedicated TEST_CASE below.
  *
  * Run:  ctest -R 'pass_pattern' --output-on-failure
  */
@@ -41,7 +32,6 @@
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -99,6 +89,9 @@ TEST_CASE("PatternPass: empty trace produces zero matches",
     SECTION("zero matches for NOP-only trace") {
         REQUIRE(res.total() == 0);
     }
+    SECTION("zero materialized constants for NOP-only trace") {
+        REQUIRE(res.constants.total() == 0);
+    }
 }
 
 TEST_CASE("PatternPass: by_category index has categories only for matched patterns",
@@ -126,20 +119,20 @@ TEST_CASE("PatternPass: by_category index has categories only for matched patter
     }
 }
 
-TEST_CASE("PatternPass: MOVZ+MOVK sequence without constant_materialization "
-          "is reported via the unverified fallback path",
+TEST_CASE("PatternPass: 2-part MOVZ+MOVK sequence stays below the "
+          "materialization threshold and reports no match",
           "[unit][pass][pattern]") {
     // SHA-256 initial hash value H0 = 0x6a09e667
     // Materialized as: MOVZ x3, #0xe667, LSL #0; MOVK x3, #0x6a09, LSL #16
     //
-    // NOTE: only PatternPass is registered here (no ConstantMaterializationPass),
-    // and try_require() never triggers a pass to run — it only returns a
-    // result if the pass already completed. So this test exercises
-    // PatternCollector's own movz/movk fallback detector (Detector 3), NOT
-    // the constant_materialization integration path. That is intentional:
-    // this is the "value never verified against a known constant table"
-    // case, which must be surfaced at Low confidence — see the dedicated
-    // "via constant_materialization" test below for the High-confidence path.
+    // A 2-part sequence is recorded in PatternResult::constants (min_parts
+    // defaults to 2), but finalize_constants() only emits an "unverified"
+    // KeySchedule PatternMatch for sequences with >= 3 parts, so a 2-part
+    // sequence produces a constants[] entry without a matching
+    // "Constant loading sequence" PatternMatch unless it hits the known
+    // constant table (which it does here, emitting a High-confidence
+    // "Known constant" match instead — see the dedicated test below for the
+    // >= 3-part "no known match" fallback shape).
     const uint64_t kSHA256_H0 = 0x6a09e667ULL;
 
     auto env = make_env([kSHA256_H0](TraceWriter& tw) {
@@ -175,28 +168,32 @@ TEST_CASE("PatternPass: MOVZ+MOVK sequence without constant_materialization "
             REQUIRE(m != nullptr);
         }
     }
-    SECTION("2 movz/movk instructions is below CONST_LOAD_THRESHOLD (3), "
-            "so no match is emitted yet") {
-        // Detector 3 only fires once the pending sequence reaches
-        // CONST_LOAD_THRESHOLD (3) parts; a 2-part sequence alone should not
-        // produce a "Constant loading sequence" match.
-        bool found_unverified = false;
+    SECTION("the 2-part sequence is recorded as a known SHA-256 constant") {
+        // Even though num_parts (2) is below the >= 3 threshold for the
+        // generic "unverified" fallback match, a value that hits the known
+        // constant table is always identified regardless of part count.
+        REQUIRE(res.constants.total() == 1);
+        REQUIRE(res.constants.constants[0].value == kSHA256_H0);
+        REQUIRE(res.constants.constants[0].known_match != nullptr);
+    }
+    SECTION("no generic unnamed 'Constant loading sequence' match is emitted") {
+        bool found_generic = false;
         for (const auto& m : res.matches) {
-            if (m.pattern_name.find("Constant loading") != std::string::npos) {
-                found_unverified = true;
+            if (m.pattern_name == "Constant loading sequence") {
+                found_generic = true;
             }
         }
-        REQUIRE_FALSE(found_unverified);
+        REQUIRE_FALSE(found_generic);
     }
 }
 
-TEST_CASE("PatternPass: MOVZ+MOVK+MOVK fallback sequence (no constmat) is "
-          "Low confidence and labeled unverified",
+TEST_CASE("PatternPass: MOVZ+MOVK+MOVK sequence with no known match is "
+          "Medium confidence 'Constant loading sequence'",
           "[unit][pass][pattern]") {
-    // 3-part load sequence reaches CONST_LOAD_THRESHOLD, so Detector 3 fires.
-    // Without ConstantMaterializationPass registered, this must go through
-    // flush_const_load_match() — always Low confidence, name suffixed
-    // "(unverified)", description mentions the value was not checked.
+    // 3-part load sequence reaches the >= 3-part threshold used by
+    // finalize_constants() to emit a generic (unnamed) "Constant loading
+    // sequence" PatternMatch for values that don't match anything in the
+    // known-constant database.
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
         tw.write_header();
@@ -215,7 +212,7 @@ TEST_CASE("PatternPass: MOVZ+MOVK+MOVK fallback sequence (no constmat) is "
         // Break the sequence so it gets flushed (non-movz/movk instruction).
         tw.emit(ms, 0x100C, enc::nop(), {{33, tw.rt(0x1010)}}, {});
         tw.emit_anchor(ms);
-    }, "pattern_const_fallback_low");
+    }, "pattern_const_generic");
     REQUIRE(env != nullptr);
 
     auto pm = make_pm(*env);
@@ -225,33 +222,35 @@ TEST_CASE("PatternPass: MOVZ+MOVK+MOVK fallback sequence (no constmat) is "
 
     const PatternMatch* load_match = nullptr;
     for (const auto& m : res.matches) {
-        if (m.pattern_name.find("Constant loading") != std::string::npos) {
+        if (m.pattern_name == "Constant loading sequence") {
             load_match = &m;
         }
     }
     REQUIRE(load_match != nullptr);
 
-    SECTION("confidence is Low (unverified value)") {
-        REQUIRE(load_match->confidence == PatternConfidence::Low);
+    SECTION("confidence is Medium (unnamed but structurally meaningful)") {
+        REQUIRE(load_match->confidence == PatternConfidence::Medium);
     }
-    SECTION("name is explicitly marked unverified") {
-        REQUIRE(load_match->pattern_name.find("unverified") != std::string::npos);
+    SECTION("description mentions the movz/movk instruction count") {
+        REQUIRE(load_match->description.find("movz/movk instructions") != std::string::npos);
     }
-    SECTION("description mentions the value was not checked against a "
-            "constant table") {
-        REQUIRE(load_match->description.find("NOT checked") != std::string::npos);
+    SECTION("the constant is also present in PatternResult::constants "
+            "without a known_match") {
+        REQUIRE(res.constants.total() == 1);
+        REQUIRE(res.constants.constants[0].known_match == nullptr);
+        REQUIRE(res.constants.identified_count() == 0);
     }
 }
 
-TEST_CASE("PatternPass: known crypto constant via constant_materialization "
-          "is High confidence with no unverified fallback match",
+TEST_CASE("PatternPass: known crypto constant produces a High-confidence "
+          "'Known constant' match with no generic fallback",
           "[unit][pass][pattern]") {
-    // Same SHA-256 H0 sequence as above, but this time we actually register
-    // AND require ConstantMaterializationPass first so its result is
-    // Completed by the time PatternPass::run() calls try_require(). This
-    // exercises constmat_to_pattern_matches() (High confidence) instead of
-    // the fallback detector, and Detector 3 must stay disabled throughout
-    // (see "Skipped when constmat result is available" in on_inst()).
+    // Same SHA-256 H0 sequence as above. Constant materialization is now
+    // tracked unconditionally as part of PatternCollector's own scan (no
+    // separate pass/dependency needed), so an identified value always
+    // produces a High-confidence match, and finalize_constants() skips the
+    // generic "Constant loading sequence" match for any constant that has a
+    // known_match.
     const uint64_t kSHA256_H0 = 0x6a09e667ULL;
 
     auto env = make_env([kSHA256_H0](TraceWriter& tw) {
@@ -268,28 +267,22 @@ TEST_CASE("PatternPass: known crypto constant via constant_materialization "
         tw.emit(ms, 0x1004, enc::movk(3, hi, 16),
                 {{3, kSHA256_H0}, {33, tw.rt(0x1008)}}, {});
         tw.emit_anchor(ms);
-    }, "pattern_sha256_constmat");
+    }, "pattern_sha256_known");
     REQUIRE(env != nullptr);
 
     auto pm = make_pm(*env);
-    pm->register_pass(std::make_unique<ConstantMaterializationPass>());
     pm->register_pass(std::make_unique<PatternPass>());
-
-    // Force constant_materialization to actually run and complete BEFORE
-    // pattern, so PatternPass::run()'s try_require() sees it as Completed.
-    auto& cm_raw = pm->require("constant_materialization");
-    REQUIRE(cm_raw.ok());
 
     auto& res = pm->require("pattern").get<PatternResult>();
 
     const PatternMatch* known_match = nullptr;
-    bool any_unverified_fallback = false;
+    bool any_generic_fallback = false;
     for (const auto& m : res.matches) {
         if (m.pattern_name.find("Known constant") != std::string::npos) {
             known_match = &m;
         }
-        if (m.pattern_name.find("unverified") != std::string::npos) {
-            any_unverified_fallback = true;
+        if (m.pattern_name == "Constant loading sequence") {
+            any_generic_fallback = true;
         }
     }
 
@@ -297,9 +290,14 @@ TEST_CASE("PatternPass: known crypto constant via constant_materialization "
         REQUIRE(known_match != nullptr);
         REQUIRE(known_match->confidence == PatternConfidence::High);
     }
-    SECTION("the unverified fallback detector never fires when constmat "
-            "is available") {
-        REQUIRE_FALSE(any_unverified_fallback);
+    SECTION("the generic fallback never fires for an identified constant") {
+        REQUIRE_FALSE(any_generic_fallback);
+    }
+    SECTION("PatternResult::constants also reflects the identified value") {
+        REQUIRE(res.constants.total() == 1);
+        REQUIRE(res.constants.identified_count() == 1);
+        REQUIRE(res.constants.constants[0].known_match != nullptr);
+        REQUIRE(res.constants.constants[0].known_match->algorithm == "SHA-256");
     }
 }
 
@@ -473,5 +471,39 @@ TEST_CASE("PatternPass: PatternResult total equals sum of by_category indices",
             cat_total += kv.second.size();
         }
         REQUIRE(cat_total == res.total());
+    }
+}
+
+TEST_CASE("PatternPass: set_constants_min_parts(1) reports standalone "
+          "movz-only constants",
+          "[unit][pass][pattern]") {
+    // A single MOVZ (no MOVK follow-up) is only recorded when
+    // constants_min_parts is lowered to 1 — the default (2) requires at
+    // least a movz+movk pair.
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x1000, enc::movz(6, 0x1234, 0),
+                {{6, 0x1234ULL}, {33, tw.rt(0x1004)}}, {});
+        // Break the sequence immediately so it flushes as a 1-part constant.
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "pattern_min_parts_1");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    auto pp = std::make_unique<PatternPass>();
+    pp->set_constants_min_parts(1);
+    pm->register_pass(std::move(pp));
+
+    auto& res = pm->require("pattern").get<PatternResult>();
+
+    SECTION("the standalone movz is recorded in PatternResult::constants") {
+        REQUIRE(res.constants.total() == 1);
+        REQUIRE(res.constants.constants[0].num_parts == 1);
+        REQUIRE(res.constants.constants[0].value == 0x1234ULL);
     }
 }

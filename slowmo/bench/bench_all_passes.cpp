@@ -26,10 +26,8 @@
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
 #include "analysis/passes/trace_diff_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
 #include "analysis/passes/memory_snapshot_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
@@ -204,8 +202,9 @@ int main(int argc, char** argv) {
     pm.register_pass(std::make_unique<XrefPass>());
     pm.register_pass(std::make_unique<FunctionPass>());
     pm.register_pass(std::make_unique<LoopPass>());
+    // "constant_materialization" was merged into "pattern" (see
+    // PatternResult::constants), so only PatternPass needs to be registered.
     pm.register_pass(std::make_unique<PatternPass>());
-    pm.register_pass(std::make_unique<ConstantMaterializationPass>());
     pm.register_pass(std::make_unique<StringPass>());
     pm.register_pass(std::make_unique<ObjcPass>());
     pm.register_pass(std::make_unique<ThreadPass>());
@@ -261,7 +260,9 @@ int main(int argc, char** argv) {
     pm.register_pass(std::make_unique<LoopSemanticsPass>());
 
     // Register composite passes
-    pm.register_pass(std::make_unique<SymbolAnnotationPass>());
+    // Note: symbol_annotation was demoted from a pass to a plain aggregation
+    // helper (build_annotation_view()) — it does no analysis of its own, so
+    // it is no longer part of the PassManager benchmark loop.
     pm.register_pass(std::make_unique<AlgorithmSummaryPass>());
 
     // ── Define pass execution order (topological) ─────────────────────────
@@ -272,7 +273,6 @@ int main(int argc, char** argv) {
         {"function",                 "root", {}},
         {"loop",                     "root", {}},
         {"pattern",                  "root", {}},
-        {"constant_materialization", "root", {}},
         {"strings",                  "root", {}},
         {"objc",                     "root", {}},
         {"thread",                   "root", {}},
@@ -286,9 +286,10 @@ int main(int argc, char** argv) {
         {"taint",          "derived", {"xref"}},
         {"call_graph",     "derived", {"function"}},
         {"loop_semantics", "derived", {"loop"}},
-        // Composite passes
-        {"symbol_annotation",  "composite", {"function", "loop", "constant_materialization", "pattern"}},
-        {"algorithm_summary",  "composite", {"pattern", "constant_materialization", "loop_semantics", "function", "call_graph"}},
+    // Composite passes
+    // "constant_materialization" was merged into "pattern" — see
+    // PatternResult::constants.
+    {"algorithm_summary",  "composite", {"pattern", "loop_semantics", "function", "call_graph"}},
     };
 
     // ── Run each pass and measure incremental time ────────────────────────

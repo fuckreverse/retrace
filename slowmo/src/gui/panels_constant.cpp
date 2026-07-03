@@ -1,8 +1,10 @@
 // panels_constant.cpp — Constant materialization analysis panel.
 //
-// Displays the ConstantMaterializationResult from ConstantMaterializationPass.
-// Shows every movz+movk sequence recovered from the trace and highlights
-// those that matched known algorithm constants (SHA-256, AES, SM3, SM4, …).
+// Displays the ConstantMaterializationResult embedded in PatternResult
+// (produced by PatternPass — constant materialization was merged into the
+// "pattern" pass). Shows every movz+movk sequence recovered from the trace
+// and highlights those that matched known algorithm constants (SHA-256, AES,
+// SM3, SM4, …).
 //
 // Two view modes:
 //   0 = All     : every materialized constant (identified + unknown)
@@ -11,7 +13,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"
 
 #include <imgui.h>
 #include <fmt/core.h>
@@ -51,7 +53,7 @@ void GuiApp::render_constant_panel() {
         ImGui::TextDisabled("No constant analysis performed.");
         ImGui::Spacing();
         if (ImGui::Button("Run Constant Analysis")) {
-            run_pass_by_name("constant_materialization");
+            run_pass_by_name("pattern");
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
@@ -72,7 +74,7 @@ void GuiApp::render_constant_panel() {
 
     ImGui::SameLine(panel_w - 90.0f);
     if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {        // ↺
-        run_pass_by_name("constant_materialization");
+        run_pass_by_name("pattern");
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Re-run constant analysis (clears current results)");

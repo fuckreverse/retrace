@@ -16,15 +16,14 @@
 #include "analysis/passes/xref_pass.h"
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/objc_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
+#include "analysis/annotation_view.h"
 #include "analysis/passes/memory_snapshot_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
@@ -134,10 +133,14 @@ void TenetMcpService::register_analysis_tools() {
               {"min_parts", {{"type", "integer"}, {"description", "Min movz+movk parts"}, {"default", 2}}}
           }}}},
         [this](const json& args) -> json {
-            auto pass = std::make_unique<ConstantMaterializationPass>();
-            pass->set_min_parts(args.value("min_parts", uint8_t(2)));
+            // Constant materialization was merged into "pattern" (see
+            // PatternResult::constants) — register PatternPass and read the
+            // embedded ConstantMaterializationResult.
+            auto pass = std::make_unique<PatternPass>();
+            pass->set_constants_min_parts(args.value("min_parts", uint8_t(2)));
             pm_->register_pass(std::move(pass));
-            const auto& result = require_pass<ConstantMaterializationResult>(pm_, "constant_materialization", "Constants pass failed");
+            const auto& pattern_result = require_pass<PatternResult>(pm_, "pattern", "Constants pass failed");
+            const auto& result = pattern_result.constants;
 
             json identified = json::array();
             for (size_t idx : result.identified_indices) {
@@ -204,8 +207,9 @@ void TenetMcpService::register_analysis_tools() {
         [this](const json&) -> json {
             tenet::register_pass_by_name(*pm_, "xref");
             tenet::register_pass_by_name(*pm_, "cfg");
+            // "constant_materialization" was merged into "pattern" — see
+            // PatternResult::constants.
             tenet::register_pass_by_name(*pm_, "pattern");
-            tenet::register_pass_by_name(*pm_, "constant_materialization");
             tenet::register_pass_by_name(*pm_, "loop");
             tenet::register_pass_by_name(*pm_, "loop_semantics");
             tenet::register_pass_by_name(*pm_, "function");
@@ -254,14 +258,24 @@ void TenetMcpService::register_analysis_tools() {
               {"limit",  {{"type", "integer"}, {"description", "Pagination: max PCs per page (max 1000)"}, {"default", 1000}}}
           }}}},
         [this](const json& args) -> json {
-            tenet::register_pass_by_name(*pm_, "xref");
-            tenet::register_pass_by_name(*pm_, "cfg");
+            // Not a registered pass: this tool just aggregates the results of
+            // three independent passes on the fly via build_annotation_view().
+            // Constant materialization was merged into "pattern" (see
+            // PatternResult::constants), so only function/loop/pattern need
+            // to be scheduled here.
+            // Each require_pass<T>() below still schedules its pass in the
+            // background and throws PassNotReady if not yet complete, so the
+            // non-blocking MCP semantics are unchanged.
             tenet::register_pass_by_name(*pm_, "function");
             tenet::register_pass_by_name(*pm_, "loop");
-            tenet::register_pass_by_name(*pm_, "constant_materialization");
             tenet::register_pass_by_name(*pm_, "pattern");
-            tenet::register_pass_by_name(*pm_, "symbol_annotation");
-            const auto& result = require_pass<AnnotationResult>(pm_, "symbol_annotation", "Annotation pass failed");
+
+            const auto& func_result  = require_pass<FunctionResult>(pm_, "function", "Function pass failed");
+            const auto& loop_result  = require_pass<LoopResult>(pm_, "loop", "Loop pass failed");
+            const auto& pat_result   = require_pass<PatternResult>(pm_, "pattern", "Pattern pass failed");
+            const auto& const_result = pat_result.constants;
+
+            auto result = build_annotation_view(&func_result, &loop_result, &const_result, &pat_result);
 
             size_t offset = args.value("offset", size_t(0));
             size_t limit = std::min(args.value("limit", size_t(1000)), size_t(1000));
@@ -332,7 +346,8 @@ void TenetMcpService::register_analysis_tools() {
          {{"type", "object"}, {"properties", json::object()}}},
         [this](const json&) -> json {
             tenet::register_pass_by_name(*pm_, "objc");
-            tenet::register_pass_by_name(*pm_, "constant_materialization");
+            // "constant_materialization" was merged into "pattern" — see
+            // PatternResult::constants.
             tenet::register_pass_by_name(*pm_, "pattern");
             tenet::register_pass_by_name(*pm_, "objc_crypto");
             const auto& result = require_pass<ObjcCryptoResult>(pm_, "objc_crypto", "ObjC crypto failed");
@@ -690,10 +705,11 @@ void TenetMcpService::register_search_tools() {
             json frames = json::array();
             for (const auto& f : result.call_stack) {
                 frames.push_back({
-                    {"call_site_pc", fmt::format("0x{:X}", rebase(f.call_site_pc))},
-                    {"callee_pc",    fmt::format("0x{:X}", rebase(f.callee_pc))},
-                    {"call_inst_id", f.call_inst_id},
-                    {"return_addr",  fmt::format("0x{:X}", rebase(f.return_addr))}
+                    {"call_site_pc",   fmt::format("0x{:X}", rebase(f.call_site_pc))},
+                    {"callee_pc",      fmt::format("0x{:X}", rebase(f.callee_pc))},
+                    {"call_inst_id",   f.call_inst_id},
+                    {"return_inst_id", f.return_inst_id},
+                    {"is_tail_call",   f.is_tail_call}
                 });
             }
             return {{"target_inst_id", result.target_inst_id},

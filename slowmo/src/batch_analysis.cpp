@@ -6,8 +6,7 @@
 #include "analysis/passes/cfg_pass.h"
 #include "analysis/passes/cfg_layout_pass.h"
 #include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/constant_materialization_pass.h"
+#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
 #include "analysis/passes/call_graph_pass.h"
 #include "analysis/passes/function_pass.h"
 #include "analysis/passes/taint_pass.h"
@@ -15,7 +14,7 @@
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
+#include "analysis/annotation_view.h"
 #include "analysis/passes/memory_snapshot_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
@@ -546,16 +545,16 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<StringPass>());
     }
 
-    // --pattern needs PatternPass
-    if (opts.opt_pattern) {
-        pm.register_pass(std::make_unique<PatternPass>());
-    }
-
-    // --constants needs ConstantMaterializationPass
-    if (opts.opt_constants) {
-        auto cmp = std::make_unique<ConstantMaterializationPass>();
-        cmp->set_min_parts(opts.constants_min_parts);
-        pm.register_pass(std::move(cmp));
+    // --pattern / --constants both need PatternPass — constant materialization
+    // (movz+movk scanning) was merged into "pattern" (see PatternResult::constants).
+    // Register once so a `--constants`-specific min-parts config isn't silently
+    // dropped by a duplicate registration.
+    if (opts.opt_pattern || opts.opt_constants) {
+        auto pp = std::make_unique<PatternPass>();
+        if (opts.opt_constants) {
+            pp->set_constants_min_parts(opts.constants_min_parts);
+        }
+        pm.register_pass(std::move(pp));
     }
 
     // --call-graph needs function -> call_graph
@@ -597,13 +596,13 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<LoopSemanticsPass>());
     }
 
-    // --symbol-annotation needs function, loop, constant_materialization, pattern
+    // --symbol-annotation needs function, loop, pattern (constant materialization
+    // was merged into "pattern" — see PatternResult::constants)
+    // (aggregated on-the-fly via build_annotation_view(), not a registered pass)
     if (opts.opt_symbol_annotation) {
         pm.register_pass(std::make_unique<FunctionPass>());
         pm.register_pass(std::make_unique<LoopPass>());
-        pm.register_pass(std::make_unique<ConstantMaterializationPass>());
         pm.register_pass(std::make_unique<PatternPass>());
-        pm.register_pass(std::make_unique<SymbolAnnotationPass>());
     }
 
     // --memory-snapshot
@@ -630,10 +629,10 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<DataflowGraphPass>(std::move(dg_cfg)));
     }
 
-    // --algorithm-summary needs pattern, constant_materialization, loop_semantics, function, call_graph
+    // --algorithm-summary needs pattern (includes constant materialization —
+    // see PatternResult::constants), loop_semantics, function, call_graph
     if (opts.opt_algorithm_summary) {
         pm.register_pass(std::make_unique<PatternPass>());
-        pm.register_pass(std::make_unique<ConstantMaterializationPass>());
         pm.register_pass(std::make_unique<LoopPass>());
         pm.register_pass(std::make_unique<LoopSemanticsPass>());
         pm.register_pass(std::make_unique<FunctionPass>());
@@ -653,7 +652,6 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     // --objc-crypto: correlate Pattern hits with ObjC call stack
     if (opts.opt_objc_crypto) {
         // ObjcPass is already registered above; ensure PatternPass is also registered
-        pm.register_pass(std::make_unique<ConstantMaterializationPass>());
         pm.register_pass(std::make_unique<PatternPass>());
         pm.register_pass(std::make_unique<ObjcCryptoPass>());
     }
@@ -766,13 +764,16 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     if (opts.opt_constants) {
-        const auto& cm_raw = pm.require("constant_materialization");
+        // Constant materialization was merged into "pattern" (see
+        // PatternResult::constants) — require "pattern" and read the
+        // embedded ConstantMaterializationResult.
+        const auto& cm_raw = pm.require("pattern");
         if (!cm_raw.ok()) {
-            fmt::print(stderr, "[constants] Constant materialization pass failed: {}\n",
+            fmt::print(stderr, "[constants] Pattern pass failed: {}\n",
                        cm_raw.error_message);
             rc |= 1;
         } else {
-            const auto& cm_result = cm_raw.get<ConstantMaterializationResult>();
+            const auto& cm_result = cm_raw.get<PatternResult>().constants;
             fmt::print("[constants] Found {} materialized constants ({} identified as known)\n\n",
                        cm_result.total(), cm_result.identified_count());
 
@@ -948,35 +949,42 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     // --symbol-annotation
-    if (opts.opt_symbol_annotation) {
-        const auto& sa_raw = pm.require("symbol_annotation");
-        if (!sa_raw.ok()) {
-            fmt::print(stderr, "[symbol-annotation] Pass failed: {}\n", sa_raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& sa_result = sa_raw.get<AnnotationResult>();
-            fmt::print(stderr, "[symbol-annotation] {} PCs annotated\n",
-                       sa_result.by_pc.size());
-            json sa_json;
-            json ann_arr = json::array();
-            size_t count = 0;
-            for (const auto& [pc, annotations] : sa_result.by_pc) {
-                if (count >= 1000) break;
-                for (const auto& a : annotations) {
-                    ann_arr.push_back({
-                        {"pc", fmt::format("0x{:X}", pc)},
-                        {"label", a.label},
-                        {"detail", a.detail},
-                        {"kind", static_cast<int>(a.kind)}
-                    });
-                }
-                count++;
+    // Not a registered pass: build_annotation_view() is a plain aggregation
+    // helper over already-computed results (function/loop/constant/pattern).
+if (opts.opt_symbol_annotation) {
+const auto& func_raw  = pm.require("function");
+const auto& loop_raw  = pm.require("loop");
+// Constant materialization was merged into "pattern" — pull the embedded
+// ConstantMaterializationResult from PatternResult instead of a separate pass.
+const auto& pat_raw   = pm.require("pattern");
+
+auto sa_result = build_annotation_view(
+func_raw.ok()  ? &func_raw.get<FunctionResult>()  : nullptr,
+loop_raw.ok()  ? &loop_raw.get<LoopResult>()      : nullptr,
+pat_raw.ok()   ? &pat_raw.get<PatternResult>().constants : nullptr,
+pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
+
+        fmt::print(stderr, "[symbol-annotation] {} PCs annotated\n",
+                   sa_result.by_pc.size());
+        json sa_json;
+        json ann_arr = json::array();
+        size_t count = 0;
+        for (const auto& [pc, annotations] : sa_result.by_pc) {
+            if (count >= 1000) break;
+            for (const auto& a : annotations) {
+                ann_arr.push_back({
+                    {"pc", fmt::format("0x{:X}", pc)},
+                    {"label", a.label},
+                    {"detail", a.detail},
+                    {"kind", static_cast<int>(a.kind)}
+                });
             }
-            sa_json["annotations"] = std::move(ann_arr);
-            sa_json["total_pcs"] = sa_result.by_pc.size();
-            if (sa_result.by_pc.size() > 1000) sa_json["truncated"] = true;
-            fmt::print("{}\n", sa_json.dump(2));
+            count++;
         }
+        sa_json["annotations"] = std::move(ann_arr);
+        sa_json["total_pcs"] = sa_result.by_pc.size();
+        if (sa_result.by_pc.size() > 1000) sa_json["truncated"] = true;
+        fmt::print("{}\n", sa_json.dump(2));
     }
 
     // --memory-snapshot
@@ -1620,7 +1628,8 @@ int tenet::run_batch_analysis(const CliOptions& opts,
 
     // --call-context: reconstruct call stack at a specific instruction
     if (opts.opt_call_context) {
-        pm.register_pass(std::make_unique<LoopPass>());
+        tenet::register_pass_by_name(pm, "function");
+        tenet::register_pass_by_name(pm, "loop");
         CallContextConfig cc_cfg;
         cc_cfg.target_inst_id = opts.call_context_inst_id;
         pm.register_pass(std::make_unique<CallContextPass>(std::move(cc_cfg)));
@@ -1638,7 +1647,8 @@ int tenet::run_batch_analysis(const CliOptions& opts,
                     {"call_site_pc", fmt::format("0x{:X}", f.call_site_pc)},
                     {"callee_pc", fmt::format("0x{:X}", f.callee_pc)},
                     {"call_inst_id", f.call_inst_id},
-                    {"return_addr", fmt::format("0x{:X}", f.return_addr)}
+                    {"return_inst_id", f.return_inst_id},
+                    {"is_tail_call", f.is_tail_call}
                 });
             }
             cc_json["target_inst_id"] = opts.call_context_inst_id;

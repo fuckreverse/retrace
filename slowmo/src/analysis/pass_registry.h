@@ -25,7 +25,7 @@ namespace tenet {
 enum class PassCategory : uint8_t {
     Structure,   ///< function / xref / cfg / call_graph / loop / disassembly
     Taint,       ///< taint / backward_taint / taint_source_annotation
-    Crypto,      ///< pattern / constant_materialization / loop_semantics / algorithm_summary / objc_crypto / symbol_annotation
+    Crypto,      ///< pattern (incl. constant materialization) / loop_semantics / algorithm_summary / objc_crypto
     Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / literal_search / yara_mem_scan
     PlatformApi,  ///< objc / syscall_intercept
     Profile,     ///< trace_fold / reg_timeline / call_context / window_stats / cache_sim / trace_diff / dataflow_graph

@@ -15,7 +15,6 @@
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/loop_semantics_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
-#include "analysis/passes/symbol_annotation_pass.h"
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/taint_source_annotation_pass.h"
@@ -108,11 +107,10 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
     if (name == "call_graph")              return std::make_unique<CallGraphPass>();
     if (name == "loop")                    return std::make_unique<LoopPass>();
     // Crypto
-    if (name == "pattern")                 return std::make_unique<PatternPass>();
-    if (name == "constant_materialization")return std::make_unique<ConstantMaterializationPass>();
-    if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass>();
+if (name == "pattern")                 return std::make_unique<PatternPass>();
+// "constant_materialization" was merged into "pattern" (see PatternResult::constants).
+if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass>();
     if (name == "algorithm_summary")       return std::make_unique<AlgorithmSummaryPass>();
-    if (name == "symbol_annotation")       return std::make_unique<SymbolAnnotationPass>();
     if (name == "objc_crypto")             return std::make_unique<ObjcCryptoPass>();
     // Memory
     if (name == "strings")                 return std::make_unique<StringPass>();
@@ -259,12 +257,13 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"taint_source_annotation","Taint Sources","Annotate backward-taint endpoints (ObjC/mem/const)",     PassCategory::Taint,     PassDefault::No},
 
         // — Crypto / Pattern —
-        {"pattern",               "Patterns",      "Crypto / anti-debug pattern detection",                  PassCategory::Crypto,    PassDefault::Yes},
-        {"constant_materialization","Constants",   "Materialize crypto/hash constants (SHA/SM4/ChaCha…)",    PassCategory::Crypto,    PassDefault::Yes},
+        // NOTE: "constant_materialization" (movz+movk crypto constant matching)
+        // was merged into "pattern" — see PatternResult::constants. It is no
+        // longer a separately-registrable pass.
+        {"pattern",               "Patterns",      "Crypto/anti-debug patterns + materialized constants",    PassCategory::Crypto,    PassDefault::Yes},
         {"loop_semantics",        "Loop Semantics","Classify loops (Feistel/SPN/ARX/memcpy…)",               PassCategory::Crypto,    PassDefault::Yes},
         {"algorithm_summary",     "Algorithm",     "Cross-reference constants+patterns→algorithm ID",        PassCategory::Crypto,    PassDefault::Yes},
         {"objc_crypto",           "ObjC×Crypto",   "Correlate crypto patterns with ObjC call stacks",        PassCategory::Crypto,    PassDefault::No},
-        {"symbol_annotation",     "Annotations",   "Unified PC→label map for the disassembly view",          PassCategory::Crypto,    PassDefault::Yes},
 
         // — Memory / String —
         {"strings",               "Strings",       "String accesses in the trace",                           PassCategory::Memory,    PassDefault::Yes},
@@ -420,17 +419,13 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
             return cat_count("sources", r->total());
     }
 
-    // Crypto
-    if (name == "pattern") {
-        if (auto* r = try_get<PatternResult>(result))
-            return cat_count("matches", r->total());
-    }
-    if (name == "constant_materialization") {
-        if (auto* r = try_get<ConstantMaterializationResult>(result))
-            return fmt::format("constants: {} ({} identified)",
-                               r->total(), r->identified_count());
-    }
-    if (name == "loop_semantics") {
+// Crypto
+if (name == "pattern") {
+if (auto* r = try_get<PatternResult>(result))
+return fmt::format("matches: {} | constants: {} ({} identified)",
+r->total(), r->constants.total(), r->constants.identified_count());
+}
+if (name == "loop_semantics") {
         if (auto* r = try_get<LoopSemanticsResult>(result))
             return fmt::format("loops: {} ({} crypto)", r->loop_semantics.size(),
                                r->crypto_loops().size());
@@ -442,10 +437,6 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
     if (name == "objc_crypto") {
         if (auto* r = try_get<ObjcCryptoResult>(result))
             return fmt::format("hits: {} ({} in ObjC)", r->total(), r->in_objc_count());
-    }
-    if (name == "symbol_annotation") {
-        if (auto* r = try_get<AnnotationResult>(result))
-            return fmt::format("annotated PCs: {}", r->by_pc.size());
     }
 
     // Memory

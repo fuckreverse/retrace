@@ -416,13 +416,12 @@ ninja -j$(nproc) tenet
 
 | Pass | 用于哪些结构 |
 |---|---|
-| `pattern_pass` | `by_category`、`pc_info_`、`hw_sites_` |
+| `pattern_pass` | `by_category`、`pc_info_`、`hw_sites_`、`constants.by_algorithm`（内嵌的 constant materialization 子结果） |
 | `objc_pass` | `sel_name_cache_`、`deref_cache_` |
 | `cache_sim_pass` | `line_miss_count`、`line_hit_count`、`func_stats_` |
 | `window_stats_pass` | `pc_cache_`、`mnemonic_counts_`、`unique_pcs_`、`unique_mem_addrs_` |
 | `dataflow_graph_pass` | `incoming_edge_idx_`、`outgoing_edge_idx_` |
 | `taint_source_annotation_pass` | 主结果表 |
-| `constant_materialization_pass` | 两个 match 表 |
 | `loop_pass`、`cfg_pass`、`xref_pass` | 块 / PC / xref 索引 |
 
 **可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_contents`、`by_addr`）、`disassembly_pass`（`pc_table`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
@@ -433,7 +432,7 @@ ninja -j$(nproc) tenet
 
 **原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records）写入 RocksDB。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
 
-**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`、`algorithm_summary`、`objc`、`objc_crypto`、`cache_sim`、`window_stats`、`thread`、`symbol_annotation`、`syscall_intercept`、`constant_materialization`、`trace_fold`。
+**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`cache_sim`、`window_stats`、`thread`、`syscall_intercept`、`trace_fold`。
 
 **关键设计变体**：`memory_string`、`memory_snapshot`、`cache_sim`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）。
 
@@ -462,9 +461,9 @@ ninja -j$(nproc) tenet
 
 ### 4. Scan Fusion：多 Collector 单次遍历
 
-**原理**：`TraceScanEngine` 单次遍历 trace，将每条记录广播给所有注册的 `TraceCollector`。11+ 个扫描型 Pass 共享一次 IO 遍历，替代各自独立扫描。注释明确说明 `constant_materialization_pass` 的 Collector 融合"halving the total trace I/O"。
+**原理**：`TraceScanEngine` 单次遍历 trace，将每条记录广播给所有注册的 `TraceCollector`。11+ 个扫描型 Pass 共享一次 IO 遍历，替代各自独立扫描。`pattern_pass` 的 `PatternCollector` 现已内嵌 movz+movk 常量物化追踪（原独立的 `constant_materialization_pass` 已合并），在同一次扫描中顺带完成，进一步减少了 trace I/O。
 
-**已用 Pass**：`xref`、`disassembly`、`cfg`、`function`、`string`、`thread`、`objc`、`pattern`、`window_stats`、`syscall_intercept`、`constant_materialization`（通过 `prepare_scan()`/`finish_scan()` 接口参与）。
+**已用 Pass**：`xref`、`disassembly`、`cfg`、`function`、`string`、`thread`、`objc`、`pattern`（内嵌 constant materialization）、`window_stats`、`syscall_intercept`（通过 `prepare_scan()`/`finish_scan()` 接口参与）。
 
 **可推广的 Pass**：
 

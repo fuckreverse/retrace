@@ -90,7 +90,7 @@ Collector 可按记录类型覆写回调：
 
 ## Pass 分类总览
 
-当前 `pass_catalog()` 注册了 **37 个 pass**，分成 8 类。
+当前 `pass_catalog()` 注册了 **33 个 pass**，分成 8 类。
 
 ### 1. Structure
 
@@ -118,12 +118,20 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `pattern` | 模式检测：crypto / anti-debug / obfuscation / networking（syscall 寄存器按 target_os 自动选择 x16/x8） |
-| `constant_materialization` | 识别 movz+movk 常量链 |
+| `pattern` | 模式检测：crypto / anti-debug / obfuscation / networking（syscall 寄存器按 target_os 自动选择 x16/x8）；同一次 trace 扫描内还内嵌了 movz+movk 常量链识别（原独立的 `constant_materialization` pass 已合并，见 `PatternResult::constants`） |
 | `loop_semantics` | 判断循环是否像 Feistel / SPN / ARX / memcpy |
 | `algorithm_summary` | 汇总模式、常量、循环、调用图做算法识别 |
 | `objc_crypto` | 把密码学命中与 ObjC 调用上下文关联 |
-| `symbol_annotation` | 汇总结构与模式注释成统一标签层 |
+
+> `constant_materialization` 已并入 `pattern`（`PatternCollector` 在同一次扫描中顺带追踪
+> movz+movk 常量链，见 `pattern_pass.h` 的 `ConstantMaterializationResult` / `PatternResult::constants`），
+> 不再是独立可注册的 pass。
+
+> `symbol_annotation` 不是 pass：它是 `analysis/annotation_view.h` 里的一个轻量聚合函数
+> `build_annotation_view()`，直接消费 `function`/`loop`/`pattern`（含其内嵌的常量结果）
+> 三个 pass 已有的结果、重新按 PC/inst_id 索引，不产出任何新的分析结论。CLI 的
+> `--symbol-annotation` 与 MCP 的 `symbol_annotation` tool 各自 `require()` 这些 pass
+> 后现查现用，因此不需要注册为 PassManager 里的一等公民（无独立缓存、无下游依赖）。
 
 ### 3b. Obfuscation / VM
 
@@ -185,18 +193,13 @@ flowchart LR
     xref --> trace_fold
     loop --> loop_semantics
     xref --> loop_semantics
-    function --> symbol_annotation
-    loop --> symbol_annotation
-    constant_materialization --> symbol_annotation
-    pattern --> symbol_annotation
     backward_taint --> taint_source_annotation
     objc --> taint_source_annotation
     pattern --> objc_crypto
     objc --> objc_crypto
     thread --> thread_filter
-    pattern --> algorithm_summary
-    constant_materialization --> algorithm_summary
-    loop_semantics --> algorithm_summary
+pattern --> algorithm_summary
+loop_semantics --> algorithm_summary
     function --> algorithm_summary
     call_graph --> algorithm_summary
     xref --> vm_abstract
@@ -209,7 +212,6 @@ flowchart LR
 - `cfg` **当前仍依赖 `xref`**，这要以 `cfg_pass.h` 为准。
 - `loop` 依赖 `cfg`。
 - `loop_semantics` 依赖 `loop + xref`。
-- `symbol_annotation` 聚合的是 `function + loop + constant_materialization + pattern`。
 - `trace_fold` 依赖 `loop + xref`。
 - `taint_source_annotation` 依赖 `backward_taint + objc`。
 - `objc` 和 `objc_crypto` 在 target_os 为 Android/Linux 时自动跳过（返回空结果）。

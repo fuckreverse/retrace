@@ -74,8 +74,8 @@ public:
     }
 
     std::vector<std::string_view> dependencies() const override {
-        return {"pattern", "constant_materialization", "loop_semantics",
-                "function", "call_graph"};
+        // constant_materialization was merged into pattern (see PatternResult::constants).
+        return {"pattern", "loop_semantics", "function", "call_graph"};
     }
 
     PassResult run(PassContext& ctx) override;
