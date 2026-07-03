@@ -129,7 +129,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `vm_abstract` | VMP（虚拟机保护）执行抽象：检测 dispatcher 循环、提取 handler、推断 VM-PC、解码 opcode、推断架构类型、读取 VM context |
+| `vm_abstract` | VMP（虚拟机保护）执行抽象：检测 dispatcher 循环（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode**）、提取 handler、推断 VM-PC、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、推断架构类型、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）|
 
 ### 4. Memory / String
 
@@ -154,7 +154,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `trace_fold` | 折叠重复循环迭代 |
+| `trace_fold` | 折叠重复循环迭代，保留首尾代表性样本 + GPR/FPR 变化模式（单调/振荡/常量），自动去除嵌套循环重叠 |
 | `reg_timeline` | 寄存器写时间线 |
 | `call_context` | 某条指令的调用栈 / 循环 / 邻居上下文 |
 | `window_stats` | 滑动窗口统计 |
@@ -216,7 +216,13 @@ flowchart LR
 - `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
 - `syscall_intercept` 优先消费 REC_CAPICALL 记录（`on_capicall()`），已处理的 callee PC 写入 `capicall_seen_` 防止后续 XFER_CALL Event 重复生成记录；无 REC_CAPICALL 时降级为 XFER_CALL 启发式。
 - `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
-- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；支持 hint-driven 和 auto-detect 两种模式；通过 `VMConfig` 接收静态分析提供的 dispatcher / VM-PC / opcode format / context 等 hint。
+- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；支持 hint-driven 和 auto-detect 两种模式；通过 `VMConfig` 接收静态分析提供的 dispatcher / VM-PC / opcode format / context 等 hint。新增能力：
+  - **ThreadedCode 拓扑**：`dispatch_type_hint = ThreadedCode` + `threaded_dispatch_pcs`，切换为 `ThreadedCollector`（无中央 loop，每条 handler 尾部自行 fetch+dispatch）。
+  - **扩展去混淆 op**：`OpcodeDeobfStep::Op` 新增 `ror`（循环右移）、`bswap`（字节序反转）、`neg`（取负）、`not_`（按位取反）。
+  - **opcode_byte_offset**：从 vm_pc 偏移 N 字节处读取 opcode，而非固定从 0 字节读。
+  - **`VMContextHint::Field::size`**：可按 1/2/4/8 字节粒度读取 ctx 字段，不再固定为 8 字节。
+  - **混合 RF+Stack 架构**：`VMRegisterFileHint` 允许 `regs`（命名寄存器）与 `stack_sp_offset`（操作数栈）共存（`is_mixed() = true`）；SIMD 宽寄存器（size=16）拆为 `_lo`/`_hi` 双条目。
+  - **`StackDirection`**：支持 `Descending`（SP 指向栈顶，默认）与 `Ascending`（SP 指向下一个空槽，TOS = \*(SP−elem)）两种栈增长方向。
 
 ## pass_registry.cpp 的作用
 

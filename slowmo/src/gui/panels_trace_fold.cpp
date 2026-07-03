@@ -126,7 +126,7 @@ void GuiApp::render_trace_fold_panel() {
                     navigate_to(fr.first_inst_id);
                 }
 
-                // ── Hover tooltip: kept iterations + reg changes ───────────
+                // ── Hover tooltip: kept iterations + reg/FPR changes ────────
                 if (ImGui::IsItemHovered()) {
                     std::string tip = fmt::format(
                         "PC:    0x{:x}  (runtime 0x{:x})\n"
@@ -141,11 +141,22 @@ void GuiApp::render_trace_fold_panel() {
                     }
 
                     if (!fr.reg_changes.empty()) {
-                        tip += "\nRegister changes across folded iterations:\n";
+                        tip += "\nGPR changes across folded iterations (pattern):\n";
                         for (const auto& rc : fr.reg_changes) {
-                            tip += fmt::format("  x{}: {:#018x} \xe2\x86\x92 {:#018x}\n",
+                            tip += fmt::format("  x{}: {:#018x} \xe2\x86\x92 {:#018x}  [{}]\n",
                                                (unsigned)rc.reg,
-                                               rc.first_val, rc.last_val);
+                                               rc.first_val, rc.last_val,
+                                               reg_change_pattern_name(rc.pattern));
+                        }
+                    }
+
+                    if (!fr.fpr_changes.empty()) {
+                        tip += "\nFPR/NEON changes across folded iterations:\n";
+                        for (const auto& fc : fr.fpr_changes) {
+                            tip += fmt::format("  v{}: {:016x}{:016x} \xe2\x86\x92 {:016x}{:016x}\n",
+                                               (unsigned)fc.reg,
+                                               fc.first_hi, fc.first_lo,
+                                               fc.last_hi, fc.last_lo);
                         }
                     }
 
@@ -205,18 +216,68 @@ void GuiApp::render_trace_fold_panel() {
                         fmt_count(fr.total_instructions_folded).c_str());
                 }
 
-                // ── Column 4: Reg Changes (count + hover detail) ──────────
+                // ── Column 4: Reg Changes (GPR + FPR count + pattern hint) ──
+                // Pattern glyphs are shown inline (not just in the tooltip) so
+                // a reader can scan the whole table for "counter-like" loops
+                // (↑ monotonic) versus "state-machine-like" ones (~ oscillating)
+                // without hovering every row. The whole cell shares a single
+                // hover target (an invisible full-width button drawn first,
+                // then the glyphs/text drawn on top of it) so the detailed
+                // tooltip triggers anywhere in the cell, not just over the
+                // last glyph drawn.
                 ImGui::TableSetColumnIndex(4);
-                if (fr.reg_changes.empty()) {
+                size_t total_changes = fr.reg_changes.size() + fr.fpr_changes.size();
+                if (total_changes == 0) {
                     ImGui::TextDisabled("—");
                 } else {
-                    ImGui::Text("%zu", fr.reg_changes.size());
-                    if (ImGui::IsItemHovered()) {
+                    size_t n_mono = 0, n_osc = 0;
+                    for (const auto& rc : fr.reg_changes) {
+                        if (rc.pattern == RegChangePattern::Monotonic) n_mono++;
+                        else if (rc.pattern == RegChangePattern::Oscillating) n_osc++;
+                    }
+
+                    ImVec2 cell_cursor = ImGui::GetCursorPos();
+                    char cell_id[32];
+                    snprintf(cell_id, sizeof(cell_id), "##tfregcell%d", row);
+                    ImGui::InvisibleButton(cell_id,
+                        ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight()));
+                    bool cell_hovered = ImGui::IsItemHovered();
+
+                    ImGui::SetCursorPos(cell_cursor);
+                    if (fr.fpr_changes.empty()) {
+                        ImGui::Text("%zu", fr.reg_changes.size());
+                    } else {
+                        ImGui::Text("%zu+%zuv", fr.reg_changes.size(), fr.fpr_changes.size());
+                    }
+                    if (n_mono > 0) {
+                        ImGui::SameLine(0.0f, 4.0f);
+                        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
+                                           ICON_FA_ARROW_UP "%zu", n_mono);
+                    }
+                    if (n_osc > 0) {
+                        ImGui::SameLine(0.0f, 4.0f);
+                        ImGui::TextColored(ImVec4(0.9f, 0.75f, 0.3f, 1.0f),
+                                           ICON_FA_WAVE_SQUARE "%zu", n_osc);
+                    }
+
+                    if (cell_hovered) {
                         std::string detail;
+                        if (n_mono > 0 || n_osc > 0) {
+                            detail += fmt::format(ICON_FA_ARROW_UP " {} monotonic (counter-like)   "
+                                                  ICON_FA_WAVE_SQUARE " {} oscillating (state-like)\n\n",
+                                                  n_mono, n_osc);
+                        }
                         for (const auto& rc : fr.reg_changes) {
-                            detail += fmt::format("x{}: {:#018x} \xe2\x86\x92 {:#018x}\n",
+                            detail += fmt::format("x{}: {:#018x} \xe2\x86\x92 {:#018x}  [{}]\n",
                                                   (unsigned)rc.reg,
-                                                  rc.first_val, rc.last_val);
+                                                  rc.first_val, rc.last_val,
+                                                  reg_change_pattern_name(rc.pattern));
+                        }
+                        for (const auto& fc : fr.fpr_changes) {
+                            detail += fmt::format("v{}: {:016x}{:016x} \xe2\x86\x92 {:016x}{:016x}\n",
+                                                  (unsigned)fc.reg,
+                                                  fc.first_hi, fc.first_lo,
+                                                  fc.last_hi, fc.last_lo);
                         }
                         ImGui::SetTooltip("%s", detail.c_str());
                     }

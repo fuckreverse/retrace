@@ -3,7 +3,6 @@
 #include "analysis/pass_manager.h"
 #include <cstdint>
 #include <vector>
-#include <string>
 
 namespace tenet {
 
@@ -16,9 +15,38 @@ struct TraceFoldConfig {
     uint32_t keep_iterations = 2;
     /// If true, output includes per-loop register diff summary.
     bool include_reg_summary = true;
+    /// If true (and the trace carries FPR/NEON data, i.e. v7 "HF_HAS_FPR"),
+    /// also compute first/last FPR (v0-v31) differences per folded region.
+    bool include_fpr_summary = true;
+    /// Number of interior sample points (in addition to first/last) used to
+    /// classify each register's change pattern across the folded region
+    /// (monotonic increasing/decreasing, oscillating, or constant).
+    /// 0 disables interior sampling (first/last comparison only).
+    uint32_t pattern_sample_points = 6;
 };
 
 // ─── Folded region description ─────────────────────────────────────────────
+
+/// Per-register change-pattern classification across the folded (removed)
+/// iterations of a region, derived from `pattern_sample_points` interior
+/// samples plus the first/last values. This is a cheap heuristic — NOT a
+/// substitute for `loop_semantics` — intended to give a quick hint about
+/// whether a register looks like a counter/accumulator (monotonic) versus
+/// something that is being reused as scratch state (oscillating).
+enum class RegChangePattern : uint8_t {
+    Constant,     // Value never changed across sampled points.
+    Monotonic,    // Strictly increasing or strictly decreasing at every sample.
+    Oscillating,  // Changed direction at least once (non-monotonic).
+};
+
+inline const char* reg_change_pattern_name(RegChangePattern p) {
+    switch (p) {
+        case RegChangePattern::Constant:    return "constant";
+        case RegChangePattern::Monotonic:   return "monotonic";
+        case RegChangePattern::Oscillating: return "oscillating";
+    }
+    return "unknown";
+}
 
 struct FoldedRegion {
     uint64_t header_pc;          // Loop header PC
@@ -32,9 +60,24 @@ struct FoldedRegion {
     struct IterRange { uint64_t start; uint64_t end; };
     std::vector<IterRange> kept_iterations;
 
-    /// Registers modified across folded iterations (index, first_value, last_value)
-    struct RegChange { uint8_t reg; uint64_t first_val; uint64_t last_val; };
+    /// GPR registers modified across folded iterations (index, first_value, last_value).
+    struct RegChange {
+        uint8_t reg;
+        uint64_t first_val;
+        uint64_t last_val;
+        RegChangePattern pattern = RegChangePattern::Oscillating;
+    };
     std::vector<RegChange> reg_changes;
+
+    /// NEON/FPR registers (v0-v31) modified across folded iterations.
+    /// Only populated when the trace has FPR data (v7 "HF_HAS_FPR") and
+    /// `TraceFoldConfig::include_fpr_summary` is set.
+    struct FprChange {
+        uint8_t reg;
+        uint64_t first_lo, first_hi;
+        uint64_t last_lo, last_hi;
+    };
+    std::vector<FprChange> fpr_changes;
 };
 
 // ─── Result ────────────────────────────────────────────────────────────────

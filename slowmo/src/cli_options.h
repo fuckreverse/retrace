@@ -93,6 +93,9 @@ struct CliOptions {
     bool opt_trace_fold = false;
     uint64_t trace_fold_start = 0, trace_fold_end = 0;
     uint32_t trace_fold_min_iter = 3;
+    uint32_t trace_fold_keep_iter = 2;        // TraceFoldConfig::keep_iterations
+    uint32_t trace_fold_samples = 6;          // TraceFoldConfig::pattern_sample_points
+    bool trace_fold_no_fpr = false;           // disables TraceFoldConfig::include_fpr_summary
 
     bool opt_reg_timeline = false;
     uint8_t reg_timeline_reg = 0;

@@ -1460,6 +1460,9 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<XrefPass>());
         TraceFoldConfig tf_cfg;
         tf_cfg.min_iterations_to_fold = opts.trace_fold_min_iter;
+        tf_cfg.keep_iterations = opts.trace_fold_keep_iter;
+        tf_cfg.pattern_sample_points = opts.trace_fold_samples;
+        tf_cfg.include_fpr_summary = !opts.trace_fold_no_fpr;
         pm.register_pass(std::make_unique<TraceFoldPass>(std::move(tf_cfg)));
         const auto& tf_raw = pm.require("trace_fold");
         if (!tf_raw.ok()) {
@@ -1472,16 +1475,38 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             json tf_json;
             json regions_arr = json::array();
             for (const auto& r : tf_result.folded_regions) {
+                json reg_changes = json::array();
+                for (const auto& rc : r.reg_changes) {
+                    reg_changes.push_back({
+                        {"reg", fmt::format("x{}", rc.reg)},
+                        {"first_val", fmt::format("0x{:X}", rc.first_val)},
+                        {"last_val", fmt::format("0x{:X}", rc.last_val)},
+                        {"pattern", reg_change_pattern_name(rc.pattern)}
+                    });
+                }
+                json fpr_changes = json::array();
+                for (const auto& fc : r.fpr_changes) {
+                    fpr_changes.push_back({
+                        {"reg", fmt::format("v{}", fc.reg)},
+                        {"first", fmt::format("0x{:016X}{:016X}", fc.first_hi, fc.first_lo)},
+                        {"last", fmt::format("0x{:016X}{:016X}", fc.last_hi, fc.last_lo)}
+                    });
+                }
                 regions_arr.push_back({
                     {"loop_header_pc", fmt::format("0x{:X}", r.header_pc)},
                     {"iteration_count", r.total_iterations},
                     {"first_inst_id", r.first_inst_id},
                     {"last_inst_id", r.last_inst_id},
-                    {"instructions_per_iteration", r.instructions_per_iteration}
+                    {"instructions_per_iteration", r.instructions_per_iteration},
+                    {"reg_changes", std::move(reg_changes)},
+                    {"fpr_changes", std::move(fpr_changes)}
                 });
             }
             tf_json["regions"] = std::move(regions_arr);
             tf_json["total_folded"] = tf_result.total_instructions_removed;
+            tf_json["original_inst_count"] = tf_result.original_inst_count;
+            tf_json["folded_inst_count"] = tf_result.folded_inst_count;
+            tf_json["compression_ratio"] = tf_result.compression_ratio;
             fmt::print("{}\n", tf_json.dump(2));
         }
     }

@@ -43,6 +43,7 @@
 
 #include <fmt/core.h>
 
+#include <fstream>
 #include <string>
 #include <sstream>
 
@@ -378,9 +379,16 @@ void TenetMcpService::register_analysis_tools() {
     // ── trace_fold ────────────────────────────────────────────────────────
     register_tool(
         {"trace_fold",
-         "Fold (compress) the trace by merging repeated call sequences. "
-         "Shows a high-level summary of function call patterns and their "
-         "repetition counts. Supports pagination via offset/limit "
+         "Fold (compress) repetitive LOOP iterations in the trace. For each "
+         "loop that runs many times, this keeps only the first/last few "
+         "representative iterations and summarizes the rest as one "
+         "'folded region' (iteration count, average body size, and which "
+         "GPR/FPR registers changed — with a monotonic/oscillating/constant "
+         "pattern hint). Useful for quickly spotting which hot loop consumed "
+         "most of a huge trace before deciding whether to --exclude-range it "
+         "or inspect it in detail (e.g. with loop_semantics). This does NOT "
+         "analyze function call sequences — see call_graph/call_context for "
+         "that. Supports pagination via offset/limit "
          "(use has_more + next_offset to fetch more regions).",
          {{"type", "object"},
           {"properties", {
@@ -402,12 +410,31 @@ void TenetMcpService::register_analysis_tools() {
             size_t end_i = std::min(start_i + limit, result.folded_regions.size());
             for (size_t i = start_i; i < end_i; i++) {
                 const auto& r = result.folded_regions[i];
+                json reg_changes = json::array();
+                for (const auto& rc : r.reg_changes) {
+                    reg_changes.push_back({
+                        {"reg", fmt::format("x{}", rc.reg)},
+                        {"first_val", fmt::format("0x{:X}", rc.first_val)},
+                        {"last_val", fmt::format("0x{:X}", rc.last_val)},
+                        {"pattern", reg_change_pattern_name(rc.pattern)}
+                    });
+                }
+                json fpr_changes = json::array();
+                for (const auto& fc : r.fpr_changes) {
+                    fpr_changes.push_back({
+                        {"reg", fmt::format("v{}", fc.reg)},
+                        {"first", fmt::format("0x{:016X}{:016X}", fc.first_hi, fc.first_lo)},
+                        {"last", fmt::format("0x{:016X}{:016X}", fc.last_hi, fc.last_lo)}
+                    });
+                }
                 regions.push_back({
                     {"header_pc", fmt::format("0x{:X}", rebase(r.header_pc))},
                     {"total_iterations", r.total_iterations},
                     {"instructions_per_iteration", r.instructions_per_iteration},
                     {"total_instructions_folded", r.total_instructions_folded},
-                    {"inst_range", {r.first_inst_id, r.last_inst_id}}
+                    {"inst_range", {r.first_inst_id, r.last_inst_id}},
+                    {"reg_changes", std::move(reg_changes)},
+                    {"fpr_changes", std::move(fpr_changes)}
                 });
             }
             bool has_more = end_i < result.folded_regions.size();
@@ -1108,25 +1135,48 @@ void TenetMcpService::register_pass_tools() {
          "Detect and analyze Virtual Machine (VM) based obfuscation in the trace. "
          "Identifies the VM dispatcher loop, extracts handler set, decodes VM opcodes, "
          "and reconstructs the VM execution trace (bytecode → handler mapping). "
-         "Accepts optional static hints from IDA (dispatcher PC, handler entries, "
-         "VM-PC register, opcode format) to improve accuracy. Without hints, "
+         "Supports WhileSwitch, IndirectBranch, CallTable, and ThreadedCode topologies. "
+         "Accepts optional static hints from IDA to improve accuracy. Without hints, "
          "auto-detects dispatcher via loop + indirect-branch heuristics. "
-         "Use this when you suspect VM/VMP protection (large while-switch pattern, "
-         "many indirect branches from a hot loop).",
+         "Use this when you suspect VM/VMP protection.",
          {{"type", "object"},
           {"properties", {
-              {"dispatcher_pc",      {{"type", "string"},  {"description", "Hint: PC of the dispatch loop header (hex). From IDA static analysis."}}},
-              {"indirect_branch_pc", {{"type", "string"},  {"description", "Hint: PC of the BR/BLR instruction that selects handlers (hex)."}}},
-              {"handler_entry_pcs",  {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: known handler entry PCs (hex array). From IDA jump table analysis."}}},
-              {"vm_pc_reg",          {{"type", "string"},  {"description", "Hint: host register holding VM program counter (e.g. 'x19', 'x20')."}}},
-              {"bytecode_base",      {{"type", "string"},  {"description", "Hint: base address of bytecode buffer (hex)."}}},
-              {"opcode_size",        {{"type", "integer"}, {"description", "Hint: bytes per opcode (1, 2, or 4)."}}},
-              {"opcode_mask",        {{"type", "string"},  {"description", "Hint: mask applied to extract opcode from loaded word (hex, e.g. '0xFF')."}}},
-              {"opcode_shift",       {{"type", "integer"}, {"description", "Hint: right-shift after masking to get opcode index."}}},
-              {"ctx_base_reg",       {{"type", "string"},  {"description", "Hint: register holding VM context struct pointer (e.g. 'x21')."}}},
-              {"auto_detect",        {{"type", "boolean"}, {"description", "Auto-detect dispatcher if no hint provided"}, {"default", true}}},
-              {"steps_offset",       {{"type", "integer"}, {"description", "Pagination: skip first N VM steps"}, {"default", 0}}},
-              {"steps_limit",        {{"type", "integer"}, {"description", "Pagination: max VM steps per page (max 2000)"}, {"default", 500}}}
+              // ── Dispatcher location ──
+              {"dispatcher_pc",        {{"type", "string"},  {"description", "Hint: PC of the dispatch loop header (hex). From IDA static analysis."}}},
+              {"indirect_branch_pc",   {{"type", "string"},  {"description", "Hint: PC of the BR/BLR instruction that selects handlers (hex)."}}},
+              {"handler_entry_pcs",    {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: known handler entry PCs (hex array). From IDA jump table analysis."}}},
+              // ── Dispatch topology ──
+              {"dispatch_type",        {{"type", "string"},  {"description", "Hint: force dispatch topology: 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'. Default: auto-detect."}}},
+              {"threaded_dispatch_pcs",{{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint (ThreadedCode only): set of runtime fetch/dispatch tail PCs shared by every handler (hex array). E.g. the LDR+BR pair at the end of each handler. Required when dispatch_type='ThreadedCode'."}}},
+              // ── VM-PC ──
+              {"vm_pc_reg",            {{"type", "string"},  {"description", "Hint: host register holding VM program counter (e.g. 'x19', 'x20')."}}},
+              {"bytecode_base",        {{"type", "string"},  {"description", "Hint: base address of bytecode buffer (hex)."}}},
+              // ── Opcode format ──
+              {"opcode_size",          {{"type", "integer"}, {"description", "Hint: bytes per opcode (1, 2, or 4). Mode A (memory read)."}}},
+              {"opcode_byte_offset",   {{"type", "integer"}, {"description", "Hint: byte offset of the opcode field within the instruction word (default 0). E.g. if insn layout is [imm16][opcode8], set opcode_size=1, opcode_byte_offset=2. Mode A only."}}},
+              {"opcode_mask",          {{"type", "string"},  {"description", "Hint: mask applied to extract opcode from loaded word (hex). Mode A."}}},
+              {"opcode_shift",         {{"type", "integer"}, {"description", "Hint: right-shift after masking. Mode A."}}},
+              {"opcode_deobf_steps",   {{"type", "array"},   {"items", {{"type", "object"}}}, {"description", "Hint: ordered deobfuscation transforms applied to (raw & mask) >> shift. Each element: {\"op\": \"sub|add|xor|and|or|lsr|lsl|mul|ror|bswap|neg|not\", \"imm\": <integer>}. ror=rotate-right, bswap=byte-swap (imm=width 2/4/8), neg=two's-complement negate, not=bitwise-NOT. Mode A only."}}},
+              {"opcode_from_reg",      {{"type", "string"},  {"description", "Hint: host register (e.g. 'x0') that holds the already-decoded opcode index at dispatch time. Mode B — skips memory read entirely. Use when a decoder stub runs before the dispatch branch."}}},
+              // ── VM context ──
+              {"ctx_base_reg",         {{"type", "string"},  {"description", "Hint: register holding VM context struct pointer (e.g. 'x21')."}}},
+              {"ctx_fields",           {{"type", "array"},   {"items", {{"type", "object"}}}, {"description", "Hint: named fields within vm_ctx struct. Each element: {\"name\":\"ip\", \"offset\":0, \"size\":4, \"is_pointer\":false}. size defaults to 8. is_pointer=true formats value as 0x.... Enables VM Context panel."}}},
+              // ── VM register file ──
+              {"vm_registers",         {{"type", "array"},   {"items", {{"type", "object"}}}, {"description", "Hint: VM register file layout. Each element: {\"name\":\"R0\", \"offset\":0, \"size\":8, \"is_float\":false, \"is_pointer\":false}. size 1/2/4/8/16 (16=SIMD, shown as _lo/_hi pair). offset from rf_base_reg (or ctx_base_reg). Enables VM register panel."}}},
+              {"rf_base_reg",          {{"type", "string"},  {"description", "Hint: host register holding VM register-file base pointer (overrides ctx_base_reg for RF reads). E.g. 'x20'."}}},
+              // ── VM stack ──
+              {"vm_stack_sp_offset",   {{"type", "integer"}, {"description", "Hint: byte offset within vm_ctx/rf_base where VM stack pointer lives. Enables stack panel (can coexist with vm_registers for mixed-type VMs)."}}},
+              {"vm_stack_depth",       {{"type", "integer"}, {"description", "Hint: stack slots visible in VM stack panel (default 8)."}}},
+              {"vm_stack_elem_size",   {{"type", "integer"}, {"description", "Hint: VM stack element size in bytes (1/2/4/8, default 8)."}}},
+              {"vm_stack_direction",   {{"type", "string"},  {"description", "Hint: stack growth direction: 'descending' (default, SP=TOS, slot_i=SP+i*elem) or 'ascending' (SP=next-free, slot_i=SP-(i+1)*elem)."}}},
+              // ── Handler asm ──
+              {"handler_asm_map",      {{"type", "object"},  {"description", "Hint: static disassembly for handler bodies. Keys = handler static PC (hex string), values = array of {\"pc\": \"0x...\", \"text\": \"...\"}. Enables annotated asm in VM instruction panel."}}},
+              // ── Misc ──
+              {"hints_file",           {{"type", "string"},  {"description", "Path to a JSON file containing any/all of the above hints. Merged with inline args (inline args take priority). JSON keys match arg names."}}},
+              {"auto_detect",          {{"type", "boolean"}, {"description", "Auto-detect dispatcher if no hint provided"}, {"default", true}}},
+              {"force_rerun",          {{"type", "boolean"}, {"description", "Force re-run even if a cached result exists (use when hints have changed)"}, {"default", false}}},
+              {"steps_offset",         {{"type", "integer"}, {"description", "Pagination: skip first N VM steps"}, {"default", 0}}},
+              {"steps_limit",          {{"type", "integer"}, {"description", "Pagination: max VM steps per page (max 2000)"}, {"default", 500}}}
           }}}},
         [this](const json& args) -> json {
             if (!pm_) throw std::runtime_error("PassManager not available");
@@ -1150,6 +1200,23 @@ void TenetMcpService::register_pass_tools() {
                 }
             }
 
+            // ── Dispatch topology ─────────────────────────────────────────
+            if (args.contains("dispatch_type")) {
+                const std::string& dt = args["dispatch_type"].get_ref<const std::string&>();
+                if      (dt == "WhileSwitch")    cfg.dispatch_type_hint = DispatchType::WhileSwitch;
+                else if (dt == "IndirectBranch") cfg.dispatch_type_hint = DispatchType::IndirectBranch;
+                else if (dt == "CallTable")      cfg.dispatch_type_hint = DispatchType::CallTable;
+                else if (dt == "ThreadedCode")   cfg.dispatch_type_hint = DispatchType::ThreadedCode;
+                else if (dt == "Trampoline")     cfg.dispatch_type_hint = DispatchType::Trampoline;
+            }
+            if (args.contains("threaded_dispatch_pcs")) {
+                for (const auto& pc_str : args["threaded_dispatch_pcs"]) {
+                    // Runtime addresses: apply rebase (user passes static PC, we add slide)
+                    cfg.threaded_dispatch_pcs.push_back(
+                        unrebase(parse_hex(pc_str.get<std::string>())));
+                }
+            }
+
             if (args.contains("vm_pc_reg")) {
                 VMPCHint vph;
                 vph.reg = parse_reg(args.at("vm_pc_reg"));
@@ -1159,14 +1226,68 @@ void TenetMcpService::register_pass_tools() {
                 cfg.vm_pc = vph;
             }
 
-            if (args.contains("opcode_size")) {
+            // ── Opcode format / deobfuscation ──────────────────────────────
+            // Construct OpcodeFormatHint when any of the opcode-related args is present.
+            if (args.contains("opcode_size") ||
+                args.contains("opcode_from_reg") ||
+                args.contains("opcode_deobf_steps") ||
+                args.contains("opcode_byte_offset")) {
+
                 OpcodeFormatHint ofh;
-                ofh.opcode_size = static_cast<uint8_t>(args["opcode_size"].get<int>());
+
+                // Mode B: register snapshot
+                if (args.contains("opcode_from_reg")) {
+                    ofh.opcode_from_reg = parse_reg(args.at("opcode_from_reg"));
+                }
+
+                // Mode A fields (ignored when opcode_from_reg is set)
+                if (args.contains("opcode_size")) {
+                    ofh.opcode_size = static_cast<uint8_t>(args["opcode_size"].get<int>());
+                }
+                if (args.contains("opcode_byte_offset")) {
+                    ofh.opcode_byte_offset =
+                        static_cast<uint8_t>(args["opcode_byte_offset"].get<int>());
+                }
                 if (args.contains("opcode_mask")) {
                     ofh.opcode_mask = parse_hex(args["opcode_mask"].get<std::string>());
                 }
                 ofh.opcode_shift = static_cast<uint8_t>(args.value("opcode_shift", 0));
-                cfg.opcode_format = ofh;
+
+                // Deobfuscation step sequence
+                if (args.contains("opcode_deobf_steps")) {
+                    // Helper: parse op name string to enum
+                    auto parse_op = [](const std::string& s) -> OpcodeDeobfStep::Op {
+                        if (s == "sub")   return OpcodeDeobfStep::Op::sub;
+                        if (s == "add")   return OpcodeDeobfStep::Op::add;
+                        if (s == "xor")   return OpcodeDeobfStep::Op::xor_;
+                        if (s == "and")   return OpcodeDeobfStep::Op::and_;
+                        if (s == "or")    return OpcodeDeobfStep::Op::or_;
+                        if (s == "lsr")   return OpcodeDeobfStep::Op::lsr;
+                        if (s == "lsl")   return OpcodeDeobfStep::Op::lsl;
+                        if (s == "mul")   return OpcodeDeobfStep::Op::mul;
+                        if (s == "ror")   return OpcodeDeobfStep::Op::ror;
+                        if (s == "bswap") return OpcodeDeobfStep::Op::bswap;
+                        if (s == "neg")   return OpcodeDeobfStep::Op::neg;
+                        if (s == "not")   return OpcodeDeobfStep::Op::not_;
+                        throw std::runtime_error("Unknown deobf op: " + s);
+                    };
+
+                    for (const auto& elem : args["opcode_deobf_steps"]) {
+                        OpcodeDeobfStep ds;
+                        ds.op = parse_op(elem.at("op").get<std::string>());
+                        // imm may be integer or hex string (or absent for neg/not)
+                        if (elem.contains("imm")) {
+                            if (elem.at("imm").is_number()) {
+                                ds.imm = elem["imm"].get<uint64_t>();
+                            } else {
+                                ds.imm = parse_hex(elem["imm"].get<std::string>());
+                            }
+                        }
+                        ofh.deobfuscation_steps.push_back(ds);
+                    }
+                }
+
+                cfg.opcode_format = std::move(ofh);
             }
 
             if (args.contains("ctx_base_reg")) {
@@ -1175,7 +1296,136 @@ void TenetMcpService::register_pass_tools() {
                 cfg.vm_context = vch;
             }
 
+            // ── hints_file: load JSON file and merge with inline args ──────────
+            // File values are the base; inline args override them.
+            json file_hints = json::object();
+            if (args.contains("hints_file")) {
+                std::string hpath = args["hints_file"].get<std::string>();
+                std::ifstream hf(hpath);
+                if (hf.good()) {
+                    try { hf >> file_hints; }
+                    catch (...) { file_hints = json::object(); }
+                }
+            }
+            // Merge: file_hints is base, args override
+            auto get_hint = [&](const char* key) -> const json* {
+                if (args.contains(key)) return &args.at(key);
+                if (file_hints.contains(key)) return &file_hints.at(key);
+                return nullptr;
+            };
+
+            // ── VM Context fields hint (merged with ctx_base_reg above) ──────
+            {
+                const json* ctx_fields_j = get_hint("ctx_fields");
+                if (ctx_fields_j && ctx_fields_j->is_array()) {
+                    // Ensure we have a VMContextHint object (may already exist)
+                    if (!cfg.vm_context.has_value()) {
+                        cfg.vm_context = VMContextHint{};
+                    }
+                    for (const auto& cf : *ctx_fields_j) {
+                        VMContextHint::Field field;
+                        field.name       = cf.value("name", std::string{});
+                        field.offset     = cf.value("offset", uint32_t(0));
+                        field.size       = static_cast<uint8_t>(cf.value("size", 8));
+                        field.is_pointer = cf.value("is_pointer", false);
+                        if (!field.name.empty())
+                            cfg.vm_context->fields.push_back(std::move(field));
+                    }
+                }
+            }
+
+            // ── VM Register File hint ─────────────────────────────────────────
+            {
+                const json* vm_regs_j  = get_hint("vm_registers");
+                const json* rf_base_j  = get_hint("rf_base_reg");
+                const json* sp_off_j   = get_hint("vm_stack_sp_offset");
+                const json* sp_dep_j   = get_hint("vm_stack_depth");
+                const json* sp_elem_j  = get_hint("vm_stack_elem_size");
+                const json* sp_dir_j   = get_hint("vm_stack_direction");
+
+                if (vm_regs_j || rf_base_j || sp_off_j) {
+                    VMRegisterFileHint rfh;
+
+                    if (rf_base_j)
+                        rfh.rf_base_reg = parse_reg(*rf_base_j);
+
+                    if (vm_regs_j) {
+                        for (const auto& rv : *vm_regs_j) {
+                            VMRegisterFileHint::VMReg vreg;
+                            vreg.name       = rv.value("name", std::string{});
+                            vreg.offset     = rv.value("offset", uint32_t(0));
+                            vreg.size       = static_cast<uint8_t>(rv.value("size", 8));
+                            vreg.is_float   = rv.value("is_float", false);
+                            vreg.is_pointer = rv.value("is_pointer", false);
+                            if (!vreg.name.empty())
+                                rfh.regs.push_back(std::move(vreg));
+                        }
+                    }
+
+                    if (sp_off_j)
+                        rfh.stack_sp_offset = sp_off_j->get<uint32_t>();
+                    if (sp_dep_j)
+                        rfh.stack_depth = sp_dep_j->get<uint32_t>();
+                    if (sp_elem_j)
+                        rfh.stack_elem_size = static_cast<uint8_t>(sp_elem_j->get<int>());
+                    if (sp_dir_j && sp_dir_j->is_string()) {
+                        const std::string& dir = sp_dir_j->get_ref<const std::string&>();
+                        if (dir == "ascending") {
+                            rfh.stack_direction = VMRegisterFileHint::StackDirection::Ascending;
+                        }
+                        // "descending" is the default; no action needed
+                    }
+
+                    cfg.vm_register_file = std::move(rfh);
+                }
+            }
+
+            // ── Handler ASM map ───────────────────────────────────────────────
+            {
+                const json* asm_j = get_hint("handler_asm_map");
+                if (asm_j && asm_j->is_object()) {
+                    HandlerAsmHint hah;
+                    (void)0;  // static PCs stored as-is; slide handled by UI
+                    for (auto& [pc_str, lines] : asm_j->items()) {
+                        // Key is static hex PC string
+                        uint64_t static_pc = parse_hex(pc_str);
+                        // Store as static PC (no slide applied — UI adds slide)
+                        std::vector<HandlerAsmEntry> entries;
+                        if (lines.is_array()) {
+                            for (const auto& line : lines) {
+                                HandlerAsmEntry e;
+                                if (line.is_string()) {
+                                    // Shorthand: just the asm text, no pc
+                                    e.pc   = 0;
+                                    e.text = line.get<std::string>();
+                                } else {
+                                    // Full form: {"pc": "0x...", "text": "..."}
+                                    if (line.contains("pc"))
+                                        e.pc = parse_hex(line["pc"].get<std::string>());
+                                    e.text = line.value("text", std::string{});
+                                }
+                                if (!e.text.empty())
+                                    entries.push_back(std::move(e));
+                            }
+                        }
+                        hah.handler_asm[static_pc] = std::move(entries);
+                    }
+                    cfg.handler_asm = std::move(hah);
+                }
+            }
+
             // ── Run the pass ──
+            // force_rerun: explicitly requested re-run with new hints.
+            // Only invalidate when explicitly requested (not on every hint call)
+            // to avoid a reset → run → reset → run loop.
+            bool force_rerun = args.value("force_rerun", false);
+            if (force_rerun) {
+                auto cur_state = pm_->state("vm_abstract");
+                if (cur_state == PassManager::PassState::Completed) {
+                    pm_->invalidate_and_clear_blob("vm_abstract");
+                }
+            }
+
             tenet::register_pass_by_name(*pm_, "xref");
             tenet::register_pass_by_name(*pm_, "cfg");
             tenet::register_pass_by_name(*pm_, "loop");

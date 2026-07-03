@@ -290,6 +290,12 @@ CliOptions parse_args(int argc, char** argv) {
             opts.trace_fold_end = std::stoull(argv[++i]);
         } else if (arg == "--trace-fold-min-iter" && i + 1 < argc) {
             opts.trace_fold_min_iter = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--trace-fold-keep-iter" && i + 1 < argc) {
+            opts.trace_fold_keep_iter = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--trace-fold-samples" && i + 1 < argc) {
+            opts.trace_fold_samples = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--trace-fold-no-fpr") {
+            opts.trace_fold_no_fpr = true;
         } else if (arg == "--reg-timeline" && i + 1 < argc) {
             opts.opt_reg_timeline = true;
             opts.reg_timeline_reg = static_cast<uint8_t>(std::stoul(argv[++i]));
