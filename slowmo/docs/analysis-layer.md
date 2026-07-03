@@ -166,7 +166,6 @@ Collector 可按记录类型覆写回调：
 | `reg_timeline` | 寄存器写时间线 |
 | `call_context` | 某条指令的调用栈 / 循环 / 邻居上下文 |
 | `window_stats` | 滑动窗口统计 |
-| `cache_sim` | 缓存模拟与时序侧信道检测 |
 | `trace_diff` | 对比两个 trace 区间 |
 | `dataflow_graph` | 指令区间内的数据流图 |
 

@@ -30,7 +30,6 @@
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/literal_search_pass.h"
-#include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/yara_mem_scan_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
@@ -1779,102 +1778,6 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             {"has_nzcv",      hdr.has_nzcv()},
         };
         fmt::print("{}\n", st_json.dump(2));
-    }
-
-    // ── P3: --cache-sim ────────────────────────────────────────────────
-    if (opts.opt_cache_sim) {
-        CacheSimConfig cs_cfg;
-        // Override L1D and L2 sizes
-        cs_cfg.levels[0].size_kb = opts.cache_sim_l1_size_kb;
-        if (cs_cfg.levels.size() >= 2) {
-            cs_cfg.levels[1].size_kb = opts.cache_sim_l2_size_kb;
-        }
-        cs_cfg.policy = opts.cache_sim_policy;
-        cs_cfg.detect_timing_sidechannel = !opts.cache_sim_no_sidechannel;
-
-        // Register optional FunctionPass for per-function stats
-        pm.register_pass(std::make_unique<FunctionPass>());
-        pm.register_pass(std::make_unique<CacheSimPass>(std::move(cs_cfg)));
-
-        const auto& cs_raw = pm.require("cache_sim");
-        if (!cs_raw.ok()) {
-            fmt::print(stderr, "[cache-sim] Pass failed: {}\n", cs_raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& cs_result = cs_raw.get<CacheSimResult>();
-            fmt::print(stderr, "[cache-sim] %s\n", cs_result.summary().c_str());
-
-            json cs_json;
-            cs_json["total_instructions"] = cs_result.total_instructions;
-            cs_json["summary"] = cs_result.summary();
-
-            // Level stats
-            json levels_arr = json::array();
-            for (const auto& ls : cs_result.level_stats) {
-                levels_arr.push_back({
-                    {"name",           ls.name},
-                    {"total_accesses", ls.total_accesses},
-                    {"hits",           ls.hits},
-                    {"misses",         ls.misses},
-                    {"miss_rate",      ls.miss_rate()},
-                    {"hit_rate",       ls.hit_rate()},
-                    {"read_accesses",  ls.read_accesses},
-                    {"write_accesses", ls.write_accesses},
-                    {"evictions",      ls.evictions}
-                });
-            }
-            cs_json["level_stats"] = std::move(levels_arr);
-
-            // Per-function stats (top 50)
-            json fn_arr = json::array();
-            size_t fn_limit = std::min(cs_result.function_stats.size(), size_t(50));
-            for (size_t i = 0; i < fn_limit; i++) {
-                const auto& fs = cs_result.function_stats[i];
-                fn_arr.push_back({
-                    {"pc",               fmt::format("0x{:X}", fs.entry_pc)},
-                    {"name",             fs.name},
-                    {"total_calls",      fs.total_calls},
-                    {"mean_l1d_misses",  fs.mean_l1d_misses()},
-                    {"stddev_l1d_misses",fs.stddev_l1d_misses()},
-                    {"cv",               fs.cv_l1d_misses()},
-                    {"max_misses",       fs.max_l1d_misses()},
-                    {"min_misses",       fs.min_l1d_misses()}
-                });
-            }
-            cs_json["function_stats"] = std::move(fn_arr);
-            if (cs_result.function_stats.size() > 50) cs_json["function_stats_truncated"] = true;
-
-            // Timing side-channel suspects
-            json sc_arr = json::array();
-            for (const auto& sc : cs_result.sidechannels) {
-                sc_arr.push_back({
-                    {"pc",           fmt::format("0x{:X}", sc.entry_pc)},
-                    {"name",         sc.function_name},
-                    {"cv",           sc.cv},
-                    {"min_misses",   sc.min_misses},
-                    {"max_misses",   sc.max_misses},
-                    {"total_calls",  sc.total_calls},
-                    {"reason",       sc.reason}
-                });
-            }
-            cs_json["sidechannels"] = std::move(sc_arr);
-            cs_json["sidechannel_count"] = cs_result.sidechannels.size();
-
-            // Hottest cache lines
-            json hot_arr = json::array();
-            size_t hot_limit = std::min(cs_result.hottest_lines.size(), size_t(20));
-            for (size_t i = 0; i < hot_limit; i++) {
-                const auto& hl = cs_result.hottest_lines[i];
-                hot_arr.push_back({
-                    {"addr",   fmt::format("0x{:X}", hl.addr)},
-                    {"misses", hl.misses},
-                    {"hits",   hl.hits}
-                });
-            }
-            cs_json["hottest_cache_lines"] = std::move(hot_arr);
-
-            fmt::print("{}\n", cs_json.dump(2));
-        }
     }
 
     // ── P3: --yara-mem-scan ────────────────────────────────────────────

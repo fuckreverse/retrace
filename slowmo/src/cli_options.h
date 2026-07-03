@@ -6,7 +6,6 @@
 // in main() with a single struct + parse function.
 // ═══════════════════════════════════════════════════════════════════════════
 
-#include "analysis/passes/cache_sim_pass.h"  // ReplacementPolicy
 #include "io/mcp/mcp_server.h"               // McpHttpConfig
 
 #include <cstdint>
@@ -128,12 +127,6 @@ struct CliOptions {
     uint64_t dump_ma_count = 0;
     bool dump_ma_strings = false;
 
-    // --- P3: Cache simulation ---
-    bool opt_cache_sim = false;
-    uint32_t cache_sim_l1_size_kb = 128;
-    uint32_t cache_sim_l2_size_kb = 12288;
-    ReplacementPolicy cache_sim_policy = ReplacementPolicy::LRU;
-    bool cache_sim_no_sidechannel = false;
 
     // --- P3: YARA memory scan ---
     bool opt_yara_mem_scan = false;

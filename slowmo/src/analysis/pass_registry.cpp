@@ -37,7 +37,6 @@
 #include "analysis/passes/reg_timeline_pass.h"
 #include "analysis/passes/call_context_pass.h"
 #include "analysis/passes/window_stats_pass.h"
-#include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
@@ -121,7 +120,6 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
     if (name == "syscall_intercept")       return std::make_unique<SyscallInterceptPass>();
     // Profile
     if (name == "window_stats")            return std::make_unique<WindowStatsPass>();
-    if (name == "cache_sim")               return std::make_unique<CacheSimPass>();
     if (name == "trace_fold")              return std::make_unique<TraceFoldPass>();
     // Misc
     if (name == "thread")                  return std::make_unique<ThreadPass>();
@@ -283,7 +281,6 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"reg_timeline",          "Reg Timeline",  "Timeline of all writes to a register",                   PassCategory::Profile,   PassDefault::No},
         {"call_context",          "Call Context",  "Call stack + loop position + neighbors at an inst",      PassCategory::Profile,   PassDefault::No},
         {"window_stats",          "Window Stats",  "Sliding window statistics (hot regions, entropy…)",      PassCategory::Profile,   PassDefault::No},
-        {"cache_sim",             "Cache Sim",     "Cache hierarchy simulation + timing side-channels",      PassCategory::Profile,   PassDefault::No},
         {"trace_diff",            "Trace Diff",    "Compare two trace regions for divergence",               PassCategory::Profile,   PassDefault::No},
         {"dataflow_graph",        "Dataflow",      "Register-level data-flow graph for a region",            PassCategory::Profile,   PassDefault::No},
 
@@ -503,10 +500,6 @@ if (name == "loop_semantics") {
     if (name == "window_stats") {
         if (auto* r = try_get<WindowStatsResult>(result))
             return cat_count("windows", r->total_windows);
-    }
-    if (name == "cache_sim") {
-        if (auto* r = try_get<CacheSimResult>(result))
-            return r->summary();
     }
     if (name == "trace_diff") {
         if (auto* r = try_get<TraceDiffResult>(result))

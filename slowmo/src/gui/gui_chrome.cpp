@@ -133,7 +133,6 @@ void GuiApp::render_menu_bar() {
 
             // ── Profiling & Diff ──────────────────────────────────────────
             if (ImGui::BeginMenu("Profiling & Diff")) {
-                ImGui::MenuItem("Cache Sim",           nullptr, &show_cache_sim_);
                 ImGui::MenuItem("Trace Fold",          nullptr, &show_trace_fold_);
                 ImGui::MenuItem("Register Timeline",   nullptr, &show_reg_timeline_);
                 ImGui::MenuItem("Trace Diff",          nullptr, &show_trace_diff_);
@@ -298,9 +297,6 @@ void GuiApp::render_menu_bar() {
 
             // ── Profiling ─────────────────────────────────────────────────
             if (ImGui::BeginMenu("Profiling")) {
-                if (ImGui::MenuItem("Cache Simulation")) {
-                    run_pass_by_name("cache_sim"); show_cache_sim_ = true;
-                }
                 if (ImGui::MenuItem("Trace Fold")) {
                     run_pass_by_name("trace_fold"); show_trace_fold_ = true;
                 }

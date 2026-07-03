@@ -22,7 +22,6 @@
 #include "analysis/passes/objc_crypto_pass.h"
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/syscall_intercept_pass.h"
-#include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
 #include "analysis/passes/vm_hints_json.h"
@@ -296,12 +295,6 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         syscall_result_          = &raw->get<SyscallInterceptResult>();
         show_syscall_intercept_  = true;
         pending_focus_windows_.push_back("API Intercepts");
-        return;
-    }
-    if (name == "cache_sim") {
-        cache_sim_result_ = &raw->get<CacheSimResult>();
-        show_cache_sim_   = true;
-        pending_focus_windows_.push_back("Cache Sim");
         return;
     }
     if (name == "trace_fold") {
@@ -732,8 +725,6 @@ void GuiApp::clear_analysis() {
     std::memset(syscall_filter_buf_, 0, sizeof(syscall_filter_buf_));
     syscall_filter_.clear();
     syscall_cursor_ = 0;
-    cache_sim_result_ = nullptr;
-    show_cache_sim_   = false;
     trace_fold_result_ = nullptr;
     show_trace_fold_   = false;
     vm_abstract_result_ = nullptr;

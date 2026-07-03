@@ -25,7 +25,7 @@ bool CliOptions::has_analysis_option() const {
            opt_entropy || opt_literal_search ||
            opt_dump_memaccess ||
            // P3 options
-           opt_cache_sim || opt_yara_mem_scan || opt_thread_filter ||
+           opt_yara_mem_scan || opt_thread_filter ||
            opt_rpc || opt_mcp || opt_mcp_http || opt_streaming || opt_stats_only ||
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
@@ -114,11 +114,6 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --mem-history <addr> <size>       List all writes to an address\n");
     fmt::print(stderr, "  --search-pc <addr> [limit]        Find all inst_ids visiting a PC\n");
     fmt::print(stderr, "\nP3 feature options:\n");
-    fmt::print(stderr, "  --cache-sim                       Run cache simulation (L1D/L2, set-associative)\n");
-    fmt::print(stderr, "  --cache-sim-l1-size <KB>          L1D cache size in KiB (default: 128)\n");
-    fmt::print(stderr, "  --cache-sim-l2-size <KB>          L2 cache size in KiB (default: 12288)\n");
-    fmt::print(stderr, "  --cache-sim-policy <lru|plru|rand> Replacement policy (default: lru)\n");
-    fmt::print(stderr, "  --cache-sim-no-sidechannel        Disable timing side-channel detection\n");
     fmt::print(stderr, "  --yara-mem-scan                   Scan memory pages with YARA rules\n");
     fmt::print(stderr, "  --yara-rules <file_or_dir>        Extra YARA rule file/dir (repeatable)\n");
     fmt::print(stderr, "  --yara-min-entropy <N>            Skip pages with Shannon entropy < N (default: 0)\n");
@@ -347,19 +342,6 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--dump-ma-strings") {
             opts.dump_ma_strings = true;
         // ── P3 options ──────────────────────────────────────────────────────
-        } else if (arg == "--cache-sim") {
-            opts.opt_cache_sim = true;
-        } else if (arg == "--cache-sim-l1-size" && i + 1 < argc) {
-            opts.cache_sim_l1_size_kb = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--cache-sim-l2-size" && i + 1 < argc) {
-            opts.cache_sim_l2_size_kb = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--cache-sim-policy" && i + 1 < argc) {
-            std::string pol = argv[++i];
-            if (pol == "plru") opts.cache_sim_policy = ReplacementPolicy::PLRU;
-            else if (pol == "rand") opts.cache_sim_policy = ReplacementPolicy::RAND;
-            else opts.cache_sim_policy = ReplacementPolicy::LRU;
-        } else if (arg == "--cache-sim-no-sidechannel") {
-            opts.cache_sim_no_sidechannel = true;
         } else if (arg == "--yara-mem-scan") {
             opts.opt_yara_mem_scan = true;
         } else if (arg == "--yara-rules" && i + 1 < argc) {

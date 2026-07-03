@@ -520,9 +520,6 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 
 # 窗口统计（热点函数、执行频率）
 ./tenet trace.bin --window-stats
-
-# 缓存模拟（cache miss 分析）
-./tenet trace.bin --cache-sim
 ```
 
 **排除噪声区间（分析时过滤）：**

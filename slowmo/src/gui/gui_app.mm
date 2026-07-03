@@ -779,8 +779,8 @@ enum MenuTag : NSInteger {
     kTagViewCallGraph         = 325,
     kTagViewObjCCrypto        = 326,
     kTagViewMemStrings        = 327,
-    kTagViewSyscallIntercept  = 328,
-    kTagViewCacheSim          = 329,
+        kTagViewSyscallIntercept  = 328,
+
 
     // ── View — Profiling & Diff: 330-339 ────────────────────────────
     kTagViewRegTimeline       = 330,
@@ -832,8 +832,7 @@ enum MenuTag : NSInteger {
     kTagAnaAPIIntercepts      = 531,
 
     // ── Analysis — Profiling: 540-549 ───────────────────────────────
-    kTagAnaCacheSim           = 540,
-    kTagAnaTraceFold          = 541,
+        kTagAnaTraceFold          = 541,
     kTagAnaTraceDiff          = 542,
     kTagAnaMemStrings         = 543,
 
@@ -956,7 +955,6 @@ case kTagViewVMWorkspace:      action = [this]{
 }; break;
 
 // ── View — Profiling & Diff ──────────────────────────────────────
-case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show_cache_sim_;          }; break;
         case kTagViewTraceFold:        action = [this]{ show_trace_fold_         = !show_trace_fold_;         }; break;
         case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
@@ -1046,7 +1044,6 @@ case kTagAnaVMAbstract:     action = [this]{
 }; break;
 
         // ── Analysis — Profiling ─────────────────────────────────────────
-        case kTagAnaCacheSim:       action = [this]{ run_pass_by_name("cache_sim"); show_cache_sim_ = true; }; break;
         case kTagAnaTraceFold:      action = [this]{ run_pass_by_name("trace_fold"); show_trace_fold_ = true; }; break;
         case kTagAnaTraceDiff:      action = [this]{ show_trace_diff_ = true; }; break;
         case kTagAnaMemStrings:     action = [this]{ run_pass_by_name("memory_strings"); show_mem_strings_ = true; }; break;
@@ -1153,7 +1150,6 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
 case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewVMAbstract:       it.state = show_vm_abstract_        ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlStateValueOn : NSControlStateValueOff; break;
-case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewDwarf:            it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
@@ -1293,7 +1289,6 @@ void tenet::GuiApp::setup_native_menu() {
 
         // ── Profiling & Diff ──────────────────────────────────────────
         NSMenu* profMenu = mksub(viewMenu, @"Profiling & Diff");
-        [profMenu addItem:mk(@"Cache Sim",           @"", 0, kTagViewCacheSim)];
         [profMenu addItem:mk(@"Trace Fold",          @"", 0, kTagViewTraceFold)];
         [profMenu addItem:mk(@"Register Timeline",   @"", 0, kTagViewRegTimeline)];
         [profMenu addItem:mk(@"Trace Diff",          @"", 0, kTagViewTraceDiff)];
@@ -1384,7 +1379,6 @@ void tenet::GuiApp::setup_native_menu() {
 
         // ── Profiling ─────────────────────────────────────────────────
         NSMenu* profAnaMenu = mksub(anaMenu, @"Profiling");
-        [profAnaMenu addItem:mk(@"Cache Simulation",  @"", 0, kTagAnaCacheSim)];
         [profAnaMenu addItem:mk(@"Trace Fold",        @"", 0, kTagAnaTraceFold)];
         [profAnaMenu addItem:mk(@"Trace Diff",        @"", 0, kTagAnaTraceDiff)];
         [profAnaMenu addItem:mk(@"Memory Strings",    @"", 0, kTagAnaMemStrings)];
@@ -1857,7 +1851,6 @@ void GuiApp::render_frame() {
         // as tabs next to Instructions rather than floating windows.
         ImGui::DockBuilderDockWindow("Trace Diff##P214",    dock_center_main);
         ImGui::DockBuilderDockWindow("Trace Fold",          dock_center_main);
-        ImGui::DockBuilderDockWindow("Cache Sim",           dock_center_main);
         ImGui::DockBuilderDockWindow("Loop Semantics",      dock_center_main);
         ImGui::DockBuilderDockWindow("Algorithm Summary",   dock_center_main);
         ImGui::DockBuilderDockWindow("Call Graph",          dock_center_main);
@@ -2154,9 +2147,6 @@ void GuiApp::render_frame() {
     }
     if (show_objc_crypto_) {
         render_objc_crypto_panel();
-    }
-    if (show_cache_sim_) {
-        render_cache_sim_panel();
     }
     if (show_trace_fold_) {
         render_trace_fold_panel();

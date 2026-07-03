@@ -390,7 +390,6 @@ src/core/register_file.cpp
     src/analysis/passes/window_stats_pass.cpp
     src/analysis/passes/entropy_pass.cpp
     src/analysis/passes/literal_search_pass.cpp
-    src/analysis/passes/cache_sim_pass.cpp
     src/analysis/passes/yara_mem_scan_pass.cpp
     src/analysis/passes/thread_filter_pass.cpp
     src/analysis/passes/objc_crypto_pass.cpp
@@ -505,7 +504,6 @@ src/gui/panels_loop_semantics.cpp
 src/gui/panels_pattern.cpp
 src/gui/panels_constant.cpp
 src/gui/panels_algorithm_summary.cpp
-src/gui/panels_cache_sim.cpp
 src/gui/panels_trace_fold.cpp
 src/gui/panels_memory_strings.cpp
 src/gui/panels_syscall_intercept.cpp

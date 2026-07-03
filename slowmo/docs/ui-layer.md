@@ -82,7 +82,7 @@ CLI 由两部分组成：
 | 数据流 | `--taint*`, `--backward-taint*`, `--critical-path`, `--dataflow-graph*`, `--producer-chain` |
 | 内存与字符串 | `--memread`, `--mem-history`, `--strings`, `--memory-strings`, `--memory-snapshot*`, `--mem-search*`, `--literal-search*`, `--entropy` |
 | 算法与语义 | `--pattern`, `--constants*`, `--loop-semantics`, `--algorithm-summary`, `--objc*`, `--syscall-intercept*`, `--taint-source-annotation`, `--vm-abstract` |
-| 轨迹与性能 | `--trace-diff`, `--trace-fold*`, `--reg-timeline*`, `--window-stats*`, `--cache-sim*`, `--yara-mem-scan*`, `--thread-filter` |
+| 轨迹与性能 | `--trace-diff`, `--trace-fold*`, `--reg-timeline*`, `--window-stats*`, `--yara-mem-scan*`, `--thread-filter` |
 | 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--streaming`, `--stats` |
 | 调试 / 管理 | `--run-pass`, `--list-passes`, `--index-build`, `--cache-list`, `--cache-delete`, `--no-parallel-scan` |
 

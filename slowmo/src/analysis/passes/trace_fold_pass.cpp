@@ -221,8 +221,9 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
     // The persisted blob only stores results, not the config that produced
     // them. Every knob in TraceFoldConfig (min_iterations_to_fold,
     // keep_iterations, pattern_sample_points, include_fpr_summary) changes
-    // what gets computed, so — like CacheSimPass — we only read/write the
-    // cache when the pass is running with its default configuration. A
+    // what gets computed, so — like other parameter-aware-cached passes
+    // (e.g. window_stats) — we only read/write the cache when the pass is
+    // running with its default configuration. A
     // custom config (e.g. `--trace-fold-min-iter 10`) always recomputes,
     // avoiding silently returning results from a *different* configuration.
     const bool is_default_cfg = (cfg_.min_iterations_to_fold == TraceFoldConfig{}.min_iterations_to_fold &&

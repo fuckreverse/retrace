@@ -60,7 +60,6 @@ struct PatternResult;
 struct LoopSemanticsResult;
 struct AlgorithmSummaryResult;
 struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
-struct CacheSimResult;           // defined in cache_sim_pass.h
 struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
 struct VMAbstractResult;         // defined in vm_abstract_pass.h
 // ObjcResult is defined in objc_pass.h (already included)
@@ -528,10 +527,6 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     std::string mem_string_filter_;
     int mem_string_view_mode_ = 0;   // 0=All, 1=RegPointer, 2=StackLocal
 
-    // ─── Cache simulation analysis state ──────────────────────────────
-    const CacheSimResult* cache_sim_result_ = nullptr;
-    bool show_cache_sim_ = false;
-    int  cache_sim_view_mode_ = 0;  // 0=Overview, 1=Functions, 2=SideChannels, 3=HotLines
 
     // ─── Syscall / API intercept analysis state ─────────────────────
     const SyscallInterceptResult* syscall_result_ = nullptr;
@@ -786,7 +781,6 @@ private:
     void render_trace_diff_panel();      // Multi-trace divergence view (P2-14)
     void render_pattern_panel();          // Pattern recognition (crypto/anti-debug)
     void render_constant_panel();         // Constant materialization / algorithm constant identification
-    void render_cache_sim_panel();               // Cache simulation / side-channel
     void render_objc_panel();                  // Objective-C message analysis
     void render_objc_crypto_panel();           // ObjC x Crypto correlation
     void render_call_graph_panel();            // Call graph analysis

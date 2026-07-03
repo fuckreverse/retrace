@@ -43,11 +43,10 @@ mindmap
       MCP HTTP
       batch_query
     流式与性能
-      streaming
-      stats
-      cache_sim
-      window_stats
-      profiling
+streaming
+stats
+window_stats
+profiling
 ```
 
 ## 1. 交互浏览

@@ -173,35 +173,6 @@ class TaintResult:
                 f"tainted_regs={self.tainted_regs}>")
 
 
-class CacheSimResult:
-    """Result of a cache simulation pass."""
-
-    def __init__(self, data: Dict[str, Any]):
-        self._data = data
-
-    @property
-    def miss_rate(self) -> float:
-        lvls = self._data.get("level_stats", [])
-        if not lvls:
-            return 0.0
-        l1 = lvls[0]
-        total = l1.get("total_accesses", 0)
-        misses = l1.get("misses", 0)
-        return misses / total if total > 0 else 0.0
-
-    @property
-    def sidechannels(self) -> List[Dict[str, Any]]:
-        return self._data.get("sidechannels", [])
-
-    @property
-    def hottest_lines(self) -> List[Dict[str, Any]]:
-        return self._data.get("hottest_lines", [])
-
-    def __repr__(self) -> str:
-        return (f"<CacheSimResult miss_rate={self.miss_rate:.2%} "
-                f"sidechannels={len(self.sidechannels)}>")
-
-
 class RpcClient:
     """
     Thin JSON-RPC 2.0 client over Unix Domain Socket.
@@ -483,14 +454,6 @@ class Trace:
             return json.loads(raw).get("strings", [])
         except:
             return []
-
-    def pass_cache_sim(self) -> CacheSimResult:
-        """Run and return the cache simulation pass result."""
-        raw = self._run(["--cache-sim"])
-        try:
-            return CacheSimResult(json.loads(raw))
-        except Exception as e:
-            raise TraceError(f"cache-sim failed: {e}")
 
     def pass_yara_mem_scan(self) -> List[Dict[str, Any]]:
         """Run and return YARA memory scan results."""

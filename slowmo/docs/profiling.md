@@ -418,7 +418,6 @@ ninja -j$(nproc) tenet
 |---|---|
 | `pattern_pass` | `by_category`、`pc_info_`、`hw_sites_`、`constants.by_algorithm`（内嵌的 constant materialization 子结果） |
 | `objc_pass` | `sel_name_cache_`、`deref_cache_` |
-| `cache_sim_pass` | `line_miss_count`、`line_hit_count`、`func_stats_` |
 | `window_stats_pass` | `pc_cache_`、`mnemonic_counts_`、`unique_pcs_`、`unique_mem_addrs_` |
 | `dataflow_graph_pass` | `incoming_edge_idx_`、`outgoing_edge_idx_` |
 | `taint_source_annotation_pass` | 主结果表 |
@@ -432,9 +431,9 @@ ninja -j$(nproc) tenet
 
 **原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records）写入 RocksDB。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
 
-**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`cache_sim`、`window_stats`、`thread`、`syscall_intercept`、`trace_fold`。
+**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`window_stats`、`thread`、`syscall_intercept`、`trace_fold`。
 
-**关键设计变体**：`memory_string`、`memory_snapshot`、`cache_sim`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）。
+**关键设计变体**：`memory_string`、`memory_snapshot`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）。
 
 **可推广的 Pass**：`reg_timeline_pass`（目前每次重算）、`literal_search_pass`/`mem_search_pass`（搜索结果可以 pattern hash 为 key 缓存）、`entropy_pass`、`trace_diff_pass`。
 
@@ -454,7 +453,6 @@ ninja -j$(nproc) tenet
 
 - `string_pass`：Phase 2 的连续地址段扫描相互独立，可 `parallel_for`。
 - `entropy_pass`：多个内存区域的熵计算完全独立，可 `parallel_for`。
-- `cache_sim_pass`：不同函数的 cache 统计相互独立，可 per-function 并行。
 - `taint_pass`：理论上可按时间窗口分片 + 合并（有寄存器状态依赖，难度较高）。
 
 ---
@@ -568,7 +566,6 @@ ninja -j$(nproc) tenet
 | Pass | 算法优化 |
 |---|---|
 | `loop_semantics_pass` | `regfile.warm_range(start, end)` 预热 loop 范围内所有 ANCHOR 缓存，避免后续数万次 random replay |
-| `cache_sim_pass` | `std::partial_sort` 只取 Top-100 热 cache line，O(N log 100) vs O(N log N) |
 | `pattern_pass` | XOR loop 检测用环形缓冲区 `xor_ring_[8]`，O(1) 维护窗口内 EOR 密度 |
 | `trace_fold_pass` | 折叠区间排序后单遍扫描（`[first_inst_id asc, span desc]` + 贪心跳过嵌套/重叠区间）避免嵌套循环重复计数；`regfile.warm_range()` 批量预热所有候选区间再采样，避免逐区间冷 replay；寄存器变化模式检测采用"均匀采样点 + 半迭代周期伴随点"两层策略，避免周期性振荡信号（如 +delta/-delta 交替的临时寄存器）在均匀采样步长恰好对齐周期时被误判为单调/常量（混叠问题） |
 | `mem_search_pass`、`yara_mem_scan_pass` | YARA Aho-Corasick 自动机多模式匹配，O(N)（与 pattern 数无关） |
@@ -606,7 +603,6 @@ ninja -j$(nproc) tenet
 | algorithm_summary | — | ✓ | — | — | — | — | — | — |
 | objc | ✓ | ✓ | — | — | — | — | ✓ raw-scan | ✓ sel-cache |
 | objc_crypto | — | ✓ | — | — | — | — | — | ✓ binary-search |
-| cache_sim | ✓ | ✓ | ✓ | — | — | — | — | ✓ partial_sort |
 | window_stats | ✓ | ✓ | ✓ | — | — | — | — | ✓ sliding-win |
 | dataflow_graph | ✓ | ✓ | — | — | ✓ | — | — | — |
 | slice | — | — | — | — | ✓ | ✓ | ✓ advise | — |
