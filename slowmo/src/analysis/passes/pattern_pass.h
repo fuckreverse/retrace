@@ -131,6 +131,22 @@ private:
 
     PatternMatch& add_match(PatternMatch match);
 
+    /// Emit the currently-buffered XOR-loop candidate as a PatternMatch,
+    /// choosing confidence based on how "loop-like" it looked (see the
+    /// XOR loop detector state comment above). `end_pc` is the anchor PC
+    /// to record (the instruction that broke the run, or 0 at end-of-trace).
+    void flush_xor_loop_match(uint64_t end_pc);
+
+    /// Emit the currently-buffered movz/movk load-sequence candidate as a
+    /// PatternMatch. Always Low confidence: unlike constant_materialization
+    /// (which this detector only runs as a fallback for, see the "Skipped
+    /// when constmat result is available" comment at the call site), this
+    /// path never checks the *value* being loaded against a known
+    /// cryptographic constant table — it only knows "a register got
+    /// assembled from >=3 immediate parts", which any 32/64-bit literal
+    /// (pointer, offset, magic number, ...) can trigger.
+    void flush_const_load_match();
+
     // ─── Configuration ───────────────────────────────────────────────────
 
     CodeTable& code_table_;
@@ -161,17 +177,58 @@ private:
     ankerl::unordered_dense::map<uint64_t, HWCryptoSite> hw_sites_;
 
     // ─── XOR loop detector state ─────────────────────────────────────────
-
+    //
+    // Heuristic note: a sliding window of "many EOR instructions" alone is
+    // NOT sufficient evidence of a crypto round function — dense bit-packing
+    // / checksum / masking code can trigger the same signature without any
+    // loop structure at all.  To cut down on false positives we also track
+    // how many *distinct* PCs appear across the whole candidate run: a real
+    // loop body re-executes a small, fixed set of PCs over and over, whereas
+    // straight-line code marching through many EORs keeps visiting new PCs
+    // (unique PCs ~= instruction count).  We use that ratio to separate
+    // "looks like a loop" (Medium confidence) from "just EOR-dense
+    // straight-line code" (Low confidence, clearly labeled as such) instead
+    // of asserting one fixed confidence for both cases.
     static constexpr size_t XOR_WINDOW_SIZE = 8;
     static constexpr size_t XOR_THRESHOLD  = 4;
+    // If the number of distinct PCs seen in the run is <= this fraction of
+    // the window size, treat it as "small repeating code region" (i.e.
+    // consistent with an actual loop body) rather than straight-line code.
+    static constexpr size_t XOR_LOOP_MAX_UNIQUE_PCS = XOR_WINDOW_SIZE / 2;
 
+    // Parallel ring buffers: xor_ring_[i] says "was the i-th most recent
+    // instruction an eor", xor_pc_ring_[i] says "what PC was it at". Both
+    // are needed because when the window first fills up and the run is
+    // detected, the instructions that were already sitting in the window
+    // (but arrived before we started tracking `in_xor_loop_`) must still be
+    // counted — otherwise the very first flush of a run would only see the
+    // *last* instruction and always look like "1 unique PC", regardless of
+    // whether the preceding 7 executions were actually a repeating loop
+    // body or 7 unrelated straight-line instructions (see
+    // seed_from_ring_window() below).
     bool xor_ring_[XOR_WINDOW_SIZE] = {};
+    uint64_t xor_pc_ring_[XOR_WINDOW_SIZE] = {};
+    uint64_t xor_inst_id_ring_[XOR_WINDOW_SIZE] = {};
     size_t xor_ring_pos_ = 0;
     size_t xor_ring_size_ = 0;
     size_t xor_eor_count_ = 0;
     bool in_xor_loop_ = false;
     uint64_t xor_loop_start_ = 0;
     std::vector<uint64_t> xor_loop_insts_;
+    // Distinct PCs observed across the whole candidate run; used to decide
+    // the confidence level when the match is flushed. A run that only ever
+    // touches a handful of PCs looks like a tight loop body; one that keeps
+    // visiting new PCs looks like straight-line code and gets downgraded to
+    // Low confidence.
+    ankerl::unordered_dense::set<uint64_t> xor_loop_unique_pcs_;
+
+    /// Called exactly once, when a candidate run first starts (i.e. the
+    /// window has just filled up and crossed XOR_THRESHOLD): backfills
+    /// xor_loop_insts_/xor_loop_unique_pcs_ with the EOR instructions that
+    /// are already sitting in the ring buffer (the ones that made the
+    /// window cross the threshold in the first place), not just the one
+    /// instruction that triggered detection.
+    void seed_xor_loop_from_ring();
 
     // ─── Constant loading detector state ─────────────────────────────────
 

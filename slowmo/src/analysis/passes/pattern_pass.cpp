@@ -355,12 +355,15 @@ bool PatternCollector::begin(uint64_t start_inst_id, uint64_t end_inst_id) {
     // Reset all detector state
     hw_sites_.clear();
     std::memset(xor_ring_, 0, sizeof(xor_ring_));
+    std::memset(xor_pc_ring_, 0, sizeof(xor_pc_ring_));
+    std::memset(xor_inst_id_ring_, 0, sizeof(xor_inst_id_ring_));
     xor_ring_pos_ = 0;
     xor_ring_size_ = 0;
     xor_eor_count_ = 0;
     in_xor_loop_ = false;
     xor_loop_start_ = 0;
     xor_loop_insts_.clear();
+    xor_loop_unique_pcs_.clear();
     in_load_seq_ = false;
     load_seq_start_ = 0;
     load_seq_insts_.clear();
@@ -478,6 +481,14 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
     }
 
     // ─── Detector 2: XOR loop (sliding window) ───────────────────────
+    //
+    // A dense-EOR window alone only tells us "lots of XORs happened
+    // recently" — that is equally consistent with a real crypto round
+    // function (few PCs, executed repeatedly) and with straight-line
+    // bit-packing/checksum code (many distinct PCs, each executed once).
+    // We track distinct PCs across the whole candidate run
+    // (xor_loop_unique_pcs_) so the confidence assigned at flush time
+    // reflects which of those two shapes we saw.
     {
         bool is_eor = (cls == MC_EOR);
 
@@ -487,6 +498,8 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
             xor_ring_size_++;
         }
         xor_ring_[xor_ring_pos_] = is_eor;
+        xor_pc_ring_[xor_ring_pos_] = inst.pc;
+        xor_inst_id_ring_[xor_ring_pos_] = inst_id;
         xor_ring_pos_ = (xor_ring_pos_ + 1) % XOR_WINDOW_SIZE;
         if (is_eor) xor_eor_count_++;
 
@@ -496,20 +509,21 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
                 xor_loop_start_ = (inst_id >= XOR_WINDOW_SIZE - 1)
                                      ? inst_id - XOR_WINDOW_SIZE + 1 : 0;
                 xor_loop_insts_.clear();
+                xor_loop_unique_pcs_.clear();
+                // Backfill with the EOR instructions already sitting in the
+                // window — without this, a run's first flush would only
+                // ever contain the single triggering instruction and thus
+                // always look like "1 unique PC" (falsely "loop-like"),
+                // regardless of whether the window was actually a tight
+                // loop or 8 unrelated straight-line EORs.
+                seed_xor_loop_from_ring();
+            } else {
+                xor_loop_insts_.push_back(inst_id);
+                xor_loop_unique_pcs_.insert(inst.pc);
             }
-            xor_loop_insts_.push_back(inst_id);
         } else {
             if (in_xor_loop_ && !xor_loop_insts_.empty()) {
-                add_match(PatternMatch{
-                    "XOR loop",
-                    PatternCategory::Crypto,
-                    PatternConfidence::Medium,
-                    xor_loop_start_, xor_loop_insts_.back(), inst.pc,
-                    fmt::format("XOR loop: {} eor instructions at inst #{}-#{}",
-                                 xor_loop_insts_.size(), xor_loop_start_, xor_loop_insts_.back()),
-                    std::move(xor_loop_insts_), {},
-                });
-                xor_loop_insts_.clear();
+                flush_xor_loop_match(inst.pc);
             }
             in_xor_loop_ = false;
         }
@@ -517,6 +531,9 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
 
     // ─── Detector 3: Constant loading (movz + movk sequences) ────────
     // Skipped when constmat result is available (more precise, no duplication).
+    // This fallback path never validates the loaded *value* against a known
+    // crypto constant table, so it is always reported at Low confidence —
+    // see flush_const_load_match().
     if (!constmat_) {
         bool is_movz = (cls == MC_MOVZ);
         bool is_movk = (cls == MC_MOVK);
@@ -528,15 +545,7 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
                 load_seq_insts_.clear();
             } else {
                 if (load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
-                    add_match(PatternMatch{
-                        "Constant loading sequence",
-                        PatternCategory::KeySchedule,
-                        PatternConfidence::Medium,
-                        load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
-                        fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                     load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
-                        load_seq_insts_, {},
-                    });
+                    flush_const_load_match();
                 }
                 load_seq_insts_.clear();
                 load_seq_start_ = inst_id;
@@ -547,15 +556,7 @@ void PatternCollector::on_inst(uint64_t inst_id, const InstView& inst) {
             load_seq_insts_.push_back(inst_id);
         } else if (in_load_seq_) {
             if (load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
-                add_match(PatternMatch{
-                    "Constant loading sequence",
-                    PatternCategory::KeySchedule,
-                    PatternConfidence::Medium,
-                    load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
-                    fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{}",
-                                 load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
-                    load_seq_insts_, {},
-                });
+                flush_const_load_match();
             }
             in_load_seq_ = false;
             load_seq_insts_.clear();
@@ -578,31 +579,90 @@ void PatternCollector::end() {
         });
     }
 
-    // Flush pending XOR loop
+    // Flush pending XOR loop (trace ended mid-run; no "breaking" PC to record).
     if (in_xor_loop_ && !xor_loop_insts_.empty()) {
-        add_match(PatternMatch{
-            "XOR loop",
-            PatternCategory::Crypto,
-            PatternConfidence::Medium,
-            xor_loop_start_, xor_loop_insts_.back(), 0,
-            fmt::format("XOR loop: {} eor instructions at inst #{}-#{} (end of trace)",
-                         xor_loop_insts_.size(), xor_loop_start_, xor_loop_insts_.back()),
-            std::move(xor_loop_insts_), {},
-        });
+        flush_xor_loop_match(0);
     }
 
     // Flush pending constant loading (only when not using constmat)
     if (!constmat_ && in_load_seq_ && load_seq_insts_.size() >= CONST_LOAD_THRESHOLD) {
-        add_match(PatternMatch{
-            "Constant loading sequence",
-            PatternCategory::KeySchedule,
-            PatternConfidence::Medium,
-            load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
-            fmt::format("Key schedule: {} movz/movk instructions at inst #{}-#{} (end of trace)",
-                         load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
-            load_seq_insts_, {},
-        });
+        flush_const_load_match();
     }
+}
+
+void PatternCollector::seed_xor_loop_from_ring() {
+    // xor_ring_pos_ currently points at the OLDEST slot (the one that is
+    // about to be overwritten on the next iteration), so walking forward
+    // from there for XOR_WINDOW_SIZE steps visits the whole window in
+    // chronological order (oldest → newest). Only the EOR instructions
+    // matter for "unique PCs in this run" — the interleaved non-EOR
+    // instructions are noise the detector already ignores elsewhere.
+    for (size_t i = 0; i < XOR_WINDOW_SIZE; ++i) {
+        size_t slot = (xor_ring_pos_ + i) % XOR_WINDOW_SIZE;
+        if (!xor_ring_[slot]) continue;  // not an eor
+        xor_loop_insts_.push_back(xor_inst_id_ring_[slot]);
+        xor_loop_unique_pcs_.insert(xor_pc_ring_[slot]);
+    }
+}
+
+void PatternCollector::flush_const_load_match() {
+    // Always Low confidence: this fallback path (only active when
+    // constant_materialization hasn't run) never checks the assembled
+    // value against a known crypto constant table — it only knows that a
+    // register was built from >=3 movz/movk immediate parts. Any 32/64-bit
+    // literal (pointer, offset, magic number, timestamp, ...) can produce
+    // the same instruction shape, so this is a much weaker signal than a
+    // verified constant-table hit (which constant_materialization reports
+    // at High confidence via constmat_to_pattern_matches()).
+    add_match(PatternMatch{
+        "Constant loading sequence (unverified)",
+        PatternCategory::KeySchedule,
+        PatternConfidence::Low,
+        load_seq_start_, load_seq_insts_.back(), last_movz_pc_,
+        fmt::format("{} movz/movk instructions at inst #{}-#{} assembled a "
+                     "register value — value NOT checked against any known "
+                     "cryptographic constant table (run constant_materialization "
+                     "for a verified match), may simply be a pointer/offset/magic "
+                     "number",
+                     load_seq_insts_.size(), load_seq_start_, load_seq_insts_.back()),
+        load_seq_insts_, {},
+    });
+}
+
+void PatternCollector::flush_xor_loop_match(uint64_t end_pc) {
+    size_t n_insts = xor_loop_insts_.size();
+    size_t n_unique_pcs = xor_loop_unique_pcs_.size();
+    uint64_t last_inst = xor_loop_insts_.back();
+
+    // A tight loop body re-executes the same few PCs; straight-line code
+    // marching through many EORs visits close to one new PC per step. Use
+    // that ratio to separate "looks like a real crypto loop" from "just a
+    // burst of XORs in straight-line code" instead of always claiming the
+    // same confidence for both.
+    bool looks_like_loop = n_unique_pcs <= XOR_LOOP_MAX_UNIQUE_PCS;
+    PatternConfidence confidence = looks_like_loop ? PatternConfidence::Medium
+                                                    : PatternConfidence::Low;
+    std::string desc = looks_like_loop
+        ? fmt::format("XOR loop: {} eor instructions across {} unique PC(s) "
+                       "at inst #{}-#{} (repeating code region, consistent "
+                       "with a crypto round function)",
+                       n_insts, n_unique_pcs, xor_loop_start_, last_inst)
+        : fmt::format("XOR-dense code: {} eor instructions across {} unique "
+                       "PCs at inst #{}-#{} (straight-line code, not a tight "
+                       "loop — likely bit-packing/checksum, not necessarily "
+                       "crypto)",
+                       n_insts, n_unique_pcs, xor_loop_start_, last_inst);
+
+    add_match(PatternMatch{
+        looks_like_loop ? "XOR loop" : "XOR-dense code (non-loop)",
+        PatternCategory::Crypto,
+        confidence,
+        xor_loop_start_, last_inst, end_pc,
+        std::move(desc),
+        std::move(xor_loop_insts_), {},
+    });
+    xor_loop_insts_.clear();
+    xor_loop_unique_pcs_.clear();
 }
 
 PatternMatch& PatternCollector::add_match(PatternMatch match) {
