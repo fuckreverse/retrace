@@ -224,6 +224,11 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                     auto mem = inst.mem_access(m);
                     if (!(mem.type & 0x02)) continue;  // writes only
 
+                    // Skip accesses where QBDI could not capture the value
+                    // (bit2 of mem_flags = unknown_value / QBDI_MEMORY_UNKNOWN_VALUE).
+                    // Storing a zero/garbage value as 'known' is worse than unknown.
+                    if (mem.flags & 0x04) continue;
+
                     MemWrite mw;
                     mw.inst_id = inst_id;
                     mw.addr = mem.addr;
@@ -444,6 +449,11 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                 auto mem = inst.mem_access(m);
                 bool is_write = (mem.type & 0x02) != 0;
                 if (!is_write && !has_read_cf) continue;
+
+                // Skip accesses where QBDI could not capture the value
+                // (bit2 of mem_flags = unknown_value / QBDI_MEMORY_UNKNOWN_VALUE).
+                // Storing a zero/garbage value as 'known' is worse than unknown.
+                if (mem.flags & 0x04) continue;
 
                 uint8_t total_size = static_cast<uint8_t>(std::min<uint64_t>(mem.size, 16));
 
@@ -869,9 +879,16 @@ MemoryModel::load_page_index(uint64_t page,
                 // with size e.size may not exceed kPageSize.
                 uint16_t max_size = static_cast<uint16_t>(kPageSize - found_offset);
                 if (e.size > max_size) e.size = static_cast<uint8_t>(max_size);
-                std::memset(e.data, 0, 16);
-                std::memcpy(e.data, val.data() + 1, e.size);
-                idx.push_back(e);
+                // Guard against truncated value (should not happen with a correct
+                // build, but defend against DB corruption / partial writes).
+                size_t avail = val.size() - 1;  // bytes actually present after size byte
+                if (avail < e.size) e.size = static_cast<uint8_t>(avail);
+                if (e.size > 0) {
+                    std::memset(e.data, 0, 16);
+                    std::memcpy(e.data, val.data() + 1, e.size);
+                    idx.push_back(e);
+                }
+                // If e.size == 0, skip (don't push) but still advance below.
             }
 
             it->Next();
@@ -924,6 +941,16 @@ bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
     // inst_id, the highest inst_id entries come last within each offset group.
     if (end_it == idx.begin()) return false;
 
+    // Track the best (highest inst_id) covering write found so far.
+    // We cannot return at the first hit because the index sorts by
+    // (page_offset ASC, inst_id ASC) — a write at a smaller offset with a
+    // higher inst_id may appear later in the backward scan and should win.
+    // Example: (offset=0, inst_id=100, size=8) wins over (offset=4, inst_id=80, size=4)
+    // for byte at offset=5, even though offset=4 entry is encountered first in
+    // the backward scan.
+    bool found = false;
+    uint64_t best_id = 0;  // 0 is valid; use `found` to distinguish "no hit yet"
+
     auto it = end_it;
     while (it != idx.begin()) {
         --it;
@@ -932,22 +959,28 @@ bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
         if (it->page_offset < min_start) break;
 
         // Skip entries whose inst_id is too new (shouldn't happen after
-        // upper_bound, but guard against floating-point / boundary issues).
+        // upper_bound, but guard against boundary edge cases).
         if (it->inst_id > search_id) continue;
+
+        // Once we have a winner, skip any entry strictly older than it.
+        // (An entry with the same inst_id at a different offset cannot win because
+        // a single instruction cannot write two overlapping locations with the same id.)
+        if (found && it->inst_id < best_id) continue;
 
         // Check coverage: does this write reach page_offset?
         uint16_t end_off = static_cast<uint16_t>(it->page_offset + it->size);
         if (it->page_offset <= page_offset && page_offset < end_off) {
-            uint8_t byte_idx = static_cast<uint8_t>(page_offset - it->page_offset);
-            out_value  = it->data[byte_idx];
-            out_writer = it->inst_id;
-            return true;
+            if (!found || it->inst_id > best_id) {
+                uint8_t byte_idx = static_cast<uint8_t>(page_offset - it->page_offset);
+                out_value  = it->data[byte_idx];
+                out_writer = it->inst_id;
+                best_id    = it->inst_id;
+                found      = true;
+            }
         }
-        // If this entry's offset is already < min_start we can stop early.
-        if (it->page_offset < min_start) break;
     }
 
-    return false;
+    return found;
 }
 
 // ─── Batch range read (single reverse scan) ──────────────────────────────
@@ -990,10 +1023,30 @@ size_t MemoryModel::index_read_range(const PageWriteIndex& idx,
 
     if (scan_end == idx.begin()) return 0;
 
-    // Single backward scan: for each write entry, check which bytes in our
-    // range it covers and fill them in (only if not already filled — we want
-    // the MOST RECENT write, which is the one with highest inst_id, so we
-    // process entries in reverse inst_id order within each offset group).
+    // Track per-byte winning inst_id to resolve ordering across different
+    // page_offset groups.  The index sorts by (page_offset ASC, inst_id ASC),
+    // so a backward scan does NOT guarantee we see the highest inst_id first
+    // when writes at different offsets interleave in time.  For example, a
+    // write at offset=0, inst_id=100, size=8 may cover bytes 4-7 but be seen
+    // AFTER a write at offset=4, inst_id=80, size=4 — so the "first seen wins"
+    // approach would incorrectly keep the older write for bytes 4-7.
+    // Solution: track the highest inst_id seen per byte and overwrite when a
+    // newer entry is found.  `count` is bounded by kPageSize (4096 bytes);
+    // use a stack buffer that fits the typical small case (≤16B from read())
+    // and falls back to a heap buffer for larger read_region() calls.
+    constexpr uint16_t kSmallBuf = 64;
+    uint64_t small_best[kSmallBuf];
+    std::unique_ptr<uint64_t[]> heap_best;
+    uint64_t* best_inst_id;
+    if (count <= kSmallBuf) {
+        std::memset(small_best, 0, count * sizeof(uint64_t));
+        best_inst_id = small_best;
+    } else {
+        heap_best = std::make_unique<uint64_t[]>(count);
+        best_inst_id = heap_best.get();
+        // make_unique<uint64_t[]> value-initializes (zero-initializes) the array
+    }
+
     auto it = scan_end;
     while (it != idx.begin()) {
         --it;
@@ -1014,19 +1067,27 @@ size_t MemoryModel::index_read_range(const PageWriteIndex& idx,
 
         if (overlap_begin >= overlap_end) continue;
 
-        // Fill bytes that haven't been resolved yet (newer writes take precedence).
+        // For each covered byte, keep the value from the highest inst_id write.
+        // Note: best_inst_id[] is zero-initialized and inst_id 0 is valid,
+        // so we use !out_known[] as the "no winner yet" sentinel and only
+        // apply the inst_id comparison when a previous winner exists.
         for (uint16_t b = overlap_begin; b < overlap_end; ++b) {
             size_t result_idx = b - start_offset;
-            if (!out_known[result_idx]) {
+            if (!out_known[result_idx] || it->inst_id > best_inst_id[result_idx]) {
                 uint8_t byte_in_write = static_cast<uint8_t>(b - write_start);
-                out_data[result_idx]  = it->data[byte_in_write];
-                out_known[result_idx] = true;
-                ++known_count;
+                out_data[result_idx]     = it->data[byte_in_write];
+                best_inst_id[result_idx] = it->inst_id;
+                if (!out_known[result_idx]) {
+                    out_known[result_idx] = true;
+                    ++known_count;
+                }
             }
         }
 
-        // Early exit: all bytes resolved.
-        if (known_count == count) break;
+        // Early exit: all bytes resolved and no earlier write can beat them
+        // (entries are sorted by page_offset ASC then inst_id ASC, so further
+        // backward steps may still have higher inst_ids at smaller offsets).
+        // We cannot early-exit until min_start is reached.
     }
 
     return known_count;
@@ -1048,10 +1109,12 @@ MemReadResult MemoryModel::read_inmemory(uint64_t addr, uint8_t size, uint64_t a
 
         stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
 
-        // Scan from newest to oldest to find last write covering this byte
+        // Scan from newest to oldest to find last write covering this byte.
+        // at_inst_id is exclusive: we want inst_id < at_inst_id ("before" semantics),
+        // matching the RocksDB path which uses search_id = at_inst_id - 1.
         const MemWrite* best = nullptr;
         for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-            if (rit->inst_id > at_inst_id) continue;
+            if (rit->inst_id >= at_inst_id) continue;
             // Check if this write covers our byte
             if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
                 best = &(*rit);
@@ -1112,7 +1175,9 @@ std::optional<uint8_t> MemoryModel::byte_at_inmemory(uint64_t addr, uint64_t at_
     if (!writes) return std::nullopt;
 
     for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-        if (rit->inst_id > at_inst_id) continue;
+        // at_inst_id is exclusive: inst_id < at_inst_id ("before" semantics),
+        // matching the RocksDB path which uses search_id = at_inst_id - 1.
+        if (rit->inst_id >= at_inst_id) continue;
         if (addr >= rit->addr && addr < rit->addr + rit->size) {
             uint8_t offset = static_cast<uint8_t>(addr - rit->addr);
             return rit->data[offset];
@@ -1540,21 +1605,27 @@ uint64_t MemoryModel::index_last_writer(const PageWriteIndex& idx,
 
     if (end_it == idx.begin()) return 0;
 
+    uint64_t best_id = 0;
+    bool found = false;
+
     auto it = end_it;
     while (it != idx.begin()) {
         --it;
 
         if (it->page_offset < min_start) break;
         if (it->inst_id > search_id) continue;
+        if (found && it->inst_id < best_id) continue;  // strictly older, can't improve
 
         uint16_t end_off = static_cast<uint16_t>(it->page_offset + it->size);
         if (it->page_offset <= page_offset && page_offset < end_off) {
-            return it->inst_id;
+            if (!found || it->inst_id > best_id) {
+                best_id = it->inst_id;
+                found = true;
+            }
         }
-        if (it->page_offset < min_start) break;
     }
 
-    return 0;
+    return best_id;
 }
 
 uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_inst_id) {

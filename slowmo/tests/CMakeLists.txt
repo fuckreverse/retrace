@@ -94,6 +94,7 @@ tenet_add_test(test_mcp_tools_ai               unit/test_mcp_tools_ai.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
+tenet_add_test(test_memory_reconstruction  integration/test_memory_reconstruction.cpp)
 
 # test_mcp_http uses a shared in-process server environment (static singleton).
 # Running all TEST_CASEs in a single process (instead of per-test discovery)
