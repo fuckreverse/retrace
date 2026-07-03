@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 
 namespace tenet {
 
@@ -15,7 +16,7 @@ namespace tenet {
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x44464752 ("DFGR")
-//   u32  version = 1
+//   u32  version = 2
 //   u64  num_nodes
 //   for each DataflowNode:
 //     u64  inst_id, pc
@@ -28,11 +29,19 @@ namespace tenet {
 //     u8   via_reg
 //     u64  via_mem_addr
 //   (adjacency index rebuilt after deserialization)
+//
+// Version history:
+//   v1: register-only edges (via_mem_addr always 0).
+//   v2: adds memory dependency edges (store → load, via_mem_addr != 0).
+//       Wire format is unchanged (via_mem_addr was always serialized); the
+//       version bump exists purely so older v1 blobs — produced before
+//       memory edges existed — are invalidated and the pass re-runs to
+//       pick up the new edges, rather than silently serving stale results.
 
 namespace {
 
 static constexpr uint32_t DFGR_BLOB_MAGIC   = 0x44464752u;  // "DFGR"
-static constexpr uint32_t DFGR_BLOB_VERSION = 1u;
+static constexpr uint32_t DFGR_BLOB_VERSION = 2u;
 
 std::string dataflow_graph_serialize(const DataflowGraphResult& res) {
     size_t total = 4 + 4 + 8;  // magic, version, num_nodes
@@ -196,11 +205,19 @@ std::string DataflowGraphResult::to_dot() const {
 
     out += "\n";
 
-    // Emit edges
+    // Emit edges. Memory edges (via_mem_addr != 0) are distinguished from
+    // register edges both by label and by a dashed/colored style, since
+    // via_reg == 0 is ambiguous with the legitimate register x0.
     for (const auto& edge : edges) {
-        out += fmt::format("    n{} -> n{} [label=\"{}\"];\n",
-                           edge.from_inst_id, edge.to_inst_id,
-                           reg_name(edge.via_reg));
+        if (edge.via_mem_addr != 0) {
+            out += fmt::format(
+                "    n{} -> n{} [label=\"mem:0x{:X}\", style=dashed, color=\"#3070c0\"];\n",
+                edge.from_inst_id, edge.to_inst_id, edge.via_mem_addr);
+        } else {
+            out += fmt::format("    n{} -> n{} [label=\"{}\"];\n",
+                               edge.from_inst_id, edge.to_inst_id,
+                               reg_name(edge.via_reg));
+        }
     }
 
     out += "}\n";
@@ -250,13 +267,20 @@ std::string DataflowGraphResult::to_json() const {
     }
     out += "  ],\n";
 
-    // Edges
+    // Edges. Memory edges (via_mem_addr != 0) carry a "via_mem" field instead
+    // of "reg", since via_reg == 0 is ambiguous with the legitimate x0.
     out += "  \"edges\": [\n";
     for (size_t i = 0; i < edges.size(); ++i) {
         const auto& edge = edges[i];
-        out += fmt::format("    {{\"from_inst_id\": {}, \"to_inst_id\": {}, \"reg\": \"{}\"}}",
-                           edge.from_inst_id, edge.to_inst_id,
-                           reg_name(edge.via_reg));
+        if (edge.via_mem_addr != 0) {
+            out += fmt::format(
+                "    {{\"from_inst_id\": {}, \"to_inst_id\": {}, \"via_mem\": \"0x{:X}\"}}",
+                edge.from_inst_id, edge.to_inst_id, edge.via_mem_addr);
+        } else {
+            out += fmt::format("    {{\"from_inst_id\": {}, \"to_inst_id\": {}, \"reg\": \"{}\"}}",
+                               edge.from_inst_id, edge.to_inst_id,
+                               reg_name(edge.via_reg));
+        }
         if (i + 1 < edges.size()) out += ",";
         out += "\n";
     }
@@ -309,6 +333,22 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     constexpr uint64_t NO_WRITER = UINT64_MAX;
     std::array<uint64_t, AARCH64_GPR_COUNT> last_writer;
     last_writer.fill(NO_WRITER);
+
+    // ─── Memory dependency tracking ────────────────────────────────────────
+    // Tracks live (non-fully-shadowed) store intervals as start_addr →
+    // {end_addr, inst_id}, ordered by start address. On each load, we find
+    // the interval with the greatest inst_id whose byte range overlaps the
+    // load (same overlap test as BackwardTaintPass:
+    //   store_start < load_end && load_start < store_end
+    // ) and add a single edge from that instruction — the most recent write
+    // is the effective source of the loaded bytes. On each store, any
+    // existing interval fully covered by the new write is dropped (its bytes
+    // can never be observed again) to keep the map small.
+    struct MemWriteEntry {
+        uint64_t end_addr;
+        uint64_t inst_id;
+    };
+    std::map<uint64_t, MemWriteEntry> mem_writes;  // start_addr → {end_addr, inst_id}
 
     uint64_t nodes_added = 0;
     uint64_t total = end - start;
@@ -387,6 +427,73 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
             uint8_t reg = decoded->regs_written[i];
             if (reg >= AARCH64_GPR_COUNT) continue;
             last_writer[reg] = inst_id;
+        }
+
+        // ─── Memory dependency edges (store → load) ─────────────────────
+        // Uses the trace's recorded mem_access entries (actual runtime
+        // addresses), not statically-inferred operands, so this is precise
+        // even for register-indexed/indirect addressing. See mem_writes
+        // declaration above for the resolution semantics.
+        if (inst.mem_access_count > 0) {
+            for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
+                auto mem = inst.mem_access(m);
+                bool is_write = (mem.type & 0x02) != 0;
+                if (is_write || mem.addr == 0 || mem.size == 0) continue;
+
+                uint64_t load_start = mem.addr;
+                uint64_t load_end   = mem.addr + mem.size;
+
+                // Scan backward from the first store starting at/after
+                // load_end; once a store starts at or before load_start, no
+                // earlier (smaller start_addr) store can overlap further
+                // right, so it's safe to stop after examining it.
+                uint64_t best_writer = NO_WRITER;
+                auto it_mw = mem_writes.upper_bound(load_end);
+                while (it_mw != mem_writes.begin()) {
+                    --it_mw;
+                    uint64_t store_start = it_mw->first;
+                    uint64_t store_end   = it_mw->second.end_addr;
+                    bool overlaps = store_start < load_end && load_start < store_end;
+                    if (overlaps &&
+                        (best_writer == NO_WRITER || it_mw->second.inst_id > best_writer)) {
+                        best_writer = it_mw->second.inst_id;
+                    }
+                    if (store_start <= load_start) break;  // no earlier store can start later
+                }
+
+                if (best_writer != NO_WRITER && result.inst_to_node.count(best_writer) > 0) {
+                    DFGEdge edge;
+                    edge.from_inst_id = best_writer;
+                    edge.to_inst_id   = inst_id;
+                    edge.via_reg      = 0;
+                    edge.via_mem_addr = mem.addr;
+                    result.edges.push_back(edge);
+                }
+            }
+
+            // Writes: record this instruction as the latest writer for the
+            // touched byte range, dropping any pre-existing entries that are
+            // now fully shadowed (their bytes can no longer be observed by
+            // any future load) to keep the map small.
+            for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
+                auto mem = inst.mem_access(m);
+                bool is_write = (mem.type & 0x02) != 0;
+                if (!is_write || mem.addr == 0 || mem.size == 0) continue;
+
+                uint64_t store_start = mem.addr;
+                uint64_t store_end   = mem.addr + mem.size;
+
+                auto it_lo = mem_writes.lower_bound(store_start);
+                for (auto it_e = it_lo; it_e != mem_writes.end() && it_e->first < store_end; ) {
+                    if (it_e->second.end_addr <= store_end) {
+                        it_e = mem_writes.erase(it_e);
+                    } else {
+                        ++it_e;
+                    }
+                }
+
+                mem_writes[store_start] = MemWriteEntry{store_end, inst_id};
+            }
         }
 
         result.nodes.push_back(std::move(node));
