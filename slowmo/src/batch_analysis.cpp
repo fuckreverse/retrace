@@ -21,6 +21,7 @@
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/algorithm_summary_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
+#include "analysis/passes/vm_hints_json.h"
 #include "analysis/passes/objc_pass.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
@@ -670,8 +671,21 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     // --vm-abstract: VM dispatcher detection + handler extraction
+    //
+    // Auto-detection is disabled by default: its heuristic (loop iteration
+    // count + indirect-branch shape) has a very high false-positive/false-
+    // negative rate on real traces. The caller must supply at least one
+    // static-analysis hint (--vm-dispatcher / --vm-handler / --vm-hints
+    // <file>, ...) or explicitly pass --vm-auto-detect to opt into the
+    // unreliable heuristic scan.
     if (opts.opt_vm_abstract) {
         VMConfig vm_cfg;
+
+        if (!opts.vm_hints_file.empty()) {
+            if (!load_vm_hints_from_json(opts.vm_hints_file, vm_cfg)) {
+                return 1;
+            }
+        }
         if (opts.vm_dispatcher_pc != 0) {
             DispatcherHint dh;
             dh.loop_header_pc = opts.vm_dispatcher_pc;
@@ -686,6 +700,19 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         for (uint64_t hpc : opts.vm_handler_pcs) {
             vm_cfg.handler_entry_pcs.push_back(hpc);
         }
+
+        vm_cfg.auto_detect = opts.vm_auto_detect;
+
+        if (!vm_cfg.has_any_static_hint() && !opts.vm_auto_detect) {
+            fmt::print(stderr,
+                "Error: --vm-abstract requires at least one static-analysis hint\n"
+                "  (--vm-dispatcher, --vm-handler, --vm-pc-reg, --vm-hints <file>, ...).\n"
+                "  The heuristic dispatcher auto-detection is disabled by default because\n"
+                "  it has a very high false-positive/false-negative rate on real traces.\n"
+                "  Pass --vm-auto-detect to explicitly opt into it anyway (not recommended).\n");
+            return 1;
+        }
+
         pm.register_pass(std::make_unique<XrefPass>());
         pm.register_pass(std::make_unique<CFGPass>());
         pm.register_pass(std::make_unique<LoopPass>());

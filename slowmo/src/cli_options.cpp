@@ -97,10 +97,15 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --syscall-intercept-bytes <N> Bytes to capture per pointer arg (default: 64)\n");
     fmt::print(stderr, "  --taint-source-annotation     Annotate backward taint leaf sources with ObjC getter context\n");
     fmt::print(stderr, "  --vm-abstract                 Detect VM dispatcher, extract handlers, abstract execution\n");
+    fmt::print(stderr, "                                Requires at least one static hint below (or --vm-auto-detect)\n");
     fmt::print(stderr, "  --vm-dispatcher <hex>         Hint: dispatcher loop header PC (hex)\n");
     fmt::print(stderr, "  --vm-indirect-br <hex>        Hint: indirect branch PC inside dispatcher (hex)\n");
     fmt::print(stderr, "  --vm-pc-reg <index>           Hint: VM program counter register index (0-28)\n");
     fmt::print(stderr, "  --vm-handler <hex>            Hint: handler entry PC (hex, repeatable)\n");
+    fmt::print(stderr, "  --vm-hints <file.json>        Load VM static-analysis hints from a JSON file\n");
+    fmt::print(stderr, "  --vm-auto-detect              Explicitly opt into the unreliable heuristic\n");
+    fmt::print(stderr, "                                dispatcher auto-detection (no hints required,\n");
+    fmt::print(stderr, "                                NOT recommended — high false positive rate)\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
     fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
     fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
@@ -269,6 +274,10 @@ CliOptions parse_args(int argc, char** argv) {
             opts.vm_pc_reg = static_cast<uint8_t>(val);
         } else if (arg == "--vm-handler" && i + 1 < argc) {
             opts.vm_handler_pcs.push_back(std::stoull(argv[++i], nullptr, 16));
+        } else if (arg == "--vm-hints" && i + 1 < argc) {
+            opts.vm_hints_file = argv[++i];
+        } else if (arg == "--vm-auto-detect") {
+            opts.vm_auto_detect = true;
         } else if (arg == "--memread" && i + 3 < argc) {
             opts.opt_memread = true;
             opts.memread_addr = std::stoull(argv[++i], nullptr, 16);

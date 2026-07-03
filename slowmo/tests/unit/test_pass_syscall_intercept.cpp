@@ -145,7 +145,7 @@ static std::unique_ptr<TraceEnv> make_with_capicall_jni() {
         s0.arg_idx = 1;  // x1 = class name string
         s0.value   = "com/example/MainActivity";
         tw.emit_capicall(/*FindClass=*/33, tw.rt(0x1004), 0xDEAD400ULL,
-                         {0xENV000ULL, 0xC000ULL}, {s0});
+                         {0xE000ULL, 0xC000ULL}, {s0});
         tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
         tw.emit_anchor(ms);
     }, "si_capicall_jni_findclass");

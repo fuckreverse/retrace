@@ -100,6 +100,7 @@ struct Shard {
     uint64_t file_end;        // one-past-last byte offset of last record
     uint64_t start_inst_id;   // inst_id of the first INST record in this shard
     uint64_t end_inst_id;     // one-past-last inst_id for this shard
+    uint64_t seed_pc = 0;     // v5 only: absolute PC at file_start (from index)
 };
 
 // ─── Per-shard scan result ───────────────────────────────────────────────────
@@ -138,6 +139,8 @@ struct ShardResult {
 /// This is the hot loop — every cycle counts.
 /// P1.7: is_v5/is_v6 flags control INST header and memacc sizes.
 /// Uses a per-thread ThreadReader to avoid mutex contention.
+/// For v5 (HF_PC_DELTA) traces, shard.seed_pc seeds the running PC accumulator;
+/// ANCHOR records resync it from their absolute PC field.
 void scan_shard(const Shard& shard, uint32_t num_gpr,
                 bool is_v5, bool is_v6, ShardResult& out,
                 const TraceReader::ThreadReader& thread_reader,
@@ -162,6 +165,10 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     roaring64_bulk_context_t last_ctx = {};
     const bool has_excludes = !exclude_ranges.empty();
 
+    // v5: running PC accumulator seeded from index (each shard starts at an anchor boundary).
+    // For each INST: running_pc += pc_delta.  For each ANCHOR: running_pc = anchor.pc.
+    uint64_t running_pc = shard.seed_pc;
+
     while (offset < end_offset) {
         // Check for cancellation every 64K instructions to allow
         // prompt shutdown without measurably impacting scan throughput.
@@ -174,17 +181,26 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — the hot path (>95% of records)
-            uint64_t pc = is_v5 ? 0 : raw_inst_pc(ptr);
+            uint64_t pc;
+            if (is_v5) {
+                // v5: decode pc_delta (int16 at byte offset 4) and advance running_pc.
+                int16_t delta;
+                std::memcpy(&delta, ptr + 4, 2);
+                running_pc += static_cast<int64_t>(delta);
+                pc = running_pc;
+            } else {
+                pc = raw_inst_pc(ptr);
+            }
 
             // Skip excluded PC ranges
             bool excluded = false;
-            if (has_excludes && !is_v5) {
+            if (has_excludes) {
                 for (const auto& [s, e] : exclude_ranges) {
                     if (pc >= s && pc < e) { excluded = true; break; }
                 }
             }
 
-            if (!is_v5 && !excluded) {
+            if (!excluded) {
                 if (__builtin_expect(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
@@ -206,6 +222,11 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 + n_mem     * memacc_sz;
             inst_id++;
         } else {
+            // For v5 traces, resync running_pc from ANCHOR records.
+            if (is_v5 && kind == 1) { // ANCHOR
+                const auto* a_hdr = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+                running_pc = a_hdr->pc;
+            }
             offset += raw_record_size(ptr, num_gpr, is_v5, is_v6);
         }
     }
@@ -697,13 +718,19 @@ PassResult XrefPass::run(PassContext& ctx) {
     std::vector<Shard> shards;
     shards.reserve(n_workers);
 
+    // For v5 (HF_PC_DELTA) traces, we need the absolute PC at each shard boundary
+    // so scan_shard can reconstruct PCs from pc_delta fields.
+    // Use offset_of_with_pc() which already implements this via the anchor table.
+    const bool build_is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+
     for (unsigned i = 0; i < n_workers; i++) {
         uint64_t shard_start_id = start + i * insts_per_shard;
         uint64_t shard_end_id = std::min(shard_start_id + insts_per_shard, end);
         if (shard_start_id >= end) break;
 
-        // Resolve file offsets from the sparse index
-        uint64_t start_offset = index.offset_of(shard_start_id, reader);
+        // Resolve file offsets from the sparse index.
+        // For v5 traces, also capture the seed_pc at the shard boundary.
+        auto [start_offset, seed_pc] = index.offset_of_with_pc(shard_start_id, reader);
         uint64_t end_offset;
         if (shard_end_id >= end) {
             end_offset = file_size;
@@ -721,6 +748,23 @@ PassResult XrefPass::run(PassContext& ctx) {
         s.file_end = end_offset;
         s.start_inst_id = shard_start_id;
         s.end_inst_id = shard_end_id;
+
+        // For v5: seed_pc from offset_of_with_pc() is the PC *after* applying the
+        // first instruction's pc_delta.  scan_shard applies the delta itself, so we
+        // need to pass the pre-delta value (running_pc before the first delta).
+        // Read the first record's pc_delta and subtract it to get pre-delta running_pc.
+        if (build_is_v5 && start_offset < file_size) {
+            const uint8_t* first_ptr = reader.data_at(start_offset);
+            if (first_ptr[0] == 0) { // INST record
+                int16_t first_delta;
+                std::memcpy(&first_delta, first_ptr + 4, 2);
+                s.seed_pc = seed_pc - static_cast<int64_t>(first_delta);
+            } else {
+                s.seed_pc = seed_pc;  // anchor or other: seed_pc is pre-delta already
+            }
+        } else {
+            s.seed_pc = 0;  // v4: not used
+        }
         shards.push_back(s);
     }
 

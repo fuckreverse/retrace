@@ -272,6 +272,126 @@ private:
     ankerl::unordered_dense::set<uint64_t> handler_pc_set_;  // PCs in current handler execution
 };
 
+// ─── ThreadedCollector — single-pass scan for threaded-code VMs ──────────
+//
+// Threaded-code (direct-threaded / indirect-threaded) VMs have no central
+// dispatcher loop.  Instead every handler ends with an inline "fetch next
+// opcode + branch to next handler" sequence.  The observable pattern in the
+// trace is:
+//
+//   handler_A body ... → dispatch_pc_1 (fetch/decode) → BR Xn → handler_B body
+//   handler_B body ... → dispatch_pc_2 (fetch/decode) → BR Xn → handler_C body
+//   ...
+//
+// where dispatch_pc_* is one of the "threaded dispatch PCs" provided by the
+// user (the common tail-fetch PCs shared by every handler).
+//
+// Detection strategy:
+//   1. The user supplies a set of "dispatch PCs" (the common fetch+dispatch
+//      instruction addresses that appear in every handler's tail).
+//   2. The collector observes every instruction.  When it hits a dispatch PC,
+//      it closes the current handler and begins watching for the next handler
+//      entry (the first new PC after the next BR Xn in the dispatch sequence).
+//
+// This is architecturally identical to VMCollector's InDispatcher→AwaitHandler
+// transition, except that "loop header hit" is replaced by "dispatch PC hit".
+
+class ThreadedCollector final : public TraceCollector {
+public:
+    ThreadedCollector(const ankerl::unordered_dense::set<uint64_t>& dispatch_pc_set,
+                      const ankerl::unordered_dense::set<uint64_t>& indirect_branch_pcs)
+        : dispatch_pc_set_(dispatch_pc_set)
+        , indirect_branch_pcs_(indirect_branch_pcs) {}
+
+    std::string_view name() const override { return "ThreadedCollector"; }
+
+    void on_inst(uint64_t inst_id, const InstView& inst) override {
+        uint64_t pc = inst.pc;
+
+        switch (state_) {
+            case State::Idle:
+            case State::InHandler:
+                if (dispatch_pc_set_.contains(pc)) {
+                    // Entering the tail-dispatch sequence; close the current handler.
+                    if (state_ == State::InHandler && !executions_.empty()) {
+                        executions_.back().handler_last_inst_id = last_inst_id_;
+                    }
+                    state_ = State::InDispatch;
+                    current_dispatch_inst_id_ = inst_id;
+                } else if (state_ == State::InHandler && !executions_.empty()) {
+                    auto& exec = executions_.back();
+                    if (handler_pc_set_.insert(pc).second) {
+                        exec.body_pcs.push_back(pc);
+                    }
+                    accumulate_effects(inst);
+                }
+                break;
+
+            case State::InDispatch:
+                if (indirect_branch_pcs_.contains(pc)) {
+                    // The dispatch BR — next instruction is the new handler entry.
+                    state_ = State::AwaitHandler;
+                } else if (!dispatch_pc_set_.contains(pc)) {
+                    // Unexpected PC in dispatch sequence — reset.
+                    state_ = State::Idle;
+                }
+                break;
+
+            case State::AwaitHandler:
+                // First instruction after BR — handler entry.
+                {
+                    HandlerExecution exec;
+                    exec.dispatch_inst_id     = current_dispatch_inst_id_;
+                    exec.handler_entry_pc     = pc;
+                    exec.handler_first_inst_id = inst_id;
+                    executions_.push_back(exec);
+                    state_ = State::InHandler;
+                    handler_pc_set_.clear();
+                    handler_pc_set_.insert(pc);
+                    accumulate_effects(inst);
+                }
+                break;
+        }
+
+        last_inst_id_ = inst_id;
+    }
+
+    void end() override {
+        if (state_ == State::InHandler && !executions_.empty()) {
+            executions_.back().handler_last_inst_id = last_inst_id_;
+        }
+    }
+
+    std::vector<HandlerExecution>& executions() { return executions_; }
+
+private:
+    void accumulate_effects(const InstView& inst) {
+        if (executions_.empty()) return;
+        auto& exec = executions_.back();
+        for (uint8_t d = 0; d < inst.reg_diff_count; ++d) {
+            auto rd = inst.reg_diff(d);
+            if (rd.index < 34) exec.regs_written_mask |= (1ULL << rd.index);
+        }
+        for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
+            auto ma = inst.mem_access(m);
+            if (ma.type & 0x01) exec.mem_reads++;
+            else if (ma.type & 0x02) exec.mem_writes++;
+        }
+    }
+
+    enum class State { Idle, InDispatch, AwaitHandler, InHandler };
+
+    const ankerl::unordered_dense::set<uint64_t>& dispatch_pc_set_;
+    const ankerl::unordered_dense::set<uint64_t>& indirect_branch_pcs_;
+
+    State    state_                    = State::Idle;
+    uint64_t current_dispatch_inst_id_ = 0;
+    uint64_t last_inst_id_             = 0;
+
+    std::vector<HandlerExecution>       executions_;
+    ankerl::unordered_dense::set<uint64_t> handler_pc_set_;
+};
+
 }  // anonymous namespace
 
 // ─── VMAbstractPass::run ─────────────────────────────────────────────────
@@ -309,7 +429,96 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     std::vector<Candidate> candidates;
 
-    if (config_.dispatcher.has_value()) {
+    // ── FetchOnly short-circuit ───────────────────────────────────────────
+    //
+    // Some VMs obfuscate the handler-dispatch decision itself beyond what any
+    // generic collector state-machine can recognize — e.g. a CFF-wrapped
+    // binary-search / linear opcode-compare tree where *every* comparison
+    // node (not just the final "handler selected" edge) routes through the
+    // same "BL cff_stub -> computed RET" primitive.  In that case there is no
+    // PC that unambiguously means "handler entry", so VMCollector/
+    // ThreadedCollector cannot attribute executions to handlers at all.
+    //
+    // FetchOnly sidesteps handler discovery entirely: it only requires a
+    // single stable "fetch / loop-back" anchor PC (`dispatcher.loop_header_pc`)
+    // that is hit exactly once per VM instruction (e.g. the interpreter
+    // loop's back-edge landing point). At each hit, it snapshots VM state
+    // (vm_pc, ctx_fields, vm_registers) via the same Step-7 logic used by the
+    // other topologies — no loop/CFG dependency, no handler classification,
+    // no opcode decoding.
+    // A FetchOnly hint may anchor on either a code PC (`loop_header_pc`,
+    // resolved via xref below) or a memory location (`mem_anchor_addr`,
+    // resolved via MemoryModel::write_history below) — see DispatcherHint
+    // for why the memory anchor exists (heavily CFF-obfuscated VMs where the
+    // fetch/PC++ logic has no single stable PC).
+    bool fetch_only_pc_anchor =
+        (config_.dispatch_type_hint == DispatchType::FetchOnly) &&
+        config_.dispatcher.has_value() &&
+        config_.dispatcher->loop_header_pc != 0;
+    bool fetch_only_mem_anchor =
+        (config_.dispatch_type_hint == DispatchType::FetchOnly) &&
+        config_.dispatcher.has_value() &&
+        config_.dispatcher->mem_anchor_addr != 0;
+    bool fetch_only_short_circuit = fetch_only_pc_anchor || fetch_only_mem_anchor;
+
+    // ── ThreadedCode short-circuit ───────────────────────────────────────
+    //
+    // ThreadedCode topology has no real dispatch loop header: every handler
+    // tail-chains directly into the next handler via a shared "fetch+decode"
+    // instruction sequence (threaded_dispatch_pcs) followed by an indirect
+    // (or, on heavily-CFF'd binaries, a *computed-RET*-based) transfer.
+    // On such binaries the "loop" pass — which only sees back-edges realized
+    // as direct B/B.cond/BR/BLR in the *dynamic* CFG — frequently cannot
+    // detect the real interpreter loop at all (CFF stubs implement every
+    // control-flow edge, including the loop back-edge, as
+    // "BL stub -> computed index -> ADD LR,LR,offset -> RET", which the CFG
+    // call/return pairing does not recognize as a loop back-edge).
+    //
+    // When the caller explicitly asks for ThreadedCode via dispatch_type_hint
+    // and supplies threaded_dispatch_pcs, skip the loop-lookup requirement
+    // entirely and go straight to the ThreadedCollector path below — it only
+    // needs the dispatch PC set + indirect-branch PC set, never a LoopInfo.
+    bool threaded_short_circuit =
+        (config_.dispatch_type_hint == DispatchType::ThreadedCode) &&
+        !config_.threaded_dispatch_pcs.empty();
+
+    if (fetch_only_mem_anchor) {
+        // Memory-anchor FetchOnly: header_inst_ids come from
+        // MemoryModel::write_history() on `mem_anchor_addr`, not from an
+        // xref PC lookup. Populate header_inst_ids right here (the generic
+        // "Collect header inst_ids for each candidate from XRef" loop below
+        // skips this candidate since header_pc == 0 has no xref entry — see
+        // the `cand.header_pc != 0` guard there).
+        Candidate cand;
+        cand.header_pc = 0;  // no single code PC for this anchor — see mem_anchor_addr
+        cand.score = 10.0f;
+
+        auto write_ids = ctx.memory().write_history(
+            config_.dispatcher->mem_anchor_addr, config_.dispatcher->mem_anchor_size);
+        cand.header_inst_ids.reserve(std::min<size_t>(write_ids.size(), 20000));
+        for (uint64_t iid : write_ids) {
+            if (iid < range.start_inst_id) continue;
+            if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
+            cand.header_inst_ids.push_back(iid);
+            if (cand.header_inst_ids.size() >= 20000) break;
+        }
+        candidates.push_back(std::move(cand));
+
+    } else if (fetch_only_pc_anchor) {
+        Candidate cand;
+        cand.header_pc = config_.dispatcher->loop_header_pc;
+        cand.score = 10.0f;
+        candidates.push_back(std::move(cand));
+
+    } else if (threaded_short_circuit) {
+        Candidate cand;
+        cand.header_pc = *config_.threaded_dispatch_pcs.begin();
+        cand.indirect_branch_pc = config_.dispatcher.has_value()
+            ? config_.dispatcher->indirect_branch_pc : 0;
+        cand.score = 10.0f;
+        candidates.push_back(std::move(cand));
+
+    } else if (config_.dispatcher.has_value()) {
         // ── Hint-driven ─────────────────────────────────────────────────
         const auto& hint = *config_.dispatcher;
         Candidate cand;
@@ -328,7 +537,10 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
         if (!loop_found) {
             ctx.progress(1.0f, fmt::format(
-                "VM abstract: hinted dispatcher at {:#x} not found in loop results",
+                "VM abstract: hinted dispatcher at {:#x} not found in loop results "
+                "(if this VM's back-edge is realized via CFF-computed RET rather than "
+                "a direct B/BR, try dispatch_type_hint=ThreadedCode + threaded_dispatch_pcs "
+                "instead of dispatcher_pc)",
                 hint.loop_header_pc));
             return PassResult::success(std::move(result));
         }
@@ -416,7 +628,19 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
 
-    const auto& loop = loop_result.loops[best->loop_index];
+    // Decide which collector to use.
+    bool use_threaded = (config_.dispatch_type_hint == DispatchType::ThreadedCode)
+                     && !config_.threaded_dispatch_pcs.empty();
+    bool use_fetch_only = fetch_only_short_circuit;
+
+    // `loop` is only meaningful for the loop-based (!use_threaded && !use_fetch_only)
+    // path below (classify_dispatch_type() at the bottom of this block). The
+    // threaded_short_circuit / fetch_only_short_circuit candidate's loop_index
+    // is a dummy (0) — never dereference loop_result.loops with it.
+    static const LoopInfo kEmptyLoop{};
+    const LoopInfo& loop = (use_threaded || use_fetch_only || best->loop_index >= loop_result.loops.size())
+        ? kEmptyLoop
+        : loop_result.loops[best->loop_index];
 
     ctx.progress(0.15f, fmt::format(
         "VM abstract: dispatcher at {:#x} ({} iterations), running trace scan...",
@@ -424,18 +648,94 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     // ── Step 3: Single-pass trace scan to discover handlers ─────────────
     //
-    // Use a VMCollector in a TraceScanEngine to find every dispatch→handler
-    // transition in one sequential pass.  This is dramatically faster than
-    // seeking to each header inst_id individually.
+    // Two modes depending on dispatch topology:
+    //
+    //   WhileSwitch / IndirectBranch / CallTable:
+    //     Use VMCollector (state: InDispatcher → AwaitHandler → InHandler).
+    //     Anchored on the loop header PC.
+    //
+    //   ThreadedCode:
+    //     Use ThreadedCollector (state: InDispatch → AwaitHandler → InHandler).
+    //     Anchored on the set of threaded_dispatch_pcs provided by the user.
+    //     Falls back to VMCollector if no threaded_dispatch_pcs are given.
 
-    ankerl::unordered_dense::set<uint64_t> body_pc_set(
-        loop.body_pcs.begin(), loop.body_pcs.end());
+    // Storage for whichever collector is active.
+    // One of these will be engaged; executions_ points to the live one.
+    std::vector<HandlerExecution>* executions_ptr = nullptr;
 
-    VMCollector collector(best->header_pc, best->indirect_branch_pc, body_pc_set);
+    // VMCollector path (default)
+    ankerl::unordered_dense::set<uint64_t> body_pc_set;
+    std::unique_ptr<VMCollector> vm_collector;
 
-    {
+    // ThreadedCollector path
+    ankerl::unordered_dense::set<uint64_t> threaded_dispatch_pc_set;
+    ankerl::unordered_dense::set<uint64_t> threaded_br_pc_set;
+    std::unique_ptr<ThreadedCollector> threaded_collector;
+
+    // FetchOnly path: no state machine, no trace scan engine at all — the
+    // XRef-derived `best->header_inst_ids` (every hit of dispatcher_pc) *is*
+    // the full execution list. One HandlerExecution per hit, all fields
+    // beyond dispatch_inst_id left at their zero defaults (no handler concept).
+    std::vector<HandlerExecution> fetch_only_executions;
+
+    if (use_fetch_only) {
+        fetch_only_executions.reserve(best->header_inst_ids.size());
+        for (uint64_t iid : best->header_inst_ids) {
+            HandlerExecution exec;
+            exec.dispatch_inst_id      = iid;
+            exec.handler_entry_pc      = 0;   // no handler concept in this mode
+            exec.handler_first_inst_id = 0;
+            exec.handler_last_inst_id  = iid; // step "ends" at the same fetch point
+            fetch_only_executions.push_back(exec);
+        }
+        executions_ptr = &fetch_only_executions;
+
+        // Synthesise dispatcher info: the fetch anchor IS the loop header.
+        result.dispatcher.loop_header_pc     = best->header_pc;
+        result.dispatcher.indirect_branch_pc = 0;
+        result.dispatcher.iteration_count    = fetch_only_executions.size();
+        result.dispatcher.dispatch_type      = DispatchType::FetchOnly;
+        result.dispatcher.confidence         = 0.9f;  // user-provided hint
+
+    } else if (use_threaded) {
+        // Build dispatch PC set from user hints.
+        // threaded_dispatch_pcs are stored as runtime addresses (with slide)
+        // consistent with how dispatcher_hint.loop_header_pc is stored.
+        for (uint64_t pc : config_.threaded_dispatch_pcs) {
+            threaded_dispatch_pc_set.insert(pc);
+        }
+        // Collect all indirect-branch PCs reachable from any of the dispatch PCs.
+        // We scan the CFG for BR/BLR instructions within a short window around
+        // each dispatch PC.  Alternatively, the user can include the BR itself in
+        // threaded_dispatch_pcs and we will detect it via the CFG.
+        // For now, add any BR/BLR that immediately follows a dispatch PC in the
+        // code_table (this covers the common "LDR X8, [X20, X0, LSL #3]; BR X8"
+        // pattern).
+        for (uint64_t dpc : threaded_dispatch_pc_set) {
+            // Walk up to 8 instructions forward looking for a BR/BLR
+            uint64_t probe = dpc;
+            for (int step_i = 0; step_i < 8; ++step_i) {
+                auto code = code_table.opcode_at(probe);
+                if (code.has_value()) {
+                    if (aarch64::is_br(*code) || aarch64::is_blr(*code)) {
+                        threaded_br_pc_set.insert(probe);
+                        break;
+                    }
+                }
+                probe += 4;  // AArch64: fixed 4-byte instruction
+            }
+        }
+        // Also include any indirect branch PC from the best candidate if
+        // it was auto-detected (handles mixed-topology traces).
+        if (best->indirect_branch_pc != 0) {
+            threaded_br_pc_set.insert(best->indirect_branch_pc);
+        }
+
+        threaded_collector = std::make_unique<ThreadedCollector>(
+            threaded_dispatch_pc_set, threaded_br_pc_set);
+
         auto engine = ctx.make_scan_engine();
-        engine.add_collector(&collector);
+        engine.add_collector(threaded_collector.get());
         engine.set_progress([&](uint64_t processed, uint64_t total) {
             if (total > 0) {
                 ctx.progress(0.15f + 0.45f * static_cast<float>(processed) /
@@ -444,11 +744,42 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         });
         engine.set_cancel_check([&]() { return ctx.cancelled(); });
         engine.run(range.start_inst_id, range.end_inst_id);
+
+        executions_ptr = &threaded_collector->executions();
+
+        // Synthesise dispatcher info (no real loop, fill with sentinel values)
+        result.dispatcher.loop_header_pc     = 0;
+        result.dispatcher.indirect_branch_pc =
+            threaded_br_pc_set.empty() ? 0 : *threaded_br_pc_set.begin();
+        result.dispatcher.iteration_count    = executions_ptr->size();
+        result.dispatcher.dispatch_type      = DispatchType::ThreadedCode;
+        result.dispatcher.confidence         = 0.9f;  // user-provided hint
+
+    } else {
+        // ── WhileSwitch / IndirectBranch / CallTable path (original) ────
+        body_pc_set.insert(loop.body_pcs.begin(), loop.body_pcs.end());
+        vm_collector = std::make_unique<VMCollector>(
+            best->header_pc, best->indirect_branch_pc, body_pc_set);
+
+        {
+            auto engine = ctx.make_scan_engine();
+            engine.add_collector(vm_collector.get());
+            engine.set_progress([&](uint64_t processed, uint64_t total) {
+                if (total > 0) {
+                    ctx.progress(0.15f + 0.45f * static_cast<float>(processed) /
+                                 static_cast<float>(total));
+                }
+            });
+            engine.set_cancel_check([&]() { return ctx.cancelled(); });
+            engine.run(range.start_inst_id, range.end_inst_id);
+        }
+
+        executions_ptr = &vm_collector->executions();
     }
 
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
 
-    auto& executions = collector.executions();
+    auto& executions = *executions_ptr;
 
     if (executions.empty()) {
         ctx.progress(1.0f, "VM abstract: no handler executions found");
@@ -463,27 +794,40 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         }
     }
 
-    if (unique_handler_pcs.size() < config_.min_handler_count) {
+    // FetchOnly has no handler concept at all — skip the min_handler_count
+    // gate entirely (unique_handler_pcs will always be empty/0 since every
+    // exec.handler_entry_pc is 0 in this mode).
+    if (!use_fetch_only && unique_handler_pcs.size() < config_.min_handler_count) {
         ctx.progress(1.0f, fmt::format(
             "VM abstract: only {} distinct targets (need >= {}), not a VM",
             unique_handler_pcs.size(), config_.min_handler_count));
         return PassResult::success(std::move(result));
     }
 
-    ctx.progress(0.6f, fmt::format(
-        "VM abstract: found {} handlers across {} executions",
-        unique_handler_pcs.size(), executions.size()));
+    if (use_fetch_only) {
+        ctx.progress(0.6f, fmt::format(
+            "VM abstract: FetchOnly mode — {} fetch-cycle snapshots", executions.size()));
+    } else {
+        ctx.progress(0.6f, fmt::format(
+            "VM abstract: found {} handlers across {} executions",
+            unique_handler_pcs.size(), executions.size()));
+    }
 
     // ── Step 4: Build dispatcher info ───────────────────────────────────
+    //
+    // ThreadedCode / FetchOnly paths: dispatcher info was already filled
+    // during Step 3 (no real loop header, or the anchor PC IS the header
+    // with no separate indirect-branch/handler classification).  Only fill
+    // for loop-based topologies here.
 
-    result.dispatcher.loop_header_pc = best->header_pc;
-    result.dispatcher.indirect_branch_pc = best->indirect_branch_pc;
-    result.dispatcher.iteration_count = best->iteration_count;
-    result.dispatcher.confidence = std::min(1.0f, best->score);
-    result.dispatcher.dispatch_type = classify_dispatch_type(loop, cfg_result, best->is_blr);
+    if (!use_threaded && !use_fetch_only) {
+        result.dispatcher.loop_header_pc   = best->header_pc;
+        result.dispatcher.indirect_branch_pc = best->indirect_branch_pc;
+        result.dispatcher.iteration_count  = best->iteration_count;
+        result.dispatcher.confidence       = std::min(1.0f, best->score);
+        result.dispatcher.dispatch_type    = classify_dispatch_type(loop, cfg_result, best->is_blr);
 
-    // Identify state vs invariant registers across dispatch iterations
-    {
+        // Identify state vs invariant registers across dispatch iterations
         uint32_t n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
                               MAX_SAMPLE_ITERATIONS);
         std::vector<RegState> states;
@@ -491,13 +835,11 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         for (uint32_t i = 0; i < n; ++i) {
             states.push_back(regfile.state_before(best->header_inst_ids[i]));
         }
-
         for (uint8_t r = 0; r <= 28; ++r) {
             bool changed = false;
             for (uint32_t i = 1; i < n; ++i) {
                 if (states[i].gpr[r] != states[0].gpr[r]) {
-                    changed = true;
-                    break;
+                    changed = true; break;
                 }
             }
             if (changed) result.dispatcher.state_regs.push_back(r);
@@ -512,17 +854,37 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     if (config_.vm_pc.has_value() && config_.vm_pc->reg != 0xFF) {
         result.vm_pc_reg = config_.vm_pc->reg;
         result.bytecode_base = config_.vm_pc->bytecode_base;
-    } else {
+    } else if (!use_threaded) {
+        // Auto-inference requires loop header inst_ids (not available for
+        // ThreadedCode). Works for both loop-based topologies and FetchOnly
+        // (best->header_inst_ids is populated identically in both cases).
         result.vm_pc_reg = infer_vm_pc_register(regfile, best->header_inst_ids);
     }
 
-    // Infer bytecode address range from observed VM-PC values
+    // Infer bytecode address range from observed VM-PC values.
+    // For ThreadedCode, sample from dispatch inst_ids recorded by the collector.
     if (result.vm_pc_reg != 0xFF) {
-        uint32_t n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
-                              MAX_SAMPLE_ITERATIONS);
+        uint32_t n;
+        std::vector<uint64_t> sample_inst_ids;
+        if (use_threaded) {
+            // Sample dispatch inst_ids from the first N executions
+            n = std::min(static_cast<uint32_t>(executions.size()),
+                         MAX_SAMPLE_ITERATIONS);
+            sample_inst_ids.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                sample_inst_ids.push_back(executions[i].dispatch_inst_id);
+            }
+        } else {
+            n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
+                         MAX_SAMPLE_ITERATIONS);
+            sample_inst_ids = std::vector<uint64_t>(
+                best->header_inst_ids.begin(),
+                best->header_inst_ids.begin() + n);
+        }
+        uint32_t n_real = static_cast<uint32_t>(sample_inst_ids.size());
         uint64_t min_vpc = UINT64_MAX, max_vpc = 0;
-        for (uint32_t i = 0; i < n; ++i) {
-            auto state = regfile.state_before(best->header_inst_ids[i]);
+        for (uint32_t i = 0; i < n_real; ++i) {
+            auto state = regfile.state_before(sample_inst_ids[i]);
             uint64_t vpc = state.gpr[result.vm_pc_reg];
             if (vpc < min_vpc) min_vpc = vpc;
             if (vpc > max_vpc) max_vpc = vpc;
@@ -653,16 +1015,64 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         step.handler_entry_pc = exec.handler_entry_pc;
 
         // Decode VM-PC value and opcode
+        //
+        // Timing contract for register reads:
+        //   dispatch_inst_id  = inst_id of the loop-header instruction.
+        //   handler_first_inst_id = inst_id of the very first instruction of
+        //                          the handler body (after the indirect branch).
+        //
+        //   state_before(dispatch_inst_id):  register values BEFORE the
+        //       dispatcher loop body starts executing.  Good for VM-PC (which
+        //       was set by the previous handler and has not been touched yet by
+        //       the current dispatcher iteration).
+        //
+        //   state_before(handler_first_inst_id): register values just before
+        //       the handler's first instruction.  This is AFTER the dispatcher
+        //       has fully executed the opcode-decode stub (e.g. bl 0x885F48 for
+        //       the bnlabel VMP), so any decode result in a scratch register
+        //       (e.g. x0) reflects the decoded opcode for this step.
         if (result.vm_pc_reg != 0xFF) {
-            auto state = regfile.state_before(exec.dispatch_inst_id);
-            step.vm_pc_value = state.gpr[result.vm_pc_reg];
+            // VM-PC: read at dispatcher entry — it holds the bytecode pointer
+            // that the dispatcher is about to decode.  Using dispatch_inst_id
+            // is intentional here (it hasn't been advanced yet by this
+            // iteration's fetch logic).
+            auto state_dispatch = regfile.state_before(exec.dispatch_inst_id);
+            step.vm_pc_value = state_dispatch.gpr[result.vm_pc_reg];
             step.vm_pc_valid = true;
 
             if (config_.opcode_format.has_value()) {
                 auto& ofmt = *config_.opcode_format;
-                if (ofmt.opcode_size > 0 && ofmt.opcode_size <= 8) {
+
+                // ── Mode B: register snapshot after decode stub ────────────
+                // The target register (e.g. x0) is set by the dispatcher's
+                // opcode-decode stub which runs BETWEEN dispatch_inst_id and
+                // handler_first_inst_id.  We must read it at the handler
+                // boundary (state_before handler entry) — NOT at the loop
+                // header where the stub hasn't run yet.
+                if (ofmt.opcode_from_reg != 0xFF) {
+                    if (exec.handler_first_inst_id != 0) {
+                        auto state_handler = regfile.state_before(
+                            exec.handler_first_inst_id);
+                        step.opcode_value = state_handler.gpr[ofmt.opcode_from_reg];
+                    } else {
+                        // Fallback: no handler_first recorded, use dispatch state
+                        step.opcode_value = state_dispatch.gpr[ofmt.opcode_from_reg];
+                    }
+                    step.opcode_valid = true;
+                }
+                // ── Mode A: memory read at VM-PC + deobfuscation pipeline ──
+                // Read the raw opcode bytes from the bytecode buffer at the
+                // address (vm_pc_value + opcode_byte_offset).  This works only
+                // when the bytecode memory was written through the trace.  If
+                // the bytecode is a read-only mmap'd file section with no
+                // recorded writes, MemReadResult::known[] will be all-false and
+                // decoding silently skips this step.
+                else if (ofmt.opcode_size > 0 && ofmt.opcode_size <= 8) {
                     auto& memory = ctx.memory();
-                    auto mem = memory.read(step.vm_pc_value,
+                    // Apply opcode_byte_offset: skip prefix bytes to reach the opcode field.
+                    uint64_t read_addr = step.vm_pc_value +
+                                        static_cast<uint64_t>(ofmt.opcode_byte_offset);
+                    auto mem = memory.read(read_addr,
                                            static_cast<uint8_t>(ofmt.opcode_size),
                                            exec.dispatch_inst_id);
                     // Check that all requested bytes are known
@@ -675,43 +1085,256 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                         std::memcpy(&raw, mem.data.data(),
                                     std::min(static_cast<size_t>(ofmt.opcode_size),
                                              sizeof(raw)));
-                        step.opcode_value = (raw & ofmt.opcode_mask) >> ofmt.opcode_shift;
-                        step.opcode_valid = true;
+                        // Step 1: mask + shift
+                        uint64_t val = (raw & ofmt.opcode_mask) >> ofmt.opcode_shift;
 
-                        // Record opcode→handler mapping
-                        auto hit = result.handler_by_pc.find(step.handler_entry_pc);
-                        if (hit != result.handler_by_pc.end()) {
-                            auto& h = result.handlers[hit->second];
-                            bool dup = false;
-                            for (uint64_t ov : h.opcode_values) {
-                                if (ov == step.opcode_value) { dup = true; break; }
+                        // Step 2: apply ordered deobfuscation transforms
+                        for (const auto& step_def : ofmt.deobfuscation_steps) {
+                            using Op = OpcodeDeobfStep::Op;
+                            switch (step_def.op) {
+                                case Op::sub:   val -= step_def.imm; break;
+                                case Op::add:   val += step_def.imm; break;
+                                case Op::xor_:  val ^= step_def.imm; break;
+                                case Op::and_:  val &= step_def.imm; break;
+                                case Op::or_:   val |= step_def.imm; break;
+                                case Op::lsr:   val >>= step_def.imm; break;
+                                case Op::lsl:   val <<= step_def.imm; break;
+                                case Op::mul:   val *= step_def.imm; break;
+                                case Op::ror: {
+                                    // Rotate right by imm bits within a 64-bit word.
+                                    // Normalise shift amount to [0, 63].
+                                    uint8_t r = static_cast<uint8_t>(step_def.imm & 63u);
+                                    if (r > 0) val = (val >> r) | (val << (64u - r));
+                                    break;
+                                }
+                                case Op::bswap: {
+                                    // Byte-swap within the specified width (2/4/8).
+                                    uint8_t w = step_def.imm ? static_cast<uint8_t>(step_def.imm) : 8u;
+                                    if (w >= 8) {
+                                        val = __builtin_bswap64(val);
+                                    } else if (w == 4) {
+                                        val = __builtin_bswap32(static_cast<uint32_t>(val));
+                                    } else if (w == 2) {
+                                        val = __builtin_bswap16(static_cast<uint16_t>(val));
+                                    }
+                                    break;
+                                }
+                                case Op::neg:   val = static_cast<uint64_t>(-static_cast<int64_t>(val)); break;
+                                case Op::not_:  val = ~val; break;
                             }
-                            if (!dup) h.opcode_values.push_back(step.opcode_value);
                         }
+
+                        step.opcode_value = val;
+                        step.opcode_valid = true;
+                    }
+                }
+
+                // ── Record opcode→handler mapping (both modes) ─────────────
+                if (step.opcode_valid) {
+                    auto hit = result.handler_by_pc.find(step.handler_entry_pc);
+                    if (hit != result.handler_by_pc.end()) {
+                        auto& h = result.handlers[hit->second];
+                        bool dup = false;
+                        for (uint64_t ov : h.opcode_values) {
+                            if (ov == step.opcode_value) { dup = true; break; }
+                        }
+                        if (!dup) h.opcode_values.push_back(step.opcode_value);
                     }
                 }
             }
         }
 
+        // ── VM context / register file snapshot ─────────────────────────
+        //
+        // state_dispatch (state_before dispatch_inst_id) is needed below
+        // even when vm_pc_reg == 0xFF.  Compute it lazily here if not already
+        // computed by the vm_pc_reg block above (where it was declared in scope).
+        // We use a lambda-initialized const ref to avoid the double-call cost.
+        //
+        // For the ctx_base and rf_base pointers: these are almost always
+        // invariant registers (they point to a heap-allocated VM state struct
+        // that never moves).  Reading them at dispatch_inst_id or
+        // handler_first_inst_id yields the same value.  We use
+        // dispatch_inst_id for consistency.
+        //
+        // For the MEMORY values at those pointers (vm_ctx fields, VM
+        // registers, SP): we query at dispatch_inst_id.  The MemoryModel
+        // returns "the last write that happened BEFORE dispatch_inst_id",
+        // which is exactly the state left by the PREVIOUS handler — i.e., the
+        // VM register file contents that the current step's handler will see
+        // as its inputs.  This is the correct semantic for a VM-register panel.
+        bool need_ctx_state = (config_.vm_context.has_value() &&
+                               config_.vm_context->ctx_base_reg != 0xFF) ||
+                              config_.vm_register_file.has_value();
+        // Use the state already fetched by vm_pc_reg block, or fetch it now.
+        // We re-fetch unconditionally when needed; RegisterFile caches states,
+        // so a second call with the same inst_id is an O(1) LRU hit.
+        const RegState* p_state_dispatch = nullptr;
+        RegState lazy_state_dispatch;
+        if (need_ctx_state) {
+            if (result.vm_pc_reg != 0xFF) {
+                // Already computed as state_dispatch inside the block above.
+                // Re-fetch (LRU cache hit, ~ns).
+                lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
+            } else {
+                lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
+            }
+            p_state_dispatch = &lazy_state_dispatch;
+        }
+
         // Decode VM context structure fields if hint provided
         if (config_.vm_context.has_value() && config_.vm_context->ctx_base_reg != 0xFF) {
             auto& vctx = *config_.vm_context;
-            auto state = regfile.state_before(exec.dispatch_inst_id);
-            uint64_t ctx_base = state.gpr[vctx.ctx_base_reg];
+            // ctx_base_reg is invariant; read it from state_before dispatch.
+            uint64_t ctx_base = p_state_dispatch->gpr[vctx.ctx_base_reg];
             auto& memory = ctx.memory();
 
             for (const auto& field : vctx.fields) {
+                // Clamp field size to [1, 8]; 0 defaults to 8.
+                uint8_t fsz = (field.size > 0 && field.size <= 8) ? field.size : uint8_t(8);
                 uint64_t field_addr = ctx_base + field.offset;
-                auto mem = memory.read(field_addr, 8, exec.dispatch_inst_id);
-                // Check that at least 8 bytes are known
+                auto mem = memory.read(field_addr, fsz, exec.dispatch_inst_id);
                 bool known = true;
-                for (uint8_t b = 0; b < 8; ++b) {
+                for (uint8_t b = 0; b < fsz; ++b) {
                     if (!mem.known[b]) { known = false; break; }
                 }
                 if (known) {
                     uint64_t val = 0;
-                    std::memcpy(&val, mem.data.data(), 8);
+                    std::memcpy(&val, mem.data.data(), fsz);
                     step.ctx_fields.emplace_back(field.name, val);
+                }
+            }
+        }
+
+        // ── VM Register File snapshot ────────────────────────────────────
+        // Read named VM registers and/or VM stack from the RF base pointer.
+        // Memory time-point: dispatch_inst_id (= values left by the previous
+        // handler, which are the inputs to the current step).
+        //
+        // Register file and stack are no longer mutually exclusive: a VM may
+        // have both (e.g. JVM-style mixed architecture).  When both are
+        // configured, both are emitted into step.vm_regs.
+        if (config_.vm_register_file.has_value()) {
+            auto& rf = *config_.vm_register_file;
+            auto& memory = ctx.memory();
+
+            // Determine RF base address from an invariant host register.
+            // rf_base_reg is expected to be invariant (never changed by
+            // handler code); reading it from state_dispatch is correct.
+            uint64_t rf_base = 0;
+            bool rf_base_valid = false;
+            if (rf.rf_base_reg != 0xFF) {
+                rf_base = p_state_dispatch->gpr[rf.rf_base_reg];
+                rf_base_valid = true;
+            } else if (config_.vm_context.has_value() &&
+                       config_.vm_context->ctx_base_reg != 0xFF) {
+                rf_base = p_state_dispatch->gpr[config_.vm_context->ctx_base_reg];
+                rf_base_valid = true;
+            }
+
+            if (rf_base_valid) {
+                // ── Register machine: read named VM registers ──────────────
+                // Supports up to 16 bytes (SIMD/XMM).  Values > 8 bytes are
+                // stored as two adjacent uint64 entries: "V0_lo" / "V0_hi".
+                for (const auto& vreg : rf.regs) {
+                    // Clamp to a meaningful max (16B for SIMD); default to 8.
+                    uint8_t sz = (vreg.size > 0 && vreg.size <= 16)
+                                     ? vreg.size : uint8_t(8);
+                    uint64_t addr = rf_base + vreg.offset;
+
+                    if (sz <= 8) {
+                        // ── scalar path ──
+                        auto mem = memory.read(addr, sz, exec.dispatch_inst_id);
+                        bool known = true;
+                        for (uint8_t b = 0; b < sz; ++b) {
+                            if (!mem.known[b]) { known = false; break; }
+                        }
+                        if (known) {
+                            uint64_t val = 0;
+                            std::memcpy(&val, mem.data.data(), sz);
+                            step.vm_regs.emplace_back(vreg.name, val);
+                        }
+                    } else {
+                        // ── 128-bit SIMD path: read as two 8-byte halves ──
+                        // Read first 8 bytes (lo)
+                        auto mem_lo = memory.read(addr,     8, exec.dispatch_inst_id);
+                        auto mem_hi = memory.read(addr + 8, 8, exec.dispatch_inst_id);
+                        bool lo_ok = true, hi_ok = true;
+                        for (uint8_t b = 0; b < 8; ++b) {
+                            if (!mem_lo.known[b]) lo_ok = false;
+                            if (!mem_hi.known[b]) hi_ok = false;
+                        }
+                        if (lo_ok) {
+                            uint64_t lo = 0;
+                            std::memcpy(&lo, mem_lo.data.data(), 8);
+                            step.vm_regs.emplace_back(vreg.name + "_lo", lo);
+                        }
+                        if (hi_ok) {
+                            uint64_t hi = 0;
+                            std::memcpy(&hi, mem_hi.data.data(), 8);
+                            step.vm_regs.emplace_back(vreg.name + "_hi", hi);
+                        }
+                    }
+                }
+
+                // ── Stack machine: read SP pointer, then stack slots ───────
+                // SP lives inside the ctx/RF region at stack_sp_offset.
+                // The SP value itself is a pointer into a separate stack buffer.
+                //
+                // Stack growth direction is configurable via rf.stack_direction:
+                //
+                //   Descending (default, full-descending):
+                //     SP points to the last pushed item.
+                //     TOS = *SP, next = *(SP + elem), ...
+                //     Slot i: SP + i * elem
+                //
+                //   Ascending (full-ascending / empty-ascending):
+                //     SP points to the next free slot.
+                //     TOS = *(SP - elem), next = *(SP - 2*elem), ...
+                //     Slot i: SP - (i + 1) * elem
+                //
+                if (rf.has_stack()) {
+                    auto sp_mem = memory.read(rf_base + rf.stack_sp_offset, 8,
+                                              exec.dispatch_inst_id);
+                    bool sp_ok = true;
+                    for (uint8_t b = 0; b < 8; ++b) {
+                        if (!sp_mem.known[b]) { sp_ok = false; break; }
+                    }
+                    if (sp_ok) {
+                        uint64_t sp = 0;
+                        std::memcpy(&sp, sp_mem.data.data(), 8);
+                        // Record the SP value itself for display
+                        step.vm_regs.emplace_back("SP", sp);
+
+                        uint8_t  elem  = rf.stack_elem_size > 0 ? rf.stack_elem_size : uint8_t(8);
+                        uint32_t depth = rf.stack_depth     > 0 ? rf.stack_depth     : 8u;
+
+                        using Dir = VMRegisterFileHint::StackDirection;
+                        bool ascending = (rf.stack_direction == Dir::Ascending);
+
+                        for (uint32_t si = 0; si < depth; ++si) {
+                            uint64_t slot_addr;
+                            if (ascending) {
+                                // Ascending stack: TOS is below SP.
+                                // slot 0 = *(SP - elem), slot 1 = *(SP - 2*elem), ...
+                                slot_addr = sp - static_cast<uint64_t>(si + 1) * elem;
+                            } else {
+                                // Descending stack: TOS is at SP.
+                                // slot 0 = *SP, slot 1 = *(SP + elem), ...
+                                slot_addr = sp + static_cast<uint64_t>(si) * elem;
+                            }
+                            auto sm = memory.read(slot_addr, elem, exec.dispatch_inst_id);
+                            bool sok = true;
+                            for (uint8_t b = 0; b < elem; ++b) {
+                                if (!sm.known[b]) { sok = false; break; }
+                            }
+                            if (sok) {
+                                uint64_t sv = 0;
+                                std::memcpy(&sv, sm.data.data(), elem);
+                                step.vm_regs.emplace_back(fmt::format("S{}", si), sv);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -728,6 +1351,10 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
             result.total_native_instructions += (step.inst_id_end - step.inst_id_start + 1);
         }
     }
+
+    // ── Step 9: Carry hints into result for VM Workspace UI ────────────
+    result.vm_register_file = config_.vm_register_file;
+    result.handler_asm      = config_.handler_asm;
 
     ctx.progress(1.0f, fmt::format(
         "VM abstract: dispatcher at {:#x}, {} handlers, {} VM steps, VM-PC={}",

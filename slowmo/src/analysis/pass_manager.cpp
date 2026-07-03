@@ -76,8 +76,21 @@ void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
     auto name = pass->name();
 
-    // Reject duplicate registration — silently ignore if already present.
-    if (name_map_.count(name)) {
+    // If the pass was previously registered but then invalidated (NotRun state),
+    // allow replacing the pass object so that a new config takes effect.
+    // This is the expected pattern when re-running with different parameters
+    // (e.g. vm_abstract with updated static hints).
+    auto it = name_map_.find(name);
+    if (it != name_map_.end()) {
+        PassEntry* existing = it->second;
+        std::lock_guard<std::mutex> elk(existing->mtx);
+        if (existing->state.load(std::memory_order_acquire) == PassState::NotRun) {
+            // Safe to replace: pass was invalidated and has not started running.
+            existing->pass = std::move(pass);
+            LOG_INFO("PassManager: replaced invalidated pass '{}'", name);
+            return;
+        }
+        // Pass is Running or Completed — silently ignore (idempotent).
         LOG_WARN("PassManager: duplicate registration of '{}' ignored", name);
         return;
     }

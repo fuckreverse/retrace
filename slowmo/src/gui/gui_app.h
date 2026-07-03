@@ -64,6 +64,7 @@ struct AnnotationResult;
 struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
 struct CacheSimResult;           // defined in cache_sim_pass.h
 struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
+struct VMAbstractResult;         // defined in vm_abstract_pass.h
 // ObjcResult is defined in objc_pass.h (already included)
 // MemoryStringResult is defined in memory_string_pass.h (already included)
 
@@ -566,6 +567,59 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     const TraceFoldResult* trace_fold_result_ = nullptr;
     bool show_trace_fold_ = false;
 
+    // ─── VM Abstract analysis state ──────────────────────────────────────────
+    const VMAbstractResult* vm_abstract_result_ = nullptr;
+    bool show_vm_abstract_ = false;
+    int  vm_handler_sort_  = 0;   // 0=by execution count, 1=by entry PC
+    size_t vm_handler_cursor_ = 0;
+    size_t vm_step_cursor_    = 0;
+
+    // VM dispatcher auto-detection is a pure heuristic (loop iteration count +
+    // indirect-branch shape) with a very high false-positive/false-negative
+    // rate on real traces. The GUI therefore requires the user to load a
+    // static-analysis hints JSON file (from IDA/Ghidra/MCP) before running
+    // vm_abstract — or explicitly check "run without hints (unreliable)".
+    char vm_hints_path_buf_[512] = {};   // text input buffer for hints file path
+    bool vm_auto_detect_opt_in_  = false; // explicit "run without hints" checkbox
+    std::string vm_hints_status_;         // feedback line ("loaded N hints" / error)
+    /// Run vm_abstract using vm_hints_path_buf_ / vm_auto_detect_opt_in_.
+    /// Shared by the legacy panel and the VM Workspace "Run"/"Rerun" buttons.
+    void run_vm_abstract_with_hints();
+    /// Renders the hints-file path input + "Run"/"Rerun" button + auto-detect
+    /// opt-in checkbox + status line. Shared by the legacy panel (empty and
+    /// already-run states) and the VM Workspace toolbar.
+    /// `button_label`/`button_width` let callers customize the primary
+    /// action button ("Run VM Detection" vs "Rerun").
+    void render_vm_hints_input(const char* button_label, float button_width);
+
+    // ─── VM Workspace (independent floating window with its own DockSpace) ───
+    // Layout mirrors the native layout but at the VM abstraction level:
+    //   Left  : VM Handler list (like Functions panel)
+    //   Center top    : VM Step / bytecode instruction viewer
+    //   Center bottom : VM bytecode hex / stats
+    //   Right top     : VM Register file  (register machine)
+    //                   VM Stack          (stack machine)
+    //   Right bottom  : VM memory accesses / context fields
+    bool   vm_ws_open_         = false;   // workspace window visible
+    bool   vm_ws_linked_       = true;    // sync navigate_to() with native panel
+    bool   vm_ws_first_frame_  = true;    // rebuild DockSpace on first open
+    ImGuiID vm_ws_dockspace_id_ = 0;     // DockSpace ID (set once)
+
+    // Cursor: which VM step is currently selected in the workspace
+    size_t vm_ws_step_cursor_   = 0;
+    // Handler filter / sort (workspace variant, independent from old panel)
+    char   vm_ws_handler_filter_[128] = {};
+    int    vm_ws_handler_sort_  = 0;   // 0=freq, 1=pc
+    size_t vm_ws_handler_cursor_ = 0;
+
+    // Render helpers (all in panels_vm_abstract.cpp)
+    void render_vm_workspace();              // top-level: open/close the host window + DockSpace
+    void render_vmws_handlers_panel();       // left: handler list
+    void render_vmws_steps_panel();          // center-top: VM step / asm instruction viewer
+    void render_vmws_bytecode_panel();       // center-bottom: bytecode hex + stats
+    void render_vmws_registers_panel();      // right-top: VM RF or VM stack
+    void render_vmws_memaccess_panel();      // right-bottom: VM memory accesses / ctx fields
+
     // ─── Cache Manager panel state ─────────────────────────────────────────
     bool show_cache_manager_ = false;
     bool cache_manager_dirty_ = true;  ///< Re-load entry list from RocksDB next frame.
@@ -743,6 +797,8 @@ private:
     void render_memory_strings_panel();          // Time-aware memory string discovery
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
+    void render_vm_abstract_panel();             // VM dispatcher / handler / step view (legacy single-panel)
+    // render_vm_workspace() declared in the VM Abstract state block above
     void render_log_panel();                       // Output / Log panel (IDA-style)
     void render_cache_manager_panel();             // Pass-cache management panel
 

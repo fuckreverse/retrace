@@ -21,6 +21,7 @@
 #include "analysis/passes/taint_source_annotation_pass.h"
 #include "analysis/passes/thread_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
+
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/slice_pass.h"
@@ -43,6 +44,7 @@
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/dataflow_graph_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
+#include "analysis/passes/vm_hints_json.h"
 
 #include <fmt/core.h>
 
@@ -224,7 +226,25 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
                             : ctx.range_end;
         return std::make_unique<DataflowGraphPass>(std::move(c));
     }
-    if (name == "vm_abstract")         return std::make_unique<VMAbstractPass>();
+    if (name == "vm_abstract") {
+        // VM dispatcher auto-detection is unreliable on real traces (pure
+        // heuristic on loop iteration count + indirect-branch shape).
+        // Require the caller to have supplied static-analysis hints (via a
+        // hints JSON file) or to have explicitly opted into auto-detection;
+        // otherwise refuse to register the pass (caller sees registration
+        // failure and should prompt the user for hints instead).
+        VMConfig cfg;
+        if (!ctx.vm_hints_file.empty()) {
+            if (!load_vm_hints_from_json(ctx.vm_hints_file, cfg)) {
+                return nullptr;
+            }
+        }
+        cfg.auto_detect = ctx.vm_auto_detect;
+        if (!cfg.has_any_static_hint() && !ctx.vm_auto_detect) {
+            return nullptr;
+        }
+        return std::make_unique<VMAbstractPass>(std::move(cfg));
+    }
 
     // Should be unreachable: catalog promises a case for every entry.
     return nullptr;
@@ -243,6 +263,7 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"cfg_layout",            "CFG Layout",    "Graph layout coordinates for CFG view",                  PassCategory::Structure, PassDefault::No},
         {"call_graph",            "Call Graph",    "Inter-function call graph",                              PassCategory::Structure, PassDefault::Yes},
         {"loop",                  "Loops",         "Detect loops via back-edges in CFG",                     PassCategory::Structure, PassDefault::Yes},
+
         // — Taint —
         {"taint",                 "Taint",         "Forward taint from current register",                    PassCategory::Taint,     PassDefault::No},
         {"backward_taint",        "Back Taint",    "Backward taint from current instruction",                PassCategory::Taint,     PassDefault::No},

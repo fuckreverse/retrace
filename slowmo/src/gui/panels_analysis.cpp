@@ -27,6 +27,8 @@
 #include "analysis/passes/syscall_intercept_pass.h"
 #include "analysis/passes/cache_sim_pass.h"
 #include "analysis/passes/trace_fold_pass.h"
+#include "analysis/passes/vm_abstract_pass.h"
+#include "analysis/passes/vm_hints_json.h"
 
 #include <imgui.h>
 #include "gui/icons/IconsFontAwesome6.h"
@@ -318,6 +320,14 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         trace_fold_result_ = &raw->get<TraceFoldResult>();
         show_trace_fold_   = true;
         pending_focus_windows_.push_back("Trace Fold");
+        return;
+    }
+    if (name == "vm_abstract") {
+        vm_abstract_result_ = &raw->get<VMAbstractResult>();
+        show_vm_abstract_   = true;
+        vm_handler_cursor_  = 0;
+        vm_step_cursor_     = 0;
+        pending_focus_windows_.push_back("VM Abstract\xef\x83\x90##VMPanel");
         return;
     }
 }
@@ -613,6 +623,77 @@ void GuiApp::run_pass_by_name(std::string_view name) {
     });
 }
 
+// ─── VM Abstract: hints-gated runner ────────────────────────────────────────
+//
+// VM dispatcher auto-detection is a pure heuristic (loop iteration count +
+// indirect-branch shape) with a very high false-positive/false-negative rate
+// on real traces. The GUI requires the user to load a static-analysis hints
+// JSON file (produced by IDA/Ghidra, or the same schema as the MCP
+// `vm_abstract` tool's hints_file) before running the pass — unless they
+// explicitly check "run without hints (unreliable)".
+void GuiApp::run_vm_abstract_with_hints() {
+    ensure_pass_manager();
+
+    std::string hints_path(vm_hints_path_buf_);
+
+    if (hints_path.empty() && !vm_auto_detect_opt_in_) {
+        vm_hints_status_ =
+            "Load a static-analysis hints JSON file first (dispatcher_pc, "
+            "handler_entry_pcs, ...), or check \"run without hints\" to use "
+            "the unreliable heuristic auto-detection.";
+        last_pass_status_ = "vm_abstract: hints required";
+        return;
+    }
+
+    // Build the VMConfig up front so we can validate hints before touching
+    // any pass-manager state.
+    VMConfig vm_cfg;
+    if (!hints_path.empty()) {
+        if (!load_vm_hints_from_json(hints_path, vm_cfg)) {
+            vm_hints_status_ = fmt::format("Failed to load hints file: {}", hints_path);
+            last_pass_status_ = "vm_abstract: invalid hints file";
+            return;
+        }
+    }
+    vm_cfg.auto_detect = vm_auto_detect_opt_in_;
+    if (!vm_cfg.has_any_static_hint() && !vm_auto_detect_opt_in_) {
+        vm_hints_status_ = "Hints file has no usable hints, and auto-detect is not enabled.";
+        last_pass_status_ = "vm_abstract: hints required";
+        return;
+    }
+
+    // Always invalidate any previous result so new hints actually take
+    // effect. NOTE: register_pass_by_name()/pm_has_pass() is idempotent by
+    // NAME regardless of NotRun/Completed state, so it would incorrectly
+    // skip re-registration here — construct + register the pass directly
+    // instead (dependencies still go through register_pass_by_name, which
+    // is safe for them since their config never changes).
+    if (pass_manager_->state("vm_abstract") == PassManager::PassState::Running) {
+        pass_manager_->cancel("vm_abstract");
+    }
+    pass_manager_->invalidate_and_clear_blob("vm_abstract");
+    vm_abstract_result_ = nullptr;
+
+    tenet::register_pass_by_name(*pass_manager_, "xref");
+    tenet::register_pass_by_name(*pass_manager_, "cfg");
+    tenet::register_pass_by_name(*pass_manager_, "loop");
+    pass_manager_->register_pass(std::make_unique<VMAbstractPass>(std::move(vm_cfg)));
+
+    vm_hints_status_ = hints_path.empty()
+        ? "Running with auto-detect (unreliable) — no hints loaded."
+        : fmt::format("Hints loaded from {}", hints_path);
+
+    enqueue_async("vm_abstract", [this]() {
+        auto& raw = pass_manager_->require("vm_abstract");
+        std::string summary = tenet::summarize_pass_result("vm_abstract", raw);
+        bool ok = raw.ok();
+        post_apply([this, summary, ok]() {
+            last_pass_status_ = fmt::format("vm_abstract: {}", summary);
+            if (ok) apply_pass_result_pointers("vm_abstract");
+        });
+    });
+}
+
 void GuiApp::force_rerun_pass(std::string_view name) {
     ensure_pass_manager();
 
@@ -720,6 +801,10 @@ void GuiApp::clear_analysis() {
     show_cache_sim_   = false;
     trace_fold_result_ = nullptr;
     show_trace_fold_   = false;
+    vm_abstract_result_ = nullptr;
+    show_vm_abstract_   = false;
+    vm_handler_cursor_  = 0;
+    vm_step_cursor_     = 0;
     show_taint_ = false;
     show_threads_ = false;
     show_slice_ = false;

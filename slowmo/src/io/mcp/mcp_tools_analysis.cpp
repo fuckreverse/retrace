@@ -1169,18 +1169,23 @@ void TenetMcpService::register_pass_tools() {
          "Detect and analyze Virtual Machine (VM) based obfuscation in the trace. "
          "Identifies the VM dispatcher loop, extracts handler set, decodes VM opcodes, "
          "and reconstructs the VM execution trace (bytecode → handler mapping). "
-         "Supports WhileSwitch, IndirectBranch, CallTable, and ThreadedCode topologies. "
-         "Accepts optional static hints from IDA to improve accuracy. Without hints, "
-         "auto-detects dispatcher via loop + indirect-branch heuristics. "
+         "Supports WhileSwitch, IndirectBranch, CallTable, ThreadedCode, and FetchOnly topologies. "
+         "REQUIRES at least one static-analysis hint (e.g. 'dispatcher_pc' from IDA/Ghidra) "
+         "or 'hints_file'. The purely heuristic dispatcher auto-detection (loop iteration "
+         "count + indirect-branch shape) is disabled by default because it has a very high "
+         "false-positive/false-negative rate on real traces; pass auto_detect=true to opt "
+         "into it anyway (not recommended). "
          "Use this when you suspect VM/VMP protection.",
          {{"type", "object"},
           {"properties", {
               // ── Dispatcher location ──
               {"dispatcher_pc",        {{"type", "string"},  {"description", "Hint: PC of the dispatch loop header (hex). From IDA static analysis."}}},
               {"indirect_branch_pc",   {{"type", "string"},  {"description", "Hint: PC of the BR/BLR instruction that selects handlers (hex)."}}},
+              {"mem_anchor_addr",      {{"type", "string"},  {"description", "Hint (FetchOnly only): runtime address of a memory location written exactly once per VM instruction (hex). Alternative to dispatcher_pc for heavily CFF-obfuscated VMs where NO single stable PC exists. E.g. '0x13B3444F0' = ctx_base + field_offset. Resolved via MemoryModel::write_history()."}}},
+              {"mem_anchor_size",      {{"type", "integer"}, {"description", "Hint (FetchOnly + mem_anchor_addr): byte width of the write to watch for (1/2/4/8, default 4)."}}},
               {"handler_entry_pcs",    {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: known handler entry PCs (hex array). From IDA jump table analysis."}}},
               // ── Dispatch topology ──
-              {"dispatch_type",        {{"type", "string"},  {"description", "Hint: force dispatch topology: 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'. Default: auto-detect."}}},
+              {"dispatch_type",        {{"type", "string"},  {"description", "Hint: force dispatch topology: 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'|'FetchOnly'. 'FetchOnly' skips handler/opcode discovery entirely and just snapshots VM state (vm_pc/ctx_fields/vm_registers) once per hit of 'dispatcher_pc' — use when the handler-selection logic itself is too obfuscated to recognize (e.g. a CFF-wrapped opcode-compare tree) but there is still one stable per-VM-instruction 'fetch/loop-back' anchor PC. Default: auto-detect."}}},
               {"threaded_dispatch_pcs",{{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint (ThreadedCode only): set of runtime fetch/dispatch tail PCs shared by every handler (hex array). E.g. the LDR+BR pair at the end of each handler. Required when dispatch_type='ThreadedCode'."}}},
               // ── VM-PC ──
               {"vm_pc_reg",            {{"type", "string"},  {"description", "Hint: host register holding VM program counter (e.g. 'x19', 'x20')."}}},
@@ -1207,7 +1212,7 @@ void TenetMcpService::register_pass_tools() {
               {"handler_asm_map",      {{"type", "object"},  {"description", "Hint: static disassembly for handler bodies. Keys = handler static PC (hex string), values = array of {\"pc\": \"0x...\", \"text\": \"...\"}. Enables annotated asm in VM instruction panel."}}},
               // ── Misc ──
               {"hints_file",           {{"type", "string"},  {"description", "Path to a JSON file containing any/all of the above hints. Merged with inline args (inline args take priority). JSON keys match arg names."}}},
-              {"auto_detect",          {{"type", "boolean"}, {"description", "Auto-detect dispatcher if no hint provided"}, {"default", true}}},
+              {"auto_detect",          {{"type", "boolean"}, {"description", "Explicitly opt into the heuristic dispatcher auto-detection (loop iteration count + indirect-branch shape) when NO static hint is provided. This heuristic has a very high false-positive/false-negative rate on real traces and is DISABLED by default — you should almost always supply at least 'dispatcher_pc' (or another hint) from IDA/Ghidra static analysis instead of relying on this."}, {"default", false}}},
               {"force_rerun",          {{"type", "boolean"}, {"description", "Force re-run even if a cached result exists (use when hints have changed)"}, {"default", false}}},
               {"steps_offset",         {{"type", "integer"}, {"description", "Pagination: skip first N VM steps"}, {"default", 0}}},
               {"steps_limit",          {{"type", "integer"}, {"description", "Pagination: max VM steps per page (max 2000)"}, {"default", 500}}}
@@ -1216,122 +1221,13 @@ void TenetMcpService::register_pass_tools() {
             if (!pm_) throw std::runtime_error("PassManager not available");
 
             VMConfig cfg;
-            cfg.auto_detect = args.value("auto_detect", true);
-
-            // ── Static hints from IDA ──
-            if (args.contains("dispatcher_pc")) {
-                DispatcherHint dh;
-                dh.loop_header_pc = unrebase(parse_hex(args["dispatcher_pc"].get<std::string>()));
-                if (args.contains("indirect_branch_pc")) {
-                    dh.indirect_branch_pc = unrebase(parse_hex(args["indirect_branch_pc"].get<std::string>()));
-                }
-                cfg.dispatcher = dh;
-            }
-
-            if (args.contains("handler_entry_pcs")) {
-                for (const auto& pc_str : args["handler_entry_pcs"]) {
-                    cfg.handler_entry_pcs.push_back(unrebase(parse_hex(pc_str.get<std::string>())));
-                }
-            }
-
-            // ── Dispatch topology ─────────────────────────────────────────
-            if (args.contains("dispatch_type")) {
-                const std::string& dt = args["dispatch_type"].get_ref<const std::string&>();
-                if      (dt == "WhileSwitch")    cfg.dispatch_type_hint = DispatchType::WhileSwitch;
-                else if (dt == "IndirectBranch") cfg.dispatch_type_hint = DispatchType::IndirectBranch;
-                else if (dt == "CallTable")      cfg.dispatch_type_hint = DispatchType::CallTable;
-                else if (dt == "ThreadedCode")   cfg.dispatch_type_hint = DispatchType::ThreadedCode;
-                else if (dt == "Trampoline")     cfg.dispatch_type_hint = DispatchType::Trampoline;
-            }
-            if (args.contains("threaded_dispatch_pcs")) {
-                for (const auto& pc_str : args["threaded_dispatch_pcs"]) {
-                    // Runtime addresses: apply rebase (user passes static PC, we add slide)
-                    cfg.threaded_dispatch_pcs.push_back(
-                        unrebase(parse_hex(pc_str.get<std::string>())));
-                }
-            }
-
-            if (args.contains("vm_pc_reg")) {
-                VMPCHint vph;
-                vph.reg = parse_reg(args.at("vm_pc_reg"));
-                if (args.contains("bytecode_base")) {
-                    vph.bytecode_base = parse_hex(args["bytecode_base"].get<std::string>());
-                }
-                cfg.vm_pc = vph;
-            }
-
-            // ── Opcode format / deobfuscation ──────────────────────────────
-            // Construct OpcodeFormatHint when any of the opcode-related args is present.
-            if (args.contains("opcode_size") ||
-                args.contains("opcode_from_reg") ||
-                args.contains("opcode_deobf_steps") ||
-                args.contains("opcode_byte_offset")) {
-
-                OpcodeFormatHint ofh;
-
-                // Mode B: register snapshot
-                if (args.contains("opcode_from_reg")) {
-                    ofh.opcode_from_reg = parse_reg(args.at("opcode_from_reg"));
-                }
-
-                // Mode A fields (ignored when opcode_from_reg is set)
-                if (args.contains("opcode_size")) {
-                    ofh.opcode_size = static_cast<uint8_t>(args["opcode_size"].get<int>());
-                }
-                if (args.contains("opcode_byte_offset")) {
-                    ofh.opcode_byte_offset =
-                        static_cast<uint8_t>(args["opcode_byte_offset"].get<int>());
-                }
-                if (args.contains("opcode_mask")) {
-                    ofh.opcode_mask = parse_hex(args["opcode_mask"].get<std::string>());
-                }
-                ofh.opcode_shift = static_cast<uint8_t>(args.value("opcode_shift", 0));
-
-                // Deobfuscation step sequence
-                if (args.contains("opcode_deobf_steps")) {
-                    // Helper: parse op name string to enum
-                    auto parse_op = [](const std::string& s) -> OpcodeDeobfStep::Op {
-                        if (s == "sub")   return OpcodeDeobfStep::Op::sub;
-                        if (s == "add")   return OpcodeDeobfStep::Op::add;
-                        if (s == "xor")   return OpcodeDeobfStep::Op::xor_;
-                        if (s == "and")   return OpcodeDeobfStep::Op::and_;
-                        if (s == "or")    return OpcodeDeobfStep::Op::or_;
-                        if (s == "lsr")   return OpcodeDeobfStep::Op::lsr;
-                        if (s == "lsl")   return OpcodeDeobfStep::Op::lsl;
-                        if (s == "mul")   return OpcodeDeobfStep::Op::mul;
-                        if (s == "ror")   return OpcodeDeobfStep::Op::ror;
-                        if (s == "bswap") return OpcodeDeobfStep::Op::bswap;
-                        if (s == "neg")   return OpcodeDeobfStep::Op::neg;
-                        if (s == "not")   return OpcodeDeobfStep::Op::not_;
-                        throw std::runtime_error("Unknown deobf op: " + s);
-                    };
-
-                    for (const auto& elem : args["opcode_deobf_steps"]) {
-                        OpcodeDeobfStep ds;
-                        ds.op = parse_op(elem.at("op").get<std::string>());
-                        // imm may be integer or hex string (or absent for neg/not)
-                        if (elem.contains("imm")) {
-                            if (elem.at("imm").is_number()) {
-                                ds.imm = elem["imm"].get<uint64_t>();
-                            } else {
-                                ds.imm = parse_hex(elem["imm"].get<std::string>());
-                            }
-                        }
-                        ofh.deobfuscation_steps.push_back(ds);
-                    }
-                }
-
-                cfg.opcode_format = std::move(ofh);
-            }
-
-            if (args.contains("ctx_base_reg")) {
-                VMContextHint vch;
-                vch.ctx_base_reg = parse_reg(args.at("ctx_base_reg"));
-                cfg.vm_context = vch;
-            }
 
             // ── hints_file: load JSON file and merge with inline args ──────────
-            // File values are the base; inline args override them.
+            // File values are the base; inline args override them. Loaded up
+            // front so that EVERY hint field below (dispatcher_pc, vm_pc_reg,
+            // opcode format, ctx_base_reg, ...) can come from either source —
+            // this makes "hints_file only, no inline args" a fully supported
+            // usage pattern, which matters now that hints are required.
             json file_hints = json::object();
             if (args.contains("hints_file")) {
                 std::string hpath = args["hints_file"].get<std::string>();
@@ -1347,6 +1243,148 @@ void TenetMcpService::register_pass_tools() {
                 if (file_hints.contains(key)) return &file_hints.at(key);
                 return nullptr;
             };
+
+            // Auto-detection is opt-in only (see tool description): the pure
+            // heuristic has a very high false-positive/false-negative rate on
+            // real traces. Default false; gated/checked again below once all
+            // hints have been merged in.
+            {
+                const json* ad = get_hint("auto_detect");
+                cfg.auto_detect = ad ? ad->get<bool>() : false;
+            }
+
+            // ── Static hints from IDA ── (inline args OR hints_file)
+            //
+            // dispatcher_pc / indirect_branch_pc: normally both describe a
+            // classic loop-based dispatcher (loop_header_pc + the BR/BLR that
+            // selects handlers). But indirect_branch_pc is also meaningful on
+            // its own for dispatch_type=ThreadedCode, where there is no real
+            // loop header — it just tells the ThreadedCollector which PC(s)
+            // mark "handler selected, next instruction is the new handler
+            // entry". So construct a DispatcherHint (loop_header_pc left 0)
+            // even when only indirect_branch_pc is present.
+            {
+                const json* dp  = get_hint("dispatcher_pc");
+                const json* ibp = get_hint("indirect_branch_pc");
+                const json* maa = get_hint("mem_anchor_addr");
+                const json* mas = get_hint("mem_anchor_size");
+                if (dp || ibp || maa) {
+                    DispatcherHint dh;
+                    if (dp)  dh.loop_header_pc     = unrebase(parse_hex(dp->get<std::string>()));
+                    if (ibp) dh.indirect_branch_pc = unrebase(parse_hex(ibp->get<std::string>()));
+                    // mem_anchor_addr is a runtime address (already has ASLR slide)
+                    if (maa) dh.mem_anchor_addr = parse_hex(maa->get<std::string>());
+                    if (mas) dh.mem_anchor_size = static_cast<uint8_t>(mas->get<int>());
+                    cfg.dispatcher = dh;
+                }
+            }
+
+            if (const json* hep = get_hint("handler_entry_pcs")) {
+                for (const auto& pc_str : *hep) {
+                    cfg.handler_entry_pcs.push_back(unrebase(parse_hex(pc_str.get<std::string>())));
+                }
+            }
+
+            // ── Dispatch topology ─────────────────────────────────────────
+            if (const json* dt_j = get_hint("dispatch_type")) {
+                const std::string& dt = dt_j->get_ref<const std::string&>();
+                if      (dt == "WhileSwitch")    cfg.dispatch_type_hint = DispatchType::WhileSwitch;
+                else if (dt == "IndirectBranch") cfg.dispatch_type_hint = DispatchType::IndirectBranch;
+                else if (dt == "CallTable")      cfg.dispatch_type_hint = DispatchType::CallTable;
+                else if (dt == "ThreadedCode")   cfg.dispatch_type_hint = DispatchType::ThreadedCode;
+                else if (dt == "Trampoline")     cfg.dispatch_type_hint = DispatchType::Trampoline;
+                else if (dt == "FetchOnly")      cfg.dispatch_type_hint = DispatchType::FetchOnly;
+            }
+            if (const json* tdp = get_hint("threaded_dispatch_pcs")) {
+                for (const auto& pc_str : *tdp) {
+                    // Runtime addresses: apply rebase (user passes static PC, we add slide)
+                    cfg.threaded_dispatch_pcs.push_back(
+                        unrebase(parse_hex(pc_str.get<std::string>())));
+                }
+            }
+
+            if (const json* vpr = get_hint("vm_pc_reg")) {
+                VMPCHint vph;
+                vph.reg = parse_reg(*vpr);
+                if (const json* bb = get_hint("bytecode_base")) {
+                    vph.bytecode_base = parse_hex(bb->get<std::string>());
+                }
+                cfg.vm_pc = vph;
+            }
+
+            // ── Opcode format / deobfuscation ──────────────────────────────
+            // Construct OpcodeFormatHint when any of the opcode-related hints is present.
+            {
+                const json* op_size   = get_hint("opcode_size");
+                const json* op_reg    = get_hint("opcode_from_reg");
+                const json* op_deobf  = get_hint("opcode_deobf_steps");
+                const json* op_offset = get_hint("opcode_byte_offset");
+                const json* op_mask   = get_hint("opcode_mask");
+                const json* op_shift  = get_hint("opcode_shift");
+
+                if (op_size || op_reg || op_deobf || op_offset) {
+                    OpcodeFormatHint ofh;
+
+                    // Mode B: register snapshot
+                    if (op_reg) {
+                        ofh.opcode_from_reg = parse_reg(*op_reg);
+                    }
+
+                    // Mode A fields (ignored when opcode_from_reg is set)
+                    if (op_size) {
+                        ofh.opcode_size = static_cast<uint8_t>(op_size->get<int>());
+                    }
+                    if (op_offset) {
+                        ofh.opcode_byte_offset = static_cast<uint8_t>(op_offset->get<int>());
+                    }
+                    if (op_mask) {
+                        ofh.opcode_mask = parse_hex(op_mask->get<std::string>());
+                    }
+                    ofh.opcode_shift = static_cast<uint8_t>(op_shift ? op_shift->get<int>() : 0);
+
+                    // Deobfuscation step sequence
+                    if (op_deobf) {
+                        // Helper: parse op name string to enum
+                        auto parse_op = [](const std::string& s) -> OpcodeDeobfStep::Op {
+                            if (s == "sub")   return OpcodeDeobfStep::Op::sub;
+                            if (s == "add")   return OpcodeDeobfStep::Op::add;
+                            if (s == "xor")   return OpcodeDeobfStep::Op::xor_;
+                            if (s == "and")   return OpcodeDeobfStep::Op::and_;
+                            if (s == "or")    return OpcodeDeobfStep::Op::or_;
+                            if (s == "lsr")   return OpcodeDeobfStep::Op::lsr;
+                            if (s == "lsl")   return OpcodeDeobfStep::Op::lsl;
+                            if (s == "mul")   return OpcodeDeobfStep::Op::mul;
+                            if (s == "ror")   return OpcodeDeobfStep::Op::ror;
+                            if (s == "bswap") return OpcodeDeobfStep::Op::bswap;
+                            if (s == "neg")   return OpcodeDeobfStep::Op::neg;
+                            if (s == "not")   return OpcodeDeobfStep::Op::not_;
+                            throw std::runtime_error("Unknown deobf op: " + s);
+                        };
+
+                        for (const auto& elem : *op_deobf) {
+                            OpcodeDeobfStep ds;
+                            ds.op = parse_op(elem.at("op").get<std::string>());
+                            // imm may be integer or hex string (or absent for neg/not)
+                            if (elem.contains("imm")) {
+                                if (elem.at("imm").is_number()) {
+                                    ds.imm = elem["imm"].get<uint64_t>();
+                                } else {
+                                    ds.imm = parse_hex(elem["imm"].get<std::string>());
+                                }
+                            }
+                            ofh.deobfuscation_steps.push_back(ds);
+                        }
+                    }
+
+                    cfg.opcode_format = std::move(ofh);
+                }
+            }
+
+            if (const json* cbr = get_hint("ctx_base_reg")) {
+                VMContextHint vch;
+                vch.ctx_base_reg = parse_reg(*cbr);
+                cfg.vm_context = vch;
+            }
 
             // ── VM Context fields hint (merged with ctx_base_reg above) ──────
             {
@@ -1446,6 +1484,21 @@ void TenetMcpService::register_pass_tools() {
                     }
                     cfg.handler_asm = std::move(hah);
                 }
+            }
+
+            // ── Require at least one static hint (or explicit auto_detect opt-in) ──
+            // The heuristic dispatcher auto-detection has a very high false-
+            // positive/false-negative rate on real traces, so it must not run
+            // silently. Fail loudly and tell the caller what to do instead.
+            if (!cfg.has_any_static_hint() && !cfg.auto_detect) {
+                throw std::runtime_error(
+                    "vm_abstract requires at least one static-analysis hint "
+                    "(e.g. 'dispatcher_pc' from IDA/Ghidra static analysis, or "
+                    "'hints_file' pointing to a JSON hints file). The heuristic "
+                    "dispatcher auto-detection is disabled by default because it "
+                    "has a very high false-positive/false-negative rate on real "
+                    "traces. Pass auto_detect=true to explicitly opt into it "
+                    "anyway (not recommended).");
             }
 
             // ── Run the pass ──

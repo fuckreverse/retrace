@@ -838,6 +838,13 @@ enum MenuTag : NSInteger {
     kTagAnaTraceDiff          = 542,
     kTagAnaMemStrings         = 543,
 
+    // ── Analysis — Reverse Engineering / VM: 550-559 ────────────────
+    kTagAnaVMAbstract         = 550,
+
+    // ── View — VM Abstract / Workspace: 340-349 ──────────────────────
+    kTagViewVMAbstract        = 340,
+    kTagViewVMWorkspace       = 341,
+
     // ── Analysis — Maintenance: 590-599 ─────────────────────────────
     kTagAnaClearTaint         = 590,
     kTagAnaClear              = 591,
@@ -942,10 +949,15 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagViewAlgoSummary:   action = [this]{ show_algorithm_summary_  = !show_algorithm_summary_;  }; break;
         case kTagViewObjCCrypto:       action = [this]{ show_objc_crypto_        = !show_objc_crypto_;        }; break;
         case kTagViewMemStrings:       action = [this]{ show_mem_strings_        = !show_mem_strings_;        }; break;
-        case kTagViewSyscallIntercept: action = [this]{ show_syscall_intercept_  = !show_syscall_intercept_;  }; break;
+case kTagViewSyscallIntercept: action = [this]{ show_syscall_intercept_  = !show_syscall_intercept_;  }; break;
+case kTagViewVMAbstract:       action = [this]{ show_vm_abstract_        = !show_vm_abstract_;        }; break;
+case kTagViewVMWorkspace:      action = [this]{
+    vm_ws_open_ = !vm_ws_open_;
+    if (vm_ws_open_) vm_ws_first_frame_ = true;
+}; break;
 
-        // ── View — Profiling & Diff ──────────────────────────────────────
-        case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show_cache_sim_;          }; break;
+// ── View — Profiling & Diff ──────────────────────────────────────
+case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show_cache_sim_;          }; break;
         case kTagViewTraceFold:        action = [this]{ show_trace_fold_         = !show_trace_fold_;         }; break;
         case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
@@ -1018,9 +1030,22 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagAnaAlgoSummary:    action = [this]{ run_pass_by_name("algorithm_summary"); show_algorithm_summary_ = true; }; break;
         case kTagAnaObjCCrypto:     action = [this]{ run_pass_by_name("objc_crypto"); show_objc_crypto_ = true; }; break;
 
-        // ── Analysis — ObjC / iOS ────────────────────────────────────────
-        case kTagAnaObjC:           action = [this]{ run_pass_by_name("objc"); show_objc_ = true; }; break;
-        case kTagAnaAPIIntercepts:  action = [this]{ run_pass_by_name("syscall_intercept"); show_syscall_intercept_ = true; }; break;
+// ── Analysis — ObjC / iOS ────────────────────────────────────────
+case kTagAnaObjC:           action = [this]{ run_pass_by_name("objc"); show_objc_ = true; }; break;
+case kTagAnaAPIIntercepts:  action = [this]{ run_pass_by_name("syscall_intercept"); show_syscall_intercept_ = true; }; break;
+
+// ── Analysis — Reverse Engineering / VM ──────────────────────────
+// vm_abstract requires static-analysis hints before it can run (its
+// heuristic auto-detection is unreliable on real traces) — just open the
+// panel where the user loads a hints file / opts into auto-detect, rather
+// than attempting (and silently failing) to run immediately.
+case kTagAnaVMAbstract:     action = [this]{
+    show_vm_abstract_ = true;
+    if (vm_abstract_result_) {
+        vm_ws_open_ = true;
+        vm_ws_first_frame_ = true;
+    }
+}; break;
 
         // ── Analysis — Profiling ─────────────────────────────────────────
         case kTagAnaCacheSim:       action = [this]{ run_pass_by_name("cache_sim"); show_cache_sim_ = true; }; break;
@@ -1129,8 +1154,10 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
             case kTagViewAlgoSummary:      it.state = show_algorithm_summary_  ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewObjCCrypto:       it.state = show_objc_crypto_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewMemStrings:       it.state = show_mem_strings_        ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
-            case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlStateValueOn : NSControlStateValueOff; break;
+case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
+case kTagViewVMAbstract:       it.state = show_vm_abstract_        ? NSControlStateValueOn : NSControlStateValueOff; break;
+case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlStateValueOn : NSControlStateValueOff; break;
+case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewDwarf:            it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
@@ -1264,6 +1291,9 @@ void tenet::GuiApp::setup_native_menu() {
         [resMenu addItem:mk(@"API Intercepts",     @"", 0, kTagViewSyscallIntercept)];
         [resMenu addItem:sep()];
         [resMenu addItem:mk(@"Memory Strings",     @"", 0, kTagViewMemStrings)];
+        [resMenu addItem:sep()];
+        [resMenu addItem:mk(@"VM Abstract",        @"", 0, kTagViewVMAbstract)];
+[resMenu addItem:mk(@"VM Workspace",       @"", 0, kTagViewVMWorkspace)];
 
         // ── Profiling & Diff ──────────────────────────────────────────
         NSMenu* profMenu = mksub(viewMenu, @"Profiling & Diff");
@@ -1352,6 +1382,10 @@ void tenet::GuiApp::setup_native_menu() {
         NSMenu* objcMenu = mksub(anaMenu, @"ObjC / API");
         [objcMenu addItem:mk(@"ObjC Messages",     @"", 0, kTagAnaObjC)];
         [objcMenu addItem:mk(@"API Intercepts",    @"", 0, kTagAnaAPIIntercepts)];
+
+        // ── Reverse Engineering / VM ─────────────────────────────────────
+        NSMenu* reMenu = mksub(anaMenu, @"Reverse Eng / VM");
+        [reMenu addItem:mk(@"VM Abstract Analysis", @"", 0, kTagAnaVMAbstract)];
 
         // ── Profiling ─────────────────────────────────────────────────
         NSMenu* profAnaMenu = mksub(anaMenu, @"Profiling");
@@ -2131,6 +2165,15 @@ void GuiApp::render_frame() {
     }
     if (show_trace_fold_) {
         render_trace_fold_panel();
+    }
+    if (show_vm_abstract_) {
+        render_vm_abstract_panel();
+    }
+    // VM Workspace: independent floating window, always rendered when open.
+    // vm_ws_open_ is toggled by the "Open Workspace" button in the legacy panel
+    // or directly via the View menu.
+    if (vm_ws_open_) {
+        render_vm_workspace();
     }
 
     // ─── Log panel (always rendered) ────────────────────────────────

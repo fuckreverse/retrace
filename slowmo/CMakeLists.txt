@@ -376,6 +376,7 @@ src/core/register_file.cpp
     src/analysis/passes/loop_pass.cpp
     src/analysis/passes/loop_semantics_pass.cpp
     src/analysis/passes/vm_abstract_pass.cpp
+    src/analysis/passes/vm_hints_json.cpp
     src/analysis/passes/algorithm_summary_pass.cpp
     src/analysis/passes/trace_diff_pass.cpp
     src/analysis/passes/symbol_annotation_pass.cpp
@@ -512,6 +513,7 @@ src/gui/panels_trace_fold.cpp
 src/gui/panels_memory_strings.cpp
 src/gui/panels_syscall_intercept.cpp
 src/gui/panels_objc_crypto.cpp
+src/gui/panels_vm_abstract.cpp
 src/gui/panels_log.cpp
 src/gui/panels_cache_manager.cpp
 src/gui/popups.cpp
