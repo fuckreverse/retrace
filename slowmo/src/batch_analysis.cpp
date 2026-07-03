@@ -28,7 +28,6 @@
 #include "analysis/passes/reg_timeline_pass.h"
 #include "analysis/passes/mem_search_pass.h"
 #include "analysis/passes/call_context_pass.h"
-#include "analysis/passes/producer_chain_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/literal_search_pass.h"
@@ -1646,36 +1645,6 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             cc_json["frames"] = std::move(frames_arr);
             cc_json["depth"] = cc_result.call_stack.size();
             fmt::print("{}\n", cc_json.dump(2));
-        }
-    }
-
-    // --producer-chain: backward reg_diff chain tracing
-    if (opts.opt_producer_chain) {
-        ProducerChainConfig pc_cfg;
-        pc_cfg.start_inst_id = opts.producer_chain_inst_id;
-        pc_cfg.start_reg = opts.producer_chain_reg;
-        pc_cfg.max_depth = opts.producer_chain_depth;
-        pm.register_pass(std::make_unique<ProducerChainPass>(std::move(pc_cfg)));
-        const auto& pc_raw = pm.require("producer_chain");
-        if (!pc_raw.ok()) {
-            fmt::print(stderr, "[producer-chain] Pass failed: {}\n", pc_raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& pc_result = pc_raw.get<ProducerChainResult>();
-            fmt::print(stderr, "[producer-chain] {} nodes in chain\n", pc_result.chain.size());
-            json pc_json;
-            json chain_arr = json::array();
-            for (const auto& n : pc_result.chain) {
-                chain_arr.push_back({
-                    {"inst_id", n.inst_id},
-                    {"pc", fmt::format("0x{:X}", n.pc)},
-                    {"reg", n.produced_reg},
-                    {"value", fmt::format("0x{:X}", n.value)}
-                });
-            }
-            pc_json["chain"] = std::move(chain_arr);
-            pc_json["depth"] = pc_result.chain.size();
-            fmt::print("{}\n", pc_json.dump(2));
         }
     }
 

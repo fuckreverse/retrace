@@ -108,11 +108,6 @@ struct CliOptions {
     bool opt_call_context = false;
     uint64_t call_context_inst_id = 0;
 
-    bool opt_producer_chain = false;
-    uint64_t producer_chain_inst_id = 0;
-    uint8_t producer_chain_reg = 0;
-    uint32_t producer_chain_depth = 32;
-
     bool opt_window_stats = false;
     uint64_t window_stats_start = 0, window_stats_end = 0;
     uint32_t window_stats_size = 1024;

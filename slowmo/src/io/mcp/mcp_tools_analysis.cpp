@@ -36,7 +36,6 @@
 #include "analysis/passes/reg_timeline_pass.h"
 #include "analysis/passes/mem_search_pass.h"
 #include "analysis/passes/call_context_pass.h"
-#include "analysis/passes/producer_chain_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/literal_search_pass.h"
@@ -641,67 +640,6 @@ void TenetMcpService::register_search_tools() {
             return {{"total", result.hits.size()},
                     {"instructions_scanned", result.instructions_scanned},
                     {"hits", std::move(hits)}};
-        }
-    );
-
-    // ── producer_chain ────────────────────────────────────────────────────
-    register_tool(
-        {"producer_chain",
-         "Find the chain of producers for a register at a given instruction. "
-         "Walks backward through register assignments and memory loads to "
-         "build a compact chain showing where the value originated. "
-         "Provide EITHER inst_id OR pc (hex string) to identify the instruction.",
-         {{"type", "object"},
-          {"properties", {
-              {"inst_id",   {{"type", "integer"}, {"description", "Instruction ID to start from (preferred if known)"}}},
-              {"pc",        {{"type", "string"},  {"description", "PC address (hex string). Used when inst_id is not provided."}}},
-              {"reg_index", {{"type", json::array({"integer", "string"})}, {"description", "Register: integer index OR name string ('x0','lr', etc.)"}}},
-              {"max_depth", {{"type", "integer"}, {"description", "Max chain depth"}, {"default", 20}}}
-          }},
-          {"required", json::array({"reg_index"})}}},
-        [this](const json& args) -> json {
-            ProducerChainConfig cfg;
-            // Resolve inst_id
-            if (args.contains("inst_id")) {
-                cfg.start_inst_id = args.at("inst_id").get<uint64_t>();
-            } else if (args.contains("pc")) {
-                uint64_t runtime_pc = unrebase(parse_hex(args.at("pc").get<std::string>()));
-                tenet::register_pass_by_name(*pm_, "xref");
-                const auto& xref_raw = require_pass_nb(pm_, "xref");
-                if (!xref_raw.ok())
-                    throw std::runtime_error("xref pass failed: " + xref_raw.error_message);
-                const auto& xref = xref_raw.get<XrefResult>();
-                auto ids = xref.inst_ids_at(runtime_pc);
-                if (ids.empty())
-                    throw std::runtime_error(fmt::format(
-                        "No instruction found at PC {}. Use search_pc to check execution history.",
-                        args.at("pc").get<std::string>()));
-                cfg.start_inst_id = ids.front();
-            } else {
-                throw std::runtime_error("Provide 'inst_id' or 'pc'.");
-            }
-            cfg.start_reg = parse_reg(args.at("reg_index"));
-            cfg.max_depth = args.value("max_depth", uint32_t(20));
-
-            pm_->register_pass(std::make_unique<ProducerChainPass>(std::move(cfg)));
-            const auto& result = require_pass<ProducerChainResult>(pm_, "producer_chain", "Producer chain failed");
-
-            json chain = json::array();
-            for (const auto& link : result.chain) {
-                json lk = {
-                    {"inst_id", link.inst_id},
-                    {"pc",      fmt::format("0x{:X}", rebase(link.pc))},
-                    {"produced_reg", link.produced_reg},
-                    {"value", fmt::format("0x{:X}", link.value)},
-                    {"is_memory_load", link.is_memory_load}
-                };
-                if (!link.disassembly.empty()) lk["disassembly"] = link.disassembly;
-                if (link.mem_addr != 0) lk["mem_addr"] = fmt::format("0x{:X}", link.mem_addr);
-                chain.push_back(std::move(lk));
-            }
-            return {{"depth", result.chain.size()},
-                    {"chain", std::move(chain)},
-                    {"truncated", result.truncated}};
         }
     );
 

@@ -8,7 +8,7 @@
 
 #include "gui/gui_app.h"
 #include "analysis/passes/reg_timeline_pass.h"
-#include "analysis/passes/producer_chain_pass.h"
+#include "analysis/passes/backward_taint_pass.h"
 
 #include <imgui.h>
 #include <fmt/core.h>
@@ -88,8 +88,16 @@ void GuiApp::rebuild_reg_timeline(uint8_t reg_idx) {
 
 // ─── run_producer_chain ──────────────────────────────────────────────────────
 //
-// Runs ProducerChainPass for `reg_idx` at `inst_id` and caches the
-// inst_ids in producer_chain_ids_ so the instruction panel can highlight them.
+// "Producer chain" in the UI is a quick-preview backward data-flow trace:
+// given (inst_id, reg), find the instructions that contributed to that
+// register's value. This used to run a bespoke, hand-rolled instruction
+// decoder (ProducerChainPass) that mis-parsed several common AArch64
+// encodings (LDP, ADRP+ADD, three-operand ops) and only ever followed a
+// single source register per step. It has been replaced by BackwardTaintPass
+// run in a capped "quick" mode — same underlying engine as the Taint menu,
+// just with a small step budget so it stays snappy for interactive use.
+// Caches the resulting inst_ids in producer_chain_ids_ so the instruction
+// panel can highlight them.
 
 void GuiApp::run_producer_chain(uint64_t inst_id, uint8_t reg_idx) {
     producer_chain_ids_.clear();
@@ -99,13 +107,17 @@ void GuiApp::run_producer_chain(uint64_t inst_id, uint8_t reg_idx) {
 
     ensure_pass_manager();
 
-    ProducerChainConfig cfg;
-    cfg.start_inst_id = inst_id;
-    cfg.start_reg     = reg_idx;
-    cfg.max_depth     = 64;
-    cfg.follow_memory = true;
+    BackwardTaintConfig cfg;
+    cfg.sink_inst_id = inst_id;
+    cfg.add_sink_reg(reg_idx);
+    cfg.propagate_through_memory = true;
+    cfg.cross_function = false;      // quick local preview, not a full trace
+    cfg.build_dataflow_graph = false;
+    cfg.per_sink_tags = false;
+    cfg.max_steps = 2000;            // keep it fast for interactive UI use
+    cfg.max_tainted_insts = 2000;
 
-    auto pass = std::make_unique<ProducerChainPass>(cfg);
+    auto pass = std::make_unique<BackwardTaintPass>(cfg);
     PassManager pm;
     pm.set_reader(&reader_);
     pm.set_index(&index_);
@@ -114,12 +126,13 @@ void GuiApp::run_producer_chain(uint64_t inst_id, uint8_t reg_idx) {
     pm.set_memory(&memory_);
     pm.set_decoder(&decoder_);
     pm.register_pass(std::move(pass));
-    const auto& result = pm.require("producer_chain");
+    const auto& result = pm.require("backward_taint");
     if (!result.ok()) return;
 
-    const auto& chain = result.get<ProducerChainResult>();
-    for (const auto& link : chain.chain) {
-        producer_chain_ids_.push_back(link.inst_id);
+    const auto& bt = result.get<BackwardTaintResult>();
+    producer_chain_ids_.reserve(bt.contributing_count());
+    for (auto it = bt.contributing_inst_ids.begin(); it != bt.contributing_inst_ids.end(); ++it) {
+        producer_chain_ids_.push_back(*it);
     }
     // Sort so binary_search in instruction panel works correctly
     std::sort(producer_chain_ids_.begin(), producer_chain_ids_.end());
@@ -329,16 +342,16 @@ void GuiApp::render_reg_timeline_panel() {
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
-                           "Chain depth: %zu instructions highlighted",
+                           "%zu contributing instructions highlighted",
                            producer_chain_ids_.size());
         ImGui::TextDisabled("(highlighted in yellow in the instruction panel)");
 
-        // Quick table showing the chain
+        // Quick table showing the contributing instructions (sorted by inst_id)
         if (ImGui::BeginTable("##chain_tbl", 3,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
                 ImVec2(0, 100))) {
-            ImGui::TableSetupColumn("Depth",  ImGuiTableColumnFlags_WidthFixed, 50.0f);
+            ImGui::TableSetupColumn("#",      ImGuiTableColumnFlags_WidthFixed, 50.0f);
             ImGui::TableSetupColumn("Inst#",  ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();

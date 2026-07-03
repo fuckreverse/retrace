@@ -1173,17 +1173,6 @@ TEST_CASE("MCP HTTP: reg_timeline tool", "[integration][mcp][http]") {
     CHECK(resp["result"]["isError"] == false);
 }
 
-TEST_CASE("MCP HTTP: producer_chain tool", "[integration][mcp][http]") {
-    auto& ctx = shared_env();
-    auto client = make_client(ctx);
-
-    auto resp = client.send_rpc_retry(make_tool_call("producer_chain", 42, {
-        {"inst_id", 10}, {"reg_index", 3}
-    }));
-    REQUIRE_HTTP_RESPONSE(resp);
-    CHECK(resp["result"]["isError"] == false);
-}
-
 TEST_CASE("MCP HTTP: find_function tool", "[integration][mcp][http]") {
     auto& ctx = shared_env();
     auto client = make_client(ctx);
@@ -1534,24 +1523,6 @@ TEST_CASE("MCP HTTP: call_context via pc parameter", "[integration][mcp][http]")
     auto result = json::parse(text);
     REQUIRE(result.contains("call_stack"));
     REQUIRE(result.contains("target_inst_id"));
-}
-
-TEST_CASE("MCP HTTP: producer_chain via pc parameter", "[integration][mcp][http]") {
-    auto& ctx = shared_env();
-    auto client = make_client(ctx);
-
-    // xor_decrypt body (static 0x200C) → displayed 0x10000200C, reg x3
-    uint64_t disp_xor_body = 0x200CULL + kImageBase;
-    auto resp = client.send_rpc_retry(make_tool_call("producer_chain", 202, {
-        {"pc",        fmt::format("0x{:X}", disp_xor_body)},
-        {"reg_index", "x3"}
-    }));
-    REQUIRE_HTTP_RESPONSE(resp);
-    CHECK(resp["result"]["isError"] == false);
-
-    auto text = resp["result"]["content"][0]["text"].get<std::string>();
-    auto result = json::parse(text);
-    REQUIRE(result.contains("chain"));
 }
 
 TEST_CASE("MCP HTTP: get_regs via unknown pc returns error", "[integration][mcp][http]") {

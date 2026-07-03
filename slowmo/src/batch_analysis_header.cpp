@@ -26,7 +26,6 @@
 #include "analysis/passes/reg_timeline_pass.h"
 #include "analysis/passes/mem_search_pass.h"
 #include "analysis/passes/call_context_pass.h"
-#include "analysis/passes/producer_chain_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
 #include "analysis/passes/literal_search_pass.h"

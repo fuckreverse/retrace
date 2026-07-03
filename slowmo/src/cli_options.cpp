@@ -21,7 +21,7 @@ bool CliOptions::has_analysis_option() const {
            opt_memread || opt_mem_history || opt_search_pc ||
            opt_trace_fold || opt_reg_timeline ||
            opt_mem_search || opt_call_context ||
-           opt_producer_chain || opt_window_stats ||
+           opt_window_stats ||
            opt_entropy || opt_literal_search ||
            opt_dump_memaccess ||
            // P3 options
@@ -320,12 +320,6 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--call-context" && i + 1 < argc) {
             opts.opt_call_context = true;
             opts.call_context_inst_id = std::stoull(argv[++i]);
-        } else if (arg == "--producer-chain" && i + 2 < argc) {
-            opts.opt_producer_chain = true;
-            opts.producer_chain_inst_id = std::stoull(argv[++i]);
-            opts.producer_chain_reg = static_cast<uint8_t>(std::stoul(argv[++i]));
-        } else if (arg == "--producer-chain-depth" && i + 1 < argc) {
-            opts.producer_chain_depth = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--window-stats" && i + 2 < argc) {
             opts.opt_window_stats = true;
             opts.window_stats_start = std::stoull(argv[++i]);

@@ -24,7 +24,7 @@ namespace tenet {
 /// Grouping for UI presentation.
 enum class PassCategory : uint8_t {
     Structure,   ///< function / xref / cfg / call_graph / loop / disassembly
-    Taint,       ///< taint / backward_taint / producer_chain / taint_source_annotation
+    Taint,       ///< taint / backward_taint / taint_source_annotation
     Crypto,      ///< pattern / constant_materialization / loop_semantics / algorithm_summary / objc_crypto / symbol_annotation
     Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / literal_search / yara_mem_scan
     PlatformApi,  ///< objc / syscall_intercept

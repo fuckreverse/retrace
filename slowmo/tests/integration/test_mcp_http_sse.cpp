@@ -1176,17 +1176,6 @@ TEST_CASE("MCP HTTP SSE: reg_timeline tool", "[integration][mcp][http]") {
     CHECK(resp["result"]["isError"] == false);
 }
 
-TEST_CASE("MCP HTTP SSE: producer_chain tool", "[integration][mcp][http]") {
-    auto ctx = make_http_env();
-    SseClient client;
-    REQUIRE_SSE_CONNECT(client, "127.0.0.1", ctx.port);
-
-    auto resp = client.send_rpc(make_tool_call("producer_chain", 42, {
-        {"inst_id", 10}, {"reg_index", 3}
-    }));
-    REQUIRE_SSE_RESPONSE(resp);
-    CHECK(resp["result"]["isError"] == false);
-}
 
 TEST_CASE("MCP HTTP SSE: find_function tool", "[integration][mcp][http]") {
     auto ctx = make_http_env();

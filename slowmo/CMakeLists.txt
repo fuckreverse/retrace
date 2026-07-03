@@ -388,7 +388,6 @@ src/core/register_file.cpp
     src/analysis/passes/reg_timeline_pass.cpp
     src/analysis/passes/mem_search_pass.cpp
     src/analysis/passes/call_context_pass.cpp
-    src/analysis/passes/producer_chain_pass.cpp
     src/analysis/passes/window_stats_pass.cpp
     src/analysis/passes/entropy_pass.cpp
     src/analysis/passes/literal_search_pass.cpp

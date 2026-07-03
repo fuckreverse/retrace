@@ -24,7 +24,6 @@
 
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/producer_chain_pass.h"
 
 #include "analysis/passes/memory_string_pass.h"
 #include "analysis/passes/memory_snapshot_pass.h"
@@ -150,12 +149,6 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
         c.max_tainted_insts = 50000;
         return std::make_unique<BackwardTaintPass>(std::move(c));
     }
-    if (name == "producer_chain") {
-        ProducerChainConfig c;
-        c.start_inst_id = ctx.current_inst;
-        c.start_reg = ctx.current_reg;
-        return std::make_unique<ProducerChainPass>(std::move(c));
-    }
     if (name == "taint_source_annotation") {
         return std::make_unique<TaintSourceAnnotationPass>();
     }
@@ -263,7 +256,6 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         // — Taint —
         {"taint",                 "Taint",         "Forward taint from current register",                    PassCategory::Taint,     PassDefault::No},
         {"backward_taint",        "Back Taint",    "Backward taint from current instruction",                PassCategory::Taint,     PassDefault::No},
-        {"producer_chain",        "Producer Chain","Lightweight register-value provenance",                  PassCategory::Taint,     PassDefault::No},
         {"taint_source_annotation","Taint Sources","Annotate backward-taint endpoints (ObjC/mem/const)",     PassCategory::Taint,     PassDefault::No},
 
         // — Crypto / Pattern —
@@ -353,7 +345,7 @@ bool register_pass_by_name(PassManager& pm, std::string_view name,
 
     // Register dependencies first (recursively), so require() finds them
     // when the pass executes. This lets any pass be run standalone — e.g.
-    // `--run-pass call_graph` auto-pulls `function`; `slice` auto-pulls `taint`.
+    // `--run-pass call_graph` auto-pulls `function`.
     for (auto dep : pass->dependencies()) {
         register_pass_by_name(pm, dep, ctx);
     }
@@ -422,11 +414,6 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
         if (auto* r = try_get<BackwardTaintResult>(result))
             return fmt::format("contributing insts: {}, depth: {}",
                                r->contributing_count(), r->max_depth);
-    }
-    if (name == "producer_chain") {
-        if (auto* r = try_get<ProducerChainResult>(result))
-            return fmt::format("chain links: {}{}", r->chain.size(),
-                               r->truncated ? " (truncated)" : "");
     }
     if (name == "taint_source_annotation") {
         if (auto* r = try_get<TaintSourceAnnotationResult>(result))
