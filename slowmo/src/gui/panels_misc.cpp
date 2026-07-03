@@ -1227,9 +1227,6 @@ void GuiApp::render_status_bar() {
     if (show_backward_taint_ && backward_taint_result_) {
         right += "  [BT]";
     }
-    if (show_slice_ && slice_result_) {
-        right += "  [SLICE]";
-    }
     if (show_loops_ && loop_result_) {
         right += fmt::format("  [" ICON_FA_ARROW_ROTATE_LEFT " {}L]", loop_result_->loops.size());
     }

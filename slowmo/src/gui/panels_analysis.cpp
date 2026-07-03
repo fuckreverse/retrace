@@ -7,7 +7,6 @@
 #include "gui/gui_app.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/taint_pass.h"
-#include "analysis/passes/slice_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/xref_pass.h"
 #include "analysis/passes/function_pass.h"
@@ -287,12 +286,7 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         show_backward_taint_   = true;
         return;
     }
-    if (name == "slice") {
-        slice_result_ = &raw->get<SliceResult>();
-        show_slice_   = true;
-        return;
-    }
-    if (name == "objc_crypto") {
+        if (name == "objc_crypto") {
         objc_crypto_result_ = &raw->get<ObjcCryptoResult>();
         show_objc_crypto_   = true;
         pending_focus_windows_.push_back("ObjC Crypto");
@@ -381,7 +375,6 @@ void GuiApp::run_taint_analysis() {
     // If already completed, apply immediately (fast path, no thread needed).
     if (pass_manager_->state("taint") == PassManager::PassState::Completed) {
         apply_pass_result_pointers("taint");
-        show_slice_ = false;
         show_backward_taint_ = false;
         return;
     }
@@ -416,7 +409,6 @@ void GuiApp::run_taint_analysis() {
         post_apply([this, ok]() {
             if (ok) {
                 apply_pass_result_pointers("taint");
-                show_slice_ = false;
                 show_backward_taint_ = false;
             }
         });
@@ -429,7 +421,6 @@ void GuiApp::run_backward_taint_analysis() {
     if (pass_manager_->state("backward_taint") == PassManager::PassState::Completed) {
         apply_pass_result_pointers("backward_taint");
         show_taint_ = false;
-        show_slice_ = false;
         return;
     }
     if (pass_manager_->state("backward_taint") == PassManager::PassState::Running)
@@ -464,55 +455,6 @@ void GuiApp::run_backward_taint_analysis() {
             if (ok) {
                 apply_pass_result_pointers("backward_taint");
                 show_taint_ = false;
-                show_slice_ = false;
-            }
-        });
-    });
-}
-
-void GuiApp::run_slice_analysis() {
-    ensure_pass_manager();
-
-    // Slice depends on taint — the PassManager handles the dependency
-    // via require("taint") inside SlicePass::run().  We just need to
-    // make sure taint is registered.  If taint was already completed,
-    // apply its result; otherwise it will run as a dependency.
-    if (pass_manager_->state("taint") == PassManager::PassState::NotRun) {
-        // Register taint with default config (will be triggered by slice's require()).
-        // We use run_taint_analysis() to register + enqueue it.
-        run_taint_analysis();
-    }
-
-    if (pass_manager_->state("slice") == PassManager::PassState::Completed) {
-        apply_pass_result_pointers("slice");
-        show_taint_ = false;
-        show_backward_taint_ = false;
-        return;
-    }
-    if (pass_manager_->state("slice") == PassManager::PassState::Running)
-        return;
-
-    uint8_t target_reg = 0;
-    auto [offset_sl, seed_pc_sl] = index_.offset_of_with_pc(current_inst_, reader_);
-    auto rec_sl = reader_.record_at(offset_sl, seed_pc_sl);
-    if (rec_sl.kind == RecordKind::Inst) {
-        auto inst = rec_sl.as_inst();
-        if (inst.reg_diff_count > 0) {
-            target_reg = inst.reg_diff(0).index;
-        }
-    }
-
-    pass_manager_->register_pass(
-        std::make_unique<SlicePass>(current_inst_, target_reg));
-
-    enqueue_async("slice", [this]() {
-        auto& r = pass_manager_->require("slice");
-        bool ok = r.ok();
-        post_apply([this, ok]() {
-            if (ok) {
-                apply_pass_result_pointers("slice");
-                show_taint_ = false;
-                show_backward_taint_ = false;
             }
         });
     });
@@ -746,7 +688,6 @@ void GuiApp::clear_analysis() {
     }
 
     taint_result_ = nullptr;
-    slice_result_ = nullptr;
     backward_taint_result_ = nullptr;
     function_result_ = nullptr;
     xref_result_ = nullptr;
@@ -807,7 +748,6 @@ void GuiApp::clear_analysis() {
     vm_step_cursor_     = 0;
     show_taint_ = false;
     show_threads_ = false;
-    show_slice_ = false;
     show_backward_taint_ = false;
     show_callstack_ = false;
     show_functions_ = false;

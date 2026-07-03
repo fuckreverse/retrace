@@ -240,8 +240,6 @@ void GuiApp::render_menu_bar() {
                     run_taint_analysis();
                 if (ImGui::MenuItem("Backward Taint\xe2\x80\xa6", "Cmd+Shift+T"))
                     run_backward_taint_analysis();
-                if (ImGui::MenuItem("Slice\xe2\x80\xa6",          "Cmd+S"))
-                    run_slice_analysis();
                 ImGui::Separator();
                 if (ImGui::MenuItem("Register Timeline")) {
                     show_reg_timeline_ = true;
@@ -318,13 +316,12 @@ void GuiApp::render_menu_bar() {
             ImGui::Separator();
             // Clear Taint (greyed out when no taint active)
             {
-                bool has_taint = (show_taint_ || show_backward_taint_ || show_slice_);
+                bool has_taint = (show_taint_ || show_backward_taint_);
                 if (!has_taint) ImGui::BeginDisabled();
                 if (ImGui::MenuItem("Clear Taint")) {
-                    show_taint_ = show_backward_taint_ = show_slice_ = false;
+                    show_taint_ = show_backward_taint_ = false;
                     taint_result_          = nullptr;
                     backward_taint_result_ = nullptr;
-                    slice_result_          = nullptr;
                     taint_sorted_ids_dirty_ = true;
                 }
                 if (!has_taint) ImGui::EndDisabled();
@@ -587,8 +584,8 @@ void GuiApp::render_toolbar() {
     float win_w = ImGui::GetWindowWidth();
 
     // Build status string(s)
-    bool has_status = analysis_running_.load() || show_taint_ || show_backward_taint_ ||
-                      show_slice_ || (show_loops_ && loop_result_);
+        bool has_status = analysis_running_.load() || show_taint_ || show_backward_taint_ ||
+                          (show_loops_ && loop_result_);
 
     if (has_status) {
         // estimate approx position
@@ -635,11 +632,9 @@ void GuiApp::render_toolbar() {
             };
             if (show_backward_taint_ && backward_taint_result_)
                 badge("BACK-TAINT", ImVec4(0.55f, 0.10f, 0.10f, 0.90f));
-            else if (show_taint_ && taint_result_)
-                badge("TAINT", ImVec4(0.10f, 0.40f, 0.12f, 0.90f));
-            if (show_slice_ && slice_result_)
-                badge("SLICE", ImVec4(0.40f, 0.10f, 0.42f, 0.90f));
-            if (show_loops_ && loop_result_) {
+        else if (show_taint_ && taint_result_)
+            badge("TAINT", ImVec4(0.10f, 0.40f, 0.12f, 0.90f));
+        if (show_loops_ && loop_result_) {
                 char loop_label[32];
                 snprintf(loop_label, sizeof(loop_label), ICON_FA_ARROW_ROTATE_LEFT " %zu LOOPS",
                          loop_result_->loops.size());

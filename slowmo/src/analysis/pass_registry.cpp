@@ -24,7 +24,6 @@
 
 #include "analysis/passes/taint_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/slice_pass.h"
 #include "analysis/passes/producer_chain_pass.h"
 
 #include "analysis/passes/memory_string_pass.h"
@@ -151,9 +150,6 @@ std::unique_ptr<AnalysisPass> create_pass_by_name(std::string_view name,
         c.max_tainted_insts = 50000;
         return std::make_unique<BackwardTaintPass>(std::move(c));
     }
-    if (name == "slice") {
-        return std::make_unique<SlicePass>(ctx.current_inst, ctx.current_reg);
-    }
     if (name == "producer_chain") {
         ProducerChainConfig c;
         c.start_inst_id = ctx.current_inst;
@@ -267,7 +263,6 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         // — Taint —
         {"taint",                 "Taint",         "Forward taint from current register",                    PassCategory::Taint,     PassDefault::No},
         {"backward_taint",        "Back Taint",    "Backward taint from current instruction",                PassCategory::Taint,     PassDefault::No},
-        {"slice",                 "Slice",         "Backward program slice from current instruction",        PassCategory::Taint,     PassDefault::No},
         {"producer_chain",        "Producer Chain","Lightweight register-value provenance",                  PassCategory::Taint,     PassDefault::No},
         {"taint_source_annotation","Taint Sources","Annotate backward-taint endpoints (ObjC/mem/const)",     PassCategory::Taint,     PassDefault::No},
 
@@ -427,10 +422,6 @@ std::string summarize_pass_result(std::string_view name, const PassResult& resul
         if (auto* r = try_get<BackwardTaintResult>(result))
             return fmt::format("contributing insts: {}, depth: {}",
                                r->contributing_count(), r->max_depth);
-    }
-    if (name == "slice") {
-        if (auto* r = try_get<SliceResult>(result))
-            return cat_count("slice insts", r->slice_inst_ids.size());
     }
     if (name == "producer_chain") {
         if (auto* r = try_get<ProducerChainResult>(result))

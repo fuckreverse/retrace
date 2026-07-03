@@ -48,7 +48,6 @@ namespace tenet {
 // Forward declarations
 struct CFGResult;
 struct TaintResult;
-struct SliceResult;
 struct BackwardTaintResult;
 // FunctionResult, CallEvent, FunctionInfo: defined in function_pass.h (included above)
 struct XrefResult;
@@ -305,7 +304,6 @@ private:
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
     const TaintResult* taint_result_ = nullptr;
-    const SliceResult* slice_result_ = nullptr;
     const BackwardTaintResult* backward_taint_result_ = nullptr;
     const FunctionResult* function_result_ = nullptr;
     const XrefResult* xref_result_ = nullptr;
@@ -333,7 +331,6 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     uint64_t call_graph_selected_pc_ = 0;
 
     bool show_taint_ = false;
-    bool show_slice_ = false;
     bool show_backward_taint_ = false;
     size_t xref_cursor_ = 0;
 
@@ -841,7 +838,6 @@ private:
     void auto_start_mcp();         // Auto-start MCP HTTP server on GUI launch
     void run_taint_analysis();
     void run_backward_taint_analysis();
-    void run_slice_analysis();
     void run_call_graph_analysis();
     void run_cfg_layout();
     void clear_analysis();

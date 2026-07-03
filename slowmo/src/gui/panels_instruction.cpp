@@ -4,7 +4,6 @@
 
 #include "gui/gui_app.h"
 #include "analysis/passes/taint_pass.h"
-#include "analysis/passes/slice_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/loop_pass.h"
 #include "analysis/passes/xref_pass.h"
@@ -111,8 +110,6 @@ void GuiApp::render_instruction_panel() {
                 bool is_bookmarked= row.has_bookmark;
                 bool is_tainted   = show_taint_ && taint_result_ &&
                                     taint_result_->has_event_at(inst_id);
-                bool is_sliced    = show_slice_ && slice_result_ &&
-                                    slice_result_->is_in_slice(inst_id);
                 bool is_back_taint= show_backward_taint_ && backward_taint_result_ &&
                                     backward_taint_result_->is_contributing(inst_id);
                 bool is_search_hit= search_active_ &&
@@ -135,7 +132,7 @@ void GuiApp::render_instruction_panel() {
 
                 // ── Row background priority (high → low) ─────────────────
                 // 1) current instruction: bright blue-white
-                // 2) analysis overlays: taint/slice/backward-taint
+                // 2) analysis overlays: taint/backward-taint
                 // 3) loop markers
                 // 4) search hits: subtle gold
                 if (is_current) {
@@ -148,9 +145,6 @@ void GuiApp::render_instruction_panel() {
                 } else if (is_back_taint) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
                         IM_COL32(110, 22, 22, 115));
-                } else if (is_sliced) {
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
-                        IM_COL32(80, 22, 110, 115));
                 } else if (is_tainted) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
                         IM_COL32(20, 80, 28, 115));

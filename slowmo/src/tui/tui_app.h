@@ -182,11 +182,9 @@ private:
     // ─── Analysis passes ──────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
     bool show_taint_ = false;
-    bool show_slice_ = false;
     bool show_backward_taint_ = false;
 
     void run_taint_analysis();
-    void run_slice_analysis();
     void run_backward_taint_analysis();
     void clear_analysis();
 

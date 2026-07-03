@@ -9,7 +9,6 @@
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/taint_pass.h"
-#include "analysis/passes/slice_pass.h"
 #include "analysis/passes/backward_taint_pass.h"
 #include "analysis/passes/xref_pass.h"
 #include "analysis/passes/function_pass.h"
@@ -198,9 +197,8 @@ Element TuiApp::render_instruction_list() {
         bool is_search_hit = search_active_ &&
             search_current_ < search_results_.size() &&
             search_results_[search_current_] == row.inst_id;
-        bool is_tainted = show_taint_ && ctx_.taint_result && ctx_.taint_result->has_event_at(row.inst_id);
-        bool is_sliced = show_slice_ && ctx_.slice_result && ctx_.slice_result->is_in_slice(row.inst_id);
-        bool is_backward_tainted = show_backward_taint_ && ctx_.backward_taint_result &&
+bool is_tainted = show_taint_ && ctx_.taint_result && ctx_.taint_result->has_event_at(row.inst_id);
+bool is_backward_tainted = show_backward_taint_ && ctx_.backward_taint_result &&
             ctx_.backward_taint_result->is_contributing(row.inst_id);
 
         // Loop state
@@ -240,11 +238,9 @@ Element TuiApp::render_instruction_list() {
 
         if (is_cursor) {
             line = line | bgcolor(Color::GrayDark);
-        } else if (is_backward_tainted) {
-            line = line | bgcolor(Color::RedLight);
-        } else if (is_sliced) {
-            line = line | bgcolor(Color::Magenta);
-        } else if (is_tainted) {
+} else if (is_backward_tainted) {
+line = line | bgcolor(Color::RedLight);
+} else if (is_tainted) {
             line = line | bgcolor(Color::Green);
         } else if (is_search_hit) {
             line = line | bgcolor(Color::Blue);
@@ -321,11 +317,6 @@ Element TuiApp::render_status_bar() {
             mode_str = fmt::format(" TAINT [{}/{}] ", taint_jump_cursor_ + 1, taint_jump_list_.size());
         else
             mode_str = " TAINT ";
-    } else if (show_slice_) {
-        if (!taint_jump_list_.empty())
-            mode_str = fmt::format(" SLICE [{}/{}] ", taint_jump_cursor_ + 1, taint_jump_list_.size());
-        else
-            mode_str = " SLICE ";
     } else {
         // Show breakpoint count if any are set
         if (bp_engine_ && bp_engine_->has_breakpoints()) {
@@ -963,9 +954,8 @@ void TuiApp::init_key_bindings() {
         "hex focus toggle");
 
     // ─── Analysis passes ─────────────────────────────────────────────────
-    normal_keys_.bind(Event::Character('t'), [this] { run_taint_analysis(); return true; }, "taint");
-    normal_keys_.bind(Event::Character('S'), [this] { run_slice_analysis(); return true; }, "slice");
-    normal_keys_.bind(Event::Character('B'), [this] { run_backward_taint_analysis(); return true; }, "back taint");
+normal_keys_.bind(Event::Character('t'), [this] { run_taint_analysis(); return true; }, "taint");
+normal_keys_.bind(Event::Character('B'), [this] { run_backward_taint_analysis(); return true; }, "back taint");
     normal_keys_.bind(Event::Character('C'), [this] { clear_analysis(); return true; }, "clear analysis");
 
     // ─── Function/call navigation ────────────────────────────────────────
@@ -1272,13 +1262,9 @@ void TuiApp::rebuild_taint_jump_list() {
     // Collect tainted inst IDs from whichever analysis is active
     if (show_taint_ && ctx_.taint_result) {
         for (uint64_t i = 0; i < total_inst_; i++) {
-            if (ctx_.taint_result->has_event_at(i)) taint_jump_list_.push_back(i);
-        }
-    } else if (show_slice_ && ctx_.slice_result) {
-        for (uint64_t i = 0; i < total_inst_; i++) {
-            if (ctx_.slice_result->is_in_slice(i)) taint_jump_list_.push_back(i);
-        }
-    } else if (show_backward_taint_ && ctx_.backward_taint_result) {
+if (ctx_.taint_result->has_event_at(i)) taint_jump_list_.push_back(i);
+}
+} else if (show_backward_taint_ && ctx_.backward_taint_result) {
         for (uint64_t i = 0; i < total_inst_; i++) {
             if (ctx_.backward_taint_result->is_contributing(i)) taint_jump_list_.push_back(i);
         }
@@ -1374,40 +1360,10 @@ void TuiApp::run_taint_analysis() {
     pass_manager_->register_pass(std::make_unique<TaintPass>(config));
     auto& result = pass_manager_->require("taint");
     if (result.ok()) {
-        ctx_.taint_result = &result.get<TaintResult>();
-        show_taint_ = true;
-        show_slice_ = false;
-        taint_jump_list_.clear();  // Will be rebuilt lazily
-    }
+ctx_.taint_result = &result.get<TaintResult>();
+show_taint_ = true;
+taint_jump_list_.clear();  // Will be rebuilt lazily
 }
-
-void TuiApp::run_slice_analysis() {
-    if (!ctx_.taint_result) {
-        // Need taint first
-        run_taint_analysis();
-    }
-    if (!ctx_.taint_result) return;
-
-    // Determine which register to slice from current instruction
-    uint8_t target_reg = 0;
-    auto [offset_sl, seed_pc_sl] = index_.offset_of_with_pc(current_inst_, reader_);
-    auto rec_sl = reader_.record_at(offset_sl, seed_pc_sl);
-    if (rec_sl.kind == RecordKind::Inst) {
-        auto inst = rec_sl.as_inst();
-        if (inst.reg_diff_count > 0) {
-            target_reg = inst.reg_diff(0).index;
-        }
-    }
-
-    pass_manager_->register_pass(
-        std::make_unique<SlicePass>(current_inst_, target_reg));
-    auto& result = pass_manager_->require("slice");
-    if (result.ok()) {
-        ctx_.slice_result = &result.get<SliceResult>();
-        show_slice_ = true;
-        show_taint_ = false;
-        taint_jump_list_.clear();
-    }
 }
 
 void TuiApp::run_backward_taint_analysis() {
@@ -1448,27 +1404,24 @@ void TuiApp::run_backward_taint_analysis() {
     auto& result = pass_manager_->require("backward_taint");
     if (result.ok()) {
         ctx_.backward_taint_result = &result.get<BackwardTaintResult>();
-        show_backward_taint_ = true;
-        show_taint_ = false;
-        show_slice_ = false;
-        taint_jump_list_.clear();
-    }
+show_backward_taint_ = true;
+show_taint_ = false;
+taint_jump_list_.clear();
+}
 }
 
 void TuiApp::clear_analysis() {
-    ctx_.taint_result = nullptr;
-    ctx_.slice_result = nullptr;
-    ctx_.backward_taint_result = nullptr;
+ctx_.taint_result = nullptr;
+ctx_.backward_taint_result = nullptr;
     ctx_.function_result = nullptr;
     ctx_.xref_result = nullptr;
     ctx_.string_result = nullptr;
     ctx_.call_graph_result = nullptr;
     ctx_.loop_result = nullptr;
     ctx_.thread_result = nullptr;
-    show_taint_ = false;
-    show_slice_ = false;
-    show_backward_taint_ = false;
-    callstack_panel_->set_visible(false);
+show_taint_ = false;
+show_backward_taint_ = false;
+callstack_panel_->set_visible(false);
     functions_panel_->set_visible(false);
     strings_panel_->set_visible(false);
     show_loops_ = false;

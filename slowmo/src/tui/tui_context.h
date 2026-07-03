@@ -17,7 +17,6 @@ class RegisterFile;
 class MemoryModel;
 class PassManager;
 struct TaintResult;
-struct SliceResult;
 struct BackwardTaintResult;
 struct FunctionResult;
 struct XrefResult;
@@ -49,7 +48,6 @@ struct TuiContext {
 
     // ─── Analysis results (written by TuiApp pass wiring, read by panels) ─
     const TaintResult*         taint_result = nullptr;
-    const SliceResult*         slice_result = nullptr;
     const BackwardTaintResult* backward_taint_result = nullptr;
     const FunctionResult*      function_result = nullptr;
     const XrefResult*          xref_result = nullptr;

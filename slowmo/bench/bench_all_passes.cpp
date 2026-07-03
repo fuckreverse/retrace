@@ -28,7 +28,6 @@
 #include "analysis/passes/string_pass.h"
 #include "analysis/passes/pattern_pass.h"
 #include "analysis/passes/constant_materialization_pass.h"
-#include "analysis/passes/slice_pass.h"
 #include "analysis/passes/trace_diff_pass.h"
 #include "analysis/passes/symbol_annotation_pass.h"
 #include "analysis/passes/memory_snapshot_pass.h"

@@ -808,7 +808,6 @@ enum MenuTag : NSInteger {
     // ── Analysis — Data Flow: 500-509 ───────────────────────────────
     kTagAnaTaint              = 500,
     kTagAnaBackTaint          = 501,
-    kTagAnaSlice              = 502,
     kTagAnaRegTimeline        = 503,
     kTagAnaProducerChain      = 504,
 
@@ -1004,10 +1003,9 @@ case kTagViewCacheSim:         action = [this]{ show_cache_sim_          = !show
         case kTagNavPrevBackTainted:  action = [this]{ if (show_backward_taint_ && backward_taint_result_) jump_backward_taint_prev(); }; break;
 
         // ── Analysis — Data Flow ─────────────────────────────────────────
-        case kTagAnaTaint:          action = [this]{ run_taint_analysis(); }; break;
-        case kTagAnaBackTaint:      action = [this]{ run_backward_taint_analysis(); }; break;
-        case kTagAnaSlice:          action = [this]{ run_slice_analysis(); }; break;
-        case kTagAnaRegTimeline:
+case kTagAnaTaint:          action = [this]{ run_taint_analysis(); }; break;
+case kTagAnaBackTaint:      action = [this]{ run_backward_taint_analysis(); }; break;
+case kTagAnaRegTimeline:
             action = [this]{ show_reg_timeline_ = true; reg_timeline_dirty_ = true; };
             break;
         case kTagAnaProducerChain:
@@ -1056,13 +1054,11 @@ case kTagAnaVMAbstract:     action = [this]{
         // ── Analysis — Maintenance ───────────────────────────────────────
         case kTagAnaClearTaint:
             action = [this]{
-                show_taint_           = false;
-                show_backward_taint_  = false;
-                show_slice_           = false;
-                taint_result_         = nullptr;
-                backward_taint_result_= nullptr;
-                slice_result_         = nullptr;
-                taint_sorted_ids_dirty_ = true;
+        show_taint_           = false;
+        show_backward_taint_  = false;
+        taint_result_         = nullptr;
+        backward_taint_result_= nullptr;
+        taint_sorted_ids_dirty_ = true;
             };
             break;
         case kTagAnaClear:          action = [this]{ clear_analysis(); }; break;
@@ -1170,8 +1166,8 @@ case kTagViewCacheSim:         it.state = show_cache_sim_          ? NSControlSt
                 it.enabled = (backward_taint_result_ != nullptr); break;
 
             // ── Analysis — Clear Taint: only useful when taint is active ─
-            case kTagAnaClearTaint:
-                it.enabled = (show_taint_ || show_backward_taint_ || show_slice_); break;
+        case kTagAnaClearTaint:
+            it.enabled = (show_taint_ || show_backward_taint_); break;
 
             default: break;
         }
@@ -1352,10 +1348,9 @@ void tenet::GuiApp::setup_native_menu() {
 
         // ── Data Flow ─────────────────────────────────────────────────
         NSMenu* dfMenu = mksub(anaMenu, @"Data Flow");
-        [dfMenu addItem:mk(@"Forward Taint\u2026",     @"t", Cmd,         kTagAnaTaint)];
-        [dfMenu addItem:mk(@"Backward Taint\u2026",    @"t", Cmd | Shift, kTagAnaBackTaint)];
-        [dfMenu addItem:mk(@"Slice\u2026",             @"s", Cmd,         kTagAnaSlice)];
-        [dfMenu addItem:sep()];
+[dfMenu addItem:mk(@"Forward Taint\u2026",     @"t", Cmd,         kTagAnaTaint)];
+[dfMenu addItem:mk(@"Backward Taint\u2026",    @"t", Cmd | Shift, kTagAnaBackTaint)];
+[dfMenu addItem:sep()];
         [dfMenu addItem:mk(@"Register Timeline",       @"", 0, kTagAnaRegTimeline)];
         [dfMenu addItem:mk(@"Producer Chain",          @"", 0, kTagAnaProducerChain)];
 

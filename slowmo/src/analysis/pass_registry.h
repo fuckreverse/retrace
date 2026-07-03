@@ -24,7 +24,7 @@ namespace tenet {
 /// Grouping for UI presentation.
 enum class PassCategory : uint8_t {
     Structure,   ///< function / xref / cfg / call_graph / loop / disassembly
-    Taint,       ///< taint / backward_taint / slice / producer_chain / taint_source_annotation
+    Taint,       ///< taint / backward_taint / producer_chain / taint_source_annotation
     Crypto,      ///< pattern / constant_materialization / loop_semantics / algorithm_summary / objc_crypto / symbol_annotation
     Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / literal_search / yara_mem_scan
     PlatformApi,  ///< objc / syscall_intercept
@@ -50,7 +50,7 @@ struct PassCatalogEntry {
 /// Runtime context used to derive on-demand pass configs (e.g. from the
 /// current cursor position). Fields default to "whole trace / register 0".
 struct PassRunCtx {
-    uint64_t current_inst = 0;       ///< cursor inst_id (taint/slice/call_context/…)
+    uint64_t current_inst = 0;       ///< cursor inst_id (taint/backward_taint/call_context/…)
     uint64_t total_inst   = 0;       ///< total instructions in trace
     uint8_t  current_reg  = 0;       ///< register under cursor (x0..x28,fp,lr,sp,nzcv,pc)
     uint64_t range_start  = 0;       ///< analysis range start
