@@ -140,6 +140,19 @@ struct CFGResult {
             const_cast<CFGResult*>(this)->build_adjacency();
         }
 
+        // An edge is inter-procedural (crosses a function boundary) when its
+        // source block ends in a Call (bl/blr — jumping into a callee) or a
+        // Return (ret — jumping back to the caller) and it is not a
+        // fallthrough edge. Such edges must not be walked in either
+        // direction, or the BFS below would pull the caller's or callee's
+        // blocks into this function's extracted sub-CFG.
+        auto is_inter_procedural = [this](const CFGEdge& e) {
+            auto src_it = blocks.find(e.from_block);
+            if (src_it == blocks.end() || e.is_fallthrough) return false;
+            auto term = src_it->second.terminator;
+            return term == TerminatorKind::Call || term == TerminatorKind::Return;
+        };
+
         // BFS from entry_pc using adjacency index (forward + backward)
         ankerl::unordered_dense::set<uint64_t> visited;
         visited.reserve(64);
@@ -156,11 +169,7 @@ struct CFGResult {
             if (succ_it != succ_edge_idx_.end()) {
                 for (size_t idx : succ_it->second) {
                     const auto& e = edges[idx];
-                    // Skip non-fallthrough call edges (inter-function)
-                    auto src_it = blocks.find(e.from_block);
-                    if (src_it != blocks.end() &&
-                        src_it->second.terminator == TerminatorKind::Call &&
-                        !e.is_fallthrough) continue;
+                    if (is_inter_procedural(e)) continue;
                     if (!visited.count(e.to_block))
                         worklist.push_back(e.to_block);
                 }
@@ -171,11 +180,12 @@ struct CFGResult {
             if (pred_it != pred_edge_idx_.end()) {
                 for (size_t idx : pred_it->second) {
                     const auto& e = edges[idx];
-                    // Skip non-fallthrough call edges (inter-function)
-                    auto dst_it = blocks.find(e.to_block);
-                    if (dst_it != blocks.end() &&
-                        /* skip edges coming from call blocks that aren't
-                           fallthrough (return edges) */ false) continue;
+                    // Mirrors the forward-direction check above: a
+                    // predecessor edge that is itself inter-procedural
+                    // (e.g. "caller calls into this function's entry", or
+                    // "callee returns into this block") must not be walked,
+                    // or it would pull the caller's/callee's blocks in.
+                    if (is_inter_procedural(e)) continue;
                     if (!visited.count(e.from_block))
                         worklist.push_back(e.from_block);
                 }

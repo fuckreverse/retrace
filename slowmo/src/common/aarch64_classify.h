@@ -32,9 +32,15 @@ inline bool is_b(uint32_t opcode) noexcept {
     return (opcode >> 26) == 0x05u;
 }
 
-/// Returns true if the opcode is a conditional B.cond (top 8 bits == 0x54, bit 4 == 0).
+/// Returns true if the opcode is a conditional B.cond.
+/// Encoding: bits[31:24] == 0b0101_0100 (fixed), bits[23:5] == imm19
+/// (variable offset), bit[4] == 0 (fixed), bits[3:0] == cond (variable
+/// condition code). Only bits [31:24] and [4] are fixed; imm19 and cond
+/// must NOT be included in the comparison mask, or non-zero offsets /
+/// non-EQ conditions (e.g. b.lt, b.ne with a real branch target) will be
+/// missed.
 inline bool is_b_cond(uint32_t opcode) noexcept {
-    return (opcode & 0xFF00001Fu) == 0x54000000u;
+    return (opcode & 0xFF000010u) == 0x54000000u;
 }
 
 /// Returns true if the opcode is RET.

@@ -5,6 +5,7 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
+#include "common/aarch64_classify.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -132,15 +133,24 @@ namespace {
 
 /// AArch64 opcode-based terminator classification (no Capstone needed).
 /// Returns Fallthrough for non-branch instructions.
+///
+/// Delegates the actual bit-pattern matching to common/aarch64_classify.h
+/// (shared with function_pass, memory_string_pass, memory_snapshot_pass)
+/// rather than re-deriving masks here. This previously had its own
+/// hand-rolled masks for BR/BLR/RET (0xFE1FFC1F) that omitted bits [24:21]
+/// (the `opc` field that actually distinguishes BR/BLR/RET from each
+/// other), so BLR and RET were silently misclassified as BR
+/// (IndirectBranch) whenever bits [24:21] were checked first — see the
+/// correct mask (0xFFFFFC1F) already used elsewhere in the codebase.
 static TerminatorKind classify_opcode_terminator(uint32_t opcode) {
     // Unconditional branch immediate: B (bit[31]=0, [30:26]=00101)
-    if ((opcode & 0xFC000000) == 0x14000000) return TerminatorKind::Branch;
+    if (aarch64::is_b(opcode)) return TerminatorKind::Branch;
 
     // Branch with link: BL (bit[31]=1, [30:26]=00101)
-    if ((opcode & 0xFC000000) == 0x94000000) return TerminatorKind::Call;
+    if (aarch64::is_bl(opcode)) return TerminatorKind::Call;
 
     // Conditional branch: B.cond ([31:25]=0101010, [4]=0)
-    if ((opcode & 0xFE000010) == 0x54000000) return TerminatorKind::ConditionalBranch;
+    if (aarch64::is_b_cond(opcode)) return TerminatorKind::ConditionalBranch;
 
     // Compare and branch zero/nonzero: CBZ/CBNZ ([30:25]=011010)
     if ((opcode & 0x7E000000) == 0x34000000) return TerminatorKind::ConditionalBranch;
@@ -148,19 +158,17 @@ static TerminatorKind classify_opcode_terminator(uint32_t opcode) {
     // Test and branch: TBZ/TBNZ ([30:25]=011011)
     if ((opcode & 0x7E000000) == 0x36000000) return TerminatorKind::ConditionalBranch;
 
-    // Branch register: BR ([24:21]=0000)
-    if ((opcode & 0xFE1FFC1F) == 0xD61F0000) return TerminatorKind::IndirectBranch;
+    // RET (and RETAA/RETAB pointer-auth variants) must be checked before
+    // BR/BLR: RETAA/RETAB set bits outside the plain is_ret() mask.
+    if (aarch64::is_ret(opcode)) return TerminatorKind::Return;
+    if ((opcode & 0xFEFFFCFF) == 0xD65F0BFF) return TerminatorKind::Return;  // RETAA/RETAB
 
-    // BLR: [24:21]=0001
-    if ((opcode & 0xFE1FFC1F) == 0xD63F0000) return TerminatorKind::Call;
+    // BLR (and BLRAA/BLRAB/BLRAAZ/BLRABZ pointer-auth variants): call.
+    if (aarch64::is_blr(opcode)) return TerminatorKind::Call;
+    if ((opcode & 0xFEFFF800) == 0xD63F0800) return TerminatorKind::Call;  // BLRAA/BLRAB/...
 
-    // BLRAA/BLRAB/BLRAAZ/BLRABZ (pointer auth variants)
-    if ((opcode & 0xFEFFF800) == 0xD63F0800) return TerminatorKind::Call;
-
-    // RET: [24:21]=0010
-    if ((opcode & 0xFE1FFC1F) == 0xD65F0000) return TerminatorKind::Return;
-    // RETAA/RETAB (pointer auth)
-    if ((opcode & 0xFEFFFCFF) == 0xD65F0BFF) return TerminatorKind::Return;
+    // Branch register: BR (unconditional, non-call, non-return).
+    if (aarch64::is_br(opcode)) return TerminatorKind::IndirectBranch;
 
     return TerminatorKind::Fallthrough;
 }
