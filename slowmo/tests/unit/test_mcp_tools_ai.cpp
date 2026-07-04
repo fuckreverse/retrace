@@ -11,8 +11,13 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <cstring>
+#include <thread>
+
 #include "fixtures/trace_fixture.h"
 #include "io/mcp/mcp_server.h"
+#include "io/mcp/mcp_helpers.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -584,6 +589,121 @@ TEST_CASE("MCP hypothesis_mark_reviewed: works on abandoned hypothesis",
     // Abandoned hypothesis should also be reviewable
     auto res = ctx.mcp->call_tool("hypothesis_mark_reviewed", {{"id", hid}});
     REQUIRE(res["reviewed"] == true);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// mem_search: hex_pattern / text wildcard-mask regression tests
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Regression coverage for a bug where the mem_search MCP tool's hex_pattern/
+// text parsing inverted MemSearchConfig::Pattern's mask semantics: concrete
+// bytes were marked as wildcards (0xFF, i.e. "ignored") and "??" placeholders
+// were marked as requiring an exact 0x00 byte — the opposite of
+// MemSearchPass::match_at()'s contract (0xFF = wildcard, 0x00 = exact match).
+// This made hex_pattern/text searches match almost nothing meaningful.
+//
+// The fixture's `mem_search_env` writes the 8 bytes "DEADBEEF" (ASCII) to
+// memory at inst 2, which we use as ground truth for both hex_pattern and
+// text lookups below.
+
+static McpTestEnv make_mem_search_env() {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+
+        // Write the ASCII bytes "DEADBEEF" (0x46454542444145 44 little-endian
+        // as a 64-bit value) to memory — used as ground truth for both
+        // hex_pattern and text search below.
+        uint64_t ascii_deadbeef = 0;
+        const char* s = "DEADBEEF";
+        std::memcpy(&ascii_deadbeef, s, 8);
+        tw.emit(ms, 0x1000, enc::str_imm(0, 31, 0),
+                {{33, tw.rt(0x1004)}},
+                {{2 /* WRITE */, 8, 0x7F000000ULL, ascii_deadbeef}});
+
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "mcp_mem_search_test");
+
+    McpTestEnv result;
+    result.env = std::move(env);
+    result.pm = make_pm(*result.env);
+    result.mcp = std::make_unique<TenetMcpService>(
+        *result.env->reader, *result.env->index,
+        *result.env->regfile, *result.env->memory,
+        result.pm.get(),
+        &result.env->code_table, &result.env->decoder);
+    return result;
+}
+
+// `mem_search` (like other pass-backed MCP tools) is non-blocking:
+// require_pass<T>() kicks off the pass on a detached background thread and
+// throws PassNotReady on the first call. Poll call_tool() until the pass
+// actually completes and returns its result, to avoid racing the background
+// thread's access to the PassManager/pass objects (which are torn down when
+// the TEST_CASE's `ctx` goes out of scope).
+static json call_mem_search_blocking(McpTestEnv& ctx, const json& args,
+                                      int max_attempts = 200) {
+    for (int i = 0; i < max_attempts; i++) {
+        try {
+            return ctx.mcp->call_tool("mem_search", args);
+        } catch (const PassNotReady&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    FAIL("mem_search pass did not complete in time");
+    return {};
+}
+
+TEST_CASE("mem_search: hex_pattern with concrete bytes finds an exact match",
+          "[unit][mcp][mem_search]") {
+    auto ctx = make_mem_search_env();
+    // "DEADBEEF" in ASCII is 44 45 41 44 42 45 45 46 (little-endian layout
+    // in memory matches the string's byte order for str_imm here).
+    auto res = call_mem_search_blocking(
+        ctx, {{"hex_pattern", "44 45 41 44 42 45 45 46"}});
+    REQUIRE(res["total_matches"].get<size_t>() >= 1);
+    REQUIRE_FALSE(res["hits"].empty());
+}
+
+TEST_CASE("mem_search: hex_pattern with wildcard placeholder still matches",
+          "[unit][mcp][mem_search]") {
+    auto ctx = make_mem_search_env();
+    // Wildcard out the middle two bytes; the concrete bytes around them must
+    // still be required to match exactly.
+    auto res = call_mem_search_blocking(
+        ctx, {{"hex_pattern", "44 45 ?? ?? 42 45 45 46"}});
+    REQUIRE(res["total_matches"].get<size_t>() >= 1);
+}
+
+TEST_CASE("mem_search: hex_pattern rejects a non-matching concrete byte",
+          "[unit][mcp][mem_search]") {
+    auto ctx = make_mem_search_env();
+    // Corrupt one concrete byte (44 -> 00); if concrete bytes were being
+    // treated as wildcards (the historical bug), this would still match.
+    auto res = call_mem_search_blocking(
+        ctx, {{"hex_pattern", "00 45 41 44 42 45 45 46"}});
+    REQUIRE(res["total_matches"].get<size_t>() == 0);
+}
+
+TEST_CASE("mem_search: text search finds an exact ASCII match",
+          "[unit][mcp][mem_search]") {
+    auto ctx = make_mem_search_env();
+    auto res = call_mem_search_blocking(ctx, {{"text", "DEADBEEF"}});
+    REQUIRE(res["total_matches"].get<size_t>() >= 1);
+}
+
+TEST_CASE("mem_search: text search rejects a non-matching string",
+          "[unit][mcp][mem_search]") {
+    auto ctx = make_mem_search_env();
+    // If `text` bytes were being treated as wildcards (the historical bug),
+    // any 8-character string would spuriously "match" the write.
+    auto res = call_mem_search_blocking(ctx, {{"text", "ZZZZZZZZ"}});
+    REQUIRE(res["total_matches"].get<size_t>() == 0);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -540,16 +540,21 @@ void TenetMcpService::register_search_tools() {
                 MemSearchConfig::Pattern pat;
                 std::string hex = args["hex_pattern"].get<std::string>();
                 pat.label = hex;
-                // Parse space-separated hex bytes, ?? for wildcards
+                // Parse space-separated hex bytes, ?? for wildcards.
+                // NOTE: mask semantics (see MemSearchPass::match_at): 0xFF =
+                // wildcard (byte ignored), 0x00 = exact match required. This
+                // was previously inverted here, which made "??" require an
+                // exact 0x00 byte and made concrete bytes act as wildcards —
+                // i.e. hex_pattern search was effectively broken.
                 std::istringstream iss(hex);
                 std::string token;
                 while (iss >> token) {
-                    if (token == "??" || token == "??") {
+                    if (token == "??") {
                         pat.bytes.push_back(0);
-                        pat.mask.push_back(0);
+                        pat.mask.push_back(0xFF);
                     } else {
                         pat.bytes.push_back(static_cast<uint8_t>(std::stoul(token, nullptr, 16)));
-                        pat.mask.push_back(0xFF);
+                        pat.mask.push_back(0x00);
                     }
                 }
                 cfg.patterns.push_back(std::move(pat));
@@ -560,7 +565,7 @@ void TenetMcpService::register_search_tools() {
                 pat.label = text;
                 for (char c : text) {
                     pat.bytes.push_back(static_cast<uint8_t>(c));
-                    pat.mask.push_back(0xFF);
+                    pat.mask.push_back(0x00);  // exact match, not a wildcard
                 }
                 cfg.patterns.push_back(std::move(pat));
             }

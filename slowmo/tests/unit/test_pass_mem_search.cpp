@@ -349,6 +349,78 @@ TEST_CASE("MemSearchPass: max_matches caps hits per value",
     REQUIRE(res.by_value[0].size() == 3);
 }
 
+TEST_CASE("MemSearchPass: max_matches caps byte-pattern hits in mem writes",
+          "[unit][pass][mem_search][max_matches]") {
+    // Regression test: linear_scan()'s mem-write byte-pattern branch used to
+    // `break` only out of the innermost `offset` loop when max_matches was
+    // reached, so the same pattern kept accumulating unbounded hits across
+    // subsequent mem-write events. Verify the cap is actually enforced across
+    // multiple separate memory writes.
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+        uint64_t spc = 0x1000;
+        for (int i = 0; i < 10; i++) {
+            tw.emit(ms, spc, enc::str_imm(10, 20, 0),
+                    {{33, tw.rt(spc + 4)}},
+                    {{2, 8, 0x700000 + (uint64_t)i * 8, 0x00000000DEADBEEFULL}});
+            spc += 4;
+        }
+        tw.emit_anchor(ms);
+    }, "memsearch_pattern_max_matches_memwrite");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    MemSearchConfig cfg;
+    cfg.patterns.emplace_back(std::vector<uint8_t>{0xEF, 0xBE, 0xAD, 0xDE}, "deadbeef");
+    cfg.max_matches = 3;
+
+    pm->register_pass(std::make_unique<MemSearchPass>(std::move(cfg)));
+    auto& raw = pm->require("mem_search");
+    REQUIRE(raw.ok());
+
+    auto& res = raw.get<MemSearchResult>();
+    REQUIRE(res.by_pattern.size() == 1);
+    REQUIRE(res.by_pattern[0].size() == 3);
+}
+
+TEST_CASE("MemSearchPass: max_matches caps byte-pattern hits in register diffs",
+          "[unit][pass][mem_search][max_matches]") {
+    // Regression test: linear_scan()'s reg-diff byte-pattern branch had no
+    // max_matches check at all (only an unconditional `break` after the
+    // first match within a single reg-diff), so a pattern occurring
+    // frequently across many reg-diffs could grow unbounded.
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+        uint64_t spc = 0x1000;
+        for (int i = 0; i < 10; i++) {
+            // add x1, x1, x2 producing the same reg-diff value each time.
+            tw.emit(ms, spc, enc::add_reg(1, 1, 2),
+                    {{1, 0x00000000DEADBEEFULL}, {33, tw.rt(spc + 4)}}, {});
+            spc += 4;
+        }
+        tw.emit_anchor(ms);
+    }, "memsearch_pattern_max_matches_regdiff");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    MemSearchConfig cfg;
+    cfg.patterns.emplace_back(std::vector<uint8_t>{0xEF, 0xBE, 0xAD, 0xDE}, "deadbeef");
+    cfg.search_reg_values = true;
+    cfg.max_matches = 3;
+
+    pm->register_pass(std::make_unique<MemSearchPass>(std::move(cfg)));
+    auto& raw = pm->require("mem_search");
+    REQUIRE(raw.ok());
+
+    auto& res = raw.get<MemSearchResult>();
+    REQUIRE(res.by_pattern.size() == 1);
+    REQUIRE(res.by_pattern[0].size() == 3);
+}
+
 // ─── Tests: combined patterns + exact_values in one run ────────────────────
 
 TEST_CASE("MemSearchPass: patterns and exact_values can run together",

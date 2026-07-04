@@ -86,6 +86,7 @@ struct MemSearchYaraCtx {
     const std::vector<uint8_t>* offset_to_size;
     MemSearchMatch::Source source;
     size_t entry_size;  // bytes per entry in the buffer (8 for reg, 16 for mem)
+    uint64_t max_matches = 0;  // 0 = unlimited (mirrors MemSearchConfig::max_matches)
     const std::function<bool()>* cancel_check = nullptr;
 };
 
@@ -106,11 +107,24 @@ int memsearch_yara_callback(YR_SCAN_CONTEXT* context, int message,
         pattern_index = static_cast<uint8_t>(std::atoi(rule->identifier + 4));
     }
 
-    // Iterate all matching strings for precise offsets
+    // Iterate all matching strings for precise offsets. Enforce max_matches
+    // per pattern here — YARA itself has no notion of "stop after N hits for
+    // this rule", so without this cap a hot pattern could accumulate
+    // unbounded matches across the whole scanned buffer.
+    if (pattern_index >= ctx->result->by_pattern.size()) return CALLBACK_CONTINUE;
+
     YR_STRING* str;
     yr_rule_strings_foreach(rule, str) {
+        if (ctx->max_matches > 0 &&
+            ctx->result->by_pattern[pattern_index].size() >= ctx->max_matches) {
+            break;
+        }
         YR_MATCH* match;
         yr_string_matches_foreach(context, str, match) {
+            if (ctx->max_matches > 0 &&
+                ctx->result->by_pattern[pattern_index].size() >= ctx->max_matches) {
+                break;
+            }
             size_t buf_offset = match->offset;
             size_t entry_idx = buf_offset / ctx->entry_size;
             size_t within_offset = buf_offset % ctx->entry_size;
@@ -204,6 +218,7 @@ void MemSearchPass::yara_scan_buffer(
     ctx.offset_to_size = &offset_to_size;
     ctx.source = source;
     ctx.entry_size = entry_size;
+    ctx.max_matches = cfg_.max_matches;
     ctx.cancel_check = &cancel_check;
 
     yr_rules_scan_mem(yr_rules_, data, len, 0, memsearch_yara_callback, &ctx, 0);
@@ -547,6 +562,15 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result, bool 
                     for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
                         const auto& pat = cfg_.patterns[pi];
                         if (pat.bytes.size() > buf_len) continue;
+                        // Skip this pattern entirely once it has hit max_matches —
+                        // without this, the inner `break` below only stops the
+                        // current mem-access's offset scan, so the same pattern
+                        // would keep accumulating unbounded matches across
+                        // subsequent mem-accesses/instructions.
+                        if (cfg_.max_matches > 0 &&
+                            result.by_pattern[pi].size() >= cfg_.max_matches) {
+                            continue;
+                        }
 
                         for (size_t offset = 0; offset + pat.bytes.size() <= buf_len; offset++) {
                             if (match_at(buf, buf_len, offset, pat)) {
@@ -594,6 +618,14 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result, bool 
                     for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
                         const auto& pat = cfg_.patterns[pi];
                         if (pat.bytes.size() > 8) continue;
+                        // Same max_matches guard as the mem-write path above —
+                        // previously this loop had no cap at all, so a pattern
+                        // occurring frequently in reg-diffs could grow
+                        // result.by_pattern[pi] unbounded.
+                        if (cfg_.max_matches > 0 &&
+                            result.by_pattern[pi].size() >= cfg_.max_matches) {
+                            continue;
+                        }
 
                         for (size_t offset = 0; offset + pat.bytes.size() <= 8; offset++) {
                             if (match_at(buf, 8, offset, pat)) {
