@@ -579,7 +579,17 @@ void GraphGridLayout::computeAllBlockPlacement(const std::vector<uint64_t> &bloc
             return;
         }
         auto &block = layoutState.gridBlocks[*it];
+        // `col` is later used as a direct index into columnWidth[]/columnOffset[]
+        // (see calculateLayout() and adjustColumnWidths()). A negative value here
+        // is not just a cosmetic offset bug — it would cause out-of-bounds vector
+        // access downstream. This should be unreachable given a well-formed tree
+        // layout, but real-world CFGs can have topologies the ported algorithm
+        // wasn't validated against, so clamp defensively instead of relying on
+        // an assert() that Release builds silently compile out.
         assert(block.col >= 0);
+        if (block.col < 0) {
+            block.col = 0;
+        }
         for (auto childId : block.treeEdge) {
             auto &childBlock = layoutState.gridBlocks[childId];
             childBlock.col += block.col;
@@ -668,8 +678,30 @@ void GraphGridLayout::calculateEdgeMainColumn(GraphGridLayout::LayoutState &stat
             } else {
                 auto nearestLeft = blockedColumns.rightMostLessThan(column, topRow);
                 auto nearestRight = blockedColumns.leftMostLessThan(column, topRow);
-                // There should always be empty column at the sides of drawing
+                // There should always be an empty column at the sides of the drawing
+                // (PointSetMinTree is sized with a padding column on each side), so
+                // this should be unreachable. However this algorithm was ported from
+                // Cutter and validated on synthetic/typical CFGs; real-world traces
+                // can produce topologies (dense fan-out, deeply nested loops, etc.)
+                // that weren't part of that validation set. `mainColumn` is used as a
+                // direct vector index downstream (roughRouting/elaborateEdgePlacement),
+                // so a stray -1 here would cause an out-of-bounds access rather than
+                // just a cosmetic layout glitch — and assert() is compiled out in
+                // Release builds, so guard defensively instead of trusting the
+                // invariant unconditionally.
                 assert(nearestLeft != -1 && nearestRight != -1);
+                if (nearestLeft == -1 && nearestRight == -1) {
+                    // No empty column found on either side: fall back to the
+                    // source block's own column, which is always a valid index.
+                    edge.mainColumn = column;
+                    continue;
+                } else if (nearestLeft == -1) {
+                    edge.mainColumn = nearestRight;
+                    continue;
+                } else if (nearestRight == -1) {
+                    edge.mainColumn = nearestLeft;
+                    continue;
+                }
 
                 // Choose closest column. Take into account distance to source and target block
                 // columns.
@@ -1023,15 +1055,24 @@ static int compressCoordinates(std::vector<EdgeSegment> &segments, std::vector<N
     auto positionToIndex = [&](int position) {
         const size_t index =
                 std::lower_bound(positions.begin(), positions.end(), position) - positions.begin();
+        // `positions` was built from every segment.y0/y1 pushed above, so `position`
+        // should always be found exactly. This is compiled out in Release builds via
+        // assert(), so guard against an unexpected out-of-range index defensively —
+        // it would otherwise silently index past `positions.size()` in every caller.
         assert(index < positions.size());
-        return index;
+        return std::min(index, positions.empty() ? size_t(0) : positions.size() - 1);
     };
     for (auto &segment : segments) {
         segment.y0 = positionToIndex(segment.y0);
         segment.y1 = positionToIndex(segment.y1);
     }
+    // leftSides/rightSides are always constructed in matching pairs by callers
+    // (elaborateEdgePlacement pushes one NodeSide to each per grid block/edge).
+    // Guard the mismatched-size case defensively rather than reading past the
+    // shorter vector below, since assert() is a no-op in Release builds.
     assert(leftSides.size() == rightSides.size());
-    for (size_t i = 0; i < leftSides.size(); i++) {
+    const size_t side_count = std::min(leftSides.size(), rightSides.size());
+    for (size_t i = 0; i < side_count; i++) {
         leftSides[i].y0 = rightSides[i].y0 = positionToIndex(leftSides[i].y0);
         leftSides[i].y1 = rightSides[i].y1 = positionToIndex(leftSides[i].y1);
     }
@@ -1338,6 +1379,13 @@ void GraphGridLayout::connectEdgeEnds(Graph &graph) const
         auto &block = it.second;
         for (size_t i = 0; i < block.edges.size(); i++) {
             auto &resultEdge = block.edges[i];
+            // Every routed edge should have at least a start+end point produced by
+            // roughRouting(). This is not guarded by an assert() anywhere upstream,
+            // so an unexpectedly empty polyline (e.g. from a topology roughRouting
+            // wasn't validated against) would otherwise index a 0-length vector here.
+            if (resultEdge.polyline.empty()) {
+                continue;
+            }
             const auto &target = graph[resultEdge.target];
             resultEdge.polyline[0].ry() = block.y + block.height;
             resultEdge.polyline.back().ry() = target.y;

@@ -60,6 +60,8 @@ tenet_add_test(test_gui_metal_ownership    unit/test_gui_metal_ownership.cpp)
 # ─── Unit tests: analysis passes ────────────────────────────────────────────
 tenet_add_test(test_pass_xref              unit/test_pass_xref.cpp)
 tenet_add_test(test_pass_cfg               unit/test_pass_cfg.cpp)
+tenet_add_test(test_pass_cfg_layout        unit/test_pass_cfg_layout.cpp)
+tenet_add_test(test_graph_grid_layout      unit/test_graph_grid_layout.cpp)
 tenet_add_test(test_pass_taint             unit/test_pass_taint.cpp)
 tenet_add_test(test_pass_loop              unit/test_pass_loop.cpp)
 tenet_add_test(test_pass_function          unit/test_pass_function.cpp)
