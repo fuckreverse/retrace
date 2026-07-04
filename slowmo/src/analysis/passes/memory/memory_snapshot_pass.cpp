@@ -5,6 +5,7 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
+#include "common/logger.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <chrono>
@@ -338,8 +339,8 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
             ctx.progress(0.0f, "Collecting snapshot targets (fast path)");
 
             size_t processed = 0;
-            fmt::print(stderr, "[memory_snapshot] fast-path: {} call events, limit={}\n",
-                       events.size(), config_.max_snapshots);
+            LOG_DEBUG("memory_snapshot: fast-path: {} call events, limit={}",
+                      events.size(), config_.max_snapshots);
 
             // ── Opt: pre-cache regfile for all call sites before the loop ──
             // state_before(inst_id) rebuilds from the nearest anchor and
@@ -360,8 +361,8 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
                 }
                 auto t_warm1 = HiResClock::now();
                 double warm_ms = std::chrono::duration<double, std::milli>(t_warm1 - t_warm0).count();
-                fmt::print(stderr, "[memory_snapshot] warm_at {} call sites: {:.1f} ms\n",
-                           warmed, warm_ms);
+                LOG_DEBUG("memory_snapshot: warm_at {} call sites: {:.1f} ms",
+                          warmed, warm_ms);
             }
 
             for (const auto& ev : events) {
@@ -383,8 +384,8 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
                 }
             }
 
-            fmt::print(stderr, "[memory_snapshot] collected {} requests from {} call events\n",
-                       requests.size(), processed);
+            LOG_DEBUG("memory_snapshot: collected {} requests from {} call events",
+                      requests.size(), processed);
         } else {
             // ── Fallback: scan trace linearly (original algorithm) ───────
             auto& code_table = ctx.code_table();
@@ -462,11 +463,11 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
             if (requests[order[i]].page != requests[order[i-1]].page)
                 ++unique_pages;
         }
-        fmt::print(stderr, "[memory_snapshot] batch read: {} requests across {} unique pages\n"
-                   "  ({} bytes/req = {} total byte-reads)\n",
-                   requests.size(), unique_pages,
-                   config_.snapshot_size,
-                   requests.size() * config_.snapshot_size);
+        LOG_DEBUG("memory_snapshot: batch read: {} requests across {} unique pages "
+                  "({} bytes/req = {} total byte-reads)",
+                  requests.size(), unique_pages,
+                  config_.snapshot_size,
+                  requests.size() * config_.snapshot_size);
 
         ctx.progress(0.3f, "Batch reading memory (page-sorted)");
 
@@ -565,13 +566,13 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
         }
     }
 
-    fmt::print(stderr, "[memory_snapshot] timing breakdown:\n"
-                       "  regfile.state_before: {:.1f} ms ({} calls, avg {:.1f} us/call)\n"
-                       "  capture_region:       {:.1f} ms ({} calls, avg {:.1f} us/call)\n",
-               regfile_us / 1000.0, regfile_calls,
-               regfile_calls ? regfile_us / regfile_calls : 0.0,
-               memread_us / 1000.0, memread_calls,
-               memread_calls ? memread_us / memread_calls : 0.0);
+    LOG_DEBUG("memory_snapshot: timing breakdown: "
+              "regfile.state_before: {:.1f} ms ({} calls, avg {:.1f} us/call), "
+              "capture_region: {:.1f} ms ({} calls, avg {:.1f} us/call)",
+              regfile_us / 1000.0, regfile_calls,
+              regfile_calls ? regfile_us / regfile_calls : 0.0,
+              memread_us / 1000.0, memread_calls,
+              memread_calls ? memread_us / memread_calls : 0.0);
 
     ctx.progress(1.0f, fmt::format("Done: {} snapshots captured", result.total()));
 
