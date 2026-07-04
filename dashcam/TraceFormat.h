@@ -574,10 +574,24 @@ typedef struct {
 #define QBDITRACE_SF_BINARY         (1u << 1) /* raw bytes, not a C string */
 #define QBDITRACE_SF_SAFE_READ_FAIL (1u << 2) /* safeRead failed; capture is empty */
 
+/* FIXME(api_id-width): qbditrace_capi_id_t now defines Android/BoringSSL and
+ * JNI-extended entries up to 726 (see below), but api_id here is a single
+ * uint8_t (max 255). Any id >= 256 (e.g. QBDITRACE_CAPI_EVP_ENCRYPT_UPDATE=601,
+ * QBDITRACE_CAPI_HMAC_INIT_EX=610, ...) silently truncates when written to
+ * disk — see QBDITrace.cpp's `ch.api_id = cf->api_id;` (cf->api_id is
+ * uint16_t in the in-process config, see QBDITrace.h). Net effect: none of
+ * the >=256 Android CAPI ids can currently round-trip through a real trace
+ * file. Needs a format bump (widen to uint16_t, or a new record
+ * flag/version) to fix properly; deliberately NOT fixed yet because it
+ * touches the on-disk format (tracer + trace_decode + tenet all need to
+ * agree). Tracked via this FIXME; see also the NOTE in
+ * tests/unit/test_pass_syscall_intercept.cpp explaining why the Android
+ * platform-dispatch tests avoid ids >= 256. */
+
 /* Fixed header for REC_CAPICALL. Variable-length string captures follow. */
 typedef struct {
   uint8_t  kind;       /* == QBDITRACE_REC_CAPICALL */
-  uint8_t  api_id;     /* qbditrace_capi_id_t */
+  uint8_t  api_id;     /* qbditrace_capi_id_t — FIXME: too narrow for ids >= 256, see above */
   uint8_t  arg_count;  /* number of valid entries in args[] (0..8) */
   uint8_t  str_count;  /* number of inline string captures that follow (0..4) */
   uint64_t pc;         /* call-site PC (inside the traced range) */

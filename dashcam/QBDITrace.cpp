@@ -1872,7 +1872,14 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
         qbditrace_capicall_head_t ch;
         std::memset(&ch, 0, sizeof(ch));
         ch.kind      = QBDITRACE_REC_CAPICALL;
-        ch.api_id    = cf->api_id;
+        /* FIXME(api_id-width): cf->api_id is uint16_t (holds ids up to ~726,
+         * see QBDITrace.h), but qbditrace_capicall_head_t::api_id on disk is
+         * uint8_t (TraceFormat.h) — this narrows and silently truncates any
+         * id >= 256 (all Android/BoringSSL + most JNI-extended ids). Needs a
+         * trace format bump to fix properly (tracer + trace_decode + tenet
+         * must agree); not fixed yet, tracked via the FIXME in
+         * TraceFormat.h next to qbditrace_capicall_head_t. */
+        ch.api_id    = static_cast<uint8_t>(cf->api_id);
         ch.arg_count = cf->n_args;
         ch.pc        = site;
         ch.target    = target;
