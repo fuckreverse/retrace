@@ -1,6 +1,8 @@
 #include "analysis/passes/mem_search_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "io/code_table.h"
+#include "common/aarch64_classify.h"
 
 #ifdef TENET_HAS_YARA
 #include <yara.h>
@@ -9,6 +11,7 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <cstring>
+#include <ankerl/unordered_dense.h>
 
 namespace tenet {
 
@@ -121,6 +124,7 @@ int memsearch_yara_callback(YR_SCAN_CONTEXT* context, int message,
             m.offset = static_cast<uint16_t>(within_offset);
             m.pattern_index = pattern_index;
             m.source = ctx->source;
+            m.is_exact_value_match = false;
 
             ctx->result->by_pattern[pattern_index].push_back(ctx->result->matches.size());
             ctx->result->matches.push_back(m);
@@ -208,13 +212,29 @@ void MemSearchPass::yara_scan_buffer(
 #endif  // TENET_HAS_YARA
 
 // ─── Main pass execution ──────────────────────────────────────────────────
+//
+// Two independent search facilities share this pass:
+//
+//   - `patterns`     : arbitrary-length byte sequences (with wildcards),
+//                      matched via YARA (if available) or a linear scan.
+//   - `exact_values` : specific scalar values, matched via an O(1) hash-map
+//                      lookup against register diffs, memory-write values,
+//                      and MOVZ/MOVK instruction immediates. This absorbs
+//                      what used to be the standalone LiteralSearchPass.
+//
+// Both facilities can be enabled simultaneously. `linear_scan()` handles
+// both in a single trace traversal when patterns don't use the YARA path
+// (or when there are no byte patterns at all, i.e. exact_values-only mode).
+// When YARA *is* used for byte patterns, exact_values are matched in a
+// second, lightweight pass afterward — this keeps the (rarely-combined)
+// two facilities decoupled without duplicating the YARA buffer-construction
+// machinery for a case that doesn't benefit from it.
 
 PassResult MemSearchPass::run(PassContext& ctx) {
-    if (cfg_.patterns.empty()) {
+    if (cfg_.patterns.empty() && cfg_.exact_values.empty()) {
         return PassResult::skipped();
     }
 
-    auto& reader = ctx.reader();
     auto& index = ctx.index();
 
     const uint64_t total_insts = index.inst_count();
@@ -224,8 +244,19 @@ PassResult MemSearchPass::run(PassContext& ctx) {
 
     MemSearchResult result;
     result.by_pattern.resize(cfg_.patterns.size());
+    result.by_value.resize(cfg_.exact_values.size());
 
-    // ─── Strategy selection ───────────────────────────────────────────────
+    if (cfg_.patterns.empty()) {
+        // exact_values only — a single linear_scan() pass covers everything,
+        // no need for the YARA buffer-construction machinery at all.
+        linear_scan(ctx, result);
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
+        return PassResult::success(std::move(result));
+    }
+
+    // ─── Strategy selection (byte patterns) ────────────────────────────────
     //
     // YARA path: Build contiguous buffer from mem-writes (and optionally regs),
     // compile patterns into YARA hex rules, run Aho-Corasick multi-pattern match.
@@ -237,7 +268,8 @@ PassResult MemSearchPass::run(PassContext& ctx) {
     //   1. TENET_HAS_YARA is defined
     //   2. Patterns compile successfully (YARA supports wildcards via ??)
     //
-    // Fallback: linear per-instruction scan (always correct).
+    // Fallback: linear per-instruction scan (always correct), which also
+    // handles exact_values inline.
 
 #ifdef TENET_HAS_YARA
     bool use_yara = compile_patterns_to_yara();
@@ -245,8 +277,19 @@ PassResult MemSearchPass::run(PassContext& ctx) {
     bool use_yara = false;
 #endif
 
-    if (use_yara) {
+    if (!use_yara) {
+        // linear_scan() handles both patterns and exact_values in one pass.
+        linear_scan(ctx, result);
+        if (ctx.cancelled()) {
+            return PassResult::failed("cancelled by user");
+        }
+        return PassResult::success(std::move(result));
+    }
+
 #ifdef TENET_HAS_YARA
+    {
+        auto& reader = ctx.reader();
+
         ctx.progress(0.0f, "MemSearch: building contiguous buffers for YARA scan...");
 
         const uint64_t start = cfg_.start_inst_id;
@@ -375,33 +418,107 @@ PassResult MemSearchPass::run(PassContext& ctx) {
         }
 
         reader.advise_random();
-        ctx.progress(1.0f, fmt::format("MemSearch: {} matches via YARA", result.matches.size()));
-        return PassResult::success(std::move(result));
-#endif
     }
 
-    // ─── Fallback: linear scan ────────────────────────────────────────────
-    linear_scan(ctx, result);
+    // ── Exact-value search runs as a lightweight second pass ────────────
+    // (only when combined with a YARA-accelerated pattern search; the
+    // exact_values-only and non-YARA-patterns cases are already fully
+    // handled by linear_scan() above). scan_patterns=false avoids re-running
+    // the byte-pattern brute force we already did via YARA above.
+    if (!cfg_.exact_values.empty()) {
+        ctx.progress(0.85f, "MemSearch: scanning for exact values...");
+        MemSearchResult exact_only;
+        exact_only.by_value.resize(cfg_.exact_values.size());
+
+        linear_scan(ctx, exact_only, /*scan_patterns=*/false);
+
+        // Merge exact-value matches into the main result, re-basing indices.
+        size_t base = result.matches.size();
+        for (auto& m : exact_only.matches) {
+            result.matches.push_back(m);
+        }
+        for (size_t vi = 0; vi < exact_only.by_value.size(); vi++) {
+            for (size_t idx : exact_only.by_value[vi]) {
+                result.by_value[vi].push_back(base + idx);
+            }
+        }
+        result.bytes_scanned += exact_only.bytes_scanned;
+    }
+
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
+    ctx.progress(1.0f, fmt::format("MemSearch: {} matches", result.matches.size()));
     return PassResult::success(std::move(result));
+#endif
 }
 
-// ─── Fallback linear scan (original logic, always correct) ────────────────
+// ─── Linear scan: byte patterns (fallback) + exact values (always) ────────
 
-void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result) {
+void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result, bool scan_patterns) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
+    auto& code_table = ctx.code_table();
 
     const uint64_t total_insts = index.inst_count();
     const uint64_t start = cfg_.start_inst_id;
     const uint64_t end = std::min(cfg_.end_inst_id, total_insts);
     const uint64_t progress_interval = std::max(total_insts / 100, uint64_t(1));
 
-    ctx.progress(0.0f, "MemSearch: linear scan (no YARA)...");
+    const bool do_patterns = scan_patterns && !cfg_.patterns.empty();
+    const bool do_exact = !cfg_.exact_values.empty();
+
+    ctx.progress(0.0f, do_patterns ? "MemSearch: linear scan (no YARA)..."
+                                    : "MemSearch: exact-value scan...");
+
+    // ── O(1) exact-value lookup maps (mirrors former LiteralSearchPass) ───
+    // map[val] → indices into cfg_.exact_values, so a single hash lookup per
+    // candidate value resolves all matching search values at once (handles
+    // duplicate/overlapping values without an O(N) inner loop).
+    ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> map_64;
+    ankerl::unordered_dense::map<uint32_t, std::vector<size_t>> map_32;
+    if (do_exact) {
+        map_64.reserve(cfg_.exact_values.size());
+        for (size_t i = 0; i < cfg_.exact_values.size(); i++) {
+            map_64[cfg_.exact_values[i]].push_back(i);
+            if (cfg_.match_32bit) {
+                uint32_t v32 = static_cast<uint32_t>(cfg_.exact_values[i] & 0xFFFFFFFF);
+                map_32[v32].push_back(i);
+            }
+        }
+    }
+
+    auto record_exact_hit = [&](uint64_t inst_id, uint64_t pc, uint64_t val,
+                                 size_t vi, MemSearchMatch::Source src,
+                                 uint64_t addr) {
+        if (cfg_.max_matches > 0 && result.by_value[vi].size() >= cfg_.max_matches) {
+            return;
+        }
+        MemSearchMatch m;
+        m.inst_id = inst_id;
+        m.pc = pc;
+        m.addr = addr;
+        m.offset = 0;
+        m.pattern_index = static_cast<uint8_t>(vi);
+        m.source = src;
+        m.matched_value = val;
+        m.is_exact_value_match = true;
+        result.by_value[vi].push_back(result.matches.size());
+        result.matches.push_back(m);
+    };
+
+    auto lookup_exact = [&](uint64_t val) -> const std::vector<size_t>* {
+        auto it64 = map_64.find(val);
+        if (it64 != map_64.end()) return &it64->second;
+        if (cfg_.match_32bit && (val >> 32) == 0) {
+            auto it32 = map_32.find(static_cast<uint32_t>(val));
+            if (it32 != map_32.end()) return &it32->second;
+        }
+        return nullptr;
+    };
 
     uint64_t inst_id = 0;
+    reader.advise_sequential();
 
     for (auto it = reader.begin(); it != reader.end(); ++it) {
         auto rec = *it;
@@ -414,7 +531,7 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result) {
         auto inst = rec.as_inst();
         result.instructions_scanned++;
 
-        // Search memory write values
+        // ── Memory write values: byte patterns + exact values ──────────
         if (cfg_.search_mem_writes) {
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
@@ -426,56 +543,100 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result) {
                 size_t buf_len = std::min(static_cast<size_t>(mem.size), size_t(16));
                 result.bytes_scanned += buf_len;
 
-                for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
-                    const auto& pat = cfg_.patterns[pi];
-                    if (pat.bytes.size() > buf_len) continue;
+                if (do_patterns) {
+                    for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
+                        const auto& pat = cfg_.patterns[pi];
+                        if (pat.bytes.size() > buf_len) continue;
 
-                    for (size_t offset = 0; offset + pat.bytes.size() <= buf_len; offset++) {
-                        if (match_at(buf, buf_len, offset, pat)) {
-                            MemSearchMatch match;
-                            match.inst_id = inst_id;
-                            match.pc = inst.pc;
-                            match.addr = mem.addr + offset;
-                            match.offset = static_cast<uint16_t>(offset);
-                            match.pattern_index = static_cast<uint8_t>(pi);
-                            match.source = MemSearchMatch::MemWrite;
-                            result.by_pattern[pi].push_back(result.matches.size());
-                            result.matches.push_back(match);
+                        for (size_t offset = 0; offset + pat.bytes.size() <= buf_len; offset++) {
+                            if (match_at(buf, buf_len, offset, pat)) {
+                                MemSearchMatch match;
+                                match.inst_id = inst_id;
+                                match.pc = inst.pc;
+                                match.addr = mem.addr + offset;
+                                match.offset = static_cast<uint16_t>(offset);
+                                match.pattern_index = static_cast<uint8_t>(pi);
+                                match.source = MemSearchMatch::MemWrite;
+                                match.is_exact_value_match = false;
+                                result.by_pattern[pi].push_back(result.matches.size());
+                                result.matches.push_back(match);
 
-                            if (cfg_.max_matches > 0 &&
-                                result.by_pattern[pi].size() >= cfg_.max_matches) {
-                                break;
+                                if (cfg_.max_matches > 0 &&
+                                    result.by_pattern[pi].size() >= cfg_.max_matches) {
+                                    break;
+                                }
                             }
+                        }
+                    }
+                }
+
+                if (do_exact) {
+                    if (auto* indices = lookup_exact(mem.value)) {
+                        for (size_t vi : *indices) {
+                            record_exact_hit(inst_id, inst.pc, mem.value, vi,
+                                              MemSearchMatch::MemWrite, mem.addr);
                         }
                     }
                 }
             }
         }
 
-        // Search register diff values
+        // ── Register diff values: byte patterns + exact values ─────────
         if (cfg_.search_reg_values) {
             for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
                 auto diff = inst.reg_diff(d);
-                uint8_t buf[8];
-                std::memcpy(buf, &diff.value, 8);
-                result.bytes_scanned += 8;
 
-                for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
-                    const auto& pat = cfg_.patterns[pi];
-                    if (pat.bytes.size() > 8) continue;
+                if (do_patterns) {
+                    uint8_t buf[8];
+                    std::memcpy(buf, &diff.value, 8);
+                    result.bytes_scanned += 8;
 
-                    for (size_t offset = 0; offset + pat.bytes.size() <= 8; offset++) {
-                        if (match_at(buf, 8, offset, pat)) {
-                            MemSearchMatch match;
-                            match.inst_id = inst_id;
-                            match.pc = inst.pc;
-                            match.addr = 0;
-                            match.offset = static_cast<uint16_t>(offset);
-                            match.pattern_index = static_cast<uint8_t>(pi);
-                            match.source = MemSearchMatch::RegDiff;
-                            result.by_pattern[pi].push_back(result.matches.size());
-                            result.matches.push_back(match);
-                            break;
+                    for (size_t pi = 0; pi < cfg_.patterns.size(); pi++) {
+                        const auto& pat = cfg_.patterns[pi];
+                        if (pat.bytes.size() > 8) continue;
+
+                        for (size_t offset = 0; offset + pat.bytes.size() <= 8; offset++) {
+                            if (match_at(buf, 8, offset, pat)) {
+                                MemSearchMatch match;
+                                match.inst_id = inst_id;
+                                match.pc = inst.pc;
+                                match.addr = 0;
+                                match.offset = static_cast<uint16_t>(offset);
+                                match.pattern_index = static_cast<uint8_t>(pi);
+                                match.source = MemSearchMatch::RegDiff;
+                                match.is_exact_value_match = false;
+                                result.by_pattern[pi].push_back(result.matches.size());
+                                result.matches.push_back(match);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (do_exact) {
+                    if (auto* indices = lookup_exact(diff.value)) {
+                        for (size_t vi : *indices) {
+                            record_exact_hit(inst_id, inst.pc, diff.value, vi,
+                                              MemSearchMatch::RegDiff, 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── MOVZ/MOVK instruction immediates: exact values only ─────────
+        // Byte-pattern matching against a lone 16-bit immediate is rarely
+        // useful (patterns are meant for multi-byte sequences like keys/IVs),
+        // so only the exact-value path inspects immediates.
+        if (do_exact && cfg_.search_immediates) {
+            if (auto opcode = code_table.opcode_at(inst.pc)) {
+                if (aarch64::is_movz(*opcode) || aarch64::is_movk(*opcode)) {
+                    uint64_t imm = static_cast<uint64_t>(aarch64::movzk_imm16(*opcode))
+                                   << aarch64::movzk_shift(*opcode);
+                    if (auto* indices = lookup_exact(imm)) {
+                        for (size_t vi : *indices) {
+                            record_exact_hit(inst_id, inst.pc, imm, vi,
+                                              MemSearchMatch::Immediate, 0);
                         }
                     }
                 }
@@ -483,7 +644,8 @@ void MemSearchPass::linear_scan(PassContext& ctx, MemSearchResult& result) {
         }
 
         if (inst_id % progress_interval == 0) {
-            ctx.progress(static_cast<float>(inst_id - start) / (end - start));
+            ctx.progress(static_cast<float>(inst_id - start) /
+                         static_cast<float>(std::max<uint64_t>(end - start, 1)));
             if (ctx.cancelled()) {
                 return;
             }

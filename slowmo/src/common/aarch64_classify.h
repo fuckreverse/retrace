@@ -85,16 +85,18 @@ inline bool is_return(uint32_t opcode) noexcept {
     return is_ret(opcode);
 }
 
-/// Returns true for MOVZ (move with zero, bit pattern: sf:10:1010_0101:hw:imm16:Rd).
-/// Top 9 bits (excluding sf): 0b10_1001_01 → with sf=0: 0b0010_1001_01 = 0x52800000 >> 5
-/// Simpler: (opcode & 0x7FE00000) == 0x52800000.
+/// Returns true for MOVZ (move with zero).
+/// Encoding: sf:opc(10):100101:hw:imm16:Rd
+/// Mask out sf (bit 31) and hw (bits 22:21) to match all shift variants.
 inline bool is_movz(uint32_t opcode) noexcept {
-    return (opcode & 0x7FE00000u) == 0x52800000u;
+    return (opcode & 0x7F800000u) == 0x52800000u;
 }
 
 /// Returns true for MOVK (move with keep).
+/// Encoding: sf:opc(11):100101:hw:imm16:Rd
+/// Mask out sf (bit 31) and hw (bits 22:21) to match all shift variants.
 inline bool is_movk(uint32_t opcode) noexcept {
-    return (opcode & 0x7FE00000u) == 0x72800000u;
+    return (opcode & 0x7F800000u) == 0x72800000u;
 }
 
 // ─── Mnemonic-level helpers (for use with Capstone decoded strings) ────────

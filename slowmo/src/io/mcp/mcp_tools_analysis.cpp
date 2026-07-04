@@ -37,7 +37,6 @@
 #include "analysis/passes/call_context_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
-#include "analysis/passes/literal_search_pass.h"
 #include "analysis/passes/vm_abstract_pass.h"
 
 #include <fmt/core.h>
@@ -500,21 +499,39 @@ void TenetMcpService::register_analysis_tools() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Search tools (memory search, literal search, reg timeline, producer chain)
+// Search tools (memory search incl. exact-value/immediate search, reg timeline)
 // ═══════════════════════════════════════════════════════════════════════════
 
 void TenetMcpService::register_search_tools() {
     // ── mem_search ────────────────────────────────────────────────────────
+    // Two complementary modes (may be combined in a single call):
+    //   - byte pattern search (hex_pattern / text): arbitrary-length byte
+    //     sequences with optional wildcards, matched against memory writes
+    //     (and, if enabled, register diffs).
+    //   - exact-value search (exact_value / exact_values): O(1) hash-map
+    //     lookup for a specific scalar (e.g. a crypto IV or known pointer)
+    //     against register diffs, memory writes, and — with
+    //     search_immediates — MOVZ/MOVK instruction immediate fields. This
+    //     absorbs what used to be the standalone `literal_search` tool.
     register_tool(
         {"mem_search",
-         "Search for a byte pattern in all traced memory writes. "
-         "Useful for finding where a known value (key, magic bytes, etc.) "
-         "first appears or is computed.",
+         "Search memory writes/registers/immediates for a byte pattern and/or "
+         "exact scalar value(s). Useful for finding where a known value (key, "
+         "magic bytes, crypto constant, pointer, etc.) first appears or is "
+         "computed. Provide hex_pattern/text for byte-sequence search, and/or "
+         "exact_value/exact_values for O(1) exact-value search (formerly the "
+         "separate 'literal_search' tool — now a mode of this one). Set "
+         "search_immediates=true to also scan MOVZ/MOVK instruction immediates "
+         "for exact_value(s).",
          {{"type", "object"},
           {"properties", {
               {"hex_pattern", {{"type", "string"}, {"description", "Hex bytes to search, e.g. '4AES' or 'DEADBEEF'"}}},
               {"text",        {{"type", "string"}, {"description", "ASCII text to search (alternative to hex_pattern)"}}},
-              {"limit",       {{"type", "integer"}, {"description", "Max results"}, {"default", 50}}}
+              {"exact_value", {{"type", "string"}, {"description", "Single exact scalar value to search (hex or decimal)"}}},
+              {"exact_values",{{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Multiple exact scalar values to search (hex or decimal)"}}},
+              {"search_immediates", {{"type", "boolean"}, {"description", "Also scan MOVZ/MOVK immediate fields for exact_value(s)"}, {"default", false}}},
+              {"search_registers",  {{"type", "boolean"}, {"description", "Also scan register diffs (in addition to memory writes)"}, {"default", false}}},
+              {"limit",       {{"type", "integer"}, {"description", "Max results per pattern/value"}, {"default", 50}}}
           }}}},
         [this](const json& args) -> json {
             MemSearchConfig cfg;
@@ -536,7 +553,8 @@ void TenetMcpService::register_search_tools() {
                     }
                 }
                 cfg.patterns.push_back(std::move(pat));
-            } else if (args.contains("text")) {
+            }
+            if (args.contains("text")) {
                 MemSearchConfig::Pattern pat;
                 std::string text = args["text"].get<std::string>();
                 pat.label = text;
@@ -545,9 +563,20 @@ void TenetMcpService::register_search_tools() {
                     pat.mask.push_back(0xFF);
                 }
                 cfg.patterns.push_back(std::move(pat));
-            } else {
-                throw std::runtime_error("Provide hex_pattern or text");
             }
+            if (args.contains("exact_value")) {
+                cfg.exact_values.push_back(parse_hex(args["exact_value"].get<std::string>()));
+            }
+            if (args.contains("exact_values")) {
+                for (const auto& v : args["exact_values"]) {
+                    cfg.exact_values.push_back(parse_hex(v.get<std::string>()));
+                }
+            }
+            if (cfg.patterns.empty() && cfg.exact_values.empty()) {
+                throw std::runtime_error("Provide hex_pattern, text, exact_value, and/or exact_values");
+            }
+            cfg.search_immediates = args.value("search_immediates", false);
+            cfg.search_reg_values = args.value("search_registers", false);
             cfg.max_matches = args.value("limit", uint64_t(50));
 
             pm_->register_pass(std::make_unique<MemSearchPass>(std::move(cfg)));
@@ -555,13 +584,20 @@ void TenetMcpService::register_search_tools() {
 
             json hits = json::array();
             for (const auto& m : result.matches) {
-                hits.push_back({
+                const char* src = m.source == MemSearchMatch::MemWrite ? "mem_write" :
+                                  m.source == MemSearchMatch::RegDiff  ? "reg_diff" : "immediate";
+                json h = {
                     {"addr", fmt::format("0x{:X}", m.addr)},
                     {"inst_id", m.inst_id},
                     {"pc", fmt::format("0x{:X}", rebase(m.pc))},
-                    {"source", m.source == MemSearchMatch::MemWrite ? "mem_write" : "reg_diff"},
-                    {"pattern_index", m.pattern_index}
-                });
+                    {"source", src},
+                    {"exact_value_match", m.is_exact_value_match},
+                    {"index", m.pattern_index}
+                };
+                if (m.is_exact_value_match) {
+                    h["matched_value"] = fmt::format("0x{:X}", m.matched_value);
+                }
+                hits.push_back(std::move(h));
             }
             return {{"total_matches", result.matches.size()},
                     {"instructions_scanned", result.instructions_scanned},
@@ -619,42 +655,6 @@ void TenetMcpService::register_search_tools() {
                     {"has_more", has_more},
                     {"next_offset", has_more ? end_i : offset},
                     {"timeline", std::move(timeline)}};
-        }
-    );
-
-    // ── literal_search ────────────────────────────────────────────────────
-    register_tool(
-        {"literal_search",
-         "Search for a literal (integer/float) value in register values "
-         "and memory accesses throughout the trace.",
-         {{"type", "object"},
-          {"properties", {
-              {"value", {{"type", "string"}, {"description", "Value to search (hex or decimal)"}}},
-              {"limit", {{"type", "integer"}, {"description", "Max results"}, {"default", 50}}}
-          }},
-          {"required", json::array({"value"})}}},
-        [this](const json& args) -> json {
-            LiteralSearchConfig cfg;
-            cfg.search_values.push_back(parse_hex(args.at("value").get<std::string>()));
-            cfg.max_results = args.value("limit", uint64_t(50));
-
-            pm_->register_pass(std::make_unique<LiteralSearchPass>(std::move(cfg)));
-            const auto& result = require_pass<LiteralSearchResult>(pm_, "literal_search", "Literal search failed");
-
-            json hits = json::array();
-            for (const auto& h : result.hits) {
-                const char* src = (h.source == LiteralHit::RegDiff) ? "reg" :
-                                  (h.source == LiteralHit::MemWrite) ? "mem" : "imm";
-                hits.push_back({
-                    {"inst_id",  h.inst_id},
-                    {"pc",       fmt::format("0x{:X}", rebase(h.pc))},
-                    {"source",   src},
-                    {"matched_value", fmt::format("0x{:X}", h.matched_value)}
-                });
-            }
-            return {{"total", result.hits.size()},
-                    {"instructions_scanned", result.instructions_scanned},
-                    {"hits", std::move(hits)}};
         }
     );
 

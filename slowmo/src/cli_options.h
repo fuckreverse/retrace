@@ -101,8 +101,11 @@ struct CliOptions {
     uint64_t reg_timeline_start = 0, reg_timeline_end = 0;
 
     bool opt_mem_search = false;
-    std::string mem_search_pattern;
+    std::string mem_search_pattern;               // --mem-search <hex>: byte pattern
     uint64_t mem_search_start = 0, mem_search_end = 0;
+    // Exact-value search (formerly the standalone --literal-search).
+    std::vector<uint64_t> mem_search_exact_values; // --mem-search-value <hex> (repeatable)
+    bool mem_search_immediates = false;            // --mem-search-immediates: also scan MOVZ/MOVK
 
     bool opt_call_context = false;
     uint64_t call_context_inst_id = 0;
@@ -113,10 +116,6 @@ struct CliOptions {
 
     bool opt_entropy = false;
     uint64_t entropy_start = 0, entropy_end = 0;
-
-    bool opt_literal_search = false;
-    uint64_t literal_search_value = 0;
-    uint64_t literal_search_start = 0, literal_search_end = 0;
 
     bool opt_no_parallel_scan = false;
 

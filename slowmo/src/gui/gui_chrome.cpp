@@ -364,10 +364,9 @@ if (ctx_mem_addr_ != 0 && entropy_addr_buf_[0] == '\0') {
                 run_pass_by_name("memory_snapshot"); show_analysis_ = true;
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Literal Search\xe2\x80\xa6")) {
-                run_pass_by_name("literal_search"); show_analysis_ = true;
-            }
-            if (ImGui::MenuItem("Memory Pattern Search\xe2\x80\xa6")) {
+            if (ImGui::MenuItem("Memory / Value Search\xe2\x80\xa6")) {
+                // Covers both byte-pattern and exact-value/immediate search —
+                // literal_search was merged into mem_search.
                 run_pass_by_name("mem_search"); show_analysis_ = true;
             }
             if (ImGui::MenuItem("YARA Scan\xe2\x80\xa6")) {

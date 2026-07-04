@@ -856,7 +856,7 @@ enum MenuTag : NSInteger {
     // ── Tools: 700-799 ──────────────────────────────────────────────
     kTagToolEntropy           = 700,
     kTagToolMemSnapshot       = 701,
-    kTagToolLiteralSearch     = 702,
+    // 702 was kTagToolLiteralSearch — literal_search merged into mem_search.
     kTagToolMemSearch         = 703,
     kTagToolYaraScan          = 704,
     kTagToolMemHistory        = 705,
@@ -1081,9 +1081,9 @@ case kTagAnaVMAbstract:     action = [this]{
             }; break;
         case kTagToolMemSnapshot:
             action = [this]{ run_pass_by_name("memory_snapshot"); show_analysis_ = true; }; break;
-        case kTagToolLiteralSearch:
-            action = [this]{ run_pass_by_name("literal_search"); show_analysis_ = true; }; break;
         case kTagToolMemSearch:
+            // Covers both byte-pattern and exact-value/immediate search —
+            // literal_search was merged into mem_search.
             action = [this]{ run_pass_by_name("mem_search"); show_analysis_ = true; }; break;
         case kTagToolYaraScan:
             action = [this]{ run_pass_by_name("yara_mem_scan"); show_analysis_ = true; }; break;
@@ -1423,8 +1423,7 @@ void tenet::GuiApp::setup_native_menu() {
         [toolMenu addItem:mk(@"Entropy at Cursor\u2026",         @"", 0, kTagToolEntropy)];
         [toolMenu addItem:mk(@"Memory Snapshot\u2026",           @"", 0, kTagToolMemSnapshot)];
         [toolMenu addItem:sep()];
-        [toolMenu addItem:mk(@"Literal Search\u2026",            @"", 0, kTagToolLiteralSearch)];
-        [toolMenu addItem:mk(@"Memory Pattern Search\u2026",     @"", 0, kTagToolMemSearch)];
+        [toolMenu addItem:mk(@"Memory / Value Search\u2026",     @"", 0, kTagToolMemSearch)];
 #if TENET_ENABLE_YARA
         [toolMenu addItem:mk(@"YARA Scan\u2026",                 @"", 0, kTagToolYaraScan)];
 #endif

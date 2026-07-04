@@ -29,7 +29,6 @@
 #include "analysis/passes/call_context_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
-#include "analysis/passes/literal_search_pass.h"
 #include "analysis/passes/yara_mem_scan_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"
@@ -1584,11 +1583,14 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
         }
     }
 
-    // --mem-search: Boyer-Moore-Horspool multi-pattern memory search
+    // --mem-search: byte-pattern search (Boyer-Moore-Horspool/YARA) + exact-value
+    // search (formerly the standalone --literal-search) + immediate scan.
     if (opts.opt_mem_search) {
         MemSearchConfig ms_cfg;
-        // Parse hex pattern string into bytes and add as a Pattern
-        {
+        // Parse hex pattern string into bytes and add as a Pattern (only if
+        // a byte pattern was actually given — exact-value-only invocations
+        // via --mem-search-value leave mem_search_pattern empty).
+        if (!opts.mem_search_pattern.empty()) {
             std::vector<uint8_t> pat_bytes;
             std::string hex = opts.mem_search_pattern;
             for (size_t i = 0; i + 1 < hex.size(); i += 2) {
@@ -1596,6 +1598,8 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             }
             ms_cfg.patterns.emplace_back(std::move(pat_bytes), opts.mem_search_pattern);
         }
+        ms_cfg.exact_values = opts.mem_search_exact_values;
+        ms_cfg.search_immediates = opts.mem_search_immediates;
         ms_cfg.start_inst_id = opts.mem_search_start;
         ms_cfg.end_inst_id = opts.mem_search_end;
         pm.register_pass(std::make_unique<MemSearchPass>(std::move(ms_cfg)));
@@ -1611,12 +1615,19 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             size_t limit = std::min(ms_result.matches.size(), size_t(500));
             for (size_t i = 0; i < limit; i++) {
                 const auto& m = ms_result.matches[i];
-                matches_arr.push_back({
+                const char* source_str = m.source == MemSearchMatch::MemWrite ? "mem" :
+                                          m.source == MemSearchMatch::RegDiff  ? "reg" : "imm";
+                json j = {
                     {"addr", fmt::format("0x{:X}", m.addr)},
                     {"inst_id", m.inst_id},
                     {"pc", fmt::format("0x{:X}", m.pc)},
-                    {"source", m.source == MemSearchMatch::MemWrite ? "mem" : "reg"}
-                });
+                    {"source", source_str},
+                    {"exact_value_match", m.is_exact_value_match}
+                };
+                if (m.is_exact_value_match) {
+                    j["matched_value"] = fmt::format("0x{:X}", m.matched_value);
+                }
+                matches_arr.push_back(std::move(j));
             }
             ms_json["matches"] = std::move(matches_arr);
             ms_json["total"] = ms_result.matches.size();
@@ -1716,40 +1727,6 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             ent_json["blocks"] = std::move(blocks_arr);
             if (ent_result.blocks.size() > 200) ent_json["truncated"] = true;
             fmt::print("{}\n", ent_json.dump(2));
-        }
-    }
-
-    // --literal-search: find a specific value in registers and memory
-    if (opts.opt_literal_search) {
-        LiteralSearchConfig ls_cfg;
-        ls_cfg.search_values.push_back(opts.literal_search_value);
-        pm.register_pass(std::make_unique<LiteralSearchPass>(std::move(ls_cfg)));
-        const auto& ls_raw = pm.require("literal_search");
-        if (!ls_raw.ok()) {
-            fmt::print(stderr, "[literal-search] Pass failed: {}\n", ls_raw.error_message);
-            rc |= 1;
-        } else {
-            const auto& ls_result = ls_raw.get<LiteralSearchResult>();
-            fmt::print(stderr, "[literal-search] {} hits for 0x{:X}\n",
-                       ls_result.hits.size(), opts.literal_search_value);
-            json ls_json;
-            json hits_arr = json::array();
-            size_t limit = std::min(ls_result.hits.size(), size_t(1000));
-            for (size_t i = 0; i < limit; i++) {
-                const auto& h = ls_result.hits[i];
-                hits_arr.push_back({
-                    {"inst_id", h.inst_id},
-                    {"pc", fmt::format("0x{:X}", h.pc)},
-                    {"matched_value", fmt::format("0x{:X}", h.matched_value)},
-                    {"source", h.source == LiteralHit::RegDiff ? "reg" :
-                               h.source == LiteralHit::MemWrite ? "mem" : "imm"}
-                });
-            }
-            ls_json["value"] = fmt::format("0x{:X}", opts.literal_search_value);
-            ls_json["hits"] = std::move(hits_arr);
-            ls_json["total"] = ls_result.hits.size();
-            if (ls_result.hits.size() > 1000) ls_json["truncated"] = true;
-            fmt::print("{}\n", ls_json.dump(2));
         }
     }
 

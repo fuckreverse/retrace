@@ -28,7 +28,6 @@
 #include "analysis/passes/memory_snapshot_pass.h"
 #include "analysis/passes/mem_search_pass.h"
 #include "analysis/passes/entropy_pass.h"
-#include "analysis/passes/literal_search_pass.h"
 #include "analysis/passes/yara_mem_scan_pass.h"
 
 #include "analysis/passes/syscall_intercept_pass.h"
@@ -177,12 +176,12 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
                 c.patterns.emplace_back(std::move(bytes), std::string(hex));
             }
         }
+        // Exact-value search (formerly the standalone literal_search pass).
+        c.exact_values = ctx.literal_search_values;
+        if (!c.exact_values.empty()) {
+            c.search_immediates = true;
+        }
         return std::make_unique<MemSearchPass>(std::move(c));
-    }
-    if (name == "literal_search") {
-        LiteralSearchConfig c;
-        c.search_values = ctx.literal_search_values;
-        return std::make_unique<LiteralSearchPass>(std::move(c));
     }
     if (name == "memory_snapshot") {
         MemorySnapshotConfig c;
@@ -269,9 +268,8 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"strings",               "Strings",       "String accesses in the trace",                           PassCategory::Memory,    PassDefault::Yes},
         {"memory_strings",        "Mem Strings",   "Time-aware string discovery via memory reconstruction",  PassCategory::Memory,    PassDefault::No},
         {"memory_snapshot",       "Mem Snapshot",  "Capture memory snapshots at call sites / inst_ids",      PassCategory::Memory,    PassDefault::No},
-        {"mem_search",            "Mem Search",    "Multi-pattern search on memory writes / registers",      PassCategory::Memory,    PassDefault::No},
+        {"mem_search",            "Mem Search",    "Multi-pattern + exact-value/immediate search on memory/registers", PassCategory::Memory, PassDefault::No},
         {"entropy",               "Entropy",       "Shannon entropy of a memory region (ciphertext detect)", PassCategory::Memory,    PassDefault::No},
-        {"literal_search",        "Literal Search","Search literal values in reg/mem/immediates",            PassCategory::Memory,    PassDefault::No},
         {"yara_mem_scan",         "YARA Mem Scan", "YARA scan of memory pages (crypto constants in mem)",    PassCategory::Memory,    PassDefault::No},
 
         // — Platform API —
@@ -460,11 +458,6 @@ if (name == "loop_semantics") {
         if (auto* r = try_get<EntropyResult>(result))
             return fmt::format("entropy: {:.2f} ({})", r->overall_entropy,
                                r->known_bytes);
-    }
-    if (name == "literal_search") {
-        if (auto* r = try_get<LiteralSearchResult>(result))
-            return fmt::format("hits: {}, scanned {} insts",
-                               r->hits.size(), r->instructions_scanned);
     }
     if (name == "yara_mem_scan") {
         if (auto* r = try_get<YaraMemScanResult>(result))

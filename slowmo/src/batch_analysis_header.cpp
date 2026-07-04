@@ -27,7 +27,6 @@
 #include "analysis/passes/call_context_pass.h"
 #include "analysis/passes/window_stats_pass.h"
 #include "analysis/passes/entropy_pass.h"
-#include "analysis/passes/literal_search_pass.h"
 #include "analysis/passes/yara_mem_scan_pass.h"
 #include "analysis/passes/thread_filter_pass.h"
 #include "analysis/passes/objc_crypto_pass.h"

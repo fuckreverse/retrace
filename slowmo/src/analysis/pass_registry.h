@@ -26,7 +26,7 @@ enum class PassCategory : uint8_t {
     Structure,   ///< function / xref / cfg / call_graph / loop / disassembly
     Taint,       ///< taint / backward_taint / taint_source_annotation
     Crypto,      ///< pattern (incl. constant materialization) / loop_semantics / algorithm_summary / objc_crypto
-    Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / literal_search / yara_mem_scan
+    Memory,      ///< string / memory_string / memory_snapshot / mem_search / entropy / yara_mem_scan
     PlatformApi,  ///< objc / syscall_intercept
     Profile,     ///< trace_fold / reg_timeline / call_context / window_stats / trace_diff / dataflow_graph
     Misc,        ///< thread / thread_filter
@@ -56,8 +56,9 @@ struct PassRunCtx {
     uint64_t range_start  = 0;       ///< analysis range start
     uint64_t range_end    = UINT64_MAX;  ///< analysis range end (exclusive-ish)
     std::vector<uint64_t> thread_ids;             ///< for thread_filter (empty = all)
-    std::vector<std::string> mem_search_patterns; ///< hex patterns for mem_search
-    std::vector<uint64_t> literal_search_values;  ///< values for literal_search
+    std::vector<std::string> mem_search_patterns; ///< hex byte patterns for mem_search
+    std::vector<uint64_t> literal_search_values;  ///< exact scalar values for mem_search
+                                                   ///< (formerly the standalone literal_search pass)
 
     // ── Entropy ──────────────────────────────────────────────────────
     uint64_t entropy_addr = 0;       ///< memory region address for entropy analysis

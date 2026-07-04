@@ -389,7 +389,6 @@ src/core/register_file.cpp
     src/analysis/passes/call_context_pass.cpp
     src/analysis/passes/window_stats_pass.cpp
     src/analysis/passes/entropy_pass.cpp
-    src/analysis/passes/literal_search_pass.cpp
     src/analysis/passes/yara_mem_scan_pass.cpp
     src/analysis/passes/thread_filter_pass.cpp
     src/analysis/passes/objc_crypto_pass.cpp

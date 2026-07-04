@@ -22,7 +22,7 @@ bool CliOptions::has_analysis_option() const {
            opt_trace_fold || opt_reg_timeline ||
            opt_mem_search || opt_call_context ||
            opt_window_stats ||
-           opt_entropy || opt_literal_search ||
+           opt_entropy ||
            opt_dump_memaccess ||
            // P3 options
            opt_yara_mem_scan || opt_thread_filter ||
@@ -312,6 +312,15 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--mem-search-range" && i + 2 < argc) {
             opts.mem_search_start = std::stoull(argv[++i]);
             opts.mem_search_end = std::stoull(argv[++i]);
+        } else if ((arg == "--mem-search-value" || arg == "--literal-search") && i + 1 < argc) {
+            // --literal-search is a deprecated alias for --mem-search-value:
+            // exact-value search is now a mode of MemSearchPass rather than a
+            // standalone pass. Repeatable.
+            opts.opt_mem_search = true;
+            opts.mem_search_exact_values.push_back(std::stoull(argv[++i], nullptr, 16));
+        } else if (arg == "--mem-search-immediates") {
+            opts.opt_mem_search = true;
+            opts.mem_search_immediates = true;
         } else if (arg == "--call-context" && i + 1 < argc) {
             opts.opt_call_context = true;
             opts.call_context_inst_id = std::stoull(argv[++i]);
@@ -325,12 +334,12 @@ CliOptions parse_args(int argc, char** argv) {
             opts.opt_entropy = true;
             opts.entropy_start = std::stoull(argv[++i]);
             opts.entropy_end = std::stoull(argv[++i]);
-        } else if (arg == "--literal-search" && i + 1 < argc) {
-            opts.opt_literal_search = true;
-            opts.literal_search_value = std::stoull(argv[++i], nullptr, 16);
         } else if (arg == "--literal-search-range" && i + 2 < argc) {
-            opts.literal_search_start = std::stoull(argv[++i]);
-            opts.literal_search_end = std::stoull(argv[++i]);
+            // Deprecated alias for --mem-search-range (shares the same
+            // inst_id range field since exact-value search now runs inside
+            // MemSearchPass).
+            opts.mem_search_start = std::stoull(argv[++i]);
+            opts.mem_search_end = std::stoull(argv[++i]);
         } else if (arg == "--no-parallel-scan") {
             opts.opt_no_parallel_scan = true;
         } else if (arg == "--image" && i + 1 < argc) {
