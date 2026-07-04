@@ -1851,7 +1851,7 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             rc |= 1;
         } else {
             const auto& tf_result = tf_raw.get<ThreadFilterResult>();
-            fmt::print(stderr, "[thread-filter] %zu threads, filtered=%s\n",
+            fmt::print(stderr, "[thread-filter] {} threads, filtered={}\n",
                        tf_result.thread_count,
                        tf_result.is_filtered ? "yes" : "no");
 
