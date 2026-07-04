@@ -250,6 +250,58 @@ TEST_CASE("CallGraphPass detects recursive functions", "[unit][pass][call_graph]
             REQUIRE(pc != rt_pc(0x1000));
         }
     }
+
+    SECTION("recursive_functions returns exactly {fact}, not every node") {
+        // Regression test: recursive_functions() used to be implemented as
+        // `has_call_path(pc, pc)`, whose "from == to" base case is
+        // trivially true for ANY node — so it used to report every single
+        // node in the graph (including <root> and fact's own non-recursive
+        // callers) as "recursive". With the fix, only nodes reachable from
+        // themselves via >= 1 real edge should show up. This fixture has
+        // exactly one real node with a genuine self-edge (fact@0x2000), so
+        // the result must be precisely {fact} — not "at least contains
+        // fact", not "everything".
+        auto recursive = cg.recursive_functions();
+        REQUIRE(recursive.size() == 1);
+        REQUIRE(recursive[0] == rt_pc(0x2000));
+    }
+}
+
+TEST_CASE("CallGraphPass recursive_functions does not misclassify a DAG",
+          "[unit][pass][call_graph]") {
+    // Regression test for the has_call_path(pc,pc) base-case bug: a strict
+    // call DAG (root -> foo -> bar, no cycles anywhere) must report ZERO
+    // recursive functions. Before the fix, every node (root, foo, bar) was
+    // incorrectly reported as recursive because has_call_path(pc, pc) is
+    // unconditionally true for any pc.
+    auto env = make_env(gen_call_chain, "callgraph_no_recursion_dag");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<FunctionPass>());
+    pm->register_pass(std::make_unique<CallGraphPass>());
+
+    auto& cg = pm->require("call_graph").get<CallGraphResult>();
+
+    SECTION("no node is falsely reported as recursive") {
+        REQUIRE(cg.nodes.size() == 3);  // <root>, foo, bar
+        auto recursive = cg.recursive_functions();
+        REQUIRE(recursive.empty());
+    }
+
+    SECTION("has_real_cycle is false for every real node in a DAG") {
+        REQUIRE_FALSE(cg.has_real_cycle(rt_pc(0x2000)));  // foo
+        REQUIRE_FALSE(cg.has_real_cycle(rt_pc(0x3000)));  // bar
+        REQUIRE_FALSE(cg.has_real_cycle(kCallGraphRootTagBit | rt_pc(0x1000)));
+    }
+
+    SECTION("has_call_path(pc, pc) is still unconditionally true (unchanged base-case semantics)") {
+        // has_call_path's trivial self-reachability semantics are
+        // intentional and documented — only recursive_functions()/
+        // has_real_cycle() needed to stop relying on it for cycle
+        // detection.
+        REQUIRE(cg.has_call_path(rt_pc(0x2000), rt_pc(0x2000)));
+        REQUIRE(cg.has_call_path(rt_pc(0x3000), rt_pc(0x3000)));
+    }
 }
 
 TEST_CASE("CallGraphPass ranking helpers order by call count", "[unit][pass][call_graph]") {
@@ -307,6 +359,16 @@ TEST_CASE("CallGraphPass ranking helpers order by call count", "[unit][pass][cal
         REQUIRE(active.size() == 1);
         REQUIRE(active[0].first == rt_pc(0x2000));
         REQUIRE(active[0].second == 6);
+    }
+
+    SECTION("none of driver/foo/bar are misclassified as recursive") {
+        // driver calls foo 5x and bar 1x, none of them call back into
+        // driver or each other — a real-world "fan-out, no cycles" shape.
+        // Regression coverage for the has_call_path(pc,pc) base-case bug
+        // (see the dedicated DAG test above), exercised here with a
+        // multi-callee/high-call-count fixture rather than a simple chain.
+        auto recursive = cg.recursive_functions();
+        REQUIRE(recursive.empty());
     }
 }
 

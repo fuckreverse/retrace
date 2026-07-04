@@ -183,11 +183,56 @@ struct CallGraphResult {
         return false;
     }
 
+    /// Whether `pc` lies on a real cycle of length >= 1 (directly or
+    /// indirectly calls itself via at least one outgoing edge).
+    ///
+    /// This is deliberately NOT implemented as `has_call_path(pc, pc)`:
+    /// that helper treats "from == to" as a trivial true base case (see its
+    /// doc comment — that's the correct/expected semantics for a general
+    /// reachability query, e.g. "is pc on the same call tree as itself").
+    /// Reusing it here would make *every* node in `nodes` count as
+    /// "recursive", since the base case fires before any edge is ever
+    /// followed. A real recursion check must require walking at least one
+    /// outgoing edge before we're allowed to land back on `pc`.
+    bool has_real_cycle(uint64_t pc) const {
+        auto start_it = nodes.find(pc);
+        if (start_it == nodes.end()) return false;
+
+        ankerl::unordered_dense::set<uint64_t> visited;
+        std::vector<uint64_t> queue;
+
+        // Seed the BFS with pc's direct callees (i.e. force at least one
+        // edge traversal before we can match `pc` again).
+        for (auto edge_idx : start_it->second.outgoing_edges) {
+            uint64_t callee = edges[edge_idx].callee_pc;
+            if (callee == pc) return true;  // direct self-call
+            if (visited.insert(callee).second) {
+                queue.push_back(callee);
+            }
+        }
+
+        while (!queue.empty()) {
+            uint64_t current = queue.back();
+            queue.pop_back();
+            auto it = nodes.find(current);
+            if (it == nodes.end()) continue;
+            for (auto edge_idx : it->second.outgoing_edges) {
+                uint64_t callee = edges[edge_idx].callee_pc;
+                if (callee == pc) return true;
+                if (visited.insert(callee).second) {
+                    queue.push_back(callee);
+                }
+            }
+        }
+        return false;
+    }
+
     /// Find all recursive functions (functions that directly or indirectly call themselves).
     std::vector<uint64_t> recursive_functions() const {
         std::vector<uint64_t> result;
         for (const auto& [pc, node] : nodes) {
-            if (has_call_path(pc, pc)) {
+            (void)node;
+            if (has_real_cycle(pc)) {
                 result.push_back(pc);
             }
         }
