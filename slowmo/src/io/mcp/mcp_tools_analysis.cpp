@@ -1611,6 +1611,27 @@ void TenetMcpService::register_pass_tools() {
                 const VMHandler* handler = result.handler_at(s.handler_entry_pc);
                 if (handler && !handler->label.empty()) sj["label"] = handler->label;
 
+                // VM context field snapshot (from VMContextHint.ctx_fields)
+                if (!s.ctx_fields.empty()) {
+                    json ctx_j = json::object();
+                    for (const auto& [name, val] : s.ctx_fields) {
+                        ctx_j[name] = fmt::format("0x{:X}", val);
+                    }
+                    sj["ctx_fields"] = std::move(ctx_j);
+                }
+
+                // VM register file / stack snapshot (from VMRegisterFileHint).
+                // Named registers (e.g. "R0".."R31") and stack entries
+                // ("SP", "S0".."Sn") are both stored in vm_regs by the pass;
+                // surface them verbatim as a name->hex-value map.
+                if (!s.vm_regs.empty()) {
+                    json regs_j = json::object();
+                    for (const auto& [name, val] : s.vm_regs) {
+                        regs_j[name] = fmt::format("0x{:X}", val);
+                    }
+                    sj["vm_regs"] = std::move(regs_j);
+                }
+
                 steps_arr.push_back(std::move(sj));
             }
             output["steps"] = std::move(steps_arr);

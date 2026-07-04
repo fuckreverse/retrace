@@ -707,6 +707,126 @@ TEST_CASE("mem_search: text search rejects a non-matching string",
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// vm_abstract: ctx_fields / vm_regs must be serialised into the MCP response
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Regression coverage for a bug where VMAbstractPass correctly computed
+// per-step VM context field and VM register-file snapshots (VMStep::ctx_fields
+// / VMStep::vm_regs — see vm_abstract_pass.cpp), and the GUI VM Workspace
+// panel displayed them correctly (it reads VMStep directly), but the
+// `vm_abstract` MCP tool's JSON step serialisation only emitted
+// inst_id_start/end, handler_entry_pc, opcode, vm_pc, and label — silently
+// dropping ctx_fields and vm_regs. Any MCP/AI client (as opposed to the GUI)
+// therefore saw the VM register/context panels as always empty, even when a
+// fully valid vm_registers/ctx_fields hint was supplied.
+//
+// This builds a minimal FetchOnly-style VM: a dispatcher PC hit repeatedly,
+// with a register-file base held in x9. Before each hit, memory at
+// [x9+0] ("R0") and [x9+8] (ctx field "flags") is written with a distinct
+// value, so each VM step's snapshot is independently checkable.
+
+static McpTestEnv make_vm_abstract_env() {
+    constexpr uint64_t RF_BASE = 0xE0000000ULL;
+    constexpr uint64_t DISPATCH_PC = 0x2000ULL;
+    constexpr int kIters = 4;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.x(9) = tw.rt(0) + RF_BASE;  // x9 = RF base (runtime address)
+        tw.emit_anchor(ms);
+
+        auto write_mem = [&](uint64_t addr, uint64_t val, uint64_t pc) {
+            TraceWriter::MemAcc ma;
+            ma.type = 2;  // WRITE
+            ma.size = 8;
+            ma.addr = addr;
+            ma.value = val;
+            tw.emit(ms, pc, enc::nop(), {{33, tw.rt(pc + 4)}}, {ma});
+        };
+
+        uint64_t pc = 0x1000;
+        for (int i = 0; i < kIters; i++) {
+            // R0 = 0x1000 + i, ctx field "flags" = 0x2000 + i
+            write_mem(ms.x(9) + 0, 0x1000ULL + i, pc); pc += 4;
+            write_mem(ms.x(9) + 8, 0x2000ULL + i, pc); pc += 4;
+            // Dispatcher fetch point: hit once per "VM instruction".
+            tw.emit(ms, DISPATCH_PC, enc::nop(), {{33, tw.rt(pc)}}, {});
+        }
+        tw.emit(ms, pc, enc::nop(), {{33, tw.rt(pc + 4)}}, {});
+        tw.emit_anchor(ms);
+    }, "mcp_vm_abstract_test");
+
+    McpTestEnv result;
+    result.env = std::move(env);
+    result.pm = make_pm(*result.env);
+    result.mcp = std::make_unique<TenetMcpService>(
+        *result.env->reader, *result.env->index,
+        *result.env->regfile, *result.env->memory,
+        result.pm.get(),
+        &result.env->code_table, &result.env->decoder);
+    return result;
+}
+
+// vm_abstract is a pass-backed MCP tool: it runs asynchronously (like
+// mem_search) and throws PassNotReady until the pass completes.
+static json call_vm_abstract_blocking(McpTestEnv& ctx, const json& args,
+                                       int max_attempts = 200) {
+    for (int i = 0; i < max_attempts; i++) {
+        try {
+            return ctx.mcp->call_tool("vm_abstract", args);
+        } catch (const PassNotReady&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    FAIL("vm_abstract pass did not complete in time");
+    return {};
+}
+
+TEST_CASE("vm_abstract: MCP response includes vm_regs and ctx_fields per step",
+          "[unit][mcp][vm_abstract]") {
+    auto ctx = make_vm_abstract_env();
+
+    // NOTE: MCP tools accept "displayed" PCs (IDA-style, relative to the
+    // service's image_base_ — default 0x100000000, matching the fixture's
+    // default TraceWriter::module_base). unrebase() converts back to the
+    // trace's runtime PC (static_pc + module_slide). So dispatcher_pc here
+    // must be image_base(0x100000000) + DISPATCH_PC(0x2000).
+    auto res = call_vm_abstract_blocking(ctx, {
+        {"dispatch_type", "FetchOnly"},
+        {"dispatcher_pc", "0x100002000"},
+        {"ctx_base_reg", "x9"},
+        {"ctx_fields", json::array({
+            json{{"name", "flags"}, {"offset", 8}, {"size", 8}, {"is_pointer", false}}
+        })},
+        {"rf_base_reg", "x9"},
+        {"vm_registers", json::array({
+            json{{"name", "R0"}, {"offset", 0}, {"size", 8}}
+        })}
+    });
+
+    REQUIRE(res["total_vm_steps"].get<size_t>() >= 1);
+    REQUIRE_FALSE(res["steps"].empty());
+
+    // Every returned step must carry both a vm_regs and a ctx_fields map —
+    // this is exactly what was missing before the fix (the keys would be
+    // absent from `sj` entirely, not merely empty).
+    bool saw_r0 = false, saw_flags = false;
+    for (const auto& step : res["steps"]) {
+        REQUIRE(step.contains("vm_regs"));
+        REQUIRE(step.contains("ctx_fields"));
+        REQUIRE(step["vm_regs"].contains("R0"));
+        REQUIRE(step["ctx_fields"].contains("flags"));
+        if (step["vm_regs"]["R0"].get<std::string>() != "0x0") saw_r0 = true;
+        if (step["ctx_fields"]["flags"].get<std::string>() != "0x0") saw_flags = true;
+    }
+    CHECK(saw_r0);
+    CHECK(saw_flags);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Tool registration count
 // ═════════════════════════════════════════════════════════════════════════════
 
