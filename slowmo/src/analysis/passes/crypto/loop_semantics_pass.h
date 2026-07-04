@@ -61,6 +61,17 @@ struct LoopSemanticInfo {
     bool has_addition_chain = false;     // ADD/SUB chains
     bool has_modular_arithmetic = false; // MUL/UDIV patterns
 
+    /// True if at least one register-offset load's index register was
+    /// verified to be produced by a mixing op (XOR/shift/add/mul) earlier in
+    /// the same loop body, i.e. `has_sbox_pattern` is backed by an actual
+    /// same-body data-flow dependency rather than merely "a load reads 2+
+    /// registers somewhere". See BodyFeatures::data_dependent_load_count in
+    /// loop_semantics_pass.cpp for the detection logic. When false but
+    /// has_sbox_pattern is true, the S-box classification rests solely on
+    /// the weaker structural heuristic and should be treated with more
+    /// skepticism (surfaced in `description`).
+    bool sbox_pattern_data_dependent = false;
+
     // ─── Iteration sampling info ─────────────────────────────────────
     uint64_t sample_iter_start = 0;      // inst_id of first sampled iteration start
     uint64_t sample_iter_end = 0;        // inst_id of first sampled iteration end
