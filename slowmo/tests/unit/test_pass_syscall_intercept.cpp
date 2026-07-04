@@ -93,6 +93,75 @@ static std::unique_ptr<TraceEnv> make_with_capicall_known() {
     }, "si_capicall_cccrypt");
 }
 
+// NOTE on api_id range: qbditrace_capicall_head_t::api_id on disk is a
+// single uint8_t (TraceFormat.h), but qbditrace_capi_id_t defines the
+// Android/BoringSSL and JNI-extended entries at 200-726 — i.e. every
+// "real" Android CAPI id (EVP_EncryptUpdate=601, HMAC_Init_ex=610, ...)
+// does not fit in the on-disk field and would silently truncate if it
+// ever reached emit_capicall()/the real tracer. See QBDITrace.cpp:1875
+// (`ch.api_id = cf->api_id;`, narrowing a uint16_t to uint8_t) — this
+// looks like a genuine format bug, filed for follow-up separately.
+//
+// Because of that truncation, these tests intentionally stay within the
+// uint8_t-safe range and instead prove platform dispatch using "CCCrypt"
+// (api_id=134), which only resolves in the iOS/CommonCrypto table
+// (known_apis()) and must NOT resolve to BoringSSL/CommonCrypto category
+// when the header declares target_os=Android.
+
+/// Trace with target_os=iOS and a REC_CAPICALL for CCCrypt (api_id=134).
+/// Baseline: on iOS, CCCrypt resolves via known_apis() (CommonCrypto table).
+static std::unique_ptr<TraceEnv> make_with_capicall_ios_cccrypt() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_capicall(134, tw.rt(0x1008), 0xB000100ULL,
+                         {0, 0, 0, 0xC000ULL, 16, 0, 0, 0});
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_capicall_ios_cccrypt");
+}
+
+/// Same CCCrypt CAPICALL (api_id=134), but with target_os=Android. CCCrypt
+/// only exists in known_apis() (iOS/CommonCrypto), not known_android_apis()
+/// (BoringSSL) — so on Android the Collector must NOT resolve it to
+/// ApiCategory::CommonCrypto. This proves the target_os->table dispatch
+/// branch (is_darwin_target/is_linux_target in the ctor) actually swaps
+/// tables instead of always loading both.
+static std::unique_ptr<TraceEnv> make_with_capicall_cccrypt_on_android() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_capicall(134, tw.rt(0x1008), 0xB000200ULL,
+                         {0, 0, 0, 0xC000ULL, 16, 0, 0, 0});
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_capicall_cccrypt_on_android");
+}
+
+/// Trace with target_os=Android and a REC_SVC record (syscall #1 = write).
+/// The Syscall category path doesn't depend on the api_id signature tables
+/// at all, but this still exercises SyscallInterceptCollector's ctor with
+/// target_os=Android end-to-end (constructor loads known_android_apis(),
+/// scan proceeds normally) to guard against platform-specific ctor crashes
+/// or table-loading regressions.
+static std::unique_ptr<TraceEnv> make_with_svc_android() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_svc(tw.rt(0x1004), /*no=*/1, /*a0=*/3, /*a1=*/0xBEEF000ULL);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_svc_android");
+}
+
 /// Trace with REC_CAPICALL that carries 2 inline captured strings.
 /// api_id=22 (strcmp) with x0="hello", x1="world".
 static std::unique_ptr<TraceEnv> make_with_capicall_strings() {
@@ -347,6 +416,102 @@ TEST_CASE("SyscallInterceptPass: CAPICALL known iOS API (CCCrypt) resolved",
 
     SECTION("callee_pc == 0xDEAD100") {
         REQUIRE(res.calls[0].callee_pc == 0xDEAD100ULL);
+    }
+}
+
+// ─── B2b. Android target_os platform dispatch ────────────────────────────────
+//
+// These tests exercise SyscallInterceptCollector's target_os-based table
+// selection (see syscall_intercept_pass.cpp ctor: is_darwin_target vs
+// is_linux_target). See the NOTE above make_with_capicall_ios_cccrypt() for
+// why they use CCCrypt (api_id=134) rather than a genuine BoringSSL id.
+
+TEST_CASE("SyscallInterceptPass: CCCrypt resolves to CommonCrypto on iOS (baseline)",
+          "[unit][pass][syscall_intercept][capicall][android]") {
+    auto env = make_with_capicall_ios_cccrypt();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+
+    SECTION("exactly one call recorded") {
+        REQUIRE(res.total() == 1);
+    }
+
+    SECTION("callee_name is 'CCCrypt'") {
+        REQUIRE(res.calls[0].callee_name == "CCCrypt");
+    }
+
+    SECTION("category resolved to CommonCrypto on iOS") {
+        REQUIRE(res.calls[0].category == ApiCategory::CommonCrypto);
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: target_os=Android does not load the iOS CommonCrypto table",
+          "[unit][pass][syscall_intercept][capicall][android]") {
+    // Same api_id (134 == CCCrypt) and same raw args as the iOS baseline
+    // above, but the trace header declares target_os=Android. Since
+    // "CCCrypt" only exists in known_apis() (iOS/CommonCrypto), the
+    // constructor's is_linux_target branch must load known_android_apis()
+    // instead — so the name still resolves via capi_entry() (a flat,
+    // platform-independent id->name table) but api_by_name_ must NOT
+    // contain a CommonCrypto signature for it, and the category must NOT
+    // be ApiCategory::CommonCrypto. This is what actually proves the
+    // platform-based table selection branch (not just "the iOS table works
+    // when iOS is requested").
+    auto env = make_with_capicall_cccrypt_on_android();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+
+    SECTION("exactly one call recorded") {
+        REQUIRE(res.total() == 1);
+    }
+
+    SECTION("category is NOT CommonCrypto when target_os=Android") {
+        REQUIRE(res.calls[0].category != ApiCategory::CommonCrypto);
+    }
+
+    SECTION("category falls back to Custom (no BoringSSL entry named CCCrypt)") {
+        REQUIRE(res.calls[0].category == ApiCategory::Custom);
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: SVC record works end-to-end with target_os=Android",
+          "[unit][pass][syscall_intercept][svc][android]") {
+    // Guards against ctor/scan regressions specific to the Android code path
+    // (e.g. known_android_apis() failing to build, or is_linux_target being
+    // miscomputed causing a crash/empty table). The Syscall category itself
+    // is platform-agnostic, so this is a smoke test for the ctor branch,
+    // complementing the CCCrypt table-selection tests above.
+    auto env = make_with_svc_android();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+
+    SECTION("exactly one call recorded") {
+        REQUIRE(res.total() == 1);
+    }
+
+    SECTION("category is Syscall") {
+        REQUIRE(res.calls[0].category == ApiCategory::Syscall);
     }
 }
 

@@ -217,6 +217,28 @@ struct TraceWriter {
         fwrite(&hdr, sizeof(hdr), 1, fp);
     }
 
+    /// Same as write_header(), but also stamps `target_os` (see
+    /// qbditrace_target_os_t: 0=Unknown, 1=iOS, 2=Android, 3=Linux).
+    /// Used by tests that need platform-specific dispatch (e.g. picking the
+    /// iOS/CommonCrypto vs Android/BoringSSL API signature table in
+    /// SyscallInterceptCollector).
+    void write_header_target_os(uint32_t target_os, uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE;
+        hdr.target_os = target_os;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
     /// Write a v6 (HF_OLD_VALUE) header.  Version is bumped to
     /// QBDITRACE_VERSION_V6_OLD_VALUE and the HF_OLD_VALUE flag is set so that
     /// tenet's TraceReader recognises v6 mode and uses qbditrace_memacc_v6_t.
