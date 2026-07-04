@@ -513,6 +513,7 @@ src/gui/panels_call_context.cpp
 src/gui/panels_syscall_intercept.cpp
 src/gui/panels_objc_crypto.cpp
 src/gui/panels_vm_abstract.cpp
+src/gui/panels_taint_source_annotation.cpp
 src/gui/panels_log.cpp
 src/gui/panels_cache_manager.cpp
 src/gui/popups.cpp

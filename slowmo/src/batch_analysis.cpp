@@ -496,6 +496,24 @@ int tenet::run_batch_analysis(const CliOptions& opts,
                               MemoryModel& memory) {
     const auto& hdr = reader.header();
 
+    // --taint-source-annotation requires a backward-taint sink to annotate.
+    // TaintSourceAnnotationPass hard-depends on "backward_taint" (see its
+    // dependencies()), but BackwardTaintPass is only registered below when
+    // --backward-taint is also given. Without this check, omitting
+    // --backward-taint would register TaintSourceAnnotationPass anyway and
+    // let it fail deep inside PassManager dependency resolution with an
+    // opaque "backward_taint not found"-style error instead of telling the
+    // user what flag they forgot — mirror the --vm-abstract precondition
+    // check style above.
+    if (opts.opt_taint_source_annotation && !opts.opt_backward_taint) {
+        fmt::print(stderr,
+            "Error: --taint-source-annotation requires a backward-taint sink to annotate.\n"
+            "  Pass --backward-taint <sink_inst_id> <sink_reg> to specify where the\n"
+            "  backward taint search should start (e.g. the register at the point\n"
+            "  you suspect holds a decrypted key or password).\n");
+        return 1;
+    }
+
     PassManager pm;
     pm.set_reader(&reader);
     pm.set_index(&index);

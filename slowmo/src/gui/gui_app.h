@@ -54,6 +54,7 @@ namespace tenet {
 struct CFGResult;
 struct TaintResult;
 struct BackwardTaintResult;
+struct TaintSourceAnnotationResult;  // defined in taint_source_annotation_pass.h
 // FunctionResult, CallEvent, FunctionInfo: defined in function_pass.h (included above)
 struct XrefResult;
 struct StringResult;
@@ -340,6 +341,22 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     bool show_taint_ = false;
     bool show_backward_taint_ = false;
     size_t xref_cursor_ = 0;
+
+    // ─── Taint Source Annotation state ────────────────────────────────
+    // Annotates the "leaf" sources of a BackwardTaintResult (ObjC getter /
+    // memory load / constant / function return). Depends on backward_taint
+    // + objc; run_taint_source_annotation_analysis() auto-registers both
+    // (backward_taint sinking on current_inst_/current_reg) via
+    // register_pass_by_name(), mirroring the CLI's --backward-taint
+    // prerequisite.
+    const TaintSourceAnnotationResult* taint_source_annotation_result_ = nullptr;
+    bool show_taint_source_annotation_ = false;
+    int  taint_source_annotation_view_mode_ = 0;  // 0=All,1=ObjC,2=Memory,3=Constant
+    char taint_source_annotation_filter_buf_[128] = {};
+    std::string taint_source_annotation_filter_;
+    size_t taint_source_annotation_cursor_ = 0;
+    void run_taint_source_annotation_analysis();
+    void render_taint_source_annotation_panel();
 
     // ─── Taint jump state ────────────────────────────────────────────
     // Cached sorted list of tainted inst_ids for fast prev/next navigation

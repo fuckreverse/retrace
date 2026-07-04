@@ -73,6 +73,7 @@ tenet_add_test(test_pass_objc              unit/test_pass_objc.cpp)
 
 # ─── Unit tests: newly-added analysis passes ────────────────────────────────
 tenet_add_test(test_pass_backward_taint    unit/test_pass_backward_taint.cpp)
+tenet_add_test(test_pass_taint_critical_path unit/test_pass_taint_critical_path.cpp)
 tenet_add_test(test_pass_entropy           unit/test_pass_entropy.cpp)
 tenet_add_test(test_pass_reg_timeline      unit/test_pass_reg_timeline.cpp)
 tenet_add_test(test_pass_call_context      unit/test_pass_call_context.cpp)

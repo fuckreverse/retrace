@@ -8,6 +8,7 @@
 #include "analysis/pass_registry.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/taint/taint_source_annotation_pass.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "analysis/passes/structure/function_pass.h"
 #include "analysis/passes/memory/string_pass.h"
@@ -279,6 +280,13 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         show_backward_taint_   = true;
         return;
     }
+    if (name == "taint_source_annotation") {
+        taint_source_annotation_result_ = &raw->get<TaintSourceAnnotationResult>();
+        show_taint_source_annotation_   = true;
+        taint_source_annotation_cursor_ = 0;
+        pending_focus_windows_.push_back("Taint Sources");
+        return;
+    }
         if (name == "objc_crypto") {
         objc_crypto_result_ = &raw->get<ObjcCryptoResult>();
         show_objc_crypto_   = true;
@@ -475,6 +483,60 @@ void GuiApp::run_backward_taint_analysis() {
             if (ok) {
                 apply_pass_result_pointers("backward_taint");
                 show_taint_ = false;
+            }
+        });
+    });
+}
+
+void GuiApp::run_taint_source_annotation_analysis() {
+    ensure_pass_manager();
+
+    if (pass_manager_->state("taint_source_annotation") == PassManager::PassState::Completed) {
+        apply_pass_result_pointers("taint_source_annotation");
+        return;
+    }
+    if (pass_manager_->state("taint_source_annotation") == PassManager::PassState::Running)
+        return;
+
+    // taint_source_annotation hard-depends on "backward_taint" (+ "objc").
+    // Mirror the CLI's --taint-source-annotation-requires-backward-taint
+    // precondition: if backward_taint hasn't been configured/run yet,
+    // register it here sinking on the current cursor position — same
+    // default register_pass_by_name() would derive via PassRunCtx.
+    if (pass_manager_->state("backward_taint") == PassManager::PassState::NotRun) {
+        BackwardTaintConfig config;
+        config.sink_inst_id = current_inst_;
+        config.propagate_through_memory = true;
+        config.max_steps = 500000;
+        config.max_tainted_insts = 50000;
+
+        auto [offset_sk, seed_pc_sk] = index_.offset_of_with_pc(current_inst_, reader_);
+        auto rec_sk = reader_.record_at(offset_sk, seed_pc_sk);
+        if (rec_sk.kind == RecordKind::Inst) {
+            auto inst = rec_sk.as_inst();
+            for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+                auto diff = inst.reg_diff(i);
+                config.add_sink_reg(diff.index);
+            }
+        }
+        if (config.sink_regs == 0) {
+            config.add_sink_reg(0);
+        }
+        pass_manager_->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
+    }
+    tenet::register_pass_by_name(*pass_manager_, "objc", {});
+    pass_manager_->register_pass(std::make_unique<TaintSourceAnnotationPass>());
+
+    enqueue_async("taint_source_annotation", [this]() {
+        auto& r = pass_manager_->require("taint_source_annotation");
+        bool ok = r.ok();
+        std::string summary = tenet::summarize_pass_result("taint_source_annotation", r);
+        post_apply([this, ok, summary]() {
+            last_pass_status_ = fmt::format("taint_source_annotation: {}", summary);
+            if (ok) {
+                apply_pass_result_pointers("backward_taint");
+                apply_pass_result_pointers("objc");
+                apply_pass_result_pointers("taint_source_annotation");
             }
         });
     });
@@ -782,6 +844,11 @@ void GuiApp::clear_analysis() {
     call_context_result_ = nullptr;
     show_call_context_   = false;
     std::memset(call_context_inst_buf_, 0, sizeof(call_context_inst_buf_));
+    taint_source_annotation_result_ = nullptr;
+    show_taint_source_annotation_   = false;
+    std::memset(taint_source_annotation_filter_buf_, 0, sizeof(taint_source_annotation_filter_buf_));
+    taint_source_annotation_filter_.clear();
+    taint_source_annotation_cursor_ = 0;
     show_taint_ = false;
     show_threads_ = false;
     show_backward_taint_ = false;

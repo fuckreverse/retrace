@@ -780,6 +780,7 @@ enum MenuTag : NSInteger {
     kTagViewObjCCrypto        = 326,
     kTagViewMemStrings        = 327,
         kTagViewSyscallIntercept  = 328,
+    kTagViewTaintSourceAnnotation = 329,
 
 
     // ── View — Profiling & Diff: 330-339 ────────────────────────────
@@ -808,6 +809,7 @@ enum MenuTag : NSInteger {
     // ── Analysis — Data Flow: 500-509 ───────────────────────────────
     kTagAnaTaint              = 500,
     kTagAnaBackTaint          = 501,
+    kTagAnaTaintSourceAnnotation = 502,
     kTagAnaRegTimeline        = 503,
     kTagAnaProducerChain      = 504,
 
@@ -948,6 +950,9 @@ void tenet::GuiApp::_post_native_action(long tag) {
         case kTagViewObjCCrypto:       action = [this]{ show_objc_crypto_        = !show_objc_crypto_;        }; break;
         case kTagViewMemStrings:       action = [this]{ show_mem_strings_        = !show_mem_strings_;        }; break;
 case kTagViewSyscallIntercept: action = [this]{ show_syscall_intercept_  = !show_syscall_intercept_;  }; break;
+case kTagViewTaintSourceAnnotation:
+    action = [this]{ show_taint_source_annotation_ = !show_taint_source_annotation_; };
+    break;
 case kTagViewVMAbstract:       action = [this]{ show_vm_abstract_        = !show_vm_abstract_;        }; break;
 case kTagViewVMWorkspace:      action = [this]{
     vm_ws_open_ = !vm_ws_open_;
@@ -1003,6 +1008,9 @@ case kTagViewVMWorkspace:      action = [this]{
         // ── Analysis — Data Flow ─────────────────────────────────────────
 case kTagAnaTaint:          action = [this]{ run_taint_analysis(); }; break;
 case kTagAnaBackTaint:      action = [this]{ run_backward_taint_analysis(); }; break;
+case kTagAnaTaintSourceAnnotation:
+    action = [this]{ run_taint_source_annotation_analysis(); };
+    break;
 case kTagAnaRegTimeline:
             action = [this]{ show_reg_timeline_ = true; reg_timeline_dirty_ = true; };
             break;
@@ -1049,15 +1057,20 @@ case kTagAnaVMAbstract:     action = [this]{
         case kTagAnaMemStrings:     action = [this]{ run_pass_by_name("memory_strings"); show_mem_strings_ = true; }; break;
 
         // ── Analysis — Maintenance ───────────────────────────────────────
-        case kTagAnaClearTaint:
-            action = [this]{
-        show_taint_           = false;
-        show_backward_taint_  = false;
-        taint_result_         = nullptr;
-        backward_taint_result_= nullptr;
-        taint_sorted_ids_dirty_ = true;
-            };
-            break;
+case kTagAnaClearTaint:
+action = [this]{
+show_taint_           = false;
+show_backward_taint_  = false;
+show_taint_source_annotation_ = false;
+taint_result_         = nullptr;
+backward_taint_result_= nullptr;
+// TaintSourceAnnotationResult hard-depends on backward_taint's
+// contributing set — its pointer would dangle once backward_taint
+// is cleared/re-run with a different sink, so clear it alongside.
+taint_source_annotation_result_ = nullptr;
+taint_sorted_ids_dirty_ = true;
+};
+break;
         case kTagAnaClear:          action = [this]{ clear_analysis(); }; break;
 
         // ── Export ───────────────────────────────────────────────────────
@@ -1161,6 +1174,7 @@ void tenet::GuiApp::_update_native_menu(void* menuPtr) {
             case kTagViewObjCCrypto:       it.state = show_objc_crypto_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewMemStrings:       it.state = show_mem_strings_        ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewSyscallIntercept: it.state = show_syscall_intercept_  ? NSControlStateValueOn : NSControlStateValueOff; break;
+case kTagViewTaintSourceAnnotation: it.state = show_taint_source_annotation_ ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewVMAbstract:       it.state = show_vm_abstract_        ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
@@ -1175,8 +1189,8 @@ case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlSt
                 it.enabled = (backward_taint_result_ != nullptr); break;
 
             // ── Analysis — Clear Taint: only useful when taint is active ─
-        case kTagAnaClearTaint:
-            it.enabled = (show_taint_ || show_backward_taint_); break;
+case kTagAnaClearTaint:
+it.enabled = (show_taint_ || show_backward_taint_ || show_taint_source_annotation_); break;
 
             default: break;
         }
@@ -1294,6 +1308,7 @@ void tenet::GuiApp::setup_native_menu() {
         [resMenu addItem:mk(@"ObjC Messages",      @"", 0, kTagViewObjC)];
         [resMenu addItem:mk(@"ObjC Crypto",        @"", 0, kTagViewObjCCrypto)];
         [resMenu addItem:mk(@"API Intercepts",     @"", 0, kTagViewSyscallIntercept)];
+        [resMenu addItem:mk(@"Taint Sources",      @"", 0, kTagViewTaintSourceAnnotation)];
         [resMenu addItem:sep()];
         [resMenu addItem:mk(@"Memory Strings",     @"", 0, kTagViewMemStrings)];
         [resMenu addItem:sep()];
@@ -1357,8 +1372,9 @@ void tenet::GuiApp::setup_native_menu() {
         // ── Data Flow ─────────────────────────────────────────────────
         NSMenu* dfMenu = mksub(anaMenu, @"Data Flow");
 [dfMenu addItem:mk(@"Forward Taint\u2026",     @"t", Cmd,         kTagAnaTaint)];
-[dfMenu addItem:mk(@"Backward Taint\u2026",    @"t", Cmd | Shift, kTagAnaBackTaint)];
-[dfMenu addItem:sep()];
+        [dfMenu addItem:mk(@"Backward Taint\u2026",    @"t", Cmd | Shift, kTagAnaBackTaint)];
+        [dfMenu addItem:mk(@"Taint Source Annotation", @"", 0, kTagAnaTaintSourceAnnotation)];
+        [dfMenu addItem:sep()];
         [dfMenu addItem:mk(@"Register Timeline",       @"", 0, kTagAnaRegTimeline)];
         [dfMenu addItem:mk(@"Producer Chain",          @"", 0, kTagAnaProducerChain)];
 
@@ -2168,6 +2184,9 @@ void GuiApp::render_frame() {
     }
     if (show_call_context_) {
         render_call_context_panel();
+    }
+    if (show_taint_source_annotation_) {
+        render_taint_source_annotation_panel();
     }
     if (show_syscall_intercept_) {
         render_syscall_intercept_panel();
