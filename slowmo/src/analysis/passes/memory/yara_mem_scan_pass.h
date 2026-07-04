@@ -83,6 +83,17 @@ struct YaraMemScanResult {
     /// Number of pages that had insufficient entropy and were skipped.
     uint64_t pages_skipped_entropy = 0;
 
+    /// Number of individual .yar rule files successfully compiled/loaded
+    /// (across the default dir + extra_rules + user_rules_dir). Exposed so
+    /// callers/UI can tell "ran but 0 matches because no crypto present"
+    /// apart from "ran but 0 matches because rules failed to load".
+    uint64_t rules_loaded = 0;
+
+    /// Directories that were actually searched for .yar files (for
+    /// diagnostics when rules_loaded == 0 — e.g. shown in an error message
+    /// or a GUI tooltip so the user knows where tenet looked).
+    std::vector<std::string> rule_search_dirs;
+
     /// Convenience: get all matches of a specific category.
     std::vector<const YaraMemMatch*> by_category(PatternCategory cat) const;
 
@@ -107,10 +118,27 @@ struct YaraMemScanResult {
 /// points in the trace.  Auto-scanning mode visits all active pages at their
 /// final state (end of trace).
 ///
-/// YARA rules are loaded from:
-///   1. Default rules directory: <exe_dir>/../rules/
-///   2. User-supplied extra_rules paths
-///   3. config.user_rules_dir
+/// YARA rules are loaded from (all that exist are merged; at least one must
+/// yield a compiled rule or the pass fails — see find_default_rules_dirs()):
+///   1. Default rules directory, resolved relative to the running
+///      executable's own path (NOT the process's current working directory):
+///        <exe_dir>/rules/, <exe_dir>/../rules/, <exe_dir>/../../rules/
+///      This makes the pass work regardless of where tenet/tenet_tests is
+///      launched from (double-clicked .app bundle, `ctest` from a build
+///      subdir, absolute-path invocation from an unrelated cwd, etc.) —
+///      previously this only checked `<cwd>/rules` and `<cwd>/../rules`,
+///      which silently produced zero rules (and thus zero matches, but a
+///      "successful" pass) whenever cwd wasn't the build directory.
+///   2. <cwd>/rules and <cwd>/../rules (kept as a secondary fallback for
+///      compatibility with existing scripts/docs that rely on cwd-relative
+///      lookup).
+///   3. User-supplied extra_rules paths (config.extra_rules).
+///   4. config.user_rules_dir.
+///
+/// If none of the above yields at least one successfully-compiled rule file,
+/// run() fails with an actionable error message listing every directory that
+/// was searched (see YaraMemScanResult::rule_search_dirs for the same list
+/// on the success path, e.g. for GUI diagnostics).
 ///
 /// Dependencies: none (optional: function pass for function-call scan points).
 ///
@@ -133,9 +161,23 @@ public:
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 12.0f; }
 
+    /// Candidate directories to search for the *default* rule set, in
+    /// priority order: resolved relative to the running executable's path
+    /// first, then relative to the current working directory as a fallback.
+    /// Exposed as a free function (not dependent on TENET_HAS_YARA) so it
+    /// can be unit-tested even in YARA-disabled builds.
+    static std::vector<std::filesystem::path> find_default_rules_dirs();
+
 private:
 #ifdef TENET_HAS_YARA
-    bool load_rules(const std::filesystem::path& default_dir);
+    /// Compiles every .yar file found under `default_dirs` plus
+    /// cfg_.extra_rules plus cfg_.user_rules_dir. Returns true iff at least
+    /// one rule file was successfully compiled. Populates `n_loaded` with
+    /// the count and appends every directory actually probed to `searched`
+    /// (regardless of whether it existed / contained rules) for diagnostics.
+    bool load_rules(const std::vector<std::filesystem::path>& default_dirs,
+                     uint64_t& n_loaded,
+                     std::vector<std::string>& searched);
     void scan_buffer(const uint8_t* data, size_t size,
                      uint64_t base_addr, uint64_t at_inst_id,
                      const std::string& label,

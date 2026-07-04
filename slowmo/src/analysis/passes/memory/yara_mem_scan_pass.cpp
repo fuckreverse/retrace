@@ -17,7 +17,83 @@
 #include <yara.h>
 #endif
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
 namespace tenet {
+
+// ─── Executable path resolution ────────────────────────────────────────────
+//
+// Resolving the default rules directory relative to the process's *current
+// working directory* (as the previous implementation did) is fragile: the
+// GUI app may be launched from Finder (cwd = "/"), tests may be invoked via
+// `ctest` from an arbitrary directory, and CLI users may pass an absolute
+// path to the `tenet` binary from anywhere. In all of those cases
+// `<cwd>/rules` / `<cwd>/../rules` do not exist, silently yielding zero
+// loaded rules — the pass still reports success (0 matches), which is
+// indistinguishable from "ran fine, target just has no crypto in memory".
+//
+// Resolving relative to the *executable's own path* is robust to all of the
+// above, mirroring how `tenet/rules/` sits next to the build output
+// (`tools/tenet/build/tenet` -> `tools/tenet/rules/`).
+namespace {
+
+/// Best-effort absolute path to the running executable. Returns an empty
+/// path if it could not be determined (caller falls back to cwd-relative
+/// lookup only).
+std::filesystem::path current_executable_path() {
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // first call: query required size
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical(buf, ec);
+    return ec ? std::filesystem::path(buf) : resolved;
+#elif defined(__linux__)
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical("/proc/self/exe", ec);
+    return ec ? std::filesystem::path() : resolved;
+#else
+    return {};
+#endif
+}
+
+}  // namespace
+
+std::vector<std::filesystem::path> YaraMemScanPass::find_default_rules_dirs() {
+    std::vector<std::filesystem::path> out;
+    auto add_unique = [&](std::filesystem::path p) {
+        if (p.empty()) return;
+        std::error_code ec;
+        auto canon = std::filesystem::weakly_canonical(p, ec);
+        if (!ec) p = canon;
+        if (std::find(out.begin(), out.end(), p) == out.end()) out.push_back(std::move(p));
+    };
+
+    // 1. Relative to the executable's own directory — robust regardless of
+    //    cwd. Covers both the flat build layout (bin next to rules/) and a
+    //    one-level-deeper install layout (bin/ + rules/ siblings under a
+    //    common prefix, or an .app bundle's Contents/MacOS/).
+    auto exe = current_executable_path();
+    if (!exe.empty()) {
+        auto exe_dir = exe.parent_path();
+        add_unique(exe_dir / "rules");
+        add_unique(exe_dir / ".." / "rules");
+        add_unique(exe_dir / ".." / ".." / "rules");
+    }
+
+    // 2. Relative to cwd — secondary fallback, kept for compatibility with
+    //    any existing scripts/docs/tests that rely on `cd build && ./tenet`.
+    auto cwd = std::filesystem::current_path();
+    add_unique(cwd / "rules");
+    add_unique(cwd / ".." / "rules");
+
+    return out;
+}
 
 // ─── YaraMemScanResult helpers ────────────────────────────────────────────
 
@@ -115,7 +191,10 @@ static int yara_callback(YR_SCAN_CONTEXT* ctx, int msg, void* msg_data, void* us
 
 }  // anonymous namespace
 
-bool YaraMemScanPass::load_rules(const std::filesystem::path& default_dir) {
+bool YaraMemScanPass::load_rules(const std::vector<std::filesystem::path>& default_dirs,
+                                  uint64_t& n_loaded,
+                                  std::vector<std::string>& searched) {
+    n_loaded = 0;
     yr_initialize();
 
     YR_COMPILER* compiler = nullptr;
@@ -123,9 +202,10 @@ bool YaraMemScanPass::load_rules(const std::filesystem::path& default_dir) {
         return false;
     }
 
-    auto add_dir = [&](const std::filesystem::path& dir) -> bool {
+    auto add_dir = [&](const std::filesystem::path& dir) {
+        searched.push_back(dir.string());
         if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir))
-            return true;  // not an error
+            return;
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
             if (entry.path().extension() != ".yar") continue;
             FILE* f = fopen(entry.path().c_str(), "r");
@@ -133,33 +213,40 @@ bool YaraMemScanPass::load_rules(const std::filesystem::path& default_dir) {
             int err = yr_compiler_add_file(compiler, f, nullptr,
                                            entry.path().filename().c_str());
             fclose(f);
-            if (err > 0) {
-                // Compiler warnings — not fatal
+            if (err == 0) {
+                n_loaded++;
             }
+            // err > 0: compiler warnings/errors for this file — not fatal to
+            // the overall load, but this file does not count as loaded.
         }
-        return true;
     };
 
-    auto add_file = [&](const std::filesystem::path& fpath) -> bool {
-        if (!std::filesystem::exists(fpath)) return true;
-        if (std::filesystem::is_directory(fpath)) return add_dir(fpath);
+    auto add_file = [&](const std::filesystem::path& fpath) {
+        if (std::filesystem::is_directory(fpath)) {
+            add_dir(fpath);
+            return;
+        }
+        searched.push_back(fpath.string());
+        if (!std::filesystem::exists(fpath)) return;
         FILE* f = fopen(fpath.c_str(), "r");
-        if (!f) return false;
+        if (!f) return;
         int err = yr_compiler_add_file(compiler, f, nullptr,
                                        fpath.filename().c_str());
         fclose(f);
-        return err == 0;
+        if (err == 0) n_loaded++;
     };
 
-    // 1. Default rules dir
-    add_dir(default_dir);
+    // 1. Default rules dirs (executable-relative first, then cwd-relative).
+    for (const auto& dir : default_dirs) {
+        add_dir(dir);
+    }
 
-    // 2. User-supplied extra rules
+    // 2. User-supplied extra rules (files or directories).
     for (const auto& extra : cfg_.extra_rules) {
         add_file(extra);
     }
 
-    // 3. User rules dir
+    // 3. User rules dir.
     if (!cfg_.user_rules_dir.empty()) {
         add_dir(cfg_.user_rules_dir);
     }
@@ -169,8 +256,8 @@ bool YaraMemScanPass::load_rules(const std::filesystem::path& default_dir) {
         return false;
     }
     yr_compiler_destroy(compiler);
-    rules_loaded_ = true;
-    return true;
+    rules_loaded_ = (n_loaded > 0);
+    return n_loaded > 0;
 }
 
 void YaraMemScanPass::scan_buffer(const uint8_t* data, size_t size,
@@ -213,27 +300,36 @@ PassResult YaraMemScanPass::run(PassContext& ctx) {
 #ifndef TENET_HAS_YARA
     return PassResult::failed("YaraMemScanPass: YARA support not compiled in (TENET_ENABLE_YARA=OFF)");
 #else
-    // Find default rules directory (same dir as executable ../../rules, or next to binary)
-    std::filesystem::path default_rules_dir;
-    {
-        // Try well-known locations relative to CWD / executable
-        // 1. <cwd>/rules/
-        auto cwd_rules = std::filesystem::current_path() / "rules";
-        if (std::filesystem::exists(cwd_rules)) {
-            default_rules_dir = cwd_rules;
-        }
-        // 2. ../rules/ (build/ dir scenario)
-        auto up_rules = std::filesystem::current_path() / ".." / "rules";
-        if (default_rules_dir.empty() && std::filesystem::exists(up_rules)) {
-            default_rules_dir = std::filesystem::canonical(up_rules);
-        }
-    }
+    auto default_dirs = find_default_rules_dirs();
 
-    if (!load_rules(default_rules_dir)) {
-        return PassResult::failed("YaraMemScanPass: failed to load YARA rules");
+    uint64_t n_loaded = 0;
+    std::vector<std::string> searched;
+    bool compiler_ok = load_rules(default_dirs, n_loaded, searched);
+
+    if (!compiler_ok) {
+        return PassResult::failed("YaraMemScanPass: failed to initialize YARA compiler");
+    }
+    if (n_loaded == 0) {
+        // Loading "succeeded" (the compiler didn't error), but zero .yar
+        // files were actually found/compiled anywhere we looked. Reporting
+        // success here would be indistinguishable from "scanned fine, no
+        // crypto found" — fail loudly instead and tell the user exactly
+        // which directories were searched so they can fix their rules_dir
+        // or extra_rules configuration.
+        std::string dirs_str;
+        for (const auto& d : searched) {
+            if (!dirs_str.empty()) dirs_str += ", ";
+            dirs_str += d;
+        }
+        return PassResult::failed(fmt::format(
+            "YaraMemScanPass: no .yar rule files found. Searched: [{}]. "
+            "Pass an explicit rules directory via YaraMemScanConfig::user_rules_dir "
+            "or --yara-rules.", dirs_str));
     }
 
     YaraMemScanResult result;
+    result.rules_loaded = n_loaded;
+    result.rule_search_dirs = searched;
     auto& memory = ctx.memory();
 
     ctx.progress(0.0f, "YaraMemScan: scanning explicit points...");

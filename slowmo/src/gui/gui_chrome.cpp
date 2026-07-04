@@ -392,9 +392,23 @@ if (ctx_mem_addr_ != 0 && entropy_addr_buf_[0] == '\0') {
                 // literal_search was merged into mem_search.
                 show_mem_search_ = true;
             }
+#ifdef TENET_HAS_YARA
             if (ImGui::MenuItem("YARA Scan\xe2\x80\xa6")) {
                 show_yara_mem_scan_ = true;
             }
+#else
+            // Greyed out (rather than hidden) so users know the feature
+            // exists but requires a rebuild with -DTENET_ENABLE_YARA=ON,
+            // instead of clicking it and only then discovering — via a pass
+            // failure — that it's unavailable in this build.
+            ImGui::BeginDisabled();
+            ImGui::MenuItem("YARA Scan\xe2\x80\xa6 (requires TENET_ENABLE_YARA)");
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("This build was compiled with -DTENET_ENABLE_YARA=OFF.\n"
+                                  "Rebuild with YARA enabled to use this feature.");
+            }
+#endif
             ImGui::Separator();
             if (ImGui::MenuItem("Memory Write History\xe2\x80\xa6"))
                 show_memory_ = true;

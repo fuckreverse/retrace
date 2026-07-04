@@ -102,6 +102,19 @@ void GuiApp::render_yara_mem_scan_panel() {
 
     float panel_w = ImGui::GetContentRegionAvail().x;
 
+#ifndef TENET_HAS_YARA
+    // Defensive fallback: the menu item that opens this panel is disabled
+    // in non-YARA builds (see gui_chrome.cpp), but show_yara_mem_scan_ could
+    // still be flipped some other way (e.g. persisted UI state from a
+    // YARA-enabled build). Explain rather than silently failing the pass.
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), ICON_FA_TRIANGLE_EXCLAMATION " YARA support not compiled in");
+    ImGui::TextWrapped(
+        "This build was compiled with -DTENET_ENABLE_YARA=OFF. "
+        "Rebuild tenet with YARA enabled (requires libyara) to use this feature.");
+    ImGui::End();
+    return;
+#else
+
     // ── No result yet — show parameter form ───────────────────────────
     if (!yara_mem_result_) {
         ImGui::TextDisabled(ICON_FA_SHIELD_HALVED "  YARA Memory Scan");
@@ -139,10 +152,16 @@ void GuiApp::render_yara_mem_scan_panel() {
     // ── Result available ──────────────────────────────────────────────
 
     ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        ICON_FA_SHIELD_HALVED "  %zu matches  |  %llu pages scanned  |  %llu bytes",
+        ICON_FA_SHIELD_HALVED "  %zu matches  |  %llu pages scanned  |  %llu bytes  |  %llu rules loaded",
         yara_mem_result_->total(),
         (unsigned long long)yara_mem_result_->pages_scanned,
-        (unsigned long long)yara_mem_result_->bytes_scanned);
+        (unsigned long long)yara_mem_result_->bytes_scanned,
+        (unsigned long long)yara_mem_result_->rules_loaded);
+    if (ImGui::IsItemHovered() && !yara_mem_result_->rule_search_dirs.empty()) {
+        std::string tip = "Rule directories searched:\n";
+        for (const auto& d : yara_mem_result_->rule_search_dirs) tip += "  " + d + "\n";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
 
     ImGui::SameLine(panel_w - 90.0f);
     if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
@@ -277,6 +296,7 @@ void GuiApp::render_yara_mem_scan_panel() {
     }
 
     ImGui::End();
+#endif  // TENET_HAS_YARA
 }
 
 }  // namespace tenet

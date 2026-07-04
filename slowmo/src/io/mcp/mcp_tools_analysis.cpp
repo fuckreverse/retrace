@@ -34,6 +34,7 @@
 #include "analysis/passes/profile/trace_diff_pass.h"
 #include "analysis/passes/profile/reg_timeline_pass.h"
 #include "analysis/passes/memory/mem_search_pass.h"
+#include "analysis/passes/memory/yara_mem_scan_pass.h"
 #include "analysis/passes/profile/call_context_pass.h"
 #include "analysis/passes/profile/window_stats_pass.h"
 #include "analysis/passes/memory/entropy_pass.h"
@@ -607,6 +608,64 @@ void TenetMcpService::register_search_tools() {
             return {{"total_matches", result.matches.size()},
                     {"instructions_scanned", result.instructions_scanned},
                     {"hits", std::move(hits)}};
+        }
+    );
+
+    // ── yara_mem_scan ────────────────────────────────────────────────────
+    // Scans *heap/stack memory snapshots* (not register values/code, unlike
+    // pattern_scan) with YARA rules to find crypto constants, anti-debug
+    // strings, network protocols, and packed payloads materialized in
+    // memory. Only available when built with TENET_ENABLE_YARA; the tool is
+    // still registered in YARA-disabled builds so `tools/list` is stable,
+    // but invoking it returns a clear "not compiled in" error instead of a
+    // generic pass failure.
+    register_tool(
+        {"yara_mem_scan",
+         "Scan heap/stack memory snapshots with YARA rules. Finds crypto "
+         "constants materialized in memory (AES S-Box, SHA-256 IV, etc.), "
+         "anti-debug strings (ptrace, frida-server), DER certs/key material, "
+         "and packed/compressed payload signatures. Complements pattern_scan "
+         "(which scans register values/code, not memory contents). Requires "
+         "a build with TENET_ENABLE_YARA=ON.",
+         {{"type", "object"},
+          {"properties", {
+              {"rules_dir", {{"type", "string"}, {"description", "Extra directory of .yar files to load in addition to the bundled default rules"}}},
+              {"min_entropy", {{"type", "number"}, {"description", "Skip auto-scanned pages with Shannon entropy below this (0=scan all, 4.0=skip near-zero/uniform pages)"}, {"default", 0.0}}},
+              {"scan_code", {{"type", "boolean"}, {"description", "Also scan the reconstructed instruction-byte buffer (finds constants embedded in code)"}, {"default", false}}},
+              {"min_writes_per_page", {{"type", "integer"}, {"description", "Skip auto-scanned pages written fewer than this many times"}, {"default", 1}}}
+          }}}},
+        [this](const json& args) -> json {
+            YaraMemScanConfig cfg;
+            cfg.auto_scan_all_pages = true;
+            if (args.contains("rules_dir")) {
+                cfg.user_rules_dir = args["rules_dir"].get<std::string>();
+            }
+            cfg.min_entropy_threshold = args.value("min_entropy", 0.0f);
+            cfg.scan_code_buffer = args.value("scan_code", false);
+            cfg.min_writes_per_page = args.value("min_writes_per_page", uint32_t(1));
+
+            pm_->register_pass(std::make_unique<YaraMemScanPass>(std::move(cfg)));
+            const auto& result = require_pass<YaraMemScanResult>(pm_, "yara_mem_scan", "YARA memory scan failed");
+
+            json matches = json::array();
+            for (const auto& m : result.matches) {
+                matches.push_back({
+                    {"rule_name",    m.rule_name},
+                    {"category",     pattern_category_str(m.category)},
+                    {"confidence",   pattern_confidence_str(m.confidence)},
+                    {"description",  m.description},
+                    {"match_addr",   fmt::format("0x{:X}", m.match_addr)},
+                    {"match_length", m.match_length},
+                    {"at_inst_id",   m.at_inst_id},
+                    {"scan_label",   m.scan_label}
+                });
+            }
+            return {{"total", result.total()},
+                    {"matches", std::move(matches)},
+                    {"pages_scanned", result.pages_scanned},
+                    {"bytes_scanned", result.bytes_scanned},
+                    {"pages_skipped_entropy", result.pages_skipped_entropy},
+                    {"rules_loaded", result.rules_loaded}};
         }
     );
 
