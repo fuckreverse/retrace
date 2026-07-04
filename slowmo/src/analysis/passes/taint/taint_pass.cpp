@@ -1,4 +1,5 @@
 #include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/taint_common.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
@@ -13,18 +14,6 @@
 #include <algorithm>
 
 namespace tenet {
-
-// ─── AArch64 ABI constants ─────────────────────────────────────────────────
-
-static constexpr uint8_t ABI_ARG_FIRST = 0;   // X0
-static constexpr uint8_t ABI_ARG_LAST  = 7;   // X7
-static constexpr uint8_t ABI_RET_REG   = 0;   // X0 (return value)
-static constexpr uint8_t REG_LR        = 30;  // X30 / LR
-
-/// Check if a register is an ABI argument register (X0-X7).
-static bool is_abi_arg_reg(uint8_t reg) {
-    return reg >= ABI_ARG_FIRST && reg <= ABI_ARG_LAST;
-}
 
 // ─── Helper: emit a PropagationStep and legacy TaintEvent ──────────────────
 
@@ -86,35 +75,55 @@ static std::string check_stop_conditions(const TaintResult& result,
     return {};
 }
 
-// ─── XRef acceleration: find next relevant instruction ─────────────────────
+// ─── ABI-aware call-boundary event (shared by both engines) ────────────────
+//
+// Detecting a BL/BLR call site (LR written) and — if any ABI argument
+// register carries taint at that point — emitting a Call PropagationStep is
+// identical logic regardless of how taint state is tracked, so it is
+// factored out once here instead of appearing twice.
 
-/// Given the current taint state, determine if an instruction at `inst_id`
-/// could possibly interact with tainted registers. Uses the XRef pass to
-/// skip large blocks of instructions that don't touch any tainted register.
-///
-/// Returns the next inst_id that might be relevant, or `end` if none.
-/// This implements "sparse propagation skip" from the article.
-///
-/// Strategy: For each tainted register, we know which PCs read/write it
-/// (from Triton semantics or heuristic). We use the XRef PC→inst_id bitmap
-/// to find the next occurrence of any relevant PC after `current_inst_id`.
-///
-/// Simplified approach for heuristic mode: since we don't have per-register
-/// use-def chains, we skip instructions whose PC has never been seen to
-/// produce a reg_diff involving any currently-tainted register. This requires
-/// a pre-built "PC → set of registers it touches" map.
-///
-/// For now, we implement a simpler but still effective optimization:
-/// If the current instruction has zero reg_diffs and zero mem_accesses,
-/// it cannot propagate taint → skip it without emitting events.
-/// The XRef bitmap is used for a more aggressive skip when available.
+static void maybe_emit_call_event(TaintResult& result, const TaintConfig& config,
+                                   uint64_t inst_id, uint64_t pc,
+                                   uint64_t tainted_regs_after_write,
+                                   bool triton_resolved) {
+    uint64_t arg_taint = tainted_regs_after_write & 0xFFULL;  // X0-X7 = bits 0-7
+    if (!arg_taint) return;
 
-// ─── Triton-based precise taint propagation ────────────────────────────────
+    PropagationStep step;
+    step.inst_id = inst_id;
+    step.pc = pc;
+    step.type = PropagationType::Call;
+    step.triton_resolved = triton_resolved;
+    step.cross_function_pc = pc;  // resolved by the next inst (callee entry)
+    step.src_reg_mask = arg_taint;
+    emit_step(result, config, std::move(step));
+    result.call_crossings++;
+}
 
-static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) {
+// ═══════════════════════════════════════════════════════════════════════════
+// Common forward-scan framework (templated for inlining the per-inst step)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Both the Triton and heuristic engines walk the trace forward from
+// config.source_inst_id, checking stop conditions / XRef-driven skip
+// opportunities / cancellation identically. The only thing that differs is
+// *how* a single instruction updates the taint state (StepFn) — Triton asks
+// its own taint engine, the heuristic infers from reg_diff. Factoring the
+// scan loop out here keeps that shared bookkeeping in one place instead of
+// duplicated across run_triton_taint/run_heuristic_taint.
+//
+// StepFn signature:
+//   void step_fn(const InstView& inst, uint64_t inst_id, TaintResult& result)
+// It is responsible for mutating `result` (tainted_regs/tainted_memory) and
+// emitting whatever PropagationStep events are appropriate for this one
+// instruction (RegToReg/MemToReg/RegToMem/Kill/Call). The shared loop takes
+// care of stop conditions, iteration, and progress reporting.
+
+template <typename StepFn>
+static PassResult run_taint_scan_common(PassContext& ctx, const TaintConfig& config,
+                                         StepFn&& step_fn, const char* method_label) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
     const auto& range = ctx.range();
 
     uint64_t start = config.source_inst_id > 0 ? config.source_inst_id : range.start_inst_id;
@@ -124,37 +133,6 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
     // Pre-build stop_pc set for O(1) lookup in the hot loop
     ankerl::unordered_dense::set<uint64_t> stop_pc_set(config.stop_pcs.begin(),
                                                         config.stop_pcs.end());
-
-    // Create a fresh Triton bridge for this analysis
-    auto bridge_ptr = create_triton_bridge();
-    if (!bridge_ptr->is_available()) {
-        return PassResult::failed("Triton bridge not available");
-    }
-
-    auto* triton = dynamic_cast<TritonBridgeTaint*>(bridge_ptr.get());
-    if (!triton) {
-        return PassResult::failed("Triton bridge does not support taint interface");
-    }
-
-    // ── Performance: ONLY_ON_TAINTED mode means Triton's taint engine propagates
-    // taint purely based on instruction semantics (data-flow graph), NOT on
-    // concrete register/memory values. Therefore we do NOT call
-    // set_register_context or set_memory_context per instruction — those calls
-    // cost 34+ Triton API calls each and are pure overhead in taint-only mode.
-    //
-    // We still need concrete values only at initialization to seed taint sources;
-    // after that the taint engine is self-contained.
-
-    // Set initial taint sources (iterate bitmask)
-    for (uint64_t mask = config.source_regs; mask; mask &= mask - 1) {
-        uint8_t reg_idx = static_cast<uint8_t>(__builtin_ctzll(mask));
-        triton->taint_register(reg_idx);
-    }
-
-    // Taint initial memory sources
-    for (uint64_t addr : config.source_mem_addrs) {
-        triton->taint_memory(addr, 8);  // Assume 8-byte granularity
-    }
 
     TaintResult result;
     result.config = config;
@@ -202,23 +180,82 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             break;
         }
 
+        // ─── Per-instruction taint update (engine-specific) ────────────
+        bool skipped = step_fn(inst, inst_id, result);
+        if (skipped) {
+            result.instructions_skipped_xref++;
+        }
+
+        inst_id++;
+        processed++;
+        result.instructions_processed = processed;
+
+        if (processed % 10000 == 0) {
+            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
+        }
+    }
+
+    ctx.progress(1.0f, fmt::format("Taint ({}): {} events, {} steps, {} kills, "
+                                     "{} skipped, {} regs, {} mem",
+                                     method_label,
+                                     result.events.size(),
+                                     result.steps.size(),
+                                     result.kill_events_count,
+                                     result.instructions_skipped_xref,
+                                     result.tainted_reg_count(),
+                                     result.tainted_memory.cardinality()));
+    return PassResult::success(std::move(result));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Triton-based precise taint step
+// ═══════════════════════════════════════════════════════════════════════════
+
+static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) {
+    auto& code_table = ctx.code_table();
+
+    // Create a fresh Triton bridge for this analysis
+    auto bridge_ptr = create_triton_bridge();
+    if (!bridge_ptr->is_available()) {
+        return PassResult::failed("Triton bridge not available");
+    }
+
+    auto* triton = dynamic_cast<TritonBridgeTaint*>(bridge_ptr.get());
+    if (!triton) {
+        return PassResult::failed("Triton bridge does not support taint interface");
+    }
+
+    // ── Performance: ONLY_ON_TAINTED mode means Triton's taint engine propagates
+    // taint purely based on instruction semantics (data-flow graph), NOT on
+    // concrete register/memory values. Therefore we do NOT call
+    // set_register_context or set_memory_context per instruction — those calls
+    // cost 34+ Triton API calls each and are pure overhead in taint-only mode.
+    //
+    // We still need concrete values only at initialization to seed taint sources;
+    // after that the taint engine is self-contained.
+
+    // Set initial taint sources (iterate bitmask)
+    for (uint64_t mask = config.source_regs; mask; mask &= mask - 1) {
+        uint8_t reg_idx = static_cast<uint8_t>(__builtin_ctzll(mask));
+        triton->taint_register(reg_idx);
+    }
+
+    // Taint initial memory sources
+    for (uint64_t addr : config.source_mem_addrs) {
+        triton->taint_memory(addr, 8);  // Assume 8-byte granularity
+    }
+
+    // step_fn captures triton/code_table/config by reference; the shared
+    // scan loop calls it once per instruction.
+    auto step_fn = [&](const InstView& inst, uint64_t inst_id, TaintResult& result) -> bool {
         // Get opcode bytes from code table
         auto opcode_opt = code_table.opcode_at(inst.pc);
         if (!opcode_opt) {
-            inst_id++;
-            processed++;
-            continue;
+            return false;
         }
 
         uint32_t opcode_val = *opcode_opt;
         auto* opcode_bytes = reinterpret_cast<const uint8_t*>(&opcode_val);
-
-        // ── Concrete context injection removed ────────────────────────
-        // In ONLY_ON_TAINTED mode, Triton propagates taint via instruction
-        // semantics (getReadRegisters/getWrittenRegisters/getLoadAccess/
-        // getStoreAccess), which do NOT require concrete register values to
-        // be accurate. Injecting 34 register values + memory bytes per
-        // instruction was the single largest CPU cost (eliminated here).
 
         // ── Lazy Triton Symbolization (P0 optimization) ───────────────
         // Before calling the expensive process_instruction(), do a cheap
@@ -232,11 +269,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         //     even a "NOP-like" instruction might kill taint on a written reg.
         //
         // Reference: Sydr paper (Positive Technologies, 2020) reports
-        // 1.2-3.5× speedup from this single optimization.
-        //
-        // We use the zero-allocation bitmask API (get_tainted_gpr_mask)
-        // and compute the new/kill sets with O(1) bitwise diff instead of
-        // the previous O(T²) nested-vector scan.
+        // 1.2-3.5x speedup from this single optimization.
         uint64_t before_mask = triton->get_tainted_gpr_mask();
 
         // Fast path: nothing is tainted at all → no need to run Triton.
@@ -246,20 +279,14 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             // haven't processed the source instruction yet), we can't skip.
             // Guard: only skip when we're past the source instruction.
             if (inst_id >= config.source_inst_id) {
-                inst_id++;
-                processed++;
-                result.instructions_processed = processed;
-                result.instructions_skipped_xref++;  // reuse counter for lazy skips
-                continue;
+                return true;  // skipped
             }
         }
 
         // Process instruction through Triton's taint engine
         bool ok = triton->process_instruction(inst.pc, opcode_bytes, 4);
         if (!ok) {
-            inst_id++;
-            processed++;
-            continue;
+            return false;
         }
 
         uint64_t after_mask = triton->get_tainted_gpr_mask();
@@ -270,7 +297,6 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(new_taint));
             new_taint &= new_taint - 1;  // clear lowest set bit
 
-            // Determine propagation type
             PropagationStep step;
             step.inst_id = inst_id;
             step.pc = inst.pc;
@@ -287,12 +313,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                 }
             }
 
-            if (from_mem) {
-                step.type = PropagationType::MemToReg;
-            } else {
-                step.type = PropagationType::RegToReg;
-            }
-
+            step.type = from_mem ? PropagationType::MemToReg : PropagationType::RegToReg;
             // Source regs: bitmask of all previously tainted regs — O(1)
             step.src_reg_mask = before_mask;
 
@@ -332,7 +353,6 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
                         step.triton_resolved = true;
-                        // Source: bitmask of all previously tainted regs — O(1)
                         step.src_reg_mask = before_mask;
                         emit_step(result, config, std::move(step));
                     }
@@ -340,91 +360,39 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             }
         }
 
-        // ─── Memory taint sources (MemToReg) already handled above ────
-
         // ─── ABI-aware call crossing ──────────────────────────────────
         // Detect BL/BLR: if LR is written (saved return address), it's a call.
         // Taint propagates to callee only through X0-X7 argument registers.
         if (config.propagate_through_calls) {
             bool is_call = false;
             for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                auto diff = inst.reg_diff(i);
-                if (diff.index == REG_LR) {
+                if (inst.reg_diff(i).index == kTaintRegLR) {
                     is_call = true;
                     break;
                 }
             }
             if (is_call) {
                 // At a call boundary: only argument registers (X0-X7) carry taint
-                // into the callee. Kill taint on non-argument caller-saved regs
-                // that the callee might clobber (X9-X15, X16-X17).
-                // However, since we're doing forward propagation through the actual
-                // trace, the callee's reg_diffs will naturally handle this.
-                // We just emit a Call event for tracking.
-                uint64_t arg_taint = after_mask & 0xFFULL;  // X0-X7 = bits 0-7
-                if (arg_taint) {
-                    PropagationStep step;
-                    step.inst_id = inst_id;
-                    step.pc = inst.pc;
-                    step.type = PropagationType::Call;
-                    step.triton_resolved = true;
-                    // The next PC (callee entry) from the trace
-                    step.cross_function_pc = inst.pc;  // Will be resolved by next inst
-                    step.src_reg_mask = arg_taint;  // bitmask of argument regs carrying taint
-                    emit_step(result, config, std::move(step));
-                    result.call_crossings++;
-                }
-
-                if (!config.propagate_through_calls) {
-                    // Kill all taint at call boundary
-                    uint64_t a = arg_taint;
-                    while (a) {
-                        uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(a));
-                        a &= a - 1;
-                        triton->untaint_register(reg);
-                    }
-                }
+                // into the callee. We just emit a Call event for tracking — the
+                // callee's own reg_diffs (walked next in the trace) naturally
+                // handle whatever clobbering/propagation happens inside it.
+                maybe_emit_call_event(result, config, inst_id, inst.pc, after_mask, true);
             }
         }
 
         // Update tainted_regs bitmask directly from Triton state (O(1))
         result.tainted_regs = after_mask;
+        return false;  // not skipped
+    };
 
-        inst_id++;
-        processed++;
-        result.instructions_processed = processed;
-
-        if (processed % 10000 == 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-        }
-    }
-
-    ctx.progress(1.0f, fmt::format("Taint (Triton): {} events, {} steps, {} kills, "
-                                     "{} lazy-skipped, {} regs, {} mem",
-                                     result.events.size(),
-                                     result.steps.size(),
-                                     result.kill_events_count,
-                                     result.instructions_skipped_xref,
-                                     result.tainted_reg_count(),
-                                     result.tainted_memory.cardinality()));
-    return PassResult::success(std::move(result));
+    return run_taint_scan_common(ctx, config, step_fn, "Triton");
 }
 
-// ─── Heuristic taint with kill semantics + XRef acceleration ───────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// Heuristic taint step (kill semantics + XRef acceleration)
+// ═══════════════════════════════════════════════════════════════════════════
 
 static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& config) {
-    auto& reader = ctx.reader();
-    auto& index = ctx.index();
-    const auto& range = ctx.range();
-
-    uint64_t start = config.source_inst_id > 0 ? config.source_inst_id : range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    // Pre-build stop_pc set for O(1) lookup in the hot loop
-    ankerl::unordered_dense::set<uint64_t> stop_pc_set(config.stop_pcs.begin(),
-                                                        config.stop_pcs.end());
-
     // ─── Try to get XRef result for acceleration ──────────────────────
     const XrefResult* xref = nullptr;
     if (config.use_xref_acceleration) {
@@ -438,148 +406,71 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         }
     }
 
-    TaintResult result;
-    result.config = config;
-    result.tainted_regs = config.source_regs;
+    // Track which PCs modify which registers (learned during scan, bitmask).
+    // Captured by the step lambda across calls (state must persist).
+    auto pc_to_written_regs =
+        std::make_shared<ankerl::unordered_dense::map<uint64_t, uint64_t>>();
+    bool use_learned_map = (xref != nullptr);
 
-    // Initialize tainted memory from config
-    for (uint64_t addr : config.source_mem_addrs) {
-        result.tainted_memory.add(addr);
-    }
-
-    // ─── Build PC → registers-touched bitmask for XRef skip ──────────────
-    // We'll build this incrementally: track which PCs we've seen and what
-    // registers they modify (as a bitmask). If a PC never touches any
-    // tainted register, we can potentially skip future occurrences.
-
-    uint64_t processed = 0;
-    uint64_t total = end - start;
-
-    // Track which PCs modify which registers (learned during scan, bitmask)
-    ankerl::unordered_dense::map<uint64_t, uint64_t> pc_to_written_regs;
-
-    // Seek directly to start position using index (avoid scanning prefix)
-    uint64_t start_offset = 0;
-    uint64_t scan_inst_id = 0;
-    if (start > 0) {
-        auto [off, pc] = index.offset_of_with_pc(start, reader);
-        start_offset = off;
-        scan_inst_id = start;
-    }
-
-    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
-    uint64_t inst_id = scan_inst_id;
-
-    for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
-        auto rec = *it;
-        if (rec.kind != RecordKind::Inst) continue;
-
-        auto inst = rec.as_inst();
-
-        // ─── Stop condition check ─────────────────────────────────────
-        auto stop = check_stop_conditions(result, stop_pc_set, inst.pc, processed,
-                                           config.max_instructions, config.max_taint_width);
-        if (!stop.empty()) {
-            result.stop_reason = std::move(stop);
-            break;
-        }
-
-        if (ctx.cancelled()) {
-            result.stop_reason = "cancelled by user";
-            break;
-        }
-
+    auto step_fn = [pc_to_written_regs, use_learned_map, &config](
+                       const InstView& inst, uint64_t inst_id, TaintResult& result) -> bool {
         // ─── XRef acceleration: skip if instruction cannot affect taint ─
-        // An instruction can only propagate taint if:
-        // 1. It reads a tainted register (src), OR
-        // 2. It reads from tainted memory
-        // If neither is possible, we can skip it.
-        //
-        // Quick check: if this instruction has no reg_diffs and no mem_accesses,
-        // it's a pure control-flow instruction (B, NOP) → skip.
+        // Quick check: a pure control-flow instruction (B, NOP) with no
+        // reg_diffs and no mem_accesses cannot propagate taint → skip.
         if (inst.reg_diff_count == 0 && inst.mem_access_count == 0) {
-            inst_id++;
-            processed++;
-            result.instructions_skipped_xref++;
-            continue;
+            return true;  // skipped
         }
 
         // ─── Advanced XRef skip using learned PC→reg map ──────────────
         // If we've seen this PC before and it only writes registers that
         // are NOT currently tainted, AND it doesn't read any tainted register,
-        // we can skip it. But we need to be conservative: the instruction
-        // might KILL taint (overwrite a tainted reg with non-tainted data).
-        // So we only skip if the PC doesn't touch any tainted register at all.
-        if (xref != nullptr) {
-          auto pcwr_it = pc_to_written_regs.find(inst.pc);
-          if (pcwr_it != pc_to_written_regs.end()) {
-            uint64_t written_mask = pcwr_it->second;
-            bool touches_tainted = (written_mask & result.tainted_regs) != 0;
-            // Also check if any source reg is tainted (reads)
-            if (!touches_tainted) {
-                // Check reg_diffs: if none of the diff'd registers are tainted
-                bool src_tainted = false;
-                for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                    auto diff = inst.reg_diff(i);
-                    if ((result.tainted_regs >> diff.index) & 1) {
-                        src_tainted = true;
-                        break;
+        // we can skip it. We only skip if the PC doesn't touch any tainted
+        // register at all — conservative w.r.t. kill semantics.
+        if (use_learned_map) {
+            auto pcwr_it = pc_to_written_regs->find(inst.pc);
+            if (pcwr_it != pc_to_written_regs->end()) {
+                uint64_t written_mask = pcwr_it->second;
+                bool touches_tainted = (written_mask & result.tainted_regs) != 0;
+                if (!touches_tainted) {
+                    bool src_tainted = false;
+                    for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+                        auto diff = inst.reg_diff(i);
+                        if ((result.tainted_regs >> diff.index) & 1) {
+                            src_tainted = true;
+                            break;
+                        }
                     }
-                }
-                // Check memory: if any read address is tainted
-                bool mem_tainted = false;
-                if (config.taint_from_memory) {
-                    for (uint8_t m = 0; m < inst.mem_access_count; m++) {
-                        auto mem = inst.mem_access(m);
-                        if ((mem.type & 2) == 0) {  // read
-                            if (result.tainted_memory.contains(mem.addr)) {
+                    bool mem_tainted = false;
+                    if (config.taint_from_memory) {
+                        for (uint8_t m = 0; m < inst.mem_access_count; m++) {
+                            auto mem = inst.mem_access(m);
+                            if ((mem.type & 2) == 0 &&  // read
+                                mem_range_hits_tainted_set(result.tainted_memory, mem.addr, mem.size)) {
                                 mem_tainted = true;
                                 break;
                             }
                         }
                     }
-                }
-
-                if (!src_tainted && !mem_tainted) {
-                    inst_id++;
-                    processed++;
-                    result.instructions_skipped_xref++;
-                    continue;
+                    if (!src_tainted && !mem_tainted) {
+                        return true;  // skipped
+                    }
                 }
             }
-          }
         }
 
         // ─── Learn which registers this PC writes ─────────────────────
-        uint64_t& written_mask = pc_to_written_regs[inst.pc];
+        uint64_t& written_mask = (*pc_to_written_regs)[inst.pc];
         for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
             written_mask |= (1ULL << inst.reg_diff(i).index);
         }
 
         // ─── Determine which source registers are tainted ─────────────
-        // In heuristic mode, we infer data flow from reg_diffs:
-        // - Registers that appear in reg_diffs but are NOT the destination
-        //   are potential sources (read operands).
-        // - The register that changes value is the destination.
-        //
-        // Improved heuristic: a register is "read" if it appears in the
-        // pre-state and its value contributes to the computation. Since we
-        // can't know this precisely without Triton, we use the conservative
-        // assumption that ALL registers in the diff set are both read and
-        // written (except for the one that actually changes).
-
-        // Collect all registers that are modified (written)
-        // ── Perf: stack-local arrays eliminate per-instruction heap alloc ──
-        // For 100M+ instructions, this prevents billions of malloc/free calls.
-        uint8_t written_regs[16];  // max reg_diffs per instruction
-        uint8_t n_written = 0;
-        for (uint8_t i = 0; i < inst.reg_diff_count && i < 16; i++) {
-            written_regs[n_written++] = inst.reg_diff(i).index;
-        }
-
-        // Determine if any source is tainted
+        // In heuristic mode, we infer data flow from reg_diffs: since we
+        // can't know precisely which reg_diff entries are "read" operands
+        // without Triton, we conservatively treat any other tainted
+        // reg_diff entry (or the register's own prior taint, for
+        // read-modify-write patterns) as a potential source.
         bool any_src_tainted = (result.tainted_regs != 0);
-        // Build stack-local tainted source reg list from bitmask
         uint8_t tainted_sources[64];
         uint8_t n_tainted_sources = 0;
         if (any_src_tainted) {
@@ -587,23 +478,25 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             while (tmp) {
                 uint8_t bit = static_cast<uint8_t>(__builtin_ctzll(tmp));
                 tainted_sources[n_tainted_sources++] = bit;
-                tmp &= tmp - 1;  // clear lowest set bit
+                tmp &= tmp - 1;
             }
         }
 
-        // Check memory sources
+        // Check memory sources — overlap-aware, so a read that partially
+        // overlaps a previously-tainted store is still recognized (this
+        // matches BackwardTaintPass's memory-overlap semantics rather than
+        // requiring an exact starting-address match).
         bool mem_source_tainted = false;
-        uint64_t tainted_mem_sources[8];  // max mem accesses per inst
+        uint64_t tainted_mem_sources[8];
         uint8_t n_tainted_mem = 0;
         if (config.taint_from_memory) {
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
-                if ((mem.type & 2) == 0) {  // read
-                    if (result.tainted_memory.contains(mem.addr)) {
-                        mem_source_tainted = true;
-                        if (n_tainted_mem < 8) {
-                            tainted_mem_sources[n_tainted_mem++] = mem.addr;
-                        }
+                if ((mem.type & 2) == 0 &&  // read
+                    mem_range_hits_tainted_set(result.tainted_memory, mem.addr, mem.size)) {
+                    mem_source_tainted = true;
+                    if (n_tainted_mem < 8) {
+                        tainted_mem_sources[n_tainted_mem++] = mem.addr;
                     }
                 }
             }
@@ -622,15 +515,13 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             bool was_tainted = (result.tainted_regs >> reg_idx) & 1;
 
             // ─── Kill semantics ───────────────────────────────────────
-            // If a register is overwritten and NONE of its sources are tainted,
-            // the register becomes untainted (killed).
-            // This is the key improvement over the old heuristic mode.
-
-            // Check if this specific write has tainted inputs
+            // If a register is overwritten and NONE of its sources are
+            // tainted, it becomes untainted (killed).
             bool has_tainted_input = false;
 
-            // Heuristic: if any other reg in the diff set is tainted, it might
-            // be a source operand (e.g., ADD X1, X2, X3 where X2 is tainted).
+            // Heuristic: if any other reg in the diff set is tainted, it
+            // might be a source operand (e.g., ADD X1, X2, X3 where X2 is
+            // tainted).
             for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
                 if (i == j) continue;
                 auto src = inst.reg_diff(j);
@@ -640,12 +531,9 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                 }
             }
 
-            // Also check: if the register being written was itself tainted
-            // and this looks like a read-modify-write (e.g., ADD X1, X1, X2)
+            // Read-modify-write self-reference (e.g., X1 = X1 + something):
+            // conservatively keep taint if the reg was already tainted.
             if (!has_tainted_input && was_tainted) {
-                // Could be self-referencing (X1 = X1 + something)
-                // In heuristic mode, we conservatively keep taint if the reg
-                // was already tainted (it might be reading its own value).
                 has_tainted_input = true;
             }
 
@@ -655,7 +543,6 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             }
 
             if (has_tainted_input) {
-                // ─── Taint propagation ────────────────────────────────
                 if (!was_tainted) {
                     result.tainted_regs |= (1ULL << reg_idx);
 
@@ -671,7 +558,6 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                             step.add_src_mem(tainted_mem_sources[mi]);
                     } else {
                         step.type = PropagationType::RegToReg;
-                        // Build src_reg_mask from actual tainted source regs
                         for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
                             if (i == j) continue;
                             auto src = inst.reg_diff(j);
@@ -712,7 +598,6 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
                 if (mem.type & 2) {  // write
-                    // Check if any source register is tainted
                     bool tainted_store = false;
                     uint8_t store_sources[34];
                     uint8_t n_store_sources = 0;
@@ -725,7 +610,6 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                             }
                         }
                     }
-                    // Also check if any currently-tainted reg could be the store source
                     if (!tainted_store && any_src_tainted) {
                         tainted_store = true;
                         std::memcpy(store_sources, tainted_sources, n_tainted_sources);
@@ -741,7 +625,6 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                         step.type = PropagationType::RegToMem;
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
-                        // Build src_reg_mask from store_sources
                         for (uint8_t si = 0; si < n_store_sources; si++)
                             step.src_reg_mask |= (1ULL << store_sources[si]);
                         step.triton_resolved = false;
@@ -753,57 +636,27 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
 
         // ─── ABI-aware call boundary detection ────────────────────────
         if (config.propagate_through_calls) {
-            // Detect call: LR (X30) is written → this is a BL/BLR
             bool is_call = false;
             for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                if (inst.reg_diff(i).index == REG_LR) {
+                if (inst.reg_diff(i).index == kTaintRegLR) {
                     is_call = true;
                     break;
                 }
             }
-
             if (is_call) {
-                // Emit Call event if any argument register is tainted
-                uint64_t arg_taint = result.tainted_regs & 0xFFULL;  // X0-X7 = bits 0-7
-                if (arg_taint) {
-                    PropagationStep step;
-                    step.inst_id = inst_id;
-                    step.pc = inst.pc;
-                    step.type = PropagationType::Call;
-                    step.src_reg_mask = arg_taint;  // bitmask of arg regs carrying taint
-                    step.triton_resolved = false;
-                    emit_step(result, config, std::move(step));
-                    result.call_crossings++;
-                }
+                maybe_emit_call_event(result, config, inst_id, inst.pc,
+                                       result.tainted_regs, false);
             }
-
-            // Detect return: PC changes to LR value (heuristic: if PC diff
-            // matches the LR value from before). In practice, we detect RET
-            // by checking if the instruction has no reg_diffs except PC
-            // and the next PC equals the saved LR. Simplified: if we see
-            // X0 tainted at what looks like a function exit, emit Return event.
-            // For now, we rely on the natural trace flow — the caller will
-            // see X0 tainted after the callee returns.
+            // Return-event detection (PC jumps back to a saved LR) is not
+            // implemented in heuristic mode: we rely on the natural trace
+            // flow — the caller will see X0 already tainted once the callee
+            // returns, since propagation continues linearly through the trace.
         }
 
-        inst_id++;
-        processed++;
-        result.instructions_processed = processed;
+        return false;  // not skipped
+    };
 
-        if (processed % 10000 == 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-        }
-    }
-
-    ctx.progress(1.0f, fmt::format("Taint (heuristic): {} events, {} steps, {} kills, "
-                                     "{} skipped, {} regs, {} mem",
-                                     result.events.size(),
-                                     result.steps.size(),
-                                     result.kill_events_count,
-                                     result.instructions_skipped_xref,
-                                     result.tainted_reg_count(),
-                                     result.tainted_memory.cardinality()));
-    return PassResult::success(std::move(result));
+    return run_taint_scan_common(ctx, config, step_fn, "heuristic");
 }
 
 // ─── TaintPass dispatch ─────────────────────────────────────────────────────

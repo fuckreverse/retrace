@@ -1,5 +1,6 @@
 #include "analysis/passes/taint/backward_taint_pass.h"
 #include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/taint_common.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -13,24 +14,18 @@ namespace tenet {
 
 using json = nlohmann::json;
 
-// AArch64 ABI constants
-static constexpr uint8_t REG_X0  = 0;
-static constexpr uint8_t REG_X7  = 7;
-static constexpr uint8_t REG_X30 = 30;  // LR
+// AArch64 ABI constants and register-exclusion rule now live in
+// taint_common.h (kTaintRegLR, TaintRegFilter) so TaintPass and
+// BackwardTaintPass can't drift out of sync on what counts as "data".
 
 // Maximum registers we track (AArch64 has 34 GPRs; 64 gives headroom).
 static constexpr uint8_t MAX_TRACKED_REGS = 64;
-// Maximum written/read registers per instruction (16 is generous; most
-// AArch64 instructions write ≤2 registers).
-static constexpr uint8_t MAX_INFO_REGS = 16;
-
-// --- Helper: check if a register should be excluded from propagation ------
 
 static bool should_exclude_reg(uint8_t reg_idx, const BackwardTaintConfig& config) {
-    if (reg_idx == IDX_NZCV) return true;
-    if (reg_idx == IDX_SP && !config.include_sp) return true;
-    if (reg_idx == IDX_PC && !config.include_pc) return true;
-    return false;
+    TaintRegFilter filter;
+    filter.include_sp = config.include_sp;
+    filter.include_pc = config.include_pc;
+    return filter.should_exclude(reg_idx);
 }
 
 // --- Per-sink tracking state (zero-alloc, bitmask-based) ------------------
@@ -88,35 +83,11 @@ struct PropagationState {
 //   - Is it a BL (branch-and-link) site? (exclude LR from data tracking)
 //   - Does it have a memory read? (for load propagation through memory)
 //
-// InstructionInfo uses fixed-size stack arrays to avoid per-instruction heap
-// allocation in the million-instruction hot loop.
-
-/// Describes the register/memory classification of one instruction.
-struct InstructionInfo {
-    /// All registers WRITTEN by this instruction (potential definitions).
-    uint8_t written_regs[MAX_INFO_REGS];
-    uint8_t n_written = 0;
-
-    /// All registers READ by this instruction (potential sources).
-    uint8_t read_regs[MAX_INFO_REGS];
-    uint8_t n_read = 0;
-
-    /// Whether this instruction writes LR (i.e., is a BL call site).
-    bool is_bl_site = false;
-
-    /// Whether this instruction has semantic memory reads (for load detection).
-    bool has_memory_reads = false;
-
-    /// Valid: set to false if instruction could not be classified (e.g., no opcode).
-    bool valid = true;
-
-    void add_written(uint8_t reg_id) {
-        if (n_written < MAX_INFO_REGS) written_regs[n_written++] = reg_id;
-    }
-    void add_read(uint8_t reg_id) {
-        if (n_read < MAX_INFO_REGS) read_regs[n_read++] = reg_id;
-    }
-};
+// The shared TaintInstructionInfo (taint_common.h) uses fixed-size stack
+// arrays to avoid per-instruction heap allocation in the million-instruction
+// hot loop, and is also used by TaintPass's heuristic classifier — see
+// classify_inst_heuristic() below for the shared heuristic strategy.
+using InstructionInfo = TaintInstructionInfo;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Common backward traversal framework (templated for inlining classify)
@@ -233,7 +204,7 @@ static PassResult run_backward_taint_common(
             uint8_t wr_reg = info.written_regs[i];
             if (should_exclude_reg(wr_reg, config)) continue;
             // Skip LR write at BL sites (it's control flow, not data)
-            if (info.is_bl_site && wr_reg == REG_X30) continue;
+            if (info.is_bl_site && wr_reg == kTaintRegLR) continue;
 
             if (state.has_reg(wr_reg)) {
                 contributes = true;
@@ -253,7 +224,7 @@ static PassResult run_backward_taint_common(
             for (uint8_t i = 0; i < info.n_read; i++) {
                 uint8_t sr_reg = info.read_regs[i];
                 if (should_exclude_reg(sr_reg, config)) continue;
-                if (info.is_bl_site && sr_reg == REG_X30) continue;
+                if (info.is_bl_site && sr_reg == kTaintRegLR) continue;
                 if (event.has_dst_reg(sr_reg)) continue;
 
                 event.add_src_reg(sr_reg);
@@ -284,12 +255,7 @@ static PassResult run_backward_taint_common(
                     uint64_t needed_addr = it->first;
                     uint8_t needed_size = it->second.size;
 
-                    uint64_t store_start = mem.addr;
-                    uint64_t store_end = mem.addr + mem.size;
-                    uint64_t need_start = needed_addr;
-                    uint64_t need_end = needed_addr + needed_size;
-
-                    if (store_start < need_end && need_start < store_end) {
+                    if (mem_ranges_overlap(mem.addr, mem.size, needed_addr, needed_size)) {
                         if (!contributes) contributes = true;
                         event.stores_to_memory = true;
                         event.store_addr = mem.addr;
@@ -439,7 +405,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
         for (const auto& ra : sem.reg_accesses) {
             if (ra.is_written) {
                 info.add_written(ra.reg_id);
-                if (ra.reg_id == REG_X30) {
+                if (ra.reg_id == kTaintRegLR) {
                     info.is_bl_site = true;
                 }
             }
@@ -470,29 +436,12 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
     // Heuristic: uses reg_diff entries to infer written registers.
     // All reg_diff entries are treated as writes; those not in the destination set
     // become potential source dependencies (overapproximation).
+    //
+    // This is the exact same inference TaintPass's heuristic (forward) engine
+    // uses — shared once as classify_inst_heuristic() in taint_common.h so
+    // both directions agree on what a "write" vs. "potential source" means.
     auto classify = [](const InstView& inst) -> InstructionInfo {
-        InstructionInfo info;
-
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            info.add_written(diff.index);
-            if (diff.index == REG_X30) {
-                info.is_bl_site = true;
-            }
-        }
-
-        // For heuristic: read_regs are the same reg_diff set minus dst_regs.
-        // This is an overapproximation: we treat all modified registers as potential
-        // sources. The traversal loop filters out actual dst_regs.
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            info.add_read(diff.index);
-        }
-
-        // Heuristic always considers memory reads possible (relies on inst.mem_access)
-        info.has_memory_reads = true;
-
-        return info;
+        return classify_inst_heuristic(inst);
     };
 
     return run_backward_taint_common(ctx, config, classify, "heuristic");
