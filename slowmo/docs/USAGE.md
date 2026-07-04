@@ -454,9 +454,6 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 # 反向污点 + 导出数据流图
 ./tenet trace.bin --backward-taint 45678 0 --backward-taint-graph dfg.json
 
-# 程序切片（正向）
-./tenet trace.bin --slice 12345 0
-
 # 关键路径（critical path）
 ./tenet trace.bin --backward-taint 45678 0 --critical-path
 ```
@@ -598,7 +595,7 @@ python3 ... --trace-mode once --output run2.bin
 
 ```bash
 ./tenet --mcp trace.bin
-# AI 客户端（如 Claude Desktop）通过 stdio 调用 46 个 MCP 工具
+# AI 客户端（如 Claude Desktop）通过 stdio 调用 47 个 MCP 工具
 ```
 
 **MCP HTTP（远程或 GUI 宿主）：**
@@ -689,7 +686,7 @@ cat /tmp/pcring.txt
 | [`qbditrace/README.md`](../../qbditrace/README.md) | tracer 详细设计、C ABI 参考、Benchmark 套件 |
 | [`docs/capabilities.md`](capabilities.md) | tenet 全部能力按场景的导航地图 |
 | [`docs/trace-format.md`](trace-format.md) | 二进制格式完整规范（v4/v5/v7/flags） |
-| [`docs/analysis-layer.md`](analysis-layer.md) | 37 个 Pass 的分类、依赖和调度 |
+| [`docs/analysis-layer.md`](analysis-layer.md) | 30 个 Pass 的分类、依赖和调度 |
 | [`docs/ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP 详细说明 |
 | [`docs/pass-cookbook.md`](pass-cookbook.md) | 新增自定义 Pass 的开发指南 |
 | [`docs/profiling.md`](profiling.md) | 性能调优与 Instruments 使用 |

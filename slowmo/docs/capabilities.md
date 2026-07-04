@@ -19,8 +19,6 @@ mindmap
     数据流分析
       taint
       backward_taint
-      slice
-      producer_chain
       dataflow_graph
     内存与字符串
       memread
@@ -28,7 +26,7 @@ mindmap
       memory_snapshot
       strings
       memory_strings
-      literal_search
+      mem_search（含精确值检索）
     算法识别
       pattern（内嵌 constant_materialization）
       loop_semantics
@@ -114,8 +112,6 @@ profiling
 | 前向污点 | `--taint`, `taint_forward` | 从 source 寄存器或内存向后传播 |
 | 反向污点 | `--backward-taint`, `taint_backward` | 从 sink 反推贡献源 |
 | 关键路径 | `--critical-path`, `critical_path` | 前向与反向污点交集 |
-| 切片 | `slice` | 只保留真正相关的依赖链 |
-| producer chain | `--producer-chain`, `producer_chain` | 轻量寄存器值来源追踪 |
 | 数据流图 | `--dataflow-graph`, `dataflow_graph` | 指令范围内寄存器级图结构 |
 | taint source annotation | `--taint-source-annotation` | 给反向叶子源加 ObjC / 内存上下文 |
 
@@ -128,7 +124,9 @@ profiling
 ./tenet trace.bin --dataflow-graph 20000 24000 --dataflow-graph-output dfg.dot
 ```
 
-对应 pass：`taint`, `backward_taint`, `slice`, `producer_chain`, `dataflow_graph`, `taint_source_annotation`
+对应 pass：`taint`, `backward_taint`, `dataflow_graph`, `taint_source_annotation`
+
+> `slice`、`producer_chain` 已被 `backward_taint` 取代（不再是独立 pass/CLI 选项/MCP 工具）；GUI 里的 “Producer Chain” 快捷入口现在内部调用的是 `BackwardTaintPass` 的一个小步数预览模式。
 
 参考：[`analysis-layer.md`](analysis-layer.md), [`core-layer.md`](core-layer.md)
 
@@ -143,8 +141,7 @@ profiling
 | 内存快照 | `--memory-snapshot`, `memory_snapshot` | 在指定调用点或 inst_id 抓区域快照 |
 | 字符串扫描 | `--strings`, `strings_scan` | 从最终快照中恢复字符串 |
 | 调用点字符串 | `--memory-strings`, `memory_strings` | 用时间感知重建调用瞬间的参数字符串 |
-| 字面值搜索 | `--literal-search`, `literal_search` | 在寄存器、内存、立即数里搜常量 |
-| 模式搜索 | `--mem-search`, `mem_search` | 按字节模式搜索写入或寄存器值 |
+| 模式/精确值搜索 | `--mem-search`, `--mem-search-value`（兼容旧参数名 `--literal-search`）, `mem_search` | 按字节模式、精确数值或立即数搜索内存写入/寄存器值 |
 | 熵分析 | `--entropy`, `entropy_analysis` | 判断高熵区、密文区 |
 | YARA 扫描 | `--yara-mem-scan` | 在内存页上跑 YARA 规则 |
 
@@ -154,10 +151,12 @@ profiling
 ./tenet trace.bin --memread 0x16fdff200 64 32000
 ./tenet trace.bin --memory-snapshot 40000 --memory-snapshot-size 128
 ./tenet trace.bin --strings --memory-strings
-./tenet trace.bin --literal-search 0x9E3779B97F4A7C15
+./tenet trace.bin --mem-search-value 0x9E3779B97F4A7C15
 ```
 
-对应 pass：`strings`, `memory_strings`, `memory_snapshot`, `mem_search`, `literal_search`, `entropy`, `yara_mem_scan`
+对应 pass：`strings`, `memory_strings`, `memory_snapshot`, `mem_search`, `entropy`, `yara_mem_scan`
+
+> `literal_search` 已不是独立 pass：精确数值搜索现在是 `MemSearchPass` 的一个模式。`--literal-search`/`--literal-search-range` 仍保留为 `--mem-search-value`/`--mem-search-range` 的弃用别名（仅 CLI 层面，不影响 MCP/GUI）。
 
 参考：[`core-layer.md`](core-layer.md), [`analysis-layer.md`](analysis-layer.md)
 
@@ -265,7 +264,7 @@ profiling
 
 | 你遇到的问题 | 优先使用 |
 |--------------|----------|
-| 我想知道某个输出是怎么来的 | `backward_taint`, `producer_chain`, `mem_write_history` |
+| 我想知道某个输出是怎么来的 | `backward_taint`（含 GUI 内快速预览 “Producer Chain” 步数受限模式）, `mem_write_history` |
 | 我想知道输入往哪流了 | `taint`, `critical_path`, `dataflow_graph` |
 | 我想知道代码结构 | `function`, `xref`, `cfg`, `call_graph`, `loops` |
 | 我想知道是不是某个算法 | `pattern`, `constants`, `loop_semantics`, `algorithm_summary` |

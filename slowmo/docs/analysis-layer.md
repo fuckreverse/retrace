@@ -90,7 +90,9 @@ Collector 可按记录类型覆写回调：
 
 ## Pass 分类总览
 
-当前 `pass_catalog()` 注册了 **33 个 pass**，分成 8 类。
+当前 `pass_catalog()` 注册了 **30 个 pass**，分成 7 类。
+
+> `index_build` 已不是独立 pass（`--index-build` 是 CLI 里单独触发索引构建/重建的选项，不经过 PassManager）；`slice`、`producer_chain` 已被 `backward_taint` 取代并从 catalog 中移除——GUI 里保留的 `run_producer_chain()` 只是 `BackwardTaintPass` 的一个受限步数封装（quick preview），不再是独立 pass 或 MCP 工具。
 
 ### 1. Structure
 
@@ -102,7 +104,7 @@ Collector 可按记录类型覆写回调：
 | `cfg_layout` | 为 CFG 生成布局坐标 / DOT |
 | `call_graph` | 基于函数结果生成调用图 |
 | `loop` | 基于 CFG 检测循环 |
-| `index_build` | 显式触发索引构建 / 重建 |
+| `vm_abstract` | VMP 执行抽象（详见 3b 节）|
 
 ### 2. Taint
 
@@ -110,9 +112,9 @@ Collector 可按记录类型覆写回调：
 |------|----------|
 | `taint` | 前向污点传播 |
 | `backward_taint` | 反向污点回溯 |
-| `slice` | 反向切片 |
-| `producer_chain` | 轻量寄存器来源追踪 |
 | `taint_source_annotation` | 为反向叶子源补充 ObjC / 内存上下文 |
+
+> `taint` 与 `backward_taint` 共享 `taint_common.h`：AArch64 ABI 常量（X0-X7 参数、X0 返回值、X30/LR）、寄存器排除规则（NZCV/SP/PC 默认不追踪）、以及 overlap-aware 的内存区间匹配（部分/非对齐访问命中已污点内存区域时仍能识别）三者集中定义，避免两个 pass 各自实现导致精度差异或悄悄漂移。
 
 ### 3. Crypto / Pattern
 
@@ -120,7 +122,7 @@ Collector 可按记录类型覆写回调：
 |------|----------|
 | `pattern` | 模式检测：crypto / anti-debug / obfuscation / networking（syscall 寄存器按 target_os 自动选择 x16/x8）；同一次 trace 扫描内还内嵌了 movz+movk 常量链识别（原独立的 `constant_materialization` pass 已合并，见 `PatternResult::constants`） |
 | `loop_semantics` | 判断循环是否像 Feistel / SPN / ARX / memcpy |
-| `algorithm_summary` | 汇总模式、常量、循环、调用图做算法识别 |
+| `algorithm_summary` | 汇总模式、常量、循环、调用图做算法识别；结果按 `AlgorithmFamily`（结构化枚举，如 AES/SHA256/ChaCha）归并证据，不再靠子串匹配拼接不同检测器的措辞；每个候选带 `is_speculative` 标记，仅凭“高频调用”这一弱证据得出的候选会被单独标出，`confirmed_candidates()` 可过滤掉它们 |
 | `objc_crypto` | 把密码学命中与 ObjC 调用上下文关联 |
 
 > `constant_materialization` 已并入 `pattern`（`PatternCollector` 在同一次扫描中顺带追踪
@@ -137,7 +139,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `vm_abstract` | VMP（虚拟机保护）执行抽象，**完全由静态分析 hint 驱动**（不在 trace 里猜测 dispatcher/VM-PC/拓扑/架构类型）：给定 dispatcher 位置（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode** / **FetchOnly**）后提取 handler 执行次数、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）|
+| `vm_abstract` | VMP（虚拟机保护）执行抽象，**完全由静态分析 hint 驱动**（不在 trace 里猜测 dispatcher/VM-PC/拓扑/架构类型，也不再提供任何 auto-detect 回退开关——`VMConfig` 里已移除 `auto_detect`/`vm_auto_detect` 字段，无 hint 直接拒绝注册）：给定 dispatcher 位置（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode** / **FetchOnly**）后提取 handler 执行次数、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）；`arch_type_hint` 与 dispatch 类型的机械判定（`classify_dispatch_type()`）也都只读取已 hint 位置的指令编码，不做统计推断。归类为 Structure（见上表）|
 
 ### 4. Memory / String
 
@@ -146,9 +148,8 @@ Collector 可按记录类型覆写回调：
 | `strings` | 最终内存快照中的字符串恢复 |
 | `memory_strings` | 调用点瞬时字符串恢复 |
 | `memory_snapshot` | 在 inst_id 或调用点抓快照 |
-| `mem_search` | 按字节模式搜索内存写 / 寄存器值 |
+| `mem_search` | 按字节模式/精确数值搜索内存写 / 寄存器值 / 立即数（原独立的 `literal_search` 已合并进来）|
 | `entropy` | 对内存区域做 Shannon 熵分析 |
-| `literal_search` | 搜索常量字面值 |
 | `yara_mem_scan` | 在内存页上跑 YARA 规则 |
 
 ### 5. Platform API
@@ -187,7 +188,6 @@ flowchart LR
     cfg --> loop
     function --> call_graph
     xref --> taint
-    taint --> slice
     loop --> trace_fold
     xref --> trace_fold
     loop --> loop_semantics
@@ -217,7 +217,7 @@ loop_semantics --> algorithm_summary
 - `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
 - `syscall_intercept` 优先消费 REC_CAPICALL 记录（`on_capicall()`），已处理的 callee PC 写入 `capicall_seen_` 防止后续 XFER_CALL Event 重复生成记录；无 REC_CAPICALL 时降级为 XFER_CALL 启发式。
 - `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
-- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；**完全由 hint 驱动**（`VMConfig::has_any_static_hint()` 为 false 时拒绝运行）——dispatcher 位置、VM-PC 寄存器、dispatch 拓扑、VM 架构类型均需通过 `VMConfig` 由静态分析（IDA/Ghidra）提供，pass 本身不做启发式扫描/推断。`classify_dispatch_type()` 仅在未提供 `dispatch_type_hint` 时做一次纯机械判定（读取已定位的 dispatch 指令是否为 BLR，不做统计推测）；`find_indirect_branch_in_loop()` 仅在已 hint 的 loop 内做结构补全（用户只给了 `loop_header_pc` 时，在其 body 内查找唯一的间接跳转指令）。新增能力：
+- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；**完全由 hint 驱动**（`VMConfig::has_any_static_hint()` 为 false 时拒绝运行，且已不存在 auto-detect 回退——`auto_detect`/`vm_auto_detect` 字段、`--vm-auto-detect` CLI 开关、MCP `auto_detect` 参数均已删除）——dispatcher 位置、VM-PC 寄存器、dispatch 拓扑、VM 架构类型均需通过 `VMConfig` 由静态分析（IDA/Ghidra）提供，pass 本身不做启发式扫描/推断。`classify_dispatch_type()` 仅在未提供 `dispatch_type_hint` 时做一次纯机械判定（读取已定位的 dispatch 指令是否为 BLR，不做统计推测）；`find_indirect_branch_in_loop()` 仅在已 hint 的 loop 内做结构补全（用户只给了 `loop_header_pc` 时，在其 body 内查找唯一的间接跳转指令）。新增能力：
   - **ThreadedCode 拓扑**：`dispatch_type_hint = ThreadedCode` + `threaded_dispatch_pcs`，切换为 `ThreadedCollector`（无中央 loop，每条 handler 尾部自行 fetch+dispatch）。
   - **扩展去混淆 op**：`OpcodeDeobfStep::Op` 新增 `ror`（循环右移）、`bswap`（字节序反转）、`neg`（取负）、`not_`（按位取反）。
   - **opcode_byte_offset**：从 vm_pc 偏移 N 字节处读取 opcode，而非固定从 0 字节读。

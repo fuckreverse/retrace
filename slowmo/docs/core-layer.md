@@ -67,7 +67,8 @@ trace 里不会为每条指令保存完整寄存器快照，而是：
 | `state_after(inst_id)` | 返回执行后状态 |
 | `warm_range(start,end,stride,...)` | 预热一段范围的缓存 |
 | `warm_at(inst_id)` | 预热某个热点点位 |
-| `cache_stats()` | 查看缓存命中情况 |
+| `set_cache_capacity(size_t)` | 调整 LRU 缓存容量（默认 4096 条） |
+| `cache_stats()` | 查看缓存命中情况（`CacheStats` 含 `warm_samples` 字段） |
 
 ### 什么时候会受益于预热
 
@@ -115,27 +116,31 @@ trace 里不会为每条指令保存完整寄存器快照，而是：
 | 接口 | 作用 |
 |------|------|
 | `read(addr,size,at_inst_id)` | 小块时间感知读取 |
-| `read_region(addr,size,at_inst_id)` | 任意长度区域读取 |
+| `read_region(addr,size,at_inst_id)` | 任意长度区域读取（返回 `RegionReadResult`） |
 | `last_writer(addr,size,before_id)` | 找最近写入者 |
 | `write_history(addr,size)` | 列出所有写时刻 |
 | `byte_at(addr,at_inst_id)` | 单字节查询 |
-| `active_pages()` | 活跃页统计 |
+| `active_pages()` | 活跃页统计（返回 `PageActivity`） |
 | `was_accessed(addr)` | 地址是否出现过 |
+| `build(progress_fn)` / `is_built()` | 触发 mem_write 数据写入 RocksDB 持久化 / 查询是否已持久化 |
+| `cache_stats()` | 返回 `CacheStatsSnapshot` |
+| `invalidate_thread_iterators()` / `invalidate_tl_page_cache()` | RocksDB 关闭前清理线程本地资源 |
 
 ### 缓存层级
 
-`MemoryModel` 不是每次都重新扫 RocksDB，它用了三层缓存：
+`MemoryModel` 不是每次都重新扫 RocksDB，它用了四层缓存（`memory_model.h`）：
 
-1. `page_cache_`：缓存整页写历史
-2. `byte_cache_`：缓存热点 `(addr,inst_id) -> byte`
-3. RocksDB block cache
+1. `page_cache_`：`uint64_t -> vector<MemWrite>` 的 LRU，缓存整页原始写入事件（容量 512）
+2. `page_index_cache_`：`uint64_t -> PageWriteIndex` 的 LRU，缓存排序后的每页写入索引以支持 O(log W) 二分查找（容量 512）——**这是最关键的快路径**
+3. `byte_cache_`：缓存热点 `(addr,inst_id) -> byte`（容量 65536）
+4. RocksDB block cache
 
 ## 3. InstructionDecoder：把 opcode 变成人能看的指令
 
 `InstructionDecoder` 基于 Capstone，但做了两层工程封装：
 
-- 线程安全保护（Capstone handle 本身不安全）
-- 热路径缓存（同一个 PC 不应重复解码）
+- **每线程独立 Capstone handle**（`thread_local`），彻底消除了曾经成为瓶颈的全局 mutex
+- **按 opcode 而非 PC 缓存**：AArch64 是定长指令集（4 字节），opcode 字完全决定反汇编结果，不同 PC 执行相同 opcode 时共享同一个缓存项，命中率远高于按 PC 缓存
 
 ### 典型用途
 
@@ -147,9 +152,12 @@ trace 里不会为每条指令保存完整寄存器快照，而是：
 
 | 接口 | 作用 |
 |------|------|
-| `decode(pc, opcode)` | 解码一条 opcode |
-| `decode(pc, code_table)` | 从 `CodeTable` 间接解码 |
-| `format(pc, opcode)` | 直接生成字符串形式 |
+| `init()` | 初始化当前线程的 Capstone handle |
+| `decode(pc, opcode)` | 解码一条 opcode，返回 `std::optional<DecodedInst>` |
+| `decode(pc, code_table)` | 从 `CodeTable` 间接解码，返回 `std::optional<DecodedInst>` |
+| `format(pc, opcode)` | 直接生成 `std::string` 形式 |
+
+`DecodedInst` 除 mnemonic/operands 外还带 `regs_read`/`regs_written` 等寄存器读写集合信息，以及 `mnemonic_sv()`/`op_str_sv()` 零拷贝 accessor。
 
 ### 为什么很多 pass 还要绕过它
 
@@ -167,9 +175,9 @@ Triton 在 tenet 里不是“永远在线的大脑”，而是按需借用的精
 
 所以 tenet 把它包装成：
 
-- `TritonBridge`：统一语义接口
+- `TritonBridge`：统一语义接口，`query_batch()` 支持批量语义查询；`create_triton_bridge()` 工厂函数按编译开关选择实现
 - `TritonBridgeStub`：无 Triton 时的降级实现
-- `TritonBridgeTaint`：精确污点接口扩展
+- `TritonBridgeTaint`：精确污点接口扩展，`get_tainted_gpr_mask()` 返回 `uint64_t` 位掩码——这是热循环里做按位 diff 的首选 API，避免 O(T²) 的嵌套扫描
 - `TritonPool`：多个 pass 并发时的实例池
 
 ### 典型场景
@@ -209,11 +217,14 @@ Triton 实例不是零成本对象，而且并发访问时需要隔离上下文�
 
 | 接口 | 作用 |
 |------|------|
-| `add_breakpoint()` / `remove_breakpoint()` | 管理断点 |
+| `add_breakpoint()` / `remove_breakpoint()` / `clear_breakpoints()` | 管理断点 |
+| `has_breakpoints()` / `entries()` | 查询断点集合（`entries()` 供 TUI 展示） |
 | `run_forward(from_id)` | 前向继续到下一命中 |
 | `run_backward(from_id)` | 反向继续到上一命中 |
-| `next_execution(pc, from)` | 找某 PC 下一次执行 |
-| `next_write(addr, size, from)` | 找某地址下一次写入 |
+| `next_execution(pc, from)` / `prev_execution(pc, from)` | 找某 PC 下一次 / 上一次执行 |
+| `next_write(addr, size, from)` / `prev_write(addr, size, from)` | 找某地址下一次 / 上一次写入 |
+
+断点类型系统：`PcBreakpoint`/`WatchBreakpoint`/`ConditionalBreakpoint` 结构体，`BreakpointSpec` variant 统一持有，`BreakpointId` 为句柄类型，`BreakpointHit`/`BreakpointEntry` 为结果结构体。自由函数 `parse_breakpoint_cmd()` 供 TUI 解析断点命令字符串。
 
 ## 6. Core 层如何服务 Analysis 层
 
@@ -246,7 +257,7 @@ flowchart TD
 | `TraceIndex` | RocksDB 并发安全 | 可以全局共享 |
 | `RegisterFile` | 偏向单线程缓存 | 热路径建议每个 worker 私有或串行用 |
 | `MemoryModel` | 并发安全 | 可共享 |
-| `InstructionDecoder` | 内部 mutex | 可共享，但高并发下注意争用 |
+| `InstructionDecoder` | 每线程独立 Capstone handle（无 mutex）+ opcode 缓存的 `shared_mutex` | 可共享，解码本身无争用，仅缓存读写需要读写锁 |
 | `TritonBridge` | 实例独占 | 通过 `TritonPool` 借用 |
 | `BreakpointEngine` | 偏向单线程交互 | 主要供 GUI / TUI 主线程使用 |
 

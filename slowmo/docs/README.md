@@ -43,7 +43,7 @@ flowchart TD
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 系统总览、启动流程、对象装配 | `main.cpp`, `run_batch_analysis()` |
 | [`io-layer.md`](io-layer.md) | trace 读取、索引、代码字节、流式索引 | `TraceReader`, `TraceIndex`, `CodeTable`, `StreamingIndex` |
 | [`core-layer.md`](core-layer.md) | 寄存器、内存、解码、语义桥接、断点 | `RegisterFile`, `MemoryModel`, `InstructionDecoder`, `TritonBridge`, `BreakpointEngine` |
-| [`analysis-layer.md`](analysis-layer.md) | PassManager、TraceScanEngine、37 个 pass | `PassManager`, `TraceCollector`, `pass_registry.cpp` |
+| [`analysis-layer.md`](analysis-layer.md) | PassManager、TraceScanEngine、30 个 pass | `PassManager`, `TraceCollector`, `pass_registry.cpp` |
 | [`ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP / HTTP | `GuiApp`, `TuiApp`, `TenetRpcService`, `TenetMcpService` |
 | [`trace-format.md`](trace-format.md) | tenet 与 qbditrace 的接口契约 | `TraceFormat.h`, `InstView`, `AnchorView` |
 | [`pass-cookbook.md`](pass-cookbook.md) | pass 开发实操 | `AnalysisPass`, `pass_registry.cpp`, `batch_analysis.cpp`, `mcp_tools_*` |
@@ -56,7 +56,7 @@ flowchart TD
 | 结构恢复（函数 / XRef / CFG / 调用图） | [`capabilities.md`](capabilities.md), [`analysis-layer.md`](analysis-layer.md) | 结构类 pass 与导出方式 |
 | 数据流与污点 | [`capabilities.md`](capabilities.md), [`analysis-layer.md`](analysis-layer.md) | 正反向污点、切片、critical path |
 | 内存与字符串 | [`capabilities.md`](capabilities.md), [`core-layer.md`](core-layer.md) | 时间感知内存、快照、字符串恢复 |
-| AI / 自动化接入 | [`ui-layer.md`](ui-layer.md) | `--rpc`, `--mcp`, `--mcp-http`, 46 个 MCP 工具（核心 12 + AI 推理 9 + 分析 25） |
+| AI / 自动化接入 | [`ui-layer.md`](ui-layer.md) | `--rpc`, `--mcp`, `--mcp-http`, 47 个 MCP 工具（核心 12 + AI 推理 9 + 分析 25 + 其他 1）|
 | 新增分析能力 | [`pass-cookbook.md`](pass-cookbook.md), [`analysis-layer.md`](analysis-layer.md) | 从 pass 实现到 CLI / MCP 暴露 |
 | 边录边分析 | [`capabilities.md`](capabilities.md), [`io-layer.md`](io-layer.md) | `StreamingIndex` 与 `--streaming` |
 | 性能分析 | [`profiling.md`](profiling.md) | Instruments、bench、优化方法论 |

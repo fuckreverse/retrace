@@ -52,13 +52,13 @@ flowchart TD
 
 ## Step 1：定义 Result / Config / Pass 类
 
-以 `literal_search` 这种简单 pass 为例，头文件需要三部分：
+以 `entropy` 这种简单、无依赖的 pass 为例，头文件需要三部分：
 
 - `Config`
 - `Result`
 - `class ... : public AnalysisPass`
 
-参考位置：`src/analysis/passes/literal_search_pass.h`
+参考位置：`src/analysis/passes/memory/entropy_pass.h`
 
 ### 最小模板
 
@@ -224,35 +224,38 @@ CLI 入口通常要改三处：
 2. `src/cli_options.cpp`：加参数解析和 help 文案
 3. `src/batch_analysis.cpp`：注册 pass、执行、格式化输出
 
-### 例子：`literal_search`
+### 例子：`entropy`
 
 #### 5.1 `CliOptions`
 
 ```cpp
-bool opt_literal_search = false;
-uint64_t literal_search_value = 0;
+bool opt_entropy = false;
+uint64_t entropy_start = 0, entropy_end = 0;  // 复用为 addr/at_inst_id 等参数
 ```
 
 #### 5.2 参数解析
 
 ```cpp
-} else if (arg == "--literal-search" && i + 1 < argc) {
-    opts.opt_literal_search = true;
-    opts.literal_search_value = std::stoull(argv[++i], nullptr, 16);
+} else if (arg == "--entropy" && i + 2 < argc) {
+    opts.opt_entropy = true;
+    opts.entropy_start = std::stoull(argv[++i]);
+    opts.entropy_end = std::stoull(argv[++i]);
 }
 ```
 
 #### 5.3 批处理执行
 
 ```cpp
-if (opts.opt_literal_search) {
-    LiteralSearchConfig ls_cfg;
-    ls_cfg.search_values.push_back(opts.literal_search_value);
-    pm.register_pass(std::make_unique<LiteralSearchPass>(std::move(ls_cfg)));
-    const auto& raw = pm.require("literal_search");
+if (opts.opt_entropy) {
+    EntropyConfig ent_cfg;
+    ent_cfg.at_inst_id = opts.entropy_start;  // use start as sample point
+    pm.register_pass(std::make_unique<EntropyPass>(std::move(ent_cfg)));
+    const auto& raw = pm.require("entropy");
     // ... 序列化输出 ...
 }
 ```
+
+> 注意：旧版本文档曾以独立的 `literal_search` pass 为例——该 pass 现在已合并进 `mem_search`（作为精确数值搜索模式），不再是独立可注册的 pass。如果你需要参考“多个搜索条件合并为一个 pass”的设计，可以看 `src/analysis/passes/memory/mem_search_pass.h`。
 
 ### 什么时候只用 `--run-pass`
 

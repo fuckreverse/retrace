@@ -6,7 +6,7 @@
 
 - 交互浏览 trace：GUI / TUI 双前端，支持时间轴导航、书签、搜索、断点、Hex Dump。
 - 恢复程序结构：函数识别、XRef、CFG、调用图、循环与循环语义。
-- 追踪数据流：前向污点、反向污点、程序切片、producer chain、数据流图。
+- 追踪数据流：前向污点、反向污点、关键路径、数据流图。
 - 重建运行时状态：任意指令点寄存器状态、时间感知内存读取、写历史、内存快照、字符串恢复。
 - 识别高层语义：常量物化、模式检测、算法摘要、ObjC 消息分析、系统调用参数提取。
 - 做自动化与 AI 集成：CLI 批处理、JSON-RPC、MCP stdio、MCP Streamable HTTP、实时 streaming index。
@@ -21,7 +21,7 @@
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 看整体设计 | 启动流程、层次边界、运行时装配、扩展点 |
 | [`docs/io-layer.md`](docs/io-layer.md) | 看底层数据访问 | `TraceReader`、`TraceIndex`、`CodeTable`、`StreamingIndex` |
 | [`docs/core-layer.md`](docs/core-layer.md) | 看状态重建 | `RegisterFile`、`MemoryModel`、`InstructionDecoder`、Triton 桥接 |
-| [`docs/analysis-layer.md`](docs/analysis-layer.md) | 看 Pass 框架 | `PassManager`、`TraceScanEngine`、36 个 pass 的分类与依赖 |
+| [`docs/analysis-layer.md`](docs/analysis-layer.md) | 看 Pass 框架 | `PassManager`、`TraceScanEngine`、30 个 pass 的分类与依赖 |
 | [`docs/ui-layer.md`](docs/ui-layer.md) | 看入口与服务 | GUI、TUI、CLI、RPC、MCP、MCP HTTP |
 | [`docs/trace-format.md`](docs/trace-format.md) | 看格式契约 | tenet 与 qbditrace 的 trace 二进制接口 |
 | [`docs/profiling.md`](docs/profiling.md) | 看性能优化 | Instruments、os_signpost、bench、优化方法论 |
@@ -31,8 +31,8 @@
 ## 当前实现速览
 
 - 主入口在 `src/main.cpp`：解析参数、打开 trace、构建/加载索引、初始化 Core、再分发到 GUI/TUI/CLI/服务模式。
-- `src/analysis/pass_registry.cpp` 当前注册了 **36 个 pass**，按结构、污点、密码学、内存、ObjC/系统调用、性能、线程等类别组织。
-- `src/io/mcp/` 当前注册了 **46 个 MCP 工具**，覆盖 trace 查询、分析触发、搜索、批量调用、证据验证和假设管理。
+- `src/analysis/pass_registry.cpp` 当前注册了 **30 个 pass**，按结构、污点、密码学、内存、ObjC/系统调用、性能、线程等类别组织。
+- `src/io/mcp/` 当前注册了 **47 个 MCP 工具**，覆盖 trace 查询、分析触发、搜索、批量调用、证据验证和假设管理。
 - 常驻对象模型是：`TraceReader` + `TraceIndex` + `CodeTable` + `RegisterFile` + `MemoryModel` + `InstructionDecoder` + `PassManager`。
 
 ## 固定构建目录

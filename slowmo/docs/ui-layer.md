@@ -35,7 +35,7 @@ flowchart TD
 
 - `gui_app.h`：GuiApp 成员、状态与渲染入口声明。
 - `gui_app.mm`：SDL3 + Metal + ImGui 生命周期、窗口与主循环。
-- `panels_*.cpp`：把不同功能面板拆到独立翻译单元。
+- `panels_*.cpp`（约 30 个翻译单元）：每个功能面板独立成文件，其中大部分是**参数驱动型 Pass 的专属悬浮窗口**（见下）。
 - `navigation.cpp` / `popups.cpp` / `gui_settings.cpp`：导航、弹窗、设置与持久化。
 
 ### 核心特性
@@ -46,10 +46,39 @@ flowchart TD
 - 启动后可异步预热核心 pass，不阻塞 UI。
 - 关闭时走异步 shutdown 流程，先取消分析、再安全回收。
 
+### Analysis 面板：无参数 Pass 的统一控制台
+
+`render_analysis_panel()`（`panels_analysis.cpp`）是一个按 `PassCategory`（Structure / Taint / Crypto·Pattern / Memory·String / ObjC·Platform API / Profile·Trace / Misc）分组的**扁平 pass 列表**，遍历 `tenet::pass_catalog()` 渲染：
+
+- 每行显示状态图标（NotRun / Running / Completed / Failed）、显示名、以及 `summarize_pass_result()` 生成的一句话摘要。
+- Running 态显示进度条、百分比与实时 progress message，可单独 Cancel；顶部 Banner 提供 “Stop All”。
+- Completed 态提供 “Rerun”（强制丢缓存重跑）；Failed 态提供重试。
+- 该面板只负责**无参数或参数已内置**的 pass（即直接 `PassManager::require()` 即可运行的那一类）。
+
+### 参数驱动型 Pass：独立悬浮窗口
+
+需要用户先输入查询参数（模式串、地址范围、YARA 规则等）的 pass，**不再共用 Analysis 面板**，而是各自拥有独立窗口，自带输入表单 + 结果表格 + 右键跳转：
+
+| 窗口标题 | 文件 | 对应 pass / 功能 |
+|----------|------|------------------|
+| Memory Search | `panels_mem_search.cpp` | `mem_search`（含原 `literal_search` 的精确值检索） |
+| YARA Memory Scan | `panels_yara_mem_scan.cpp` | `yara_mem_scan` |
+| Window Stats | `panels_window_stats.cpp` | `window_stats` |
+| Dataflow Graph | `panels_dataflow_graph.cpp` | `dataflow_graph` |
+| Register Timeline | `panels_reg_timeline.cpp` | `reg_timeline` |
+| Trace Diff | `panels_trace_diff.cpp` | `trace_diff` |
+| Trace Fold | `panels_trace_fold.cpp` | `trace_fold` |
+| Memory Snapshots | `panels_memory_snapshot.cpp` | `memory_snapshot` |
+| Call Context | `panels_call_context.cpp` | `call_context` |
+| VM Abstract / VM Workspace | `panels_vm_abstract.cpp` | `vm_abstract`（独立悬浮工作区，含 dispatcher/handler 可视化） |
+
+其余高层语义结果（Call Graph、CFG、Constants、Entropy、Loop Semantics、Algorithm Summary、ObjC Messages/Crypto、API Intercepts、Patterns、DWARF 符号信息）也各自拥有独立窗口，但多数无需前置参数输入，展示的是 `PassManager::require()` 的直接结果。
+
 ### GUI 与 Analysis 的关系
 
 - 即时显示（比如当前行、寄存器、Hex Dump）直接走 `RegisterFile` / `MemoryModel` / `InstructionDecoder`。
 - 高层结果（比如 CFG、污点、函数列表）全部通过 `PassManager::require()` 获取。
+- 每个独立窗口自行管理"是否已运行 / 参数是否变化 / 是否需要重跑"的状态，不经过 Analysis 面板的统一列表。
 
 ## TUI
 
@@ -79,8 +108,8 @@ CLI 由两部分组成：
 |------|----------|
 | 基础浏览 | `-c`, `-n`, `-s`, `-r`, `-m`, `-i` |
 | 结构恢复 | `--export-cfg`, `--call-graph`, `--symbol-annotation` |
-| 数据流 | `--taint*`, `--backward-taint*`, `--critical-path`, `--dataflow-graph*`, `--producer-chain` |
-| 内存与字符串 | `--memread`, `--mem-history`, `--strings`, `--memory-strings`, `--memory-snapshot*`, `--mem-search*`, `--literal-search*`, `--entropy` |
+| 数据流 | `--taint*`, `--backward-taint*`, `--critical-path`, `--dataflow-graph*` |
+| 内存与字符串 | `--memread`, `--mem-history`, `--strings`, `--memory-strings`, `--memory-snapshot*`, `--mem-search*`（`--literal-search*` 为弃用别名）, `--entropy` |
 | 算法与语义 | `--pattern`, `--constants*`, `--loop-semantics`, `--algorithm-summary`, `--objc*`, `--syscall-intercept*`, `--taint-source-annotation`, `--vm-abstract` |
 | 轨迹与性能 | `--trace-diff`, `--trace-fold*`, `--reg-timeline*`, `--window-stats*`, `--yara-mem-scan*`, `--thread-filter` |
 | 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--streaming`, `--stats` |
@@ -117,7 +146,7 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
 - 传输模式：
   - stdio（`--mcp`）
   - Streamable HTTP（`--mcp-http`）
-- 工具总数：**46 个**
+- 工具总数：**47 个**（`mcp_tools_core.cpp` 12 + `mcp_tools_ai.cpp` 9 + `mcp_tools_analysis.cpp` 25 + `mcp_server.cpp` 里直接注册的 `set_image_base` 1）
 - 注册入口：`register_all_tools()`
 - 工具分成 10 组：
   - `register_trace_tools()`
@@ -138,7 +167,7 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
 | trace / query | `trace_info`, `disasm`, `get_regs`, `memread`, `mem_write_history`, `search_pc` | 基础 trace 查询 |
 | taint / graph | `taint_forward`, `taint_backward`, `critical_path`, `cfg_export`, `call_graph`, `dataflow_graph` | 数据流与图恢复 |
 | analysis | `pattern_scan`, `strings_scan`, `constants_scan`, `loop_semantics`, `algorithm_summary`, `objc_messages`, `memory_snapshot` | 高层语义分析 |
-| search / pass | `mem_search`, `reg_timeline`, `literal_search`, `producer_chain`, `call_context`, `window_stats`, `entropy_analysis`, `functions`, `loops`, `xref`, `trace_diff`, `find_function` | 搜索、摘要、按名发现 pass |
+| search / pass | `mem_search`, `reg_timeline`, `call_context`, `window_stats`, `entropy_analysis`, `functions`, `loops`, `xref`, `trace_diff`, `find_function` | 搜索、摘要、按名发现 pass（`literal_search` 已合并进 `mem_search`，`producer_chain` 已被 `backward_taint` 取代，不再作为独立 MCP 工具）|
 | AI tools | `verify_evidence`, `batch_query`, `hypothesis_*` | 证据校验、批量查询、假设账本 |
 
 ### MCP HTTP 模式补充
@@ -177,6 +206,29 @@ MCP 不只是把 CLI 包了一层，而是额外提供了：
 - `hypothesis_*`：把“猜测 → 补证据 → 下结论”建模成显式状态机
 
 这让 AI 使用 tenet 时更像“受约束的分析员”，而不是随意生成文本摘要。
+
+### MCP 请求生命周期日志
+
+`mcp_server.cpp` 用 `LOG_*_M(log::Module::Mcp, ...)` 记录每个请求的完整生命周期，便于排查 AI 客户端的调用行为：
+
+- 启动：`service initialized: N tools registered (M write tools)`、`tenet-mcp server vX starting (...)`
+- 握手：`initialize: client=... version=...`、`client initialized (handshake complete)`
+- 每次 `tools/call`：分配自增序号 `seq`，依次打印
+  - Debug 级：`tools/call #seq name args={...}`（请求）
+  - Info 级：`tools/call #seq name OK  N.Nms  result=NB`（成功）
+  - Info 级：`tools/call #seq name PENDING  N.Nms  pass='...' progress=N%`（`PassNotReady`，异步 pass 未就绪）
+  - Warn 级：`tools/call #seq name FAILED  N.Nms  error=...`（异常）
+- 高频/低价值事件（`tools/list`、`ping`、stdio 收发原文）降级为 Debug/Trace，避免淹没关键日志。
+
+## 日志系统
+
+tenet 的日志（`src/common/logger.h`，纯头文件）在 Level 之外叠加了 **Module** 维度，用于聚焦排查某个子系统：
+
+- **Level**：`Off/Error/Warn/Info/Debug/Trace`，由环境变量 `TENET_LOG` 控制（`0-4` 或名字）。
+- **Module**：`General/Mcp/Io/Core/Analysis/Gui/Tui/Batch`（8 个，`Module::Count` 为哨兵），由环境变量 `TENET_LOG_MODULES=mcp,io` 控制（逗号分隔白名单；不设置 = 全部模块开启，向后兼容，不给现有用户增加噪音）。
+- 新代码推荐使用 `LOG_INFO_M(Module::Mcp, "...")` 等带模块标签的宏；旧代码不加标签等价于 `Module::General`，行为不变。
+- **GUI Output 面板**（`panels_log.cpp`，即 `render_log_panel()`）始终接收全部模块的日志，`TENET_LOG_MODULES` 只影响 stderr 输出；面板自身提供独立的 Level 下拉 + Module 多选下拉（复选框，位掩码）+ 文本子串过滤，三者可组合，互不影响 stderr 侧的过滤逻辑。
+- Output 面板对 `Module::General` 的消息不显示模块 tag（与引入模块系统之前的输出保持视觉一致）。
 
 ## Streaming 模式
 

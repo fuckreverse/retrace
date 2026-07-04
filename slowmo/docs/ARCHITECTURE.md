@@ -63,7 +63,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | `TraceReader` | 进程级 / 单 trace | 只读并发安全 | mmap 零拷贝底座 |
 | `TraceIndex` | 进程级 / 单 trace | RocksDB 并发安全 | 持久化索引与元信息 |
 | `CodeTable` | 进程级 / 单 trace | 读多写少 | 缓存 PC→opcode 映射 |
-| `InstructionDecoder` | 进程级 | 内部互斥 | Capstone 句柄包装 |
+| `InstructionDecoder` | 进程级 | 每线程独立 Capstone handle（无锁）+ opcode 缓存读写锁 | 按 opcode（非 PC）缓存反汇编结果 |
 | `RegisterFile` | 进程级或 pass 私有 | 缓存偏向单线程 | ANCHOR+diff 状态重建 |
 | `MemoryModel` | 进程级 | 并发安全 | 时间感知内存读取与写历史 |
 | `PassManager` | 入口级 / 会话级 | 内部同步 | 调度、缓存、依赖解析 |
@@ -121,8 +121,8 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 ## 当前实现规模
 
-- `src/analysis/pass_registry.cpp` 当前维护 **37 个 pass**。
-- `src/io/mcp/` 当前维护 **46 个 MCP 工具**。
+- `src/analysis/pass_registry.cpp` 当前维护 **30 个 pass**。
+- `src/io/mcp/` 当前维护 **47 个 MCP 工具**。
 - CLI 参数集中在 `src/cli_options.cpp`，批处理执行集中在 `src/batch_analysis.cpp`。
 
 ## 扩展点

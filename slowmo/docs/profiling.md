@@ -282,7 +282,7 @@ ctest -R perf --output-on-failure
 | `objc_crypto_pass.h` | `by_selector`、`by_class` |
 | `syscall_intercept_pass.h` | `by_callee`、`by_category`、`api_by_name_` |
 | `dataflow_graph_pass.h` | `inst_to_node` |
-| `constant_materialization_pass.h` | `known_db_`、`known_db_32_`、`by_algorithm` |
+| `constant_materialization_pass.h`（已并入 `pattern_pass.h`，见下方“Pass 名称变更”） | `known_db_`、`known_db_32_`、`by_algorithm` |
 | `algorithm_summary_pass.cpp` | `accum`（局部 EvidenceAccumulator map） |
 
 注：`syscall_intercept_pass.h` 中的 `ApiCategory` 是 `enum class`，需在 `namespace tenet` 外补充 `ankerl::unordered_dense::hash<ApiCategory>` 特化（以 `static_cast<uint64_t>` 直接映射枚举值，标记 `is_avalanching`）。
@@ -406,7 +406,7 @@ ninja -j$(nproc) tenet
 
 ## Pass 优化技术全景
 
-对全部 ~37 个 Pass 进行系统性代码分析后，将所有优化手段归纳为以下 9 类。每类注明了已使用的 Pass 和可进一步推广的 Pass，供下一步优化参考。
+对全部 30 个 Pass 进行系统性代码分析后，将所有优化手段归纳为以下 9 类。每类注明了已使用的 Pass 和可进一步推广的 Pass，供下一步优化参考。
 
 ### 1. 高速哈希表：`ankerl::unordered_dense`
 
@@ -431,11 +431,11 @@ ninja -j$(nproc) tenet
 
 **原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records）写入 RocksDB。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
 
-**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `index_build`、`xref`、`function`、`cfg`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`window_stats`、`thread`、`syscall_intercept`、`trace_fold`。
+**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `xref`、`function`、`cfg`、`cfg_layout`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`window_stats`、`dataflow_graph`、`thread`、`syscall_intercept`、`trace_fold`。（`index_build` 不是 PassManager 里的 pass，是 `--index-build` 单独触发的索引构建/重建选项，见 [`analysis-layer.md`](analysis-layer.md)。）
 
-**关键设计变体**：`memory_string`、`memory_snapshot`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）。
+**关键设计变体**：`memory_string`、`memory_snapshot`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）；`cfg_layout`、`dataflow_graph` 仅在 `ctx.range().is_full_trace()`（全量扫描）时读写缓存，区间/增量扫描不受影响。
 
-**可推广的 Pass**：`reg_timeline_pass`（目前每次重算）、`literal_search_pass`/`mem_search_pass`（搜索结果可以 pattern hash 为 key 缓存）、`entropy_pass`、`trace_diff_pass`。
+**可推广的 Pass**：`reg_timeline_pass`（目前每次重算，已用 `TraceIndex::find_last_writer_of()` 加速单寄存器查询但结果未持久化）、`mem_search_pass`（搜索结果可以 pattern hash 为 key 缓存，已含精确值搜索模式）、`entropy_pass`、`trace_diff_pass`。
 
 ---
 
@@ -479,7 +479,7 @@ ninja -j$(nproc) tenet
 
 - **`memory_snapshot_pass`（最典型）**：两阶段设计——Phase A 收集所有 `(addr, inst_id)` 请求但不读内存；Phase B 按 `page = addr >> 12` 排序后批量执行 `capture_region`。按页排序让同页访问连续，命中 MemoryModel 的 thread-local page cache。包含 `std::chrono` 精确计时对比，效果可量化，实测 5.4s → 1.2s（4.5×）。
 - **`objc_pass`**：直接遍历 raw trace 字节（绕过 `TraceScanEngine` 抽象），只处理 OBJC 记录（kind=5），跳过 >99.99% 的 INST 记录。`advise_sequential()`/`advise_random()` 切换 mmap 预读策略。
-- **`taint_pass`、`xref_pass`、`slice_pass`、`literal_search_pass`**：显式调用 `advise_sequential()` 提示 OS 预读。
+- **`taint_pass`、`xref_pass`、`backward_taint_pass`、`mem_search_pass`**：显式调用 `advise_sequential()` 提示 OS 预读。（`slice_pass`/`literal_search_pass` 已废弃：前者被 `backward_taint` 取代，后者合并进 `mem_search`。）
 - **`entropy_pass`、`syscall_intercept_pass`**：以 16 字节为单位批量调用 `memory.read()`，比逐字节 `byte_at()` 减少 RocksDB seek 次数 16×。
 
 **可推广的 Pass**：
@@ -499,11 +499,9 @@ ninja -j$(nproc) tenet
 | Pass | 跳跃机制 |
 |---|---|
 | `taint_pass` | `index.offset_of(inst_id)` + `reader.seek(offset)` 直接定位指令 |
-| `backward_taint_pass` | `index.find_last_writer_of(reg, before_inst)`，一次跳过数十万指令 |
+| `backward_taint_pass` | `index.find_last_writer_of(reg, before_inst)`（一次跳过数十万指令）+ RocksDB `SeekForPrev` 反向查最近写入，O(log N)（原 `slice_pass`/`producer_chain_pass` 的 `offset_of_with_pc`/`SeekForPrev` 跳跃逻辑已废弃并合并到这里，两个 pass 均已从 catalog 移除） |
 | `call_context_pass` | `lower_bound` 二分定位 `FunctionResult` 中的 call/ret 事件 |
-| `slice_pass` | `index.offset_of_with_pc(start_pc, start_inst)` 定位切片起点 |
 | `dataflow_graph_pass` | `index.offset_of()` 定位子图起点 |
-| `producer_chain_pass` | RocksDB `SeekForPrev` 反向查最近写入，O(log N) |
 | `thread_pass` | 4 处 `std::lower_bound` 在有序事件列表上二分搜索 |
 
 **可推广的 Pass**：
@@ -583,15 +581,16 @@ ninja -j$(nproc) tenet
 
 ### 当前优化覆盖率矩阵
 
+> `index_build` 不是 pass（`--index-build` 是索引构建/重建的 CLI 选项，不经过 PassManager，见 [`analysis-layer.md`](analysis-layer.md)），`slice`/`producer_chain`/`literal_search`/`constant_mat`（`constant_materialization`）已从 catalog 移除，不再单独出现在下表——它们的能力/优化已分别并入 `backward_taint`（Index 跳跃 ✓ SeekPrev、位操作）、`mem_search`（I/O 优化 ✓ advise）、`pattern`（Blob 缓存/Scan Fusion/ring-buf）。
+
 | Pass | 高速哈希表 | Blob 缓存 | Scan Fusion | 并行化 | Index 跳跃 | 位操作 | I/O 优化 | 算法优化 |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| index_build | ✓ | ✓ | — | ✓ parallel_sort | — | — | — | — |
 | xref | ✓ | ✓ | ✓ | ✓ shard | — | ✓ roaring | ✓ advise | — |
 | function | ✓ | ✓ | ✓ | — | ✓ | ✓ | — | ✓ hot/cold |
 | cfg | ✓ | ✓ | ✓ | — | — | — | — | — |
 | call_graph | ✓ | ✓ | — | — | — | — | — | — |
 | taint | ✓ | ✓ | — | — | ✓ | ✓ bitmask | ✓ advise | — |
-| backward_taint | ✓ | ✓ | — | — | ✓ SeekPrev | ✓ bitmask | — | — |
+| backward_taint | ✓ | ✓ | — | — | ✓ SeekPrev | ✓ bitmask | ✓ advise | — |
 | loop | ✓ | ✓ | — | — | — | — | — | — |
 | loop_semantics | — | — | — | — | — | — | — | ✓ warm_range |
 | string | — | ✓ | ✓ | — | — | — | — | — |
@@ -605,17 +604,13 @@ ninja -j$(nproc) tenet
 | objc_crypto | — | ✓ | — | — | — | — | — | ✓ binary-search |
 | window_stats | ✓ | ✓ | ✓ | — | — | — | — | ✓ sliding-win |
 | dataflow_graph | ✓ | ✓ | — | — | ✓ | — | — | — |
-| slice | — | — | — | — | ✓ | ✓ | ✓ advise | — |
-| producer_chain | — | — | — | — | ✓ SeekPrev | — | — | — |
 | thread_filter | — | — | — | — | — | ✓ roaring | — | — |
 | thread | ✓ | ✓ | ✓ | — | ✓ binary | — | — | — |
-| literal_search | ✓ | — | — | — | — | — | ✓ advise | — |
-| mem_search | — | — | — | — | — | — | ✓ advise | ✓ YARA AC |
+| mem_search | ✓ | — | — | — | — | — | ✓ advise | ✓ YARA AC |
 | reg_timeline | ✓ | — | — | — | ✓ anchor | — | — | — |
 | symbol_annotation | — | ✓ | — | — | — | — | — | — |
 | taint_src_annot | ✓ | — | — | — | — | ✓ ctzll | — | — |
 | syscall_intercept | — | ✓ | ✓ | — | — | — | ✓ 16B batch | — |
-| constant_mat | ✓ | ✓ | ✓ | — | — | — | — | — |
 | yara_mem_scan | — | — | — | — | — | — | — | ✓ multi-filter |
 
 ---
