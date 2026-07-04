@@ -469,18 +469,31 @@ inline const uint8_t* BlockCacheReader::data_at(uint64_t logical_offset) {
     uint64_t remaining = block.data.size() - offset_in_block;
 
     // Fast path: enough contiguous bytes within this block.
-    if (remaining >= kOverlapBytes || block_id + 1 >= index_.size()) {
+    //
+    // NOTE: this must NOT be short-circuited just because block_id is the
+    // last block. Decompressed block sizes are not a fixed 1 MB (the last
+    // block in particular is usually smaller than the others), so
+    // `remaining` can legitimately be less than kOverlapBytes even for the
+    // last block. Returning a raw pointer in that case would let a caller
+    // that honors the kOverlapBytes contract (see class comment) read past
+    // the end of `block.data`'s heap allocation — this used to crash with
+    // SIGBUS/SIGSEGV on real traces whose logical size isn't a multiple of
+    // the block size (i.e. almost all of them). The last block must go
+    // through the slow path below, which zero-pads the missing tail.
+    if (remaining >= kOverlapBytes) {
         return block.data.data() + offset_in_block;
     }
 
-    // Slow path: the read may straddle the block boundary.  Build a
-    // per-block overlap buffer that covers the tail of this block plus
-    // the head of the next block.  The overlap is stored separately from
-    // `data` so that existing pointers into `data` remain valid.
+    // Slow path: the read may straddle the block boundary, or (for the last
+    // block) run past the end of all data.  Build a per-block overlap
+    // buffer that covers the tail of this block plus the head of the next
+    // block (zero-filled if there is no next block, or if it doesn't have
+    // enough bytes).  The overlap is stored separately from `data` so that
+    // existing pointers into `data` remain valid.
     //
     // Layout:  overlap_start_ = max(0, data.size() - kOverlapBytes)
     //          overlap[0..tail] = data[overlap_start_ .. data.size()]
-    //          overlap[tail..tail+kOverlapBytes] = next_block[0..kOverlapBytes]
+    //          overlap[tail..tail+kOverlapBytes] = next_block[0..kOverlapBytes] (or zeros)
     //
     // Any logical offset mapping to offset_in_block >= overlap_start_ can
     // be served from the overlap buffer.
@@ -500,15 +513,20 @@ inline const uint8_t* BlockCacheReader::data_at(uint64_t logical_offset) {
                     block.data.data() + overlap_start,
                     tail_bytes);
 
-        // Fill head of next block.
+        // Fill head of next block, if any (last block: zero-fill instead).
         CachedBlock* next_cached = nullptr;
-        for (auto& slot : cache_) {
-            if (slot.block_id == block_id + 1) {
-                next_cached = &slot;
-                break;
+        if (block_id + 1 < index_.size()) {
+            for (auto& slot : cache_) {
+                if (slot.block_id == block_id + 1) {
+                    next_cached = &slot;
+                    break;
+                }
             }
         }
-        if (next_cached) {
+        if (block_id + 1 >= index_.size()) {
+            // No next block exists at all — the trace simply ends here.
+            std::memset(block.overlap.data() + tail_bytes, 0, kOverlapBytes);
+        } else if (next_cached) {
             size_t avail = std::min(kOverlapBytes, next_cached->data.size());
             std::memcpy(block.overlap.data() + tail_bytes,
                         next_cached->data.data(), avail);

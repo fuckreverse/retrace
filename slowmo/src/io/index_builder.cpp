@@ -172,6 +172,30 @@ static uint64_t xxhash64(const uint8_t* data, size_t len, uint64_t seed = 0) {
     return h64;
 }
 
+/// Copy `len` bytes starting at file offset `offset` into `out` (block mode).
+///
+/// `TraceReader::data_at()` only guarantees `kOverlapBytes` (32 KB, see
+/// block_cache_reader.h) contiguous bytes past the returned pointer, even
+/// when the read straddles a block boundary — decompressed block sizes are
+/// NOT guaranteed to be a fixed 1 MB (the last block in particular is
+/// usually smaller). Requesting more than that in one data_at() + memcpy
+/// reads past the end of the block's heap-allocated buffer (SIGBUS/SIGSEGV
+/// depending on what's mapped there). This helper honors the contract by
+/// copying in bounded chunks and re-resolving the pointer via data_at() for
+/// every chunk, regardless of `len`.
+static void copy_block_mode(const TraceReader& reader, uint64_t offset,
+                             size_t len, uint8_t* out) {
+    // Stay comfortably under kOverlapBytes (32 KB) to leave headroom.
+    constexpr size_t kChunk = 16 * 1024;
+    size_t done = 0;
+    while (done < len) {
+        size_t n = std::min(kChunk, len - done);
+        const uint8_t* p = reader.data_at(offset + done);
+        std::memcpy(out + done, p, n);
+        done += n;
+    }
+}
+
 /// Hash only a representative sample of the trace file (first 1MB + last 1MB).
 /// For large traces this is much faster than full hash while still detecting
 /// truncation, corruption at head/tail, and file swaps.
@@ -179,22 +203,24 @@ static uint64_t sample_trace_hash(const TraceReader& reader) {
     constexpr size_t SAMPLE = 1024 * 1024;  // 1MB per end
     const uint64_t size = reader.file_size();
     if (reader.is_block_mode()) {
-        // Block-compressed: cannot get a contiguous pointer spanning the
-        // full file.  Use data_at() to read the first and last SAMPLE
-        // bytes.  Since each SAMPLE is within one or two 1MB blocks,
-        // data_at() is safe.
+        // Block-compressed: cannot get a single contiguous pointer spanning
+        // a full 1 MB sample (data_at() only guarantees kOverlapBytes=32KB
+        // past any given offset — see copy_block_mode() above). Copy each
+        // sample into a local buffer in bounded chunks, then hash that.
         reader.pin_all();
         // data_at() takes a file offset (0 = start of file). In block mode
         // it subtracts header_size_ before passing to the block cache, so
         // we must pass header_size() (536) to get the first record byte.
         // Passing 0 would underflow: 0 - 536 = 0xFFFFFFFFFFFFFDE8.
-        const uint8_t* head = reader.data_at(reader.header_size());
         uint64_t actual_head = std::min(static_cast<uint64_t>(SAMPLE), size);
-        uint64_t h1 = xxhash64(head, static_cast<size_t>(actual_head));
+        std::vector<uint8_t> head_buf(static_cast<size_t>(actual_head));
+        copy_block_mode(reader, reader.header_size(), head_buf.size(), head_buf.data());
+        uint64_t h1 = xxhash64(head_buf.data(), head_buf.size());
         uint64_t h2 = 0;
         if (size > SAMPLE) {
-            const uint8_t* tail = reader.data_at(size - SAMPLE);
-            h2 = xxhash64(tail, SAMPLE);
+            std::vector<uint8_t> tail_buf(SAMPLE);
+            copy_block_mode(reader, size - SAMPLE, tail_buf.size(), tail_buf.data());
+            h2 = xxhash64(tail_buf.data(), tail_buf.size());
         }
         reader.unpin_all();
         return h1 ^ (h2 * XXH_PRIME64_2) ^ (size * XXH_PRIME64_3);
