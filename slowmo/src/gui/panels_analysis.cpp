@@ -24,6 +24,8 @@
 #include "analysis/passes/memory/memory_string_pass.h"
 #include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "analysis/passes/profile/trace_fold_pass.h"
+#include "analysis/passes/profile/window_stats_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
 #include "analysis/passes/vm/vm_hints_json.h"
 
@@ -350,6 +352,20 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         call_context_result_ = &raw->get<CallContextResult>();
         show_call_context_   = true;
         pending_focus_windows_.push_back("Call Context");
+        return;
+    }
+    if (name == "window_stats") {
+        window_stats_result_ = &raw->get<WindowStatsResult>();
+        show_window_stats_   = true;
+        window_stats_cursor_ = 0;
+        pending_focus_windows_.push_back("Window Stats");
+        return;
+    }
+    if (name == "dataflow_graph") {
+        dataflow_graph_result_ = &raw->get<DataflowGraphResult>();
+        show_dataflow_graph_   = true;
+        dataflow_graph_cursor_ = 0;
+        pending_focus_windows_.push_back("Dataflow Graph");
         return;
     }
 }
@@ -718,6 +734,51 @@ void GuiApp::run_vm_abstract_with_hints() {
     });
 }
 
+// ─── Dataflow Graph: parameterized runner ──────────────────────────────────
+//
+// Unlike most catalog passes (which derive their config purely from the
+// current cursor via run_pass_by_name), dataflow_graph needs an explicit
+// [start_inst_id, end_inst_id) range — mirrors run_call_context_with_params().
+
+void GuiApp::run_dataflow_graph_with_params() {
+    ensure_pass_manager();
+
+    auto parse_inst = [](const char* buf, uint64_t fallback) -> uint64_t {
+        if (buf[0] == '\0') return fallback;
+        try {
+            std::string s(buf);
+            if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+                return std::stoull(s, nullptr, 16);
+            return std::stoull(s, nullptr, 0);
+        } catch (...) {
+            return fallback;
+        }
+    };
+
+    DataflowGraphConfig cfg;
+    cfg.start_inst_id = parse_inst(dataflow_graph_start_buf_, current_inst_);
+    uint64_t default_end = std::min<uint64_t>(cfg.start_inst_id + 1000, total_inst_);
+    cfg.end_inst_id = parse_inst(dataflow_graph_end_buf_, default_end);
+
+    // Invalidate previous result (config changed — pass isn't idempotent by name).
+    if (pass_manager_->state("dataflow_graph") != PassManager::PassState::NotRun) {
+        pass_manager_->invalidate_and_clear_blob("dataflow_graph");
+    }
+    pass_manager_->register_pass(std::make_unique<DataflowGraphPass>(std::move(cfg)));
+    dataflow_graph_result_ = nullptr;
+
+    std::string name_str = "dataflow_graph";
+    enqueue_async(name_str, [this, name_str]() {
+        auto& raw = pass_manager_->require(name_str);
+        std::string summary = tenet::summarize_pass_result(name_str, raw);
+        bool ok = raw.ok();
+        post_apply([this, name_str, summary, ok]() {
+            last_pass_status_ = fmt::format("{}: {}", name_str, summary);
+            if (ok) apply_pass_result_pointers(name_str);
+        });
+    });
+}
+
 void GuiApp::force_rerun_pass(std::string_view name) {
     ensure_pass_manager();
 
@@ -822,6 +883,14 @@ void GuiApp::clear_analysis() {
     syscall_cursor_ = 0;
     trace_fold_result_ = nullptr;
     show_trace_fold_   = false;
+    window_stats_result_ = nullptr;
+    show_window_stats_   = false;
+    window_stats_cursor_ = 0;
+    dataflow_graph_result_ = nullptr;
+    show_dataflow_graph_   = false;
+    dataflow_graph_cursor_ = 0;
+    std::memset(dataflow_graph_start_buf_, 0, sizeof(dataflow_graph_start_buf_));
+    std::memset(dataflow_graph_end_buf_, 0, sizeof(dataflow_graph_end_buf_));
     vm_abstract_result_ = nullptr;
     show_vm_abstract_   = false;
     vm_handler_cursor_  = 0;

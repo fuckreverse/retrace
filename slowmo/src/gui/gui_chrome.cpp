@@ -134,6 +134,8 @@ void GuiApp::render_menu_bar() {
             // ── Profiling & Diff ──────────────────────────────────────────
             if (ImGui::BeginMenu("Profiling & Diff")) {
                 ImGui::MenuItem("Trace Fold",          nullptr, &show_trace_fold_);
+                ImGui::MenuItem("Window Stats",        nullptr, &show_window_stats_);
+                ImGui::MenuItem("Dataflow Graph",      nullptr, &show_dataflow_graph_);
                 ImGui::MenuItem("Register Timeline",   nullptr, &show_reg_timeline_);
                 ImGui::MenuItem("Trace Diff",          nullptr, &show_trace_diff_);
                 ImGui::Separator();
@@ -300,6 +302,19 @@ void GuiApp::render_menu_bar() {
                 if (ImGui::MenuItem("Trace Fold")) {
                     run_pass_by_name("trace_fold"); show_trace_fold_ = true;
                 }
+                if (ImGui::MenuItem("Window Stats")) {
+                    run_pass_by_name("window_stats"); show_window_stats_ = true;
+                }
+                if (ImGui::MenuItem("Dataflow Graph\xe2\x80\xa6")) {
+                    // Needs a start/end inst_id range — open the panel's
+                    // parameter form rather than running immediately (mirrors
+                    // how Call Context works from the Tools menu).
+                    show_dataflow_graph_ = true;
+                    if (dataflow_graph_start_buf_[0] == '\0') {
+                        snprintf(dataflow_graph_start_buf_, sizeof(dataflow_graph_start_buf_),
+                                 "%llu", (unsigned long long)current_inst_);
+                    }
+                }
                 if (ImGui::MenuItem("Trace Diff")) {
                     show_trace_diff_ = true;
                 }
@@ -343,8 +358,12 @@ void GuiApp::render_menu_bar() {
                     export_backward_taint_graph_to_file();
                 if (!has_bt) ImGui::EndDisabled();
             }
-            if (ImGui::MenuItem("Export Dataflow Graph\xe2\x80\xa6 (DOT/JSON)")) {
-                // TODO: dataflow_graph pass not yet plumbed into GUI
+            if (ImGui::MenuItem("Export Dataflow Graph\xe2\x80\xa6 (DOT)")) {
+                export_dataflow_graph_to_file();
+            }
+            if (ImGui::IsItemHovered() && !dataflow_graph_result_) {
+                ImGui::SetTooltip("Build a Dataflow Graph first "
+                                  "(Analysis > Profiling > Dataflow Graph\xe2\x80\xa6)");
             }
             ImGui::EndMenu();
         }
@@ -383,6 +402,13 @@ if (ctx_mem_addr_ != 0 && entropy_addr_buf_[0] == '\0') {
                 show_call_context_ = true;
                 snprintf(call_context_inst_buf_, sizeof(call_context_inst_buf_),
                          "%llu", (unsigned long long)current_inst_);
+            }
+            if (ImGui::MenuItem("Dataflow Graph from Cursor\xe2\x80\xa6")) {
+                show_dataflow_graph_ = true;
+                if (dataflow_graph_start_buf_[0] == '\0') {
+                    snprintf(dataflow_graph_start_buf_, sizeof(dataflow_graph_start_buf_),
+                             "%llu", (unsigned long long)current_inst_);
+                }
             }
             ImGui::EndMenu();
         }

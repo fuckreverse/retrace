@@ -23,6 +23,8 @@
 #include "analysis/passes/memory/yara_mem_scan_pass.h"
 #include "analysis/passes/profile/call_context_pass.h"
 #include "analysis/passes/profile/trace_fold_pass.h"
+#include "analysis/passes/profile/window_stats_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
 #include "io/mcp/mcp_server.h"
 
 #include <SDL3/SDL.h>
@@ -72,6 +74,8 @@ struct CallContextResult;         // defined in call_context_pass.h (now include
 struct MemSearchResult;           // defined in mem_search_pass.h (now included)
 struct MemorySnapshotResult;      // defined in memory_snapshot_pass.h (now included)
 struct YaraMemScanResult;        // defined in yara_mem_scan_pass.h (now included)
+struct WindowStatsResult;        // defined in window_stats_pass.h (now included)
+struct DataflowGraphResult;      // defined in dataflow_graph_pass.h (now included)
 // ObjcResult is defined in objc_pass.h (already included)
 // MemoryStringResult is defined in memory_string_pass.h (already included)
 
@@ -635,6 +639,25 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     const TraceFoldResult* trace_fold_result_ = nullptr;
     bool show_trace_fold_ = false;
 
+    // ─── Window Stats analysis state ───────────────────────────────────────
+    // No-parameter pass (direct trace scan) — same "run/rerun, no form" shape
+    // as Trace Fold.
+    const WindowStatsResult* window_stats_result_ = nullptr;
+    bool show_window_stats_ = false;
+    size_t window_stats_cursor_ = 0;   // selected row in the windows table
+
+    // ─── Dataflow Graph analysis state ─────────────────────────────────────
+    // Parameterized pass (instruction range) — same "form then run" shape as
+    // Call Context.
+    const DataflowGraphResult* dataflow_graph_result_ = nullptr;
+    bool show_dataflow_graph_ = false;
+    char dataflow_graph_start_buf_[32] = {};  // hex/dec start inst_id input
+    char dataflow_graph_end_buf_[32]   = {};  // hex/dec end inst_id input (blank = start + 1000)
+    size_t dataflow_graph_cursor_ = 0;        // selected node row
+    void run_dataflow_graph_with_params();    // Trigger dataflow_graph from the panel's input form
+    /// Export the current (or freshly-run) dataflow graph to a DOT/JSON file.
+    void export_dataflow_graph_to_file();
+
     // ─── VM Abstract analysis state ──────────────────────────────────────────
     const VMAbstractResult* vm_abstract_result_ = nullptr;
     bool show_vm_abstract_ = false;
@@ -873,6 +896,8 @@ private:
     void render_call_context_panel();               // Rich call context for an instruction
     void run_call_context_with_params();             // Trigger call_context from the panel's input form
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
+    void render_window_stats_panel();            // Sliding-window trace statistics
+    void render_dataflow_graph_panel();          // Register-level data-flow graph for a range
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
     void render_vm_abstract_panel();             // VM dispatcher / handler / step view (legacy single-panel)
     // render_vm_workspace() declared in the VM Abstract state block above

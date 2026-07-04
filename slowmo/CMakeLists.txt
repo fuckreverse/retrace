@@ -504,6 +504,8 @@ src/gui/panels_pattern.cpp
 src/gui/panels_constant.cpp
 src/gui/panels_algorithm_summary.cpp
 src/gui/panels_trace_fold.cpp
+src/gui/panels_window_stats.cpp
+src/gui/panels_dataflow_graph.cpp
 src/gui/panels_memory_strings.cpp
 src/gui/panels_entropy.cpp
 src/gui/panels_mem_search.cpp

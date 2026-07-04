@@ -790,6 +790,8 @@ enum MenuTag : NSInteger {
     kTagViewTraceFold         = 333,
     kTagViewLog               = 334,
     kTagViewCacheManager      = 335,
+    kTagViewWindowStats       = 336,
+    kTagViewDataflowGraph     = 337,
 
     // ── Navigate: 400-419 ───────────────────────────────────────────
     kTagNavGoto               = 400,
@@ -837,6 +839,8 @@ enum MenuTag : NSInteger {
         kTagAnaTraceFold          = 541,
     kTagAnaTraceDiff          = 542,
     kTagAnaMemStrings         = 543,
+    kTagAnaWindowStats        = 544,
+    kTagAnaDataflowGraph      = 545,
 
     // ── Analysis — Reverse Engineering / VM: 550-559 ────────────────
     kTagAnaVMAbstract         = 550,
@@ -861,8 +865,9 @@ enum MenuTag : NSInteger {
     // 702 was kTagToolLiteralSearch — literal_search merged into mem_search.
     kTagToolMemSearch         = 703,
     kTagToolYaraScan          = 704,
-    kTagToolMemHistory        = 705,
-    kTagToolCallContext       = 706,
+kTagToolMemHistory        = 705,
+kTagToolCallContext       = 706,
+kTagToolDataflowGraph     = 707,
 
     // ── Help: 800-899 ───────────────────────────────────────────────
     kTagHelpAbout             = 800,
@@ -959,8 +964,10 @@ case kTagViewVMWorkspace:      action = [this]{
     if (vm_ws_open_) vm_ws_first_frame_ = true;
 }; break;
 
-// ── View — Profiling & Diff ──────────────────────────────────────
+        // ── View — Profiling & Diff ──────────────────────────────────────
         case kTagViewTraceFold:        action = [this]{ show_trace_fold_         = !show_trace_fold_;         }; break;
+        case kTagViewWindowStats:      action = [this]{ show_window_stats_       = !show_window_stats_;       }; break;
+        case kTagViewDataflowGraph:    action = [this]{ show_dataflow_graph_     = !show_dataflow_graph_;     }; break;
         case kTagViewRegTimeline:      action = [this]{ show_reg_timeline_       = !show_reg_timeline_;       }; break;
         case kTagViewDwarf:         action = [this]{ show_dwarf_panel_        = !show_dwarf_panel_;        }; break;
         case kTagViewTraceDiff:     action = [this]{ show_trace_diff_         = !show_trace_diff_;         }; break;
@@ -1053,6 +1060,16 @@ case kTagAnaVMAbstract:     action = [this]{
 
         // ── Analysis — Profiling ─────────────────────────────────────────
         case kTagAnaTraceFold:      action = [this]{ run_pass_by_name("trace_fold"); show_trace_fold_ = true; }; break;
+        case kTagAnaWindowStats:    action = [this]{ run_pass_by_name("window_stats"); show_window_stats_ = true; }; break;
+        case kTagAnaDataflowGraph:  action = [this]{
+            // Needs a start/end inst_id range — open the panel's parameter
+            // form rather than running immediately.
+            show_dataflow_graph_ = true;
+            if (dataflow_graph_start_buf_[0] == '\0') {
+                snprintf(dataflow_graph_start_buf_, sizeof(dataflow_graph_start_buf_),
+                         "%llu", (unsigned long long)current_inst_);
+            }
+        }; break;
         case kTagAnaTraceDiff:      action = [this]{ show_trace_diff_ = true; }; break;
         case kTagAnaMemStrings:     action = [this]{ run_pass_by_name("memory_strings"); show_mem_strings_ = true; }; break;
 
@@ -1081,7 +1098,7 @@ break;
         case kTagExportBackwardTaintGraph:
             action = [this]{ export_backward_taint_graph_to_file(); }; break;
         case kTagExportDataflowGraph:
-            action = [this]{ /* TODO: dataflow_graph pass not yet plumbed into GUI */ }; break;
+            action = [this]{ export_dataflow_graph_to_file(); }; break;
 
         // ── Tools ────────────────────────────────────────────────────────
         // Tools open a small modal in the Analysis panel (reuse show_analysis_)
@@ -1111,6 +1128,13 @@ break;
             action = [this]{ show_call_context_ = true;
                 snprintf(call_context_inst_buf_, sizeof(call_context_inst_buf_),
                          "%llu", (unsigned long long)current_inst_);
+            }; break;
+        case kTagToolDataflowGraph:
+            action = [this]{ show_dataflow_graph_ = true;
+                if (dataflow_graph_start_buf_[0] == '\0') {
+                    snprintf(dataflow_graph_start_buf_, sizeof(dataflow_graph_start_buf_),
+                             "%llu", (unsigned long long)current_inst_);
+                }
             }; break;
 
         // ── Help ─────────────────────────────────────────────────────────
@@ -1178,6 +1202,8 @@ case kTagViewTaintSourceAnnotation: it.state = show_taint_source_annotation_ ? N
 case kTagViewVMAbstract:       it.state = show_vm_abstract_        ? NSControlStateValueOn : NSControlStateValueOff; break;
 case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceFold:        it.state = show_trace_fold_         ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewWindowStats:      it.state = show_window_stats_       ? NSControlStateValueOn : NSControlStateValueOff; break;
+            case kTagViewDataflowGraph:    it.state = show_dataflow_graph_     ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewRegTimeline:      it.state = show_reg_timeline_       ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewDwarf:            it.state = show_dwarf_panel_        ? NSControlStateValueOn : NSControlStateValueOff; break;
             case kTagViewTraceDiff:        it.state = show_trace_diff_         ? NSControlStateValueOn : NSControlStateValueOff; break;
@@ -1187,6 +1213,8 @@ case kTagViewVMWorkspace:      it.state = vm_ws_open_              ? NSControlSt
             // ── Export: disable if required result not yet computed ───────
             case kTagExportBackwardTaintGraph:
                 it.enabled = (backward_taint_result_ != nullptr); break;
+            case kTagExportDataflowGraph:
+                it.enabled = (dataflow_graph_result_ != nullptr); break;
 
             // ── Analysis — Clear Taint: only useful when taint is active ─
 case kTagAnaClearTaint:
@@ -1318,6 +1346,8 @@ void tenet::GuiApp::setup_native_menu() {
         // ── Profiling & Diff ──────────────────────────────────────────
         NSMenu* profMenu = mksub(viewMenu, @"Profiling & Diff");
         [profMenu addItem:mk(@"Trace Fold",          @"", 0, kTagViewTraceFold)];
+        [profMenu addItem:mk(@"Window Stats",        @"", 0, kTagViewWindowStats)];
+        [profMenu addItem:mk(@"Dataflow Graph",      @"", 0, kTagViewDataflowGraph)];
         [profMenu addItem:mk(@"Register Timeline",   @"", 0, kTagViewRegTimeline)];
         [profMenu addItem:mk(@"Trace Diff",          @"", 0, kTagViewTraceDiff)];
         [profMenu addItem:sep()];
@@ -1409,6 +1439,8 @@ void tenet::GuiApp::setup_native_menu() {
         // ── Profiling ─────────────────────────────────────────────────
         NSMenu* profAnaMenu = mksub(anaMenu, @"Profiling");
         [profAnaMenu addItem:mk(@"Trace Fold",        @"", 0, kTagAnaTraceFold)];
+        [profAnaMenu addItem:mk(@"Window Stats",      @"", 0, kTagAnaWindowStats)];
+        [profAnaMenu addItem:mk(@"Dataflow Graph\u2026", @"", 0, kTagAnaDataflowGraph)];
         [profAnaMenu addItem:mk(@"Trace Diff",        @"", 0, kTagAnaTraceDiff)];
         [profAnaMenu addItem:mk(@"Memory Strings",    @"", 0, kTagAnaMemStrings)];
 
@@ -1431,7 +1463,7 @@ void tenet::GuiApp::setup_native_menu() {
         [expMenu addItem:mk(@"Export Call Graph\u2026 (DOT)",    @"", 0, kTagExportCallGraph)];
         [expMenu addItem:sep()];
         [expMenu addItem:mk(@"Export Backward Taint Graph\u2026 (DOT)", @"", 0, kTagExportBackwardTaintGraph)];
-        [expMenu addItem:mk(@"Export Dataflow Graph\u2026 (DOT/JSON)",  @"", 0, kTagExportDataflowGraph)];
+        [expMenu addItem:mk(@"Export Dataflow Graph\u2026 (DOT)",  @"", 0, kTagExportDataflowGraph)];
 
         expItem.submenu = expMenu;
         [bar addItem:expItem];
@@ -1454,6 +1486,7 @@ void tenet::GuiApp::setup_native_menu() {
         [toolMenu addItem:sep()];
         [toolMenu addItem:mk(@"Memory Write History\u2026",      @"", 0, kTagToolMemHistory)];
         [toolMenu addItem:mk(@"Call Context at Cursor\u2026",    @"", 0, kTagToolCallContext)];
+[toolMenu addItem:mk(@"Dataflow Graph from Cursor\u2026", @"", 0, kTagToolDataflowGraph)];
 
         toolItem.submenu = toolMenu;
         [bar addItem:toolItem];
@@ -2197,6 +2230,12 @@ void GuiApp::render_frame() {
     if (show_trace_fold_) {
         render_trace_fold_panel();
     }
+    if (show_window_stats_) {
+        render_window_stats_panel();
+    }
+    if (show_dataflow_graph_) {
+        render_dataflow_graph_panel();
+    }
     if (show_vm_abstract_) {
         render_vm_abstract_panel();
     }
@@ -2392,6 +2431,21 @@ void tenet::GuiApp::export_backward_taint_graph_to_file() {
     std::string dot = backward_taint_result_->to_dot();
     save_text_to_file_async(@"backward_taint.dot",
                             @"DOT (Backward Taint Graph)", @"dot",
+                            std::move(dot));
+}
+
+// ── Export Dataflow Graph ─────────────────────────────────────────────────────
+
+void tenet::GuiApp::export_dataflow_graph_to_file() {
+    if (!dataflow_graph_result_) {
+        last_pass_status_ =
+            "Build a Dataflow Graph first "
+            "(Tools > Dataflow Graph\u2026, or the Analysis panel).";
+        return;
+    }
+    std::string dot = dataflow_graph_result_->to_dot();
+    save_text_to_file_async(@"dataflow_graph.dot",
+                            @"DOT (Dataflow Graph)", @"dot",
                             std::move(dot));
 }
 
