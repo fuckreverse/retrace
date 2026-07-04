@@ -813,6 +813,18 @@ void TenetMcpService::register_search_tools() {
             json windows = json::array();
             for (size_t i = start_i; i < end_i; i++) {
                 const auto& w = result.windows[i];
+                json top_mnem = json::array();
+                // Cap at 5 entries per window in the MCP response to keep
+                // payloads small; the GUI table shows the full top_mnemonics
+                // list (bounded by the window_stats config's top_mnemonics).
+                for (size_t m = 0; m < w.top_mnemonics.size() && m < 5; m++) {
+                    const auto& ms = w.top_mnemonics[m];
+                    top_mnem.push_back({
+                        {"mnemonic", ms.mnemonic.empty() ? fmt::format("id:{}", ms.mnemonic_id)
+                                                          : ms.mnemonic},
+                        {"count", ms.count}
+                    });
+                }
                 windows.push_back({
                     {"start", w.start_inst_id},
                     {"end",   w.end_inst_id},
@@ -821,7 +833,8 @@ void TenetMcpService::register_search_tools() {
                     {"mem_write_count", w.mem_write_count},
                     {"unique_pcs", w.unique_pcs},
                     {"branch_density", w.branch_density},
-                    {"mnemonic_entropy", w.mnemonic_entropy}
+                    {"mnemonic_entropy", w.mnemonic_entropy},
+                    {"top_mnemonics", std::move(top_mnem)}
                 });
             }
             bool has_more = end_i < result.windows.size();

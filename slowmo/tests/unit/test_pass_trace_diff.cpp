@@ -422,6 +422,102 @@ TEST_CASE("TraceDiff: register value diff at same PC", "[unit][pass][trace_diff]
     std::filesystem::remove_all(path_b_dir);
 }
 
+TEST_CASE("TraceDiff: resync requires multiple window-doubling retries",
+          "[unit][pass][trace_diff]")
+{
+    // Regression test for the incremental pc_map optimization: the resync
+    // point is deliberately placed beyond the *initial* resync_window, so
+    // the algorithm must double the window (>=2 retries) before it finds
+    // the match. This exercises the incremental extension of trace A's
+    // pc_map across attempts (as opposed to rebuilding it from scratch).
+    //
+    // resync_window = 8 → attempt 1 covers [0,8), attempt 2 covers [0,16),
+    // attempt 3 covers [0,32). Place the matching PC at trace-A offset 20
+    // (only reachable in attempt 3) to force the full retry sequence.
+    auto path_b_dir = std::filesystem::temp_directory_path() /
+                      (std::string("tenet_td_multiretry_") + std::to_string(getpid()));
+    std::filesystem::create_directories(path_b_dir);
+    auto path_b = path_b_dir / "td_multiretry_b.trace";
+
+    constexpr int kDivergeAt = 3;      // diverge after 3 matched instructions
+    constexpr int kDivergedLen = 5;    // 5 unique diverged instructions in B
+    constexpr int kResyncOffsetInA = 20;  // resync point is at trace-A index 20
+
+    {
+        TraceWriter tw;
+        tw.module_name = "td_multiretry_b";
+        tw.open(path_b.c_str());
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+        // First kDivergeAt instructions match trace A (PCs 0x1000, 0x1004, 0x1008)
+        for (int i = 0; i < kDivergeAt; ++i) {
+            uint64_t spc = 0x1000 + (uint64_t)i * 4;
+            tw.emit(ms, spc, enc::nop(), {{33, tw.rt(spc + 4)}}, {});
+        }
+        // Diverged region: unique PCs not present anywhere in trace A.
+        for (int i = 0; i < kDivergedLen; ++i) {
+            uint64_t spc = 0x9000 + (uint64_t)i * 4;
+            tw.emit(ms, spc, enc::nop(), {{33, tw.rt(spc + 4)}}, {});
+        }
+        // Resync: jump to the PC that trace A has at index kResyncOffsetInA.
+        uint64_t resync_pc = 0x1000 + (uint64_t)kResyncOffsetInA * 4;
+        tw.emit(ms, resync_pc, enc::nop(), {{33, tw.rt(resync_pc + 4)}}, {});
+        tw.emit(ms, resync_pc + 4, enc::nop(), {{33, tw.rt(resync_pc + 8)}}, {});
+        tw.emit_anchor(ms);
+        tw.close();
+    }
+
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        // 30 linear NOPs: 0x1000, 0x1004, ..., far past kResyncOffsetInA.
+        for (int i = 0; i < 30; ++i) {
+            uint64_t spc = 0x1000 + (uint64_t)i * 4;
+            tw.emit(ms, spc, enc::nop(), {{33, tw.rt(spc + 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "td_multiretry_a");
+
+    auto pm = make_pm(*env);
+
+    TraceDiffConfig cfg;
+    cfg.trace_b_path  = path_b.string();
+    cfg.trace_a_start = 0;
+    cfg.trace_a_end   = 30;
+    cfg.trace_b_start = 0;
+    cfg.trace_b_end   = kDivergeAt + kDivergedLen + 2;
+    cfg.resync_window = 8;  // small enough to force >=2 doublings
+    pm->register_pass(std::make_unique<TraceDiffPass>(std::move(cfg)));
+
+    auto& result_raw = pm->require("trace_diff");
+    REQUIRE(result_raw.ok());
+    auto& td = result_raw.get<TraceDiffResult>();
+
+    SECTION("resync succeeds despite requiring multiple window doublings") {
+        REQUIRE(td.has_divergence());
+        bool found_resynced = false;
+        for (const auto& s : td.segments) {
+            if (s.start_type == DiffType::ControlFlow && s.resynced) {
+                found_resynced = true;
+                // The resync point in trace A should land exactly at the
+                // instruction we deliberately placed there.
+                REQUIRE(s.resync_inst_a == (uint64_t)kResyncOffsetInA);
+                break;
+            }
+        }
+        REQUIRE(found_resynced);
+        REQUIRE(td.resync_count > 0);
+    }
+
+    SECTION("matched counts are consistent (prefix + post-resync tail)") {
+        REQUIRE(td.matched_count >= (uint64_t)kDivergeAt);
+    }
+
+    std::filesystem::remove_all(path_b_dir);
+}
+
 TEST_CASE("TraceDiff: max_diffs truncation", "[unit][pass][trace_diff]")
 {
     // Create traces where every instruction has a register diff

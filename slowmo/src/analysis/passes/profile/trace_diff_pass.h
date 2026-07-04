@@ -42,7 +42,17 @@ enum class DiffType : uint8_t {
     ControlFlow,     ///< PCs differ — triggers resynchronization
     RegisterValue,   ///< Same PC, register output values differ
     MemoryValue,     ///< Same PC, memory access values differ
-    OpcodeChange,    ///< Same PC, opcode differs (self-modifying code)
+    // NOTE: OpcodeChange is reserved for self-modifying-code detection
+    // (same PC executed with a different underlying opcode across the two
+    // ranges/traces) but TraceDiffPass does not currently produce this
+    // diff type — InstView carries register/memory diffs but not the raw
+    // opcode, and opcode history is only available via the separate,
+    // PC-keyed CODE_BYTES/CodeTable stream (which cannot distinguish two
+    // different opcodes recorded at the same PC at different times).
+    // Detecting this would require tracking REC_CODE events per range and
+    // is not yet implemented. The enumerator, GUI filter checkbox, and MCP
+    // "type" field are kept for forward compatibility once this lands.
+    OpcodeChange,    ///< Same PC, opcode differs (self-modifying code) — NOT YET PRODUCED
 };
 
 inline std::string_view diff_type_name(DiffType t) {

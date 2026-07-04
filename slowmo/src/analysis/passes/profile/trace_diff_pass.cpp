@@ -356,29 +356,45 @@ PassResult TraceDiffPass::run(PassContext& ctx) {
                 break;
             }
 
-            // Try resync with expanding window.
+            // Try resync with an expanding window.
+            //
+            // Optimization: the pc_map from trace A's window is built
+            // incrementally across retries instead of being rebuilt from
+            // scratch each time the window doubles. Previously, attempt N+1
+            // re-scanned the entire [0, window*2) range from `it_a`
+            // (including the [0, window) prefix already indexed in attempt
+            // N), doing O(window) redundant work per retry — up to 3x
+            // wasted scanning for the final (largest) window size. Now each
+            // attempt only advances `probe_a`/`probe_id_a` over the newly
+            // added tail, and `pc_map` persists across attempts.
+            //
+            // Trace B's probe still restarts each attempt (from `it_b`),
+            // since a wider trace-A window can reveal a match at an
+            // earlier trace-B position than the previous attempt covered.
             ResyncResult resync{};
             uint32_t window = cfg_.resync_window;
 
-            for (int attempt = 0; attempt < 3 && !resync.found; ++attempt) {
-                // Build PC→offset map from trace A's window.
-                std::unordered_map<uint64_t, uint32_t> pc_map;
-                pc_map.reserve(window);
+            std::unordered_map<uint64_t, uint32_t> pc_map;
+            pc_map.reserve(window);
+            auto probe_a = it_a;
+            uint64_t probe_id_a = inst_id_a;
+            uint32_t k_a = 0;  // number of INST records indexed into pc_map so far
 
-                auto probe_a = it_a;
-                uint64_t probe_id_a = inst_id_a;
-                for (uint32_t k = 0; k < window && probe_a != end_a_it; ++probe_a) {
+            for (int attempt = 0; attempt < 3 && !resync.found; ++attempt) {
+                // Extend trace A's PC→offset map up to the current window size.
+                for (; k_a < window && probe_a != end_a_it; ++probe_a) {
                     auto prec = *probe_a;
                     if (prec.kind != RecordKind::Inst) continue;
                     auto pinst = prec.as_inst();
                     uint64_t norm_pc = pinst.pc - slide_a;
-                    pc_map.try_emplace(norm_pc, k);
-                    ++k;
+                    pc_map.try_emplace(norm_pc, k_a);
+                    ++k_a;
                     ++probe_id_a;
                     if (probe_id_a >= a_end) break;
                 }
 
-                // Search trace B's window for a match.
+                // Search trace B's window for a match against the (now
+                // possibly larger) trace-A map.
                 auto probe_b = it_b;
                 uint64_t probe_id_b = inst_id_b;
                 for (uint32_t k = 0; k < window && probe_b != end_b_it; ++probe_b) {

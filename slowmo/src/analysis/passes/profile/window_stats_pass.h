@@ -32,7 +32,18 @@ struct WindowSnapshot {
     uint64_t instruction_count;
 
     /// Mnemonic distribution: (mnemonic_id, count) sorted by count desc.
-    struct MnemonicStat { uint16_t mnemonic_id; uint64_t count; };
+    /// `mnemonic_id` is an internal grouping key (opcode >> 21) used for
+    /// fast hot-loop classification; `mnemonic` is the human-readable
+    /// instruction name (e.g. "add", "ldr"), resolved once per top-N entry
+    /// at window-flush time via the Capstone-backed InstructionDecoder —
+    /// NOT decoded per-instruction, so it doesn't affect scan throughput.
+    /// May be empty if no decoder/PC sample was available (e.g. serialized
+    /// results loaded from an older cache format).
+    struct MnemonicStat {
+        uint16_t mnemonic_id;
+        uint64_t count;
+        std::string mnemonic;
+    };
     std::vector<MnemonicStat> top_mnemonics;
 
     /// Register write activity: reg_index → write_count.

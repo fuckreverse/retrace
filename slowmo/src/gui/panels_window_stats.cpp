@@ -169,14 +169,14 @@ void GuiApp::render_window_stats_panel() {
                 // ── Column 6: top mnemonic ──────────────────────────────────
                 ImGui::TableSetColumnIndex(6);
                 if (!w.top_mnemonics.empty()) {
-                    ImGui::Text("id %u (\xc3\x97%llu)",
-                        (unsigned)w.top_mnemonics.front().mnemonic_id,
-                        (unsigned long long)w.top_mnemonics.front().count);
+                    const auto& top = w.top_mnemonics.front();
+                    const char* name = top.mnemonic.empty() ? "?" : top.mnemonic.c_str();
+                    ImGui::Text("%s (\xc3\x97%llu)", name, (unsigned long long)top.count);
                     if (ImGui::IsItemHovered() && w.top_mnemonics.size() > 1) {
                         std::string tip;
                         for (const auto& m : w.top_mnemonics) {
-                            tip += fmt::format("mnemonic id {}: \xc3\x97{}\n",
-                                               m.mnemonic_id, m.count);
+                            const char* mname = m.mnemonic.empty() ? "?" : m.mnemonic.c_str();
+                            tip += fmt::format("{}: \xc3\x97{}\n", mname, m.count);
                         }
                         ImGui::SetTooltip("%s", tip.c_str());
                     }

@@ -394,4 +394,49 @@ TEST_CASE("WindowStatsPass top_mnemonics are populated",
             REQUIRE(m.count <= top_count);
         }
     }
+
+    SECTION("top mnemonic has a human-readable name, not just a numeric id") {
+        // Regression test: mnemonic_id alone (opcode >> 21) is an opaque
+        // grouping key with no meaning to a user; the pass must also
+        // resolve a real instruction name (e.g. "nop") via the decoder.
+        REQUIRE_FALSE(wr.windows[0].top_mnemonics.empty());
+        const auto& top = wr.windows[0].top_mnemonics[0];
+        REQUIRE_FALSE(top.mnemonic.empty());
+        // nop is the most frequent instruction in this trace (3x).
+        REQUIRE(top.mnemonic == "nop");
+    }
+}
+
+TEST_CASE("WindowStatsPass mnemonic names round-trip through the persisted cache",
+          "[unit][pass][window_stats]") {
+    // The default-config fast path persists results via save_pass_blob() and
+    // reloads them on a subsequent run. Verify the human-readable mnemonic
+    // name survives that serialize/deserialize round trip (v2 blob format).
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        emit_nops(tw, ms, 0x1000, 5);
+        tw.emit_anchor(ms);
+    }, "ws_cache_roundtrip");
+
+    // First run: computes and persists.
+    {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<WindowStatsPass>());
+        auto& wr = pm->require("window_stats").get<WindowStatsResult>();
+        REQUIRE_FALSE(wr.windows.empty());
+        REQUIRE_FALSE(wr.windows[0].top_mnemonics.empty());
+        REQUIRE(wr.windows[0].top_mnemonics[0].mnemonic == "nop");
+    }
+
+    // Second run: should load from cache and still have the mnemonic name.
+    {
+        auto pm2 = make_pm(*env);
+        pm2->register_pass(std::make_unique<WindowStatsPass>());
+        auto& wr2 = pm2->require("window_stats").get<WindowStatsResult>();
+        REQUIRE_FALSE(wr2.windows.empty());
+        REQUIRE_FALSE(wr2.windows[0].top_mnemonics.empty());
+        REQUIRE(wr2.windows[0].top_mnemonics[0].mnemonic == "nop");
+    }
 }

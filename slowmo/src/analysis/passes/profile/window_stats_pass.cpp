@@ -3,6 +3,7 @@
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
+#include "core/instruction_decoder.h"
 #include "common/aarch64_classify.h"
 
 #include <fmt/core.h>
@@ -17,7 +18,7 @@ namespace tenet {
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x57535453 ("WSTS")
-//   u32  version = 1
+//   u32  version = 2
 //   u64  window_size
 //   u64  total_windows
 //   u64  hottest_mem_window
@@ -39,11 +40,19 @@ namespace tenet {
 //     for each MnemonicStat:
 //       u16  mnemonic_id
 //       u64  count
+//       u8   mnemonic_len   (v2+)
+//       char mnemonic[mnemonic_len]  (v2+, not NUL-terminated)
+//
+// Version history:
+//   v1: initial format (no human-readable mnemonic string).
+//   v2: added `mnemonic` (resolved via InstructionDecoder at flush time).
+//       v1 blobs are still readable (mnemonic defaults to empty string).
 
 namespace {
 
-static constexpr uint32_t WSTS_BLOB_MAGIC   = 0x57535453u;  // "WSTS"
-static constexpr uint32_t WSTS_BLOB_VERSION = 1u;
+static constexpr uint32_t WSTS_BLOB_MAGIC     = 0x57535453u;  // "WSTS"
+static constexpr uint32_t WSTS_BLOB_VERSION_1 = 1u;
+static constexpr uint32_t WSTS_BLOB_VERSION   = 2u;
 
 std::string window_stats_serialize(const WindowStatsResult& res) {
     size_t total = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8;  // header fields
@@ -52,7 +61,9 @@ std::string window_stats_serialize(const WindowStatsResult& res) {
         total += 4 + 4;   // mnemonic_entropy (f32), branch_density (f32)
         total += 4 * 34;  // reg_write_counts
         total += 4;       // num_top_mnemonics
-        total += w.top_mnemonics.size() * (2 + 8);  // mnemonic_id(u16) + count(u64)
+        for (const auto& ms : w.top_mnemonics) {
+            total += 2 + 8 + 1 + ms.mnemonic.size();  // id(u16)+count(u64)+len(u8)+chars
+        }
     }
 
     std::string buf(total, '\0');
@@ -87,6 +98,11 @@ std::string window_stats_serialize(const WindowStatsResult& res) {
         for (const auto& ms : w.top_mnemonics) {
             write_u16(ms.mnemonic_id);
             write_u64(ms.count);
+            uint8_t len = static_cast<uint8_t>(std::min<size_t>(ms.mnemonic.size(), 255));
+            p[0] = static_cast<char>(len);
+            p += 1;
+            std::memcpy(p, ms.mnemonic.data(), len);
+            p += len;
         }
     }
 
@@ -103,8 +119,9 @@ bool window_stats_deserialize(const std::string& blob, WindowStatsResult& out) {
     auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
     auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
 
-    if (read_u32() != WSTS_BLOB_MAGIC)   return false;
-    if (read_u32() != WSTS_BLOB_VERSION) return false;
+    if (read_u32() != WSTS_BLOB_MAGIC) return false;
+    const uint32_t version = read_u32();
+    if (version != WSTS_BLOB_VERSION && version != WSTS_BLOB_VERSION_1) return false;
 
     out.window_size           = read_u64();
     out.total_windows         = read_u64();
@@ -129,13 +146,21 @@ bool window_stats_deserialize(const std::string& blob, WindowStatsResult& out) {
         w.branch_density     = read_f32();
         for (uint32_t j = 0; j < 34; j++) w.reg_write_counts[j] = read_u32();
         uint32_t nm = read_u32();
-        if (p + nm * (2 + 8) > end) return false;
         w.top_mnemonics.reserve(nm);
         for (uint32_t j = 0; j < nm; j++) {
+            if (p + 2 + 8 > end) return false;
             WindowSnapshot::MnemonicStat ms;
             ms.mnemonic_id = read_u16();
             ms.count       = read_u64();
-            w.top_mnemonics.push_back(ms);
+            if (version >= 2) {
+                if (p + 1 > end) return false;
+                uint8_t len = static_cast<uint8_t>(*p);
+                p += 1;
+                if (p + len > end) return false;
+                ms.mnemonic.assign(p, len);
+                p += len;
+            }
+            w.top_mnemonics.push_back(std::move(ms));
         }
         out.windows.push_back(std::move(w));
     }
@@ -161,10 +186,12 @@ class WindowStatsCollector final : public TraceCollector {
 public:
     WindowStatsCollector(const WindowStatsConfig& cfg,
                          CodeTable& code_table,
-                         uint64_t total_insts)
+                         uint64_t total_insts,
+                         InstructionDecoder* decoder)
         : cfg_(cfg)
         , code_table_(code_table)
         , total_insts_(total_insts)
+        , decoder_(decoder)
     {
         window_size_ = cfg_.window_size;
         stride_ = (cfg_.stride > 0) ? cfg_.stride : window_size_;
@@ -240,6 +267,11 @@ public:
         mnemonic_counts_[info.mnemonic_id]++;
         if (info.is_branch) branch_count_++;
 
+        // Remember one representative PC per mnemonic_id group so that, at
+        // flush time, we can resolve a human-readable name for whichever
+        // groups make the top-N cut — without decoding every instruction.
+        mnemonic_sample_pc_.try_emplace(info.mnemonic_id, inst.pc);
+
         // Check if window is complete
         if (window_inst_count_ >= window_size_) {
             flush_window(inst_id_);
@@ -303,8 +335,11 @@ private:
         std::sort(sorted_mnems.begin(), sorted_mnems.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
         for (uint32_t i = 0; i < cfg_.top_mnemonics && i < sorted_mnems.size(); i++) {
-            current_window_.top_mnemonics.push_back(
-                {sorted_mnems[i].first, sorted_mnems[i].second});
+            WindowSnapshot::MnemonicStat ms;
+            ms.mnemonic_id = sorted_mnems[i].first;
+            ms.count       = sorted_mnems[i].second;
+            ms.mnemonic    = resolve_mnemonic_name(ms.mnemonic_id);
+            current_window_.top_mnemonics.push_back(std::move(ms));
         }
 
         result_.windows.push_back(std::move(current_window_));
@@ -315,13 +350,33 @@ private:
         window_inst_count_ = 0;
         branch_count_ = 0;
         mnemonic_counts_.clear();
+        mnemonic_sample_pc_.clear();
         unique_pcs_.clear();
         unique_mem_addrs_.clear();
+    }
+
+    /// Resolve a human-readable mnemonic name for a mnemonic_id group by
+    /// decoding one representative PC from that group. Only called for the
+    /// (small) top-N set per window, so the Capstone decode cost is
+    /// negligible relative to the O(window_size) scan.
+    /// Falls back to "id:N" when no decoder is available or decode fails,
+    /// so callers always get a non-empty, unambiguous label.
+    std::string resolve_mnemonic_name(uint16_t mnemonic_id) {
+        auto it = mnemonic_sample_pc_.find(mnemonic_id);
+        if (it == mnemonic_sample_pc_.end() || !decoder_) {
+            return fmt::format("id:{}", mnemonic_id);
+        }
+        auto decoded = decoder_->decode(it->second, code_table_);
+        if (!decoded) {
+            return fmt::format("id:{}", mnemonic_id);
+        }
+        return std::string(decoded->mnemonic_sv());
     }
 
     const WindowStatsConfig& cfg_;
     CodeTable& code_table_;
     uint64_t total_insts_;
+    InstructionDecoder* decoder_ = nullptr;  // optional; nullptr → "id:N" labels
     uint64_t window_size_ = 1000;
     uint64_t stride_ = 1000;
 
@@ -333,6 +388,7 @@ private:
 
     ankerl::unordered_dense::map<uint64_t, OpcodeInfo> pc_cache_;
     ankerl::unordered_dense::map<uint16_t, uint64_t> mnemonic_counts_;
+    ankerl::unordered_dense::map<uint16_t, uint64_t> mnemonic_sample_pc_;
     ankerl::unordered_dense::set<uint64_t> unique_pcs_;
     ankerl::unordered_dense::set<uint64_t> unique_mem_addrs_;
 
@@ -372,7 +428,7 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
 
     ctx.progress(0.0f, "WindowStats: computing sliding window metrics...");
 
-    WindowStatsCollector collector(cfg_, code_table, total_insts);
+    WindowStatsCollector collector(cfg_, code_table, total_insts, &ctx.decoder());
 
     // Use shared scan engine if available; otherwise create a local one.
     // This allows future fusion with other collector-based passes.
