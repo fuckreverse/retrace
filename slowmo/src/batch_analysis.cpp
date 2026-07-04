@@ -696,14 +696,11 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<SyscallInterceptPass>(std::move(si_cfg)));
     }
 
-    // --vm-abstract: VM dispatcher detection + handler extraction
+    // --vm-abstract: hint-driven VM execution abstraction
     //
-    // Auto-detection is disabled by default: its heuristic (loop iteration
-    // count + indirect-branch shape) has a very high false-positive/false-
-    // negative rate on real traces. The caller must supply at least one
-    // static-analysis hint (--vm-dispatcher / --vm-handler / --vm-hints
-    // <file>, ...) or explicitly pass --vm-auto-detect to opt into the
-    // unreliable heuristic scan.
+    // vm_abstract never scans the trace looking for "VM-shaped" loops — the
+    // caller must supply at least one static-analysis hint (--vm-dispatcher
+    // / --vm-handler / --vm-hints <file>, ...).
     if (opts.opt_vm_abstract) {
         VMConfig vm_cfg;
 
@@ -727,15 +724,12 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             vm_cfg.handler_entry_pcs.push_back(hpc);
         }
 
-        vm_cfg.auto_detect = opts.vm_auto_detect;
-
-        if (!vm_cfg.has_any_static_hint() && !opts.vm_auto_detect) {
+        if (!vm_cfg.has_any_static_hint()) {
             fmt::print(stderr,
                 "Error: --vm-abstract requires at least one static-analysis hint\n"
                 "  (--vm-dispatcher, --vm-handler, --vm-pc-reg, --vm-hints <file>, ...).\n"
-                "  The heuristic dispatcher auto-detection is disabled by default because\n"
-                "  it has a very high false-positive/false-negative rate on real traces.\n"
-                "  Pass --vm-auto-detect to explicitly opt into it anyway (not recommended).\n");
+                "  vm_abstract does not scan the trace looking for VM candidates — static\n"
+                "  analysis (IDA/Ghidra) must supply the dispatcher location.\n");
             return 1;
         }
 

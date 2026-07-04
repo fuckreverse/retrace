@@ -1017,19 +1017,16 @@ void GuiApp::render_vm_workspace() {
 
 // ─── render_vm_hints_input ────────────────────────────────────────────────
 //
-// VM dispatcher auto-detection is a pure heuristic (loop iteration count +
-// indirect-branch shape) with a very high false-positive/false-negative rate
-// on real traces, so vm_abstract now REQUIRES static-analysis hints before
-// it can run. This widget renders:
+// vm_abstract is entirely hint-driven (see VMConfig's class comment in
+// vm_abstract_pass.h) — dispatcher location, VM-PC, dispatch topology, and
+// architecture type are all static facts that must come from IDA/Ghidra.
+// This widget renders:
 //   - a text input for the hints JSON file path (same schema as the MCP
 //     `vm_abstract` tool's `hints_file` argument),
-//   - a checkbox to explicitly opt into the unreliable auto-detection when
-//     no hints are available,
 //   - the primary run/rerun button (label/width customizable by caller),
 //   - a status line reporting load errors / success.
 void GuiApp::render_vm_hints_input(const char* button_label, float button_width) {
     ImGui::TextWrapped(
-        "VM dispatcher auto-detection is unreliable on real traces. "
         "Load static-analysis hints (dispatcher PC, handler entries, ...) "
         "from a JSON file — e.g. produced by IDA/Ghidra or the MCP "
         "vm_abstract tool's hints_file schema.");
@@ -1038,19 +1035,9 @@ void GuiApp::render_vm_hints_input(const char* button_label, float button_width)
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##vm_hints_path", "Path to hints .json file",
                               vm_hints_path_buf_, sizeof(vm_hints_path_buf_));
-
-    ImGui::Checkbox("Run without hints (unreliable heuristic auto-detect)",
-                     &vm_auto_detect_opt_in_);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            "Falls back to loop-iteration-count + indirect-branch heuristics.\n"
-            "Frequently locks onto the wrong loop or misses ThreadedCode/\n"
-            "CallTable VMs entirely. Prefer supplying hints instead.");
-    }
     ImGui::Spacing();
 
-    bool have_path = vm_hints_path_buf_[0] != '\0';
-    bool can_run   = have_path || vm_auto_detect_opt_in_;
+    bool can_run = vm_hints_path_buf_[0] != '\0';
 
     ImGui::BeginDisabled(!can_run);
     if (ImGui::Button(button_label, ImVec2(button_width, 0))) {
@@ -1058,7 +1045,7 @@ void GuiApp::render_vm_hints_input(const char* button_label, float button_width)
     }
     ImGui::EndDisabled();
     if (!can_run && ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Load a hints file or check \"run without hints\" first.");
+        ImGui::SetTooltip("Load a hints file first.");
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(

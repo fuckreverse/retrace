@@ -26,7 +26,13 @@ constexpr uint32_t MAX_SAMPLE_ITERATIONS = 16;
 
 // ─── Find indirect branches in loop body ─────────────────────────────────
 
-/// Search the basic blocks of a loop body for BR or BLR instructions.
+/// Locate the dispatch instruction inside an ALREADY-HINTED dispatcher loop
+/// (`VMConfig::dispatcher->loop_header_pc`). This is structural completion,
+/// not detection: the loop itself is a caller-provided fact, and a dispatch
+/// loop body has exactly one indirect branch by construction, so finding it
+/// mechanically (CFG terminator lookup, falling back to a raw opcode scan)
+/// is deterministic. Only used when the caller supplies `loop_header_pc` but
+/// omits `indirect_branch_pc` — supplying both skips this entirely.
 /// Returns the PC of the first indirect branch found, or 0 if none.
 /// Sets `is_blr` to true if the found instruction is BLR (call-table dispatch).
 uint64_t find_indirect_branch_in_loop(
@@ -69,80 +75,17 @@ uint64_t find_indirect_branch_in_loop(
 
 // ─── Classify dispatcher type ────────────────────────────────────────────
 
-DispatchType classify_dispatch_type(
-    const LoopInfo& loop,
-    const CFGResult& cfg,
-    bool is_blr)
-{
-    if (is_blr) return DispatchType::CallTable;
-
-    // Count conditional branches in loop body — a switch-case cascade
-    // has many (one per case), while a computed jump table has few.
-    uint32_t cond_branch_count = 0;
-    for (uint64_t body_pc : loop.body_pcs) {
-        auto it = cfg.blocks.find(body_pc);
-        if (it == cfg.blocks.end()) continue;
-        if (it->second.terminator == TerminatorKind::ConditionalBranch) {
-            cond_branch_count++;
-        }
-    }
-    if (cond_branch_count >= 3) return DispatchType::WhileSwitch;
-    return DispatchType::IndirectBranch;
-}
-
-// ─── Infer VM-PC register ────────────────────────────────────────────────
-
-/// Identify which register holds the VM program counter by looking for a
-/// register whose value increments by a small constant step across dispatch
-/// iterations.
-///
-/// Returns the register index (0-28) or 0xFF if not found.
-uint8_t infer_vm_pc_register(
-    RegisterFile& regfile,
-    const std::vector<uint64_t>& header_inst_ids)
-{
-    if (header_inst_ids.size() < 4) return 0xFF;
-
-    uint32_t n = std::min(static_cast<uint32_t>(header_inst_ids.size()),
-                          MAX_SAMPLE_ITERATIONS);
-
-    std::vector<RegState> states;
-    states.reserve(n);
-    for (uint32_t i = 0; i < n; ++i) {
-        states.push_back(regfile.state_before(header_inst_ids[i]));
-    }
-
-    uint8_t best_reg = 0xFF;
-    float best_score = 0.0f;
-
-    for (uint8_t r = 0; r <= 28; ++r) {
-        // Compute deltas between consecutive iterations
-        int64_t first_delta = static_cast<int64_t>(states[1].gpr[r]) -
-                              static_cast<int64_t>(states[0].gpr[r]);
-        if (first_delta == 0) continue;  // Invariant register
-
-        uint32_t matching = 0;
-        for (uint32_t i = 1; i < n; ++i) {
-            int64_t d = static_cast<int64_t>(states[i].gpr[r]) -
-                        static_cast<int64_t>(states[i - 1].gpr[r]);
-            if (d == first_delta) matching++;
-        }
-
-        float consistency = static_cast<float>(matching) / static_cast<float>(n - 1);
-
-        // VM-PC should increment by a small positive constant (1, 2, 4, 8)
-        bool plausible_step = (first_delta >= 1 && first_delta <= 8);
-        float score = consistency * (plausible_step ? 1.5f : 0.5f);
-
-        if (score > best_score) {
-            best_score = score;
-            best_reg = r;
-        }
-    }
-
-    // Require at least 80% consistency with a plausible step
-    if (best_score < 1.2f) return 0xFF;
-    return best_reg;
+/// Purely mechanical classification from the already-hinted dispatch
+/// instruction's encoding — NOT a statistical heuristic. `is_blr` is a fact
+/// read directly from the opcode at the (hint-provided) indirect-branch PC,
+/// so "BLR → CallTable" is deterministic. When it's a plain BR, we label it
+/// IndirectBranch; distinguishing a genuine WhileSwitch (compare-cascade)
+/// from a jump-table IndirectBranch from trace shape alone is exactly the
+/// kind of guess static analysis already answers for free — callers who
+/// care about that distinction should set `VMConfig::dispatch_type_hint`
+/// explicitly instead of relying on this fallback.
+DispatchType classify_dispatch_type(bool is_blr) {
+    return is_blr ? DispatchType::CallTable : DispatchType::IndirectBranch;
 }
 
 // ─── VMCollector — single-pass trace scan for handler discovery ──────────
@@ -410,12 +353,12 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     ctx.progress(0.0f, "VM abstract: scanning for dispatcher candidates...");
 
-    // ── Step 2: Find dispatcher candidates ──────────────────────────────
+    // ── Step 2: Resolve the hinted dispatcher into a Candidate ───────────
     //
-    // A VM dispatcher is a loop with:
-    //   - High iteration count (many VM opcodes executed)
-    //   - An indirect branch (BR Xn) in the body
-    //   - The BR targets many distinct PCs (different handlers)
+    // There is exactly one source of truth for "where is the VM dispatcher":
+    // the caller's hint (`dispatcher`, `threaded_dispatch_pcs`, or a FetchOnly
+    // anchor). This block never scores or ranks loops — it only resolves the
+    // hint into the loop/PC bookkeeping the rest of the pass needs.
 
     struct Candidate {
         size_t   loop_index = 0;
@@ -558,44 +501,17 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         cand.is_blr = hint_is_blr;
         cand.score = 10.0f;
         candidates.push_back(std::move(cand));
-
-    } else if (config_.auto_detect) {
-        // ── Auto-detection ──────────────────────────────────────────────
-        for (size_t i = 0; i < loop_result.loops.size(); ++i) {
-            if (ctx.cancelled()) return PassResult::failed("Cancelled");
-
-            const auto& loop = loop_result.loops[i];
-            if (loop.iteration_count < config_.min_dispatch_iterations) continue;
-
-            bool cand_is_blr = false;
-            uint64_t br_pc = find_indirect_branch_in_loop(loop, cfg_result, code_table, cand_is_blr);
-            if (br_pc == 0) continue;
-
-            Candidate cand;
-            cand.loop_index = i;
-            cand.header_pc = loop.header_pc;
-            cand.indirect_branch_pc = br_pc;
-            cand.iteration_count = loop.iteration_count;
-            cand.is_blr = cand_is_blr;
-
-            // Score: high iterations + compact body → likely dispatcher
-            float iter_score = std::min(1.0f,
-                static_cast<float>(loop.iteration_count) / 100.0f);
-            float body_compactness = loop.body_pcs.size() < 50  ? 1.0f :
-                                     loop.body_pcs.size() < 200 ? 0.5f : 0.2f;
-            cand.score = iter_score * 0.6f + body_compactness * 0.4f;
-
-            candidates.push_back(std::move(cand));
-        }
-
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.score > b.score;
-                  });
     }
 
+    // No candidate means the caller didn't supply a usable dispatcher hint
+    // (FetchOnly anchor, ThreadedCode dispatch PCs, or a plain dispatcher
+    // hint). This pass never scans loops looking for "VM-shaped" candidates
+    // — see VMConfig's class comment — so an empty candidate list here is a
+    // caller error, not "no VM found".
     if (candidates.empty()) {
-        ctx.progress(1.0f, "VM abstract: no VM dispatcher found");
+        ctx.progress(1.0f,
+            "VM abstract: no dispatcher hint provided (set VMConfig::dispatcher, "
+            "threaded_dispatch_pcs, or a FetchOnly anchor from static analysis)");
         return PassResult::success(std::move(result));
     }
 
@@ -825,7 +741,20 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         result.dispatcher.indirect_branch_pc = best->indirect_branch_pc;
         result.dispatcher.iteration_count  = best->iteration_count;
         result.dispatcher.confidence       = std::min(1.0f, best->score);
-        result.dispatcher.dispatch_type    = classify_dispatch_type(loop, cfg_result, best->is_blr);
+
+        // Prefer the caller's explicit hint (from static analysis) for the
+        // loop-based topologies; only fall back to the mechanical BLR/BR
+        // read when the caller didn't say WhileSwitch/IndirectBranch/CallTable.
+        switch (config_.dispatch_type_hint) {
+            case DispatchType::WhileSwitch:
+            case DispatchType::IndirectBranch:
+            case DispatchType::CallTable:
+                result.dispatcher.dispatch_type = config_.dispatch_type_hint;
+                break;
+            default:
+                result.dispatcher.dispatch_type = classify_dispatch_type(best->is_blr);
+                break;
+        }
 
         // Identify state vs invariant registers across dispatch iterations
         uint32_t n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
@@ -848,17 +777,19 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     }
 
     // ── Step 5: Identify VM-PC register ─────────────────────────────────
+    //
+    // VM-PC is always taken from the hint. Which host register holds the
+    // bytecode pointer is a static fact (readable straight from the
+    // dispatcher's fetch instruction in IDA); guessing it from "which
+    // register increments by a small constant step across a dozen
+    // iterations" is unreliable (false-positives on any other monotonic
+    // counter, e.g. the interpreter's own loop counter) and unnecessary.
 
     ctx.progress(0.65f, "VM abstract: identifying VM-PC register...");
 
     if (config_.vm_pc.has_value() && config_.vm_pc->reg != 0xFF) {
         result.vm_pc_reg = config_.vm_pc->reg;
         result.bytecode_base = config_.vm_pc->bytecode_base;
-    } else if (!use_threaded) {
-        // Auto-inference requires loop header inst_ids (not available for
-        // ThreadedCode). Works for both loop-based topologies and FetchOnly
-        // (best->header_inst_ids is populated identically in both cases).
-        result.vm_pc_reg = infer_vm_pc_register(regfile, best->header_inst_ids);
     }
 
     // Infer bytecode address range from observed VM-PC values.
@@ -959,48 +890,16 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         result.handlers.push_back(std::move(handler));
     }
 
-    // ── Step 6b: Infer VM architecture type ────────────────────────────
-
-    if (config_.arch_type_hint != VMArchType::Unknown) {
-        result.arch_type = config_.arch_type_hint;
-    } else {
-        // Lightweight inference from handler memory access patterns:
-        //   - StackMachine: handlers frequently push/pop via a single pointer
-        //     (one register has many writes with small constant offsets → SP-like)
-        //   - RegisterMachine: handlers read/write at fixed offsets from a base
-        //     register (the VM register file), spread across many distinct offsets
-        //
-        // Heuristic: look at dispatcher invariant_regs. For each invariant reg,
-        // check if handlers predominantly write near it (SP-like → stack) or read
-        // at scattered fixed offsets (regfile-like → register machine).
-        //
-        // Simple signal: if most handlers do both reads AND writes (load+store
-        // with roughly equal counts), it's likely a register machine accessing a
-        // regfile. If handlers mostly just push (write) or pop (read), it's a stack.
-
-        uint32_t load_dominant = 0, store_dominant = 0, balanced = 0;
-        for (const auto& h : result.handlers) {
-            if (h.execution_count == 0) continue;
-            uint32_t avg_reads  = h.mem_reads  / static_cast<uint32_t>(h.execution_count);
-            uint32_t avg_writes = h.mem_writes / static_cast<uint32_t>(h.execution_count);
-            if (avg_reads == 0 && avg_writes == 0) continue;
-            if (avg_reads > avg_writes * 2)       load_dominant++;
-            else if (avg_writes > avg_reads * 2)  store_dominant++;
-            else                                   balanced++;
-        }
-
-        uint32_t total = load_dominant + store_dominant + balanced;
-        if (total >= 3) {
-            // Stack machines: most handlers are either push-only or pop-only
-            if (load_dominant + store_dominant > balanced * 2) {
-                result.arch_type = VMArchType::StackMachine;
-            }
-            // Register machines: most handlers do balanced read+write
-            else if (balanced > (load_dominant + store_dominant)) {
-                result.arch_type = VMArchType::RegisterMachine;
-            }
-        }
-    }
+    // ── Step 6b: VM architecture type ───────────────────────────────────
+    //
+    // Always taken from the hint — never inferred from handler memory-access
+    // ratios. Load/store balance is a weak, easily-confounded signal (a
+    // register machine handler that only reads, or a stack machine handler
+    // that swaps two slots, looks identical to the "wrong" category), and
+    // static analysis already knows the answer with certainty. Prefer
+    // reading `vm_register_file` (has_stack()/has_regs()/is_mixed()) when
+    // you need this programmatically.
+    result.arch_type = config_.arch_type_hint;
 
     // ── Step 7: Build VM execution trace (step sequence) ────────────────
 

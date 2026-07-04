@@ -174,7 +174,7 @@ profiling
 | ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点（仅 Darwin 目标） |
 | ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑（仅 Darwin 目标） |
 | 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL） |
-| VMP 抽象 | `--vm-abstract`, `vm_abstract` | 检测虚拟机 dispatcher、提取 handler、推断 VM-PC、解码 opcode、推断架构类型 |
+| VMP 抽象 | `--vm-abstract`, `vm_abstract` | **需静态分析 hint**（dispatcher_pc 等，来自 IDA/Ghidra）：提取 handler 执行次数、解码 opcode、读取 VM context/寄存器文件/栈快照 |
 
 典型命令：
 
@@ -269,7 +269,7 @@ profiling
 | 我想知道输入往哪流了 | `taint`, `critical_path`, `dataflow_graph` |
 | 我想知道代码结构 | `function`, `xref`, `cfg`, `call_graph`, `loops` |
 | 我想知道是不是某个算法 | `pattern`, `constants`, `loop_semantics`, `algorithm_summary` |
-| 我想知道代码是不是被 VM 保护了 | `vm_abstract` |
+| 我想知道代码是不是被 VM 保护了 | 先用 IDA/Ghidra 静态分析定位 dispatcher，再用 `vm_abstract`（hint 驱动，不做启发式扫描）验证并跑执行统计 |
 | 我想知道某段内存当时的值 | `memread`, `memory_snapshot`, `memory_strings` |
 | 我想让 AI 自动分析 | `--mcp` 或 `--mcp-http` |
 | 我想边录边看 | `--streaming` |

@@ -1197,16 +1197,19 @@ void TenetMcpService::register_pass_tools() {
     // ── vm_abstract ──────────────────────────────────────────────────────
     register_tool(
         {"vm_abstract",
-         "Detect and analyze Virtual Machine (VM) based obfuscation in the trace. "
-         "Identifies the VM dispatcher loop, extracts handler set, decodes VM opcodes, "
-         "and reconstructs the VM execution trace (bytecode → handler mapping). "
+         "Abstract Virtual Machine (VM) execution from the trace, given static-analysis "
+         "hints. Extracts the handler set, decodes VM opcodes, and reconstructs the VM "
+         "execution trace (bytecode → handler mapping), producing execution-time data "
+         "that only a trace can provide (handler execution counts, observed opcode "
+         "values, per-step VM register/context/stack snapshots). "
          "Supports WhileSwitch, IndirectBranch, CallTable, ThreadedCode, and FetchOnly topologies. "
-         "REQUIRES at least one static-analysis hint (e.g. 'dispatcher_pc' from IDA/Ghidra) "
-         "or 'hints_file'. The purely heuristic dispatcher auto-detection (loop iteration "
-         "count + indirect-branch shape) is disabled by default because it has a very high "
-         "false-positive/false-negative rate on real traces; pass auto_detect=true to opt "
-         "into it anyway (not recommended). "
-         "Use this when you suspect VM/VMP protection.",
+         "This tool does NOT discover VM structure by scanning the trace — dispatcher "
+         "location, VM-PC register, dispatch topology, and architecture type are static "
+         "facts that static analysis (IDA/Ghidra) determines far more reliably and cheaply "
+         "than any dynamic heuristic could. REQUIRES at least one static-analysis hint "
+         "(e.g. 'dispatcher_pc' from IDA/Ghidra) or 'hints_file'; the call fails otherwise. "
+         "Use this when you suspect VM/VMP protection AND already have static hints — run "
+         "static analysis first if you don't.",
          {{"type", "object"},
           {"properties", {
               // ── Dispatcher location ──
@@ -1243,7 +1246,6 @@ void TenetMcpService::register_pass_tools() {
               {"handler_asm_map",      {{"type", "object"},  {"description", "Hint: static disassembly for handler bodies. Keys = handler static PC (hex string), values = array of {\"pc\": \"0x...\", \"text\": \"...\"}. Enables annotated asm in VM instruction panel."}}},
               // ── Misc ──
               {"hints_file",           {{"type", "string"},  {"description", "Path to a JSON file containing any/all of the above hints. Merged with inline args (inline args take priority). JSON keys match arg names."}}},
-              {"auto_detect",          {{"type", "boolean"}, {"description", "Explicitly opt into the heuristic dispatcher auto-detection (loop iteration count + indirect-branch shape) when NO static hint is provided. This heuristic has a very high false-positive/false-negative rate on real traces and is DISABLED by default — you should almost always supply at least 'dispatcher_pc' (or another hint) from IDA/Ghidra static analysis instead of relying on this."}, {"default", false}}},
               {"force_rerun",          {{"type", "boolean"}, {"description", "Force re-run even if a cached result exists (use when hints have changed)"}, {"default", false}}},
               {"steps_offset",         {{"type", "integer"}, {"description", "Pagination: skip first N VM steps"}, {"default", 0}}},
               {"steps_limit",          {{"type", "integer"}, {"description", "Pagination: max VM steps per page (max 2000)"}, {"default", 500}}}
@@ -1274,15 +1276,6 @@ void TenetMcpService::register_pass_tools() {
                 if (file_hints.contains(key)) return &file_hints.at(key);
                 return nullptr;
             };
-
-            // Auto-detection is opt-in only (see tool description): the pure
-            // heuristic has a very high false-positive/false-negative rate on
-            // real traces. Default false; gated/checked again below once all
-            // hints have been merged in.
-            {
-                const json* ad = get_hint("auto_detect");
-                cfg.auto_detect = ad ? ad->get<bool>() : false;
-            }
 
             // ── Static hints from IDA ── (inline args OR hints_file)
             //
@@ -1517,19 +1510,15 @@ void TenetMcpService::register_pass_tools() {
                 }
             }
 
-            // ── Require at least one static hint (or explicit auto_detect opt-in) ──
-            // The heuristic dispatcher auto-detection has a very high false-
-            // positive/false-negative rate on real traces, so it must not run
-            // silently. Fail loudly and tell the caller what to do instead.
-            if (!cfg.has_any_static_hint() && !cfg.auto_detect) {
+            // ── Require at least one static hint ──
+            // vm_abstract never scans the trace looking for "VM-shaped"
+            // loops — dispatcher location must come from static analysis.
+            if (!cfg.has_any_static_hint()) {
                 throw std::runtime_error(
                     "vm_abstract requires at least one static-analysis hint "
                     "(e.g. 'dispatcher_pc' from IDA/Ghidra static analysis, or "
-                    "'hints_file' pointing to a JSON hints file). The heuristic "
-                    "dispatcher auto-detection is disabled by default because it "
-                    "has a very high false-positive/false-negative rate on real "
-                    "traces. Pass auto_detect=true to explicitly opt into it "
-                    "anyway (not recommended).");
+                    "'hints_file' pointing to a JSON hints file). Run static "
+                    "analysis first to determine the dispatcher location.");
             }
 
             // ── Run the pass ──

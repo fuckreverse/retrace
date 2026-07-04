@@ -143,14 +143,10 @@ struct CliOptions {
     std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges;
 
     // --- VM abstract ---
-    // NOTE: VM dispatcher auto-detection is disabled by default — its pure
-    // heuristic (loop iteration count + indirect branch shape) has a very
-    // high false-positive/false-negative rate on real traces. You must
-    // supply at least one static-analysis hint (--vm-dispatcher, --vm-handler,
-    // --vm-hints <file>, ...) or pass --vm-auto-detect to explicitly opt into
-    // the unreliable heuristic scan.
+    // NOTE: vm_abstract is entirely hint-driven — it never scans the trace
+    // looking for "VM-shaped" loops. You must supply at least one
+    // static-analysis hint (--vm-dispatcher, --vm-handler, --vm-hints <file>, ...).
     bool opt_vm_abstract = false;
-    bool vm_auto_detect = false;           // --vm-auto-detect (explicit opt-in)
     uint64_t vm_dispatcher_pc = 0;         // --vm-dispatcher <hex>
     uint64_t vm_indirect_br_pc = 0;        // --vm-indirect-br <hex>
     uint8_t  vm_pc_reg = 0xFF;             // --vm-pc-reg <index>

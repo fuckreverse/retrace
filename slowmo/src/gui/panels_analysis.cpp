@@ -665,22 +665,21 @@ void GuiApp::run_pass_by_name(std::string_view name) {
 
 // ─── VM Abstract: hints-gated runner ────────────────────────────────────────
 //
-// VM dispatcher auto-detection is a pure heuristic (loop iteration count +
-// indirect-branch shape) with a very high false-positive/false-negative rate
-// on real traces. The GUI requires the user to load a static-analysis hints
-// JSON file (produced by IDA/Ghidra, or the same schema as the MCP
-// `vm_abstract` tool's hints_file) before running the pass — unless they
-// explicitly check "run without hints (unreliable)".
+// vm_abstract is entirely hint-driven — it does not scan the trace looking
+// for "VM-shaped" loops. The GUI requires the user to load a static-analysis
+// hints JSON file (produced by IDA/Ghidra, or the same schema as the MCP
+// `vm_abstract` tool's hints_file) before running the pass.
 void GuiApp::run_vm_abstract_with_hints() {
     ensure_pass_manager();
 
     std::string hints_path(vm_hints_path_buf_);
 
-    if (hints_path.empty() && !vm_auto_detect_opt_in_) {
+    if (hints_path.empty()) {
         vm_hints_status_ =
             "Load a static-analysis hints JSON file first (dispatcher_pc, "
-            "handler_entry_pcs, ...), or check \"run without hints\" to use "
-            "the unreliable heuristic auto-detection.";
+            "handler_entry_pcs, ...). vm_abstract requires at least a "
+            "dispatcher hint from static analysis — it does not scan the "
+            "trace for candidates.";
         last_pass_status_ = "vm_abstract: hints required";
         return;
     }
@@ -688,16 +687,14 @@ void GuiApp::run_vm_abstract_with_hints() {
     // Build the VMConfig up front so we can validate hints before touching
     // any pass-manager state.
     VMConfig vm_cfg;
-    if (!hints_path.empty()) {
-        if (!load_vm_hints_from_json(hints_path, vm_cfg)) {
-            vm_hints_status_ = fmt::format("Failed to load hints file: {}", hints_path);
-            last_pass_status_ = "vm_abstract: invalid hints file";
-            return;
-        }
+    if (!load_vm_hints_from_json(hints_path, vm_cfg)) {
+        vm_hints_status_ = fmt::format("Failed to load hints file: {}", hints_path);
+        last_pass_status_ = "vm_abstract: invalid hints file";
+        return;
     }
-    vm_cfg.auto_detect = vm_auto_detect_opt_in_;
-    if (!vm_cfg.has_any_static_hint() && !vm_auto_detect_opt_in_) {
-        vm_hints_status_ = "Hints file has no usable hints, and auto-detect is not enabled.";
+    if (!vm_cfg.has_any_static_hint()) {
+        vm_hints_status_ = "Hints file has no usable hints (need at least a dispatcher_pc "
+                            "or threaded_dispatch_pcs).";
         last_pass_status_ = "vm_abstract: hints required";
         return;
     }
@@ -719,9 +716,7 @@ void GuiApp::run_vm_abstract_with_hints() {
     tenet::register_pass_by_name(*pass_manager_, "loop");
     pass_manager_->register_pass(std::make_unique<VMAbstractPass>(std::move(vm_cfg)));
 
-    vm_hints_status_ = hints_path.empty()
-        ? "Running with auto-detect (unreliable) — no hints loaded."
-        : fmt::format("Hints loaded from {}", hints_path);
+    vm_hints_status_ = fmt::format("Hints loaded from {}", hints_path);
 
     enqueue_async("vm_abstract", [this]() {
         auto& raw = pass_manager_->require("vm_abstract");

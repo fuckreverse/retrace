@@ -213,20 +213,18 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
         return std::make_unique<DataflowGraphPass>(std::move(c));
     }
     if (name == "vm_abstract") {
-        // VM dispatcher auto-detection is unreliable on real traces (pure
-        // heuristic on loop iteration count + indirect-branch shape).
-        // Require the caller to have supplied static-analysis hints (via a
-        // hints JSON file) or to have explicitly opted into auto-detection;
-        // otherwise refuse to register the pass (caller sees registration
-        // failure and should prompt the user for hints instead).
+        // vm_abstract is entirely hint-driven — it never scans the trace
+        // looking for "VM-shaped" loops. Require the caller to have supplied
+        // static-analysis hints (via a hints JSON file); otherwise refuse to
+        // register the pass (caller sees registration failure and should
+        // prompt the user for hints instead).
         VMConfig cfg;
         if (!ctx.vm_hints_file.empty()) {
             if (!load_vm_hints_from_json(ctx.vm_hints_file, cfg)) {
                 return nullptr;
             }
         }
-        cfg.auto_detect = ctx.vm_auto_detect;
-        if (!cfg.has_any_static_hint() && !ctx.vm_auto_detect) {
+        if (!cfg.has_any_static_hint()) {
             return nullptr;
         }
         return std::make_unique<VMAbstractPass>(std::move(cfg));

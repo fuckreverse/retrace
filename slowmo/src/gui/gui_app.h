@@ -665,20 +665,18 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     size_t vm_handler_cursor_ = 0;
     size_t vm_step_cursor_    = 0;
 
-    // VM dispatcher auto-detection is a pure heuristic (loop iteration count +
-    // indirect-branch shape) with a very high false-positive/false-negative
-    // rate on real traces. The GUI therefore requires the user to load a
-    // static-analysis hints JSON file (from IDA/Ghidra/MCP) before running
-    // vm_abstract — or explicitly check "run without hints (unreliable)".
+    // vm_abstract is entirely hint-driven (see VMConfig's class comment) — it
+    // never scans the trace looking for "VM-shaped" loops. The GUI therefore
+    // requires the user to load a static-analysis hints JSON file (from
+    // IDA/Ghidra/MCP) before running it.
     char vm_hints_path_buf_[512] = {};   // text input buffer for hints file path
-    bool vm_auto_detect_opt_in_  = false; // explicit "run without hints" checkbox
     std::string vm_hints_status_;         // feedback line ("loaded N hints" / error)
-    /// Run vm_abstract using vm_hints_path_buf_ / vm_auto_detect_opt_in_.
+    /// Run vm_abstract using vm_hints_path_buf_.
     /// Shared by the legacy panel and the VM Workspace "Run"/"Rerun" buttons.
     void run_vm_abstract_with_hints();
-    /// Renders the hints-file path input + "Run"/"Rerun" button + auto-detect
-    /// opt-in checkbox + status line. Shared by the legacy panel (empty and
-    /// already-run states) and the VM Workspace toolbar.
+    /// Renders the hints-file path input + "Run"/"Rerun" button + status
+    /// line. Shared by the legacy panel (empty and already-run states) and
+    /// the VM Workspace toolbar.
     /// `button_label`/`button_width` let callers customize the primary
     /// action button ("Run VM Detection" vs "Rerun").
     void render_vm_hints_input(const char* button_label, float button_width);

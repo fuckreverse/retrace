@@ -77,8 +77,8 @@ static std::unique_ptr<TraceEnv> make_vm_trace(int N) {
         ms.sp() = 0x16F000000ULL;
 
         // Initial register setup
-        // x0 is NOT used as a counter — kept at a fixed value so only x1
-        // shows the constant-step pattern that infer_vm_pc_register looks for.
+        // x0 is NOT used as a counter — kept at a fixed value; only x1
+        // is the (hinted) VM-PC and shows a constant-step pattern.
         ms.x(0) = 0x42;                // some fixed value (not a loop counter)
         ms.x(1) = 0xDEAD0000ULL;       // VM-PC (bytecode pointer)
         ms.x(2) = 0;                   // handler address (loaded each iter)
@@ -184,69 +184,6 @@ static std::unique_ptr<TraceEnv> make_vm_trace(int N) {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-TEST_CASE("VMAbstractPass: auto-detect VM dispatcher with 15 iterations",
-          "[unit][pass][vm_abstract]") {
-    auto env = make_vm_trace(15);
-    REQUIRE(env != nullptr);
-
-    auto pm = make_pm(*env);
-
-    VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;  // Lower threshold for test
-    cfg.min_handler_count = 2;
-
-    pm->register_pass(std::make_unique<XrefPass>());
-    pm->register_pass(std::make_unique<CFGPass>());
-    pm->register_pass(std::make_unique<LoopPass>());
-    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
-
-    auto& raw = pm->require("vm_abstract");
-    REQUIRE(raw.ok());
-
-    auto& res = raw.get<VMAbstractResult>();
-
-    SECTION("dispatcher is detected at loop header") {
-        // The header PC should be detected (with slide applied by TraceWriter)
-        REQUIRE(res.dispatcher.loop_header_pc == rt_pc(HEADER_PC));
-    }
-
-    SECTION("indirect branch PC is found") {
-        REQUIRE(res.dispatcher.indirect_branch_pc != 0);
-    }
-
-    SECTION("at least 3 handlers extracted") {
-        REQUIRE(res.handlers.size() >= 3);
-    }
-
-    SECTION("handler entry PCs match expected values") {
-        bool found_a = false, found_b = false, found_c = false;
-        for (const auto& h : res.handlers) {
-            if (h.entry_pc == rt_pc(HANDLER_A)) found_a = true;
-            if (h.entry_pc == rt_pc(HANDLER_B)) found_b = true;
-            if (h.entry_pc == rt_pc(HANDLER_C)) found_c = true;
-        }
-        CHECK(found_a);
-        CHECK(found_b);
-        CHECK(found_c);
-    }
-
-    SECTION("handler execution counts are positive") {
-        for (const auto& h : res.handlers) {
-            CHECK(h.execution_count > 0);
-        }
-    }
-
-    SECTION("VM steps are produced") {
-        REQUIRE(res.steps.size() >= 10);
-        REQUIRE(res.total_vm_steps == res.steps.size());
-    }
-
-    SECTION("VM-PC register is identified as x1") {
-        // x1 increments by 4 each iteration → should be detected as VM-PC
-        CHECK(res.vm_pc_reg == 1);
-    }
-}
-
 TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
           "[unit][pass][vm_abstract]") {
     auto env = make_vm_trace(12);
@@ -255,10 +192,10 @@ TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.auto_detect = false;  // disable auto-detect, rely on hint
     DispatcherHint dh;
     dh.loop_header_pc = rt_pc(HEADER_PC);
-    // Don't provide indirect_branch_pc — let the pass find it
+    // Don't provide indirect_branch_pc — let the pass find it (structural
+    // completion within the already-hinted loop, not detection).
     cfg.dispatcher = dh;
     cfg.min_handler_count = 2;
 
@@ -289,7 +226,7 @@ TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
     }
 }
 
-TEST_CASE("VMAbstractPass: VM-PC hint overrides inference",
+TEST_CASE("VMAbstractPass: VM-PC hint drives vm_pc_reg (no inference)",
           "[unit][pass][vm_abstract]") {
     auto env = make_vm_trace(12);
     REQUIRE(env != nullptr);
@@ -297,8 +234,10 @@ TEST_CASE("VMAbstractPass: VM-PC hint overrides inference",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    DispatcherHint dh;
+    dh.loop_header_pc = rt_pc(HEADER_PC);
+    cfg.dispatcher = dh;
 
     // Provide a VM-PC hint for x1
     VMPCHint vph;
@@ -341,8 +280,10 @@ TEST_CASE("VMAbstractPass: handler lookup by PC works",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    DispatcherHint dh;
+    dh.loop_header_pc = rt_pc(HEADER_PC);
+    cfg.dispatcher = dh;
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -509,8 +450,12 @@ TEST_CASE("VMAbstractPass: opcode decode with OpcodeFormatHint",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     // VM-PC hint: x1 points to bytecode, base at BYTECODE_BASE
     VMPCHint vph;
@@ -685,94 +630,6 @@ static std::unique_ptr<TraceEnv> make_blr_vm_trace(int N) {
     }, ("vm_abstract_blr_" + std::to_string(N)).c_str());
 }
 
-// ─── Helper: VM trace with memory accesses on handlers ───────────────────────
-//
-// Builds a VM trace where each handler performs explicit memory read/write
-// operations so the arch_type inference heuristic has data to work with.
-//
-// Modes:
-//   'S' = StackMachine-like: each handler does many reads OR many writes (not both)
-//   'R' = RegisterMachine-like: each handler does balanced reads AND writes
-static std::unique_ptr<TraceEnv> make_memaccess_vm_trace(int N, char mode) {
-    return make_env([N, mode](TraceWriter& tw) {
-        tw.anchor_interval = 256;
-        tw.write_header();
-        MachineState ms;
-        ms.sp() = 0x16F000000ULL;
-        ms.x(0) = 0x42;
-        ms.x(1) = 0xDEAD0000ULL;
-        ms.x(2) = 0;
-        ms.x(3) = 0xBEEF0000ULL;
-        ms.x(4) = 100; ms.x(5) = 0xAAAA; ms.x(6) = 0x5555; ms.x(7) = 200;
-        ms.x(8) = 0;
-        ms.x(10) = 0xCC000000ULL;  // stack/regfile pointer for mem accesses
-
-        const uint64_t handler_pcs[] = { HANDLER_A, HANDLER_B, HANDLER_C };
-
-        for (int i = 0; i < N; i++) {
-            uint64_t handler_pc = handler_pcs[i % 3];
-            uint64_t next_x8 = static_cast<uint64_t>(i + 1);
-            uint64_t next_x1 = 0xDEAD0000ULL + static_cast<uint64_t>((i + 1) * 4);
-
-            // Header (same as make_vm_trace)
-            tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
-                    {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x8);
-            tw.emit(ms, HEADER_PC + 4, enc::b_ge(12),
-                    {{33, tw.rt(HEADER_PC + 8)}}, {});
-            tw.emit(ms, HEADER_PC + 8, enc::ldr_reg(2, 3, 1),
-                    {{2, tw.rt(handler_pc)}, {33, tw.rt(HEADER_PC + 0xC)}}, {});
-            tw.emit(ms, HEADER_PC + 0xC, enc::br(2),
-                    {{33, tw.rt(handler_pc)}}, {});
-
-            // Handler body with memory accesses
-            uint64_t mem_base = 0xCC000000ULL + static_cast<uint64_t>(i * 64);
-
-            // Build mem accesses based on mode
-            std::vector<TraceWriter::MemAcc> mems;
-            if (mode == 'S') {
-                // Stack-like: handler A does 3 reads only, B does 3 writes only, C does 3 reads only
-                if (handler_pc == HANDLER_A || handler_pc == HANDLER_C) {
-                    for (int m = 0; m < 3; m++)
-                        mems.push_back({1, 8, mem_base + static_cast<uint64_t>(m*8), 0x1234ULL});
-                } else {
-                    for (int m = 0; m < 3; m++)
-                        mems.push_back({2, 8, mem_base + static_cast<uint64_t>(m*8), 0x5678ULL});
-                }
-            } else {
-                // Register-like: every handler does 2 reads + 2 writes (balanced)
-                mems.push_back({1, 8, mem_base, 0x1234ULL});
-                mems.push_back({1, 8, mem_base + 8, 0x5678ULL});
-                mems.push_back({2, 8, mem_base + 16, 0xABCDULL});
-                mems.push_back({2, 8, mem_base + 24, 0xEF01ULL});
-            }
-
-            // Emit handler: operation + mem accesses + advance x1 + advance x8 + b header
-            tw.emit(ms, handler_pc, enc::add_imm(4, 4, 1),
-                    {{4, ms.x(4) + 1}, {33, tw.rt(handler_pc + 4)}}, mems);
-            tw.emit(ms, handler_pc + 4, enc::add_imm(1, 1, 4),
-                    {{1, next_x1}, {33, tw.rt(handler_pc + 8)}}, {});
-            tw.emit(ms, handler_pc + 8, enc::add_imm(8, 8, 1),
-                    {{8, next_x8}, {33, tw.rt(handler_pc + 0xC)}}, {});
-            tw.emit(ms, handler_pc + 0xC,
-                    enc::b(static_cast<int32_t>(HEADER_PC - (handler_pc + 0xC))),
-                    {{33, tw.rt(HEADER_PC)}}, {});
-
-            ms.x(8) = next_x8;
-            ms.x(1) = next_x1;
-            ms.x(4) = ms.x(4) + 1;
-        }
-
-        // Exit
-        tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
-                {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x4);
-        tw.emit(ms, HEADER_PC + 4, enc::b_ge(12),
-                {{33, tw.rt(EXIT_PC)}}, {});
-        tw.emit(ms, EXIT_PC, enc::nop(),
-                {{33, tw.rt(EXIT_PC + 4)}}, {});
-        tw.emit_anchor(ms);
-    }, ("vm_abstract_mem_" + std::string(1, mode) + "_" + std::to_string(N)).c_str());
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // NEW TESTS: dispatch type, arch inference, VMContextHint, config, edge cases
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -786,8 +643,12 @@ TEST_CASE("VMAbstractPass: dispatch type is IndirectBranch for BR-based dispatch
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
@@ -804,8 +665,12 @@ TEST_CASE("VMAbstractPass: dispatch type is CallTable for BLR-based dispatch",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
@@ -828,8 +693,12 @@ TEST_CASE("VMAbstractPass: arch_type_hint overrides inference",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     cfg.arch_type_hint = VMArchType::RegisterMachine;  // explicit hint
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -837,48 +706,6 @@ TEST_CASE("VMAbstractPass: arch_type_hint overrides inference",
     pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
 
     auto& res = pm->require("vm_abstract").get<VMAbstractResult>();
-    CHECK(res.arch_type == VMArchType::RegisterMachine);
-}
-
-TEST_CASE("VMAbstractPass: arch_type inferred as StackMachine from mem patterns",
-          "[unit][pass][vm_abstract]") {
-    // Stack-like handlers: each does only reads or only writes (not balanced)
-    auto env = make_memaccess_vm_trace(15, 'S');
-    REQUIRE(env != nullptr);
-    auto pm = make_pm(*env);
-
-    VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
-    cfg.min_handler_count = 2;
-    pm->register_pass(std::make_unique<XrefPass>());
-    pm->register_pass(std::make_unique<CFGPass>());
-    pm->register_pass(std::make_unique<LoopPass>());
-    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
-
-    auto& raw = pm->require("vm_abstract");
-    REQUIRE(raw.ok());
-    auto& res = raw.get<VMAbstractResult>();
-    CHECK(res.arch_type == VMArchType::StackMachine);
-}
-
-TEST_CASE("VMAbstractPass: arch_type inferred as RegisterMachine from mem patterns",
-          "[unit][pass][vm_abstract]") {
-    // Register-like handlers: each does balanced reads + writes
-    auto env = make_memaccess_vm_trace(15, 'R');
-    REQUIRE(env != nullptr);
-    auto pm = make_pm(*env);
-
-    VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
-    cfg.min_handler_count = 2;
-    pm->register_pass(std::make_unique<XrefPass>());
-    pm->register_pass(std::make_unique<CFGPass>());
-    pm->register_pass(std::make_unique<LoopPass>());
-    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
-
-    auto& raw = pm->require("vm_abstract");
-    REQUIRE(raw.ok());
-    auto& res = raw.get<VMAbstractResult>();
     CHECK(res.arch_type == VMArchType::RegisterMachine);
 }
 
@@ -964,8 +791,12 @@ TEST_CASE("VMAbstractPass: VMContextHint reads context fields from memory",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMContextHint vctx;
     vctx.ctx_base_reg = 10;  // x10 holds ctx pointer
@@ -1070,8 +901,12 @@ TEST_CASE("VMAbstractPass: VMContextHint skips unknown memory fields",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMContextHint vctx;
     vctx.ctx_base_reg = 10;
@@ -1105,8 +940,12 @@ TEST_CASE("VMAbstractPass: handler_names labels are applied",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     cfg.handler_names[rt_pc(HANDLER_A)] = "VM_ADD";
     cfg.handler_names[rt_pc(HANDLER_B)] = "VM_XOR";
 
@@ -1134,8 +973,12 @@ TEST_CASE("VMAbstractPass: handler_entry_pcs merges with discovered handlers",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     // Pre-provide one known handler PC + one fictional handler PC
     cfg.handler_entry_pcs = {rt_pc(HANDLER_A), 0xF000F000ULL};
 
@@ -1169,8 +1012,12 @@ TEST_CASE("VMAbstractPass: state_regs and invariant_regs classification",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
@@ -1223,8 +1070,18 @@ TEST_CASE("VMAbstractPass: bytecode_end uses opcode_size from hint",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
+
+    // Provide a VM-PC hint for x1 (no longer inferred automatically)
+    VMPCHint vph;
+    vph.reg = 1;
+    vph.bytecode_base = 0xDEAD0000ULL;
+    cfg.vm_pc = vph;
 
     OpcodeFormatHint ofmt;
     ofmt.opcode_size = 4;
@@ -1253,7 +1110,6 @@ TEST_CASE("VMAbstractPass: hint-driven with explicit indirect_branch_pc",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.auto_detect = false;
     DispatcherHint dh;
     dh.loop_header_pc = rt_pc(HEADER_PC);
     dh.indirect_branch_pc = rt_pc(HEADER_PC + 0xC);  // explicit BR PC
@@ -1280,7 +1136,6 @@ TEST_CASE("VMAbstractPass: hinted loop header not found returns empty",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.auto_detect = false;
     DispatcherHint dh;
     dh.loop_header_pc = 0xDEADDEADULL;  // non-existent PC
     cfg.dispatcher = dh;
@@ -1298,17 +1153,23 @@ TEST_CASE("VMAbstractPass: hinted loop header not found returns empty",
     CHECK(res.dispatcher.loop_header_pc == 0);
 }
 
-TEST_CASE("VMAbstractPass: VM-PC inference fails with too few iterations",
+TEST_CASE("VMAbstractPass: VM-PC hint works even with very few iterations",
           "[unit][pass][vm_abstract]") {
-    // Build a trace with only 3 dispatch iterations — below the 4-sample minimum
-    // for infer_vm_pc_register.
+    // With auto-inference removed, VM-PC always comes straight from the
+    // hint — there is no minimum sample count to worry about, unlike the
+    // old statistical inference which needed >= 4 header hits.
     auto env = make_vm_trace(3);
     REQUIRE(env != nullptr);
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 2;  // very low threshold
     cfg.min_handler_count = 2;
+    DispatcherHint dh;
+    dh.loop_header_pc = rt_pc(HEADER_PC);
+    cfg.dispatcher = dh;
+    VMPCHint vph;
+    vph.reg = 1;
+    cfg.vm_pc = vph;
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -1319,15 +1180,8 @@ TEST_CASE("VMAbstractPass: VM-PC inference fails with too few iterations",
     REQUIRE(raw.ok());
     auto& res = raw.get<VMAbstractResult>();
 
-    // With only 3 header inst_ids, the pass may not detect a dispatcher at all
-    // (needs >= 3 header_inst_ids for a valid candidate). If a dispatcher IS found,
-    // VM-PC inference will fail because header_inst_ids.size() < 4.
-    if (!res.handlers.empty()) {
-        // If somehow detected: VM-PC should be unknown (inference needs ≥4 samples)
-        // Actually the header is hit 4 times (3 iterations + 1 exit), so inference
-        // might work. Just verify the result is internally consistent.
-        CHECK(res.total_vm_steps == res.steps.size());
-    }
+    CHECK(res.vm_pc_reg == 1);
+    CHECK(res.total_vm_steps == res.steps.size());
 }
 
 TEST_CASE("VMAbstractPass: opcode decode fails gracefully with bad opcode_size",
@@ -1337,8 +1191,12 @@ TEST_CASE("VMAbstractPass: opcode decode fails gracefully with bad opcode_size",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     // opcode_size = 0 should skip decode entirely
     OpcodeFormatHint ofmt;
@@ -1364,8 +1222,12 @@ TEST_CASE("VMAbstractPass: opcode decode fails when opcode_size > 8",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     OpcodeFormatHint ofmt;
     ofmt.opcode_size = 16;  // exceeds max (8)
@@ -1392,8 +1254,12 @@ TEST_CASE("VMAbstractPass: opcode decode fails for unwritten memory",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMPCHint vph;
     vph.reg = 1;
@@ -1426,8 +1292,12 @@ TEST_CASE("VMAbstractPass: total_native_instructions is consistent",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
@@ -1566,8 +1436,12 @@ TEST_CASE("VMAbstractPass: opcode_byte_offset extracts opcode from non-zero offs
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMPCHint vph;
     vph.reg = 1;
@@ -1694,8 +1568,12 @@ TEST_CASE("VMAbstractPass: not_ deobfuscation op recovers original opcode",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMPCHint vph;
     vph.reg = 1;
@@ -1832,8 +1710,12 @@ TEST_CASE("VMAbstractPass: neg deobfuscation op recovers negated opcode",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMPCHint vph4;
     vph4.reg = 1;
@@ -1961,8 +1843,12 @@ TEST_CASE("VMAbstractPass: VMContextHint respects field.size truncation",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMContextHint vctx5;
     vctx5.ctx_base_reg = 10;
@@ -2093,8 +1979,12 @@ TEST_CASE("VMAbstractPass: mixed RF+Stack mode populates both vm_regs panels",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMRegisterFileHint rfh6;
     rfh6.rf_base_reg = 11;  // x11 holds RF base
@@ -2225,8 +2115,12 @@ TEST_CASE("VMAbstractPass: stack_direction Ascending reads slots below SP",
     auto pm = make_pm(*env);
 
     VMConfig cfg;
-    cfg.min_dispatch_iterations = 5;
     cfg.min_handler_count = 2;
+    {
+        DispatcherHint dh;
+        dh.loop_header_pc = rt_pc(HEADER_PC);
+        cfg.dispatcher = dh;
+    }
 
     VMRegisterFileHint rfh7;
     rfh7.rf_base_reg    = 12;    // x12 holds RF base
@@ -2354,13 +2248,12 @@ TEST_CASE("VMConfig::has_any_static_hint detects threaded_dispatch_pcs",
 
 TEST_CASE("VMConfig::has_any_static_hint ignores arch_type_hint and thresholds",
           "[unit][pass][vm_abstract][hints]") {
-    // arch_type_hint / min_dispatch_iterations / min_handler_count are tuning
-    // knobs, not static-analysis hints from IDA/Ghidra — they must NOT count
-    // towards "has hints" (a caller could otherwise bypass the gate by simply
-    // tweaking a threshold instead of providing real dispatcher information).
+    // arch_type_hint / min_handler_count are tuning knobs / static-fact
+    // hints that don't by themselves say WHERE the dispatcher is — they must
+    // NOT count towards "has hints" (a caller could otherwise bypass the
+    // gate without providing real dispatcher information).
     VMConfig cfg;
     cfg.arch_type_hint = VMArchType::RegisterMachine;
-    cfg.min_dispatch_iterations = 3;
     cfg.min_handler_count = 1;
     CHECK_FALSE(cfg.has_any_static_hint());
 }
@@ -2643,7 +2536,7 @@ TEST_CASE("load_vm_hints_from_json parsing a full hints file satisfies has_any_s
           "[unit][pass][vm_abstract][hints][json]") {
     // End-to-end sanity check mirroring the CLI/GUI/MCP gate: a caller who
     // loads a realistic hints file should pass has_any_static_hint() and be
-    // allowed to run vm_abstract without opting into auto-detect.
+    // allowed to run vm_abstract.
     TempJsonFile f(R"({
         "dispatcher_pc": "0x1000",
         "indirect_branch_pc": "0x100C",
@@ -2651,7 +2544,6 @@ TEST_CASE("load_vm_hints_from_json parsing a full hints file satisfies has_any_s
         "vm_pc_reg": "x1"
     })");
     VMConfig cfg;
-    cfg.auto_detect = false;
     REQUIRE(load_vm_hints_from_json(f.path(), cfg));
     CHECK(cfg.has_any_static_hint());
 }

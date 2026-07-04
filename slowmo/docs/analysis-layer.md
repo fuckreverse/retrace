@@ -137,7 +137,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `vm_abstract` | VMP（虚拟机保护）执行抽象：检测 dispatcher 循环（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode**）、提取 handler、推断 VM-PC、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、推断架构类型、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）|
+| `vm_abstract` | VMP（虚拟机保护）执行抽象，**完全由静态分析 hint 驱动**（不在 trace 里猜测 dispatcher/VM-PC/拓扑/架构类型）：给定 dispatcher 位置（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode** / **FetchOnly**）后提取 handler 执行次数、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）|
 
 ### 4. Memory / String
 
@@ -217,7 +217,7 @@ loop_semantics --> algorithm_summary
 - `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
 - `syscall_intercept` 优先消费 REC_CAPICALL 记录（`on_capicall()`），已处理的 callee PC 写入 `capicall_seen_` 防止后续 XFER_CALL Event 重复生成记录；无 REC_CAPICALL 时降级为 XFER_CALL 启发式。
 - `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
-- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；支持 hint-driven 和 auto-detect 两种模式；通过 `VMConfig` 接收静态分析提供的 dispatcher / VM-PC / opcode format / context 等 hint。新增能力：
+- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；**完全由 hint 驱动**（`VMConfig::has_any_static_hint()` 为 false 时拒绝运行）——dispatcher 位置、VM-PC 寄存器、dispatch 拓扑、VM 架构类型均需通过 `VMConfig` 由静态分析（IDA/Ghidra）提供，pass 本身不做启发式扫描/推断。`classify_dispatch_type()` 仅在未提供 `dispatch_type_hint` 时做一次纯机械判定（读取已定位的 dispatch 指令是否为 BLR，不做统计推测）；`find_indirect_branch_in_loop()` 仅在已 hint 的 loop 内做结构补全（用户只给了 `loop_header_pc` 时，在其 body 内查找唯一的间接跳转指令）。新增能力：
   - **ThreadedCode 拓扑**：`dispatch_type_hint = ThreadedCode` + `threaded_dispatch_pcs`，切换为 `ThreadedCollector`（无中央 loop，每条 handler 尾部自行 fetch+dispatch）。
   - **扩展去混淆 op**：`OpcodeDeobfStep::Op` 新增 `ror`（循环右移）、`bswap`（字节序反转）、`neg`（取负）、`not_`（按位取反）。
   - **opcode_byte_offset**：从 vm_pc 偏移 N 字节处读取 opcode，而非固定从 0 字节读。

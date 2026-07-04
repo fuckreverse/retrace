@@ -1,13 +1,25 @@
 #pragma once
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// VM Abstract Pass — Virtual Machine dispatcher detection, handler extraction,
-// and VM state reconstruction from execution traces.
+// VM Abstract Pass — Virtual Machine execution abstraction driven entirely by
+// static-analysis hints.
 //
-// Designed for LLM-orchestrated analysis: accepts optional static hints from
-// IDA (dispatcher PC, handler entries, VM-PC register, opcode format) to
-// accelerate and improve analysis.  Falls back to automatic detection when
-// no hints are provided.
+// This pass does NOT attempt to discover VM structure (dispatcher location,
+// VM-PC register, architecture type, dispatch topology, opcode encoding) from
+// the trace itself. Static analysis (IDA/Ghidra) can determine these facts
+// deterministically and cheaply; trying to re-derive them from a handful of
+// dynamic samples is strictly worse — lower confidence, higher cost, and
+// wrong on anything CFF-obfuscated. All structural facts are therefore
+// required inputs (VMConfig hints), sourced from static analysis.
+//
+// What this pass DOES do dynamically, given those hints: it walks the trace
+// once to attribute native instructions to VM dispatch cycles / handler
+// executions, and produces the execution-time data that only a trace can
+// provide — handler execution counts, register/memory read-write masks,
+// observed opcode values, and per-step VM register/context/stack snapshots.
+// This is the data static analysis cannot give you, and it is also the
+// natural way to cross-check a static hint (e.g. "this handler's assumed
+// register effects don't match what actually happened").
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #include "analysis/pass_manager.h"
@@ -25,6 +37,16 @@ namespace tenet {
 
 // ─── VM type classification ──────────────────────────────────────────────────
 
+/// VM architecture classification. This is a static fact about the VM's
+/// design (does it use an operand stack or a register file?) and is ALWAYS
+/// supplied via `VMConfig::arch_type_hint` — the pass never guesses it from
+/// memory-access statistics (a few dozen samples cannot reliably distinguish
+/// "stack machine with a wide instruction format" from "register machine
+/// with unbalanced handlers", and static analysis already knows the answer
+/// for free). Prefer reading `VMConfig::vm_register_file` directly
+/// (`has_stack()` / `has_regs()` / `is_mixed()`) when you need this
+/// information programmatically — `arch_type_hint` exists mainly as a
+/// human-readable label for display.
 enum class VMArchType : uint8_t {
     Unknown,
     StackMachine,    // Push/pop operands via a VM stack pointer
@@ -249,39 +271,44 @@ struct HandlerAsmHint {
 
 // ─── VMConfig ────────────────────────────────────────────────────────────────
 
-/// Configuration for VMAbstractPass.  All hints are optional.
+/// Configuration for VMAbstractPass.  This pass is entirely hint-driven: it
+/// requires at least a `dispatcher` (or `threaded_dispatch_pcs`) hint telling
+/// it WHERE the VM dispatch happens in the trace — it never scans loops
+/// looking for "VM-shaped" candidates. Product surfaces (CLI / GUI / MCP)
+/// enforce this via `has_any_static_hint()` before registering the pass.
 ///
-/// ⚠️ Auto-detection caveat: the heuristic dispatcher auto-detection
-/// (`auto_detect == true` with no `dispatcher` hint) works purely off loop
-/// iteration counts + indirect-branch shape.  In practice it has a very high
-/// false-positive/false-negative rate on real (non-synthetic) traces — it
-/// frequently locks onto the wrong loop or misses ThreadedCode/CallTable VMs
-/// entirely.  Product surfaces (CLI / GUI / MCP) therefore default this to
-/// `false` and require the caller to supply at least a `dispatcher` hint
-/// (or another static hint) obtained from static analysis (IDA/Ghidra) before
-/// running the pass.  This field only controls the pass's own internal
-/// fallback behavior — it defaults to `true` here so the pass remains usable
-/// as a general-purpose library/unit-testable component; callers that expose
-/// this to end users should keep it hint-gated.
+/// Rationale: dispatcher location, VM-PC register, dispatch topology, and
+/// architecture type are all static facts fully determined by the binary —
+/// static analysis (IDA/Ghidra) resolves them with 100% confidence in
+/// seconds. Re-deriving them from a handful of dynamic samples (loop
+/// iteration counts, register step patterns, load/store ratios) is strictly
+/// worse on every axis: lower confidence, more expensive, and outright wrong
+/// on CFF-obfuscated or ThreadedCode VMs where no single "candidate loop"
+/// exists at all. This pass's job is to take those static facts as given and
+/// answer the questions only a trace CAN answer: how many times did each
+/// handler actually run, what opcode values were actually observed, what did
+/// the VM register file / stack actually contain at each step.
 struct VMConfig {
-    // ── Auto-detection control ───────────────────────────────────────────
-    bool  auto_detect = true;          // When true, auto-detect dispatcher if no hint
-
-    /// Minimum loop iteration count to consider as VM dispatcher candidate.
-    uint64_t min_dispatch_iterations = 10;
-
-    /// Minimum number of distinct indirect-branch targets to qualify.
+    /// Minimum number of distinct handler entry PCs required for the result
+    /// to be considered a valid VM (sanity check on the hinted dispatcher,
+    /// not a detection threshold — the dispatcher location itself always
+    /// comes from a hint, never from scanning).
     uint32_t min_handler_count = 3;
 
-    /// Hint about VM architecture type.  When Unknown, the pass infers from
-    /// handler memory access patterns (stack-pointer-style vs register-file-style).
+    /// Hint about VM architecture type (stack machine vs register machine).
+    /// This is a static fact — always supplied by the caller from static
+    /// analysis. Left at Unknown when not provided; the pass never infers it
+    /// from memory-access statistics.
     VMArchType arch_type_hint = VMArchType::Unknown;
 
     // ── Dispatch topology hints ──────────────────────────────────────────
-    /// Force a specific dispatch type instead of auto-detecting.
-    /// Useful when the trace contains a ThreadedCode VM that has no central
-    /// dispatch loop (each handler tail-chains to the next via BR Xn).
-    /// DispatchType::Unknown = auto-detect (default).
+    /// Dispatch topology, from static analysis. DispatchType::Unknown means
+    /// the pass falls back to a purely mechanical, non-statistical
+    /// classification for loop-based topologies (CallTable if the dispatch
+    /// instruction is BLR, IndirectBranch otherwise) — see
+    /// `classify_dispatch_type()`. This is NOT a detection heuristic: it
+    /// reads a single already-hinted instruction's encoding, it does not
+    /// search for or score anything.
     DispatchType dispatch_type_hint = DispatchType::Unknown;
 
     /// ThreadedCode: set of "fetch+dispatch" PCs that appear in every handler's
@@ -312,9 +339,10 @@ struct VMConfig {
 
     /// True if the caller has provided at least one piece of static analysis
     /// hint (dispatcher, handler entries, VM-PC, opcode format, context,
-    /// register file, or forced dispatch type).  Product surfaces use this
-    /// to decide whether it is safe to run the pass at all — see the
-    /// auto-detection caveat above.
+    /// register file, or dispatch type). The pass refuses to run without at
+    /// least a `dispatcher` (or `threaded_dispatch_pcs`) hint — product
+    /// surfaces use this to fail fast with an actionable error instead of
+    /// silently doing nothing useful.
     bool has_any_static_hint() const {
         return dispatcher.has_value()
             || !handler_entry_pcs.empty()
