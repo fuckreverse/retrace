@@ -328,6 +328,17 @@ static int run_pattern(PassManager& pm) {
     return 0;
 }
 
+// Render a call graph node/edge endpoint PC for CLI output. Root pseudo-node
+// keys (see call_graph_is_root_key()) are tagged call-site PCs, not real
+// function addresses — printing them raw would show a misleading giant hex
+// value like "0x8000000000001000". Render those as "root@<call_site_pc>"
+// instead, matching the "<root@0x...>" naming CallGraphPass itself uses.
+static std::string call_graph_pc_str(uint64_t pc) {
+    if (call_graph_is_root_key(pc))
+        return fmt::format("root@0x{:X}", call_graph_root_call_site(pc));
+    return fmt::format("0x{:X}", pc);
+}
+
 static int run_call_graph(PassManager& pm, const std::string& output_path) {
     const auto& cg_result_raw = pm.require("call_graph");
     if (!cg_result_raw.ok()) {
@@ -346,8 +357,9 @@ static int run_call_graph(PassManager& pm, const std::string& output_path) {
         json nodes_arr = json::array();
         for (const auto& [pc, node] : cg.nodes) {
             nodes_arr.push_back({
-                {"pc", fmt::format("0x{:X}", pc)},
+                {"pc", call_graph_pc_str(pc)},
                 {"name", node.name.empty() ? fmt::format("sub_{:X}", pc) : node.name},
+                {"is_root", node.is_root},
                 {"total_calls_made", node.total_calls_made},
                 {"total_calls_received", node.total_calls_received}
             });
@@ -357,8 +369,8 @@ static int run_call_graph(PassManager& pm, const std::string& output_path) {
         json edges_arr = json::array();
         for (const auto& edge : cg.edges) {
             edges_arr.push_back({
-                {"caller", fmt::format("0x{:X}", edge.caller_pc)},
-                {"callee", fmt::format("0x{:X}", edge.callee_pc)},
+                {"caller", call_graph_pc_str(edge.caller_pc)},
+                {"callee", call_graph_pc_str(edge.callee_pc)},
                 {"call_count", edge.call_count}
             });
         }
@@ -382,13 +394,14 @@ static int run_call_graph(PassManager& pm, const std::string& output_path) {
             std::string label = node.name.empty()
                 ? fmt::format("sub_{:X}", pc)
                 : node.name;
-            dot += fmt::format("  \"0x{:X}\" [label=\"{}\"];\n", pc, label);
+            dot += fmt::format("  \"{}\" [label=\"{}\"];\n", call_graph_pc_str(pc), label);
         }
         dot += "\n";
 
         for (const auto& edge : cg.edges) {
-            dot += fmt::format("  \"0x{:X}\" -> \"0x{:X}\" [label=\"{}\"];\n",
-                               edge.caller_pc, edge.callee_pc, edge.call_count);
+            dot += fmt::format("  \"{}\" -> \"{}\" [label=\"{}\"];\n",
+                               call_graph_pc_str(edge.caller_pc),
+                               call_graph_pc_str(edge.callee_pc), edge.call_count);
         }
 
         dot += "}\n";

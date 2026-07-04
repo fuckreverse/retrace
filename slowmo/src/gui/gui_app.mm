@@ -2323,6 +2323,16 @@ void tenet::GuiApp::export_cfg_to_file() {
 
 // ── Export Call Graph ─────────────────────────────────────────────────────────
 
+// Render a call graph node/edge endpoint PC for DOT output. Root pseudo-node
+// keys (see tenet::call_graph_is_root_key()) are tagged call-site PCs, not
+// real function addresses — printing them raw would show a misleading giant
+// hex value like "0x8000000000001000".
+static std::string call_graph_dot_pc_str(uint64_t pc) {
+    if (tenet::call_graph_is_root_key(pc))
+        return fmt::format("root@0x{:X}", tenet::call_graph_root_call_site(pc));
+    return fmt::format("0x{:X}", pc);
+}
+
 // Mirrors batch_analysis.cpp run_call_graph() DOT generation.
 static std::string build_call_graph_dot(const tenet::CallGraphResult& cg) {
     std::string dot;
@@ -2334,12 +2344,13 @@ static std::string build_call_graph_dot(const tenet::CallGraphResult& cg) {
         std::string label = node.name.empty()
             ? fmt::format("sub_{:X}", pc)
             : node.name;
-        dot += fmt::format("  \"0x{:X}\" [label=\"{}\"];\n", pc, label);
+        dot += fmt::format("  \"{}\" [label=\"{}\"];\n", call_graph_dot_pc_str(pc), label);
     }
     dot += "\n";
     for (const auto& edge : cg.edges) {
-        dot += fmt::format("  \"0x{:X}\" -> \"0x{:X}\" [label=\"{}\"];\n",
-                           edge.caller_pc, edge.callee_pc, edge.call_count);
+        dot += fmt::format("  \"{}\" -> \"{}\" [label=\"{}\"];\n",
+                           call_graph_dot_pc_str(edge.caller_pc),
+                           call_graph_dot_pc_str(edge.callee_pc), edge.call_count);
     }
     dot += "}\n";
     return dot;

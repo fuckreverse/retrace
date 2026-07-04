@@ -41,6 +41,14 @@ namespace {
 static constexpr uint32_t CALG_BLOB_MAGIC   = 0x43414C47u;  // "CALG"
 static constexpr uint32_t CALG_BLOB_VERSION = 1u;
 
+// Local helper: build a root pseudo-key from a call-site PC. See the
+// kCallGraphRootTagBit / call_graph_is_root_key / call_graph_root_call_site
+// declarations in call_graph_pass.h for the full rationale — this file uses
+// those shared helpers throughout instead of redefining the tag-bit logic.
+uint64_t make_root_key(uint64_t call_site_pc) {
+    return kCallGraphRootTagBit | call_site_pc;
+}
+
 std::string call_graph_serialize(const CallGraphResult& res) {
     size_t total = 4 + 4 + 8 + 8 + 8;  // magic, version, max_depth, total_call_events, num_edges
     for (const auto& e : res.edges) {
@@ -145,6 +153,13 @@ bool call_graph_deserialize(const std::string& blob, CallGraphResult& out) {
         if (p + n_in * 8 > end) return false;
         for (uint64_t j = 0; j < n_in; j++)
             node.incoming_edges[j] = static_cast<size_t>(read_u64());
+        // Deserialized nodes are always fully populated (blob format has no
+        // "empty placeholder" concept) — mark initialized so downstream code
+        // never mistakes it for a fresh default-constructed node. `is_root`
+        // isn't persisted explicitly (no blob format bump needed); it's
+        // fully recoverable from the tag bit baked into entry_pc itself.
+        node.initialized = true;
+        node.is_root      = call_graph_is_root_key(node.entry_pc);
         out.nodes.emplace(node.entry_pc, std::move(node));
     }
 
@@ -277,8 +292,13 @@ PassResult CallGraphPass::run(PassContext& ctx) {
         const auto& evt = func_result.call_events[te.event_index];
 
         if (te.is_call) {
-            // Determine caller: top of stack, or 0 for root
-            uint64_t caller_entry_pc = call_stack_funcs.empty() ? 0 : call_stack_funcs.back();
+            // Determine caller: top of stack, or a synthetic per-call-site
+            // root pseudo-key if the stack is empty (see
+            // kCallGraphRootTagBit in call_graph_pass.h for why we don't
+            // collapse all of these into a single PC-0 node).
+            uint64_t caller_entry_pc = call_stack_funcs.empty()
+                                           ? make_root_key(evt.call_site_pc)
+                                           : call_stack_funcs.back();
             uint64_t callee_entry_pc = evt.target_pc;
 
             // Update max depth
@@ -308,9 +328,6 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     // Reserve edge vector
     result.edges.reserve(edge_accum.size());
 
-    // Create a "root" pseudo-node (entry_pc = 0) for calls from outside the trace
-    const uint64_t ROOT_PC = 0;
-
     for (const auto& [key, acc_data] : edge_accum) {
         if (ctx.cancelled()) {
             return PassResult::failed("cancelled by user");
@@ -331,26 +348,34 @@ PassResult CallGraphPass::run(PassContext& ctx) {
         result.edge_map_[key.caller_pc][key.callee_pc] = edge_idx;
         result.edges.push_back(std::move(edge));
 
-        // Ensure both caller and callee nodes exist
+        // Ensure both caller and callee nodes exist. Use `initialized` (not
+        // `entry_pc == 0`) to detect first-touch, since entry_pc == 0 is also
+        // a legitimate *value* a root pseudo-key's call-site component could
+        // have — comparing against 0 would misidentify a root node as "not
+        // yet initialized" and clobber it on every edge that touches it.
         auto& caller_node = result.nodes[key.caller_pc];
-        if (caller_node.entry_pc == 0 && key.caller_pc != 0) {
+        if (!caller_node.initialized) {
             caller_node.entry_pc = key.caller_pc;
-            auto nit = func_names.find(key.caller_pc);
-            caller_node.name = (nit != func_names.end()) ? nit->second.name
-                            : fmt::format("sub_{:x}", key.caller_pc);
-        } else if (key.caller_pc == 0) {
-            caller_node.entry_pc = 0;
-            caller_node.name = "<root>";
+            if (call_graph_is_root_key(key.caller_pc)) {
+                caller_node.is_root = true;
+                caller_node.name = fmt::format("<root@{:#x}>", call_graph_root_call_site(key.caller_pc));
+            } else {
+                auto nit = func_names.find(key.caller_pc);
+                caller_node.name = (nit != func_names.end()) ? nit->second.name
+                                : fmt::format("sub_{:x}", key.caller_pc);
+            }
+            caller_node.initialized = true;
         }
         caller_node.outgoing_edges.push_back(edge_idx);
         caller_node.total_calls_made += acc_data.first;
 
         auto& callee_node = result.nodes[key.callee_pc];
-        if (callee_node.entry_pc == 0) {
+        if (!callee_node.initialized) {
             callee_node.entry_pc = key.callee_pc;
             auto nit = func_names.find(key.callee_pc);
             callee_node.name = (nit != func_names.end()) ? nit->second.name
                             : fmt::format("sub_{:x}", key.callee_pc);
+            callee_node.initialized = true;
         }
         callee_node.incoming_edges.push_back(edge_idx);
         callee_node.total_calls_received += acc_data.first;

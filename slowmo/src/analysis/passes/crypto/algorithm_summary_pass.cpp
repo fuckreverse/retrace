@@ -370,6 +370,13 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
             // We look for functions called many times (≥10) that are NOT in
             // accum yet — those are un-attributed hot spots.
             if (call_count < 10) continue;
+            // Root pseudo-nodes (synthetic "unknown outer caller" entries,
+            // see call_graph_is_root_key()) are never real callees — skip
+            // defensively in case one ever surfaces here (their
+            // total_calls_received is always 0 in practice, but this guards
+            // against misinterpreting a tagged call-site PC as a real
+            // function address).
+            if (call_graph_is_root_key(pc)) continue;
 
             // Check if this PC already appears in any accumulator
             bool already_known = false;

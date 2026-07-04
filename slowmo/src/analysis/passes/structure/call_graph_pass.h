@@ -8,6 +8,34 @@
 
 namespace tenet {
 
+// ─── Synthetic "root" pseudo-node key helpers ──────────────────────────────
+//
+// When CallGraphPass encounters a call site whose simulated call stack is
+// empty, the true caller lies outside the trace window and its real entry
+// PC is unknowable. Rather than collapsing every such call into a single
+// entry_pc==0 "<root>" node (which would incorrectly merge unrelated
+// outermost call sites into one node), one pseudo-node is synthesized per
+// distinct outermost call-site PC, tagged with a high bit that can never
+// collide with a real userspace PC.
+//
+// These free functions are exposed so callers (GUI, CLI, other passes) can
+// recognize root nodes and recover the call-site PC they represent — e.g.
+// to resolve it via XrefResult for "jump to call site" navigation, since a
+// root node has no real function entry to navigate to.
+inline constexpr uint64_t kCallGraphRootTagBit = 1ULL << 63;
+
+/// True if `entry_pc` identifies a synthetic root pseudo-node (see above)
+/// rather than a real function entry.
+inline bool call_graph_is_root_key(uint64_t entry_pc) {
+    return (entry_pc & kCallGraphRootTagBit) != 0;
+}
+
+/// Recover the outermost call-site PC a root pseudo-node stands in for.
+/// Only meaningful when `call_graph_is_root_key(entry_pc)` is true.
+inline uint64_t call_graph_root_call_site(uint64_t entry_pc) {
+    return entry_pc & ~kCallGraphRootTagBit;
+}
+
 // ─── Call graph result ─────────────────────────────────────────────────────
 
 /// An edge in the call graph: caller → callee.
@@ -26,6 +54,24 @@ struct CallGraphNode {
     uint64_t total_calls_received;         // Incoming call count
     std::vector<size_t> outgoing_edges;    // Indices into CallGraphResult::edges
     std::vector<size_t> incoming_edges;    // Indices into CallGraphResult::edges
+
+    // Whether name/entry_pc have been populated yet. Needed because
+    // `nodes[key]` default-constructs a node on first access (entry_pc==0),
+    // and 0 is ALSO the legitimate entry PC of a synthetic <root:...> pseudo-
+    // node — so `entry_pc == 0` alone cannot distinguish "freshly
+    // default-constructed, not yet filled in" from "this really is a root".
+    bool initialized = false;
+
+    // True if this is a synthetic "<root:CALL_SITE_PC>" pseudo-node, standing
+    // in for an unknown outer caller whose own entry PC lies outside the
+    // trace window (e.g. the function the trace itself starts inside of, or
+    // any frame active before the first recorded ANCHOR). entry_pc for a
+    // root node is the *call-site* PC of the outermost recorded call, NOT a
+    // real function entry — see CallGraphPass::run() for why one root node
+    // is synthesized per distinct outermost call site rather than collapsing
+    // all of them into a single entry_pc==0 node (that used to conflate
+    // unrelated top-level call sites into one misleading "root" edge set).
+    bool is_root = false;
 };
 
 /// Result of call graph analysis.

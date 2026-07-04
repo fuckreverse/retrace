@@ -643,11 +643,24 @@ void TenetMcpService::register_graph_tools() {
             if (!raw.ok()) throw std::runtime_error("Call graph failed: " + raw.error_message);
             const auto& cg = raw.get<CallGraphResult>();
 
+            // Root pseudo-node keys (see tenet::call_graph_is_root_key()) are
+            // tagged call-site PCs, not real function addresses — rebase()
+            // (runtime_pc - slide + image_base) would corrupt the tag bit's
+            // arithmetic and print a meaningless address. Render those as
+            // "root@<rebased call-site pc>" instead; rebase only the real
+            // (untagged) call-site component.
+            auto pc_str = [this](uint64_t pc) -> std::string {
+                if (tenet::call_graph_is_root_key(pc))
+                    return fmt::format("root@0x{:X}", rebase(tenet::call_graph_root_call_site(pc)));
+                return fmt::format("0x{:X}", rebase(pc));
+            };
+
             json nodes = json::array();
             for (const auto& [pc, node] : cg.nodes) {
                 nodes.push_back({
-                    {"pc",   fmt::format("0x{:X}", rebase(pc))},
+                    {"pc",   pc_str(pc)},
                     {"name", node.name.empty() ? fmt::format("sub_{:X}", rebase(pc)) : node.name},
+                    {"is_root",        node.is_root},
                     {"calls_made",     node.total_calls_made},
                     {"calls_received", node.total_calls_received}
                 });
@@ -655,8 +668,8 @@ void TenetMcpService::register_graph_tools() {
             json edges = json::array();
             for (const auto& edge : cg.edges) {
                 edges.push_back({
-                    {"caller", fmt::format("0x{:X}", rebase(edge.caller_pc))},
-                    {"callee", fmt::format("0x{:X}", rebase(edge.callee_pc))},
+                    {"caller", pc_str(edge.caller_pc)},
+                    {"callee", pc_str(edge.callee_pc)},
                     {"call_count", edge.call_count}
                 });
             }

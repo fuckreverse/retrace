@@ -40,6 +40,16 @@ static uint64_t pc_to_inst_id(const XrefResult* xref, uint64_t pc) {
     return xref->first_inst_id_at(pc);
 }
 
+/// Resolve a call graph node's entry PC to a navigable inst_id via xref.
+/// Root pseudo-nodes (see call_graph_is_root_key()) have no real function
+/// entry — their entry_pc is a tagged call-site PC — so navigation for them
+/// must go through call_graph_root_call_site() instead of the raw entry_pc.
+static uint64_t node_to_inst_id(const XrefResult* xref, uint64_t entry_pc) {
+    if (call_graph_is_root_key(entry_pc))
+        return pc_to_inst_id(xref, call_graph_root_call_site(entry_pc));
+    return pc_to_inst_id(xref, entry_pc);
+}
+
 // ── Panel ───────────────────────────────────────────────────────────────────
 
 void GuiApp::render_call_graph_panel() {
@@ -136,7 +146,7 @@ void GuiApp::render_call_graph_panel() {
                     char rank_label[32];
                     snprintf(rank_label, sizeof(rank_label), "%d##cgr%d", row + 1, row);
 
-                    uint64_t nav_id = pc_to_inst_id(xref_result_, entry_pc);
+                    uint64_t nav_id = node_to_inst_id(xref_result_, entry_pc);
                     bool can_nav = (nav_id != UINT64_MAX);
 
                     if (!can_nav) ImGui::BeginDisabled();
@@ -149,17 +159,34 @@ void GuiApp::render_call_graph_panel() {
 
                     // Tooltip: callers / callees counts
                     if (ImGui::IsItemHovered() && node) {
-                        ImGui::SetTooltip(
-                            "PC: 0x%llx\n"
-                            "Outgoing calls made: %llu\n"
-                            "Incoming calls received: %llu\n"
-                            "Unique callers: %zu\n"
-                            "Unique callees: %zu",
-                            (unsigned long long)entry_pc,
-                            (unsigned long long)node->total_calls_made,
-                            (unsigned long long)node->total_calls_received,
-                            node->incoming_edges.size(),
-                            node->outgoing_edges.size());
+                        if (node->is_root) {
+                            // Root pseudo-node: entry_pc is a tagged call-site
+                            // PC, not a real function entry — show the
+                            // untagged call-site PC and explain what this
+                            // node represents instead of a misleading raw
+                            // "PC: 0x8000...." dump.
+                            ImGui::SetTooltip(
+                                "<root> pseudo-node\n"
+                                "Represents an unknown caller outside the trace,\n"
+                                "observed calling out from call site: 0x%llx\n"
+                                "Outgoing calls made: %llu\n"
+                                "Unique callees: %zu",
+                                (unsigned long long)call_graph_root_call_site(entry_pc),
+                                (unsigned long long)node->total_calls_made,
+                                node->outgoing_edges.size());
+                        } else {
+                            ImGui::SetTooltip(
+                                "PC: 0x%llx\n"
+                                "Outgoing calls made: %llu\n"
+                                "Incoming calls received: %llu\n"
+                                "Unique callers: %zu\n"
+                                "Unique callees: %zu",
+                                (unsigned long long)entry_pc,
+                                (unsigned long long)node->total_calls_made,
+                                (unsigned long long)node->total_calls_received,
+                                node->incoming_edges.size(),
+                                node->outgoing_edges.size());
+                        }
                     }
 
                     // Function column
@@ -289,10 +316,18 @@ void GuiApp::render_call_graph_panel() {
                     if (!can_nav) ImGui::EndDisabled();
 
                     if (ImGui::IsItemHovered()) {
+                        // Root pseudo-callers store a tagged call-site PC in
+                        // caller_pc, not a real function entry — untag it for
+                        // display so the tooltip shows a sane address instead
+                        // of a misleading 0x8000... value.
+                        std::string caller_desc = call_graph_is_root_key(e.caller_pc)
+                            ? fmt::format("<root> (call site 0x{:x})",
+                                          call_graph_root_call_site(e.caller_pc))
+                            : fmt::format("0x{:x}", e.caller_pc);
                         std::string tip = fmt::format(
-                            "Caller: 0x{:x}\nCallee: 0x{:x}\nCall count: {}\n"
+                            "Caller: {}\nCallee: 0x{:x}\nCall count: {}\n"
                             "Call sites ({}):",
-                            e.caller_pc, e.callee_pc, e.call_count,
+                            caller_desc, e.callee_pc, e.call_count,
                             e.call_site_pcs.size());
                         size_t show = std::min(e.call_site_pcs.size(), size_t{8});
                         for (size_t k = 0; k < show; ++k)

@@ -497,11 +497,20 @@ void TenetRpcService::register_methods() {
         }
         const auto& cg = raw.get<CallGraphResult>();
         json r;
+        // Root pseudo-node keys (see tenet::call_graph_is_root_key()) are
+        // tagged call-site PCs, not real function addresses — print them as
+        // "root@0x..." (untagged) instead of a misleading giant hex value.
+        auto pc_str = [](uint64_t pc) -> std::string {
+            if (tenet::call_graph_is_root_key(pc))
+                return fmt::format("root@0x{:X}", tenet::call_graph_root_call_site(pc));
+            return fmt::format("0x{:X}", pc);
+        };
         json nodes = json::array();
         for (const auto& [pc, node] : cg.nodes) {
             nodes.push_back({
-                {"pc",   fmt::format("0x{:X}", pc)},
+                {"pc",   pc_str(pc)},
                 {"name", node.name.empty() ? fmt::format("sub_{:X}", pc) : node.name},
+                {"is_root",        node.is_root},
                 {"calls_made",     node.total_calls_made},
                 {"calls_received", node.total_calls_received}
             });
@@ -509,8 +518,8 @@ void TenetRpcService::register_methods() {
         json edges = json::array();
         for (const auto& edge : cg.edges) {
             edges.push_back({
-                {"caller",     fmt::format("0x{:X}", edge.caller_pc)},
-                {"callee",     fmt::format("0x{:X}", edge.callee_pc)},
+                {"caller",     pc_str(edge.caller_pc)},
+                {"callee",     pc_str(edge.callee_pc)},
                 {"call_count", edge.call_count}
             });
         }

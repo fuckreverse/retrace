@@ -456,10 +456,20 @@ void GuiApp::render_functions_panel() {
                     ImGui::Indent();
                     for (size_t ei = 0; ei < std::min(node->outgoing_edges.size(), size_t(8)); ei++) {
                         const auto& edge = call_graph_result_->edges[node->outgoing_edges[ei]];
-                        auto it = function_result_->functions.find(edge.callee_pc);
-                        std::string name = it != function_result_->functions.end()
-                            ? it->second.name
-                            : fmt::format("sub_{:x}", edge.callee_pc - reader_.header().module_slide);
+                        std::string name;
+                        if (call_graph_is_root_key(edge.callee_pc)) {
+                            // A root pseudo-node can never actually be a callee
+                            // (it only ever appears as a synthetic caller), but
+                            // guard anyway for consistent display rather than
+                            // subtracting module_slide from a tagged key.
+                            name = fmt::format("<root@0x{:x}>",
+                                call_graph_root_call_site(edge.callee_pc));
+                        } else {
+                            auto it = function_result_->functions.find(edge.callee_pc);
+                            name = it != function_result_->functions.end()
+                                ? it->second.name
+                                : fmt::format("sub_{:x}", edge.callee_pc - reader_.header().module_slide);
+                        }
                         ImGui::BulletText("%s (x%llu)", name.c_str(), (unsigned long long)edge.call_count);
                     }
                     if (node->outgoing_edges.size() > 8) {
@@ -472,10 +482,20 @@ void GuiApp::render_functions_panel() {
                     ImGui::Indent();
                     for (size_t ei = 0; ei < std::min(node->incoming_edges.size(), size_t(8)); ei++) {
                         const auto& edge = call_graph_result_->edges[node->incoming_edges[ei]];
-                        auto it = function_result_->functions.find(edge.caller_pc);
-                        std::string name = it != function_result_->functions.end()
-                            ? it->second.name
-                            : fmt::format("sub_{:x}", edge.caller_pc - reader_.header().module_slide);
+                        std::string name;
+                        if (call_graph_is_root_key(edge.caller_pc)) {
+                            // Caller is a synthetic root pseudo-node: its
+                            // entry_pc is a tagged call-site PC, not a real
+                            // function entry — subtracting module_slide from
+                            // it would print a meaningless huge address.
+                            name = fmt::format("<root@0x{:x}>",
+                                call_graph_root_call_site(edge.caller_pc));
+                        } else {
+                            auto it = function_result_->functions.find(edge.caller_pc);
+                            name = it != function_result_->functions.end()
+                                ? it->second.name
+                                : fmt::format("sub_{:x}", edge.caller_pc - reader_.header().module_slide);
+                        }
                         ImGui::BulletText("%s (x%llu)", name.c_str(), (unsigned long long)edge.call_count);
                     }
                     if (node->incoming_edges.size() > 8) {
