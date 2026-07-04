@@ -317,6 +317,33 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
         pending_focus_windows_.push_back("VM Abstract\xef\x83\x90##VMPanel");
         return;
     }
+    if (name == "mem_search") {
+        mem_search_result_ = &raw->get<MemSearchResult>();
+        show_mem_search_   = true;
+        mem_search_cursor_ = 0;
+        pending_focus_windows_.push_back("Memory Search");
+        return;
+    }
+    if (name == "memory_snapshot") {
+        mem_snapshot_result_ = &raw->get<MemorySnapshotResult>();
+        show_mem_snapshot_   = true;
+        mem_snapshot_selected_ = -1;
+        pending_focus_windows_.push_back("Memory Snapshots");
+        return;
+    }
+    if (name == "yara_mem_scan") {
+        yara_mem_result_ = &raw->get<YaraMemScanResult>();
+        show_yara_mem_scan_ = true;
+        yara_cursor_        = 0;
+        pending_focus_windows_.push_back("YARA Memory Scan");
+        return;
+    }
+    if (name == "call_context") {
+        call_context_result_ = &raw->get<CallContextResult>();
+        show_call_context_   = true;
+        pending_focus_windows_.push_back("Call Context");
+        return;
+    }
 }
 
 // ─── Startup Analysis ───────────────────────────────────────────────────────
@@ -737,6 +764,24 @@ void GuiApp::clear_analysis() {
     show_vm_abstract_   = false;
     vm_handler_cursor_  = 0;
     vm_step_cursor_     = 0;
+    mem_search_result_  = nullptr;
+    show_mem_search_    = false;
+    mem_search_cursor_  = 0;
+    std::memset(mem_search_pattern_buf_, 0, sizeof(mem_search_pattern_buf_));
+    std::memset(mem_search_pattern_label_, 0, sizeof(mem_search_pattern_label_));
+    std::memset(mem_search_exact_buf_, 0, sizeof(mem_search_exact_buf_));
+    mem_snapshot_result_ = nullptr;
+    show_mem_snapshot_   = false;
+    mem_snapshot_selected_ = -1;
+    std::memset(mem_snapshot_inst_buf_, 0, sizeof(mem_snapshot_inst_buf_));
+    yara_mem_result_    = nullptr;
+    show_yara_mem_scan_ = false;
+    yara_cursor_        = 0;
+    std::memset(yara_filter_buf_, 0, sizeof(yara_filter_buf_));
+    yara_filter_.clear();
+    call_context_result_ = nullptr;
+    show_call_context_   = false;
+    std::memset(call_context_inst_buf_, 0, sizeof(call_context_inst_buf_));
     show_taint_ = false;
     show_threads_ = false;
     show_backward_taint_ = false;

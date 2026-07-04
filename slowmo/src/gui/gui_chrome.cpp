@@ -361,22 +361,28 @@ if (ctx_mem_addr_ != 0 && entropy_addr_buf_[0] == '\0') {
 }
 }
             if (ImGui::MenuItem("Memory Snapshot\xe2\x80\xa6")) {
-                run_pass_by_name("memory_snapshot"); show_analysis_ = true;
+                show_mem_snapshot_ = true;
+                if (mem_snapshot_inst_buf_[0] == '\0') {
+                    snprintf(mem_snapshot_inst_buf_, sizeof(mem_snapshot_inst_buf_),
+                             "%llu", (unsigned long long)current_inst_);
+                }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Memory / Value Search\xe2\x80\xa6")) {
                 // Covers both byte-pattern and exact-value/immediate search —
                 // literal_search was merged into mem_search.
-                run_pass_by_name("mem_search"); show_analysis_ = true;
+                show_mem_search_ = true;
             }
             if (ImGui::MenuItem("YARA Scan\xe2\x80\xa6")) {
-                run_pass_by_name("yara_mem_scan"); show_analysis_ = true;
+                show_yara_mem_scan_ = true;
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Memory Write History\xe2\x80\xa6"))
                 show_memory_ = true;
             if (ImGui::MenuItem("Call Context at Cursor\xe2\x80\xa6")) {
-                run_pass_by_name("call_context"); show_analysis_ = true;
+                show_call_context_ = true;
+                snprintf(call_context_inst_buf_, sizeof(call_context_inst_buf_),
+                         "%llu", (unsigned long long)current_inst_);
             }
             ImGui::EndMenu();
         }

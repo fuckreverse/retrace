@@ -506,6 +506,10 @@ src/gui/panels_algorithm_summary.cpp
 src/gui/panels_trace_fold.cpp
 src/gui/panels_memory_strings.cpp
 src/gui/panels_entropy.cpp
+src/gui/panels_mem_search.cpp
+src/gui/panels_memory_snapshot.cpp
+src/gui/panels_yara_mem_scan.cpp
+src/gui/panels_call_context.cpp
 src/gui/panels_syscall_intercept.cpp
 src/gui/panels_objc_crypto.cpp
 src/gui/panels_vm_abstract.cpp

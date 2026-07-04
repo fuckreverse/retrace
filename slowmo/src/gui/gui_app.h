@@ -18,6 +18,10 @@
 #include "analysis/passes/crypto/objc_crypto_pass.h"
 #include "analysis/passes/memory/memory_string_pass.h"
 #include "analysis/passes/memory/entropy_pass.h"
+#include "analysis/passes/memory/mem_search_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
+#include "analysis/passes/memory/yara_mem_scan_pass.h"
+#include "analysis/passes/profile/call_context_pass.h"
 #include "analysis/passes/profile/trace_fold_pass.h"
 #include "io/mcp/mcp_server.h"
 
@@ -63,6 +67,10 @@ struct AlgorithmSummaryResult;
 struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
 struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
 struct VMAbstractResult;         // defined in vm_abstract_pass.h
+struct CallContextResult;         // defined in call_context_pass.h (now included)
+struct MemSearchResult;           // defined in mem_search_pass.h (now included)
+struct MemorySnapshotResult;      // defined in memory_snapshot_pass.h (now included)
+struct YaraMemScanResult;        // defined in yara_mem_scan_pass.h (now included)
 // ObjcResult is defined in objc_pass.h (already included)
 // MemoryStringResult is defined in memory_string_pass.h (already included)
 
@@ -536,6 +544,47 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     uint32_t entropy_size_input_ = 256;  // region size
     bool entropy_timeline_input_ = false; // whether to compute timeline
 
+    // ─── Memory Search state ──────────────────────────────────────────
+    const MemSearchResult* mem_search_result_ = nullptr;
+    bool show_mem_search_ = false;
+    // Input state for the parameter form
+    char mem_search_pattern_buf_[256] = {};    // hex byte pattern e.g. "01 23 AB"
+    char mem_search_pattern_label_[128] = {};   // label for the pattern
+    char mem_search_exact_buf_[64] = {};        // hex exact value e.g. "0x67452301"
+    bool mem_search_match_32bit_ = true;
+    bool mem_search_search_mem_ = true;
+    bool mem_search_search_reg_ = false;
+    bool mem_search_search_imm_ = false;
+    int mem_search_view_mode_ = 0;     // 0=All, 1=MemWrite, 2=RegDiff, 3=Immediate
+    size_t mem_search_cursor_ = 0;
+
+    // ─── Memory Snapshot state ────────────────────────────────────────
+    const MemorySnapshotResult* mem_snapshot_result_ = nullptr;
+    bool show_mem_snapshot_ = false;
+    // Input state for the parameter form
+    char mem_snapshot_inst_buf_[32] = {};   // hex inst_id input
+    uint32_t mem_snapshot_size_input_ = 64; // bytes per snapshot
+    bool mem_snapshot_auto_calls_ = true;   // auto-snapshot at BL/BLR
+    int mem_snapshot_selected_ = -1;        // selected snapshot index
+
+    // ─── YARA Memory Scan state ───────────────────────────────────────
+    const YaraMemScanResult* yara_mem_result_ = nullptr;
+    bool show_yara_mem_scan_ = false;
+    // Input state for the parameter form
+    char yara_rules_path_buf_[512] = {};   // user YARA rules directory
+    int yara_view_mode_ = 0;              // 0=All, 1=Crypto, 2=AntiDebug, 3=Other
+    char yara_filter_buf_[128] = {};
+    std::string yara_filter_;
+    size_t yara_cursor_ = 0;
+
+    // ─── Call Context state ────────────────────────────────────────────
+    const CallContextResult* call_context_result_ = nullptr;
+    bool show_call_context_ = false;
+    // Input state for the parameter form
+    char call_context_inst_buf_[32] = {};  // hex inst_id input
+    uint32_t call_context_before_ = 10;
+    uint32_t call_context_after_ = 10;
+
 
     // ─── Syscall / API intercept analysis state ─────────────────────
     const SyscallInterceptResult* syscall_result_ = nullptr;
@@ -798,6 +847,14 @@ private:
     void render_memory_strings_panel();          // Time-aware memory string discovery
     void render_entropy_panel();                    // Shannon entropy analysis of memory regions
     void run_entropy_with_addr();                    // Trigger entropy analysis from the panel's input form
+    void render_mem_search_panel();                  // Memory/value byte-pattern search
+    void run_mem_search_with_params();                // Trigger mem_search from the panel's input form
+    void render_memory_snapshot_panel();             // Memory snapshot capture + hex dump
+    void run_mem_snapshot_with_params();              // Trigger memory_snapshot from the panel's input form
+    void render_yara_mem_scan_panel();               // YARA rule memory scanning
+    void run_yara_mem_scan_with_params();             // Trigger yara_mem_scan from the panel's input form
+    void render_call_context_panel();               // Rich call context for an instruction
+    void run_call_context_with_params();             // Trigger call_context from the panel's input form
     void render_trace_fold_panel();              // Trace fold (loop-compressed) view
     void render_syscall_intercept_panel();       // iOS system API intercept (CommonCrypto, etc.)
     void render_vm_abstract_panel();             // VM dispatcher / handler / step view (legacy single-panel)

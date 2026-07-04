@@ -1080,17 +1080,25 @@ case kTagAnaVMAbstract:     action = [this]{
                 }
             }; break;
         case kTagToolMemSnapshot:
-            action = [this]{ run_pass_by_name("memory_snapshot"); show_analysis_ = true; }; break;
+            action = [this]{ show_mem_snapshot_ = true;
+                if (mem_snapshot_inst_buf_[0] == '\0') {
+                    snprintf(mem_snapshot_inst_buf_, sizeof(mem_snapshot_inst_buf_),
+                             "%llu", (unsigned long long)current_inst_);
+                }
+            }; break;
         case kTagToolMemSearch:
             // Covers both byte-pattern and exact-value/immediate search —
             // literal_search was merged into mem_search.
-            action = [this]{ run_pass_by_name("mem_search"); show_analysis_ = true; }; break;
+            action = [this]{ show_mem_search_ = true; }; break;
         case kTagToolYaraScan:
-            action = [this]{ run_pass_by_name("yara_mem_scan"); show_analysis_ = true; }; break;
+            action = [this]{ show_yara_mem_scan_ = true; }; break;
         case kTagToolMemHistory:
             action = [this]{ show_memory_ = true; }; break;
         case kTagToolCallContext:
-            action = [this]{ run_pass_by_name("call_context"); show_analysis_ = true; }; break;
+            action = [this]{ show_call_context_ = true;
+                snprintf(call_context_inst_buf_, sizeof(call_context_inst_buf_),
+                         "%llu", (unsigned long long)current_inst_);
+            }; break;
 
         // ── Help ─────────────────────────────────────────────────────────
         case kTagHelpShortcuts:
@@ -2148,6 +2156,18 @@ void GuiApp::render_frame() {
     }
     if (show_entropy_) {
         render_entropy_panel();
+    }
+    if (show_mem_search_) {
+        render_mem_search_panel();
+    }
+    if (show_mem_snapshot_) {
+        render_memory_snapshot_panel();
+    }
+    if (show_yara_mem_scan_) {
+        render_yara_mem_scan_panel();
+    }
+    if (show_call_context_) {
+        render_call_context_panel();
     }
     if (show_syscall_intercept_) {
         render_syscall_intercept_panel();
