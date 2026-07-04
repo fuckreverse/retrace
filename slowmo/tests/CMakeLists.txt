@@ -91,6 +91,7 @@ tenet_add_test(test_pass_dataflow_graph    unit/test_pass_dataflow_graph.cpp)
 tenet_add_test(test_dbg_loop               unit/test_dbg_loop.cpp)
 
 # ─── Unit tests: iOS-specific analysis passes ────────────────────────────────
+tenet_add_test(test_pass_algorithm_summary     unit/test_pass_algorithm_summary.cpp)
 tenet_add_test(test_pass_objc_crypto           unit/test_pass_objc_crypto.cpp)
 tenet_add_test(test_pass_syscall_intercept     unit/test_pass_syscall_intercept.cpp)
 tenet_add_test(test_pass_taint_source_annotation unit/test_pass_taint_source_annotation.cpp)

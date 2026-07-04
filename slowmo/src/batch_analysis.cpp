@@ -1119,8 +1119,11 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             rc |= 1;
         } else {
             const auto& as_result = as_raw.get<AlgorithmSummaryResult>();
-            fmt::print(stderr, "[algorithm-summary] {} algorithms detected, has_crypto={}\n",
-                       as_result.total(), as_result.has_crypto());
+            size_t n_confirmed = as_result.confirmed_candidates().size();
+            fmt::print(stderr, "[algorithm-summary] {} algorithms detected "
+                       "({} confirmed, {} speculative), has_crypto={}\n",
+                       as_result.total(), n_confirmed,
+                       as_result.total() - n_confirmed, as_result.has_crypto());
             fmt::print("{}\n", as_result.summary_json.dump(2));
         }
     }

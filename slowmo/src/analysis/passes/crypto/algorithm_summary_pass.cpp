@@ -8,6 +8,7 @@
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -15,11 +16,132 @@
 
 namespace tenet {
 
+// ─── AlgorithmFamily: canonical name / structure / normalization ───────────
+
+const char* algorithm_family_name(AlgorithmFamily f) {
+    switch (f) {
+        case AlgorithmFamily::AES:        return "AES";
+        case AlgorithmFamily::DES:        return "DES";
+        case AlgorithmFamily::Blowfish:   return "Blowfish";
+        case AlgorithmFamily::Camellia:   return "Camellia";
+        case AlgorithmFamily::TEA:        return "TEA";
+        case AlgorithmFamily::SM4:        return "SM4";
+        case AlgorithmFamily::Serpent:    return "Serpent";
+        case AlgorithmFamily::ChaCha:     return "ChaCha20";
+        case AlgorithmFamily::Salsa:      return "Salsa20";
+        case AlgorithmFamily::SHA1:       return "SHA-1";
+        case AlgorithmFamily::SHA256:     return "SHA-256";
+        case AlgorithmFamily::SHA384:     return "SHA-384";
+        case AlgorithmFamily::SHA512:     return "SHA-512";
+        case AlgorithmFamily::MD5:        return "MD5";
+        case AlgorithmFamily::SM3:        return "SM3";
+        case AlgorithmFamily::RIPEMD160:  return "RIPEMD-160";
+        case AlgorithmFamily::Whirlpool:  return "Whirlpool";
+        case AlgorithmFamily::HMAC:       return "HMAC";
+        case AlgorithmFamily::Poly1305:   return "Poly1305";
+        case AlgorithmFamily::SipHash:    return "SipHash";
+        case AlgorithmFamily::CRC32:      return "CRC32";
+        case AlgorithmFamily::ZUC:        return "ZUC";
+        case AlgorithmFamily::ECDSA:      return "ECDSA-P256";
+        case AlgorithmFamily::Ed25519:    return "Ed25519";
+        case AlgorithmFamily::Curve25519: return "Curve25519";
+        case AlgorithmFamily::GCM:        return "GCM";
+        case AlgorithmFamily::Unknown:    break;
+    }
+    return "Unknown";
+}
+
+AlgorithmStructure algorithm_family_structure(AlgorithmFamily f) {
+    switch (f) {
+        // SPN (substitution-permutation network): fixed-width state,
+        // S-box + permutation/mix-column rounds.
+        case AlgorithmFamily::AES:
+        case AlgorithmFamily::SM4:
+        case AlgorithmFamily::Serpent:
+            return AlgorithmStructure::SPN;
+        // Feistel: state split in half, one half updated per round via a
+        // round function keyed on the other half.
+        case AlgorithmFamily::DES:
+        case AlgorithmFamily::Blowfish:
+        case AlgorithmFamily::Camellia:
+        case AlgorithmFamily::TEA:
+            return AlgorithmStructure::Feistel;
+        // ARX (add-rotate-xor): stream ciphers built purely from those three
+        // operations, no table lookups.
+        case AlgorithmFamily::ChaCha:
+        case AlgorithmFamily::Salsa:
+            return AlgorithmStructure::ARX;
+        default:
+            return AlgorithmStructure::Unknown;
+    }
+}
+
+namespace {
+
+/// Case-insensitive substring test (small strings only — this runs at most
+/// once per accumulator entry per pass invocation, not per-instruction).
+bool ci_contains(std::string_view haystack, std::string_view needle) {
+    if (needle.size() > haystack.size()) return false;
+    auto lower = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (lower(haystack[i + j]) != lower(needle[j])) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+AlgorithmFamily normalize_algorithm_name(std::string_view text) {
+    // Order matters where one name is a substring of another's detector
+    // wording (e.g. must check "SHA-256"/"SHA256" before the bare "SHA"
+    // that could ambiguously prefix several digest sizes). Every entry here
+    // corresponds 1:1 to a name that actually appears in either the known-
+    // constant database (pattern_pass.cpp) or a loop_kind_algorithm_hint()
+    // string, so this table only needs to grow when those do.
+    struct Rule { const char* needle; AlgorithmFamily family; };
+    static constexpr Rule kRules[] = {
+        {"SHA-256", AlgorithmFamily::SHA256}, {"SHA256", AlgorithmFamily::SHA256},
+        {"SHA-384", AlgorithmFamily::SHA384}, {"SHA384", AlgorithmFamily::SHA384},
+        {"SHA-512", AlgorithmFamily::SHA512}, {"SHA512", AlgorithmFamily::SHA512},
+        {"SHA-1",   AlgorithmFamily::SHA1},   {"SHA1",   AlgorithmFamily::SHA1},
+        {"RIPEMD-160", AlgorithmFamily::RIPEMD160}, {"RIPEMD160", AlgorithmFamily::RIPEMD160},
+        {"MD5",       AlgorithmFamily::MD5},
+        {"SM3",       AlgorithmFamily::SM3},
+        {"SM4",       AlgorithmFamily::SM4},
+        {"AES",       AlgorithmFamily::AES},
+        {"Serpent",   AlgorithmFamily::Serpent},
+        {"Blowfish",  AlgorithmFamily::Blowfish},
+        {"Camellia",  AlgorithmFamily::Camellia},
+        {"TEA",       AlgorithmFamily::TEA},
+        {"DES",       AlgorithmFamily::DES},  // after Blowfish/Camellia (no overlap, but keep DES generic-last)
+        {"ChaCha",    AlgorithmFamily::ChaCha},
+        {"Salsa",     AlgorithmFamily::Salsa},
+        {"Whirlpool", AlgorithmFamily::Whirlpool},
+        {"HMAC",      AlgorithmFamily::HMAC},
+        {"Poly1305",  AlgorithmFamily::Poly1305},
+        {"SipHash",   AlgorithmFamily::SipHash},
+        {"CRC32",     AlgorithmFamily::CRC32},
+        {"ZUC",       AlgorithmFamily::ZUC},
+        {"ECDSA",     AlgorithmFamily::ECDSA},
+        {"Ed25519",   AlgorithmFamily::Ed25519},
+        {"Curve25519",AlgorithmFamily::Curve25519},
+        {"GCM",       AlgorithmFamily::GCM},
+    };
+    for (const auto& r : kRules) {
+        if (ci_contains(text, r.needle)) return r.family;
+    }
+    return AlgorithmFamily::Unknown;
+}
+
 // ─── AlgorithmSummaryResult serialization helpers ─────────────────────────
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x414C474F ("ALGO")
-//   u32  version = 1
+//   u32  version = 2
 //   u32  summary_text_len
 //   u8[] summary_text
 //   u32  summary_json_len
@@ -32,11 +154,18 @@ namespace tenet {
 //     u64  estimated_start, estimated_end
 //     u64  num_key_pcs; u64[] key_pcs
 //     u64  num_key_inst_ids; u64[] key_inst_ids
+//     u8   family           (v2+)
+//     u8   is_speculative   (v2+)
 
 namespace {
 
 static constexpr uint32_t ALGO_BLOB_MAGIC   = 0x414C474Fu;  // "ALGO"
-static constexpr uint32_t ALGO_BLOB_VERSION = 1u;
+// v1: original format.
+// v2: adds per-candidate `family` (u8) and `is_speculative` (u8) fields,
+//     written right after key_inst_ids. Old v1 blobs are still readable
+//     (just missing those two fields, which default to Unknown/false) so a
+//     stale cache from before this change doesn't need to be invalidated.
+static constexpr uint32_t ALGO_BLOB_VERSION = 2u;
 
 std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
     // Pre-compute json string
@@ -53,6 +182,7 @@ std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
         total += 8 + 8;  // estimated_start, estimated_end
         total += 8 + c.key_pcs.size() * 8;
         total += 8 + c.key_inst_ids.size() * 8;
+        total += 1 + 1;  // family, is_speculative (v2+)
     }
 
     std::string buf(total, '\0');
@@ -61,6 +191,7 @@ std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
     auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
     auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
     auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
+    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
     auto write_str = [&](const std::string& s) {
         write_u32(static_cast<uint32_t>(s.size()));
         std::memcpy(p, s.data(), s.size());
@@ -83,6 +214,8 @@ std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
         for (uint64_t pc : c.key_pcs) write_u64(pc);
         write_u64(static_cast<uint64_t>(c.key_inst_ids.size()));
         for (uint64_t id : c.key_inst_ids) write_u64(id);
+        write_u8(static_cast<uint8_t>(c.family));
+        write_u8(c.is_speculative ? 1 : 0);
     }
 
     return buf;
@@ -96,6 +229,7 @@ bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResu
     auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
     auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
     auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
     auto read_str = [&](std::string& s) -> bool {
         if (p + 4 > end) return false;
         uint32_t len = read_u32();
@@ -105,8 +239,9 @@ bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResu
         return true;
     };
 
-    if (read_u32() != ALGO_BLOB_MAGIC)   return false;
-    if (read_u32() != ALGO_BLOB_VERSION) return false;
+    if (read_u32() != ALGO_BLOB_MAGIC) return false;
+    uint32_t version = read_u32();
+    if (version != 1u && version != 2u) return false;
 
     if (!read_str(out.summary_text)) return false;
 
@@ -143,6 +278,12 @@ bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResu
         c.key_inst_ids.resize(static_cast<size_t>(n_ids));
         for (uint64_t j = 0; j < n_ids; j++) c.key_inst_ids[j] = read_u64();
 
+        if (version >= 2u) {
+            if (p + 2 > end) return false;
+            c.family = static_cast<AlgorithmFamily>(read_u8());
+            c.is_speculative = read_u8() != 0;
+        }
+
         out.candidates.push_back(std::move(c));
     }
 
@@ -156,8 +297,19 @@ namespace {
 // ─── Internal evidence accumulator ────────────────────────────────────────
 
 /// Collects evidence pieces for a single algorithm candidate during analysis.
+///
+/// Merge key: an accumulator is keyed by family_key()/raw_key()/structure_key()
+/// (see below). When `family` is recognized (!= Unknown), *all* evidence for
+/// that family collapses into ONE accumulator regardless of which detector
+/// (pattern/constant/loop) produced it or how it phrased the name, because
+/// the key no longer depends on exact string equality. This replaces the old
+/// two-pass "loop_keys vs const_keys substring scan": merging now happens
+/// automatically during accumulation (Phase 1) instead of as a separate
+/// cross-referencing pass (old Phase 2).
 struct EvidenceAccumulator {
-    std::string algorithm_name;
+    std::string algorithm_name;                // display name (family canonical name, or raw name if Unknown)
+    AlgorithmFamily family = AlgorithmFamily::Unknown;
+    bool is_speculative = true;                // cleared by any non-hot-function evidence
     float confidence = 0.0f;
     std::vector<std::string> evidence_lines;
     std::vector<uint64_t> pcs;
@@ -165,7 +317,19 @@ struct EvidenceAccumulator {
     uint64_t min_inst_id = UINT64_MAX;
     uint64_t max_inst_id = 0;
 
+    /// Add real (non-speculative) evidence — pattern match, known constant,
+    /// or classified loop. Clears `is_speculative` since this is stronger
+    /// than a bare call-count hint.
     void add_evidence(std::string line, float boost) {
+        evidence_lines.push_back(std::move(line));
+        confidence = std::min(1.0f, confidence + boost);
+        is_speculative = false;
+    }
+
+    /// Add hot-function evidence specifically — kept speculative (does NOT
+    /// clear is_speculative) so a candidate whose *only* evidence is call
+    /// count stays flagged as such even after this call.
+    void add_speculative_evidence(std::string line, float boost) {
         evidence_lines.push_back(std::move(line));
         confidence = std::min(1.0f, confidence + boost);
     }
@@ -184,6 +348,8 @@ struct EvidenceAccumulator {
     AlgorithmCandidate build() const {
         AlgorithmCandidate c;
         c.name = algorithm_name;
+        c.family = family;
+        c.is_speculative = is_speculative;
         c.confidence = std::min(1.0f, confidence);
         c.key_pcs = pcs;
         c.key_inst_ids = inst_ids;
@@ -212,6 +378,18 @@ const char* loop_kind_algorithm_hint(LoopKind k) {
     }
 }
 
+/// Map a LoopKind directly to the AlgorithmStructure it corresponds to, for
+/// merge-key purposes. Kept separate from loop_kind_algorithm_hint()
+/// (display text) so the merge logic doesn't need to re-parse that string.
+AlgorithmStructure loop_kind_structure(LoopKind k) {
+    switch (k) {
+        case LoopKind::FeistelRound: return AlgorithmStructure::Feistel;
+        case LoopKind::SPNRound:     return AlgorithmStructure::SPN;
+        case LoopKind::ARXRound:     return AlgorithmStructure::ARX;
+        default:                     return AlgorithmStructure::Unknown;
+    }
+}
+
 // ─── Confidence-level label ───────────────────────────────────────────────
 
 const char* confidence_label(float c) {
@@ -220,6 +398,33 @@ const char* confidence_label(float c) {
     if (c >= 0.5f) return "Medium";
     if (c >= 0.3f) return "Low";
     return "Very Low";
+}
+
+// ─── Merge-key helpers ─────────────────────────────────────────────────────
+//
+// Two kinds of accumulator keys:
+//   - "family:<N>"  for evidence normalized to a recognized family — the
+//                     numeric family id IS the identity, so differently-
+//                     worded evidence about the same algorithm (a pattern
+//                     match, a known constant, an SPN-loop hint) always
+//                     lands in the same bucket.
+//   - "raw:<text>"  fallback for anything normalize_algorithm_name() doesn't
+//                     recognize (unnamed loops, hot-function hints, etc.) —
+//                     preserves the old "group by exact name" behavior.
+//
+// A `structure`-only key ("structure:<S>") holds an as-yet-unnamed loop of a
+// given shape so a same-shape named family arriving later can still find it.
+
+std::string family_key(AlgorithmFamily f) {
+    return fmt::format("family:{}", static_cast<int>(f));
+}
+
+std::string raw_key(std::string_view text) {
+    return fmt::format("raw:{}", text);
+}
+
+std::string structure_key(AlgorithmStructure s) {
+    return fmt::format("structure:{}", static_cast<int>(s));
 }
 
 }  // anonymous namespace
@@ -248,35 +453,70 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
     // ── Soft-require all dependencies ────────────────────────────────────
     // Each dependency is optional; we degrade gracefully.
 
-const auto& pattern_raw      = ctx.require_raw("pattern");
-const auto& loop_sem_raw     = ctx.require_raw("loop_semantics");
-const auto& function_raw     = ctx.require_raw("function");
-const auto& call_graph_raw   = ctx.require_raw("call_graph");
+    const auto& pattern_raw    = ctx.require_raw("pattern");
+    const auto& loop_sem_raw   = ctx.require_raw("loop_semantics");
+    const auto& function_raw   = ctx.require_raw("function");
+    const auto& call_graph_raw = ctx.require_raw("call_graph");
 
-const PatternResult*                pattern_res = nullptr;
-// Constant-materialization data now lives inside PatternResult::constants
-// (the standalone constant_materialization pass was merged into pattern).
-const ConstantMaterializationResult* const_res  = nullptr;
-const LoopSemanticsResult*          loop_res    = nullptr;
-const FunctionResult*               func_res    = nullptr;
-const CallGraphResult*              cg_res      = nullptr;
+    const PatternResult* pattern_res = nullptr;
+    // Constant-materialization data now lives inside PatternResult::constants
+    // (the standalone constant_materialization pass was merged into pattern).
+    const ConstantMaterializationResult* const_res = nullptr;
+    const LoopSemanticsResult* loop_res = nullptr;
+    const FunctionResult* func_res = nullptr;
+    const CallGraphResult* cg_res = nullptr;
 
-if (pattern_raw.ok()) {
-pattern_res = &pattern_raw.get<PatternResult>();
-const_res   = &pattern_res->constants;
-}
-if (loop_sem_raw.ok())   loop_res    = &loop_sem_raw.get<LoopSemanticsResult>();
-if (function_raw.ok())   func_res    = &function_raw.get<FunctionResult>();
-if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
+    if (pattern_raw.ok()) {
+        pattern_res = &pattern_raw.get<PatternResult>();
+        const_res   = &pattern_res->constants;
+    }
+    if (loop_sem_raw.ok())   loop_res = &loop_sem_raw.get<LoopSemanticsResult>();
+    if (function_raw.ok())   func_res = &function_raw.get<FunctionResult>();
+    if (call_graph_raw.ok()) cg_res   = &call_graph_raw.get<CallGraphResult>();
 
     // ── Phase 1: Accumulate per-algorithm evidence ───────────────────────
-    // Key: normalised algorithm name → accumulator.
+    //
+    // Key: family_key(family) when normalize_algorithm_name() recognizes the
+    // evidence's name, else raw_key(original name). Because the key is
+    // derived from the SAME normalization function for pattern matches,
+    // known constants, AND loop hints, evidence about the same algorithm
+    // always converges on one accumulator as it streams in — no separate
+    // cross-referencing pass is needed afterwards (contrast with the old
+    // Phase 2 substring-matching pass this replaces).
     ankerl::unordered_dense::map<std::string, EvidenceAccumulator> accum;
+    // structure → key of an accumulator holding an as-yet-unnamed loop of
+    // that shape (e.g. "SPN-based cipher" with no matching named family
+    // yet). Lets a later-arriving named constant/pattern find and absorb it
+    // in O(1) instead of the old O(loops × consts) nested keyword scan.
+    ankerl::unordered_dense::map<AlgorithmStructure, std::string> unnamed_structure_keys;
 
-    auto get_accum = [&](const std::string& algo) -> EvidenceAccumulator& {
-        auto& a = accum[algo];
-        if (a.algorithm_name.empty()) a.algorithm_name = algo;
+    // Get-or-create the accumulator for a recognized family, seeding its
+    // display name from algorithm_family_name() on first use.
+    auto get_family_accum = [&](AlgorithmFamily fam) -> EvidenceAccumulator& {
+        auto& a = accum[family_key(fam)];
+        if (a.algorithm_name.empty()) {
+            a.algorithm_name = algorithm_family_name(fam);
+            a.family = fam;
+        }
         return a;
+    };
+
+    // Get-or-create the accumulator for an unrecognized/free-form name.
+    auto get_raw_accum = [&](const std::string& display_name) -> EvidenceAccumulator& {
+        auto& a = accum[raw_key(display_name)];
+        if (a.algorithm_name.empty()) a.algorithm_name = display_name;
+        return a;
+    };
+
+    // Route evidence for `raw_name` to the right accumulator: if it
+    // normalizes to a known family, use/create that family's accumulator
+    // (merging with anything already found for it); otherwise fall back to
+    // a raw-name bucket so ungrouped evidence still degrades gracefully to
+    // the old "one bucket per exact name" behavior.
+    auto route = [&](const std::string& raw_name) -> EvidenceAccumulator& {
+        AlgorithmFamily fam = normalize_algorithm_name(raw_name);
+        if (fam != AlgorithmFamily::Unknown) return get_family_accum(fam);
+        return get_raw_accum(raw_name);
     };
 
     ctx.progress(0.1f, "Algorithm summary: processing pattern matches...");
@@ -288,11 +528,12 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
                 m.category != PatternCategory::KeySchedule)
                 continue;
 
-            // Derive algorithm name from the pattern name.
-            // Pattern names are like "AES S-Box Lookup", "SHA-256 Round",
-            // "ptrace anti-debug".  We use the pattern name as-is for
-            // grouping; cross-referencing will merge related entries later.
-            auto& ea = get_accum(m.pattern_name);
+            // Pattern names are like "AES instruction (aese)", "Known
+            // constant: SHA256_H0 (SHA-256)", "XOR loop" — route() extracts
+            // a family if one is embedded, else groups by the literal name
+            // (e.g. distinct "XOR loop" occurrences all share one bucket,
+            // same as before).
+            auto& ea = route(m.pattern_name);
 
             std::string conf_str;
             switch (m.confidence) {
@@ -315,23 +556,29 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
     // ── 1b. Known constants ──────────────────────────────────────────────
     if (const_res) {
         for (const auto& [algo_name, indices] : const_res->by_algorithm) {
-            auto& ea = get_accum(algo_name);
-
             // Count how many distinct known constants for this algorithm
+            // first, so we can skip routing/creating an accumulator entirely
+            // when there's nothing to report.
             size_t known_count = 0;
             for (size_t idx : indices) {
+                if (const_res->constants[idx].known_match) ++known_count;
+            }
+            if (known_count == 0) continue;
+
+            // algo_name here is already a canonical name from pattern_pass's
+            // KnownConstant database (e.g. "SHA-256", "AES") — route() will
+            // normalize it to the matching AlgorithmFamily so this merges
+            // with any pattern-match evidence for the same family.
+            auto& ea = route(algo_name);
+            for (size_t idx : indices) {
                 const auto& mc = const_res->constants[idx];
-                if (mc.known_match) {
-                    ++known_count;
-                    ea.add_pc(mc.pc_first);
-                    ea.add_inst_range(mc.first_inst_id, mc.last_inst_id);
-                }
+                if (!mc.known_match) continue;
+                ea.add_pc(mc.pc_first);
+                ea.add_inst_range(mc.first_inst_id, mc.last_inst_id);
             }
-            if (known_count > 0) {
-                ea.add_evidence(
-                    fmt::format("{} known {} constant(s) identified", known_count, algo_name),
-                    std::min(0.45f, static_cast<float>(known_count) * 0.10f));
-            }
+            ea.add_evidence(
+                fmt::format("{} known {} constant(s) identified", known_count, algo_name),
+                std::min(0.45f, static_cast<float>(known_count) * 0.10f));
         }
     }
 
@@ -339,20 +586,62 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
     ctx.progress(0.5f, "Algorithm summary: processing loop semantics...");
 
     // ── 1c. Crypto loops ─────────────────────────────────────────────────
+    //
+    // A loop's LoopKind (Feistel/SPN/ARX) only identifies a *structural
+    // shape*, not a specific algorithm — many algorithms share a shape
+    // (AES/SM4/Serpent are all SPN). So a classified loop never resolves to
+    // a family on its own; instead it either (a) merges into an
+    // *already-named* accumulator whose family has that same structure
+    // (evidence from 1a/1b has already run by this point), or (b)
+    // starts/extends a structure-keyed "unnamed loop" bucket.
     if (loop_res) {
         auto crypto = loop_res->crypto_loops();
         for (const auto* ls : crypto) {
+            AlgorithmStructure structure = loop_kind_structure(ls->kind);
             const char* hint = loop_kind_algorithm_hint(ls->kind);
-            std::string algo = hint ? std::string(hint) : "Unknown crypto loop";
+            std::string display = hint ? std::string(hint) : "Unknown crypto loop";
+            std::string evidence_line = fmt::format(
+                "{} at PC {:#x} ({} iterations, confidence {:.0f}%)",
+                loop_kind_name(ls->kind), ls->header_pc,
+                ls->iteration_count, ls->confidence * 100.0f);
+            float boost = ls->confidence * 0.30f;
 
-            auto& ea = get_accum(algo);
-            ea.add_evidence(
-                fmt::format("{} at PC {:#x} ({} iterations, confidence {:.0f}%)",
-                            loop_kind_name(ls->kind), ls->header_pc,
-                            ls->iteration_count, ls->confidence * 100.0f),
-                ls->confidence * 0.30f);
+            // (a) Is there already a named accumulator whose family matches
+            // this loop's structure? If so, this loop IS that algorithm's
+            // round function — merge directly instead of creating a
+            // separate "SPN-based cipher" bucket next to e.g. "AES".
+            EvidenceAccumulator* target = nullptr;
+            if (structure != AlgorithmStructure::Unknown) {
+                for (auto& [key, ea] : accum) {
+                    if (ea.family != AlgorithmFamily::Unknown &&
+                        algorithm_family_structure(ea.family) == structure) {
+                        target = &ea;
+                        break;
+                    }
+                }
+            }
+            if (target) {
+                target->add_evidence(std::move(evidence_line), boost);
+                target->add_pc(ls->header_pc);
+                if (ls->sample_iter_start != 0) {
+                    target->add_inst_range(ls->sample_iter_start, ls->sample_iter_end);
+                }
+                target->add_evidence(
+                    "Cross-referenced: loop structure matches constant/pattern identification",
+                    0.15f);
+                continue;
+            }
+
+            // (b) No named match — accumulate under a structure-keyed or raw
+            // bucket so multiple loops of the same unnamed shape still merge
+            // together.
+            std::string key = (structure != AlgorithmStructure::Unknown)
+                ? unnamed_structure_keys.try_emplace(structure, structure_key(structure)).first->second
+                : raw_key(display);
+            auto& ea = accum[key];
+            if (ea.algorithm_name.empty()) ea.algorithm_name = display;
+            ea.add_evidence(std::move(evidence_line), boost);
             ea.add_pc(ls->header_pc);
-            // Use sample iteration range as an approximation
             if (ls->sample_iter_start != 0) {
                 ea.add_inst_range(ls->sample_iter_start, ls->sample_iter_end);
             }
@@ -362,14 +651,36 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
     ctx.progress(0.6f, "Algorithm summary: processing call graph...");
 
-    // ── 1d. Hot functions from call graph (as corroborating evidence) ────
+    // ── 1d. Hot functions from call graph (speculative corroborating hint) ─
+    //
+    // This is deliberately the weakest signal the pass produces: any
+    // frequently-called utility (memcpy, allocators, string helpers) looks
+    // identical to a hot cipher round purely from call count. Two guards
+    // bound false positives (see set_hot_function_min_calls/min_ratio doc in
+    // the header): an absolute floor AND a floor relative to this trace's
+    // single hottest callee, so the detector self-calibrates instead of
+    // using one fixed constant across traces with wildly different call
+    // volumes. Matches are also explicitly flagged `is_speculative` (see
+    // EvidenceAccumulator) rather than silently blending into the same
+    // confidence pool as verified pattern/constant/loop evidence.
     if (cg_res) {
         auto hot = cg_res->hottest_callees(10);
+
+        // Pre-index every PC already attributed to real evidence, once, in
+        // O(total_pcs) — replaces the old O(hot × accum × pcs_per_accum)
+        // nested scan that ran once per candidate hot PC.
+        ankerl::unordered_dense::set<uint64_t> known_pcs;
+        for (const auto& [key, ea] : accum) {
+            for (uint64_t pc : ea.pcs) known_pcs.insert(pc);
+        }
+
+        uint64_t max_calls = hot.empty() ? 0 : hot.front().second;
+        uint64_t ratio_floor = static_cast<uint64_t>(
+            static_cast<float>(max_calls) * hot_function_min_ratio_);
+
         for (const auto& [pc, call_count] : hot) {
-            // Only treat extremely hot leaf-like functions as crypto-core hints.
-            // We look for functions called many times (≥10) that are NOT in
-            // accum yet — those are un-attributed hot spots.
-            if (call_count < 10) continue;
+            if (call_count < hot_function_min_calls_) continue;
+            if (call_count < ratio_floor) continue;
             // Root pseudo-nodes (synthetic "unknown outer caller" entries,
             // see call_graph_is_root_key()) are never real callees — skip
             // defensively in case one ever surfaces here (their
@@ -377,16 +688,7 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
             // against misinterpreting a tagged call-site PC as a real
             // function address).
             if (call_graph_is_root_key(pc)) continue;
-
-            // Check if this PC already appears in any accumulator
-            bool already_known = false;
-            for (const auto& [name, ea] : accum) {
-                for (uint64_t kpc : ea.pcs) {
-                    if (kpc == pc) { already_known = true; break; }
-                }
-                if (already_known) break;
-            }
-            if (already_known) continue;
+            if (known_pcs.contains(pc)) continue;
 
             // Try to get the function name
             std::string fname;
@@ -394,99 +696,25 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
             if (node) fname = node->name;
             if (fname.empty()) fname = fmt::format("sub_{:x}", pc);
 
-            // Only add as a weak hint — not enough on its own
-            auto& ea = get_accum(fmt::format("Hot function: {}", fname));
-            ea.add_evidence(
-                fmt::format("Function {} called {} times (potential crypto core)",
+            auto& ea = get_raw_accum(fmt::format("Hot function: {}", fname));
+            ea.add_speculative_evidence(
+                fmt::format("Function {} called {} times (potential crypto core, "
+                            "speculative — no corroborating pattern/constant/loop evidence)",
                             fname, call_count),
                 0.10f);
             ea.add_pc(pc);
+            known_pcs.insert(pc);
         }
     }
 
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
-    ctx.progress(0.7f, "Algorithm summary: cross-referencing evidence...");
-
-    // ── Phase 2: Cross-reference and merge related evidence ──────────────
-    //
-    // Heuristic merges:
-    //   - If "SHA-256" constants + SPN loop → merge into "SHA-256" with boost
-    //   - If "AES" constants + SPN loop → merge into "AES" with boost
-    //   - If Feistel loop + any named Feistel cipher constants → merge
-    //
-    // We do a simple keyword-based merge: for each loop-family entry in accum,
-    // see if any named-constant entry shares a keyword.
-
-    // Collect loop-family keys and constant-family keys
-    std::vector<std::string> loop_keys;
-    std::vector<std::string> const_keys;
-    for (const auto& [key, ea] : accum) {
-        if (key.find("cipher") != std::string::npos ||
-            key.find("Cipher") != std::string::npos ||
-            key.find("loop") != std::string::npos) {
-            loop_keys.push_back(key);
-        }
-    }
-    if (const_res) {
-        for (const auto& [algo_name, indices] : const_res->by_algorithm) {
-            const_keys.push_back(algo_name);
-        }
-    }
-
-    // For each named constant algorithm, check if a matching loop-family exists.
-    // If so, merge the loop evidence into the constant entry (which has the
-    // more specific name) and boost confidence.
-    for (const auto& ckey : const_keys) {
-        auto it_const = accum.find(ckey);
-        if (it_const == accum.end()) continue;
-
-        for (const auto& lkey : loop_keys) {
-            // Simple match: "SPN-based cipher" merges with "AES*", "SM4*"
-            // "Feistel-based cipher" merges with "DES*", "Blowfish*", "Camellia*"
-            // "ARX-based cipher" merges with "ChaCha*", "Salsa*"
-            bool should_merge = false;
-
-            if (lkey.find("SPN") != std::string::npos) {
-                should_merge = (ckey.find("AES") != std::string::npos ||
-                                ckey.find("SM4") != std::string::npos ||
-                                ckey.find("Serpent") != std::string::npos);
-            } else if (lkey.find("Feistel") != std::string::npos) {
-                should_merge = (ckey.find("DES") != std::string::npos ||
-                                ckey.find("Blowfish") != std::string::npos ||
-                                ckey.find("Camellia") != std::string::npos ||
-                                ckey.find("TEA") != std::string::npos);
-            } else if (lkey.find("ARX") != std::string::npos) {
-                should_merge = (ckey.find("ChaCha") != std::string::npos ||
-                                ckey.find("Salsa") != std::string::npos);
-            }
-
-            if (!should_merge) continue;
-
-            auto it_loop = accum.find(lkey);
-            if (it_loop == accum.end()) continue;
-
-            // Merge loop evidence into the constant entry
-            auto& dst = it_const->second;
-            const auto& src = it_loop->second;
-            for (const auto& ev : src.evidence_lines) {
-                dst.evidence_lines.push_back(ev);
-            }
-            for (uint64_t pc : src.pcs) dst.add_pc(pc);
-            if (src.min_inst_id < dst.min_inst_id) dst.min_inst_id = src.min_inst_id;
-            if (src.max_inst_id > dst.max_inst_id) dst.max_inst_id = src.max_inst_id;
-            for (uint64_t id : src.inst_ids) dst.inst_ids.push_back(id);
-
-            // Cross-reference boost: both constants AND structural loop match
-            dst.add_evidence("Cross-referenced: loop structure matches constant identification", 0.15f);
-
-            // Remove the merged loop entry
-            accum.erase(it_loop);
-            break;  // loop_keys iterator invalidated, proceed to next const key
-        }
-    }
-
-    // ── Phase 3: Build final candidates ──────────────────────────────────
     ctx.progress(0.8f, "Algorithm summary: building results...");
+
+    // ── Phase 2: Build final candidates ──────────────────────────────────
+    //
+    // No separate cross-referencing pass here anymore — merging already
+    // happened as evidence streamed in during Phase 1 (see `route()` and the
+    // loop-structure lookup in 1c above).
 
     AlgorithmSummaryResult result;
 
@@ -504,7 +732,7 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
                   return a.name < b.name;
               });
 
-    // ── Phase 4: Generate Markdown summary ───────────────────────────────
+    // ── Phase 3: Generate Markdown summary ───────────────────────────────
     ctx.progress(0.85f, "Algorithm summary: generating report...");
 
     std::string md;
@@ -534,8 +762,9 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
     } else {
         for (size_t i = 0; i < result.candidates.size(); ++i) {
             const auto& c = result.candidates[i];
-            md += fmt::format("{}. **{}** (confidence: {}% — {})\n",
+            md += fmt::format("{}. **{}**{} (confidence: {}% — {})\n",
                               i + 1, c.name,
+                              c.is_speculative ? " *[speculative]*" : "",
                               static_cast<int>(c.confidence * 100.0f),
                               confidence_label(c.confidence));
             md += fmt::format("   - Evidence: {}\n", c.evidence);
@@ -559,16 +788,19 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
 
     result.summary_text = std::move(md);
 
-    // ── Phase 5: Generate structured JSON ────────────────────────────────
+    // ── Phase 4: Generate structured JSON ────────────────────────────────
     ctx.progress(0.9f, "Algorithm summary: generating JSON...");
 
     nlohmann::json j;
     j["total_candidates"] = result.candidates.size();
+    j["confirmed_candidates"] = result.confirmed_candidates().size();
 
     nlohmann::json j_candidates = nlohmann::json::array();
     for (const auto& c : result.candidates) {
         nlohmann::json jc;
         jc["name"] = c.name;
+        jc["family"] = algorithm_family_name(c.family);
+        jc["is_speculative"] = c.is_speculative;
         jc["confidence"] = c.confidence;
         jc["confidence_label"] = confidence_label(c.confidence);
         jc["evidence"] = c.evidence;
@@ -587,9 +819,9 @@ if (call_graph_raw.ok()) cg_res      = &call_graph_raw.get<CallGraphResult>();
 
     // Data source availability
     nlohmann::json sources;
-sources["pattern"]                  = pattern_res != nullptr;
-sources["constant_materialization"] = const_res   != nullptr;  // absorbed into pattern
-sources["loop_semantics"]           = loop_res    != nullptr;
+    sources["pattern"]                  = pattern_res != nullptr;
+    sources["constant_materialization"] = const_res   != nullptr;  // absorbed into pattern
+    sources["loop_semantics"]           = loop_res    != nullptr;
     sources["function"]                 = func_res    != nullptr;
     sources["call_graph"]               = cg_res      != nullptr;
     j["data_sources"] = std::move(sources);

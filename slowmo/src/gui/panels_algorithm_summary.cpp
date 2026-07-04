@@ -44,10 +44,21 @@ void GuiApp::render_algorithm_summary_panel() {
     float panel_w = ImGui::GetContentRegionAvail().x;
 
     // ── Summary header ─────────────────────────────────────────────────────
+    // has_crypto() counts ALL candidates including speculative hot-function-
+    // only hints; confirmed_candidates() excludes those, so the header shows
+    // both counts when they differ instead of implying every candidate is
+    // equally well-supported evidence.
+    size_t n_confirmed = res.confirmed_candidates().size();
     const char* crypto_badge = res.has_crypto() ? "  " ICON_FA_TRIANGLE_EXCLAMATION " CRYPTO" : "";
-    ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
-        ICON_FA_MAGNIFYING_GLASS "  %zu candidate(s)%s",
-        res.total(), crypto_badge);
+    if (n_confirmed == res.total()) {
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+            ICON_FA_MAGNIFYING_GLASS "  %zu candidate(s)%s",
+            res.total(), crypto_badge);
+    } else {
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+            ICON_FA_MAGNIFYING_GLASS "  %zu candidate(s) (%zu confirmed, %zu speculative)%s",
+            res.total(), n_confirmed, res.total() - n_confirmed, crypto_badge);
+    }
 
     ImGui::SameLine(panel_w - 90.0f);
     if (ImGui::SmallButton(ICON_FA_ARROW_ROTATE_LEFT " Rerun")) {
@@ -143,8 +154,20 @@ void GuiApp::render_algorithm_summary_panel() {
 
                     // ── Algorithm Name column ────────────────────────────
                     ImGui::TableSetColumnIndex(1);
-                    ImGui::TextColored(ImVec4(0.75f, 0.92f, 0.6f, 1.0f),
-                                       "%s", cand.name.c_str());
+                    if (cand.is_speculative) {
+                        // Speculative (hot-function-only) candidates get a
+                        // dimmer color + marker so they're visually distinct
+                        // from candidates backed by real pattern/constant/
+                        // loop evidence at a glance, without hiding them.
+                        ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.55f, 1.0f),
+                                           "%s " ICON_FA_CIRCLE_QUESTION, cand.name.c_str());
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Speculative: based only on call-count heuristic,\n"
+                                              "no corroborating pattern/constant/loop evidence.");
+                    } else {
+                        ImGui::TextColored(ImVec4(0.75f, 0.92f, 0.6f, 1.0f),
+                                           "%s", cand.name.c_str());
+                    }
 
                     // ── Confidence column (progress bar + label) ─────────
                     ImGui::TableSetColumnIndex(2);
