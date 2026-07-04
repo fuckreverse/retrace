@@ -25,8 +25,8 @@
 // All sub-panels are in the same file to keep VM-specific state local.
 
 #include "gui/gui_app.h"
-#include "analysis/passes/vm_abstract_pass.h"
-#include "analysis/passes/xref_pass.h"
+#include "analysis/passes/vm/vm_abstract_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>

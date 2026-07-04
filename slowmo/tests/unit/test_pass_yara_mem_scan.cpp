@@ -19,7 +19,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/yara_mem_scan_pass.h"
+#include "analysis/passes/memory/yara_mem_scan_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

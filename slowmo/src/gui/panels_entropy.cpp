@@ -10,7 +10,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/entropy_pass.h"
+#include "analysis/passes/memory/entropy_pass.h"
 #include "analysis/pass_registry.h"
 
 #include <imgui.h>

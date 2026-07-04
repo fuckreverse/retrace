@@ -1,7 +1,7 @@
 #include "strings_panel.h"
 
 #include "tui/tui_context.h"
-#include "analysis/passes/string_pass.h"
+#include "analysis/passes/memory/string_pass.h"
 
 #include <fmt/format.h>
 #include <ftxui/dom/elements.hpp>

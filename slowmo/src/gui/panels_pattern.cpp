@@ -7,7 +7,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/pattern_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
 
 #include <imgui.h>
 #include <fmt/core.h>

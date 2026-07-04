@@ -72,7 +72,7 @@ struct PassRunCtx {
     // VM dispatcher auto-detection is unreliable on real traces (pure
     // heuristic on loop iteration count + indirect-branch shape). Product
     // surfaces must supply static-analysis hints instead of relying on it.
-    // Path to a JSON hints file (see analysis/passes/vm_hints_json.h for the
+    // Path to a JSON hints file (see analysis/passes/vm/vm_hints_json.h for the
     // schema). Empty = no file-based hints.
     std::string vm_hints_file;
     /// Explicit opt-in to the unreliable heuristic auto-detection when no

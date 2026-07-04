@@ -17,7 +17,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/memory_string_pass.h"
+#include "analysis/passes/memory/memory_string_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

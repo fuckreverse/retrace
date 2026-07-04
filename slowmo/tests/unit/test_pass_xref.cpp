@@ -7,7 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/xref_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

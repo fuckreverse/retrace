@@ -6,10 +6,10 @@
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
 #include "common/types.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_layout_pass.h"
-#include "analysis/passes/call_graph_pass.h"
-#include "analysis/passes/taint_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/structure/call_graph_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
 
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>

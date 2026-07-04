@@ -26,13 +26,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/memory_snapshot_pass.h"
-#include "analysis/passes/string_pass.h"
-#include "analysis/passes/memory_string_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
+#include "analysis/passes/memory/string_pass.h"
+#include "analysis/passes/memory/memory_string_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

@@ -362,38 +362,38 @@ src/core/register_file.cpp
     src/analysis/pass_registry.cpp
     src/analysis/trace_collector.cpp
     src/analysis/annotation_view.cpp
-    src/analysis/passes/taint_pass.cpp
-    src/analysis/passes/backward_taint_pass.cpp
-    src/analysis/passes/xref_pass.cpp
-    src/analysis/passes/function_pass.cpp
-    src/analysis/passes/call_graph_pass.cpp
-    src/analysis/passes/cfg_pass.cpp
-    src/analysis/passes/cfg_layout_pass.cpp
+    src/analysis/passes/taint/taint_pass.cpp
+    src/analysis/passes/taint/backward_taint_pass.cpp
+    src/analysis/passes/structure/xref_pass.cpp
+    src/analysis/passes/structure/function_pass.cpp
+    src/analysis/passes/structure/call_graph_pass.cpp
+    src/analysis/passes/structure/cfg_pass.cpp
+    src/analysis/passes/structure/cfg_layout_pass.cpp
     src/analysis/passes/GraphGridLayout.cpp
-    src/analysis/passes/string_pass.cpp
-    src/analysis/passes/pattern_pass.cpp
-    src/analysis/passes/loop_pass.cpp
-    src/analysis/passes/loop_semantics_pass.cpp
-    src/analysis/passes/vm_abstract_pass.cpp
-    src/analysis/passes/vm_hints_json.cpp
-    src/analysis/passes/algorithm_summary_pass.cpp
-    src/analysis/passes/trace_diff_pass.cpp
-    src/analysis/passes/memory_snapshot_pass.cpp
-    src/analysis/passes/memory_string_pass.cpp
-    src/analysis/passes/dataflow_graph_pass.cpp
-    src/analysis/passes/objc_pass.cpp
-    src/analysis/passes/thread_pass.cpp
-    src/analysis/passes/trace_fold_pass.cpp
-    src/analysis/passes/reg_timeline_pass.cpp
-    src/analysis/passes/mem_search_pass.cpp
-    src/analysis/passes/call_context_pass.cpp
-    src/analysis/passes/window_stats_pass.cpp
-    src/analysis/passes/entropy_pass.cpp
-    src/analysis/passes/yara_mem_scan_pass.cpp
-    src/analysis/passes/thread_filter_pass.cpp
-    src/analysis/passes/objc_crypto_pass.cpp
-    src/analysis/passes/syscall_intercept_pass.cpp
-    src/analysis/passes/taint_source_annotation_pass.cpp
+    src/analysis/passes/memory/string_pass.cpp
+    src/analysis/passes/crypto/pattern_pass.cpp
+    src/analysis/passes/structure/loop_pass.cpp
+    src/analysis/passes/crypto/loop_semantics_pass.cpp
+    src/analysis/passes/vm/vm_abstract_pass.cpp
+    src/analysis/passes/vm/vm_hints_json.cpp
+    src/analysis/passes/crypto/algorithm_summary_pass.cpp
+    src/analysis/passes/profile/trace_diff_pass.cpp
+    src/analysis/passes/memory/memory_snapshot_pass.cpp
+    src/analysis/passes/memory/memory_string_pass.cpp
+    src/analysis/passes/profile/dataflow_graph_pass.cpp
+    src/analysis/passes/platform/objc_pass.cpp
+    src/analysis/passes/misc/thread_pass.cpp
+    src/analysis/passes/profile/trace_fold_pass.cpp
+    src/analysis/passes/profile/reg_timeline_pass.cpp
+    src/analysis/passes/memory/mem_search_pass.cpp
+    src/analysis/passes/profile/call_context_pass.cpp
+    src/analysis/passes/profile/window_stats_pass.cpp
+    src/analysis/passes/memory/entropy_pass.cpp
+    src/analysis/passes/memory/yara_mem_scan_pass.cpp
+    src/analysis/passes/misc/thread_filter_pass.cpp
+    src/analysis/passes/crypto/objc_crypto_pass.cpp
+    src/analysis/passes/platform/syscall_intercept_pass.cpp
+    src/analysis/passes/taint/taint_source_annotation_pass.cpp
     src/io/rpc_server.cpp
     src/io/mcp/mcp_server.cpp
     src/io/mcp/mcp_http.cpp

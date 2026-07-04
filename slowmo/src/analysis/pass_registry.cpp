@@ -5,41 +5,41 @@
 
 #include "analysis/pass_registry.h"
 
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/cfg_layout_pass.h"
-#include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/call_graph_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/loop_semantics_pass.h"
-#include "analysis/passes/algorithm_summary_pass.h"
-#include "analysis/passes/objc_pass.h"
-#include "analysis/passes/objc_crypto_pass.h"
-#include "analysis/passes/taint_source_annotation_pass.h"
-#include "analysis/passes/thread_pass.h"
-#include "analysis/passes/thread_filter_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/memory/string_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/call_graph_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/crypto/loop_semantics_pass.h"
+#include "analysis/passes/crypto/algorithm_summary_pass.h"
+#include "analysis/passes/platform/objc_pass.h"
+#include "analysis/passes/crypto/objc_crypto_pass.h"
+#include "analysis/passes/taint/taint_source_annotation_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
+#include "analysis/passes/misc/thread_filter_pass.h"
 
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
 
-#include "analysis/passes/memory_string_pass.h"
-#include "analysis/passes/memory_snapshot_pass.h"
-#include "analysis/passes/mem_search_pass.h"
-#include "analysis/passes/entropy_pass.h"
-#include "analysis/passes/yara_mem_scan_pass.h"
+#include "analysis/passes/memory/memory_string_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
+#include "analysis/passes/memory/mem_search_pass.h"
+#include "analysis/passes/memory/entropy_pass.h"
+#include "analysis/passes/memory/yara_mem_scan_pass.h"
 
-#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 
-#include "analysis/passes/trace_fold_pass.h"
-#include "analysis/passes/reg_timeline_pass.h"
-#include "analysis/passes/call_context_pass.h"
-#include "analysis/passes/window_stats_pass.h"
-#include "analysis/passes/trace_diff_pass.h"
-#include "analysis/passes/dataflow_graph_pass.h"
-#include "analysis/passes/vm_abstract_pass.h"
-#include "analysis/passes/vm_hints_json.h"
+#include "analysis/passes/profile/trace_fold_pass.h"
+#include "analysis/passes/profile/reg_timeline_pass.h"
+#include "analysis/passes/profile/call_context_pass.h"
+#include "analysis/passes/profile/window_stats_pass.h"
+#include "analysis/passes/profile/trace_diff_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
+#include "analysis/passes/vm/vm_abstract_pass.h"
+#include "analysis/passes/vm/vm_hints_json.h"
 
 #include <fmt/core.h>
 
@@ -270,7 +270,7 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         {"memory_snapshot",       "Mem Snapshot",  "Capture memory snapshots at call sites / inst_ids",      PassCategory::Memory,    PassDefault::No},
         {"mem_search",            "Mem Search",    "Multi-pattern + exact-value/immediate search on memory/registers", PassCategory::Memory, PassDefault::No},
         {"entropy",               "Entropy",       "Shannon entropy of a memory region (ciphertext detect)", PassCategory::Memory,    PassDefault::No},
-        {"yara_mem_scan",         "YARA Mem Scan", "YARA scan of memory pages (crypto constants in mem)",    PassCategory::Memory,    PassDefault::No},
+        {"yara_mem_scan",         "YARA Mem Scan", "YARA scan of heap/stack memory (crypto consts, anti-debug strings, network/cert/packed-payload signatures)", PassCategory::Memory, PassDefault::No},
 
         // — Platform API —
         {"objc",                  "ObjC",          "Objective-C message send analysis",                      PassCategory::PlatformApi, PassDefault::No},

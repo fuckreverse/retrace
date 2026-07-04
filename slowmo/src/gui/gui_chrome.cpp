@@ -5,8 +5,8 @@
 
 #include "gui/gui_app.h"
 #include "analysis/pass_registry.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/loop_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
 #include "io/recent_files.h"
 
 #include <imgui.h>

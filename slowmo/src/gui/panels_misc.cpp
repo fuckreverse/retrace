@@ -5,13 +5,13 @@
 
 #include "gui/gui_app.h"
 #include "analysis/pass_registry.h"
-#include "analysis/passes/thread_pass.h"
-#include "analysis/passes/string_pass.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/function_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
+#include "analysis/passes/memory/string_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/structure/function_pass.h"
 
 #include <imgui.h>
 

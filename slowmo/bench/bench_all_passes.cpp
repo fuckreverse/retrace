@@ -16,23 +16,23 @@
 #include "analysis/pass_manager.h"
 
 // All passes
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/cfg_layout_pass.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/call_graph_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/loop_semantics_pass.h"
-#include "analysis/passes/string_pass.h"
-#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
-#include "analysis/passes/trace_diff_pass.h"
-#include "analysis/passes/memory_snapshot_pass.h"
-#include "analysis/passes/dataflow_graph_pass.h"
-#include "analysis/passes/algorithm_summary_pass.h"
-#include "analysis/passes/objc_pass.h"
-#include "analysis/passes/thread_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/call_graph_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/crypto/loop_semantics_pass.h"
+#include "analysis/passes/memory/string_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"  // also defines ConstantMaterializationResult
+#include "analysis/passes/profile/trace_diff_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
+#include "analysis/passes/crypto/algorithm_summary_pass.h"
+#include "analysis/passes/platform/objc_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
 
 #include <fmt/core.h>
 #include <fmt/color.h>

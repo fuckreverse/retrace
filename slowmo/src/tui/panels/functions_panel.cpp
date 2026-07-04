@@ -1,5 +1,5 @@
 #include "functions_panel.h"
-#include "analysis/passes/function_pass.h"
+#include "analysis/passes/structure/function_pass.h"
 #include "io/trace_reader.h"
 
 #include <algorithm>

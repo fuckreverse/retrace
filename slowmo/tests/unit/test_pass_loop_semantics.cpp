@@ -18,10 +18,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/loop_semantics_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/crypto/loop_semantics_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

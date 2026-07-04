@@ -1,7 +1,7 @@
 #include "thread_panel.h"
 
 #include "tui/tui_context.h"
-#include "analysis/passes/thread_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
 
 #include <fmt/format.h>
 #include <ftxui/dom/elements.hpp>

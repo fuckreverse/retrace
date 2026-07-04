@@ -10,8 +10,8 @@
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/memory_snapshot_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
 
 #include <fmt/core.h>
 #include <chrono>

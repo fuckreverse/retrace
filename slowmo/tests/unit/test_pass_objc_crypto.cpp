@@ -27,9 +27,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/objc_crypto_pass.h"
-#include "analysis/passes/pattern_pass.h"
-#include "analysis/passes/objc_pass.h"
+#include "analysis/passes/crypto/objc_crypto_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
+#include "analysis/passes/platform/objc_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

@@ -3,13 +3,13 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/cfg_layout_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
 
 #include <imgui.h>
 #include "gui/icons/IconsFontAwesome6.h"

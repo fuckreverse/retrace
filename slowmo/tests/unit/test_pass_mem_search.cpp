@@ -28,7 +28,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/mem_search_pass.h"
+#include "analysis/passes/memory/mem_search_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

@@ -7,8 +7,8 @@
 // Pure C++ (no ObjC/Metal). References GuiApp members declared in gui_app.h.
 
 #include "gui/gui_app.h"
-#include "analysis/passes/reg_timeline_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
+#include "analysis/passes/profile/reg_timeline_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
 
 #include <imgui.h>
 #include <fmt/core.h>

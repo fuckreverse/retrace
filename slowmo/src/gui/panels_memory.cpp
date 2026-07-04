@@ -4,7 +4,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/xref_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
 
 #include <imgui.h>
 

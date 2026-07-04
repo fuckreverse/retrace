@@ -4,8 +4,8 @@
 // This is an internal header — only included by mcp_tools_*.cpp files.
 
 #include "analysis/pass_manager.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/pattern_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>

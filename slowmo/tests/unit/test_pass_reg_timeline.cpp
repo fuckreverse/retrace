@@ -15,7 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/reg_timeline_pass.h"
+#include "analysis/passes/profile/reg_timeline_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

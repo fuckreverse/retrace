@@ -13,10 +13,10 @@
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
 
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/loop_semantics_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/crypto/loop_semantics_pass.h"
 
 #include <fmt/core.h>
 #include <chrono>

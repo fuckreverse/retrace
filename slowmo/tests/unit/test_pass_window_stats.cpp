@@ -9,7 +9,7 @@
 #include <catch2/catch_approx.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/window_stats_pass.h"
+#include "analysis/passes/profile/window_stats_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

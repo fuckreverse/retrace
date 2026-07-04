@@ -15,8 +15,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/thread_pass.h"
-#include "analysis/passes/thread_filter_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
+#include "analysis/passes/misc/thread_filter_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

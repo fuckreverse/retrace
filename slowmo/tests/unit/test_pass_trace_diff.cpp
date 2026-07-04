@@ -8,7 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/trace_diff_pass.h"
+#include "analysis/passes/profile/trace_diff_pass.h"
 
 #include <cstdio>
 #include <filesystem>

@@ -3,8 +3,8 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
 
 #include <fmt/core.h>
 

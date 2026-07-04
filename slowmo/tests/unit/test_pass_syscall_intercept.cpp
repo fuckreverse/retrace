@@ -28,7 +28,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 #include <nlohmann/json.hpp>
 
 using namespace tenet;

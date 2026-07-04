@@ -8,7 +8,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
-#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 #include <imgui.h>
 #include <fmt/core.h>
 #include <cstring>

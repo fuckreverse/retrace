@@ -1,7 +1,7 @@
 #include "analysis/annotation_view.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/pattern_pass.h"  // also defines ConstantMaterializationResult
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"  // also defines ConstantMaterializationResult
 
 #include <fmt/core.h>
 #include <algorithm>

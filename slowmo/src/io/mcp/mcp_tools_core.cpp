@@ -13,14 +13,14 @@
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
 
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/cfg_layout_pass.h"
-#include "analysis/passes/taint_pass.h"
-#include "analysis/passes/backward_taint_pass.h"
-#include "analysis/passes/function_pass.h"
-#include "analysis/passes/call_graph_pass.h"
-#include "analysis/passes/dataflow_graph_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/taint/taint_pass.h"
+#include "analysis/passes/taint/backward_taint_pass.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "analysis/passes/structure/call_graph_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
 
 #include <fmt/core.h>
 

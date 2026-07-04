@@ -20,7 +20,7 @@
 #include <cmath>
 
 #include "fixtures/trace_fixture.h"
-#include "analysis/passes/entropy_pass.h"
+#include "analysis/passes/memory/entropy_pass.h"
 
 using namespace tenet;
 using namespace tenet::test;

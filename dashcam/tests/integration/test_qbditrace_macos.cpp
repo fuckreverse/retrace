@@ -53,10 +53,10 @@ using namespace qbditrace;
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
-#include "analysis/passes/xref_pass.h"
-#include "analysis/passes/cfg_pass.h"
-#include "analysis/passes/loop_pass.h"
-#include "analysis/passes/function_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/loop_pass.h"
+#include "analysis/passes/structure/function_pass.h"
 
 using namespace tenet;
 
@@ -479,7 +479,7 @@ TEST_CASE("qbditrace + tenet: PC values in live trace are within instrumented ra
 #endif
 #include <dlfcn.h>
 
-#include "analysis/passes/syscall_intercept_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "analysis/trace_collector.h"
 
 // ── Known test vectors ────────────────────────────────────────────────────
