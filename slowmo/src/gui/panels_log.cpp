@@ -50,6 +50,14 @@ static bool passes_level_filter(int lv, int filter) {
     }
 }
 
+// module_filter: 0 = all modules; otherwise a bitmask (bit i = Module i)
+// mirroring tenet::log::module_mask(), but purely a GUI-side display filter
+// — independent from TENET_LOG_MODULES (which only gates the stderr sink).
+static bool passes_module_filter(int mod, int filter) {
+    if (filter == 0) return true;
+    return (filter & (1 << mod)) != 0;
+}
+
 // ─── Log panel implementation ───────────────────────────────────────────────
 
 void GuiApp::render_log_panel() {
@@ -60,6 +68,7 @@ void GuiApp::render_log_panel() {
         for (auto& e : raw) {
             log_panel_.entries.push_back({
                 static_cast<int>(e.level),
+                static_cast<int>(e.module),
                 e.timestamp,
                 e.rss_mb,
                 std::move(e.message)
@@ -87,6 +96,36 @@ void GuiApp::render_log_panel() {
         ImGui::SetNextItemWidth(70.0f);
         ImGui::Combo("##LogLevel", &log_panel_.level_filter,
                      level_labels, IM_ARRAYSIZE(level_labels));
+        ImGui::SameLine();
+
+        // Module filter: multi-select popup (checkbox per module). This is a
+        // pure display filter independent of TENET_LOG_MODULES (which only
+        // gates what reaches stderr) — lets you e.g. focus on "mcp" traffic
+        // in the GUI without losing everything else from the process.
+        {
+            constexpr int kModuleCount = static_cast<int>(log::Module::Count);
+            std::string module_label = (log_panel_.module_filter == 0)
+                ? "Modules: All"
+                : fmt::format("Modules: {} selected",
+                    [&]{ int n=0; for (int i=0;i<kModuleCount;i++) if (log_panel_.module_filter & (1<<i)) n++; return n; }());
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::BeginCombo("##LogModule", module_label.c_str())) {
+                bool all_selected = (log_panel_.module_filter == 0);
+                if (ImGui::Checkbox("All", &all_selected)) {
+                    log_panel_.module_filter = 0;
+                }
+                ImGui::Separator();
+                for (int i = 0; i < kModuleCount; i++) {
+                    bool selected = (log_panel_.module_filter != 0) &&
+                                    (log_panel_.module_filter & (1 << i)) != 0;
+                    if (ImGui::Checkbox(log::module_name(static_cast<log::Module>(i)), &selected)) {
+                        if (selected) log_panel_.module_filter |= (1 << i);
+                        else          log_panel_.module_filter &= ~(1 << i);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        }
         ImGui::SameLine();
 
         // Text filter
@@ -129,6 +168,10 @@ void GuiApp::render_log_panel() {
         if (!passes_level_filter(entry.level, log_panel_.level_filter))
             continue;
 
+        // Module filter
+        if (!passes_module_filter(entry.module, log_panel_.module_filter))
+            continue;
+
         // Text filter (case-insensitive substring match)
         if (has_filter) {
             bool found = false;
@@ -157,6 +200,14 @@ void GuiApp::render_log_panel() {
         ImGui::TextColored(log_level_color(entry.level),
             " %s", log_level_tag(entry.level));
         ImGui::SameLine();
+
+        // Module tag (omitted for General to match pre-modularization output)
+        auto mod = static_cast<log::Module>(entry.module);
+        if (mod != log::Module::General) {
+            ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.68f, 1.0f),
+                " [%s]", log::module_name(mod));
+            ImGui::SameLine();
+        }
 
         // Message
         ImGui::TextColored(ImVec4(0.82f, 0.84f, 0.88f, 1.0f),

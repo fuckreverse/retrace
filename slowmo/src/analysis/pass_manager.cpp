@@ -32,20 +32,14 @@ const PassResult& PassContext::require_raw(std::string_view pass_name) {
 
 void PassContext::progress(float pct) {
     if (progress_pct_) progress_pct_->store(pct, std::memory_order_relaxed);
-    if (::tenet::log::is_enabled(::tenet::log::Level::Debug)) {
-        ::tenet::log::detail::write(::tenet::log::Level::Debug,
-            "pass progress: {:.0f}%", pct * 100.0f);
-    }
+    LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}%", pct * 100.0f);
 }
 void PassContext::progress(float pct, std::string_view msg) {
     if (progress_pct_) progress_pct_->store(pct, std::memory_order_relaxed);
     if (!msg.empty()) {
         manager_.set_progress_msg(pass_name_, msg);
     }
-    if (::tenet::log::is_enabled(::tenet::log::Level::Debug)) {
-        ::tenet::log::detail::write(::tenet::log::Level::Debug,
-            "pass progress: {:.0f}% — {}", pct * 100.0f, msg);
-    }
+    LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}% — {}", pct * 100.0f, msg);
 }
 
 bool PassContext::cancelled() const {
@@ -87,11 +81,11 @@ void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {
         if (existing->state.load(std::memory_order_acquire) == PassState::NotRun) {
             // Safe to replace: pass was invalidated and has not started running.
             existing->pass = std::move(pass);
-            LOG_INFO("PassManager: replaced invalidated pass '{}'", name);
+            LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager: replaced invalidated pass '{}'", name);
             return;
         }
         // Pass is Running or Completed — silently ignore (idempotent).
-        LOG_WARN("PassManager: duplicate registration of '{}' ignored", name);
+        LOG_WARN_M(::tenet::log::Module::Analysis, "PassManager: duplicate registration of '{}' ignored", name);
         return;
     }
 
@@ -158,7 +152,7 @@ void PassManager::execute_pass(PassEntry* entry) {
         const auto& dep_result = require(dep_name);
         if (!dep_result.ok()) {
             // Dependency failed — propagate failure.
-            LOG_WARN("pass '{}': dependency '{}' failed — skipping",
+            LOG_WARN_M(::tenet::log::Module::Analysis, "pass '{}': dependency '{}' failed — skipping",
                      entry->pass->name(), dep_name);
             {
                 std::lock_guard<std::mutex> lk(entry->mtx);
@@ -174,7 +168,7 @@ void PassManager::execute_pass(PassEntry* entry) {
     // Memory pressure check: skip non-critical passes when RSS exceeds limit.
     // Critical passes (cost < 2.0) always run; others are skipped under pressure.
     if (is_memory_pressure() && entry->pass->estimated_cost() >= 2.0f) {
-        LOG_WARN("pass '{}': skipped due to memory pressure (RSS {:.0f}MB > {:.0f}MB limit)",
+        LOG_WARN_M(::tenet::log::Module::Analysis, "pass '{}': skipped due to memory pressure (RSS {:.0f}MB > {:.0f}MB limit)",
                  entry->pass->name(), ::tenet::log::rss_mb(), rss_limit_mb_);
         {
             std::lock_guard<std::mutex> lk(entry->mtx);
@@ -186,7 +180,7 @@ void PassManager::execute_pass(PassEntry* entry) {
     }
 
     // Execute the pass itself.
-    LOG_DEBUG("pass '{}': starting", entry->pass->name());
+    LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass '{}': starting", entry->pass->name());
     auto t0  = TENET_TIMER_START();
     double m0 = ::tenet::log::rss_mb();
 
@@ -208,10 +202,10 @@ void PassManager::execute_pass(PassEntry* entry) {
     double dmem = ::tenet::log::rss_mb() - m0;
 
     if (result.ok()) {
-        LOG_INFO("pass '{}': OK  {:.1f}ms  mem {:+.1f}MB",
+        LOG_INFO_M(::tenet::log::Module::Analysis, "pass '{}': OK  {:.1f}ms  mem {:+.1f}MB",
                  entry->pass->name(), ms, dmem);
     } else {
-        LOG_WARN("pass '{}': FAILED  {:.1f}ms  — {}",
+        LOG_WARN_M(::tenet::log::Module::Analysis, "pass '{}': FAILED  {:.1f}ms  — {}",
                  entry->pass->name(), ms, result.error_message);
     }
 
@@ -353,12 +347,12 @@ void PassManager::run_all_parallel(size_t num_threads) {
     worker_mtx_ = nullptr;
 
     if (failed_dep.load(std::memory_order_relaxed)) {
-        LOG_WARN("PassManager::run_all: one or more passes failed (see above)");
+        LOG_WARN_M(::tenet::log::Module::Analysis, "PassManager::run_all: one or more passes failed (see above)");
     }
 }
 
 void PassManager::run_all(size_t num_threads) {
-    LOG_INFO("PassManager::run_all: {} passes, {} threads, RSS limit={}MB",
+    LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager::run_all: {} passes, {} threads, RSS limit={}MB",
              entries_.size(), num_threads,
              rss_limit_mb_ > 0 ? fmt::format("{:.0f}", rss_limit_mb_) : "none");
 
@@ -367,13 +361,13 @@ void PassManager::run_all(size_t num_threads) {
         for (auto& entry : entries_) {
             require(entry->pass->name());
         }
-        LOG_INFO("PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
+        LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
         return;
     }
 
     run_all_parallel(num_threads);
 
-    LOG_INFO("PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
+    LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
 }
 
 // ─── Invalidation ─────────────────────────────────────────────────────────

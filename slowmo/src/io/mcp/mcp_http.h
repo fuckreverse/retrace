@@ -81,7 +81,7 @@ public:
 
 private:
     void listener_loop();
-    void handle_client(int client_fd);
+    void handle_client(int client_fd, const std::string& client_addr);
 
     // HTTP parsing / response helpers
     struct HttpRequest {

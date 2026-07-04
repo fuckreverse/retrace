@@ -273,14 +273,14 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     auto sv = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                        "schema_version", &schema_val);
     if (!sv.ok() || schema_val.size() < 4) {
-        LOG_WARN("Index cache invalid: missing schema_version key ({})",
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: missing schema_version key ({})",
                  sv.ok() ? "too short" : sv.ToString());
         return false;
     }
     uint32_t stored_schema = 0;
     std::memcpy(&stored_schema, schema_val.data(), 4);
     if (stored_schema != INDEX_SCHEMA_VERSION) {
-        LOG_WARN("Index cache invalid: schema version mismatch "
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: schema version mismatch "
                  "(stored={}, current={}) — rebuilding",
                  stored_schema, INDEX_SCHEMA_VERSION);
         return false;
@@ -305,7 +305,7 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
                 }
             }
         }
-        LOG_WARN("Index cache invalid: missing file_size key — rebuilding "
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: missing file_size key — rebuilding "
                  "(status={}, meta_cf={}, keys_in_meta=[{}])",
                  s.ToString(), static_cast<void*>(get_cf(cf::META)), meta_keys_str);
         return false;
@@ -313,7 +313,7 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     uint64_t stored_size = 0;
     std::memcpy(&stored_size, value.data(), std::min(value.size(), size_t(8)));
     if (stored_size != reader.file_size()) {
-        LOG_WARN("Index cache invalid: file size mismatch "
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: file size mismatch "
                  "(stored={}, current={}) — rebuilding",
                  stored_size, reader.file_size());
         return false;
@@ -326,14 +326,14 @@ bool TraceIndex::is_valid_for(const TraceReader& reader) const {
     auto hs = db_->Get(rocksdb::ReadOptions(), get_cf(cf::META),
                        "trace_hash", &hash_val);
     if (!hs.ok() || hash_val.size() < 8) {
-        LOG_WARN("Index cache invalid: missing trace_hash key — rebuilding");
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: missing trace_hash key — rebuilding");
         return false;
     }
     uint64_t stored_hash = 0;
     std::memcpy(&stored_hash, hash_val.data(), 8);
     uint64_t current_hash = sample_trace_hash(reader);
     if (stored_hash != current_hash) {
-        LOG_WARN("Index cache invalid: trace content hash mismatch "
+        LOG_WARN_M(::tenet::log::Module::Io, "Index cache invalid: trace content hash mismatch "
                  "(stored={:#018x}, current={:#018x}) — rebuilding",
                  stored_hash, current_hash);
         return false;
@@ -445,7 +445,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
                     if (!ec) {
                         pc_saved = true;
                     } else {
-                        LOG_WARN("destroy_and_wipe: could not move pass_cache aside ({})"
+                        LOG_WARN_M(::tenet::log::Module::Io, "destroy_and_wipe: could not move pass_cache aside ({})"
                                  " — pass results will be recomputed", ec.message());
                     }
                 }
@@ -462,12 +462,12 @@ Result<TraceIndex> TraceIndex::open_or_build(
             rocksdb::Options destroy_opts;
             auto ds = rocksdb::DestroyDB(db_path.string(), destroy_opts);
             if (!ds.ok()) {
-                LOG_WARN("DestroyDB '{}' failed ({}), falling back to remove_all",
+                LOG_WARN_M(::tenet::log::Module::Io, "DestroyDB '{}' failed ({}), falling back to remove_all",
                          db_path.string(), ds.ToString());
                 std::error_code ec;
                 std::filesystem::remove_all(db_path, ec);
                 if (ec) {
-                    LOG_WARN("remove_all '{}' also failed: {} — build will overwrite in-place",
+                    LOG_WARN_M(::tenet::log::Module::Io, "remove_all '{}' also failed: {} — build will overwrite in-place",
                              db_path.string(), ec.message());
                 }
             }
@@ -478,11 +478,11 @@ Result<TraceIndex> TraceIndex::open_or_build(
                 std::filesystem::create_directories(db_path, ec);  // re-create dir if gone
                 std::filesystem::rename(pc_tmp, pc_dir, ec);
                 if (ec) {
-                    LOG_WARN("destroy_and_wipe: could not restore pass_cache ({})"
+                    LOG_WARN_M(::tenet::log::Module::Io, "destroy_and_wipe: could not restore pass_cache ({})"
                              " — pass results will be recomputed", ec.message());
                     std::filesystem::remove_all(pc_tmp, ec);
                 } else {
-                    LOG_INFO("Pass cache preserved across index rebuild ({} entries)",
+                    LOG_INFO_M(::tenet::log::Module::Io, "Pass cache preserved across index rebuild ({} entries)",
                              [&]() -> size_t {
                                  std::error_code e2;
                                  size_t n = 0;
@@ -501,7 +501,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
             // Open failed (e.g. corrupt SST, schema mismatch, missing CF).
             // raw_db may be null, but cf_handles_ may have been partially
             // populated by RocksDB — clean up whatever was allocated.
-            LOG_WARN("Failed to open index cache '{}': {} — will rebuild",
+            LOG_WARN_M(::tenet::log::Module::Io, "Failed to open index cache '{}': {} — will rebuild",
                      db_path.string(), s.ToString());
             // DestroyColumnFamilyHandle requires a valid DB pointer; if raw_db
             // is null we just clear the handles (they are already invalid).
@@ -544,7 +544,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
             }
         } else {
             idx.db_ = std::unique_ptr<rocksdb::DB>(raw_db);
-            LOG_INFO("Index cache found at '{}', validating...", db_path.string());
+            LOG_INFO_M(::tenet::log::Module::Io, "Index cache found at '{}', validating...", db_path.string());
             if (idx.is_valid_for(reader)) {
                 // Load stats from the META column family. inst_count and
                 // file_size are always present (written by build()). The
@@ -594,7 +594,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
                 // shows the real count instead of 0 when loading from cache).
                 idx.stats_.anchor_count = idx.anchors_.size();
 
-                LOG_INFO("Index cache hit: {} instructions, {} anchors",
+                LOG_INFO_M(::tenet::log::Module::Io, "Index cache hit: {} instructions, {} anchors",
                          idx.stats_.inst_count, idx.stats_.anchor_count);
                 return idx;
             }
@@ -623,13 +623,13 @@ Result<TraceIndex> TraceIndex::open_or_build(
                     }
                 }
             }
-            LOG_INFO("Removing stale index cache at '{}' (pass_cache: {})",
+            LOG_INFO_M(::tenet::log::Module::Io, "Removing stale index cache at '{}' (pass_cache: {})",
                      db_path.string(),
                      trace_content_unchanged ? "preserved" : "invalidated");
             destroy_and_wipe(raw_db, /*keep_pass_cache=*/trace_content_unchanged);
         }
     } else {
-        LOG_INFO("No index cache found for '{}', building from scratch...",
+        LOG_INFO_M(::tenet::log::Module::Io, "No index cache found for '{}', building from scratch...",
                  reader.path().filename().string());
     }
 
@@ -1701,7 +1701,7 @@ struct ShardResult {
         // (queries just do more L0 file checks).
         for (const auto& task : compact_tasks) {
             if (!task.error.empty()) {
-                LOG_WARN("CompactRange failed: {} — reads may be slower", task.error);
+                LOG_WARN_M(::tenet::log::Module::Io, "CompactRange failed: {} — reads may be slower", task.error);
             }
         }
         if (progress) progress(file_size + 3, file_size);  // compact done
@@ -1761,7 +1761,7 @@ struct ShardResult {
         // triggering "missing file_size key" on every subsequent open.
         auto wstatus = idx.db_->Write(wo, &meta_batch);
         if (!wstatus.ok()) {
-            LOG_ERROR("Failed to write index metadata: {} — index may be incomplete",
+            LOG_ERROR_M(::tenet::log::Module::Io, "Failed to write index metadata: {} — index may be incomplete",
                       wstatus.ToString());
             return Error::rocksdb_error("meta_batch write failed: " + wstatus.ToString());
         }
@@ -2235,7 +2235,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
     auto dir = pass_cache_dir(db_path_);
     std::filesystem::create_directories(dir, ec);
     if (ec) {
-        LOG_WARN("save_pass_blob: cannot create pass_cache dir '{}': {}",
+        LOG_WARN_M(::tenet::log::Module::Io, "save_pass_blob: cannot create pass_cache dir '{}': {}",
                  dir.string(), ec.message());
         return;
     }
@@ -2247,7 +2247,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
 
     FILE* f = std::fopen(tmp_path.c_str(), "wb");
     if (!f) {
-        LOG_WARN("save_pass_blob '{}': cannot open '{}' for write",
+        LOG_WARN_M(::tenet::log::Module::Io, "save_pass_blob '{}': cannot open '{}' for write",
                  pass_name, tmp_path.string());
         return;
     }
@@ -2270,7 +2270,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
             ok = ok && std::fwrite(cbuf.data(), 1, csize, f) == csize;
             write_ok = ok;
             if (ok) {
-                LOG_DEBUG("save_pass_blob '{}': {}B → {}B (zstd, {:.1f}x)",
+                LOG_DEBUG_M(::tenet::log::Module::Io, "save_pass_blob '{}': {}B → {}B (zstd, {:.1f}x)",
                           pass_name, size, csize, static_cast<double>(size) / csize);
             }
         }
@@ -2290,7 +2290,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
     std::fclose(f);
 
     if (!write_ok) {
-        LOG_WARN("save_pass_blob '{}': write failed, discarding", pass_name);
+        LOG_WARN_M(::tenet::log::Module::Io, "save_pass_blob '{}': write failed, discarding", pass_name);
         std::filesystem::remove(tmp_path, ec);
         return;
     }
@@ -2298,7 +2298,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
     // Atomic rename
     std::filesystem::rename(tmp_path, final_path, ec);
     if (ec) {
-        LOG_WARN("save_pass_blob '{}': rename failed: {}", pass_name, ec.message());
+        LOG_WARN_M(::tenet::log::Module::Io, "save_pass_blob '{}': rename failed: {}", pass_name, ec.message());
         std::filesystem::remove(tmp_path, ec);
     }
 }
@@ -2326,7 +2326,7 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
         uint64_t orig_size = 0;
         if (std::fread(&orig_size, 8, 1, f) != 1 || orig_size == 0 || orig_size > 4ULL * 1024 * 1024 * 1024) {
             std::fclose(f);
-            LOG_WARN("load_pass_blob '{}': corrupt header", pass_name);
+            LOG_WARN_M(::tenet::log::Module::Io, "load_pass_blob '{}': corrupt header", pass_name);
             return false;
         }
         // Read compressed payload.
@@ -2334,7 +2334,7 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
         std::vector<char> cbuf(payload_size);
         if (std::fread(cbuf.data(), 1, payload_size, f) != payload_size) {
             std::fclose(f);
-            LOG_WARN("load_pass_blob '{}': short read of compressed payload", pass_name);
+            LOG_WARN_M(::tenet::log::Module::Io, "load_pass_blob '{}': short read of compressed payload", pass_name);
             return false;
         }
         std::fclose(f);
@@ -2345,7 +2345,7 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
         size_t dsize = ZSTD_decompress(buf.data(), buf.size(),
                                        cbuf.data(), payload_size);
         if (ZSTD_isError(dsize) || dsize != orig_size) {
-            LOG_WARN("load_pass_blob '{}': decompression failed: {}",
+            LOG_WARN_M(::tenet::log::Module::Io, "load_pass_blob '{}': decompression failed: {}",
                      pass_name, ZSTD_getErrorName(dsize));
             return false;
         }
@@ -2364,7 +2364,7 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
     std::fclose(f);
 
     if (nread != fsize) {
-        LOG_WARN("load_pass_blob '{}': short read ({}/{})", pass_name, nread, fsize);
+        LOG_WARN_M(::tenet::log::Module::Io, "load_pass_blob '{}': short read ({}/{})", pass_name, nread, fsize);
         return false;
     }
     out = std::move(buf);

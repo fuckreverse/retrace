@@ -909,6 +909,7 @@ private:
     // in every GUI translation unit.
     struct GuiLogEntry {
         int         level;       // cast of tenet::log::Level
+        int         module;      // cast of tenet::log::Module
         double      timestamp;
         double      rss_mb;
         std::string message;
@@ -918,6 +919,7 @@ private:
         std::vector<GuiLogEntry> entries;       // accumulated log entries
         bool auto_scroll = true;                // scroll to bottom on new entries
         int  level_filter = 0;                  // 0=All, 1=Info+, 2=Warn+, 3=Error only
+        int  module_filter = 0;                 // 0=All modules, else 1<<(module-1) bit is checked
         char filter_buf[256] = {};              // text filter
         std::string filter_text;
     } log_panel_;

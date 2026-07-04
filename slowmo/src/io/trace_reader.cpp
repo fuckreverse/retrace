@@ -486,7 +486,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     std::filesystem::path temp_path(temp_str);
 
     fmt::print(stderr, "Decompressing trace to {}\n", temp_str);
-    LOG_INFO("decompressing compressed trace ({:.2f} MB) to {}",
+    LOG_INFO_M(::tenet::log::Module::Io, "decompressing compressed trace ({:.2f} MB) to {}",
              raw_size / (1024.0 * 1024.0), temp_str);
 
     // Write the header first (with HF_COMPRESSED flag cleared).
@@ -562,7 +562,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     }
 
     fmt::print(stderr, "\r  Decompressed: {:.1f} MB  \n", total_written / (1024.0 * 1024.0));
-    LOG_INFO("decompression complete: {:.2f} MB", total_written / (1024.0 * 1024.0));
+    LOG_INFO_M(::tenet::log::Module::Io, "decompression complete: {:.2f} MB", total_written / (1024.0 * 1024.0));
 
     // Get the decompressed file size.
     struct stat st{};

@@ -1,4 +1,5 @@
 #include "mcp_http_sse.h"
+#include "common/logger.h"
 
 #include <fmt/core.h>
 
@@ -21,14 +22,10 @@ using json = nlohmann::json;
 namespace tenet {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
-
-static void mcp_sse_log(const std::string& msg) {
-    try {
-        fmt::print(stderr, "[tenet-mcp-sse] {}\n", msg);
-    } catch (...) {
-        // stderr may be closed (e.g. parent process / pipe gone) — ignore.
-    }
-}
+//
+// Legacy transport (superseded by mcp_http.cpp's Streamable HTTP). Kept for
+// backward compatibility with older clients. Uses module=Mcp like the other
+// transports so TENET_LOG_MODULES=mcp covers it too.
 
 // ─── SseSession ───────────────────────────────────────────────────────────
 
@@ -281,7 +278,7 @@ void McpHttpSseTransport::set_auth(const std::string& username,
 bool McpHttpSseTransport::start() {
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
-        mcp_sse_log(fmt::format("socket() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "sse: socket() failed: {}", strerror(errno));
         return false;
     }
 
@@ -296,14 +293,14 @@ bool McpHttpSseTransport::start() {
     }
 
     if (::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        mcp_sse_log(fmt::format("bind() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "sse: bind({}:{}) failed: {}", host_, port_, strerror(errno));
         ::close(server_fd_);
         server_fd_ = -1;
         return false;
     }
 
     if (::listen(server_fd_, 16) < 0) {
-        mcp_sse_log(fmt::format("listen() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "sse: listen() failed: {}", strerror(errno));
         ::close(server_fd_);
         server_fd_ = -1;
         return false;
@@ -315,7 +312,7 @@ bool McpHttpSseTransport::start() {
 
     running_.store(true);
     listener_thread_ = std::thread([this] { listener_loop(); });
-    mcp_sse_log(fmt::format("HTTP SSE server listening on {}:{}", host_, port_));
+    LOG_INFO_M(log::Module::Mcp, "sse: listening on {}:{}", host_, port_);
     return true;
 }
 
@@ -453,7 +450,8 @@ void McpHttpSseTransport::handle_client(int client_fd) {
     // ── GET /sse — establish SSE stream ───────────────────────────────
     if (req.path == "/sse" && req.method == "GET") {
         auto session = create_session(client_fd);
-        mcp_sse_log(fmt::format("SSE client connected, session={}", session->id));
+        LOG_INFO_M(log::Module::Mcp, "sse: client connected, session={} (active={})",
+                   session->id, session_count());
 
         // Send SSE headers
         send_sse_headers(client_fd);
@@ -479,7 +477,7 @@ void McpHttpSseTransport::handle_client(int client_fd) {
         }
 
         remove_session(session->id);
-        mcp_sse_log(fmt::format("SSE client disconnected, session={}", session->id));
+        LOG_INFO_M(log::Module::Mcp, "sse: client disconnected, session={}", session->id);
         return;
     }
 
@@ -495,13 +493,14 @@ void McpHttpSseTransport::handle_client(int client_fd) {
         // Find the SSE session for this request
         auto session = get_session(sid);
         if (!session) {
-            mcp_sse_log(fmt::format("POST /messages: unknown sid={}", sid));
+            LOG_WARN_M(log::Module::Mcp, "sse: POST /messages: unknown sid={}", sid);
             return;
         }
 
         // Parse and dispatch the JSON-RPC message
         if (req.body.empty()) return;
 
+        auto t0 = TENET_TIMER_START();
         json response;
         try {
             json msg = json::parse(req.body);
@@ -509,7 +508,10 @@ void McpHttpSseTransport::handle_client(int client_fd) {
             // Serialize tool handler calls
             std::lock_guard<std::mutex> dispatch_lk(dispatch_mutex_);
             response = handler_(msg);
+            LOG_DEBUG_M(log::Module::Mcp, "sse: session={} method={} handled in {:.1f}ms",
+                        sid, msg.value("method", "?"), TENET_TIMER_MS(t0));
         } catch (const json::parse_error& e) {
+            LOG_WARN_M(log::Module::Mcp, "sse: session={} JSON parse error: {}", sid, e.what());
             response = {
                 {"jsonrpc", "2.0"},
                 {"id", nullptr},
@@ -517,6 +519,7 @@ void McpHttpSseTransport::handle_client(int client_fd) {
                            {"message", std::string("Parse error: ") + e.what()}}}
             };
         } catch (const std::exception& e) {
+            LOG_WARN_M(log::Module::Mcp, "sse: session={} handler threw: {}", sid, e.what());
             response = {
                 {"jsonrpc", "2.0"},
                 {"id", nullptr},

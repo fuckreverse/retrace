@@ -1,4 +1,5 @@
 #include "mcp_http.h"
+#include "common/logger.h"
 
 #include <fmt/core.h>
 
@@ -21,14 +22,9 @@ using json = nlohmann::json;
 namespace tenet {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
-
-static void mcp_http_log(const std::string& msg) {
-    try {
-        fmt::print(stderr, "[tenet-mcp-http] {}\n", msg);
-    } catch (...) {
-        // stderr may be closed (e.g. parent process / pipe gone) — ignore.
-    }
-}
+//
+// All transport-level diagnostics use module=Mcp (same as mcp_server.cpp)
+// so TENET_LOG_MODULES=mcp captures the whole MCP subsystem in one filter.
 
 // ─── UUID ─────────────────────────────────────────────────────────────────
 
@@ -212,12 +208,16 @@ bool McpHttpTransport::check_session(const HttpRequest& req, int client_fd) {
     if (it == req.headers.end()) {
         // Client forgot the session header.  Give a helpful error rather than
         // a silent 400: mention that initialize can be used to get a new one.
+        LOG_WARN_M(log::Module::Mcp, "http {} {}: missing Mcp-Session-Id header",
+                   req.method, req.path);
         send_http_response(client_fd, 400, "application/json",
                            R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Missing Mcp-Session-Id header. Send initialize to obtain a session ID."}})");
         return false;
     }
     if (it->second != session_id_) {
         // Stale session from a previous connection.  Let the client re-initialize.
+        LOG_WARN_M(log::Module::Mcp, "http {} {}: invalid/expired session {}",
+                   req.method, req.path, it->second);
         send_http_response(client_fd, 400, "application/json",
                            R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid or expired Mcp-Session-Id. Send initialize to start a new session."}})");
         return false;
@@ -253,7 +253,7 @@ void McpHttpTransport::set_auth(const std::string& username,
 bool McpHttpTransport::start() {
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
-        mcp_http_log(fmt::format("socket() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "http: socket() failed: {}", strerror(errno));
         return false;
     }
 
@@ -268,14 +268,14 @@ bool McpHttpTransport::start() {
     }
 
     if (::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        mcp_http_log(fmt::format("bind() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "http: bind({}:{}) failed: {}", host_, port_, strerror(errno));
         ::close(server_fd_);
         server_fd_ = -1;
         return false;
     }
 
     if (::listen(server_fd_, 128) < 0) {
-        mcp_http_log(fmt::format("listen() failed: {}", strerror(errno)));
+        LOG_ERROR_M(log::Module::Mcp, "http: listen() failed: {}", strerror(errno));
         ::close(server_fd_);
         server_fd_ = -1;
         return false;
@@ -296,7 +296,7 @@ bool McpHttpTransport::start() {
 
     running_.store(true);
     listener_thread_ = std::thread([this] { listener_loop(); });
-    mcp_http_log(fmt::format("Streamable HTTP server listening on {}:{}", host_, listening_port_));
+    LOG_INFO_M(log::Module::Mcp, "http: listening on {}:{}", host_, listening_port_);
     return true;
 }
 
@@ -356,6 +356,10 @@ void McpHttpTransport::listener_loop() {
                                  &client_len);
         if (client_fd < 0) continue;
 
+        char ip_buf[INET_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
+        std::string client_id = fmt::format("{}:{}", ip_buf, ntohs(client_addr.sin_port));
+
         // Receive timeout: give the client up to 10 seconds to send the full
         // HTTP request headers+body.  We do NOT set a send timeout here because
         // tool handlers (taint, algorithm_summary, etc.) may legitimately block
@@ -370,8 +374,8 @@ void McpHttpTransport::listener_loop() {
 
         // Spawn a per-client thread
         std::lock_guard<std::mutex> lk(clients_mutex_);
-        client_threads_.emplace_back([this, client_fd] {
-            handle_client(client_fd);
+        client_threads_.emplace_back([this, client_fd, client_id] {
+            handle_client(client_fd, client_id);
             ::close(client_fd);
         });
 
@@ -390,18 +394,49 @@ void McpHttpTransport::listener_loop() {
 //   DELETE /mcp — terminate session
 //   GET /health — liveness probe
 
-void McpHttpTransport::handle_client(int client_fd) {
+void McpHttpTransport::handle_client(int client_fd, const std::string& client_addr) {
+    auto t0 = TENET_TIMER_START();
+
     auto req = parse_http_request(client_fd);
-    if (!req.valid) return;
+    if (!req.valid) {
+        LOG_DEBUG_M(log::Module::Mcp, "http {} <bad request>  {:.1f}ms",
+                    client_addr, TENET_TIMER_MS(t0));
+        return;
+    }
+
+    // ── Request-lifecycle logging ────────────────────────────────────────
+    // One line per HTTP request, at the point of response, carrying
+    // method/path/status/elapsed/client — enough to answer "what is the
+    // MCP HTTP server doing right now" without per-header/body dumps.
+    // Health probes are extremely high frequency (load balancers, IDE
+    // polling) so they're demoted to Trace; everything else is Warn for
+    // errors (4xx/5xx) and Debug otherwise (mirrors tools/call framing in
+    // mcp_server.cpp, where the higher-level tool outcome is already Info).
+    auto log_response = [&](int status) {
+        double ms = TENET_TIMER_MS(t0);
+        if (req.path == "/health") {
+            LOG_TRACE_M(log::Module::Mcp, "http {} {} {} -> {}  {:.1f}ms",
+                        client_addr, req.method, req.path, status, ms);
+        } else if (status >= 400) {
+            LOG_WARN_M(log::Module::Mcp, "http {} {} {} -> {}  {:.1f}ms",
+                       client_addr, req.method, req.path, status, ms);
+        } else {
+            LOG_DEBUG_M(log::Module::Mcp, "http {} {} {} -> {}  {:.1f}ms",
+                        client_addr, req.method, req.path, status, ms);
+        }
+    };
 
     // CORS preflight
     if (req.method == "OPTIONS") {
         send_http_response(client_fd, 204, "text/plain", "");
+        log_response(204);
         return;
     }
 
     // Auth check
     if (!check_auth(req)) {
+        LOG_WARN_M(log::Module::Mcp, "http {} {} {}: unauthorized",
+                   client_addr, req.method, req.path);
         send_http_response(client_fd, 401, "application/json",
                            R"({"error":"Unauthorized"})",
                            "WWW-Authenticate: Basic realm=\"tenet-mcp\"");
@@ -412,6 +447,7 @@ void McpHttpTransport::handle_client(int client_fd) {
     if (req.path == "/health") {
         send_http_response(client_fd, 200, "application/json",
                            R"({"status":"ok"})");
+        log_response(200);
         return;
     }
 
@@ -420,6 +456,7 @@ void McpHttpTransport::handle_client(int client_fd) {
         if (req.body.empty()) {
             send_http_response(client_fd, 400, "application/json",
                                R"({"jsonrpc":"2.0","error":{"code":-32700,"message":"Empty request body"}})");
+            log_response(400);
             return;
         }
 
@@ -427,6 +464,7 @@ void McpHttpTransport::handle_client(int client_fd) {
         try {
             msg = json::parse(req.body);
         } catch (const json::parse_error& e) {
+            LOG_WARN_M(log::Module::Mcp, "http {} POST /mcp: JSON parse error: {}", client_addr, e.what());
             json err_resp = {
                 {"jsonrpc", "2.0"},
                 {"id", nullptr},
@@ -434,6 +472,7 @@ void McpHttpTransport::handle_client(int client_fd) {
                            {"message", std::string("Parse error: ") + e.what()}}}
             };
             send_http_response(client_fd, 200, "application/json", err_resp.dump());
+            log_response(200);
             return;
         }
 
@@ -453,12 +492,13 @@ void McpHttpTransport::handle_client(int client_fd) {
                     session_id_ = new_session_id;
                     session_ever_created_ = true;
                 }
-                mcp_http_log(fmt::format("Session created: {}", new_session_id));
+                LOG_INFO_M(log::Module::Mcp, "http: session created {}", new_session_id);
                 session_hdr = fmt::format("Mcp-Session-Id: {}", new_session_id);
             }
 
             send_http_response(client_fd, 200, "application/json",
                                response.dump(), session_hdr);
+            log_response(200);
             return;
         }
 
@@ -480,6 +520,7 @@ void McpHttpTransport::handle_client(int client_fd) {
                                    {"message", "No active session. Send initialize to start a new session."}}}
                     };
                     send_http_response(client_fd, 400, "application/json", err_resp.dump());
+                    log_response(400);
                     return;
                 }
             }
@@ -487,10 +528,14 @@ void McpHttpTransport::handle_client(int client_fd) {
 
         // Dispatch to handler — concurrency managed by TenetMcpService
         // (read tools run in parallel, write tools acquire exclusive lock).
+        // Note: per-tool timing/outcome is already logged inside
+        // TenetMcpService::process_message (module=Mcp); here we only log
+        // the outer HTTP envelope (status/elapsed for the whole request).
         json response;
         try {
             response = handler_(msg);
         } catch (const std::exception& e) {
+            LOG_WARN_M(log::Module::Mcp, "http {} POST /mcp: handler threw: {}", client_addr, e.what());
             response = {
                 {"jsonrpc", "2.0"},
                 {"id", msg.value("id", json(nullptr))},
@@ -503,6 +548,7 @@ void McpHttpTransport::handle_client(int client_fd) {
         if (response.is_null()) {
             send_http_response(client_fd, 202, "application/json",
                                R"({"accepted":true})");
+            log_response(202);
             return;
         }
 
@@ -516,6 +562,7 @@ void McpHttpTransport::handle_client(int client_fd) {
         }
         send_http_response(client_fd, 200, "application/json",
                            response.dump(), session_hdr);
+        log_response(200);
         return;
     }
 
@@ -526,7 +573,7 @@ void McpHttpTransport::handle_client(int client_fd) {
 
             {
                 std::lock_guard<std::mutex> lk(session_mutex_);
-                mcp_http_log(fmt::format("Session terminated: {}", session_id_));
+                LOG_INFO_M(log::Module::Mcp, "http: session terminated {}", session_id_);
                 session_id_.clear();
             }
 
@@ -537,6 +584,7 @@ void McpHttpTransport::handle_client(int client_fd) {
             send_http_response(client_fd, 200, "application/json",
                                R"({"status":"ok","message":"Session management disabled"})");
         }
+        log_response(200);
         return;
     }
 
@@ -547,6 +595,7 @@ void McpHttpTransport::handle_client(int client_fd) {
     if (req.path == "/mcp" && req.method == "GET") {
         send_http_response(client_fd, 405, "application/json",
                            R"({"error":"Server-initiated SSE not supported. Use POST /mcp for all interactions."})");
+        log_response(405);
         return;
     }
 
@@ -554,12 +603,14 @@ void McpHttpTransport::handle_client(int client_fd) {
     if (req.path == "/sse" || req.path == "/messages") {
         send_http_response(client_fd, 404, "application/json",
                            R"({"error":"Legacy SSE transport removed. Use POST /mcp (Streamable HTTP, MCP 2025-03-26+)."})");
+        log_response(404);
         return;
     }
 
     // Unknown path
     send_http_response(client_fd, 404, "application/json",
                        R"({"error":"Not Found"})");
+    log_response(404);
 }
 
 }  // namespace tenet

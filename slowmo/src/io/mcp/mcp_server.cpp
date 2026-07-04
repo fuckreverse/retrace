@@ -4,6 +4,7 @@
 
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "common/logger.h"
 
 #include <fmt/core.h>
 
@@ -21,14 +22,27 @@ static constexpr const char* MCP_PROTOCOL_VERSION = "2025-03-26";
 static constexpr const char* MCP_SERVER_NAME = "tenet-trace-analyzer";
 static constexpr const char* MCP_SERVER_VERSION = "1.0.0";
 
-// ─── Helper: log to stderr ────────────────────────────────────────────────
+// ─── Helper: log to the Mcp module ─────────────────────────────────────────
+//
+// All MCP diagnostics go through the shared tenet::log system (module=Mcp)
+// so they can be filtered with TENET_LOG_MODULES=mcp and are visible in the
+// GUI's Output panel. stderr is never touched by JSON-RPC framing (stdout
+// only), so this cannot corrupt the protocol stream.
 
-static void mcp_log(const std::string& msg) {
+// Compact one-line summary of a JSON value for logging (never dumps large
+// payloads — keeps request logs greppable and cheap even at Info level).
+static std::string json_brief(const json& j, size_t max_len = 200) {
+    std::string s;
     try {
-        fmt::print(stderr, "[tenet-mcp] {}\n", msg);
+        s = j.dump();
     } catch (...) {
-        // stderr may be closed (e.g. parent process / pipe gone) — ignore.
+        return "<unprintable>";
     }
+    if (s.size() > max_len) {
+        s.resize(max_len);
+        s += "...";
+    }
+    return s;
 }
 
 // ─── McpStdioTransport ───────────────────────────────────────────────────
@@ -37,7 +51,7 @@ McpStdioTransport::McpStdioTransport(MessageHandler handler)
     : handler_(std::move(handler)) {}
 
 void McpStdioTransport::run() {
-    mcp_log("Waiting for JSON-RPC messages on stdin...");
+    LOG_INFO_M(log::Module::Mcp, "stdio transport: waiting for JSON-RPC messages on stdin...");
 
     std::string line;
     while (running_.load() && std::getline(std::cin, line)) {
@@ -46,8 +60,10 @@ void McpStdioTransport::run() {
         json response;
         try {
             json msg = json::parse(line);
+            LOG_TRACE_M(log::Module::Mcp, "stdio recv: {}", json_brief(msg));
             response = handler_(msg);
         } catch (const json::parse_error& e) {
+            LOG_WARN_M(log::Module::Mcp, "stdio: JSON parse error: {}", e.what());
             response = {
                 {"jsonrpc", "2.0"},
                 {"id", nullptr},
@@ -58,11 +74,12 @@ void McpStdioTransport::run() {
         // Notifications get null response — don't send
         if (response.is_null()) continue;
 
+        LOG_TRACE_M(log::Module::Mcp, "stdio send: {}", json_brief(response));
         std::cout << response.dump() << "\n";
         std::cout.flush();
     }
 
-    mcp_log("Transport closed (stdin EOF).");
+    LOG_INFO_M(log::Module::Mcp, "stdio transport closed (stdin EOF).");
 }
 
 void McpStdioTransport::stop() {
@@ -82,7 +99,8 @@ TenetMcpService::TenetMcpService(TraceReader& reader,
       pm_(pm), code_table_(code_table), decoder_(decoder) {
 
     register_all_tools();
-    mcp_log(fmt::format("Registered {} MCP tools", tool_schemas_.size()));
+    LOG_INFO_M(log::Module::Mcp, "service initialized: {} tools registered ({} write tools)",
+               tool_schemas_.size(), write_tools_.size());
 }
 
 TenetMcpService::~TenetMcpService() {
@@ -95,17 +113,17 @@ void TenetMcpService::register_tool(McpToolSchema schema, McpToolHandler handler
 }
 
 void TenetMcpService::run() {
-    mcp_log(fmt::format("tenet-mcp server v{} starting...", MCP_SERVER_VERSION));
-    mcp_log(fmt::format("Protocol: MCP {}", MCP_PROTOCOL_VERSION));
-    mcp_log(fmt::format("Tools loaded: {}", tool_schemas_.size()));
-    mcp_log(fmt::format("Trace: {} instructions", index_.inst_count()));
+    LOG_INFO_M(log::Module::Mcp,
+               "tenet-mcp server v{} starting (protocol {}, {} tools, {} instructions, stdio)",
+               MCP_SERVER_VERSION, MCP_PROTOCOL_VERSION, tool_schemas_.size(), index_.inst_count());
 
     stdio_transport_ = std::make_unique<McpStdioTransport>(
         [this](const json& msg) -> json { return process_message(msg); }
     );
     stdio_transport_->run();
 
-    mcp_log("tenet-mcp server exiting.");
+    LOG_INFO_M(log::Module::Mcp, "tenet-mcp server exiting (handled {} tool calls).",
+               tool_call_count_.load(std::memory_order_relaxed));
 }
 
 bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
@@ -120,8 +138,15 @@ bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
     http_transport_->set_require_session(cfg.require_session);
     bool ok = http_transport_->start();
     if (ok) {
-        mcp_log(fmt::format("Streamable HTTP server started on {}:{} (session: {})",
-                            cfg.host, cfg.port, cfg.require_session ? "required" : "disabled"));
+        LOG_INFO_M(log::Module::Mcp,
+                   "Streamable HTTP server started on {}:{} (session: {}, auth: {}, {} tools)",
+                   cfg.host, http_transport_->listening_port(),
+                   cfg.require_session ? "required" : "disabled",
+                   cfg.username.empty() ? "disabled" : "enabled",
+                   tool_schemas_.size());
+    } else {
+        LOG_ERROR_M(log::Module::Mcp, "failed to start Streamable HTTP server on {}:{}",
+                    cfg.host, cfg.port);
     }
     return ok;
 }
@@ -129,7 +154,8 @@ bool TenetMcpService::start_http(const McpHttpConfig& cfg) {
 void TenetMcpService::stop_http() {
     if (http_transport_) {
         http_transport_->stop();
-        mcp_log("HTTP server stopped.");
+        LOG_INFO_M(log::Module::Mcp, "HTTP server stopped (handled {} tool calls).",
+                   tool_call_count_.load(std::memory_order_relaxed));
     }
 }
 
@@ -153,12 +179,17 @@ json TenetMcpService::process_message(const json& msg) {
     // Notifications (no id) — no response
     if (msg_id.is_null() && !msg.contains("id")) {
         if (method == "notifications/initialized") {
-            mcp_log("Client initialized.");
+            LOG_INFO_M(log::Module::Mcp, "client initialized (handshake complete)");
+        } else {
+            LOG_DEBUG_M(log::Module::Mcp, "notification: {}", method);
         }
         return nullptr;
     }
 
     if (method == "initialize") {
+        auto client_info = msg.value("params", json::object()).value("clientInfo", json::object());
+        LOG_INFO_M(log::Module::Mcp, "initialize: client={} version={}",
+                   client_info.value("name", "?"), client_info.value("version", "?"));
         return {
             {"jsonrpc", "2.0"},
             {"id", msg_id},
@@ -176,6 +207,9 @@ json TenetMcpService::process_message(const json& msg) {
     }
 
     if (method == "tools/list") {
+        // High-frequency / low-signal — Debug only to avoid drowning out
+        // actual tool-call activity at the default Info level.
+        LOG_DEBUG_M(log::Module::Mcp, "tools/list: returning {} tools", tool_schemas_.size());
         json tools_arr = json::array();
         for (const auto& schema : tool_schemas_) {
             tools_arr.push_back({
@@ -198,6 +232,7 @@ json TenetMcpService::process_message(const json& msg) {
 
         auto it = tool_handlers_.find(tool_name);
         if (it == tool_handlers_.end()) {
+            LOG_WARN_M(log::Module::Mcp, "tools/call {}: unknown tool", tool_name);
             json error_result = {{"error", "Unknown tool: " + tool_name}};
             return {
                 {"jsonrpc", "2.0"},
@@ -209,9 +244,18 @@ json TenetMcpService::process_message(const json& msg) {
             };
         }
 
-        try {
-            tool_call_count_.fetch_add(1, std::memory_order_relaxed);
+        // ── Request-lifecycle logging ────────────────────────────────────
+        // Principle: every tool call gets exactly one start line (Debug, with
+        // the argument summary) and exactly one end line (Info, with outcome
+        // + timing). This is enough to answer "what is the MCP server doing
+        // right now / how long did X take" without flooding stderr — no
+        // per-line dumps of large results, no logging inside hot loops.
+        int seq = tool_call_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_DEBUG_M(log::Module::Mcp, "tools/call #{} {} args={}",
+                    seq, tool_name, json_brief(arguments));
+        auto t0 = TENET_TIMER_START();
 
+        try {
             // Concurrency: write tools (hypothesis_*) acquire exclusive lock;
             // all other tools acquire shared lock for parallel execution.
             json result;
@@ -230,6 +274,8 @@ json TenetMcpService::process_message(const json& msg) {
             }
 
             std::string text = result.dump(2);
+            LOG_INFO_M(log::Module::Mcp, "tools/call #{} {} OK  {:.1f}ms  result={}B",
+                       seq, tool_name, TENET_TIMER_MS(t0), text.size());
             return {
                 {"jsonrpc", "2.0"},
                 {"id", msg_id},
@@ -239,8 +285,9 @@ json TenetMcpService::process_message(const json& msg) {
                 }}
             };
         } catch (const PassNotReady& e) {
-            mcp_log(fmt::format("Tool {} pass not ready: {} ({:.0f}%)",
-                                tool_name, e.pass_name, e.progress * 100));
+            LOG_INFO_M(log::Module::Mcp,
+                       "tools/call #{} {} PENDING  {:.1f}ms  pass='{}' progress={:.0f}%",
+                       seq, tool_name, TENET_TIMER_MS(t0), e.pass_name, e.progress * 100);
             json retry_info = {
                 {"status",         "processing"},
                 {"pass",           e.pass_name},
@@ -260,7 +307,8 @@ json TenetMcpService::process_message(const json& msg) {
                 }}
             };
         } catch (const std::exception& e) {
-            mcp_log(fmt::format("Tool {} error: {}", tool_name, e.what()));
+            LOG_WARN_M(log::Module::Mcp, "tools/call #{} {} FAILED  {:.1f}ms  error={}",
+                       seq, tool_name, TENET_TIMER_MS(t0), e.what());
             json error_result = {{"error", e.what()}};
             return {
                 {"jsonrpc", "2.0"},
@@ -274,9 +322,12 @@ json TenetMcpService::process_message(const json& msg) {
     }
 
     if (method == "ping") {
+        // Pure liveness probe, often on a timer — Trace only.
+        LOG_TRACE_M(log::Module::Mcp, "ping");
         return {{"jsonrpc", "2.0"}, {"id", msg_id}, {"result", json::object()}};
     }
 
+    LOG_WARN_M(log::Module::Mcp, "unknown method: {}", method);
     return {
         {"jsonrpc", "2.0"},
         {"id", msg_id},

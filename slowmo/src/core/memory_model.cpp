@@ -202,13 +202,13 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         // Data already in RocksDB from last run. Just load page activity cache.
         // We still need to scan the CF for page activity (or load from a cached key).
         // For now, mark built and let active_pages() do lazy scan if needed.
-        LOG_INFO("MemoryModel: using persisted data from previous session (skip rebuild)");
+        LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel: using persisted data from previous session (skip rebuild)");
         built_ = true;
         return;
     }
 
     const uint64_t total_insts = index_.inst_count();
-    LOG_INFO("MemoryModel::build: starting full trace scan ({} instructions, {})",
+    LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build: starting full trace scan ({} instructions, {})",
              total_insts, has_rocksdb_ ? "RocksDB" : "in-memory");
 
     if (!has_rocksdb_) {
@@ -246,7 +246,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                 }
                 inst_id++;
                 if ((inst_id & 0xFFFFF) == 0) {  // every ~1M instructions
-                    LOG_INFO("MemoryModel::build (in-memory): {}/{}  ({:.0f}%)",
+                    LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build (in-memory): {}/{}  ({:.0f}%)",
                              inst_id, total_insts,
                              100.0 * static_cast<double>(inst_id) / static_cast<double>(total_insts));
                     if (progress_fn) progress_fn(inst_id, total_insts);
@@ -279,7 +279,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                   });
         page_activity_cached_ = true;
 
-        LOG_INFO("MemoryModel::build: complete (in-memory, {} instructions, {} pages)",
+        LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build: complete (in-memory, {} instructions, {} pages)",
                  inst_id, page_activity_cache_.size());
 
         built_ = true;
@@ -346,7 +346,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         }
     }
 
-    LOG_INFO("MemoryModel::build: {} shards, {} anchors", num_shards, num_anchors);
+    LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build: {} shards, {} anchors", num_shards, num_anchors);
 
     // ── Per-shard result container ──────────────────────────────────────
     struct ShardResult {
@@ -541,7 +541,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             if (!s.ok()) { result.error = s.ToString(); return; }
         }
 
-        LOG_DEBUG("MemoryModel shard {}: {} insts, {} writes, {} write SSTs, {} read SSTs",
+        LOG_DEBUG_M(::tenet::log::Module::Core, "MemoryModel shard {}: {} insts, {} writes, {} write SSTs, {} read SSTs",
                   shard_idx, result.insts_scanned, result.writes_persisted,
                   result.write_ssts.size(), result.read_ssts.size());
     };
@@ -564,7 +564,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             while (progress_insts.load(std::memory_order_relaxed) < total_insts) {
                 uint64_t done = progress_insts.load(std::memory_order_relaxed);
                 progress_fn(done, total_insts);
-                LOG_INFO("MemoryModel::build (parallel): {}/{}  ({:.0f}%)",
+                LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build (parallel): {}/{}  ({:.0f}%)",
                          done, total_insts,
                          100.0 * static_cast<double>(done) / static_cast<double>(total_insts));
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -581,7 +581,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         if (!r.error.empty()) {
             std::error_code ec;
             std::filesystem::remove_all(sst_dir, ec);
-            LOG_ERROR("MemoryModel::build shard failed: {}", r.error);
+            LOG_ERROR_M(::tenet::log::Module::Core, "MemoryModel::build shard failed: {}", r.error);
             built_ = true;  // mark built to prevent retry loops
             return;
         }
@@ -616,13 +616,13 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
         auto s = ingest_cf(mem_cf_,
                            [](ShardResult& r) -> auto& { return r.write_ssts; });
         if (!s.ok()) {
-            LOG_ERROR("MemoryModel::build: ingest mem_write failed: {}", s.ToString());
+            LOG_ERROR_M(::tenet::log::Module::Core, "MemoryModel::build: ingest mem_write failed: {}", s.ToString());
         }
 
         s = ingest_cf(mem_read_cf_,
                       [](ShardResult& r) -> auto& { return r.read_ssts; });
         if (!s.ok()) {
-            LOG_ERROR("MemoryModel::build: ingest mem_read failed: {}", s.ToString());
+            LOG_ERROR_M(::tenet::log::Module::Core, "MemoryModel::build: ingest mem_read failed: {}", s.ToString());
         }
     }
 
@@ -649,7 +649,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             if (cf) {
                 auto cs = db_->CompactRange(cro, cf, nullptr, nullptr);
                 if (!cs.ok()) {
-                    LOG_WARN("MemoryModel CompactRange failed: {}", cs.ToString());
+                    LOG_WARN_M(::tenet::log::Module::Core, "MemoryModel CompactRange failed: {}", cs.ToString());
                 }
             }
         };
@@ -663,7 +663,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
             compact_cf(mem_read_cf_);
         }
 
-        LOG_INFO("MemoryModel::build: compaction complete");
+        LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build: compaction complete");
     }
 
     // ── Phase 3: Merge page activity from all shards ────────────────────
@@ -700,7 +700,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
     // Opt #1: Write sentinel so next session skips rebuild
     write_persisted_sentinel();
 
-    LOG_INFO("MemoryModel::build: complete ({} instructions, {} writes persisted, "
+    LOG_INFO_M(::tenet::log::Module::Core, "MemoryModel::build: complete ({} instructions, {} writes persisted, "
              "{} pages, {} shards)",
              total_insts, total_writes_persisted,
              page_activity_cache_.size(), num_shards);
