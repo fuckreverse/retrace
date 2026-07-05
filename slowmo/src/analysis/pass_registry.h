@@ -68,13 +68,18 @@ struct PassRunCtx {
     /// traces where unbounded RAM usage is acceptable.  Default: false (capped).
     bool function_full_mode = false;
 
-    // ── VM Abstract ──────────────────────────────────────────────────────
-    // vm_abstract is entirely hint-driven — it never scans the trace looking
-    // for "VM-shaped" loops. Product surfaces must supply static-analysis
-    // hints. Path to a JSON hints file (see
-    // analysis/passes/vm/vm_hints_json.h for the schema). Empty = no
-    // file-based hints (registration will fail via create_pass_by_name()).
-    std::string vm_hints_file;
+// ── VM Abstract ──────────────────────────────────────────────────────
+// vm_abstract is entirely hint-driven — it never scans the trace looking
+// for "VM-shaped" loops. Product surfaces must supply static-analysis
+// hints. Path to a JSON hints file (see
+// analysis/passes/vm/vm_hints_json.h for the schema). Empty = no
+// file-based hints (registration will fail via create_pass_by_name()).
+std::string vm_hints_file;
+// module_slide of the currently-open trace, used to rebase vm_hints_file's
+// IDA-displayed PC fields (dispatcher_pc, handler_entry_pcs, ...) to
+// runtime addresses — same convention as the MCP `vm_abstract` tool. See
+// analysis/passes/vm/vm_hints_json.h for the address-convention details.
+uint64_t vm_hints_module_slide = 0;
 };
 
 // ─── Catalog ───────────────────────────────────────────────────────────────

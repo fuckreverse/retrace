@@ -220,7 +220,8 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
         // prompt the user for hints instead).
         VMConfig cfg;
         if (!ctx.vm_hints_file.empty()) {
-            if (!load_vm_hints_from_json(ctx.vm_hints_file, cfg)) {
+            if (!load_vm_hints_from_json(ctx.vm_hints_file, cfg,
+                                         ctx.vm_hints_module_slide, kDefaultIdaImageBase)) {
                 return nullptr;
             }
         }

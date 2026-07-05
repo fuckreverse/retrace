@@ -16,6 +16,16 @@ uint64_t parse_hex_str(const std::string& s) {
     return std::stoull(s, nullptr, 16);
 }
 
+/// Converts an IDA-displayed address into a runtime address:
+///   runtime_pc = displayed_pc - image_base + module_slide
+/// (see the address-convention comment in vm_hints_json.h). A no-op when
+/// image_base == 0 (the default), preserving old behavior for callers/tests
+/// that pass raw runtime addresses directly.
+uint64_t rebase_hint_pc(uint64_t displayed_pc, uint64_t module_slide, uint64_t image_base) {
+    if (image_base == 0) return displayed_pc;
+    return displayed_pc - image_base + module_slide;
+}
+
 uint8_t parse_reg_field(const json& v) {
     if (v.is_number()) return static_cast<uint8_t>(v.get<int>());
     std::string s = v.get<std::string>();
@@ -41,7 +51,8 @@ OpcodeDeobfStep::Op parse_deobf_op(const std::string& s) {
 
 }  // namespace
 
-bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
+bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
+                             uint64_t module_slide, uint64_t image_base) {
     std::ifstream f(path);
     if (!f.good()) {
         fmt::print(stderr, "Error: VM hints file not found: {}\n", path);
@@ -55,15 +66,25 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
         return false;
     }
 
+    // Shorthand: parse a hex PC string field and rebase it (IDA-displayed ->
+    // runtime). See rebase_hint_pc() / the address-convention comment above.
+    auto rebase = [&](uint64_t displayed_pc) {
+        return rebase_hint_pc(displayed_pc, module_slide, image_base);
+    };
+
     try {
         if (j.contains("dispatcher_pc")) {
             DispatcherHint dh;
-            dh.loop_header_pc = parse_hex_str(j["dispatcher_pc"].get<std::string>());
+            dh.loop_header_pc = rebase(parse_hex_str(j["dispatcher_pc"].get<std::string>()));
             if (j.contains("indirect_branch_pc")) {
-                dh.indirect_branch_pc = parse_hex_str(j["indirect_branch_pc"].get<std::string>());
+                dh.indirect_branch_pc = rebase(parse_hex_str(j["indirect_branch_pc"].get<std::string>()));
             }
             // Memory-write anchor (alternative to loop_header_pc for
-            // heavily CFF-obfuscated VMs — see DispatcherHint docs)
+            // heavily CFF-obfuscated VMs — see DispatcherHint docs). Unlike
+            // the other PC fields, this is already documented as a runtime
+            // address (derived from an observed heap pointer at
+            // hint-authoring time), so it is NOT rebased — matches the MCP
+            // tool's handling of mem_anchor_addr.
             if (j.contains("mem_anchor_addr")) {
                 dh.mem_anchor_addr = parse_hex_str(j["mem_anchor_addr"].get<std::string>());
             }
@@ -75,7 +96,7 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
 
         if (j.contains("handler_entry_pcs")) {
             for (const auto& pc_str : j["handler_entry_pcs"]) {
-                cfg.handler_entry_pcs.push_back(parse_hex_str(pc_str.get<std::string>()));
+                cfg.handler_entry_pcs.push_back(rebase(parse_hex_str(pc_str.get<std::string>())));
             }
         }
 
@@ -90,7 +111,7 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
         }
         if (j.contains("threaded_dispatch_pcs")) {
             for (const auto& pc_str : j["threaded_dispatch_pcs"]) {
-                cfg.threaded_dispatch_pcs.push_back(parse_hex_str(pc_str.get<std::string>()));
+                cfg.threaded_dispatch_pcs.push_back(rebase(parse_hex_str(pc_str.get<std::string>())));
             }
         }
 
@@ -98,7 +119,7 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
             VMPCHint vph;
             vph.reg = parse_reg_field(j["vm_pc_reg"]);
             if (j.contains("bytecode_base")) {
-                vph.bytecode_base = parse_hex_str(j["bytecode_base"].get<std::string>());
+                vph.bytecode_base = rebase(parse_hex_str(j["bytecode_base"].get<std::string>()));
             }
             cfg.vm_pc = vph;
         }
@@ -207,9 +228,15 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg) {
         }
 
         if (j.contains("handler_names") && j["handler_names"].is_object()) {
+            // Unlike handler_asm_map (keyed by static PC, rebased by the UI
+            // when displaying), handler_names keys are looked up directly
+            // against VMHandler::entry_pc (a runtime address collected from
+            // the trace) in VMAbstractPass — so they must be rebased here
+            // just like dispatcher_pc/handler_entry_pcs, or an IDA-address
+            // handler_names map will simply never match anything.
             for (auto& [pc_str, name] : j["handler_names"].items()) {
                 if (name.is_string()) {
-                    cfg.handler_names[parse_hex_str(pc_str)] = name.get<std::string>();
+                    cfg.handler_names[rebase(parse_hex_str(pc_str))] = name.get<std::string>();
                 }
             }
         }

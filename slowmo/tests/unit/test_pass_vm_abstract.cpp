@@ -2347,6 +2347,79 @@ TEST_CASE("load_vm_hints_from_json parses handler_entry_pcs list",
     CHECK(cfg.handler_entry_pcs[2] == 0x4000);
 }
 
+// ─── load_vm_hints_from_json() address rebase (module_slide/image_base) ──────
+//
+// Regression coverage for the IDA-displayed-address convention: hints files
+// authored by copying addresses straight out of IDA (image_base 0x100000000)
+// must resolve to the correct runtime PC once module_slide is known — same
+// convention as the MCP `vm_abstract` tool's hints_file handling. Before this
+// was fixed, load_vm_hints_from_json() (used by the GUI's "Load Hints" and
+// the CLI's --vm-hints) took the JSON value as a raw runtime address with no
+// conversion, which silently produced "hinted PC was never executed" for any
+// hints file that worked fine through the MCP tool.
+
+TEST_CASE("load_vm_hints_from_json rebases dispatcher_pc from IDA address to runtime address",
+          "[unit][pass][vm_abstract][hints][json][rebase]") {
+    // IDA-displayed dispatcher_pc = image_base (0x100000000) + 0x8eaf60.
+    // With module_slide = 0x1000000000 (some ASLR-loaded runtime base), the
+    // resulting runtime PC should be slide + 0x8eaf60.
+    TempJsonFile f(R"({
+        "dispatcher_pc": "0x1008eaf60",
+        "indirect_branch_pc": "0x1008eaf70"
+    })");
+    VMConfig cfg;
+    uint64_t module_slide = 0x1000000000ULL;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg, module_slide, kDefaultIdaImageBase));
+    REQUIRE(cfg.dispatcher.has_value());
+    CHECK(cfg.dispatcher->loop_header_pc == module_slide + 0x8eaf60ULL);
+    CHECK(cfg.dispatcher->indirect_branch_pc == module_slide + 0x8eaf70ULL);
+}
+
+TEST_CASE("load_vm_hints_from_json rebases handler_entry_pcs and handler_names",
+          "[unit][pass][vm_abstract][hints][json][rebase]") {
+    TempJsonFile f(R"({
+        "handler_entry_pcs": ["0x100002000", "0x100003000"],
+        "handler_names": {"0x100002000": "ADD", "0x100003000": "SUB"}
+    })");
+    VMConfig cfg;
+    uint64_t module_slide = 0x2000000000ULL;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg, module_slide, kDefaultIdaImageBase));
+    REQUIRE(cfg.handler_entry_pcs.size() == 2);
+    CHECK(cfg.handler_entry_pcs[0] == module_slide + 0x2000ULL);
+    CHECK(cfg.handler_entry_pcs[1] == module_slide + 0x3000ULL);
+    REQUIRE(cfg.handler_names.count(module_slide + 0x2000ULL) == 1);
+    CHECK(cfg.handler_names.at(module_slide + 0x2000ULL) == "ADD");
+    REQUIRE(cfg.handler_names.count(module_slide + 0x3000ULL) == 1);
+    CHECK(cfg.handler_names.at(module_slide + 0x3000ULL) == "SUB");
+}
+
+TEST_CASE("load_vm_hints_from_json does not rebase mem_anchor_addr (already runtime)",
+          "[unit][pass][vm_abstract][hints][json][rebase]") {
+    TempJsonFile f(R"({
+        "dispatcher_pc": "0x100001000",
+        "mem_anchor_addr": "0x2000000abc",
+        "mem_anchor_size": 4
+    })");
+    VMConfig cfg;
+    uint64_t module_slide = 0x2000000000ULL;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg, module_slide, kDefaultIdaImageBase));
+    REQUIRE(cfg.dispatcher.has_value());
+    CHECK(cfg.dispatcher->loop_header_pc == module_slide + 0x1000ULL);
+    // mem_anchor_addr passes through unchanged regardless of module_slide/image_base.
+    CHECK(cfg.dispatcher->mem_anchor_addr == 0x2000000abcULL);
+}
+
+TEST_CASE("load_vm_hints_from_json default image_base=0 leaves addresses unrebased",
+          "[unit][pass][vm_abstract][hints][json][rebase]") {
+    // Backward-compat: callers/tests that don't pass module_slide/image_base
+    // get the raw JSON values verbatim (image_base defaults to 0 == no-op).
+    TempJsonFile f(R"({ "dispatcher_pc": "0x1000" })");
+    VMConfig cfg;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
+    REQUIRE(cfg.dispatcher.has_value());
+    CHECK(cfg.dispatcher->loop_header_pc == 0x1000);
+}
+
 TEST_CASE("load_vm_hints_from_json parses dispatch_type and threaded_dispatch_pcs",
           "[unit][pass][vm_abstract][hints][json]") {
     TempJsonFile f(R"({

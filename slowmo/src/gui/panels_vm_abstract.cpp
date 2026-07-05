@@ -1015,14 +1015,29 @@ void GuiApp::render_vm_workspace() {
     render_vmws_memaccess_panel();
 }
 
+// ─── push_vm_hints_recent ───────────────────────────────────────────────────
+// Records `path` at the front of the MRU list (de-duplicating), capped at 8
+// entries. Process-lifetime only (not persisted) since hints files are
+// tightly coupled to a specific binary/trace analysis session.
+void GuiApp::push_vm_hints_recent(const std::string& path) {
+    if (path.empty()) return;
+    auto it = std::find(vm_hints_recent_.begin(), vm_hints_recent_.end(), path);
+    if (it != vm_hints_recent_.end()) vm_hints_recent_.erase(it);
+    vm_hints_recent_.insert(vm_hints_recent_.begin(), path);
+    if (vm_hints_recent_.size() > 8) vm_hints_recent_.resize(8);
+}
+
 // ─── render_vm_hints_input ────────────────────────────────────────────────
 //
 // vm_abstract is entirely hint-driven (see VMConfig's class comment in
 // vm_abstract_pass.h) — dispatcher location, VM-PC, dispatch topology, and
 // architecture type are all static facts that must come from IDA/Ghidra.
 // This widget renders:
-//   - a text input for the hints JSON file path (same schema as the MCP
-//     `vm_abstract` tool's `hints_file` argument),
+//   - a big drag-and-drop / click-to-browse target for the hints JSON file
+//     (same schema as the MCP `vm_abstract` tool's `hints_file` argument),
+//   - a plain text input as a fallback for typing/pasting a path directly,
+//   - a "recent files" dropdown so switching back to a previously-used
+//     hints file doesn't require re-browsing,
 //   - the primary run/rerun button (label/width customizable by caller),
 //   - a status line reporting load errors / success.
 void GuiApp::render_vm_hints_input(const char* button_label, float button_width) {
@@ -1032,9 +1047,103 @@ void GuiApp::render_vm_hints_input(const char* button_label, float button_width)
         "vm_abstract tool's hints_file schema.");
     ImGui::Spacing();
 
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##vm_hints_path", "Path to hints .json file",
-                              vm_hints_path_buf_, sizeof(vm_hints_path_buf_));
+    // ── Drag & drop / click-to-browse target ────────────────────────────
+    // A visually distinct drop zone: dashed-look border box. Users can
+    // either drag a .json file from Finder onto it, or click it to open
+    // a native file picker (NSOpenPanel on macOS).
+    const float dz_h = 52.0f;
+    ImVec2 dz_pos = ImGui::GetCursorScreenPos();
+    ImVec2 dz_size(ImGui::GetContentRegionAvail().x, dz_h);
+    ImGui::InvisibleButton("##vm_hints_dropzone", dz_size);
+    bool dz_hovered = ImGui::IsItemHovered();
+    bool dz_clicked = ImGui::IsItemClicked();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 dz_bg = dz_hovered
+        ? IM_COL32(40, 60, 90, 200)
+        : IM_COL32(30, 32, 42, 160);
+    ImU32 dz_border = dz_hovered
+        ? IM_COL32(90, 160, 230, 255)
+        : IM_COL32(90, 90, 110, 200);
+    dl->AddRectFilled(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y),
+                       dz_bg, 6.0f);
+    dl->AddRect(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y),
+                dz_border, 6.0f, 0, 1.5f);
+
+    const char* dz_text = vm_hints_path_buf_[0] != '\0'
+        ? vm_hints_path_buf_
+        : ICON_FA_FILE_ARROW_UP "  Drag & drop a hints .json file here, or click to browse";
+    ImVec2 txt_sz = ImGui::CalcTextSize(dz_text);
+    // Clip long paths to the box width instead of overflowing.
+    ImVec2 txt_pos(dz_pos.x + (dz_size.x - txt_sz.x) * 0.5f,
+                    dz_pos.y + (dz_size.y - txt_sz.y) * 0.5f);
+    if (txt_pos.x < dz_pos.x + 8.0f) txt_pos.x = dz_pos.x + 8.0f;
+    ImVec4 txt_col = vm_hints_path_buf_[0] != '\0'
+        ? ImVec4(0.75f, 0.90f, 1.0f, 1.0f)
+        : ImVec4(0.65f, 0.65f, 0.72f, 1.0f);
+    dl->PushClipRect(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y), true);
+    dl->AddText(txt_pos, ImGui::GetColorU32(txt_col), dz_text);
+    dl->PopClipRect();
+
+    if (dz_hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(vm_hints_path_buf_[0] != '\0'
+            ? "Click to choose a different hints file"
+            : "Click to browse for a hints .json file");
+    }
+
+    if (dz_clicked) {
+        std::string picked = pick_file_path(
+            "Choose a VM hints JSON file", {"json"});
+        if (!picked.empty()) {
+            std::snprintf(vm_hints_path_buf_, sizeof(vm_hints_path_buf_),
+                          "%s", picked.c_str());
+            vm_hints_status_.clear();
+        }
+    }
+
+    // Consume a globally-dropped file while this widget is on screen. We
+    // only claim it if the drop happened over our window (best-effort:
+    // ImGui doesn't give per-widget native drop targeting, so any drop
+    // while the hints UI is visible is treated as "for this field" — this
+    // matches user intent in practice since it's the only drop target).
+    if (std::string dropped = take_dropped_file_path(); !dropped.empty()) {
+        std::snprintf(vm_hints_path_buf_, sizeof(vm_hints_path_buf_),
+                      "%s", dropped.c_str());
+        vm_hints_status_.clear();
+    }
+
+    ImGui::Spacing();
+
+    // ── Fallback: plain text input for typing/pasting a path ───────────
+    if (ImGui::TreeNodeEx("Type a path instead", ImGuiTreeNodeFlags_None)) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##vm_hints_path", "Path to hints .json file",
+                                  vm_hints_path_buf_, sizeof(vm_hints_path_buf_));
+        ImGui::TreePop();
+    }
+
+    // ── Recent hints files ───────────────────────────────────────────────
+    if (!vm_hints_recent_.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled(ICON_FA_CLOCK_ROTATE_LEFT "  Recent:");
+        for (size_t i = 0; i < vm_hints_recent_.size(); ++i) {
+            const std::string& p = vm_hints_recent_[i];
+            // Show just the filename to keep the row compact; full path in tooltip.
+            size_t slash = p.find_last_of('/');
+            std::string short_name = (slash == std::string::npos) ? p : p.substr(slash + 1);
+            ImGui::SameLine();
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton(short_name.c_str())) {
+                std::snprintf(vm_hints_path_buf_, sizeof(vm_hints_path_buf_),
+                              "%s", p.c_str());
+                vm_hints_status_.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+            ImGui::PopID();
+        }
+    }
+
     ImGui::Spacing();
 
     bool can_run = vm_hints_path_buf_[0] != '\0';
@@ -1042,6 +1151,7 @@ void GuiApp::render_vm_hints_input(const char* button_label, float button_width)
     ImGui::BeginDisabled(!can_run);
     if (ImGui::Button(button_label, ImVec2(button_width, 0))) {
         run_vm_abstract_with_hints();
+        push_vm_hints_recent(vm_hints_path_buf_);
     }
     ImGui::EndDisabled();
     if (!can_run && ImGui::IsItemHovered()) {
@@ -1055,8 +1165,67 @@ void GuiApp::render_vm_hints_input(const char* button_label, float button_width)
 
     if (!vm_hints_status_.empty()) {
         ImGui::Spacing();
-        ImGui::TextWrapped("%s", vm_hints_status_.c_str());
+        // Color the status line by outcome so a failed/empty detection
+        // (e.g. "0 handlers") is visually distinct from a real success —
+        // the status text itself is tagged with an icon prefix by
+        // run_vm_abstract_with_hints() (warning/error/check/spinner).
+        ImVec4 col(0.85f, 0.85f, 0.85f, 1.0f);
+        if (vm_hints_status_.rfind(ICON_FA_TRIANGLE_EXCLAMATION, 0) == 0)
+            col = ImVec4(1.0f, 0.80f, 0.30f, 1.0f);       // warning: empty/no-VM result
+        else if (vm_hints_status_.rfind(ICON_FA_CIRCLE_XMARK, 0) == 0)
+            col = ImVec4(0.95f, 0.40f, 0.40f, 1.0f);       // error: pass failed / bad file
+        else if (vm_hints_status_.rfind(ICON_FA_CIRCLE_CHECK, 0) == 0)
+            col = ImVec4(0.45f, 0.90f, 0.55f, 1.0f);       // success
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(col, "%s", vm_hints_status_.c_str());
+        ImGui::PopTextWrapPos();
     }
+}
+
+// ─── render_vm_hints_popup ───────────────────────────────────────────────────
+// The shallow entry point for VM Abstract, opened directly from the main
+// toolbar's "VM Hints..." / "VM Workspace" button group. This avoids the
+// old flow of: Analysis menu > Reverse Eng / VM > VM Abstract Analysis >
+// (find the collapsed "VM Hints" header) > load hints > Run > Open Workspace.
+//
+// Instead: toolbar click → this popup → load hints (drag/drop or browse) →
+// Run → "Open VM Workspace" appears right here once a result exists.
+void GuiApp::render_vm_hints_popup() {
+    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse;
+
+    if (!ImGui::Begin(ICON_FA_MICROCHIP "  VM Hints##vm_hints_popup",
+                      &show_vm_hints_popup_, flags)) {
+        ImGui::End();
+        return;
+    }
+
+    if (vm_abstract_result_) {
+        const auto& d = vm_abstract_result_->dispatcher;
+        bool detected = (d.loop_header_pc != 0 || !vm_abstract_result_->handlers.empty());
+        if (detected) {
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f),
+                ICON_FA_CIRCLE_CHECK "  VM Detected — %zu handlers, %llu steps",
+                vm_abstract_result_->handlers.size(),
+                (unsigned long long)vm_abstract_result_->total_vm_steps);
+        } else {
+            ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),
+                ICON_FA_CIRCLE_XMARK "  Ran, but no VM dispatcher found");
+        }
+        ImGui::Spacing();
+        if (ImGui::Button(ICON_FA_UP_RIGHT_FROM_SQUARE "  Open VM Workspace",
+                          ImVec2(-1, 0))) {
+            vm_ws_open_          = true;
+            vm_ws_first_frame_   = true;
+            show_vm_hints_popup_ = false;
+        }
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+
+    render_vm_hints_input(ICON_FA_PLAY "  Run VM Detection", -1.0f);
+
+    ImGui::End();
 }
 
 // ─── render_vm_abstract_panel (legacy single-panel) ─────────────────────────

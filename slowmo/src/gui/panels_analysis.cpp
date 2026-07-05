@@ -700,8 +700,15 @@ void GuiApp::run_vm_abstract_with_hints() {
 
     // Build the VMConfig up front so we can validate hints before touching
     // any pass-manager state.
+    //
+    // Hint addresses in the JSON file are IDA-displayed addresses (see the
+    // address-convention comment in vm_hints_json.h) — same convention as
+    // the MCP `vm_abstract` tool's hints_file. Rebase them to this trace's
+    // runtime addresses via module_slide so a hints file authored against
+    // IDA works here without the user doing the +slide arithmetic by hand.
     VMConfig vm_cfg;
-    if (!load_vm_hints_from_json(hints_path, vm_cfg)) {
+    uint64_t module_slide = reader_.header().module_slide;
+    if (!load_vm_hints_from_json(hints_path, vm_cfg, module_slide, kDefaultIdaImageBase)) {
         vm_hints_status_ = fmt::format("Failed to load hints file: {}", hints_path);
         last_pass_status_ = "vm_abstract: invalid hints file";
         return;
@@ -731,15 +738,43 @@ void GuiApp::run_vm_abstract_with_hints() {
     tenet::register_pass_by_name(*pass_manager_, "loop");
     pass_manager_->register_pass(std::make_unique<VMAbstractPass>(std::move(vm_cfg)));
 
-    vm_hints_status_ = fmt::format("Hints loaded from {}", hints_path);
+    vm_hints_status_ = fmt::format(ICON_FA_SPINNER "  Running vm_abstract with hints from {}...",
+                                    hints_path);
 
     enqueue_async("vm_abstract", [this]() {
         auto& raw = pass_manager_->require("vm_abstract");
         std::string summary = tenet::summarize_pass_result("vm_abstract", raw);
+        // The pass reports WHY a hint didn't produce a usable result (bad
+        // address, hit count too low, dispatcher found but 0 handlers, ...)
+        // via ctx.progress(1.0f, <explanation>). Surface that here instead
+        // of just the bare "dispatcher: 0x0, 0 handlers, 0 steps" summary —
+        // that number alone doesn't tell the user whether the hint address
+        // was wrong, never executed, or matched too few times. The same
+        // detail is also always logged at WARN/INFO level (see
+        // vm_abstract_pass.cpp) so it's visible in the Log panel too.
+        std::string detail = pass_manager_->progress_msg_of("vm_abstract");
         bool ok = raw.ok();
-        post_apply([this, summary, ok]() {
+        post_apply([this, summary, detail, ok]() {
             last_pass_status_ = fmt::format("vm_abstract: {}", summary);
-            if (ok) apply_pass_result_pointers("vm_abstract");
+            if (ok) {
+                apply_pass_result_pointers("vm_abstract");
+                bool empty_result = !vm_abstract_result_ ||
+                    (vm_abstract_result_->dispatcher.loop_header_pc == 0 &&
+                     vm_abstract_result_->handlers.empty());
+                if (empty_result && !detail.empty()) {
+                    // No handlers/dispatcher found — show the pass's own
+                    // explanation (why) instead of a bare "0 handlers".
+                    vm_hints_status_ = fmt::format(
+                        ICON_FA_TRIANGLE_EXCLAMATION "  {}", detail);
+                } else {
+                    vm_hints_status_ = fmt::format(
+                        ICON_FA_CIRCLE_CHECK "  {}",
+                        !detail.empty() ? detail : summary);
+                }
+            } else {
+                vm_hints_status_ = fmt::format(
+                    ICON_FA_CIRCLE_XMARK "  vm_abstract failed: {}", summary);
+            }
         });
     });
 }

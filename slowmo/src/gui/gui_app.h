@@ -109,6 +109,17 @@ private:
     float dpi_scale_ = 1.0f;
     bool first_frame_ = true;  // Used to set up default dock layout
 
+    // ─── File drag & drop (Finder → window, via SDL_EVENT_DROP_FILE) ───
+    // The event loop (gui_app.mm) records the most recently dropped path
+    // here. Any widget that wants drag-and-drop file input (e.g. the VM
+    // hints file field) calls take_dropped_file_path() once per frame
+    // while it is visible/hovered to "claim" and clear it.
+    std::string last_dropped_file_path_;
+    bool        dropped_file_pending_ = false;
+    /// Returns the most recently dropped file path and clears the pending
+    /// flag, or an empty string if nothing was dropped since the last call.
+    std::string take_dropped_file_path();
+
     // ─── Graceful shutdown state ─────────────────────────────────────
     // When the user clicks Close / Cmd+Q, we do NOT immediately stop the
     // render loop.  Instead we:
@@ -695,15 +706,31 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     // IDA/Ghidra/MCP) before running it.
     char vm_hints_path_buf_[512] = {};   // text input buffer for hints file path
     std::string vm_hints_status_;         // feedback line ("loaded N hints" / error)
+    /// Most-recently-used hints file paths (process lifetime only, newest
+    /// first, capped at 8). Lets the user re-select a hints file with one
+    /// click instead of retyping/re-browsing after switching traces.
+    std::vector<std::string> vm_hints_recent_;
+    void push_vm_hints_recent(const std::string& path);
     /// Run vm_abstract using vm_hints_path_buf_.
     /// Shared by the legacy panel and the VM Workspace "Run"/"Rerun" buttons.
     void run_vm_abstract_with_hints();
-    /// Renders the hints-file path input + "Run"/"Rerun" button + status
-    /// line. Shared by the legacy panel (empty and already-run states) and
-    /// the VM Workspace toolbar.
+    /// Renders the hints-file path input + drag-and-drop / browse button +
+    /// "Run"/"Rerun" button + status line. Shared by the legacy panel
+    /// (empty and already-run states), the VM Workspace toolbar, and the
+    /// toolbar's quick-access "VM Hints" popup.
     /// `button_label`/`button_width` let callers customize the primary
     /// action button ("Run VM Detection" vs "Rerun").
     void render_vm_hints_input(const char* button_label, float button_width);
+    /// Whether the VM hints popup opened from the main toolbar should be
+    /// shown this frame (separate from the legacy panel / workspace so it
+    /// can be triggered without opening either).
+    bool show_vm_hints_popup_ = false;
+    /// Renders the toolbar's quick-access VM hints window: a small always-
+    /// on-top window wrapping render_vm_hints_input(), plus a shortcut to
+    /// open the VM Workspace once a result is available. This is the
+    /// primary "shallow" entry point — no need to open the legacy VM
+    /// Abstract panel or dig through menus first.
+    void render_vm_hints_popup();
 
     // ─── VM Workspace (independent floating window with its own DockSpace) ───
     // Layout mirrors the native layout but at the VM abstraction level:
@@ -976,6 +1003,14 @@ private:
     void export_cfg_to_file();
     void export_call_graph_to_file();
     void export_backward_taint_graph_to_file();
+
+    /// Show a synchronous "open file" dialog (NSOpenPanel on macOS) and
+    /// return the chosen absolute path, or an empty string if cancelled.
+    /// `extensions` is an optional list of allowed filename extensions
+    /// (e.g. {"json"}); pass an empty vector to allow any file.
+    /// `message` is shown as the panel's prompt text.
+    std::string pick_file_path(const std::string& message,
+                                const std::vector<std::string>& extensions = {});
 
     /// Run any catalog pass by name, deriving config from the current cursor.
     /// Stores a one-line summary in last_pass_status_.

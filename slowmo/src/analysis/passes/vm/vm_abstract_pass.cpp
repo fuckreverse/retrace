@@ -4,6 +4,7 @@
 #include "analysis/passes/structure/xref_pass.h"
 #include "analysis/trace_collector.h"
 #include "common/aarch64_classify.h"
+#include "common/logger.h"
 #include "core/register_file.h"
 #include "core/memory_model.h"
 #include "io/code_table.h"
@@ -479,12 +480,22 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         }
 
         if (!loop_found) {
-            ctx.progress(1.0f, fmt::format(
+            std::string msg = fmt::format(
                 "VM abstract: hinted dispatcher at {:#x} not found in loop results "
                 "(if this VM's back-edge is realized via CFF-computed RET rather than "
                 "a direct B/BR, try dispatch_type_hint=ThreadedCode + threaded_dispatch_pcs "
                 "instead of dispatcher_pc)",
-                hint.loop_header_pc));
+                hint.loop_header_pc);
+            ctx.progress(1.0f, msg);
+            // Use WARN (not the default DEBUG progress-log path) so this is
+            // visible in the GUI Log panel / stderr at the default log level
+            // — without this, a bad hints_file silently produces an
+            // all-zero VMAbstractResult with no visible explanation.
+            LOG_WARN_M(::tenet::log::Module::Analysis, "{}", msg);
+            LOG_WARN_M(::tenet::log::Module::Analysis,
+                "VM abstract: is loop_header_pc a RUNTIME address (static_pc + "
+                "module_slide)? {} loop(s) were detected in this trace.",
+                loop_result.loops.size());
             return PassResult::success(std::move(result));
         }
 
@@ -509,15 +520,59 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     // — see VMConfig's class comment — so an empty candidate list here is a
     // caller error, not "no VM found".
     if (candidates.empty()) {
-        ctx.progress(1.0f,
+        static constexpr const char* kMsg =
             "VM abstract: no dispatcher hint provided (set VMConfig::dispatcher, "
-            "threaded_dispatch_pcs, or a FetchOnly anchor from static analysis)");
+            "threaded_dispatch_pcs, or a FetchOnly anchor from static analysis)";
+        ctx.progress(1.0f, kMsg);
+        LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
         return PassResult::success(std::move(result));
     }
 
     // Collect header inst_ids for each candidate from XRef
+    // (mem-anchor FetchOnly candidates already populated header_inst_ids
+    // above and have header_pc == 0, which has no xref entry — skip them
+    // here via the has_pc() guard so they aren't accidentally cleared.)
     for (auto& cand : candidates) {
-        if (!xref.has_pc(cand.header_pc)) continue;
+        if (cand.header_pc == 0) continue;  // mem-anchor FetchOnly: already populated
+        if (!xref.has_pc(cand.header_pc)) {
+            uint64_t slide = ctx.reader().header().module_slide;
+            uint64_t base  = ctx.reader().header().module_base;
+            uint64_t guess_plus  = cand.header_pc + slide;   // hint was static, needs +slide
+            uint64_t guess_minus = cand.header_pc - slide;   // hint was runtime from another run
+            bool plus_hits  = xref.has_pc(guess_plus);
+            bool minus_hits = xref.has_pc(guess_minus);
+
+            if (plus_hits) {
+                // High-confidence fix: the caller almost certainly hinted the
+                // STATIC (IDA/file) address. Tell them exactly what to use.
+                LOG_WARN_M(::tenet::log::Module::Analysis,
+                    "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
+                    "but {:#x} (= hint + module_slide {:#x}) WAS executed {} time(s). "
+                    "Your hints file almost certainly has the STATIC/file address — "
+                    "use {:#x} as dispatcher_pc instead (this trace's module_base={:#x}).",
+                    cand.header_pc, guess_plus, slide,
+                    xref.execution_count(guess_plus), guess_plus, base);
+            } else if (minus_hits) {
+                LOG_WARN_M(::tenet::log::Module::Analysis,
+                    "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
+                    "but {:#x} (= hint - module_slide {:#x}) WAS executed {} time(s). "
+                    "Your hints file may have a runtime address from a DIFFERENT "
+                    "trace/run (ASLR slide changes per launch) — use {:#x} as "
+                    "dispatcher_pc for THIS trace instead.",
+                    cand.header_pc, guess_minus, slide,
+                    xref.execution_count(guess_minus), guess_minus);
+            } else {
+                LOG_WARN_M(::tenet::log::Module::Analysis,
+                    "VM abstract: hinted PC {:#x} was never executed in this trace "
+                    "(0 xref hits), and neither hint+slide ({:#x}) nor hint-slide "
+                    "({:#x}) was executed either — this trace's module_base={:#x} "
+                    "module_slide={:#x}. Double-check the address comes from THIS "
+                    "binary/run (not a stale IDA bookmark or a different trace), and "
+                    "that it's inside the traced range.",
+                    cand.header_pc, guess_plus, guess_minus, base, slide);
+            }
+            continue;
+        }
         cand.header_inst_ids.reserve(
             std::min(static_cast<uint64_t>(10000), cand.iteration_count));
         for (uint64_t iid : xref.inst_ids_at(cand.header_pc)) {
@@ -526,6 +581,12 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
             cand.header_inst_ids.push_back(iid);
             if (cand.header_inst_ids.size() >= 10000) break;
         }
+        LOG_INFO_M(::tenet::log::Module::Analysis,
+            "VM abstract: hinted PC {:#x} hit {} time(s) in [{}, {}) "
+            "(need >= 3 to be usable as a dispatcher candidate)",
+            cand.header_pc, cand.header_inst_ids.size(),
+            range.start_inst_id,
+            range.end_inst_id == UINT64_MAX ? -1 : static_cast<int64_t>(range.end_inst_id));
     }
 
     // Pick the best candidate that has enough header hits
@@ -538,7 +599,12 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     }
 
     if (!best) {
-        ctx.progress(1.0f, "VM abstract: no valid VM dispatcher found");
+        static constexpr const char* kMsg =
+            "VM abstract: no valid VM dispatcher found (hinted PC(s) matched "
+            "fewer than 3 times in the analysis range — see prior log lines "
+            "for per-candidate hit counts)";
+        ctx.progress(1.0f, kMsg);
+        LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
         return PassResult::success(std::move(result));
     }
 
@@ -1255,12 +1321,25 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     result.vm_register_file = config_.vm_register_file;
     result.handler_asm      = config_.handler_asm;
 
-    ctx.progress(1.0f, fmt::format(
+    std::string final_msg = fmt::format(
         "VM abstract: dispatcher at {:#x}, {} handlers, {} VM steps, VM-PC={}",
         result.dispatcher.loop_header_pc,
         result.handlers.size(),
         result.total_vm_steps,
-        result.vm_pc_reg != 0xFF ? fmt::format("x{}", result.vm_pc_reg) : "unknown"));
+        result.vm_pc_reg != 0xFF ? fmt::format("x{}", result.vm_pc_reg) : "unknown");
+    ctx.progress(1.0f, final_msg);
+    // Always visible at the default log level (not gated behind
+    // TENET_LOG=DEBUG like the generic progress-message log path) — this is
+    // the single most useful line for confirming a hints file actually
+    // "took": dispatcher != 0x0 and handlers/steps > 0.
+    LOG_INFO_M(::tenet::log::Module::Analysis, "{}", final_msg);
+    if (result.handlers.empty() || result.total_vm_steps == 0) {
+        LOG_WARN_M(::tenet::log::Module::Analysis,
+            "VM abstract: dispatcher was found but produced 0 handlers/steps — "
+            "this usually means the indirect-branch PC or handler classification "
+            "inside the dispatch loop didn't match this binary. Check "
+            "indirect_branch_pc in the hints and dispatch_type_hint.");
+    }
 
     return PassResult::success(std::move(result));
 }

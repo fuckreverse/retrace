@@ -701,18 +701,29 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     // vm_abstract never scans the trace looking for "VM-shaped" loops — the
     // caller must supply at least one static-analysis hint (--vm-dispatcher
     // / --vm-handler / --vm-hints <file>, ...).
+    //
+    // All PC-valued hints (both --vm-hints JSON fields and the
+    // --vm-dispatcher/--vm-indirect-br/--vm-handler flags) are IDA-displayed
+    // addresses — same convention as the MCP `vm_abstract` tool — and get
+    // rebased to this trace's runtime addresses via module_slide. See the
+    // address-convention comment in vm_hints_json.h.
     if (opts.opt_vm_abstract) {
         VMConfig vm_cfg;
+        uint64_t slide = hdr.module_slide;
+        auto rebase_cli_pc = [&](uint64_t displayed_pc) {
+            return displayed_pc - kDefaultIdaImageBase + slide;
+        };
 
         if (!opts.vm_hints_file.empty()) {
-            if (!load_vm_hints_from_json(opts.vm_hints_file, vm_cfg)) {
+            if (!load_vm_hints_from_json(opts.vm_hints_file, vm_cfg, slide, kDefaultIdaImageBase)) {
                 return 1;
             }
         }
         if (opts.vm_dispatcher_pc != 0) {
             DispatcherHint dh;
-            dh.loop_header_pc = opts.vm_dispatcher_pc;
-            dh.indirect_branch_pc = opts.vm_indirect_br_pc;
+            dh.loop_header_pc = rebase_cli_pc(opts.vm_dispatcher_pc);
+            dh.indirect_branch_pc = opts.vm_indirect_br_pc != 0
+                ? rebase_cli_pc(opts.vm_indirect_br_pc) : 0;
             vm_cfg.dispatcher = dh;
         }
         if (opts.vm_pc_reg != 0xFF) {
@@ -721,7 +732,7 @@ int tenet::run_batch_analysis(const CliOptions& opts,
             vm_cfg.vm_pc = vph;
         }
         for (uint64_t hpc : opts.vm_handler_pcs) {
-            vm_cfg.handler_entry_pcs.push_back(hpc);
+            vm_cfg.handler_entry_pcs.push_back(rebase_cli_pc(hpc));
         }
 
         if (!vm_cfg.has_any_static_hint()) {

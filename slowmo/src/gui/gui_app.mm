@@ -959,9 +959,18 @@ case kTagViewTaintSourceAnnotation:
     action = [this]{ show_taint_source_annotation_ = !show_taint_source_annotation_; };
     break;
 case kTagViewVMAbstract:       action = [this]{ show_vm_abstract_        = !show_vm_abstract_;        }; break;
+// VM Workspace requires a vm_abstract result to render anything (it
+// auto-closes itself otherwise — see render_vm_workspace()). Toggling
+// vm_ws_open_ directly when there's no result yet used to silently do
+// nothing, which looked like a broken menu item. Instead, route straight
+// to the hints popup so the user can load hints without hunting for it.
 case kTagViewVMWorkspace:      action = [this]{
-    vm_ws_open_ = !vm_ws_open_;
-    if (vm_ws_open_) vm_ws_first_frame_ = true;
+    if (vm_abstract_result_) {
+        vm_ws_open_ = !vm_ws_open_;
+        if (vm_ws_open_) vm_ws_first_frame_ = true;
+    } else {
+        show_vm_hints_popup_ = true;
+    }
 }; break;
 
         // ── View — Profiling & Diff ──────────────────────────────────────
@@ -1614,6 +1623,17 @@ int GuiApp::run() {
                 event.window.windowID == SDL_GetWindowID(window_))) {
                 begin_shutdown();
             }
+
+            // ─── File drag & drop (Finder → window) ──────────────────
+            // SDL3 delivers one SDL_EVENT_DROP_FILE per dropped path (a
+            // multi-file drop is a sequence of these). We only care about
+            // the most recently dropped path; whichever UI widget wants
+            // drag-and-drop input (e.g. the VM hints file field) polls
+            // and "claims" it via take_dropped_file_path().
+            if (event.type == SDL_EVENT_DROP_FILE && event.drop.data) {
+                last_dropped_file_path_ = event.drop.data;
+                dropped_file_pending_   = true;
+            }
         }
 
         // ─── 1.45. Drain the main dispatch queue (non-blocking) ────────
@@ -2245,6 +2265,12 @@ void GuiApp::render_frame() {
     if (vm_ws_open_) {
         render_vm_workspace();
     }
+    // VM Hints quick-access popup: opened from the toolbar's "VM Hints..." /
+    // "VM Workspace" button group, independent of the legacy panel so hints
+    // can be loaded (and the workspace launched) without ever opening it.
+    if (show_vm_hints_popup_) {
+        render_vm_hints_popup();
+    }
 
     // ─── Log panel (always rendered) ────────────────────────────────
     if (show_log_) {
@@ -2296,6 +2322,35 @@ void GuiApp::render_frame() {
 // dispatch is needed — but we keep dispatch_async(main) as an explicit
 // safety belt for any future refactor.
 
+// ── Helper: show a synchronous NSOpenPanel and return the chosen path ──────
+// Used for "pick a file" buttons where the caller wants the result
+// immediately (e.g. to fill a text buffer) rather than via a completion
+// handler. Runs modally on the main thread — acceptable for a rare,
+// user-initiated action. Returns an empty string if cancelled.
+static std::string open_file_panel_sync(NSString* message,
+                                        NSArray<NSString*>* allowed_extensions) {
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles       = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.message = message;
+    if (allowed_extensions.count > 0) {
+        NSMutableArray<UTType*>* types = [NSMutableArray array];
+        for (NSString* ext in allowed_extensions) {
+            UTType* t = [UTType typeWithFilenameExtension:ext];
+            if (t) [types addObject:t];
+        }
+        if (types.count > 0) panel.allowedContentTypes = types;
+    }
+
+    NSModalResponse result = [panel runModal];
+    if (result != NSModalResponseOK) return {};
+    NSURL* url = panel.URL;
+    if (!url) return {};
+    const char* utf8 = url.path.UTF8String;
+    return utf8 ? std::string(utf8) : std::string();
+}
+
 // ── Helper: show an NSSavePanel and write the given text to the chosen file ──
 static void save_text_to_file_async(NSString* default_name,
                                     NSString* file_type_desc,
@@ -2325,6 +2380,26 @@ static void save_text_to_file_async(NSString* default_name,
             }
         }];
     });
+}
+
+// ── File drag & drop ──────────────────────────────────────────────────────────
+
+std::string tenet::GuiApp::take_dropped_file_path() {
+    if (!dropped_file_pending_) return {};
+    dropped_file_pending_ = false;
+    return std::move(last_dropped_file_path_);
+}
+
+// ── Pick a file via NSOpenPanel (synchronous) ─────────────────────────────────
+
+std::string tenet::GuiApp::pick_file_path(const std::string& message,
+                                          const std::vector<std::string>& extensions) {
+    NSMutableArray<NSString*>* exts = [NSMutableArray array];
+    for (const auto& e : extensions) {
+        [exts addObject:[NSString stringWithUTF8String:e.c_str()]];
+    }
+    NSString* msg = [NSString stringWithUTF8String:message.c_str()];
+    return open_file_panel_sync(msg, exts);
 }
 
 // ── Export CFG ────────────────────────────────────────────────────────────────

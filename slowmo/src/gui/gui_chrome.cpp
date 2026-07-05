@@ -612,6 +612,53 @@ void GuiApp::render_toolbar() {
         ImGui::SameLine();
     }
 
+    // ── GROUP 4.5: VM Abstract quick access ──────────────────────────
+    // Previously the only way to reach the VM Workspace was several menu
+    // levels deep (Analysis > Reverse Eng / VM > VM Abstract Analysis, then
+    // load hints, then "Open Workspace"). This toolbar shortcut collapses
+    // that into a single always-visible click:
+    //   - No result yet → opens the hints popup directly (skips the legacy
+    //     panel entirely).
+    //   - Result available → jumps straight into the VM Workspace.
+    {
+        bool has_vm_result = (vm_abstract_result_ != nullptr);
+        ImVec4 vm_btn_col = has_vm_result
+            ? ImVec4(0.15f, 0.35f, 0.55f, 0.90f)
+            : ImVec4(0.30f, 0.30f, 0.36f, 0.70f);
+        ImGui::PushStyleColor(ImGuiCol_Button, vm_btn_col);
+        if (has_vm_result) {
+            if (ImGui::Button(ICON_FA_MICROCHIP " VM Workspace", ImVec2(0, btn_h))) {
+                vm_ws_open_        = true;
+                vm_ws_first_frame_ = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Open the VM Workspace (IDA-style VM view)");
+
+            ImGui::SameLine();
+            if (ImGui::Button(ICON_FA_FILE_LINES "##vm_hints_quick", ImVec2(26.0f, btn_h))) {
+                show_vm_hints_popup_ = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Load a different VM hints file");
+        } else {
+            if (ImGui::Button(ICON_FA_MICROCHIP " VM Hints...", ImVec2(0, btn_h))) {
+                show_vm_hints_popup_ = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Load static-analysis hints (dispatcher PC, handler "
+                    "entries, ...) to detect and explore a VM dispatcher.\n"
+                    "Drag & drop the hints .json file, or click to browse.");
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+    }
+
     // ── GROUP 5: Current instruction info ────────────────────────────
     auto row = fetch_row(current_inst_);
     // PC in dimmed monospace style
