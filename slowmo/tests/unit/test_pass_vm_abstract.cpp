@@ -2633,3 +2633,408 @@ TEST_CASE("load_vm_hints_from_json file value overrides a pre-populated cfg fiel
     REQUIRE(load_vm_hints_from_json(f.path(), cfg));
     CHECK(cfg.dispatcher->loop_header_pc == 0x9999);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature: Rolling-key opcode deobfuscation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("VMAbstractPass: xor_rolling deobfuscation decodes rolling-key encrypted opcodes",
+          "[unit][pass][vm_abstract]") {
+    // Bytecode buffer: opcodes are encrypted with a rolling XOR key.
+    // key starts at 0xAA. After each opcode, key ^= decoded_opcode.
+    //
+    // Step 0: raw=0x01^0xAA=0xAB, decode: 0xAB^0xAA=0x01, key=0xAA^0x01=0xAB
+    // Step 1: raw=0x02^0xAB=0xA9, decode: 0xA9^0xAB=0x02, key=0xAB^0x02=0xA9
+    // Step 2: raw=0x03^0xA9=0xAA, decode: 0xAA^0xA9=0x03, key=0xA9^0x03=0xAA
+    // ...
+
+    constexpr uint64_t BYTECODE_BASE = 0xBBBB0000ULL;
+    constexpr int N = 6;
+    const uint8_t plain_opcodes[N] = { 0x01, 0x02, 0x03, 0x01, 0x02, 0x03 };
+
+    // Encrypt: key starts at 0xAA, after each: key ^= plain
+    uint8_t encrypted[N];
+    {
+        uint8_t key = 0xAA;
+        for (int i = 0; i < N; ++i) {
+            encrypted[i] = plain_opcodes[i] ^ key;
+            key ^= plain_opcodes[i];
+        }
+    }
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+
+        // Write encrypted bytecode buffer
+        ms.x(9) = BYTECODE_BASE;
+        for (int i = 0; i < N; ++i) {
+            TraceWriter::MemAcc ma;
+            ma.type = 2;
+            ma.size = 1;
+            ma.addr = tw.rt(0) + BYTECODE_BASE + static_cast<uint64_t>(i);
+            ma.value = encrypted[i];
+            tw.emit(ms, 0x8000 + static_cast<uint64_t>(i * 4), enc::nop(),
+                    {{33, tw.rt(0x8000 + static_cast<uint64_t>((i + 1) * 4))}}, {ma});
+        }
+
+        ms.x(0) = 0x42;
+        ms.x(1) = tw.rt(0) + BYTECODE_BASE;
+        ms.x(2) = 0;
+        ms.x(3) = 0xBEEF0000ULL;
+        ms.x(4) = 100; ms.x(5) = 0xAAAA; ms.x(6) = 0x5555; ms.x(7) = 200; ms.x(8) = 0;
+        tw.emit_anchor(ms);
+
+        const uint64_t handler_pcs[] = { HANDLER_A, HANDLER_B, HANDLER_C };
+        for (int i = 0; i < N; ++i) {
+            uint64_t handler_pc = handler_pcs[i % 3];
+            tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
+                    {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x8);
+            tw.emit(ms, HEADER_PC + 4, enc::b_ge(12),
+                    {{33, tw.rt(HEADER_PC + 8)}}, {});
+            tw.emit(ms, HEADER_PC + 8, enc::ldr_reg(2, 3, 1),
+                    {{2, tw.rt(handler_pc)}, {33, tw.rt(HEADER_PC + 0xC)}}, {});
+            tw.emit(ms, HEADER_PC + 0xC, enc::br(2),
+                    {{33, tw.rt(handler_pc)}}, {});
+
+            uint64_t next_x8 = static_cast<uint64_t>(i + 1);
+            uint64_t next_x1 = (tw.rt(0) + BYTECODE_BASE) + static_cast<uint64_t>(i + 1);
+            if (handler_pc == HANDLER_A) {
+                tw.emit(ms, HANDLER_A, enc::add_imm(4, 4, 1),
+                        {{4, 100 + static_cast<uint64_t>(i / 3) + 1}, {33, tw.rt(HANDLER_A + 4)}}, {});
+            } else if (handler_pc == HANDLER_B) {
+                tw.emit(ms, HANDLER_B, enc::eor_reg(5, 5, 6),
+                        {{5, ms.x(5) ^ ms.x(6)}, {33, tw.rt(HANDLER_B + 4)}}, {});
+            } else {
+                tw.emit(ms, HANDLER_C, enc::sub_imm(7, 7, 1),
+                        {{7, 200 - static_cast<uint64_t>(i / 3) - 1}, {33, tw.rt(HANDLER_C + 4)}}, {});
+            }
+            tw.emit(ms, handler_pc + 4, enc::add_imm(1, 1, 1),
+                    {{1, next_x1}, {33, tw.rt(handler_pc + 8)}}, {});
+            tw.emit(ms, handler_pc + 8, enc::add_imm(8, 8, 1),
+                    {{8, next_x8}, {33, tw.rt(handler_pc + 0xC)}}, {});
+            tw.emit(ms, handler_pc + 0xC,
+                    enc::b(static_cast<int32_t>(HEADER_PC - (handler_pc + 0xC))),
+                    {{33, tw.rt(HEADER_PC)}}, {});
+            ms.x(8) = next_x8;
+            ms.x(1) = next_x1;
+        }
+        tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
+                {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x4);
+        tw.emit(ms, HEADER_PC + 4, enc::b_ge(12), {{33, tw.rt(EXIT_PC)}}, {});
+        tw.emit(ms, EXIT_PC, enc::nop(), {{33, tw.rt(EXIT_PC + 4)}}, {});
+        tw.emit_anchor(ms);
+    }, "vm_abstract_rolling_key");
+
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+
+    VMConfig cfg;
+    cfg.min_handler_count = 2;
+    { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
+    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
+    {
+        OpcodeFormatHint ofmt;
+        ofmt.opcode_size = 1;
+        ofmt.opcode_mask = 0xFF;
+        // xor_rolling with initial key 0xAA
+        OpcodeDeobfStep rs;
+        rs.op = OpcodeDeobfStep::Op::xor_rolling;
+        rs.imm = 0xAA;
+        ofmt.deobfuscation_steps.push_back(rs);
+        ofmt.rolling_key_update = RollingKeyUpdate::XorOpcode;
+        cfg.opcode_format = ofmt;
+    }
+
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<CFGPass>());
+    pm->register_pass(std::make_unique<LoopPass>());
+    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
+
+    auto& raw = pm->require("vm_abstract");
+    REQUIRE(raw.ok());
+    auto& res = raw.get<VMAbstractResult>();
+
+    SECTION("all steps decode to correct plain opcodes") {
+        REQUIRE(res.steps.size() >= static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            REQUIRE(res.steps[i].opcode_valid);
+            CHECK(res.steps[i].opcode_value == plain_opcodes[i]);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature: Host-register-backed VM registers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("VMAbstractPass: from_host_reg reads VM register from host register file",
+          "[unit][pass][vm_abstract]") {
+    auto env = make_vm_trace(6);
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+
+    VMConfig cfg;
+    cfg.min_handler_count = 2;
+    { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
+    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
+
+    // Configure two VM registers: one from host x4, one from host x7.
+    // In the test trace, x4 and x7 are modified by handlers A and C
+    // respectively, so their values change across steps.
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_a;
+    vreg_a.name = "VA";
+    vreg_a.from_host_reg = 4;  // x4
+    rfh.regs.push_back(vreg_a);
+
+    VMRegisterFileHint::VMReg vreg_c;
+    vreg_c.name = "VC";
+    vreg_c.from_host_reg = 7;  // x7
+    rfh.regs.push_back(vreg_c);
+
+    cfg.vm_register_file = rfh;
+
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<CFGPass>());
+    pm->register_pass(std::make_unique<LoopPass>());
+    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
+
+    auto& raw = pm->require("vm_abstract");
+    REQUIRE(raw.ok());
+    auto& res = raw.get<VMAbstractResult>();
+
+    SECTION("host-register-backed VM regs are populated in every step") {
+        for (const auto& step : res.steps) {
+            // Should have both VA and VC
+            REQUIRE(step.vm_regs.size() >= 2);
+            bool found_va = false, found_vc = false;
+            for (const auto& [name, val] : step.vm_regs) {
+                if (name == "VA") found_va = true;
+                if (name == "VC") found_vc = true;
+            }
+            CHECK(found_va);
+            CHECK(found_vc);
+        }
+    }
+
+    SECTION("host-register values match expected initial values for first step") {
+        REQUIRE(!res.steps.empty());
+        const auto& first = res.steps[0];
+        for (const auto& [name, val] : first.vm_regs) {
+            if (name == "VA") CHECK(val == 100);  // x4 starts at 100
+            if (name == "VC") CHECK(val == 200);  // x7 starts at 200
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature: Operand field decoding
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("VMAbstractPass: operand fields are decoded from bytecode",
+          "[unit][pass][vm_abstract]") {
+    // 4-byte instruction format: [opcode:1][dst:1][src:1][imm:1]
+    // Opcodes: 0x01/0x02/0x03 as before
+    // Operands: dst=handler_idx, src=handler_idx+0x10, imm=i (step index)
+    constexpr uint64_t BYTECODE_BASE = 0xBBBB0000ULL;
+    constexpr int N = 6;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+
+        // Write bytecode: 4-byte instructions
+        ms.x(9) = BYTECODE_BASE;
+        for (int i = 0; i < N; ++i) {
+            uint8_t opcode = static_cast<uint8_t>((i % 3) + 1);
+            uint8_t dst = static_cast<uint8_t>(i % 3);
+            uint8_t src = static_cast<uint8_t>((i % 3) + 0x10);
+            uint8_t imm = static_cast<uint8_t>(i);
+            uint32_t insn_word = static_cast<uint32_t>(opcode)
+                               | (static_cast<uint32_t>(dst) << 8)
+                               | (static_cast<uint32_t>(src) << 16)
+                               | (static_cast<uint32_t>(imm) << 24);
+            TraceWriter::MemAcc ma;
+            ma.type = 2;
+            ma.size = 4;
+            ma.addr = tw.rt(0) + BYTECODE_BASE + static_cast<uint64_t>(i * 4);
+            ma.value = insn_word;
+            tw.emit(ms, 0x8000 + static_cast<uint64_t>(i * 4), enc::nop(),
+                    {{33, tw.rt(0x8000 + static_cast<uint64_t>((i + 1) * 4))}}, {ma});
+        }
+
+        ms.x(0) = 0x42;
+        ms.x(1) = tw.rt(0) + BYTECODE_BASE;
+        ms.x(2) = 0;
+        ms.x(3) = 0xBEEF0000ULL;
+        ms.x(4) = 100; ms.x(5) = 0xAAAA; ms.x(6) = 0x5555; ms.x(7) = 200; ms.x(8) = 0;
+        tw.emit_anchor(ms);
+
+        const uint64_t handler_pcs[] = { HANDLER_A, HANDLER_B, HANDLER_C };
+        for (int i = 0; i < N; ++i) {
+            uint64_t handler_pc = handler_pcs[i % 3];
+            tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
+                    {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x8);
+            tw.emit(ms, HEADER_PC + 4, enc::b_ge(12),
+                    {{33, tw.rt(HEADER_PC + 8)}}, {});
+            tw.emit(ms, HEADER_PC + 8, enc::ldr_reg(2, 3, 1),
+                    {{2, tw.rt(handler_pc)}, {33, tw.rt(HEADER_PC + 0xC)}}, {});
+            tw.emit(ms, HEADER_PC + 0xC, enc::br(2),
+                    {{33, tw.rt(handler_pc)}}, {});
+
+            uint64_t next_x8 = static_cast<uint64_t>(i + 1);
+            uint64_t next_x1 = (tw.rt(0) + BYTECODE_BASE) + static_cast<uint64_t>((i + 1) * 4);
+            if (handler_pc == HANDLER_A) {
+                tw.emit(ms, HANDLER_A, enc::add_imm(4, 4, 1),
+                        {{4, 100 + static_cast<uint64_t>(i / 3) + 1}, {33, tw.rt(HANDLER_A + 4)}}, {});
+            } else if (handler_pc == HANDLER_B) {
+                tw.emit(ms, HANDLER_B, enc::eor_reg(5, 5, 6),
+                        {{5, ms.x(5) ^ ms.x(6)}, {33, tw.rt(HANDLER_B + 4)}}, {});
+            } else {
+                tw.emit(ms, HANDLER_C, enc::sub_imm(7, 7, 1),
+                        {{7, 200 - static_cast<uint64_t>(i / 3) - 1}, {33, tw.rt(HANDLER_C + 4)}}, {});
+            }
+            tw.emit(ms, handler_pc + 4, enc::add_imm(1, 1, 4),
+                    {{1, next_x1}, {33, tw.rt(handler_pc + 8)}}, {});
+            tw.emit(ms, handler_pc + 8, enc::add_imm(8, 8, 1),
+                    {{8, next_x8}, {33, tw.rt(handler_pc + 0xC)}}, {});
+            tw.emit(ms, handler_pc + 0xC,
+                    enc::b(static_cast<int32_t>(HEADER_PC - (handler_pc + 0xC))),
+                    {{33, tw.rt(HEADER_PC)}}, {});
+            ms.x(8) = next_x8;
+            ms.x(1) = next_x1;
+        }
+        tw.emit(ms, HEADER_PC, enc::cmp_imm(8, static_cast<uint16_t>(N)),
+                {{33, tw.rt(HEADER_PC + 4)}}, {}, 0x4);
+        tw.emit(ms, HEADER_PC + 4, enc::b_ge(12), {{33, tw.rt(EXIT_PC)}}, {});
+        tw.emit(ms, EXIT_PC, enc::nop(), {{33, tw.rt(EXIT_PC + 4)}}, {});
+        tw.emit_anchor(ms);
+    }, "vm_abstract_operand_decode");
+
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+
+    VMConfig cfg;
+    cfg.min_handler_count = 2;
+    { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
+    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
+    {
+        OpcodeFormatHint ofmt;
+        ofmt.opcode_size = 1;
+        ofmt.opcode_mask = 0xFF;
+        cfg.opcode_format = ofmt;
+    }
+    // Define operand fields: [opcode:1][dst:1][src:1][imm:1]
+    VMConfig::OperandFormatHint opfmt;
+    opfmt.instruction_size = 4;
+    opfmt.fields.push_back({"dst", 1, 1, 0xFF, 0, {}});
+    opfmt.fields.push_back({"src", 2, 1, 0xFF, 0, {}});
+    opfmt.fields.push_back({"imm", 3, 1, 0xFF, 0, {}});
+    cfg.operand_format = opfmt;
+
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<CFGPass>());
+    pm->register_pass(std::make_unique<LoopPass>());
+    pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
+
+    auto& raw = pm->require("vm_abstract");
+    REQUIRE(raw.ok());
+    auto& res = raw.get<VMAbstractResult>();
+
+    SECTION("operands are decoded for each step") {
+        REQUIRE(res.steps.size() >= static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            const auto& step = res.steps[i];
+            REQUIRE(step.operands.size() == 3);
+            CHECK(step.operands[0].name == "dst");
+            CHECK(step.operands[1].name == "src");
+            CHECK(step.operands[2].name == "imm");
+
+            // dst = handler_idx = i%3
+            CHECK(step.operands[0].value == static_cast<uint64_t>(i % 3));
+            // src = handler_idx + 0x10
+            CHECK(step.operands[1].value == static_cast<uint64_t>((i % 3) + 0x10));
+            // imm = i
+            CHECK(step.operands[2].value == static_cast<uint64_t>(i));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JSON loader tests for new fields
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("load_vm_hints_from_json parses rolling_key_update",
+          "[unit][pass][vm_abstract][hints][json]") {
+    TempJsonFile f(R"({
+        "opcode_size": 1,
+        "opcode_deobf_steps": [{"op": "xor_rolling", "imm": "0xAA"}],
+        "rolling_key_update": "hash_opcode"
+    })");
+    VMConfig cfg;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
+    REQUIRE(cfg.opcode_format.has_value());
+    REQUIRE(cfg.opcode_format->deobfuscation_steps.size() == 1);
+    CHECK(cfg.opcode_format->deobfuscation_steps[0].op == OpcodeDeobfStep::Op::xor_rolling);
+    CHECK(cfg.opcode_format->deobfuscation_steps[0].imm == 0xAA);
+    CHECK(cfg.opcode_format->rolling_key_update == RollingKeyUpdate::HashOpcode);
+}
+
+TEST_CASE("load_vm_hints_from_json parses from_host_reg in vm_registers",
+          "[unit][pass][vm_abstract][hints][json]") {
+    TempJsonFile f(R"({
+        "vm_registers": [
+            {"name": "VA", "from_host_reg": "x19"},
+            {"name": "VB", "offset": 0, "size": 8}
+        ]
+    })");
+    VMConfig cfg;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
+    REQUIRE(cfg.vm_register_file.has_value());
+    REQUIRE(cfg.vm_register_file->regs.size() == 2);
+    CHECK(cfg.vm_register_file->regs[0].name == "VA");
+    CHECK(cfg.vm_register_file->regs[0].from_host_reg == 19);
+    CHECK(cfg.vm_register_file->regs[1].name == "VB");
+    CHECK(cfg.vm_register_file->regs[1].from_host_reg == 0xFF);
+}
+
+TEST_CASE("load_vm_hints_from_json parses operand_fields and instruction_size",
+          "[unit][pass][vm_abstract][hints][json]") {
+    TempJsonFile f(R"({
+        "instruction_size": 4,
+        "operand_fields": [
+            {"name": "dst", "byte_offset": 1, "size": 1, "mask": "0xFF", "shift": 0},
+            {"name": "imm", "byte_offset": 2, "size": 2, "mask": "0xFFFF",
+             "deobf_steps": [{"op": "xor", "imm": "0x55"}]}
+        ]
+    })");
+    VMConfig cfg;
+    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
+    REQUIRE(cfg.operand_format.has_value());
+    CHECK(cfg.operand_format->instruction_size == 4);
+    REQUIRE(cfg.operand_format->fields.size() == 2);
+    CHECK(cfg.operand_format->fields[0].name == "dst");
+    CHECK(cfg.operand_format->fields[0].byte_offset == 1);
+    CHECK(cfg.operand_format->fields[0].size == 1);
+    CHECK(cfg.operand_format->fields[1].name == "imm");
+    CHECK(cfg.operand_format->fields[1].byte_offset == 2);
+    CHECK(cfg.operand_format->fields[1].size == 2);
+    REQUIRE(cfg.operand_format->fields[1].deobfuscation_steps.size() == 1);
+    CHECK(cfg.operand_format->fields[1].deobfuscation_steps[0].op == OpcodeDeobfStep::Op::xor_);
+    CHECK(cfg.operand_format->fields[1].deobfuscation_steps[0].imm == 0x55);
+}
+
+TEST_CASE("VMConfig::has_any_static_hint detects operand_format hint",
+          "[unit][pass][vm_abstract][config]") {
+    VMConfig cfg;
+    CHECK_FALSE(cfg.has_any_static_hint());
+    VMConfig::OperandFormatHint opfmt;
+    opfmt.instruction_size = 4;
+    cfg.operand_format = opfmt;
+    CHECK(cfg.has_any_static_hint());
+}

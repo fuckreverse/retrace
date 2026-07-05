@@ -146,8 +146,14 @@ struct VMPCHint {
 /// One step in an opcode deobfuscation pipeline.
 /// Applied in order after loading the raw bytes from memory.
 ///
-/// Supported ops:  sub, add, xor, and, or, lsr, lsl, mul, ror, bswap
+/// Supported ops:  sub, add, xor, and, or, lsr, lsl, mul, ror, bswap, neg, not
 /// The `imm` field is the immediate operand (right-hand side).
+///
+/// Stateful rolling-key ops (xor_rolling, add_rolling, sub_rolling):
+///   These maintain a rolling key that is updated after each VM step.
+///   `imm` is the INITIAL key value for the first opcode; after each
+///   decoded opcode, the key is updated by a configurable rule (see
+///   OpcodeFormatHint::rolling_key_update).
 ///
 /// Example: ((raw - 0xF) ^ 0xE0) >> 0xF + 1
 ///   steps = [{sub, 0xF}, {xor, 0xE0}, {lsr, 0xF}, {add, 1}]
@@ -158,6 +164,13 @@ struct OpcodeDeobfStep {
         bswap,  // byte-swap (imm = byte width: 2/4/8)
         neg,    // two's complement negate (imm ignored)
         not_,   // bitwise NOT (imm ignored)
+
+        // ── Rolling-key stateful ops ─────────────────────────────────
+        // The `imm` field serves as the INITIAL key; it evolves across
+        // VM steps according to `rolling_key_update` (see OpcodeFormatHint).
+        xor_rolling,  // val ^= rolling_key (key evolves per step)
+        add_rolling,  // val += rolling_key
+        sub_rolling,  // val -= rolling_key
     } op;
     uint64_t imm = 0;
 };
@@ -176,6 +189,15 @@ struct OpcodeDeobfStep {
 ///   read the already-decoded opcode directly from that register at the
 ///   moment of dispatch (e.g. x0 after the decoder stub has run).
 ///   All Mode A fields are ignored in this mode.
+/// Rule for updating the rolling key after each decoded opcode.
+/// Applied after the decode pipeline produces a final opcode value.
+enum class RollingKeyUpdate : uint8_t {
+    XorOpcode,  // key ^= decoded_opcode  (default)
+    AddOpcode,  // key += decoded_opcode
+    SubOpcode,  // key -= decoded_opcode
+    HashOpcode, // key = (key * 31) + decoded_opcode  (simple hash)
+};
+
 struct OpcodeFormatHint {
     // ── Mode A: memory read ──────────────────────────────────────────────
     uint8_t  opcode_size = 0;           // Bytes per opcode (1/2/4/8); 0 = unknown
@@ -190,6 +212,12 @@ struct OpcodeFormatHint {
     /// Host register index that holds the decoded opcode at dispatch time.
     /// 0xFF = mode B disabled (use mode A).
     uint8_t  opcode_from_reg = 0xFF;
+
+    // ── Rolling key ──────────────────────────────────────────────────────
+    /// How to update rolling-key state after each decoded opcode.
+    /// Only relevant when deobfuscation_steps contains a rolling-key op
+    /// (xor_rolling / add_rolling / sub_rolling).  Ignored otherwise.
+    RollingKeyUpdate rolling_key_update = RollingKeyUpdate::XorOpcode;
 };
 
 /// Hint about a VM context structure.
@@ -212,6 +240,13 @@ struct VMContextHint {
 /// Register machine and stack machine are NO LONGER mutually exclusive:
 /// a VM can have both named VM registers (regs) AND an operand stack
 /// (stack_sp_offset).  When both are provided, both panels are shown.
+///
+/// Two storage modes per register:
+///   (a) Memory-backed (default): rf_base + offset → MemoryModel read.
+///   (b) Host-register-backed:    from_host_reg != 0xFF → RegisterFile read.
+///       For lightweight VMs that keep VM state in callee-saved AArch64
+///       registers (e.g. x19-x28) instead of a heap-allocated struct.
+///       When from_host_reg is set, offset/size/is_float are ignored.
 struct VMRegisterFileHint {
     // ── Register machine ────────────────────────────────────────────────
     /// Host register holding the VM register-file base pointer.
@@ -225,6 +260,13 @@ struct VMRegisterFileHint {
         std::string name;       // e.g. "R0", "V0", "PC", "FLAGS"
         bool        is_float = false;  // display as float (only for size==4/8)
         bool        is_pointer = false;// display as pointer (0x...)
+
+        /// Host register index (0-28) that holds this VM register.
+        /// 0xFF (default) = memory-backed (use rf_base + offset).
+        /// When set, the VM register value is read directly from the
+        /// AArch64 host register file (RegisterFile::state_before) at
+        /// dispatch time, bypassing MemoryModel entirely.
+        uint8_t     from_host_reg = 0xFF;
     };
     std::vector<VMReg> regs;
 
@@ -337,6 +379,30 @@ struct VMConfig {
     /// Optional — when absent the panel shows native PC ranges only.
     std::optional<HandlerAsmHint> handler_asm;
 
+    // ── Operand decoding ─────────────────────────────────────────────
+    /// Description of operand fields within each VM instruction word.
+    /// Enables per-step operand decoding (VMStep::operands).
+    /// Optional — when absent only the opcode is decoded.
+    struct OperandFieldDesc {
+        std::string name;           // e.g. "dst", "src1", "imm"
+        uint8_t     byte_offset;    // byte offset within the instruction
+        uint8_t     size;           // field width in bytes (1/2/4/8)
+        uint64_t    mask = UINT64_MAX; // mask applied after load
+        uint8_t     shift = 0;      // right-shift after masking
+        /// Per-field deobfuscation (same pipeline as opcode).
+        std::vector<OpcodeDeobfStep> deobfuscation_steps;
+    };
+    struct OperandFormatHint {
+        /// Total instruction width in bytes (opcode + operands).
+        /// When non-zero AND vm_pc_reg is set, the pass computes
+        /// `instruction_size = max(opcode_byte_offset+opcode_size, max(operand ends))`
+        /// and can report it per-step (useful for disassemblers).
+        uint8_t instruction_size = 0;
+        /// Ordered list of operand field descriptors.
+        std::vector<OperandFieldDesc> fields;
+    };
+    std::optional<OperandFormatHint> operand_format;
+
     /// True if the caller has provided at least one piece of static analysis
     /// hint (dispatcher, handler entries, VM-PC, opcode format, context,
     /// register file, or dispatch type). The pass refuses to run without at
@@ -353,7 +419,8 @@ struct VMConfig {
             || handler_asm.has_value()
             || !handler_names.empty()
             || dispatch_type_hint != DispatchType::Unknown
-            || !threaded_dispatch_pcs.empty();
+            || !threaded_dispatch_pcs.empty()
+            || operand_format.has_value();
     }
 };
 
@@ -381,6 +448,13 @@ struct VMHandler {
     uint32_t mem_writes = 0;           // Total memory write operations
 };
 
+/// Decoded operand of a single VM instruction.
+struct VMOperand {
+    std::string name;           // field name (from OperandFieldDesc::name)
+    uint64_t    value = 0;      // raw decoded value (after mask+shift+deobf)
+    uint8_t     size_bytes = 0; // original byte width of the field
+};
+
 /// One step in the VM execution trace (one handler dispatch).
 struct VMStep {
     uint64_t inst_id_start = 0;        // First native inst_id of this step
@@ -402,6 +476,10 @@ struct VMStep {
     /// Pairs of (reg_name, raw_u64_value) read from the RF base.
     /// For stack machines: pairs of ("SP", sp_value) + ("S0"…"Sn", slot_value).
     std::vector<std::pair<std::string, uint64_t>> vm_regs;
+
+    /// Decoded operand fields for this VM instruction (from OperandFormatHint).
+    /// Empty when no operand format hint is provided or decode fails.
+    std::vector<VMOperand> operands;
 };
 
 /// Detected VM dispatcher.

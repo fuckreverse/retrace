@@ -973,6 +973,27 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     result.steps.reserve(executions.size());
 
+    // ── Rolling key state ────────────────────────────────────────────────
+    //
+    // When the deobfuscation pipeline contains rolling-key ops (xor_rolling,
+    // add_rolling, sub_rolling), their `imm` field seeds the initial key.
+    // After each decoded opcode, the key is updated according to
+    // `rolling_key_update`. This vector mirrors the deobfuscation_steps
+    // array — rolling_keys[i] holds the CURRENT rolling key for step i
+    // (only meaningful when step i is a rolling op; other entries are 0).
+    std::vector<uint64_t> rolling_keys;
+    if (config_.opcode_format.has_value()) {
+        auto& ofmt = *config_.opcode_format;
+        rolling_keys.resize(ofmt.deobfuscation_steps.size(), 0);
+        for (size_t i = 0; i < ofmt.deobfuscation_steps.size(); ++i) {
+            using Op = OpcodeDeobfStep::Op;
+            auto op = ofmt.deobfuscation_steps[i].op;
+            if (op == Op::xor_rolling || op == Op::add_rolling || op == Op::sub_rolling) {
+                rolling_keys[i] = ofmt.deobfuscation_steps[i].imm;  // seed
+            }
+        }
+    }
+
     for (const auto& exec : executions) {
         VMStep step;
         step.inst_id_start = exec.dispatch_inst_id;
@@ -1054,7 +1075,8 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                         uint64_t val = (raw & ofmt.opcode_mask) >> ofmt.opcode_shift;
 
                         // Step 2: apply ordered deobfuscation transforms
-                        for (const auto& step_def : ofmt.deobfuscation_steps) {
+                        for (size_t si = 0; si < ofmt.deobfuscation_steps.size(); ++si) {
+                            const auto& step_def = ofmt.deobfuscation_steps[si];
                             using Op = OpcodeDeobfStep::Op;
                             switch (step_def.op) {
                                 case Op::sub:   val -= step_def.imm; break;
@@ -1066,14 +1088,11 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                                 case Op::lsl:   val <<= step_def.imm; break;
                                 case Op::mul:   val *= step_def.imm; break;
                                 case Op::ror: {
-                                    // Rotate right by imm bits within a 64-bit word.
-                                    // Normalise shift amount to [0, 63].
                                     uint8_t r = static_cast<uint8_t>(step_def.imm & 63u);
                                     if (r > 0) val = (val >> r) | (val << (64u - r));
                                     break;
                                 }
                                 case Op::bswap: {
-                                    // Byte-swap within the specified width (2/4/8).
                                     uint8_t w = step_def.imm ? static_cast<uint8_t>(step_def.imm) : 8u;
                                     if (w >= 8) {
                                         val = __builtin_bswap64(val);
@@ -1086,11 +1105,33 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                                 }
                                 case Op::neg:   val = static_cast<uint64_t>(-static_cast<int64_t>(val)); break;
                                 case Op::not_:  val = ~val; break;
+                                // ── Rolling-key stateful ops ────────────────
+                                case Op::xor_rolling: val ^= rolling_keys[si]; break;
+                                case Op::add_rolling: val += rolling_keys[si]; break;
+                                case Op::sub_rolling: val -= rolling_keys[si]; break;
                             }
                         }
 
                         step.opcode_value = val;
                         step.opcode_valid = true;
+
+                        // Step 3: update rolling keys for the NEXT step
+                        for (size_t si = 0; si < ofmt.deobfuscation_steps.size(); ++si) {
+                            using Op = OpcodeDeobfStep::Op;
+                            auto op = ofmt.deobfuscation_steps[si].op;
+                            if (op != Op::xor_rolling && op != Op::add_rolling && op != Op::sub_rolling)
+                                continue;
+                            switch (ofmt.rolling_key_update) {
+                                case RollingKeyUpdate::XorOpcode:
+                                    rolling_keys[si] ^= val; break;
+                                case RollingKeyUpdate::AddOpcode:
+                                    rolling_keys[si] += val; break;
+                                case RollingKeyUpdate::SubOpcode:
+                                    rolling_keys[si] -= val; break;
+                                case RollingKeyUpdate::HashOpcode:
+                                    rolling_keys[si] = rolling_keys[si] * 31 + val; break;
+                            }
+                        }
                     }
                 }
 
@@ -1130,7 +1171,8 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         // as its inputs.  This is the correct semantic for a VM-register panel.
         bool need_ctx_state = (config_.vm_context.has_value() &&
                                config_.vm_context->ctx_base_reg != 0xFF) ||
-                              config_.vm_register_file.has_value();
+                              config_.vm_register_file.has_value() ||
+                              config_.operand_format.has_value();
         // Use the state already fetched by vm_pc_reg block, or fetch it now.
         // We re-fetch unconditionally when needed; RegisterFile caches states,
         // so a second call with the same inst_id is an O(1) LRU hit.
@@ -1197,50 +1239,60 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                 rf_base_valid = true;
             }
 
-            if (rf_base_valid) {
-                // ── Register machine: read named VM registers ──────────────
-                // Supports up to 16 bytes (SIMD/XMM).  Values > 8 bytes are
-                // stored as two adjacent uint64 entries: "V0_lo" / "V0_hi".
-                for (const auto& vreg : rf.regs) {
-                    // Clamp to a meaningful max (16B for SIMD); default to 8.
-                    uint8_t sz = (vreg.size > 0 && vreg.size <= 16)
-                                     ? vreg.size : uint8_t(8);
-                    uint64_t addr = rf_base + vreg.offset;
+            // ── Register machine: read named VM registers ──────────────
+            // Two storage modes per register:
+            //   (a) Memory-backed (default): rf_base + offset → MemoryModel.
+            //   (b) Host-register-backed:    from_host_reg → RegisterFile.
+            // Supports up to 16 bytes (SIMD/XMM).  Values > 8 bytes are
+            // stored as two adjacent uint64 entries: "V0_lo" / "V0_hi".
+            for (const auto& vreg : rf.regs) {
+                // ── Mode (b): host-register-backed ──
+                if (vreg.from_host_reg != 0xFF && vreg.from_host_reg <= 28) {
+                    step.vm_regs.emplace_back(
+                        vreg.name, p_state_dispatch->gpr[vreg.from_host_reg]);
+                    continue;
+                }
 
-                    if (sz <= 8) {
-                        // ── scalar path ──
-                        auto mem = memory.read(addr, sz, exec.dispatch_inst_id);
-                        bool known = true;
-                        for (uint8_t b = 0; b < sz; ++b) {
-                            if (!mem.known[b]) { known = false; break; }
-                        }
-                        if (known) {
-                            uint64_t val = 0;
-                            std::memcpy(&val, mem.data.data(), sz);
-                            step.vm_regs.emplace_back(vreg.name, val);
-                        }
-                    } else {
-                        // ── 128-bit SIMD path: read as two 8-byte halves ──
-                        // Read first 8 bytes (lo)
-                        auto mem_lo = memory.read(addr,     8, exec.dispatch_inst_id);
-                        auto mem_hi = memory.read(addr + 8, 8, exec.dispatch_inst_id);
-                        bool lo_ok = true, hi_ok = true;
-                        for (uint8_t b = 0; b < 8; ++b) {
-                            if (!mem_lo.known[b]) lo_ok = false;
-                            if (!mem_hi.known[b]) hi_ok = false;
-                        }
-                        if (lo_ok) {
-                            uint64_t lo = 0;
-                            std::memcpy(&lo, mem_lo.data.data(), 8);
-                            step.vm_regs.emplace_back(vreg.name + "_lo", lo);
-                        }
-                        if (hi_ok) {
-                            uint64_t hi = 0;
-                            std::memcpy(&hi, mem_hi.data.data(), 8);
-                            step.vm_regs.emplace_back(vreg.name + "_hi", hi);
-                        }
+                // ── Mode (a): memory-backed ──
+                if (!rf_base_valid) continue;
+
+                uint8_t sz = (vreg.size > 0 && vreg.size <= 16)
+                                 ? vreg.size : uint8_t(8);
+                uint64_t addr = rf_base + vreg.offset;
+
+                if (sz <= 8) {
+                    auto mem = memory.read(addr, sz, exec.dispatch_inst_id);
+                    bool known = true;
+                    for (uint8_t b = 0; b < sz; ++b) {
+                        if (!mem.known[b]) { known = false; break; }
+                    }
+                    if (known) {
+                        uint64_t val = 0;
+                        std::memcpy(&val, mem.data.data(), sz);
+                        step.vm_regs.emplace_back(vreg.name, val);
+                    }
+                } else {
+                    auto mem_lo = memory.read(addr,     8, exec.dispatch_inst_id);
+                    auto mem_hi = memory.read(addr + 8, 8, exec.dispatch_inst_id);
+                    bool lo_ok = true, hi_ok = true;
+                    for (uint8_t b = 0; b < 8; ++b) {
+                        if (!mem_lo.known[b]) lo_ok = false;
+                        if (!mem_hi.known[b]) hi_ok = false;
+                    }
+                    if (lo_ok) {
+                        uint64_t lo = 0;
+                        std::memcpy(&lo, mem_lo.data.data(), 8);
+                        step.vm_regs.emplace_back(vreg.name + "_lo", lo);
+                    }
+                    if (hi_ok) {
+                        uint64_t hi = 0;
+                        std::memcpy(&hi, mem_hi.data.data(), 8);
+                        step.vm_regs.emplace_back(vreg.name + "_hi", hi);
                     }
                 }
+            }
+
+            if (rf_base_valid) {
 
                 // ── Stack machine: read SP pointer, then stack slots ───────
                 // SP lives inside the ctx/RF region at stack_sp_offset.
@@ -1301,6 +1353,78 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                         }
                     }
                 }
+            }
+        }
+
+        // ── Operand field decoding ────────────────────────────────────
+        //
+        // When an OperandFormatHint is provided and we have a valid VM-PC,
+        // decode each operand field from the bytecode buffer at
+        // (vm_pc_value + field.byte_offset), applying the same
+        // mask + shift + deobfuscation pipeline as opcode decode.
+        if (config_.operand_format.has_value() && step.vm_pc_valid) {
+            auto& opfmt = *config_.operand_format;
+            auto& memory = ctx.memory();
+
+            for (const auto& field : opfmt.fields) {
+                if (field.size == 0 || field.size > 8) continue;
+
+                uint64_t field_addr = step.vm_pc_value +
+                                      static_cast<uint64_t>(field.byte_offset);
+                auto mem = memory.read(field_addr,
+                                       static_cast<uint8_t>(field.size),
+                                       exec.dispatch_inst_id);
+                bool all_known = true;
+                for (uint8_t b = 0; b < field.size; ++b) {
+                    if (!mem.known[b]) { all_known = false; break; }
+                }
+                if (!all_known) continue;
+
+                uint64_t raw = 0;
+                std::memcpy(&raw, mem.data.data(),
+                            std::min(static_cast<size_t>(field.size), sizeof(raw)));
+
+                uint64_t val = (raw & field.mask) >> field.shift;
+
+                // Apply per-field deobfuscation pipeline
+                for (const auto& ds : field.deobfuscation_steps) {
+                    using Op = OpcodeDeobfStep::Op;
+                    switch (ds.op) {
+                        case Op::sub:   val -= ds.imm; break;
+                        case Op::add:   val += ds.imm; break;
+                        case Op::xor_:  val ^= ds.imm; break;
+                        case Op::and_:  val &= ds.imm; break;
+                        case Op::or_:   val |= ds.imm; break;
+                        case Op::lsr:   val >>= ds.imm; break;
+                        case Op::lsl:   val <<= ds.imm; break;
+                        case Op::mul:   val *= ds.imm; break;
+                        case Op::ror: {
+                            uint8_t r = static_cast<uint8_t>(ds.imm & 63u);
+                            if (r > 0) val = (val >> r) | (val << (64u - r));
+                            break;
+                        }
+                        case Op::bswap: {
+                            uint8_t w = ds.imm ? static_cast<uint8_t>(ds.imm) : 8u;
+                            if (w >= 8)      val = __builtin_bswap64(val);
+                            else if (w == 4) val = __builtin_bswap32(static_cast<uint32_t>(val));
+                            else if (w == 2) val = __builtin_bswap16(static_cast<uint16_t>(val));
+                            break;
+                        }
+                        case Op::neg:   val = static_cast<uint64_t>(-static_cast<int64_t>(val)); break;
+                        case Op::not_:  val = ~val; break;
+                        // Rolling ops are not supported for operand fields
+                        // (they only make sense for opcode decode chains).
+                        case Op::xor_rolling: break;
+                        case Op::add_rolling: break;
+                        case Op::sub_rolling: break;
+                    }
+                }
+
+                VMOperand operand;
+                operand.name = field.name;
+                operand.value = val;
+                operand.size_bytes = field.size;
+                step.operands.push_back(std::move(operand));
             }
         }
 

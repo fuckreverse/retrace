@@ -44,8 +44,11 @@ OpcodeDeobfStep::Op parse_deobf_op(const std::string& s) {
     if (s == "mul")   return OpcodeDeobfStep::Op::mul;
     if (s == "ror")   return OpcodeDeobfStep::Op::ror;
     if (s == "bswap") return OpcodeDeobfStep::Op::bswap;
-    if (s == "neg")   return OpcodeDeobfStep::Op::neg;
-    if (s == "not")   return OpcodeDeobfStep::Op::not_;
+    if (s == "neg")          return OpcodeDeobfStep::Op::neg;
+    if (s == "not")          return OpcodeDeobfStep::Op::not_;
+    if (s == "xor_rolling")  return OpcodeDeobfStep::Op::xor_rolling;
+    if (s == "add_rolling")  return OpcodeDeobfStep::Op::add_rolling;
+    if (s == "sub_rolling")  return OpcodeDeobfStep::Op::sub_rolling;
     throw std::runtime_error("Unknown deobf op: " + s);
 }
 
@@ -153,7 +156,53 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
                     ofh.deobfuscation_steps.push_back(ds);
                 }
             }
+            // Rolling key update rule (only meaningful when deobf steps
+            // contain xor_rolling / add_rolling / sub_rolling).
+            if (j.contains("rolling_key_update")) {
+                const std::string& rku = j["rolling_key_update"].get_ref<const std::string&>();
+                if      (rku == "xor_opcode")  ofh.rolling_key_update = RollingKeyUpdate::XorOpcode;
+                else if (rku == "add_opcode")  ofh.rolling_key_update = RollingKeyUpdate::AddOpcode;
+                else if (rku == "sub_opcode")  ofh.rolling_key_update = RollingKeyUpdate::SubOpcode;
+                else if (rku == "hash_opcode") ofh.rolling_key_update = RollingKeyUpdate::HashOpcode;
+            }
+
             cfg.opcode_format = std::move(ofh);
+        }
+
+        // ── Operand format ─────────────────────────────────────────────
+        if (j.contains("operand_fields") || j.contains("instruction_size")) {
+            VMConfig::OperandFormatHint opfmt;
+            if (j.contains("instruction_size")) {
+                opfmt.instruction_size = static_cast<uint8_t>(j["instruction_size"].get<int>());
+            }
+            if (j.contains("operand_fields")) {
+                for (const auto& fj : j["operand_fields"]) {
+                    VMConfig::OperandFieldDesc fd;
+                    fd.name        = fj.value("name", std::string{});
+                    fd.byte_offset = static_cast<uint8_t>(fj.value("byte_offset", 0));
+                    fd.size        = static_cast<uint8_t>(fj.value("size", 1));
+                    if (fj.contains("mask")) {
+                        fd.mask = fj["mask"].is_number()
+                            ? fj["mask"].get<uint64_t>()
+                            : parse_hex_str(fj["mask"].get<std::string>());
+                    }
+                    fd.shift = static_cast<uint8_t>(fj.value("shift", 0));
+                    if (fj.contains("deobf_steps")) {
+                        for (const auto& ds : fj["deobf_steps"]) {
+                            OpcodeDeobfStep step;
+                            step.op = parse_deobf_op(ds.at("op").get<std::string>());
+                            if (ds.contains("imm")) {
+                                step.imm = ds["imm"].is_number()
+                                    ? ds["imm"].get<uint64_t>()
+                                    : parse_hex_str(ds["imm"].get<std::string>());
+                            }
+                            fd.deobfuscation_steps.push_back(step);
+                        }
+                    }
+                    if (!fd.name.empty()) opfmt.fields.push_back(std::move(fd));
+                }
+            }
+            cfg.operand_format = std::move(opfmt);
         }
 
         if (j.contains("ctx_base_reg") || j.contains("ctx_fields")) {
@@ -185,6 +234,9 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
                     vreg.size       = static_cast<uint8_t>(rv.value("size", 8));
                     vreg.is_float   = rv.value("is_float", false);
                     vreg.is_pointer = rv.value("is_pointer", false);
+                    if (rv.contains("from_host_reg")) {
+                        vreg.from_host_reg = parse_reg_field(rv["from_host_reg"]);
+                    }
                     if (!vreg.name.empty()) rfh.regs.push_back(std::move(vreg));
                 }
             }

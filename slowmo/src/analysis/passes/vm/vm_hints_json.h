@@ -51,7 +51,14 @@
 //     "vm_stack_sp_offset": 16, "vm_stack_depth": 8, "vm_stack_elem_size": 8,
 //     "vm_stack_direction": "descending|ascending",
 //     "handler_asm_map": {"0x...": ["asm line", ...] or [{"pc":"0x...","text":"..."}]},
-//     "handler_names": {"0x...": "ADD", ...}
+//     "handler_names": {"0x...": "ADD", ...},
+//     "rolling_key_update": "xor_opcode|add_opcode|sub_opcode|hash_opcode",
+//     "operand_fields": [
+//       {"name":"dst", "byte_offset":1, "size":1, "mask":"0xFF", "shift":0,
+//        "deobf_steps": [{"op":"xor", "imm":"0x5"}]},
+//       ...
+//     ],
+//     "instruction_size": 4
 //   }
 
 #include "analysis/passes/vm/vm_abstract_pass.h"
