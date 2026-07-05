@@ -234,6 +234,22 @@ public:
     /// Uses lock-free fast path for already-completed passes.
     const PassResult& require(std::string_view pass_name);
 
+    /// Shared-ownership variant of require(). Returns a shared_ptr that keeps
+    /// the underlying PassResult (and the data it owns, e.g. a
+    /// VMAbstractResult or TraceFoldResult) alive even if another thread
+    /// concurrently invalidates or re-runs the pass and replaces the entry's
+    /// result with a new one.
+    ///
+    /// Use this instead of require()/require_raw() whenever the caller needs
+    /// to hold on to the result across some non-trivial span of time or
+    /// across a thread boundary — e.g. the GUI caching a result pointer for
+    /// rendering across many frames while the in-GUI MCP server (which
+    /// shares this same PassManager, on its own request-handling thread)
+    /// might concurrently invalidate/re-run the same pass.
+    ///
+    /// Returns nullptr only if the pass name is not registered at all.
+    std::shared_ptr<const PassResult> require_shared(std::string_view pass_name);
+
     /// Run all registered passes in dependency order with true parallelism.
     ///
     /// Uses a dynamic ready-queue scheduler (LLVM New PassManager style):
@@ -330,9 +346,29 @@ public:
 private:
     struct PassEntry {
         std::unique_ptr<AnalysisPass> pass;
-        PassResult result;
+
+        // The result is stored behind a shared_ptr and *replaced* (never
+        // mutated in place) on every (re-)execution or invalidation. This
+        // means any thread that previously copied out `result_ptr` via
+        // require_shared() keeps a strong reference to the old PassResult
+        // (and the data it owns) even after a concurrent invalidate/re-run
+        // swaps in a new one — eliminating the use-after-free window where
+        // e.g. the GUI main thread renders a cached `const T*` into a
+        // result that the MCP server's request thread concurrently
+        // invalidated and destroyed in place.
+        //
+        // Readers on the fast path (require_raw/require<T>) still get a
+        // plain reference for convenience; that's safe as long as the
+        // reference isn't retained past the current synchronous call (which
+        // holds true for every existing in-tree caller — pass dependency
+        // resolution and MCP tool handlers that serialize the result to
+        // JSON immediately). Callers that DO need to retain the result
+        // across time or threads (GUI panels, MCP long-lived caches) must
+        // use require_shared() instead.
+        std::shared_ptr<const PassResult> result_ptr =
+            std::make_shared<const PassResult>(PassResult::skipped());
         std::atomic<PassState> state{PassState::NotRun};
-        std::mutex mtx;                   // protects result write
+        std::mutex mtx;                   // protects result_ptr write
         std::condition_variable cv;       // signals completion
 
         // Dynamic scheduling fields (used only by run_all).

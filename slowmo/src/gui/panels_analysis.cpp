@@ -184,8 +184,22 @@ const PassResult* GuiApp::completed_result(std::string_view name) {
     if (!pass_manager_) return nullptr;
     if (pass_manager_->state(name) != PassManager::PassState::Completed)
         return nullptr;
-    // Fast path: require() returns immediately for completed passes.
-    return &pass_manager_->require(name);
+
+    // Use require_shared() (not require()) and pin the returned shared_ptr in
+    // pinned_results_ so the PassResult — and the typed data every
+    // xxx_result_ member below points into — stays alive for as long as the
+    // GUI keeps referencing it, even if the in-GUI MCP server (which shares
+    // this same PassManager, on its own thread) concurrently invalidates or
+    // re-runs this pass and swaps in a brand new PassResult. Without this
+    // pin, xxx_result_ would be a dangling pointer into freed memory as soon
+    // as that happened — this is the root cause of the SIGBUS crashes seen
+    // in render_trace_fold_panel() and similar panels when GUI + MCP run
+    // concurrently against the same trace.
+    auto shared = pass_manager_->require_shared(name);
+    if (!shared) return nullptr;
+    const PassResult* raw = shared.get();
+    pinned_results_[std::string(name)] = std::move(shared);
+    return raw;
 }
 
 void GuiApp::apply_pass_result_pointers(std::string_view name) {
@@ -710,6 +724,7 @@ void GuiApp::run_vm_abstract_with_hints() {
     }
     pass_manager_->invalidate_and_clear_blob("vm_abstract");
     vm_abstract_result_ = nullptr;
+    pinned_results_.erase("vm_abstract");
 
     tenet::register_pass_by_name(*pass_manager_, "xref");
     tenet::register_pass_by_name(*pass_manager_, "cfg");
@@ -795,6 +810,12 @@ void GuiApp::force_rerun_pass(std::string_view name) {
         // constant_materialization was merged into pattern.
         constant_result_ = nullptr;
     }
+    // Drop our pin on the stale result too — apply_pass_result_pointers()
+    // will re-pin the fresh one once the re-run completes. Not required for
+    // correctness (the old shared_ptr would be released on the next pin
+    // anyway) but avoids keeping a superseded, potentially large result
+    // alive in memory for longer than necessary.
+    pinned_results_.erase(std::string(name));
 
     // Re-register (may already be registered) and enqueue.
     tenet::PassRunCtx ctx;
@@ -934,6 +955,11 @@ void GuiApp::clear_analysis() {
     if (pass_manager_) {
         pass_manager_->invalidate_all();
     }
+    // Drop our pins now that every xxx_result_ pointer above has been reset
+    // to nullptr. Safe to do in either order since pointers are cleared
+    // first — but do it after invalidate_all() so pinned_results_ doesn't
+    // transiently disagree with pass state.
+    pinned_results_.clear();
     active_analysis_count_.store(0, std::memory_order_relaxed);
     analysis_running_.store(false, std::memory_order_relaxed);
 }

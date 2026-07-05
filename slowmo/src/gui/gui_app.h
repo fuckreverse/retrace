@@ -315,6 +315,30 @@ private:
 
     // ─── Analysis state ─────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
+
+    // Keeps the PassResult (and the data it owns — VMAbstractResult,
+    // TraceFoldResult, etc.) referenced by every `const XxxResult*
+    // xxx_result_` member below alive for as long as the GUI still points
+    // to it, via a strong shared_ptr obtained through
+    // PassManager::require_shared().
+    //
+    // This is required because the in-GUI MCP server (auto_start_mcp())
+    // shares the *same* PassManager instance and runs on its own
+    // request-handling thread, fully concurrent with the GUI main/render
+    // thread. An MCP tool call that invalidates or re-runs a pass (directly,
+    // or transitively as a dependency of another pass) replaces
+    // PassEntry::result_ptr with a brand new PassResult; without this pin,
+    // the GUI's cached `xxx_result_` pointer — which was never anything
+    // more than a raw pointer into the *old* PassResult's std::any payload —
+    // would be left dangling and the next render call would read freed
+    // memory (observed as SIGBUS in render_trace_fold_panel() and similar
+    // panels).
+    //
+    // apply_pass_result_pointers(name) refreshes pinned_results_[name]
+    // every time it (re-)assigns the corresponding xxx_result_ pointer;
+    // clear_analysis() drops all pins together with the pointers.
+    std::unordered_map<std::string, std::shared_ptr<const PassResult>> pinned_results_;
+
     const TaintResult* taint_result_ = nullptr;
     const BackwardTaintResult* backward_taint_result_ = nullptr;
     const FunctionResult* function_result_ = nullptr;

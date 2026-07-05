@@ -105,14 +105,59 @@ bool PassManager::is_memory_pressure() const {
 
 // ─── Lock-free fast path + CAS claiming ──────────────────────────────────
 
+namespace {
+// Per-thread keepalive table used by PassManager::require() so it can keep
+// returning a plain `const PassResult&` (source-compatible with the ~100
+// existing call sites) while staying safe against a *different* thread
+// concurrently invalidating/re-running the same pass and replacing
+// PassEntry::result_ptr.
+//
+// Keyed by PassEntry* so that unrelated passes required from the same
+// thread (e.g. `require("cfg_layout")` immediately followed by
+// `require("cfg")`, both used together afterwards — see batch_analysis.cpp
+// run_export_cfg()) each get their own keepalive slot instead of clobbering
+// one another. A single shared thread_local variable would silently
+// invalidate the first reference as soon as the second require() ran.
+//
+// This table only grows to the number of distinct passes actually required
+// from a given thread (bounded by the pass catalog size — a few dozen), so
+// it is not a meaningful leak. Entries are naturally refreshed (not
+// accumulated) on every require() of the same pass.
+thread_local std::unordered_map<const void*, std::shared_ptr<const PassResult>>
+    g_require_keepalive;
+}  // namespace
+
 const PassResult& PassManager::require(std::string_view pass_name) {
     auto* entry = find_entry(pass_name);
     if (!entry) return not_found_result_;
 
+    // NOTE on lifetime: the returned reference stays valid at least until
+    // this thread calls require()/require_shared() again for the *same*
+    // pass (see g_require_keepalive above) — every existing in-tree caller
+    // either uses the reference immediately or (as in run_export_cfg) keeps
+    // references to two *different* passes alive simultaneously, which the
+    // per-entry keepalive slots handle correctly. Callers that need to keep
+    // a result alive across frames/threads regardless of what else runs
+    // (GUI panel caches, long-lived MCP state) MUST use require_shared()
+    // instead, which returns an owning shared_ptr the caller controls
+    // directly.
+    //
+    // We take a local shared_ptr copy (via atomic_load) before dereferencing
+    // so that even if another thread concurrently replaces entry->result_ptr
+    // (invalidate/re-run), the object we're about to return a reference into
+    // stays alive — the old PassResult is only destroyed once every
+    // shared_ptr to it (including this thread's keepalive slot) is gone.
+    auto refresh_and_return = [entry]() -> const PassResult& {
+        auto ptr = std::atomic_load_explicit(&entry->result_ptr, std::memory_order_acquire);
+        const PassResult& ref = *ptr;
+        g_require_keepalive[entry] = std::move(ptr);
+        return ref;
+    };
+
     // Lock-free fast path: if already done, return immediately (no mutex).
     PassState s = entry->state.load(std::memory_order_acquire);
     if (s == PassState::Completed || s == PassState::Failed) {
-        return entry->result;
+        return refresh_and_return();
     }
 
     // Try to claim execution via CAS (NotRun -> Running).
@@ -122,7 +167,7 @@ const PassResult& PassManager::require(std::string_view pass_name) {
                                              std::memory_order_acquire)) {
         // We own execution. Run dependencies first, then this pass.
         execute_pass(entry);
-        return entry->result;
+        return refresh_and_return();
     }
 
     // Someone else is running it. Wait until completion.
@@ -131,7 +176,34 @@ const PassResult& PassManager::require(std::string_view pass_name) {
         PassState cur = entry->state.load(std::memory_order_acquire);
         return cur == PassState::Completed || cur == PassState::Failed;
     });
-    return entry->result;
+    lk.unlock();
+    return refresh_and_return();
+}
+
+std::shared_ptr<const PassResult> PassManager::require_shared(std::string_view pass_name) {
+    auto* entry = find_entry(pass_name);
+    if (!entry) return nullptr;
+
+    PassState s = entry->state.load(std::memory_order_acquire);
+    if (s == PassState::Completed || s == PassState::Failed) {
+        return std::atomic_load_explicit(&entry->result_ptr, std::memory_order_acquire);
+    }
+
+    PassState expected = PassState::NotRun;
+    if (entry->state.compare_exchange_strong(expected, PassState::Running,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+        execute_pass(entry);
+        return std::atomic_load_explicit(&entry->result_ptr, std::memory_order_acquire);
+    }
+
+    std::unique_lock<std::mutex> lk(entry->mtx);
+    entry->cv.wait(lk, [&entry] {
+        PassState cur = entry->state.load(std::memory_order_acquire);
+        return cur == PassState::Completed || cur == PassState::Failed;
+    });
+    lk.unlock();
+    return std::atomic_load_explicit(&entry->result_ptr, std::memory_order_acquire);
 }
 
 void PassManager::execute_pass(PassEntry* entry) {
@@ -141,7 +213,9 @@ void PassManager::execute_pass(PassEntry* entry) {
     // Fast-path: skip immediately if global cancellation is requested.
     if (is_cancelled()) {
         std::lock_guard<std::mutex> lk(entry->mtx);
-        entry->result = PassResult::failed("cancelled");
+        std::atomic_store_explicit(&entry->result_ptr,
+            std::make_shared<const PassResult>(PassResult::failed("cancelled")),
+            std::memory_order_release);
         entry->state.store(PassState::Failed, std::memory_order_release);
         entry->cv.notify_all();
         return;
@@ -156,8 +230,10 @@ void PassManager::execute_pass(PassEntry* entry) {
                      entry->pass->name(), dep_name);
             {
                 std::lock_guard<std::mutex> lk(entry->mtx);
-                entry->result = PassResult::failed(
-                    std::string("dependency '") + std::string(dep_name) + "' failed");
+                std::atomic_store_explicit(&entry->result_ptr,
+                    std::make_shared<const PassResult>(PassResult::failed(
+                        std::string("dependency '") + std::string(dep_name) + "' failed")),
+                    std::memory_order_release);
                 entry->state.store(PassState::Failed, std::memory_order_release);
             }
             entry->cv.notify_all();
@@ -172,7 +248,9 @@ void PassManager::execute_pass(PassEntry* entry) {
                  entry->pass->name(), ::tenet::log::rss_mb(), rss_limit_mb_);
         {
             std::lock_guard<std::mutex> lk(entry->mtx);
-            entry->result = PassResult::skipped();
+            std::atomic_store_explicit(&entry->result_ptr,
+                std::make_shared<const PassResult>(PassResult::skipped()),
+                std::memory_order_release);
             entry->state.store(PassState::Failed, std::memory_order_release);
         }
         entry->cv.notify_all();
@@ -211,9 +289,17 @@ void PassManager::execute_pass(PassEntry* entry) {
 
     {
         std::lock_guard<std::mutex> lk(entry->mtx);
-        entry->result = std::move(result);
+        bool ok = result.ok();
+        // Build the new, immutable result behind a fresh shared_ptr and swap
+        // it in atomically. The *old* shared_ptr (and the PassResult/data it
+        // points to) is only decremented here; if some other thread is still
+        // holding a strong reference obtained via require_shared() earlier,
+        // the old object stays alive until that thread releases it too.
+        std::atomic_store_explicit(&entry->result_ptr,
+            std::make_shared<const PassResult>(std::move(result)),
+            std::memory_order_release);
         entry->state.store(
-            entry->result.ok() ? PassState::Completed : PassState::Failed,
+            ok ? PassState::Completed : PassState::Failed,
             std::memory_order_release);
     }
     entry->cv.notify_all();
@@ -378,14 +464,23 @@ void PassManager::invalidate(std::string_view pass_name) {
 
     std::lock_guard<std::mutex> lk(entry->mtx);
     entry->state.store(PassState::NotRun, std::memory_order_release);
-    entry->result = PassResult::skipped();
+    // Swap in a fresh "skipped" result rather than mutating the existing one
+    // in place. Any thread holding a shared_ptr obtained via require_shared()
+    // (e.g. the GUI rendering a cached result, or an MCP handler still
+    // serializing a previous response) keeps its own reference alive and
+    // unaffected by this invalidate — only *new* callers see NotRun/skipped.
+    std::atomic_store_explicit(&entry->result_ptr,
+        std::make_shared<const PassResult>(PassResult::skipped()),
+        std::memory_order_release);
 }
 
 void PassManager::invalidate_all() {
     for (auto& entry : entries_) {
         std::lock_guard<std::mutex> lk(entry->mtx);
         entry->state.store(PassState::NotRun, std::memory_order_release);
-        entry->result = PassResult::skipped();
+        std::atomic_store_explicit(&entry->result_ptr,
+            std::make_shared<const PassResult>(PassResult::skipped()),
+            std::memory_order_release);
         entry->progress_pct.store(0.0f, std::memory_order_relaxed);
         entry->cancelled.store(false, std::memory_order_release);
     }
