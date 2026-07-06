@@ -357,6 +357,7 @@ void TenetMcpService::register_all_tools() {
     register_analysis_tools();
     register_search_tools();
     register_pass_tools();
+    register_vm_query_tools();
     register_evidence_tools();
     register_batch_tools();
     register_hypothesis_tools();

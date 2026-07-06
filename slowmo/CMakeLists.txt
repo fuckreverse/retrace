@@ -399,6 +399,7 @@ src/core/register_file.cpp
     src/io/mcp/mcp_http.cpp
     src/io/mcp/mcp_tools_core.cpp
     src/io/mcp/mcp_tools_analysis.cpp
+    src/io/mcp/mcp_tools_vm.cpp
     src/io/mcp/mcp_tools_ai.cpp
     src/io/mcp/hypothesis_ledger.cpp
     src/io/mcp/discipline_injector.cpp

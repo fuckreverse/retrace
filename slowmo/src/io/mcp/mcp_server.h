@@ -181,6 +181,7 @@ private:
     void register_analysis_tools();
     void register_search_tools();
     void register_pass_tools();
+    void register_vm_query_tools();
     void register_evidence_tools();
     void register_batch_tools();
     void register_hypothesis_tools();
