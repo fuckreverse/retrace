@@ -740,6 +740,7 @@ void GuiApp::run_vm_abstract_with_hints() {
 
     vm_hints_status_ = fmt::format(ICON_FA_SPINNER "  Running vm_abstract with hints from {}...",
                                     hints_path);
+    save_vm_profile();  // persist hints path (+ decoder path if set)
 
     enqueue_async("vm_abstract", [this]() {
         auto& raw = pass_manager_->require("vm_abstract");

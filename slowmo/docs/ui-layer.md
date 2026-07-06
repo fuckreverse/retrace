@@ -12,6 +12,7 @@
 | RPC | `src/io/rpc_server.cpp` | `--rpc [path]` | 本地工具经 Unix socket 接入 |
 | MCP stdio | `src/io/mcp/` | `--mcp` | AI 客户端通过子进程 stdio 接入 |
 | MCP HTTP | `src/io/mcp/` | `--mcp-http [host:port]` | 远程 / GUI 宿主 / 无 stdio 场景 |
+| MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | 多实例统一入口，自动 failover |
 | Streaming | `src/io/streaming_index.*` | `--streaming` | 边录制边索引边分析 |
 
 ```mermaid
@@ -25,6 +26,9 @@ flowchart TD
     G -- --rpc --> H[TenetRpcService]
     G -- --mcp --> I[TenetMcpService stdio]
     G -- --mcp-http --> J[TenetMcpService HTTP]
+    G -- --mcp-hub --> M{Hub election}
+    M -- win --> N[Hub: listen on 10444]
+    M -- lose --> O[Worker: reverse-connect to Hub]
     C --> K{--streaming?}
     K -- yes --> L[StreamingIndex]
 ```
@@ -112,7 +116,7 @@ CLI 由两部分组成：
 | 内存与字符串 | `--memread`, `--mem-history`, `--strings`, `--memory-strings`, `--memory-snapshot*`, `--mem-search*`（`--literal-search*` 为弃用别名）, `--entropy` |
 | 算法与语义 | `--pattern`, `--constants*`, `--loop-semantics`, `--algorithm-summary`, `--objc*`, `--syscall-intercept*`, `--taint-source-annotation`, `--vm-abstract` |
 | 轨迹与性能 | `--trace-diff`, `--trace-fold*`, `--reg-timeline*`, `--window-stats*`, `--yara-mem-scan*`, `--thread-filter` |
-| 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--streaming`, `--stats` |
+| 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--mcp-hub`, `--streaming`, `--stats` |
 | 调试 / 管理 | `--run-pass`, `--list-passes`, `--index-build`, `--cache-list`, `--cache-delete`, `--no-parallel-scan` |
 
 ### CLI 的特点
@@ -146,9 +150,10 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
 - 传输模式：
   - stdio（`--mcp`）
   - Streamable HTTP（`--mcp-http`）
-- 工具总数：**47 个**（`mcp_tools_core.cpp` 12 + `mcp_tools_ai.cpp` 9 + `mcp_tools_analysis.cpp` 25 + `mcp_server.cpp` 里直接注册的 `set_image_base` 1）
-- 注册入口：`register_all_tools()`
-- 工具分成 10 组：
+  - Hub 模式（`--mcp-hub`）：多实例统一入口，固定端口 10444，自动 failover
+- 工具总数：**51 个**（`mcp_tools_core.cpp` 12 + `mcp_tools_ai.cpp` 9 + `mcp_tools_analysis.cpp` 25 + `mcp_server.cpp` 里直接注册的 `set_image_base` 1 + Hub 模式注册的 `list_instances` 1 + session 模式注册的 `select_instance` 1）
+- 注册入口：`register_all_tools()`，Hub 模式额外注册 `list_instances` / `select_instance`
+- 工具分成 10 组（Hub 模式额外 1-2 个）：
   - `register_trace_tools()`
   - `register_query_tools()`
   - `register_taint_tools()`
@@ -196,6 +201,58 @@ sequenceDiagram
     PM-->>MCP: PassResult
     MCP-->>Client: structured JSON result
 ```
+
+### MCP Hub 模式（多实例协调）
+
+`--mcp-hub [host:port]` 启用 Hub 架构，解决多 tenet 实例端口管理问题。实现位于 `src/io/mcp/mcp_hub.h/.cpp`。
+
+**架构**：第一个启动的 tenet 实例通过 `flock` 选举成为 Hub，在固定端口（默认 10444）监听；后续实例自动成为 Worker，通过反向 TCP 连接到 Hub，不监听任何端口。MCP 客户端只需连接 Hub 的单一端口即可访问所有实例。
+
+**两种工作模式**：
+
+- **无 Session 模式（默认）**：每个工具调用必须显式指定 `instance` 参数，`select_instance` 工具不注册。这是默认模式，因为不同 AI 工具对会话管理实现各异，共享 session 可能导致路由混乱。
+- **Session 模式（`--mcp-hub-session` 开启）**：`select_instance` 工具设置会话默认实例，后续调用可省略 `instance` 参数。适合单用户、单会话场景。
+
+**Hub 新增工具**：
+
+- `list_instances`：列出所有已注册的实例（Hub + Workers），返回实例 ID、PID、trace 文件路径等信息。始终注册。
+- `select_instance`：设置当前会话的默认实例。仅 Session 模式注册。
+
+**工具 schema 注入**：Hub 模式下，所有现有工具的 schema 自动注入 `instance` 参数（无 Session 模式下为 required，Session 模式下为 optional）。
+
+**请求转发**：Hub 收到 `tools/call` 请求后，从参数中提取 `instance`，移除该参数后将剩余 JSON-RPC 转发给目标 Worker。Hub 自身的实例请求在本地处理。
+
+**自动 failover**：Hub 通过 `flock(LOCK_EX | LOCK_NB)` 竿选。进程崩溃时内核自动释放锁，其他实例的选举线程检测到锁可用后重新竞选，新 Hub 在秒级内恢复服务。Worker 通过心跳（10s 间隔，90s 超时）检测 Hub 存活，Hub 崩溃后 Worker 自动重连并触发选举。
+
+**协议复用**：Hub 监听单一端口，通过 `MSG_PEEK` 探测首字节区分连接类型——以 `WORKER/1.0\n` 开头的是 Worker 反向连接（newline-delimited JSON-RPC over TCP），否则视为 MCP 客户端的 HTTP 请求。
+
+```mermaid
+flowchart TD
+    Client[MCP Client] -->|HTTP :10444| Hub[Hub Instance]
+    Hub -->|local| HubMCP[TenetMcpService]
+    Hub -->|TCP reverse| W1[Worker 1]
+    Hub -->|TCP reverse| W2[Worker 2]
+    W1 --> W1MCP[TenetMcpService]
+    W2 --> W2MCP[TenetMcpService]
+    Hub -.->|flock election| Lock[(~/.tenet/mcp-hub.lock)]
+```
+
+**CLI 用法**：
+
+```bash
+# 第一个实例成为 Hub
+./tenet --mcp-hub trace1.bin
+# 后续实例自动成为 Worker
+./tenet --mcp-hub trace2.bin
+# 指定 Hub 端口
+./tenet --mcp-hub 0.0.0.0:10444 trace.bin
+# 启用 Session 模式
+./tenet --mcp-hub --mcp-hub-session trace.bin
+# 指定实例名称
+./tenet --mcp-hub --mcp-hub-name "app-analysis" trace.bin
+```
+
+**GUI 集成**：GUI 的 MCP Server 设置页自动尝试 Hub 模式（端口 10444），失败则降级为 Worker，再降级为独立 HTTP。状态指示器显示 Hub（绿）、Worker（蓝）、Standalone（绿）、Stopped（灰）四种状态。
 
 ### AI 专用能力
 

@@ -26,6 +26,7 @@
 
 #include "gui/gui_app.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
+#include "analysis/passes/vm/vm_decoder.h"
 #include "analysis/passes/structure/xref_pass.h"
 
 #include <imgui.h>
@@ -329,41 +330,59 @@ void GuiApp::render_vmws_steps_panel() {
                 }
             }
 
-            // ── Col 3: asm annotation from HandlerAsmHint ──
+            // ── Col 3: asm — decoder output > HandlerAsmHint > fallback ──
             ImGui::TableSetColumnIndex(3);
-            if (vm.handler_asm.has_value()) {
-                uint64_t h_static_pc = step.handler_entry_pc - slide;
-                auto it = vm.handler_asm->handler_asm.find(h_static_pc);
-                if (it != vm.handler_asm->handler_asm.end() && !it->second.empty()) {
-                    // Show first non-empty line inline; tooltip shows all lines
-                    const auto& lines = it->second;
-                    ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f),
-                        "%s", lines.front().text.c_str());
-                    if (lines.size() > 1 && ImGui::IsItemHovered()) {
-                        ImGui::BeginTooltip();
-                        for (const auto& ln : lines) {
-                            if (ln.pc != 0)
-                                ImGui::TextDisabled("0x%llx  ", (unsigned long long)ln.pc);
-                            ImGui::SameLine(0, 0);
-                            ImGui::TextUnformatted(ln.text.c_str());
+            {
+                bool shown = false;
+
+                // Priority 1: VM bytecode decoder (per-instruction decode)
+                if (vm_decoder_ && step.opcode_valid) {
+                    auto decoded = vm_decoder_->decode(step, vm);
+                    if (decoded.valid) {
+                        ImGui::TextColored(ImVec4(0.90f, 0.80f, 1.0f, 1.0f),
+                            "%s", decoded.asm_text.c_str());
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Decoded by '%s'\nOpcode: 0x%08llX → %s",
+                                std::string(vm_decoder_->name()).c_str(),
+                                (unsigned long long)step.opcode_value,
+                                decoded.asm_text.c_str());
                         }
-                        ImGui::EndTooltip();
+                        shown = true;
                     }
-                } else {
-                    // No asm for this handler — show native inst range
-                    ImGui::TextDisabled("#%llu–#%llu",
-                        (unsigned long long)step.inst_id_start,
-                        (unsigned long long)step.inst_id_end);
                 }
-            } else {
-                // No asm hint: label or inst range
-                const VMHandler* h = vm.handler_at(step.handler_entry_pc);
-                if (h && !h->label.empty()) {
-                    ImGui::TextDisabled("%s", h->label.c_str());
-                } else {
-                    ImGui::TextDisabled("#%llu–#%llu",
-                        (unsigned long long)step.inst_id_start,
-                        (unsigned long long)step.inst_id_end);
+
+                // Priority 2: HandlerAsmHint (static handler-level annotation)
+                if (!shown && vm.handler_asm.has_value()) {
+                    uint64_t h_static_pc = step.handler_entry_pc - slide;
+                    auto it = vm.handler_asm->handler_asm.find(h_static_pc);
+                    if (it != vm.handler_asm->handler_asm.end() && !it->second.empty()) {
+                        const auto& lines = it->second;
+                        ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f),
+                            "%s", lines.front().text.c_str());
+                        if (lines.size() > 1 && ImGui::IsItemHovered()) {
+                            ImGui::BeginTooltip();
+                            for (const auto& ln : lines) {
+                                if (ln.pc != 0)
+                                    ImGui::TextDisabled("0x%llx  ", (unsigned long long)ln.pc);
+                                ImGui::SameLine(0, 0);
+                                ImGui::TextUnformatted(ln.text.c_str());
+                            }
+                            ImGui::EndTooltip();
+                        }
+                        shown = true;
+                    }
+                }
+
+                // Fallback: handler label or inst range
+                if (!shown) {
+                    const VMHandler* h = vm.handler_at(step.handler_entry_pc);
+                    if (h && !h->label.empty()) {
+                        ImGui::TextDisabled("%s", h->label.c_str());
+                    } else {
+                        ImGui::TextDisabled("#%llu–#%llu",
+                            (unsigned long long)step.inst_id_start,
+                            (unsigned long long)step.inst_id_end);
+                    }
                 }
             }
 
@@ -951,10 +970,40 @@ void GuiApp::render_vm_workspace() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show/hide the hints file input");
 
+        ImGui::SameLine(0, 4);
+        static bool vm_ws_show_decoder_editor = false;
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            vm_ws_show_decoder_editor
+            ? ImVec4(0.40f, 0.25f, 0.60f, 0.80f)
+            : ImVec4(0.35f, 0.35f, 0.35f, 0.60f));
+        if (ImGui::SmallButton(ICON_FA_CODE "  Decoder")) {
+            vm_ws_show_decoder_editor = !vm_ws_show_decoder_editor;
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            if (vm_decoder_)
+                ImGui::SetTooltip("Decoder: %s\nClick to show/hide decoder settings",
+                    std::string(vm_decoder_->name()).c_str());
+            else
+                ImGui::SetTooltip("No decoder loaded. Click to load one.");
+        }
+
+        // Decoder status badge in toolbar
+        if (vm_decoder_) {
+            ImGui::SameLine(0, 8);
+            ImGui::TextColored(ImVec4(0.75f, 0.60f, 1.0f, 1.0f),
+                ICON_FA_CHECK "  %s", std::string(vm_decoder_->name()).c_str());
+        }
+
         ImGui::Separator();
 
         if (vm_ws_show_hints_editor) {
             render_vm_hints_input(ICON_FA_ARROW_ROTATE_LEFT "  Rerun with hints", 260.0f);
+            ImGui::Separator();
+        }
+
+        if (vm_ws_show_decoder_editor) {
+            render_vm_decoder_input();
             ImGui::Separator();
         }
     }
@@ -1025,6 +1074,191 @@ void GuiApp::push_vm_hints_recent(const std::string& path) {
     if (it != vm_hints_recent_.end()) vm_hints_recent_.erase(it);
     vm_hints_recent_.insert(vm_hints_recent_.begin(), path);
     if (vm_hints_recent_.size() > 8) vm_hints_recent_.resize(8);
+}
+
+// ─── push_vm_decoder_recent ─────────────────────────────────────────────────
+void GuiApp::push_vm_decoder_recent(const std::string& path) {
+    if (path.empty()) return;
+    auto it = std::find(vm_decoder_recent_.begin(), vm_decoder_recent_.end(), path);
+    if (it != vm_decoder_recent_.end()) vm_decoder_recent_.erase(it);
+    vm_decoder_recent_.insert(vm_decoder_recent_.begin(), path);
+    if (vm_decoder_recent_.size() > 8) vm_decoder_recent_.resize(8);
+}
+
+// ─── load_vm_decoder ────────────────────────────────────────────────────────
+void GuiApp::load_vm_decoder() {
+    std::string path(vm_decoder_path_buf_);
+    if (path.empty()) {
+        vm_decoder_.reset();
+        vm_decoder_status_.clear();
+        return;
+    }
+
+    // Skip reload if same path is already loaded
+    if (vm_decoder_ && vm_decoder_status_.find(path) != std::string::npos
+        && vm_decoder_status_.rfind(ICON_FA_CIRCLE_CHECK, 0) == 0) {
+        return;
+    }
+
+    try {
+        vm_decoder_ = std::shared_ptr<VMBytecodeDecoder>(
+            load_decoder_from_json(path).release());
+        vm_decoder_status_ = fmt::format(
+            ICON_FA_CIRCLE_CHECK "  Decoder '{}' loaded from {}",
+            vm_decoder_->name(), path);
+        push_vm_decoder_recent(path);
+        save_vm_profile();
+    } catch (const std::exception& e) {
+        vm_decoder_.reset();
+        vm_decoder_status_ = fmt::format(
+            ICON_FA_CIRCLE_XMARK "  Failed to load decoder: {}", e.what());
+    }
+}
+
+// ─── save_vm_profile ─────────────────────────────────────────────────────────
+void GuiApp::save_vm_profile() {
+    std::string module = reader_.header().module_name;
+    if (module.empty()) return;
+    vm_profiles_.upsert(module,
+                        std::string(vm_hints_path_buf_),
+                        std::string(vm_decoder_path_buf_));
+    vm_profiles_.save();
+}
+
+// ─── restore_vm_profile ──────────────────────────────────────────────────────
+void GuiApp::restore_vm_profile() {
+    std::string module = reader_.header().module_name;
+    if (module.empty()) return;
+    const auto* prof = vm_profiles_.find(module);
+    if (!prof) return;
+
+    if (!prof->hints_file.empty() && vm_hints_path_buf_[0] == '\0') {
+        std::snprintf(vm_hints_path_buf_, sizeof(vm_hints_path_buf_),
+                      "%s", prof->hints_file.c_str());
+        push_vm_hints_recent(prof->hints_file);
+    }
+    if (!prof->decoder_file.empty() && vm_decoder_path_buf_[0] == '\0') {
+        std::snprintf(vm_decoder_path_buf_, sizeof(vm_decoder_path_buf_),
+                      "%s", prof->decoder_file.c_str());
+        push_vm_decoder_recent(prof->decoder_file);
+    }
+}
+
+// ─── render_vm_decoder_input ─────────────────────────────────────────────────
+// Renders a decoder file selector: drag-and-drop target, browse button,
+// recent list, load button, status line. Visually parallel to the hints input.
+void GuiApp::render_vm_decoder_input() {
+    ImGui::TextWrapped(
+        "Load a VM bytecode decoder definition (.json) to decode raw opcodes "
+        "into readable assembly (e.g. 'XOR R3, R1, R2').");
+    ImGui::Spacing();
+
+    // ── Drag & drop / click-to-browse target ──────────────────────────
+    const float dz_h = 46.0f;
+    ImVec2 dz_pos = ImGui::GetCursorScreenPos();
+    ImVec2 dz_size(ImGui::GetContentRegionAvail().x, dz_h);
+    ImGui::InvisibleButton("##vm_decoder_dropzone", dz_size);
+    bool dz_hovered = ImGui::IsItemHovered();
+    bool dz_clicked = ImGui::IsItemClicked();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 dz_bg = dz_hovered
+        ? IM_COL32(50, 45, 80, 200)
+        : IM_COL32(32, 30, 44, 160);
+    ImU32 dz_border = dz_hovered
+        ? IM_COL32(150, 110, 230, 255)
+        : IM_COL32(95, 85, 120, 200);
+    dl->AddRectFilled(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y),
+                       dz_bg, 6.0f);
+    dl->AddRect(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y),
+                dz_border, 6.0f, 0, 1.5f);
+
+    const char* dz_text = vm_decoder_path_buf_[0] != '\0'
+        ? vm_decoder_path_buf_
+        : ICON_FA_CODE "  Drag & drop a decoder .json here, or click to browse";
+    ImVec2 txt_sz = ImGui::CalcTextSize(dz_text);
+    ImVec2 txt_pos(dz_pos.x + (dz_size.x - txt_sz.x) * 0.5f,
+                    dz_pos.y + (dz_size.y - txt_sz.y) * 0.5f);
+    if (txt_pos.x < dz_pos.x + 8.0f) txt_pos.x = dz_pos.x + 8.0f;
+    ImVec4 txt_col = vm_decoder_path_buf_[0] != '\0'
+        ? ImVec4(0.85f, 0.75f, 1.0f, 1.0f)
+        : ImVec4(0.60f, 0.55f, 0.72f, 1.0f);
+    dl->PushClipRect(dz_pos, ImVec2(dz_pos.x + dz_size.x, dz_pos.y + dz_size.y), true);
+    dl->AddText(txt_pos, ImGui::GetColorU32(txt_col), dz_text);
+    dl->PopClipRect();
+
+    if (dz_hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(vm_decoder_path_buf_[0] != '\0'
+            ? "Click to choose a different decoder file"
+            : "Click to browse for a decoder .json file");
+    }
+
+    if (dz_clicked) {
+        std::string picked = pick_file_path(
+            "Choose a VM bytecode decoder JSON", {"json"});
+        if (!picked.empty()) {
+            std::snprintf(vm_decoder_path_buf_, sizeof(vm_decoder_path_buf_),
+                          "%s", picked.c_str());
+            vm_decoder_status_.clear();
+        }
+    }
+
+    ImGui::Spacing();
+
+    // ── Recent decoder files ──────────────────────────────────────────
+    if (!vm_decoder_recent_.empty()) {
+        ImGui::TextDisabled(ICON_FA_CLOCK_ROTATE_LEFT "  Recent decoders:");
+        for (size_t i = 0; i < vm_decoder_recent_.size(); ++i) {
+            const std::string& p = vm_decoder_recent_[i];
+            size_t slash = p.find_last_of('/');
+            std::string short_name = (slash == std::string::npos) ? p : p.substr(slash + 1);
+            ImGui::SameLine();
+            ImGui::PushID(static_cast<int>(1000 + i));  // offset from hints IDs
+            if (ImGui::SmallButton(short_name.c_str())) {
+                std::snprintf(vm_decoder_path_buf_, sizeof(vm_decoder_path_buf_),
+                              "%s", p.c_str());
+                vm_decoder_status_.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Spacing();
+
+    // ── Load / Reload button ──────────────────────────────────────────
+    bool can_load = vm_decoder_path_buf_[0] != '\0';
+    ImGui::BeginDisabled(!can_load);
+    if (ImGui::Button(ICON_FA_CODE "  Load Decoder", ImVec2(160, 0))) {
+        load_vm_decoder();
+    }
+    ImGui::EndDisabled();
+    if (!can_load && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Select a decoder file first.");
+
+    // ── Clear button ──────────────────────────────────────────────────
+    if (vm_decoder_) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_FA_XMARK "  Clear")) {
+            vm_decoder_.reset();
+            vm_decoder_path_buf_[0] = '\0';
+            vm_decoder_status_ = ICON_FA_CIRCLE_XMARK "  Decoder cleared";
+        }
+    }
+
+    // ── Status ────────────────────────────────────────────────────────
+    if (!vm_decoder_status_.empty()) {
+        ImGui::Spacing();
+        ImVec4 col(0.85f, 0.85f, 0.85f, 1.0f);
+        if (vm_decoder_status_.rfind(ICON_FA_CIRCLE_XMARK, 0) == 0)
+            col = ImVec4(0.95f, 0.40f, 0.40f, 1.0f);
+        else if (vm_decoder_status_.rfind(ICON_FA_CIRCLE_CHECK, 0) == 0)
+            col = ImVec4(0.45f, 0.90f, 0.55f, 1.0f);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(col, "%s", vm_decoder_status_.c_str());
+        ImGui::PopTextWrapPos();
+    }
 }
 
 // ─── render_vm_hints_input ────────────────────────────────────────────────
@@ -1224,6 +1458,15 @@ void GuiApp::render_vm_hints_popup() {
     }
 
     render_vm_hints_input(ICON_FA_PLAY "  Run VM Detection", -1.0f);
+
+    // ── Decoder section (collapsible) ────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(ICON_FA_CODE "  Bytecode Decoder",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        render_vm_decoder_input();
+    }
 
     ImGui::End();
 }

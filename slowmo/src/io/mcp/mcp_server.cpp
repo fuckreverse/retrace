@@ -1,5 +1,6 @@
 #include "mcp_server.h"
 #include "mcp_http.h"
+#include "mcp_hub.h"
 #include "mcp_helpers.h"
 
 #include "io/trace_reader.h"
@@ -11,6 +12,9 @@
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <unistd.h>
+#include <random>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -170,6 +174,21 @@ uint16_t TenetMcpService::http_listening_port() const {
 void TenetMcpService::stop() {
     if (stdio_transport_) stdio_transport_->stop();
     stop_http();
+
+    // Stop hub/worker mode
+    if (worker_transport_) {
+        worker_transport_->stop();
+        if (worker_thread_.joinable()) worker_thread_.join();
+        worker_transport_.reset();
+    }
+    if (hub_transport_) {
+        hub_transport_->stop();
+        hub_transport_.reset();
+    }
+    if (hub_election_) {
+        hub_election_->release();
+        hub_election_.reset();
+    }
 }
 
 json TenetMcpService::process_message(const json& msg) {
@@ -407,6 +426,299 @@ void TenetMcpService::register_all_tools() {
 
 bool TenetMcpService::is_write_tool(const std::string& tool_name) const {
     return write_tools_.count(tool_name) > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hub mode implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+json TenetMcpService::instance_info_json() const {
+    return {
+        {"id",          instance_id_},
+        {"pid",         static_cast<int>(getpid())},
+        {"trace_file",  trace_file_},
+        {"module_name", module_name_},
+        {"is_hub",      true}
+    };
+}
+
+json TenetMcpService::hub_list_instances() const {
+    if (!hub_transport_) return json::object();
+    return hub_transport_->list_instances();
+}
+
+bool TenetMcpService::start_hub(const McpHubConfig& cfg) {
+    hub_cfg_ = cfg;
+    hub_session_mode_ = cfg.session_mode;
+
+    // Generate instance ID if not set
+    if (instance_id_.empty()) {
+        instance_id_ = cfg.instance_name.empty()
+            ? fmt::format("tenet-{}", getpid())
+            : cfg.instance_name;
+    }
+
+    // Get trace file and module name
+    trace_file_ = reader_.path().string();
+    module_name_ = reader_.header().module_name;
+
+    // Attempt flock election
+    hub_election_ = std::make_unique<HubElection>(
+        cfg.lock_dir, getpid(), cfg.port, trace_file_, instance_id_);
+
+    if (!hub_election_->try_acquire()) {
+        LOG_INFO_M(log::Module::Mcp, "hub: election failed, another instance is hub");
+        return false;
+    }
+
+    // We are the hub — start the hub transport
+    hub_transport_ = std::make_unique<McpHubTransport>(
+        [this](const json& msg) -> json { return process_message_hub(msg); },
+        cfg.host, cfg.port,
+        cfg.session_mode,
+        instance_id_);
+
+    hub_transport_->set_instance_info_provider([this]() -> json {
+        return instance_info_json();
+    });
+
+    if (!hub_transport_->start()) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: failed to start transport on {}:{}", cfg.host, cfg.port);
+        hub_election_->release();
+        hub_election_.reset();
+        hub_transport_.reset();
+        return false;
+    }
+
+    // Inject instance parameter into all tool schemas
+    inject_instance_param(!cfg.session_mode);  // required in sessionless mode
+
+    // Register hub-specific tools (list_instances, select_instance)
+    register_hub_tools();
+
+    LOG_INFO_M(log::Module::Mcp, "hub: started on {}:{} (id={}, session_mode={})",
+               cfg.host, cfg.port, instance_id_, cfg.session_mode);
+    return true;
+}
+
+bool TenetMcpService::start_worker(const McpHubConfig& cfg) {
+    hub_cfg_ = cfg;
+
+    // Generate instance ID if not set
+    if (instance_id_.empty()) {
+        instance_id_ = cfg.instance_name.empty()
+            ? fmt::format("tenet-{}", getpid())
+            : cfg.instance_name;
+    }
+
+    trace_file_ = reader_.path().string();
+    module_name_ = reader_.header().module_name;
+
+    // Try to read hub info from lock file
+    HubElection::HubInfo hub_info;
+    {
+        HubElection probe(cfg.lock_dir, getpid(), cfg.port, trace_file_, instance_id_);
+        hub_info = probe.read_current();
+    }
+
+    if (!hub_info.valid) {
+        LOG_WARN_M(log::Module::Mcp, "worker: no hub found in lock file");
+        return false;
+    }
+
+    LOG_INFO_M(log::Module::Mcp, "worker: connecting to hub at {}:{} (id={})",
+               cfg.host, hub_info.port, instance_id_);
+
+    worker_transport_ = std::make_unique<McpWorkerTransport>(
+        [this](const json& msg) -> json { return process_message(msg); },
+        cfg.host, hub_info.port,
+        instance_id_, getpid(),
+        trace_file_, module_name_);
+
+    // Run worker in background thread
+    worker_thread_ = std::thread([this] {
+        worker_transport_->run();
+    });
+
+    return true;
+}
+
+void TenetMcpService::inject_instance_param(bool required) {
+    for (auto& schema : tool_schemas_) {
+        // Skip hub-specific tools (they handle instance themselves)
+        if (schema.name == "list_instances" || schema.name == "select_instance")
+            continue;
+
+        // Add instance property if not already present
+        if (!schema.input_schema.contains("properties")) {
+            schema.input_schema["properties"] = json::object();
+        }
+        schema.input_schema["properties"]["instance"] = {
+            {"type", "string"},
+            {"description",
+             required
+                ? "REQUIRED: target instance ID. Call list_instances to see available instances."
+                : "Target instance ID (optional, uses session default if omitted). Call list_instances to see available instances."}
+        };
+
+        if (required) {
+            if (!schema.input_schema.contains("required")) {
+                schema.input_schema["required"] = json::array();
+            }
+            schema.input_schema["required"].push_back("instance");
+        }
+    }
+}
+
+void TenetMcpService::register_hub_tools() {
+    // ── list_instances ─────────────────────────────────────────────────
+    register_tool(
+        {"list_instances",
+         "List all tenet MCP instances and their status. "
+         "Returns each instance's id, pid, trace_file, module_name, and is_hub flag. "
+         "Call this first to find the instance ID you need, then pass it as the "
+         "'instance' parameter to other tools.",
+         {{"type", "object"}, {"properties", json::object()}}},
+        [this](const json&) -> json {
+            if (hub_transport_) {
+                return hub_transport_->list_instances();
+            }
+            return {{"instances", json::array()}};
+        }
+    );
+
+    // ── select_instance (session mode only) ────────────────────────────
+    if (hub_session_mode_) {
+        register_tool(
+            {"select_instance",
+             "Set the default instance for the current session. "
+             "After calling this, subsequent tool calls without an 'instance' "
+             "parameter will be routed to the selected instance.",
+             {{"type", "object"},
+              {"properties", {
+                  {"instance", {{"type", "string"},
+                   {"description", "Instance ID to set as default"}}}
+              }},
+              {"required", json::array({"instance"})}}},
+            [this](const json& args) -> json {
+                std::string inst = args.at("instance").get<std::string>();
+                if (!hub_transport_ || !hub_transport_->has_instance(inst)) {
+                    throw std::runtime_error("Unknown instance: " + inst);
+                }
+                std::lock_guard<std::mutex> lk(session_state_mutex_);
+                session_default_instance_["_default"] = inst;
+                return {{"ok", true}, {"default_instance", inst}};
+            }
+        );
+    }
+}
+
+json TenetMcpService::process_message_hub(const json& msg) {
+    std::string method = msg.value("method", "");
+    auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
+
+    // Notifications — pass through
+    if (msg_id.is_null() && !msg.contains("id")) {
+        return process_message(msg);
+    }
+
+    // initialize and ping — handle locally
+    if (method == "initialize" || method == "ping") {
+        return process_message(msg);
+    }
+
+    // tools/list — handle locally (schemas already have instance param)
+    if (method == "tools/list") {
+        return process_message(msg);
+    }
+
+    // tools/call — route based on instance parameter
+    if (method == "tools/call") {
+        auto params = msg.value("params", json::object());
+        std::string tool_name = params.value("name", "");
+        json arguments = params.value("arguments", json::object());
+
+        // Hub-specific tools are handled locally
+        if (tool_name == "list_instances" || tool_name == "select_instance") {
+            return process_message(msg);
+        }
+
+        // Extract instance parameter
+        std::string target_instance;
+        if (arguments.contains("instance")) {
+            target_instance = arguments["instance"].get<std::string>();
+            // Strip instance from arguments before forwarding
+            json clean_args = arguments;
+            clean_args.erase("instance");
+
+            json forwarded = msg;
+            forwarded["params"]["arguments"] = std::move(clean_args);
+
+            if (target_instance == instance_id_) {
+                return process_message(forwarded);
+            }
+
+            if (hub_transport_ && hub_transport_->has_instance(target_instance)) {
+                try {
+                    return hub_transport_->forward_request(target_instance, forwarded);
+                } catch (const std::exception& e) {
+                    json err = {{"error", e.what()}};
+                    return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                            {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                                        {"isError", true}}}};
+                }
+            }
+
+            json err = {{"error", "Unknown instance: " + target_instance +
+                ". Call list_instances to see available instances."}};
+            return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                    {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                                {"isError", true}}}};
+        }
+
+        // No instance parameter — check session mode
+        if (hub_session_mode_) {
+            std::lock_guard<std::mutex> lk(session_state_mutex_);
+            auto it = session_default_instance_.find("_default");
+            if (it != session_default_instance_.end()) {
+                target_instance = it->second;
+            }
+
+            if (target_instance.empty()) {
+                json err = {{"error", "No instance specified and no default set. "
+                    "Call select_instance first or provide the 'instance' parameter."}};
+                return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                        {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                                    {"isError", true}}}};
+            }
+
+            if (target_instance == instance_id_) {
+                return process_message(msg);
+            }
+
+            if (hub_transport_ && hub_transport_->has_instance(target_instance)) {
+                try {
+                    return hub_transport_->forward_request(target_instance, msg);
+                } catch (const std::exception& e) {
+                    json err = {{"error", e.what()}};
+                    return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                            {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                                        {"isError", true}}}};
+                }
+            }
+        }
+
+        // Sessionless mode without instance parameter
+        json err = {{"error", "Missing required 'instance' parameter. "
+            "Call list_instances to see available instances, then pass "
+            "instance='<id>' to this tool."}};
+        return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                            {"isError", true}}}};
+    }
+
+    // Other methods — handle locally
+    return process_message(msg);
 }
 
 }  // namespace tenet

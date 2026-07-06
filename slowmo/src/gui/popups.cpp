@@ -653,14 +653,40 @@ void GuiApp::render_settings_window() {
 
         // ─── MCP Server Tab ────────────────────────────────────────────
         if (ImGui::BeginTabItem("MCP Server")) {
-            bool mcp_running = mcp_service_ && mcp_service_->http_running();
+            bool mcp_active = mcp_service_ && (mcp_service_->is_hub() ||
+                                               mcp_service_->is_worker() ||
+                                               mcp_service_->http_running());
 
-            // Status indicator
+            // ── Status ───────────────────────────────────────────────────
             ImGui::SeparatorText("Status");
-            if (mcp_running) {
-                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "● Running");
-                ImGui::SameLine();
-                ImGui::TextDisabled("http://%s:%d/sse", mcp_gui_.host, mcp_gui_.port);
+            if (mcp_active && mcp_service_) {
+                if (mcp_service_->is_hub()) {
+                    // Hub: show port and instance count
+                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "● Hub");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("http://%s:%d/mcp", mcp_gui_.host, 10444);
+
+                    // Count connected instances
+                    int worker_count = 0;
+                    auto instances_json = mcp_service_->hub_list_instances();
+                    if (instances_json.contains("instances")) {
+                        for (const auto& inst : instances_json["instances"]) {
+                            if (!inst.value("is_hub", false)) worker_count++;
+                        }
+                    }
+                    ImGui::Text("Instances: %d (1 hub + %d worker%s)",
+                                worker_count + 1, worker_count,
+                                worker_count == 1 ? "" : "s");
+                } else if (mcp_service_->is_worker()) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "● Worker");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("connected to hub at %s:%d", mcp_gui_.host, 10444);
+                } else if (mcp_service_->http_running()) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "● Standalone");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("http://%s:%d/mcp", mcp_gui_.host, mcp_gui_.port);
+                }
+                ImGui::TextDisabled("Instance ID: %s", mcp_service_->instance_id().c_str());
             } else {
                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "● Stopped");
             }
@@ -669,108 +695,176 @@ void GuiApp::render_settings_window() {
                 ImGui::TextWrapped("%s", mcp_status_msg_.c_str());
             }
 
-            // Settings (disabled while running to prevent confusion)
-            ImGui::SeparatorText("Configuration");
-            ImGui::BeginDisabled(mcp_running);
-
-            // Use available width minus label area for comfortable input
-            const float input_w = ImGui::GetContentRegionAvail().x * 0.55f;
-
-            ImGui::SetNextItemWidth(input_w);
-            ImGui::InputText("Host / Interface", mcp_gui_.host, sizeof(mcp_gui_.host));
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Bind address.\n"
-                    "127.0.0.1 = localhost only (safe default)\n"
-                    "0.0.0.0   = all network interfaces");
+            // ── Connected Instances (Hub mode only) ─────────────────────
+            if (mcp_active && mcp_service_ && mcp_service_->is_hub()) {
+                ImGui::SeparatorText("Connected Instances");
+                auto instances_json = mcp_service_->hub_list_instances();
+                if (instances_json.contains("instances") && !instances_json["instances"].empty()) {
+                    if (ImGui::BeginTable("McpInstances", 4,
+                                          ImGuiTableFlags_Borders |
+                                          ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_ScrollY,
+                                          ImVec2(0, 120))) {
+                        ImGui::TableSetupColumn("Role");
+                        ImGui::TableSetupColumn("Instance ID");
+                        ImGui::TableSetupColumn("PID");
+                        ImGui::TableSetupColumn("Trace File");
+                        ImGui::TableHeadersRow();
+                        for (const auto& inst : instances_json["instances"]) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            if (inst.value("is_hub", false)) {
+                                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "Hub");
+                            } else {
+                                ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "Worker");
+                            }
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::TextUnformatted(inst.value("id", "").c_str());
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%d", inst.value("pid", 0));
+                            ImGui::TableSetColumnIndex(3);
+                            std::string tf = inst.value("trace_file", "");
+                            // Show just the filename, full path in tooltip
+                            if (auto pos = tf.find_last_of('/'); pos != std::string::npos)
+                                tf = tf.substr(pos + 1);
+                            ImGui::TextUnformatted(tf.c_str());
+                            if (ImGui::IsItemHovered() && !tf.empty()) {
+                                ImGui::SetTooltip("%s", inst.value("trace_file", "").c_str());
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                } else {
+                    ImGui::TextDisabled("No instances connected.");
+                }
             }
 
-            ImGui::SetNextItemWidth(input_w);
-            ImGui::InputInt("Port", &mcp_gui_.port);
-            mcp_gui_.port = std::max(1, std::min(65535, mcp_gui_.port));
-
-            ImGui::SeparatorText("Basic Auth (optional)");
-
-            ImGui::SetNextItemWidth(input_w);
-            ImGui::InputText("Username", mcp_gui_.username, sizeof(mcp_gui_.username));
-
-            ImGui::SetNextItemWidth(input_w);
-            ImGui::InputText("Password", mcp_gui_.password, sizeof(mcp_gui_.password),
-                             ImGuiInputTextFlags_Password);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Leave both empty to disable authentication.");
-            }
-
-            ImGui::EndDisabled();
-
-            // Control buttons
+            // ── Controls ────────────────────────────────────────────────
             ImGui::SeparatorText("Controls");
 
-            if (!mcp_running) {
+            if (!mcp_active) {
                 if (ImGui::Button("Start##mcp", ImVec2(90, 0))) {
-                    McpHttpConfig cfg;
-                    cfg.host     = mcp_gui_.host;
-                    cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
-                    cfg.username = mcp_gui_.username;
-                    cfg.password = mcp_gui_.password;
-
-                    // Ensure PassManager is available
                     ensure_pass_manager();
 
                     mcp_service_ = std::make_unique<TenetMcpService>(
                         reader_, index_, regfile_, memory_,
                         pass_manager_.get(), &code_table_, &decoder_);
 
-                    if (mcp_service_->start_http(cfg)) {
+                    // Try hub mode first, then worker, then standalone
+                    McpHubConfig hub_cfg;
+                    hub_cfg.host = mcp_gui_.host;
+                    hub_cfg.port = 10444;
+
+                    if (mcp_service_->start_hub(hub_cfg)) {
+                        mcp_gui_.port = 10444;
                         mcp_status_msg_ = fmt::format(
-                            "Server started on {}:{}", cfg.host, cfg.port);
+                            "Hub mode on {}:{}", hub_cfg.host, hub_cfg.port);
+                    } else if (mcp_service_->start_worker(hub_cfg)) {
+                        mcp_status_msg_ = fmt::format(
+                            "Worker mode, connected to hub at {}:{}", hub_cfg.host, hub_cfg.port);
                     } else {
-                        mcp_status_msg_ = fmt::format(
-                            "ERROR: Failed to bind {}:{} — check if port is in use.",
-                            cfg.host, cfg.port);
-                        mcp_service_.reset();
+                        // Fallback to standalone HTTP
+                        McpHttpConfig cfg;
+                        cfg.host     = mcp_gui_.host;
+                        cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
+                        cfg.username = mcp_gui_.username;
+                        cfg.password = mcp_gui_.password;
+
+                        if (mcp_service_->start_http(cfg)) {
+                            mcp_status_msg_ = fmt::format(
+                                "Standalone on {}:{}", cfg.host, cfg.port);
+                        } else {
+                            mcp_status_msg_ = "ERROR: Failed to start any mode.";
+                            mcp_service_.reset();
+                        }
                     }
                 }
             } else {
                 if (ImGui::Button("Stop##mcp", ImVec2(90, 0))) {
-                    mcp_service_->stop_http();
-                    mcp_status_msg_ = "Server stopped.";
+                    mcp_service_->stop();
+                    mcp_status_msg_ = "Stopped.";
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Restart##mcp", ImVec2(90, 0))) {
-                    mcp_service_->stop_http();
+                    mcp_service_->stop();
 
-                    McpHttpConfig cfg;
-                    cfg.host     = mcp_gui_.host;
-                    cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
-                    cfg.username = mcp_gui_.username;
-                    cfg.password = mcp_gui_.password;
+                    McpHubConfig hub_cfg;
+                    hub_cfg.host = mcp_gui_.host;
+                    hub_cfg.port = 10444;
 
-                    if (mcp_service_->start_http(cfg)) {
+                    if (mcp_service_->start_hub(hub_cfg)) {
+                        mcp_gui_.port = 10444;
                         mcp_status_msg_ = fmt::format(
-                            "Server restarted on {}:{}", cfg.host, cfg.port);
+                            "Hub mode on {}:{}", hub_cfg.host, hub_cfg.port);
+                    } else if (mcp_service_->start_worker(hub_cfg)) {
+                        mcp_status_msg_ = fmt::format(
+                            "Worker mode, connected to hub at {}:{}", hub_cfg.host, hub_cfg.port);
                     } else {
-                        mcp_status_msg_ = fmt::format(
-                            "ERROR: Failed to restart on {}:{}", cfg.host, cfg.port);
+                        McpHttpConfig cfg;
+                        cfg.host     = mcp_gui_.host;
+                        cfg.port     = static_cast<uint16_t>(mcp_gui_.port);
+                        cfg.username = mcp_gui_.username;
+                        cfg.password = mcp_gui_.password;
+
+                        if (mcp_service_->start_http(cfg)) {
+                            mcp_status_msg_ = fmt::format(
+                                "Standalone on {}:{}", cfg.host, cfg.port);
+                        } else {
+                            mcp_status_msg_ = "ERROR: Failed to restart.";
+                        }
                     }
                 }
             }
 
-            // Claude Desktop config hint
+            // ── Usage ───────────────────────────────────────────────────
             ImGui::SeparatorText("Usage");
             ImGui::TextWrapped(
-                "Add to Claude Desktop config (claude_desktop_config.json):");
-            if (ImGui::BeginChild("McpConfigHint", ImVec2(0, 80),
+                "Hub mode (default): first instance becomes Hub on port 10444, "
+                "others connect as Workers. If Hub closes, a Worker auto-takes over.\n"
+                "Every tool call requires instance='<id>'. Use list_instances to list all.");
+            if (ImGui::BeginChild("McpConfigHint", ImVec2(0, 70),
                                   ImGuiChildFlags_Borders)) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.9f, 0.7f, 1.0f));
                 ImGui::TextWrapped(
                     "\"tenet\": {\n"
-                    "  \"url\": \"http://%s:%d/mcp\"\n"
+                    "  \"url\": \"http://%s:10444/mcp\"\n"
                     "}",
-                    mcp_gui_.host, mcp_gui_.port);
+                    mcp_gui_.host);
                 ImGui::PopStyleColor();
             }
             ImGui::EndChild();
+
+            // ── Advanced: Standalone HTTP fallback ──────────────────────
+            if (ImGui::TreeNode("Advanced: Standalone HTTP (fallback)")) {
+                ImGui::BeginDisabled(mcp_active);
+
+                const float input_w = ImGui::GetContentRegionAvail().x * 0.55f;
+
+                ImGui::SetNextItemWidth(input_w);
+                ImGui::InputText("Host / Interface", mcp_gui_.host, sizeof(mcp_gui_.host));
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Bind address (standalone mode only).\n"
+                        "127.0.0.1 = localhost only\n"
+                        "0.0.0.0   = all interfaces");
+                }
+
+                ImGui::SetNextItemWidth(input_w);
+                ImGui::InputInt("Port", &mcp_gui_.port);
+                mcp_gui_.port = std::max(1, std::min(65535, mcp_gui_.port));
+
+                ImGui::SeparatorText("Basic Auth (standalone only)");
+
+                ImGui::SetNextItemWidth(input_w);
+                ImGui::InputText("Username", mcp_gui_.username, sizeof(mcp_gui_.username));
+
+                ImGui::SetNextItemWidth(input_w);
+                ImGui::InputText("Password", mcp_gui_.password, sizeof(mcp_gui_.password),
+                                 ImGuiInputTextFlags_Password);
+
+                ImGui::EndDisabled();
+                ImGui::TreePop();
+            }
 
             ImGui::EndTabItem();
         }

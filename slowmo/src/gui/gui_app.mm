@@ -60,10 +60,29 @@ GuiApp::GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     if (last > 0 && last < total_inst_) {
         current_inst_ = last;
     }
+
+    // Load VM profiles and restore hints/decoder paths for this module
+    vm_profiles_ = VMProfiles::load();
+    restore_vm_profile();
 }
 
 GuiApp::~GuiApp() {
     shutdown();
+}
+
+// ─── set_vm_paths ────────────────────────────────────────────────────────────
+void GuiApp::set_vm_paths(const std::string& hints_file,
+                           const std::string& decoder_file) {
+    if (!hints_file.empty()) {
+        std::snprintf(vm_hints_path_buf_, sizeof(vm_hints_path_buf_),
+                      "%s", hints_file.c_str());
+        push_vm_hints_recent(hints_file);
+    }
+    if (!decoder_file.empty()) {
+        std::snprintf(vm_decoder_path_buf_, sizeof(vm_decoder_path_buf_),
+                      "%s", decoder_file.c_str());
+        push_vm_decoder_recent(decoder_file);
+    }
 }
 
 // ─── SDL3 Initialization ────────────────────────────────────────────────────
@@ -295,6 +314,32 @@ void GuiApp::auto_start_mcp() {
         reader_, index_, regfile_, memory_,
         pass_manager_.get(), &code_table_, &decoder_);
 
+    // ── Hub mode: try to become hub first ──────────────────────────────
+    // The hub listens on a fixed port (default 10444). If we win the flock
+    // election, we are the hub. If not, we connect as a worker.
+    // Hub mode is the default for GUI instances.
+    McpHubConfig hub_cfg;
+    hub_cfg.host = mcp_gui_.host;
+    hub_cfg.port = 10444;  // Fixed hub port
+    hub_cfg.session_mode = false;  // Sessionless by default
+
+    if (mcp_service_->start_hub(hub_cfg)) {
+        mcp_gui_.port = hub_cfg.port;
+        mcp_status_msg_ = fmt::format(
+            "Hub mode on {}:{}", hub_cfg.host, hub_cfg.port);
+        return;
+    }
+
+    // ── Hub election failed — try worker mode ──────────────────────────
+    if (mcp_service_->start_worker(hub_cfg)) {
+        mcp_status_msg_ = fmt::format(
+            "Worker mode, connected to hub at {}:{}", hub_cfg.host, hub_cfg.port);
+        return;
+    }
+
+    // ── Fallback: standalone HTTP mode (no hub coordination) ───────────
+    // If no hub is running and we can't become hub (e.g. lock file issue),
+    // fall back to the old port-scanning behavior.
     McpHttpConfig cfg;
     cfg.host = mcp_gui_.host;
     auto base_port = static_cast<uint16_t>(mcp_gui_.port);
@@ -306,7 +351,7 @@ void GuiApp::auto_start_mcp() {
             auto actual_port = mcp_service_->http_listening_port();
             mcp_gui_.port = actual_port;
             mcp_status_msg_ = fmt::format(
-                "Auto-started on {}:{}", cfg.host, actual_port);
+                "Standalone on {}:{}", cfg.host, actual_port);
             return;
         }
     }
@@ -321,9 +366,9 @@ void GuiApp::auto_start_mcp() {
 void GuiApp::shutdown() {
     if (!window_) return;  // Already shut down
 
-    // Stop the in-GUI MCP HTTP SSE server if running.
+    // Stop the in-GUI MCP server (hub/worker/http) if running.
     if (mcp_service_) {
-        mcp_service_->stop_http();
+        mcp_service_->stop();
         mcp_service_.reset();
     }
 

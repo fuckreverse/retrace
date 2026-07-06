@@ -3,6 +3,7 @@
 #include "hypothesis_ledger.h"
 #include "discipline_injector.h"
 #include "common/types.h"
+#include "io/mcp/mcp_hub.h"
 
 #include <functional>
 #include <memory>
@@ -27,6 +28,7 @@ class PassManager;
 class CodeTable;
 class InstructionDecoder;
 class McpHttpTransport;
+class VMBytecodeDecoder;
 
 // ─── MCP Transport Mode ────────────────────────────────────────────────────
 
@@ -142,6 +144,35 @@ public:
     /// Effective HTTP config (valid after start_http() succeeds).
     McpHttpConfig http_config() const { return http_cfg_; }
 
+    // ── Hub mode ─────────────────────────────────────────────────────
+    // In hub mode, this instance serves as the hub for multiple tenet
+    // instances. Workers connect via TCP; the hub routes MCP requests
+    // to the appropriate instance.
+
+    /// Start in hub mode. Acquires hub role via flock election,
+    /// starts the hub HTTP+TCP listener on the fixed hub port.
+    /// Returns false if election fails or bind fails.
+    bool start_hub(const McpHubConfig& cfg);
+
+    /// Start in worker mode. Connects to the existing hub via TCP.
+    /// Blocks until connection is lost. The caller should attempt
+    /// re-election after this returns.
+    bool start_worker(const McpHubConfig& cfg);
+
+    /// Returns true if running as hub.
+    bool is_hub() const { return hub_transport_ != nullptr; }
+
+    /// Returns true if running as worker.
+    bool is_worker() const { return worker_transport_ != nullptr; }
+
+    /// Get this instance's ID.
+    const std::string& instance_id() const { return instance_id_; }
+
+    /// List all connected instances (hub mode only).
+    /// Returns JSON: {"instances": [{id, pid, trace_file, module_name, is_hub}, ...]}
+    /// Returns empty JSON if not in hub mode.
+    nlohmann::json hub_list_instances() const;
+
     // ── General ────────────────────────────────────────────────────────
     /// Stop whichever transport is active.
     void stop();
@@ -170,6 +201,16 @@ private:
     /// Process a single JSON-RPC message and return a response.
     /// Returns nullptr JSON for notifications (no response needed).
     nlohmann::json process_message(const nlohmann::json& msg);
+
+    /// Hub-mode message processor: handles instance routing, then
+    /// delegates to process_message() (local) or forwards to worker.
+    nlohmann::json process_message_hub(const nlohmann::json& msg);
+
+    /// Inject `instance` parameter into all tool schemas (hub mode).
+    void inject_instance_param(bool required);
+
+    /// Register hub-specific tools (list_instances, select_instance).
+    void register_hub_tools();
 
     // ── Tool registration helpers (grouped by category) ────────────────
     //    Implemented in mcp_tools_core.cpp / mcp_tools_analysis.cpp /
@@ -220,10 +261,36 @@ private:
     std::unique_ptr<McpHttpTransport> http_transport_;
     McpHttpConfig http_cfg_;
 
+    // Hub transport (hub mode only)
+    std::unique_ptr<McpHubTransport> hub_transport_;
+    std::unique_ptr<HubElection> hub_election_;
+    McpHubConfig hub_cfg_;
+
+    // Worker transport (worker mode only)
+    std::unique_ptr<McpWorkerTransport> worker_transport_;
+    std::thread worker_thread_;
+
+    // Instance identity
+    std::string instance_id_;         ///< "tenet-<pid>" or custom name
+    std::string trace_file_;          ///< Path to loaded trace
+    std::string module_name_;         ///< Module name from trace header
+    bool hub_session_mode_ = false;   ///< Session mode flag (hub mode)
+
+    // Session state (session mode only)
+    mutable std::mutex session_state_mutex_;
+    std::unordered_map<std::string, std::string> session_default_instance_;
+
     std::atomic<int> tool_call_count_{0};
 
     HypothesisLedger ledger_;
     DisciplineInjector discipline_;
+
+    // ── VM bytecode decoder cache ────────────────────────────────────
+    // Lazily loaded when vm_steps_query receives a decoder_file parameter.
+    // Subsequent calls with the same path reuse the cached decoder.
+    mutable std::mutex vm_decoder_mutex_;
+    mutable std::string vm_decoder_path_;
+    mutable std::shared_ptr<VMBytecodeDecoder> vm_decoder_;
 
     // ── Concurrency: read/write tool classification ─────────────────
     //
@@ -242,6 +309,9 @@ private:
 
     /// Returns true if `tool_name` is classified as a write tool.
     bool is_write_tool(const std::string& tool_name) const;
+
+    /// Get this instance's info as JSON (for list_instances).
+    nlohmann::json instance_info_json() const;
 };
 
 }  // namespace tenet

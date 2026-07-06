@@ -26,6 +26,8 @@
 #include "analysis/passes/profile/window_stats_pass.h"
 #include "analysis/passes/profile/dataflow_graph_pass.h"
 #include "io/mcp/mcp_server.h"
+#include "io/mcp/mcp_hub.h"
+#include "io/vm_profiles.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
@@ -70,6 +72,8 @@ struct AlgorithmSummaryResult;
 struct TraceDiffResult;          // P2-14 (defined in trace_diff_pass.h)
 struct SyscallInterceptResult;   // defined in syscall_intercept_pass.h
 struct VMAbstractResult;         // defined in vm_abstract_pass.h
+class VMBytecodeDecoder;         // defined in vm_decoder.h
+struct VMDecodedInsn;            // defined in vm_decoder.h
 struct CallContextResult;         // defined in call_context_pass.h (now included)
 struct MemSearchResult;           // defined in mem_search_pass.h (now included)
 struct MemorySnapshotResult;      // defined in memory_snapshot_pass.h (now included)
@@ -86,6 +90,10 @@ public:
            InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
            const std::filesystem::path& trace_path = {});
     ~GuiApp();
+
+    /// Set VM hints / decoder file paths from CLI options.
+    /// Call before run(). These take priority over restored profiles.
+    void set_vm_paths(const std::string& hints_file, const std::string& decoder_file);
 
     /// Run the GUI event loop. Returns 0 on clean exit.
     int run();
@@ -731,6 +739,24 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     /// primary "shallow" entry point — no need to open the legacy VM
     /// Abstract panel or dig through menus first.
     void render_vm_hints_popup();
+
+    // ─── VM Bytecode Decoder state ──────────────────────────────────────────
+    char vm_decoder_path_buf_[512] = {};  ///< text input buffer for decoder file path
+    std::string vm_decoder_status_;       ///< feedback line (loaded / error)
+    std::vector<std::string> vm_decoder_recent_;  ///< MRU decoder files (process lifetime)
+    std::shared_ptr<VMBytecodeDecoder> vm_decoder_;  ///< currently loaded decoder instance
+    void push_vm_decoder_recent(const std::string& path);
+    /// Load the decoder from vm_decoder_path_buf_ and cache it.
+    void load_vm_decoder();
+    /// Renders the decoder file input (drag-drop / browse / recent / status).
+    void render_vm_decoder_input();
+
+    // ─── VM Profiles (persisted hints + decoder associations) ───────────────
+    VMProfiles vm_profiles_;
+    /// Save current hints + decoder paths to the profile for this trace's module.
+    void save_vm_profile();
+    /// Load hints + decoder paths from profile for this trace's module.
+    void restore_vm_profile();
 
     // ─── VM Workspace (independent floating window with its own DockSpace) ───
     // Layout mirrors the native layout but at the VM abstraction level:

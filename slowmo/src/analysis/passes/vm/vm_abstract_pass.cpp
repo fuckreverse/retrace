@@ -666,7 +666,10 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
             HandlerExecution exec;
             exec.dispatch_inst_id      = iid;
             exec.handler_entry_pc      = 0;   // no handler concept in this mode
-            exec.handler_first_inst_id = 0;
+            // Set handler_first to dispatch+1 so that opcode_from_reg reads
+            // state_before(iid+1) == state_after(iid), capturing the value
+            // written by the fetch instruction (e.g. LDR W1,[X8,X0]).
+            exec.handler_first_inst_id = iid + 1;
             exec.handler_last_inst_id  = iid; // step "ends" at the same fetch point
             fetch_only_executions.push_back(exec);
         }

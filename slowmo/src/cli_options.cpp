@@ -26,7 +26,7 @@ bool CliOptions::has_analysis_option() const {
            opt_dump_memaccess ||
            // P3 options
            opt_yara_mem_scan || opt_thread_filter ||
-           opt_rpc || opt_mcp || opt_mcp_http || opt_streaming || opt_stats_only ||
+           opt_rpc || opt_mcp || opt_mcp_http || opt_mcp_hub || opt_streaming || opt_stats_only ||
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
            opt_vm_abstract ||
@@ -103,6 +103,7 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --vm-pc-reg <index>           Hint: VM program counter register index (0-28)\n");
     fmt::print(stderr, "  --vm-handler <hex>            Hint: handler entry PC (hex, repeatable)\n");
     fmt::print(stderr, "  --vm-hints <file.json>        Load VM static-analysis hints from a JSON file\n");
+    fmt::print(stderr, "  --vm-decoder <file.json>      Load VM bytecode decoder definition (JSON)\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
     fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
     fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
@@ -126,6 +127,12 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --mcp-host <addr>                 Bind address for --mcp-http (e.g. 0.0.0.0)\n");
     fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 7080)\n");
     fmt::print(stderr, "  --mcp-auth user:pass              Enable Basic Auth for --mcp-http\n");
+    fmt::print(stderr, "  --mcp-hub [host:port]             Enable MCP hub mode (multi-instance coordination).\n");
+    fmt::print(stderr, "                                    First instance becomes hub (flock election),\n");
+    fmt::print(stderr, "                                    others connect as workers. Default: 127.0.0.1:10444\n");
+    fmt::print(stderr, "  --mcp-hub-session                 Enable session mode (select_instance tool available).\n");
+    fmt::print(stderr, "                                    Default: sessionless (every call must specify instance).\n");
+    fmt::print(stderr, "  --mcp-hub-name <name>             Custom instance name (default: tenet-<pid>).\n");
     fmt::print(stderr, "  --streaming                       Tail a live trace file (real-time indexing)\n");
     fmt::print(stderr, "  --stats                           Print trace statistics as JSON\n");
     fmt::print(stderr, "\nMultiple analysis options can be combined; they execute in order.\n");
@@ -268,6 +275,8 @@ CliOptions parse_args(int argc, char** argv) {
             opts.vm_handler_pcs.push_back(std::stoull(argv[++i], nullptr, 16));
         } else if (arg == "--vm-hints" && i + 1 < argc) {
             opts.vm_hints_file = argv[++i];
+        } else if (arg == "--vm-decoder" && i + 1 < argc) {
+            opts.vm_decoder_file = argv[++i];
         } else if (arg == "--memread" && i + 3 < argc) {
             opts.opt_memread = true;
             opts.memread_addr = std::stoull(argv[++i], nullptr, 16);
@@ -436,6 +445,22 @@ CliOptions parse_args(int argc, char** argv) {
                 opts.mcp_http_cfg.username = auth.substr(0, colon);
                 opts.mcp_http_cfg.password = auth.substr(colon + 1);
             }
+        } else if (arg == "--mcp-hub") {
+            opts.opt_mcp_hub = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string hostport = argv[++i];
+                size_t colon = hostport.rfind(':');
+                if (colon != std::string::npos) {
+                    opts.mcp_hub_cfg.host = hostport.substr(0, colon);
+                    opts.mcp_hub_cfg.port = static_cast<uint16_t>(std::stoul(hostport.substr(colon + 1)));
+                } else {
+                    opts.mcp_hub_cfg.host = hostport;
+                }
+            }
+        } else if (arg == "--mcp-hub-session") {
+            opts.opt_mcp_hub_session = true;
+        } else if (arg == "--mcp-hub-name" && i + 1 < argc) {
+            opts.mcp_hub_name = argv[++i];
         } else if (arg == "--streaming") {
             opts.opt_streaming = true;
         } else if (arg == "--stats") {
@@ -455,6 +480,10 @@ CliOptions parse_args(int argc, char** argv) {
         if (opts.opt_mcp_http) {
             fmt::print(stderr, "  Hint: --mcp-http requires a trace file, e.g.:\n");
             fmt::print(stderr, "    tenet --mcp-http 127.0.0.1:7080 trace.bin\n");
+        }
+        if (opts.opt_mcp_hub) {
+            fmt::print(stderr, "  Hint: --mcp-hub requires a trace file, e.g.:\n");
+            fmt::print(stderr, "    tenet --mcp-hub trace.bin\n");
         }
         print_usage(argv[0]);
         opts.parse_status = 1;

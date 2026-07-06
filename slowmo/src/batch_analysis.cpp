@@ -21,6 +21,7 @@
 #include "analysis/passes/crypto/algorithm_summary_pass.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
 #include "analysis/passes/vm/vm_hints_json.h"
+#include "analysis/passes/vm/vm_decoder.h"
 #include "analysis/passes/platform/objc_pass.h"
 #include "analysis/passes/misc/thread_pass.h"
 #include "analysis/passes/profile/trace_fold_pass.h"
@@ -1212,6 +1213,47 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
                 vm_json["vm_pc_reg"] = vm_result.vm_pc_reg;
             }
             vm_json["total_steps"] = vm_result.steps.size();
+
+            // ── VM bytecode decoder ──
+            std::unique_ptr<VMBytecodeDecoder> vm_decoder;
+            if (!opts.vm_decoder_file.empty()) {
+                try {
+                    vm_decoder = load_decoder_from_json(opts.vm_decoder_file);
+                    fmt::print(stderr, "[vm-decoder] Loaded '{}' from {}\n",
+                               vm_decoder->name(), opts.vm_decoder_file);
+                } catch (const std::exception& e) {
+                    fmt::print(stderr, "[vm-decoder] Failed to load {}: {}\n",
+                               opts.vm_decoder_file, e.what());
+                }
+            }
+
+            if (vm_decoder) {
+                vm_json["decoder"] = std::string(vm_decoder->name());
+                json steps_arr = json::array();
+                size_t decoded_count = 0;
+                for (size_t si = 0; si < vm_result.steps.size(); si++) {
+                    const auto& step = vm_result.steps[si];
+                    json sj;
+                    sj["index"] = si;
+                    if (step.vm_pc_valid)
+                        sj["vm_pc"] = fmt::format("0x{:X}", step.vm_pc_value);
+                    if (step.opcode_valid) {
+                        sj["opcode"] = fmt::format("0x{:08X}", step.opcode_value);
+                        auto decoded = vm_decoder->decode(step, vm_result);
+                        if (decoded.valid) {
+                            sj["asm"] = decoded.asm_text;
+                            decoded_count++;
+                        } else {
+                            sj["asm"] = fmt::format("??? 0x{:08X}", step.opcode_value);
+                        }
+                    }
+                    steps_arr.push_back(std::move(sj));
+                }
+                vm_json["steps"] = std::move(steps_arr);
+                fmt::print(stderr, "[vm-decoder] Decoded {}/{} steps\n",
+                           decoded_count, vm_result.steps.size());
+            }
+
             fmt::print("{}\n", vm_json.dump(2));
         }
     }
@@ -2010,6 +2052,67 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
 
             mcp_service.stop_http();
             fmt::print(stderr, "[mcp-http] Server stopped.\n");
+        }
+    }
+
+    // ── P3: --mcp-hub mode (multi-instance coordination) ──────────────
+    // Hub/worker mode: first instance becomes hub (flock election),
+    // others connect as workers. Only hub listens (port 10444 by default).
+    if (opts.opt_mcp_hub) {
+        TenetMcpService mcp_service(reader, index, regfile, memory,
+                                    &pm, &code_table, &decoder);
+
+        // Build hub config from CLI options
+        McpHubConfig hub_cfg = opts.mcp_hub_cfg;
+        hub_cfg.session_mode  = opts.opt_mcp_hub_session;
+        hub_cfg.instance_name = opts.mcp_hub_name;
+
+        // Try to become hub first
+        if (mcp_service.start_hub(hub_cfg)) {
+            fmt::print(stderr, "[mcp-hub] Hub started on {}:{} (id={})\n",
+                       hub_cfg.host, hub_cfg.port,
+                       mcp_service.instance_id());
+            if (opts.opt_mcp_hub_session) {
+                fmt::print(stderr, "[mcp-hub] Session mode enabled (select_instance available)\n");
+            } else {
+                fmt::print(stderr, "[mcp-hub] Sessionless mode (instance parameter required)\n");
+            }
+            fmt::print(stderr, "[mcp-hub] Press Ctrl+C to stop\n");
+
+            static std::atomic<bool> mcp_hub_stop{false};
+            auto old_sigint  = std::signal(SIGINT,  [](int) { mcp_hub_stop.store(true); });
+            auto old_sigterm = std::signal(SIGTERM, [](int) { mcp_hub_stop.store(true); });
+            while (!mcp_hub_stop.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            std::signal(SIGINT,  old_sigint);
+            std::signal(SIGTERM, old_sigterm);
+
+            mcp_service.stop();
+            fmt::print(stderr, "[mcp-hub] Hub stopped.\n");
+        } else {
+            // Failed to become hub — try worker mode
+            fmt::print(stderr, "[mcp-hub] Another instance is hub, starting as worker...\n");
+            if (mcp_service.start_worker(hub_cfg)) {
+                fmt::print(stderr, "[mcp-hub] Worker started (id={}), connected to hub.\n",
+                           mcp_service.instance_id());
+                fmt::print(stderr, "[mcp-hub] Press Ctrl+C to stop\n");
+
+                static std::atomic<bool> mcp_worker_stop{false};
+                auto old_sigint  = std::signal(SIGINT,  [](int) { mcp_worker_stop.store(true); });
+                auto old_sigterm = std::signal(SIGTERM, [](int) { mcp_worker_stop.store(true); });
+                while (!mcp_worker_stop.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                std::signal(SIGINT,  old_sigint);
+                std::signal(SIGTERM, old_sigterm);
+
+                mcp_service.stop();
+                fmt::print(stderr, "[mcp-hub] Worker stopped.\n");
+            } else {
+                fmt::print(stderr, "[mcp-hub] Failed to start as hub or worker.\n");
+                rc |= 1;
+            }
         }
     }
 

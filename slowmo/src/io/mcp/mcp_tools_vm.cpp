@@ -12,12 +12,14 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
+#include "analysis/passes/vm/vm_decoder.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -123,10 +125,27 @@ register_tool(
         {"reg_value",    {{"type", "string"},  {"description", "Filter: required value (hex) for the register specified by reg_name."}}},
         // ── Pagination ──
         {"offset",       {{"type", "integer"}, {"description", "Skip first N matching results. Default 0."}, {"default", 0}}},
-        {"limit",        {{"type", "integer"}, {"description", "Max results to return (max 500). Default 100."}, {"default", 100}}}
+        {"limit",        {{"type", "integer"}, {"description", "Max results to return (max 500). Default 100."}, {"default", 100}}},
+        // ── Decoder ──
+        {"decoder_file", {{"type", "string"},  {"description", "Path to a VM bytecode decoder JSON file. When provided, each returned step includes an 'asm' field with human-readable disassembly (e.g. 'XOR R3, R1, R2'). The decoder is loaded once and cached for the session."}}}
       }}}},
     [this](const json& args) -> json {
         const auto& result = require_vm_result(pm_);
+
+        // ── Load / cache VM bytecode decoder ──
+        std::shared_ptr<VMBytecodeDecoder> decoder;
+        if (args.contains("decoder_file")) {
+            std::string path = args["decoder_file"].get<std::string>();
+            std::lock_guard<std::mutex> lk(vm_decoder_mutex_);
+            if (vm_decoder_ && vm_decoder_path_ == path) {
+                decoder = vm_decoder_;
+            } else {
+                vm_decoder_ = std::shared_ptr<VMBytecodeDecoder>(
+                    load_decoder_from_json(path).release());
+                vm_decoder_path_ = path;
+                decoder = vm_decoder_;
+            }
+        }
 
         // Parse filters
         size_t step_start = args.value("step_start", size_t(0));
@@ -240,11 +259,18 @@ register_tool(
             if (matched_count <= offset) continue;
             if (matches.size() >= limit) continue;  // Keep counting total matches
 
-            matches.push_back(step_to_json(result, s, i, rebase_fn));
+            json sj = step_to_json(result, s, i, rebase_fn);
+            if (decoder && s.opcode_valid) {
+                auto decoded = decoder->decode(s, result);
+                if (decoded.valid) {
+                    sj["asm"] = decoded.asm_text;
+                }
+            }
+            matches.push_back(std::move(sj));
         }
 
         bool has_more = matched_count > offset + matches.size();
-        return {
+        json resp = {
             {"total_steps",     result.steps.size()},
             {"total_matched",   matched_count},
             {"offset",          offset},
@@ -253,6 +279,10 @@ register_tool(
             {"next_offset",     has_more ? offset + matches.size() : offset},
             {"steps",           std::move(matches)}
         };
+        if (decoder) {
+            resp["decoder"] = std::string(decoder->name());
+        }
+        return resp;
     }
 );
 
@@ -575,6 +605,91 @@ register_tool(
             {"total_steps", result.steps.size()},
             {"chain",       std::move(chain)}
         };
+    }
+);
+
+// ── vm_summary ─────────────────────────────────────────────────────────
+register_tool(
+    {"vm_summary",
+     "Get a high-level overview of the VM abstract analysis result. Returns "
+     "dispatcher info (type, PC, confidence), architecture type, VM-PC register, "
+     "total step count, and a handler table sorted by execution frequency. "
+     "Call this FIRST after vm_abstract completes, before using vm_steps_query "
+     "or vm_reg_timeline — it tells you what handlers exist, how often each "
+     "fires, and what labels/opcodes are associated, so you can build targeted "
+     "queries. Requires a completed vm_abstract pass.",
+     {{"type", "object"},
+      {"properties", {
+        {"top_handlers", {{"type", "integer"},
+            {"description", "Max handlers to return (sorted by frequency). Default 50."}, {"default", 50}}}
+      }}}},
+    [this](const json& args) -> json {
+        const auto& result = require_vm_result(pm_);
+        size_t top_n = std::min(args.value("top_handlers", size_t(50)), size_t(200));
+
+        auto rebase_fn = [this](uint64_t pc) { return rebase(pc); };
+
+        // Dispatcher
+        json dj = {
+            {"loop_header_pc",    fmt::format("0x{:X}", rebase_fn(result.dispatcher.loop_header_pc))},
+            {"indirect_branch_pc", fmt::format("0x{:X}", rebase_fn(result.dispatcher.indirect_branch_pc))},
+            {"dispatch_type",     dispatch_type_name(result.dispatcher.dispatch_type)},
+            {"iterations",        result.dispatcher.iteration_count},
+            {"confidence",        result.dispatcher.confidence}
+        };
+
+        // Handlers by frequency
+        auto sorted = result.handlers_by_frequency();
+        json handlers_arr = json::array();
+        for (size_t i = 0; i < std::min(sorted.size(), top_n); i++) {
+            const auto* h = sorted[i];
+            json hj = {
+                {"entry_pc",        fmt::format("0x{:X}", rebase_fn(h->entry_pc))},
+                {"execution_count", h->execution_count},
+                {"body_pc_count",   h->body_pcs.size()},
+                {"mem_reads",       h->mem_reads},
+                {"mem_writes",      h->mem_writes}
+            };
+            if (!h->label.empty()) hj["label"] = h->label;
+            if (!h->opcode_values.empty()) {
+                json opcodes = json::array();
+                for (auto ov : h->opcode_values)
+                    opcodes.push_back(fmt::format("0x{:X}", ov));
+                hj["opcode_values"] = std::move(opcodes);
+            }
+            if (h->regs_written_mask)
+                hj["regs_written_mask"] = fmt::format("0x{:X}", h->regs_written_mask);
+            if (h->regs_read_mask)
+                hj["regs_read_mask"] = fmt::format("0x{:X}", h->regs_read_mask);
+            handlers_arr.push_back(std::move(hj));
+        }
+
+        // VM register names (from first non-empty step)
+        json reg_names = json::array();
+        for (const auto& step : result.steps) {
+            if (!step.vm_regs.empty()) {
+                for (const auto& [n, _] : step.vm_regs)
+                    reg_names.push_back(n);
+                break;
+            }
+        }
+
+        json resp = {
+            {"dispatcher",      std::move(dj)},
+            {"arch_type",       vm_arch_name(result.arch_type)},
+            {"total_steps",     result.steps.size()},
+            {"total_handlers",  result.handlers.size()},
+            {"handlers",        std::move(handlers_arr)},
+            {"vm_reg_names",    std::move(reg_names)}
+        };
+        if (result.vm_pc_reg != 0xFF)
+            resp["vm_pc_reg"] = fmt::format("x{}", result.vm_pc_reg);
+        if (result.bytecode_base != 0)
+            resp["bytecode_range"] = {
+                {"base", fmt::format("0x{:X}", result.bytecode_base)},
+                {"end",  fmt::format("0x{:X}", result.bytecode_end)}
+            };
+        return resp;
     }
 );
 

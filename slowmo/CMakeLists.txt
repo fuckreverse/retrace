@@ -351,9 +351,10 @@ endif()
 add_library(tenet_lib STATIC
     src/io/trace_reader.cpp
     src/io/code_table.cpp
-src/io/index_builder.cpp
-src/io/recent_files.cpp
-src/core/register_file.cpp
+    src/io/index_builder.cpp
+    src/io/recent_files.cpp
+    src/io/vm_profiles.cpp
+    src/core/register_file.cpp
     src/core/instruction_decoder.cpp
     src/core/memory_model.cpp
     src/core/breakpoint_engine.cpp
@@ -376,6 +377,7 @@ src/core/register_file.cpp
     src/analysis/passes/crypto/loop_semantics_pass.cpp
     src/analysis/passes/vm/vm_abstract_pass.cpp
     src/analysis/passes/vm/vm_hints_json.cpp
+    src/analysis/passes/vm/vm_decoder.cpp
     src/analysis/passes/crypto/algorithm_summary_pass.cpp
     src/analysis/passes/profile/trace_diff_pass.cpp
     src/analysis/passes/memory/memory_snapshot_pass.cpp
@@ -397,6 +399,7 @@ src/core/register_file.cpp
     src/io/rpc_server.cpp
     src/io/mcp/mcp_server.cpp
     src/io/mcp/mcp_http.cpp
+    src/io/mcp/mcp_hub.cpp
     src/io/mcp/mcp_tools_core.cpp
     src/io/mcp/mcp_tools_analysis.cpp
     src/io/mcp/mcp_tools_vm.cpp

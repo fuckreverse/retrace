@@ -287,6 +287,7 @@ int main(int argc, char** argv) {
 #if TENET_HAS_GUI
     if (!opts.force_tui) {
         GuiApp gui(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+        gui.set_vm_paths(opts.vm_hints_file, opts.vm_decoder_file);
         return gui.run();
     }
 #else

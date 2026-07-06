@@ -7,6 +7,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "io/mcp/mcp_server.h"               // McpHttpConfig
+#include "io/mcp/mcp_hub.h"                  // McpHubConfig
 
 #include <cstdint>
 #include <string>
@@ -152,6 +153,7 @@ struct CliOptions {
     uint8_t  vm_pc_reg = 0xFF;             // --vm-pc-reg <index>
     std::vector<uint64_t> vm_handler_pcs;  // --vm-handler <hex> (repeatable)
     std::string vm_hints_file;             // --vm-hints <path.json>
+    std::string vm_decoder_file;           // --vm-decoder <path.json>
 
     // --- Generic pass runner ---
     bool opt_index_build = false;
@@ -174,6 +176,12 @@ struct CliOptions {
     // --- P3: MCP Streamable HTTP server ---
     bool opt_mcp_http = false;
     McpHttpConfig mcp_http_cfg;
+
+    // --- P3: MCP Hub mode (multi-instance coordination) ---
+    bool opt_mcp_hub = false;              ///< --mcp-hub: enable hub/worker mode
+    bool opt_mcp_hub_session = false;      ///< --mcp-hub-session: enable session mode (select_instance)
+    std::string mcp_hub_name;              ///< --mcp-hub-name <name>: custom instance name
+    McpHubConfig mcp_hub_cfg;
 
     // --- P3: Streaming / live trace ---
     bool opt_streaming = false;
