@@ -20,6 +20,7 @@
 #include "tui/panels/strings_panel.h"
 #include "tui/panels/thread_panel.h"
 #include "tui/panels/breakpoint_panel.h"
+#include "tui/panels/results_panel.h"
 #include "analysis/pass_manager.h"
 
 #include <ftxui/component/component.hpp>
@@ -102,6 +103,7 @@ private:
     std::unique_ptr<StringsPanel>    strings_panel_;
     std::unique_ptr<ThreadPanel>     thread_panel_;
     std::unique_ptr<BreakpointPanel> breakpoint_panel_;
+    std::unique_ptr<ResultsPanel>    results_panel_;
 
     /// Ordered list of right-side panels for rendering loop.
     std::vector<Panel*> right_panels_;
@@ -235,6 +237,9 @@ private:
     }
     static void navigate_to_trampoline(void* self, uint64_t id) {
         static_cast<TuiApp*>(self)->navigate_to(id);
+    }
+    static void run_pass_trampoline(void* self, std::string_view name) {
+        static_cast<TuiApp*>(self)->run_pass_by_name(name);
     }
 
     // ─── Sync context (called before render/events) ──────────────────

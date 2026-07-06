@@ -88,16 +88,28 @@ flowchart TD
 
 ### 组成
 
-- `tui_app.h/.cpp`：主循环、状态、键盘绑定、面板切换。
-- `tui/panels/`：寄存器、内存、调用栈、函数、字符串、线程等面板。
+- `tui_app.h/.cpp`：主循环、状态、键盘绑定、面板切换、`wire_pass_result()`（把 `PassResult` 分发进 `TuiContext` 的各个结果指针）。
+- `tui/tui_context.h`：面板间共享状态，除导航/寄存器/内存引用外，还持有 GUI 侧全部 ~20 个 pass 结果指针（`cfg_result`、`pattern_result`、`vm_abstract_result` 等），以及 `run_pass_fn` 回调（供面板发起 pass 运行请求而无需直接持有 `PassManager`）。
+- `tui/panels/`：寄存器、内存、调用栈、函数、字符串、线程、断点等面板。
+- `tui/panels/results_panel.h/.cpp`：**Analysis Results 面板**（详见下）。
 - `hex_dump_view.*`：终端 Hex Dump 视图。
 - `key_bindings.h`：按键绑定与命令分发。
 
 ### 核心特性
 
-- 与 GUI 共享 `InstructionRow` 模型。
+- 与 GUI 共享 `InstructionRow` 模型和同一套 `PassManager` / `pass_catalog()`。
 - 支持 Goto、搜索、书签、断点、污点跳转、XRef 跳转。
-- 适合无图形环境下的长时间分析。
+- 适合无图形环境下的长时间分析（远程 SSH）。
+
+### Analysis Results 面板：TUI 版统一控制台
+
+GUI 用 ~20 个独立悬浮窗口展示各 pass 结果；终端空间有限，无法照搬多窗口模式。TUI 改为一个**两级结果浏览器**（`A` 键呼出，`ResultsPanel`）：
+
+- **Level 0（目录视图）**：遍历 `tenet::pass_catalog()`，逐行显示状态图标（NotRun `·` / Running `▶` / Completed `✓` / Failed `×`）、显示名、`summarize_pass_result()` 摘要或运行进度。`Enter` 对 NotRun/Failed 的 pass 发起运行（经 `ctx_.run_pass()` → `TuiApp::run_pass_by_name()`），对 Completed 的 pass 直接进入详情；`R` 强制重跑。
+- **Level 1（详情视图）**：由 `build_result_entries()` 把当前 pass 的结构化结果（CFG blocks、pattern matches、objc messages、mem_search hits、vm_abstract handlers 等）统一适配成 `ResultEntry{text, jump_inst_id, jumpable}` 列表；`Enter` 对可跳转条目导航指令游标到对应位置，`Esc` 返回目录视图。
+- `run_pass_by_name()` 成功后自动调用 `results_panel_->focus_pass(name)` 直接跳进详情视图（`:pass <name>` 命令同样受益），无需用户手动二次导航。
+- 这一设计让**每个 catalog pass 在 TUI 里都有真实可浏览的结果**，而不是过去仅有的 `last_pass_status_` 单行摘要；同时只需一份 `build_result_entries()` 实现即可覆盖所有 pass，避免像 GUI 那样为每个 pass 单开一个面板类。
+- `:pass <name>` / `:passes` / `:analyze` 命令与 `A` 键共享同一套 `pass_registry` 注册与摘要逻辑，保证 TUI 命令行路径与面板路径结果一致。
 
 ## CLI 批处理
 

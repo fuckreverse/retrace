@@ -6,6 +6,7 @@
 #include "tui/panels/strings_panel.h"
 #include "tui/panels/thread_panel.h"
 #include "tui/panels/breakpoint_panel.h"
+#include "tui/panels/results_panel.h"
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/taint/taint_pass.h"
@@ -16,6 +17,28 @@
 #include "analysis/passes/structure/call_graph_pass.h"
 #include "analysis/passes/structure/loop_pass.h"
 #include "analysis/passes/misc/thread_pass.h"
+#include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
+#include "analysis/passes/crypto/loop_semantics_pass.h"
+#include "analysis/passes/crypto/algorithm_summary_pass.h"
+#include "analysis/passes/crypto/objc_crypto_pass.h"
+#include "analysis/passes/platform/objc_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
+#include "analysis/passes/memory/memory_string_pass.h"
+#include "analysis/passes/memory/entropy_pass.h"
+#include "analysis/passes/memory/mem_search_pass.h"
+#include "analysis/passes/memory/memory_snapshot_pass.h"
+#include "analysis/passes/memory/yara_mem_scan_pass.h"
+#include "analysis/passes/profile/trace_fold_pass.h"
+#include "analysis/passes/profile/reg_timeline_pass.h"
+#include "analysis/passes/profile/call_context_pass.h"
+#include "analysis/passes/profile/window_stats_pass.h"
+#include "analysis/passes/profile/trace_diff_pass.h"
+#include "analysis/passes/profile/dataflow_graph_pass.h"
+#include "analysis/passes/taint/taint_source_annotation_pass.h"
+#include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/vm/vm_abstract_pass.h"
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
@@ -32,7 +55,7 @@ using namespace ftxui;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-static std::string reg_name(uint8_t idx) {
+static std::string tui_reg_name(uint8_t idx) {
     if (idx <= 28) return fmt::format("x{}", idx);
     if (idx == 29) return "fp";
     if (idx == 30) return "lr";
@@ -74,6 +97,8 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     ctx_.fetch_row_self = this;
     ctx_.navigate_to_fn = &TuiApp::navigate_to_trampoline;
     ctx_.navigate_self = this;
+    ctx_.run_pass_fn = &TuiApp::run_pass_trampoline;
+    ctx_.run_pass_self = this;
 
     total_inst_ = index.inst_count();
     int h = screen_.dimy();
@@ -99,6 +124,7 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     functions_panel_ = std::make_unique<FunctionsPanel>(ctx_);
     strings_panel_ = std::make_unique<StringsPanel>(ctx_);
     thread_panel_ = std::make_unique<ThreadPanel>(ctx_);
+    results_panel_ = std::make_unique<ResultsPanel>(ctx_);
     // breakpoint_panel_ created lazily after bp_engine_ exists
 
     // Build right-panel rendering order
@@ -109,6 +135,7 @@ TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
         functions_panel_.get(),
         strings_panel_.get(),
         thread_panel_.get(),
+        results_panel_.get(),
     };
 
     // Initialize key bindings (data-driven dispatch table)
@@ -122,7 +149,7 @@ void TuiApp::sync_context() {
     ctx_.show_backward_taint = show_backward_taint_;
     ctx_.show_nzcv = show_nzcv_;
     ctx_.show_fpr = show_fpr_;
-
+    ctx_.pass_manager = pass_manager_.get();
 }
 
 void TuiApp::focus_panel(Panel* p) {
@@ -295,6 +322,9 @@ Element TuiApp::render_status_bar() {
     } else if (breakpoint_panel_->focused() && breakpoint_panel_->visible()) {
         mode_str = " BREAKPOINTS ";
         mode_color = Color::Red;
+    } else if (results_panel_->focused() && results_panel_->visible()) {
+        mode_str = " RESULTS ";
+        mode_color = Color::RGB(0, 130, 130);
     } else if (callstack_panel_->focused()) {
         mode_str = " CALLSTACK ";
     } else if (memory_panel_->focused()) {
@@ -344,7 +374,7 @@ Element TuiApp::render_status_bar() {
 
     // Compact help line — shows the most important new bindings
     auto right = text("j/k:nav g:goto /:srch b:bkm  \":\"cmd(:b/:w/:rc/:rb)  "
-                      "t/S/B/C:analysis [/]:taint {/}:hist p:mem P:stk f/F L I O V H q")
+                      "t/S/B/C:analysis [/]:taint {/}:hist p:mem P:stk f/F L I O V H A q")
         | color(Color::GrayLight);
 
     // If there is a bp_status_msg_, show it as a second info line
@@ -1071,6 +1101,22 @@ normal_keys_.bind(Event::Character('B'), [this] { run_backward_taint_analysis();
         return true;
     }, "breakpoint panel");
 
+    // ─── Analysis Results panel toggle (A) ────────────────────────────────
+    // Browses every catalog pass (state + summary), drills into a per-item
+    // result list for passes with structured output, and jumps to any
+    // entry's inst_id. This is the TUI counterpart of the GUI's Analysis
+    // panel + its ~20 dedicated result windows.
+    normal_keys_.bind(Event::Character('A'), [this] {
+        ensure_pass_manager();
+        if (results_panel_->visible()) {
+            results_panel_->set_focused(!results_panel_->focused());
+        } else {
+            results_panel_->set_visible(true);
+            results_panel_->set_focused(true);
+        }
+        return true;
+    }, "analysis results panel");
+
     // ─── Escape: dismiss messages ────────────────────────────────────────
     normal_keys_.bind_if(Event::Escape,
         [this] { return !bp_status_msg_.empty() || !cmd_error_.empty(); },
@@ -1105,6 +1151,9 @@ bool TuiApp::handle_event(Event event) {
         return handle_hex_dump_event(event);
     if (breakpoint_panel_->focused() && breakpoint_panel_->visible()) {
         return breakpoint_panel_->handle_event(event);
+    }
+    if (results_panel_->focused() && results_panel_->visible()) {
+        return results_panel_->handle_event(event);
     }
 
     // ─── Data-driven normal-mode dispatch ────────────────────────────────
@@ -1419,6 +1468,32 @@ ctx_.backward_taint_result = nullptr;
     ctx_.call_graph_result = nullptr;
     ctx_.loop_result = nullptr;
     ctx_.thread_result = nullptr;
+
+    // Extended (Results panel) results — reset alongside the legacy set so
+    // ':analyze' / 'C' fully resets both old and new consumers together.
+    ctx_.cfg_result = nullptr;
+    ctx_.cfg_layout_result = nullptr;
+    ctx_.pattern_result = nullptr;
+    ctx_.loop_semantics_result = nullptr;
+    ctx_.algorithm_summary_result = nullptr;
+    ctx_.objc_result = nullptr;
+    ctx_.objc_crypto_result = nullptr;
+    ctx_.memory_string_result = nullptr;
+    ctx_.entropy_result = nullptr;
+    ctx_.syscall_intercept_result = nullptr;
+    ctx_.trace_fold_result = nullptr;
+    ctx_.vm_abstract_result = nullptr;
+    ctx_.mem_search_result = nullptr;
+    ctx_.memory_snapshot_result = nullptr;
+    ctx_.yara_mem_scan_result = nullptr;
+    ctx_.call_context_result = nullptr;
+    ctx_.window_stats_result = nullptr;
+    ctx_.dataflow_graph_result = nullptr;
+    ctx_.reg_timeline_result = nullptr;
+    ctx_.trace_diff_result = nullptr;
+    ctx_.taint_source_annotation_result = nullptr;
+    ctx_.thread_filter_result = nullptr;
+
 show_taint_ = false;
 show_backward_taint_ = false;
 callstack_panel_->set_visible(false);
@@ -1427,6 +1502,8 @@ callstack_panel_->set_visible(false);
     show_loops_ = false;
     thread_panel_->set_visible(false);
     thread_panel_->set_focused(false);
+    results_panel_->set_visible(false);
+    results_panel_->set_focused(false);
     xref_cursor_ = 0;
     taint_jump_list_.clear();
     taint_jump_cursor_ = 0;
@@ -1457,24 +1534,23 @@ void TuiApp::ensure_pass_manager() {
 
 void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
     if (!raw.ok()) return;
+    // ── Structure ───────────────────────────────────────────────────────
     if (name == "function") {
         ctx_.function_result = &raw.get<FunctionResult>();
         callstack_panel_->set_visible(true);
     } else if (name == "xref") {
         ctx_.xref_result = &raw.get<XrefResult>();
         xref_cursor_ = 0;
+    } else if (name == "cfg") {
+        ctx_.cfg_result = &raw.get<CFGResult>();
+    } else if (name == "cfg_layout") {
+        ctx_.cfg_layout_result = &raw.get<CFGLayoutResult>();
+    } else if (name == "call_graph") {
+        ctx_.call_graph_result = &raw.get<CallGraphResult>();
     } else if (name == "loop") {
         ctx_.loop_result = &raw.get<LoopResult>();
         show_loops_ = true;
-    } else if (name == "strings") {
-        ctx_.string_result = &raw.get<StringResult>();
-        strings_panel_->set_visible(true);
-        strings_panel_->clear_filter();
-    } else if (name == "thread") {
-        ctx_.thread_result = &raw.get<ThreadResult>();
-        thread_panel_->set_visible(true);
-    } else if (name == "call_graph") {
-        ctx_.call_graph_result = &raw.get<CallGraphResult>();
+    // ── Taint ───────────────────────────────────────────────────────────
     } else if (name == "taint") {
         ctx_.taint_result = &raw.get<TaintResult>();
         show_taint_ = true;
@@ -1482,6 +1558,58 @@ void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
     } else if (name == "backward_taint") {
         ctx_.backward_taint_result = &raw.get<BackwardTaintResult>();
         show_backward_taint_ = true;
+    } else if (name == "taint_source_annotation") {
+        ctx_.taint_source_annotation_result = &raw.get<TaintSourceAnnotationResult>();
+    // ── Crypto / Pattern ────────────────────────────────────────────────
+    } else if (name == "pattern") {
+        ctx_.pattern_result = &raw.get<PatternResult>();
+    } else if (name == "loop_semantics") {
+        ctx_.loop_semantics_result = &raw.get<LoopSemanticsResult>();
+    } else if (name == "algorithm_summary") {
+        ctx_.algorithm_summary_result = &raw.get<AlgorithmSummaryResult>();
+    } else if (name == "objc_crypto") {
+        ctx_.objc_crypto_result = &raw.get<ObjcCryptoResult>();
+    // ── Memory / String ─────────────────────────────────────────────────
+    } else if (name == "strings") {
+        ctx_.string_result = &raw.get<StringResult>();
+        strings_panel_->set_visible(true);
+        strings_panel_->clear_filter();
+    } else if (name == "memory_strings") {
+        ctx_.memory_string_result = &raw.get<MemoryStringResult>();
+    } else if (name == "memory_snapshot") {
+        ctx_.memory_snapshot_result = &raw.get<MemorySnapshotResult>();
+    } else if (name == "mem_search") {
+        ctx_.mem_search_result = &raw.get<MemSearchResult>();
+    } else if (name == "entropy") {
+        ctx_.entropy_result = &raw.get<EntropyResult>();
+    } else if (name == "yara_mem_scan") {
+        ctx_.yara_mem_scan_result = &raw.get<YaraMemScanResult>();
+    // ── Platform API ────────────────────────────────────────────────────
+    } else if (name == "objc") {
+        ctx_.objc_result = &raw.get<ObjcResult>();
+    } else if (name == "syscall_intercept") {
+        ctx_.syscall_intercept_result = &raw.get<SyscallInterceptResult>();
+    // ── Profile / Trace ─────────────────────────────────────────────────
+    } else if (name == "trace_fold") {
+        ctx_.trace_fold_result = &raw.get<TraceFoldResult>();
+    } else if (name == "reg_timeline") {
+        ctx_.reg_timeline_result = &raw.get<RegTimelineResult>();
+    } else if (name == "call_context") {
+        ctx_.call_context_result = &raw.get<CallContextResult>();
+    } else if (name == "window_stats") {
+        ctx_.window_stats_result = &raw.get<WindowStatsResult>();
+    } else if (name == "trace_diff") {
+        ctx_.trace_diff_result = &raw.get<TraceDiffResult>();
+    } else if (name == "dataflow_graph") {
+        ctx_.dataflow_graph_result = &raw.get<DataflowGraphResult>();
+    // ── Misc ────────────────────────────────────────────────────────────
+    } else if (name == "thread") {
+        ctx_.thread_result = &raw.get<ThreadResult>();
+        thread_panel_->set_visible(true);
+    } else if (name == "thread_filter") {
+        ctx_.thread_filter_result = &raw.get<ThreadFilterResult>();
+    } else if (name == "vm_abstract") {
+        ctx_.vm_abstract_result = &raw.get<VMAbstractResult>();
     }
 }
 
@@ -1513,6 +1641,13 @@ void TuiApp::run_pass_by_name(std::string_view name) {
     last_pass_status_ = fmt::format("{}: {}", name,
                                     tenet::summarize_pass_result(name, raw));
     wire_pass_result(name, raw);
+
+    // If the Results panel triggered this run (or the user ran ':pass X'),
+    // jump straight into the detail view instead of leaving them staring at
+    // a one-line status message — mirrors GUI's auto-open-window behavior.
+    if (raw.ok()) {
+        results_panel_->focus_pass(name);
+    }
 }
 
 void TuiApp::run_default_analysis() {
@@ -1780,7 +1915,7 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
             fmt::print("          ");
             for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
                 auto diff = inst.reg_diff(j);
-                fmt::print("{}=0x{:x} ", reg_name(diff.index), diff.value);
+                fmt::print("{}=0x{:x} ", tui_reg_name(diff.index), diff.value);
             }
             fmt::print("\n");
         }

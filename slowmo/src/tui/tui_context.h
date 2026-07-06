@@ -4,6 +4,7 @@
 #include "common/instruction_row.h"
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tenet {
@@ -24,6 +25,32 @@ struct StringResult;
 struct CallGraphResult;
 struct LoopResult;
 struct ThreadResult;
+
+// ─── Additional pass result types (Results panel) ──────────────────────────
+// These mirror the GUI's xxx_result_ pointers (see gui_app.h) so every
+// catalog pass has somewhere to publish its result for TUI consumption.
+struct CFGResult;
+struct PatternResult;
+struct LoopSemanticsResult;
+struct AlgorithmSummaryResult;
+struct ObjcResult;
+struct ObjcCryptoResult;
+struct MemoryStringResult;
+struct EntropyResult;
+struct SyscallInterceptResult;
+struct TraceFoldResult;
+struct VMAbstractResult;
+struct MemSearchResult;
+struct MemorySnapshotResult;
+struct YaraMemScanResult;
+struct CallContextResult;
+struct WindowStatsResult;
+struct DataflowGraphResult;
+struct RegTimelineResult;
+struct TraceDiffResult;
+struct TaintSourceAnnotationResult;
+struct ThreadFilterResult;
+struct CFGLayoutResult;
 
 /// Shared context that all TUI panels can read from and write to.
 /// Owned by TuiApp; panels hold a reference to it.
@@ -56,6 +83,30 @@ struct TuiContext {
     const LoopResult*          loop_result = nullptr;
     const ThreadResult*        thread_result = nullptr;
 
+    // ─── Extended analysis results (Results panel) ─────────────────────
+    const CFGResult*                     cfg_result = nullptr;
+    const CFGLayoutResult*               cfg_layout_result = nullptr;
+    const PatternResult*                 pattern_result = nullptr;
+    const LoopSemanticsResult*           loop_semantics_result = nullptr;
+    const AlgorithmSummaryResult*        algorithm_summary_result = nullptr;
+    const ObjcResult*                    objc_result = nullptr;
+    const ObjcCryptoResult*              objc_crypto_result = nullptr;
+    const MemoryStringResult*            memory_string_result = nullptr;
+    const EntropyResult*                 entropy_result = nullptr;
+    const SyscallInterceptResult*        syscall_intercept_result = nullptr;
+    const TraceFoldResult*               trace_fold_result = nullptr;
+    const VMAbstractResult*              vm_abstract_result = nullptr;
+    const MemSearchResult*               mem_search_result = nullptr;
+    const MemorySnapshotResult*          memory_snapshot_result = nullptr;
+    const YaraMemScanResult*             yara_mem_scan_result = nullptr;
+    const CallContextResult*             call_context_result = nullptr;
+    const WindowStatsResult*             window_stats_result = nullptr;
+    const DataflowGraphResult*           dataflow_graph_result = nullptr;
+    const RegTimelineResult*             reg_timeline_result = nullptr;
+    const TraceDiffResult*               trace_diff_result = nullptr;
+    const TaintSourceAnnotationResult*   taint_source_annotation_result = nullptr;
+    const ThreadFilterResult*            thread_filter_result = nullptr;
+
     bool show_taint = false;
     bool show_backward_taint = false;
     bool show_nzcv = true;
@@ -81,6 +132,21 @@ struct TuiContext {
     void navigate_to(uint64_t inst_id) const {
         navigate_to_fn(navigate_self, inst_id);
     }
+
+    // ─── Generic pass-run callback (provided by TuiApp) ───────────────
+    // Lets panels (e.g. ResultsPanel) request that a catalog pass be run
+    // by name without needing direct access to TuiApp/PassManager.
+    void (*run_pass_fn)(void* self, std::string_view name) = nullptr;
+    void* run_pass_self = nullptr;
+
+    void run_pass(std::string_view name) const {
+        if (run_pass_fn) run_pass_fn(run_pass_self, name);
+    }
+
+    /// Set by TuiApp before each render so panels can show live pass state
+    /// without needing a direct PassManager reference. nullptr = not created
+    /// yet (all passes report NotRun).
+    PassManager* pass_manager = nullptr;
 
     // ─── Taint jump list (shared between panels) ──────────────────────
     std::vector<uint64_t> taint_jump_list;

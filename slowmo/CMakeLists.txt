@@ -416,6 +416,7 @@ add_library(tenet_lib STATIC
     src/tui/panels/strings_panel.cpp
     src/tui/panels/thread_panel.cpp
     src/tui/panels/breakpoint_panel.cpp
+    src/tui/panels/results_panel.cpp
 )
 
 target_include_directories(tenet_lib BEFORE PUBLIC
