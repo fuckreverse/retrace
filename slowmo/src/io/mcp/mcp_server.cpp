@@ -5,6 +5,7 @@
 
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "service/tenet_service.h"
 #include "common/logger.h"
 
 #include <fmt/core.h>
@@ -104,6 +105,18 @@ TenetMcpService::TenetMcpService(TraceReader& reader,
 
     register_all_tools();
     LOG_INFO_M(log::Module::Mcp, "service initialized: {} tools registered ({} write tools)",
+               tool_schemas_.size(), write_tools_.size());
+}
+
+TenetMcpService::TenetMcpService(TenetService& service)
+    : reader_(service.reader()), index_(service.index()),
+      regfile_(service.regfile()), memory_(service.memory()),
+      pm_(&service.ensure_pass_manager()),
+      code_table_(&service.code_table()),
+      decoder_(&service.decoder()) {
+
+    register_all_tools();
+    LOG_INFO_M(log::Module::Mcp, "service initialized (via TenetService): {} tools registered ({} write tools)",
                tool_schemas_.size(), write_tools_.size());
 }
 

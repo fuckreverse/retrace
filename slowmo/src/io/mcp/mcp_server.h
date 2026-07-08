@@ -29,6 +29,7 @@ class CodeTable;
 class InstructionDecoder;
 class McpHttpTransport;
 class VMBytecodeDecoder;
+class TenetService;
 
 // ─── MCP Transport Mode ────────────────────────────────────────────────────
 
@@ -121,6 +122,10 @@ public:
                     PassManager* pm,
                     CodeTable* code_table = nullptr,
                     InstructionDecoder* decoder = nullptr);
+
+    /// Construct from TenetService — uses service's backend refs and PassManager.
+    explicit TenetMcpService(TenetService& service);
+
     ~TenetMcpService();
 
     // ── Stdio mode ─────────────────────────────────────────────────────

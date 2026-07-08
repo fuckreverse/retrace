@@ -335,9 +335,13 @@ void GuiApp::render_shutdown_overlay() {
 void GuiApp::auto_start_mcp() {
     ensure_pass_manager();
 
-    mcp_service_ = std::make_unique<TenetMcpService>(
-        reader_, index_, regfile_, memory_,
-        pass_manager_.get(), &code_table_, &decoder_);
+    if (service_) {
+        mcp_service_ = std::make_unique<TenetMcpService>(*service_);
+    } else {
+        mcp_service_ = std::make_unique<TenetMcpService>(
+            reader_, index_, regfile_, memory_,
+            pass_manager_.get(), &code_table_, &decoder_);
+    }
 
     // ── Hub mode: try to become hub first ──────────────────────────────
     // The hub listens on a fixed port (default 10444). If we win the flock
@@ -1752,9 +1756,14 @@ int GuiApp::run() {
 
                 // Build a temporary TenetMcpService and try to bind a port.
                 // This is the only blocking part; everything else is quick.
-                auto svc = std::make_unique<TenetMcpService>(
-                    reader_, index_, regfile_, memory_,
-                    pass_manager_.get(), &code_table_, &decoder_);
+                std::unique_ptr<TenetMcpService> svc;
+                if (service_) {
+                    svc = std::make_unique<TenetMcpService>(*service_);
+                } else {
+                    svc = std::make_unique<TenetMcpService>(
+                        reader_, index_, regfile_, memory_,
+                        pass_manager_.get(), &code_table_, &decoder_);
+                }
 
                 McpHttpConfig cfg;
                 cfg.host = mcp_gui_.host;
