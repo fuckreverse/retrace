@@ -4,42 +4,6 @@
 
 namespace tenet {
 
-void TenetWSService::handle_navigate(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: Navigate");
-}
-
-void TenetWSService::handle_nav_back(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: NavBack");
-}
-
-void TenetWSService::handle_nav_forward(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: NavForward");
-}
-
-void TenetWSService::handle_toggle_bookmark(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: ToggleBookmark");
-}
-
-void TenetWSService::handle_get_bookmarks(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: GetBookmarks");
-}
-
-void TenetWSService::handle_get_trace_info(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: GetTraceInfo");
-}
-
-void TenetWSService::handle_search_forward(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: SearchForward");
-}
-
-void TenetWSService::handle_search_clear(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: SearchClear");
-}
-
-void TenetWSService::handle_get_search_results(void* ws, uint32_t msg_id) {
-    send_error(ws, msg_id, 4, "not implemented: GetSearchResults");
-}
-
 void TenetWSService::handle_run_pass(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
     send_error(ws, msg_id, 4, "not implemented: RunPass");
 }
