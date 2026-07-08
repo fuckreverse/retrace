@@ -292,6 +292,28 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --exclude-range A0000:200 \
     --output /var/mobile/Documents/trace.bin
 
+# ── 采样侦察模式（先摸清执行情况，再决定排除哪些区域） ──────
+# 步骤 1：先跑一次 --sampling，产出一个体积小得多的裸 PC 流 trace
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --sampling \
+    --output /var/mobile/Documents/sampling.bin
+
+# 步骤 2：用 tenet 分析这个 sampling trace，找出占比最大的循环
+#         （--suggest-excludes 直接给出建议的 --exclude-range 参数）
+./tenet --suggest-excludes /var/mobile/Documents/sampling.bin
+# 或人工看 loop 明细：
+./tenet --run-pass loop /var/mobile/Documents/sampling.bin
+
+# 步骤 3：静态确认建议的地址范围确实是无关代码（如 memset/CRC/反调试延时），
+#         然后把确认过的范围传给正式的完整 trace
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --exclude-range 100292230-100292268 \
+    --output /var/mobile/Documents/trace.bin
+
 # ── Pre-trace 内存 patch ──────────────────────────────────
 # 在 trace 开始前修改目标进程内存（清除缓存/标志/修改常量），trace 完成后自动恢复
 
@@ -368,13 +390,14 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--record` | 63 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC, 32=CAPI |
+| `--record` | 127 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC, 32=CAPI, 64=SEQEVENTS |
 | `--no-objc` | off | 关闭 ObjC msgSend 解析 |
-| `--capi` | off | 启用 C API 拦截（自动解析常见函数地址并填入 `capi_funcs[]`）。配合 `--record 32` 或默认 `--record 63` 生效 |
+| `--capi` | off | 启用 C API 拦截（自动解析常见函数地址并填入 `capi_funcs[]`）。配合 `--record 32` 或默认 `--record 127` 生效 |
 | `--anchor-interval` | 0 (默认1024) | 每 N 条指令打全量快照 |
 | `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
 | `--no-embed-code` | off | 关闭内嵌码表 |
 | `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。可多次指定，最多 8 个。该区间内代码以原生速度执行，不产生 trace 记录。适用于排除大循环（如内存校验） |
+| `--sampling` | off | **采样侦察模式**：只记录裸 PC 流（`REC_INST` + `REC_CODE` + `REC_ANCHOR`，不含寄存器/内存/SEQ_ENTRY-EXIT），体积通常缩小 80%+，但仍逐指令执行、循环次数与回边完全精确。用于在做完整 trace 前先摸清执行情况，找出可 `--exclude-range` 排除的大循环。隐含开启 `--pc-delta` 并把 `--anchor-interval` 设为一个较大值（除非显式指定）；此时 `--record` 会被忽略。见下方「采样侦察工作流」 |
 
 **Pre-trace 内存 patch：**
 
@@ -622,7 +645,7 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 | `module_slide` | `uint64_t` | ASLR slide；静态地址 = 运行时 - slide |
 | `module_name` | `const char*` | 模块路径（可为 NULL） |
 | `output_path` | `const char*` | 输出文件路径（NULL => 默认路径） |
-| `record` | `uint32_t` | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC |
+| `record` | `uint32_t` | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC, 32=CAPI, 64=SEQEVENTS。特殊哨兵值 `QBDITRACE_REC_SAMPLING`（`1u<<31`）用于"采样侦察"模式——见下方说明 |
 | `anchor_interval` | `uint32_t` | 每 N 条指令打一次全量快照（0 = 默认 1024） |
 | `ring_bytes` | `uint64_t` | 每线程 ring buffer 字节数（0 = 默认 64 MiB） |
 | `objc_msgSend` | `uint64_t` | 运行期 objc_msgSend 地址（0 = 不捕获） |
@@ -640,6 +663,23 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 
 **`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
 `run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。
+
+**采样侦察模式（`QBDITRACE_REC_SAMPLING`）**：`record` 字段为 0 时会被 ABI 兼容层
+静默替换为 `QBDITRACE_REC_DEFAULT`（历史上 0 代表"调用方未设置该字段"），因此无法用
+`record = 0` 得到"什么都不记录"的效果。若确实只想要一份最小体积的裸 PC 流 trace（用于
+先摸清执行情况、找出可排除的大循环，而不是做完整分析），设置：
+
+```c
+cfg.record = QBDITRACE_REC_SAMPLING;   // 只产出 REC_INST + REC_CODE + REC_ANCHOR
+cfg.enable_pc_delta = 1;               // v5 格式，INST 头 16B -> 6B
+cfg.anchor_interval = 1 << 20;         // 放大 ANCHOR 间隔（不需要精确寄存器状态）
+```
+
+`QBDITRACE_REC_SAMPLING` 是一个不参与任何记录内容判断的哨兵位，只用来让 `record` 非零、
+避免被替换为默认值；效果等价于关闭 NZCV/REGDIFF/MEM/SYSCALL/OBJC/CAPI/SEQEVENTS 全部内容位。
+产出的 trace 仍是逐指令完整执行（不是跳采样），因此 tenet 的 `cfg`/`loop`/`window_stats`
+等只依赖 PC 流 + 反汇编的 pass 可以在这份 trace 上得到与完整 trace 完全一致的循环次数和
+基本块边计数。Python loader 用户直接用 `qbditrace_runner.py --sampling` 即可，无需手填这三个字段。
 
 ## 5. Benchmark 套件
 

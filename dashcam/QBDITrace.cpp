@@ -71,6 +71,7 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/vm_map.h>
 #include <dlfcn.h>
 #elif defined(__linux__)
@@ -93,6 +94,104 @@ const char *object_getClassName(id obj) __attribute__((weak_import));
  * shared with the unit test suite.  Must be included before the anonymous
  * namespace so the definitions are visible at file scope. */
 #include "QBDITraceInternal.h"
+
+/* ----------------------------------------------------------------------------
+ * Live statistics page
+ *
+ * A process-global, cache-line-aligned struct whose fields are updated by
+ * relaxed atomics on the hot path. The Frida JS agent obtains the address
+ * once via qbditrace_stats_page(), then polls individual fields with
+ * Memory.readU64() on a setInterval timer — zero function-call overhead
+ * per poll.
+ *
+ * We use a plain C struct (matching QBDITrace.h) for the exported page, but
+ * internally write through a parallel array of std::atomic<uint64_t> that
+ * shares the same storage via reinterpret_cast. This is safe because:
+ *   - uint64_t and std::atomic<uint64_t> have identical size/alignment on all
+ *     targets we care about (aarch64, x86_64) with the standard library impls
+ *     (libc++, libstdc++).
+ *   - We only ever access the storage through the atomic accessors (relaxed),
+ *     never via the C struct directly, so there is no data race.
+ * ------------------------------------------------------------------------- */
+static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t),
+              "atomic<uint64_t> must be lock-free and same size as uint64_t");
+
+alignas(64) static qbditrace_stats_t g_stats_page;
+
+/* Convenience accessors into g_stats_page fields as relaxed atomics. */
+static inline std::atomic<uint64_t> &statsField(size_t byte_offset) {
+  return *reinterpret_cast<std::atomic<uint64_t> *>(
+      reinterpret_cast<uint8_t *>(&g_stats_page) + byte_offset);
+}
+/* Named accessors for each counter (offsets match qbditrace_stats_t layout). */
+static inline void statsIncInstructions() {
+  statsField(offsetof(qbditrace_stats_t, total_instructions))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsIncAnchors() {
+  statsField(offsetof(qbditrace_stats_t, total_anchors))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsAddMemAccesses(uint64_t n) {
+  statsField(offsetof(qbditrace_stats_t, total_mem_accesses))
+      .fetch_add(n, std::memory_order_relaxed);
+}
+static inline void statsIncEvents() {
+  statsField(offsetof(qbditrace_stats_t, total_events))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsIncSvc() {
+  statsField(offsetof(qbditrace_stats_t, total_svc))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsIncObjc() {
+  statsField(offsetof(qbditrace_stats_t, total_objc))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsIncCodeEntries() {
+  statsField(offsetof(qbditrace_stats_t, total_code_entries))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsIncCapi() {
+  statsField(offsetof(qbditrace_stats_t, total_capi))
+      .fetch_add(1, std::memory_order_relaxed);
+}
+static inline void statsAddBytesWritten(uint64_t n) {
+  statsField(offsetof(qbditrace_stats_t, bytes_written))
+      .fetch_add(n, std::memory_order_relaxed);
+}
+
+/* Platform-portable nanosecond wall clock. */
+static inline uint64_t nowNs() {
+#if defined(__APPLE__)
+  /* mach_absolute_time is ~20 ns on Apple Silicon; numer/denom == 1/1 on
+   * all Apple Silicon Macs and iPhones, so the value IS nanoseconds. */
+  return mach_absolute_time();
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static void statsReset() {
+  std::memset(&g_stats_page, 0, sizeof(g_stats_page));
+  g_stats_page.start_time_ns = nowNs();
+}
+
+/* Update the elapsed_ns field from the stored start time. Called lazily by the
+ * reader (qbditrace_stats_page returns the struct; the JS side reads
+ * elapsed_ns, which the dylib keeps up-to-date on every instruction — but
+ * that would be too expensive). Instead we update it in the background writer
+ * after each chunk flush, which gives ~100ms granularity. */
+static inline void statsUpdateElapsed() {
+  uint64_t start = statsField(offsetof(qbditrace_stats_t, start_time_ns))
+      .load(std::memory_order_relaxed);
+  if (start != 0) {
+    statsField(offsetof(qbditrace_stats_t, elapsed_ns))
+        .store(nowNs() - start, std::memory_order_relaxed);
+  }
+}
 
 namespace {
 
@@ -497,6 +596,7 @@ public:
 
   bool configure(const Config &cfg) {
     std::lock_guard<std::mutex> lk(setup_mtx_);
+    statsReset();
     cfg_ = cfg;
 
     if (cfg_.output_path.empty()) {
@@ -542,6 +642,13 @@ public:
                          cfg_.compress)) {
         return false;
       }
+      /* Hook up the live stats page so the background writer updates
+       * bytes_written and elapsed_ns after each chunk flush. */
+      writer_.setStatsCounter(
+          reinterpret_cast<std::atomic<uint64_t> *>(
+              reinterpret_cast<uint8_t *>(&g_stats_page) +
+              offsetof(qbditrace_stats_t, bytes_written)),
+          statsUpdateElapsed);
       writeFileHeader();
       writer_started_ = true;
     }
@@ -930,6 +1037,7 @@ inline void prepareRecord(ThreadBuffer *buf, size_t payload) {
 inline void emitAnchor(ThreadBuffer *buf, QBDI::GPRState *gpr,
                        QBDI::FPRState *fpr, uint64_t pc,
                        bool fpr_mode) {
+  statsIncAnchors();
   const uint32_t n = QBDITRACE_AARCH64_NUM_GPR;
   const size_t fpr_bytes = fpr_mode ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
   const size_t payload =
@@ -984,6 +1092,7 @@ ch.reserved[0] = ch.reserved[1] = 0;
 ch.pc = pc;
 std::memcpy(p, &ch, sizeof(ch));
 std::memcpy(p + sizeof(ch), bytes, sizeof(bytes));
+statsIncCodeEntries();
 }
 
 /* Emit a REC_CODE using opcode bytes the caller already obtained (e.g. from
@@ -1007,6 +1116,7 @@ ch.reserved[0] = ch.reserved[1] = 0;
 ch.pc = pc;
 std::memcpy(p, &ch, sizeof(ch));
 std::memcpy(p + sizeof(ch), bytes, sizeof(bytes));
+statsIncCodeEntries();
 }
 
 /* Flush deferred CODE records that were queued while inside an LL/SC critical
@@ -1701,6 +1811,8 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     }
 
     c->last_emitted_pc = exec_pc;
+    statsIncInstructions();
+    if (n_mem) statsAddMemAccesses(n_mem);
     ++c->inst_count;
     ++c->since_anchor;
     return QBDI::CONTINUE;
@@ -1723,6 +1835,8 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     p += sizeof(ih7);
     serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem,
                          fpr_for_serial, fprbuf, fprbuf_n);
+    statsIncInstructions();
+    if (n_mem) statsAddMemAccesses(n_mem);
     ++c->inst_count;
     ++c->since_anchor;
     return QBDI::CONTINUE;
@@ -1745,6 +1859,8 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
 
   serializeInstPayload(p, regbuf, regbuf_n, macc.data(), n_mem);
 
+  statsIncInstructions();
+  if (n_mem) statsAddMemAccesses(n_mem);
   ++c->inst_count;
   ++c->since_anchor;
   return QBDI::CONTINUE;
@@ -1779,6 +1895,7 @@ QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
   prepareRecord(buf, sizeof(sh));
   uint8_t *p = buf->reserve(sizeof(sh));
   std::memcpy(p, &sh, sizeof(sh));
+  statsIncSvc();
   return QBDI::CONTINUE;
 }
 
@@ -1788,6 +1905,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
   (void)vm;
   ThreadCtx *c = ensureThreadCtx();
   ThreadBuffer *buf = c->buf;
+  const Config &cfg = *c->cached_cfg;
 
   auto emitEvent = [&](uint8_t ev, uint64_t addr, uint64_t site) {
     prepareRecord(buf, sizeof(qbditrace_event_head_t));
@@ -1799,6 +1917,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     eh.addr = addr;
     eh.site = site;
     std::memcpy(p, &eh, sizeof(eh));
+    statsIncEvents();
   };
 
   /* Emit an OBJC dispatch record (receiver + selector) captured at the call
@@ -1834,6 +1953,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     prepareRecord(buf, sizeof(oh));
     uint8_t *p = buf->reserve(sizeof(oh));
     std::memcpy(p, &oh, sizeof(oh));
+    statsIncObjc();
   };
 
   /* NOTE: register diffs store ABSOLUTE post-values, so the diff chain does not
@@ -1842,11 +1962,22 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
    * preInstCB). We request a fresh anchor after a control-flow transfer so a
    * reader that seeks into the trace has a nearby checkpoint, but we do not
    * force one on ordinary sequence entries (those are extremely frequent). */
-  if (st->event & QBDI::SEQUENCE_ENTRY) {
-    emitEvent(QBDITRACE_EV_SEQ_ENTRY, st->sequenceStart, 0);
-  }
-  if (st->event & QBDI::SEQUENCE_EXIT) {
-    emitEvent(QBDITRACE_EV_SEQ_EXIT, st->sequenceEnd, 0);
+  /* SEQ_ENTRY/SEQ_EXIT fire roughly once per taken branch (twice per loop
+   * iteration for a tight back-edge), making them the highest-volume event
+   * type in hot-loop-heavy traces. No analysis pass depends on their
+   * semantic content (basic blocks/loops are reconstructed from the plain
+   * REC_INST PC stream instead — see tenet's cfg_pass), and they do not
+   * drive ANCHOR placement (that's XFER_CALL/RETURN + anchor_interval only,
+   * unconditionally below). Gate them behind QBDITRACE_REC_SEQEVENTS so
+   * sampling-mode traces (record = QBDITRACE_REC_SAMPLING) can skip this
+   * bulk of bookkeeping entirely. */
+  if (cfg.record & QBDITRACE_REC_SEQEVENTS) {
+    if (st->event & QBDI::SEQUENCE_ENTRY) {
+      emitEvent(QBDITRACE_EV_SEQ_ENTRY, st->sequenceStart, 0);
+    }
+    if (st->event & QBDI::SEQUENCE_EXIT) {
+      emitEvent(QBDITRACE_EV_SEQ_EXIT, st->sequenceEnd, 0);
+    }
   }
   if (st->event & QBDI::EXEC_TRANSFER_CALL) {
     /* basicBlockStart is the transfer destination (the call target);
@@ -1854,7 +1985,6 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
      * (the call site inside the traced range). */
     const uint64_t target = st->basicBlockStart;
     const uint64_t site = c->cur_pc;
-    const Config &cfg = *c->cached_cfg;
     if (cfg.record & QBDITRACE_REC_MSGSEND) {
       int variant = classifyObjcTarget(cfg, target);
       if (variant >= 0) {
@@ -2016,6 +2146,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
             *p++ = '\0'; *p++ = '\0'; *p++ = '\0';
           }
         }
+        statsIncCapi();
       }
     }
     emitEvent(QBDITRACE_EV_XFER_CALL, target, site);
@@ -2042,7 +2173,6 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     const uint64_t bbStart = st->basicBlockStart;
     const uint64_t bbEnd = st->basicBlockEnd;
     if (bbStart != 0 && bbEnd > bbStart) {
-      const Config &cfg = *c->cached_cfg;
       if (cfg.embed_code) {
         for (uint64_t pc = bbStart; pc < bbEnd; pc += 4) {
           uint32_t opcode = *reinterpret_cast<const uint32_t *>(pc);
@@ -2512,4 +2642,9 @@ extern "C" int qbditrace_dump_pcring(const char *path) {
   }
   uint64_t total = g_pc_ring_pos.load(std::memory_order_relaxed);
   return (int)(total < kPcRingSize ? total : kPcRingSize);
+}
+
+extern "C" const qbditrace_stats_t *qbditrace_stats_page(void) {
+  statsUpdateElapsed();
+  return &g_stats_page;
 }

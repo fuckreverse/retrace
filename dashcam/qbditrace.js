@@ -89,6 +89,7 @@ function resolveExports(dylibModule) {
     'qbditrace_run_call',
     'qbditrace_stop',
     'qbditrace_output_path',
+    'qbditrace_stats_page',
   ];
   const ex = {};
   for (const n of names) {
@@ -123,6 +124,7 @@ function buildNativeFunctions(ex) {
         ['pointer', 'pointer', 'uint32', 'pointer']),
     stop: new NativeFunction(ex.qbditrace_stop, 'void', []),
     outputPath: new NativeFunction(ex.qbditrace_output_path, 'pointer', []),
+    statsPage: new NativeFunction(ex.qbditrace_stats_page, 'pointer', []),
   };
 }
 
@@ -963,6 +965,69 @@ function mainImpl() {
   const fn = buildNativeFunctions(ex);
   const mod = resolveTargetModule();
 
+  // --- Live stats polling ---
+  // After configure(), obtain the stats page pointer once, then poll with
+  // setInterval. Each poll reads the relaxed-atomic fields directly from
+  // native memory (zero function-call overhead) and sends a 'stats' message
+  // to Python for real-time display.
+  var statsTimerId = null;
+  var statsPtr = null; // set after first configure()
+
+  function startStatsPolling() {
+    if (statsTimerId !== null) return; // already polling
+    if (statsPtr === null || statsPtr.isNull()) {
+      statsPtr = fn.statsPage();
+      if (statsPtr === null || statsPtr.isNull()) {
+        log('WARNING: qbditrace_stats_page() returned NULL — stats disabled');
+        return;
+      }
+    }
+    var interval = (CONFIG.statsIntervalMs !== undefined) ? CONFIG.statsIntervalMs : 500;
+    if (interval <= 0) return; // disabled by config
+    var sp = statsPtr; // capture for closure
+    statsTimerId = setInterval(function () {
+      send({
+        type: 'stats',
+        insns:      sp.readU64().toString(),
+        anchors:    sp.add(8).readU64().toString(),
+        mem:        sp.add(16).readU64().toString(),
+        events:     sp.add(24).readU64().toString(),
+        svc:        sp.add(32).readU64().toString(),
+        objc:       sp.add(40).readU64().toString(),
+        code:       sp.add(48).readU64().toString(),
+        capi:       sp.add(56).readU64().toString(),
+        bytes:      sp.add(64).readU64().toString(),
+        elapsedNs:  sp.add(72).readU64().toString(),
+      });
+    }, interval);
+  }
+
+  function stopStatsPolling() {
+    if (statsTimerId !== null) {
+      clearInterval(statsTimerId);
+      statsTimerId = null;
+    }
+    // Send one final stats snapshot so the total is accurate
+    if (statsPtr !== null && !statsPtr.isNull()) {
+      // Call statsPage() once more to update elapsed_ns
+      fn.statsPage();
+      send({
+        type: 'stats',
+        final: true,
+        insns:      statsPtr.readU64().toString(),
+        anchors:    statsPtr.add(8).readU64().toString(),
+        mem:        statsPtr.add(16).readU64().toString(),
+        events:     statsPtr.add(24).readU64().toString(),
+        svc:        statsPtr.add(32).readU64().toString(),
+        objc:       statsPtr.add(40).readU64().toString(),
+        code:       statsPtr.add(48).readU64().toString(),
+        capi:       statsPtr.add(56).readU64().toString(),
+        bytes:      statsPtr.add(64).readU64().toString(),
+        elapsedNs:  statsPtr.add(72).readU64().toString(),
+      });
+    }
+  }
+
   // --- Resolve the entry function ---
   const moduleBase = mod.base;
   let funcStart;
@@ -1138,6 +1203,7 @@ function mainImpl() {
     log('-> invoking entry function @ ' + funcStart +
         ' with ' + invokeArgc + ' args...');
 
+    startStatsPolling();
     var invokeRc = fn.runCall(invokeRetOut, funcStart, invokeArgc, invokeArgv);
     if (invokeRc !== 0) {
       log('qbditrace_run_call returned error rc=' + invokeRc);
@@ -1145,6 +1211,7 @@ function mainImpl() {
     var invokeRet = invokeRetOut.readPointer();
 
     fn.stop();
+    stopStatsPolling();
 
     // Restore patched memory
     restorePatches(savedPatches);
@@ -1239,6 +1306,7 @@ function mainImpl() {
 
         removeHook();
 
+        startStatsPolling();
         const r = fn.runCall(retOut, funcStart, argc, argv);
         if (r !== 0) {
           log('qbditrace_run_call returned error rc=' + r);
@@ -1246,6 +1314,7 @@ function mainImpl() {
         const ret = retOut.readPointer();
 
         fn.stop();
+        stopStatsPolling();
         const outFile = fn.outputPath().readUtf8String();
         log('<- trace #' + thisTrace + ' done, ret = ' + ret + '. output = ' + outFile);
         status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });

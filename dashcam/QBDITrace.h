@@ -40,9 +40,59 @@ enum {
                                     * Requires enable_capi_intercept != 0 to
                                     * also enable the address-resolution step;
                                     * this bit gates the actual record emission. */
+  QBDITRACE_REC_SEQEVENTS = 1u << 6, /* capture QBDITRACE_EV_SEQ_ENTRY /
+                                    * QBDITRACE_EV_SEQ_EXIT records (one pair
+                                    * per QBDI "sequence", i.e. roughly once
+                                    * per taken branch / loop back-edge).
+                                    * These are pure bookkeeping: no analysis
+                                    * pass derives basic blocks or loops from
+                                    * them (cfg/loop passes reconstruct block
+                                    * boundaries from the REC_INST PC stream
+                                    * + static disassembly instead), and they
+                                    * do not gate ANCHOR placement (that is
+                                    * driven solely by EXEC_TRANSFER_CALL/
+                                    * RETURN and the anchor_interval counter).
+                                    * In hot-loop-heavy traces this is often
+                                    * the single largest record type by count
+                                    * (two records per loop iteration), so
+                                    * sampling mode turns it off by default.
+                                    * EXEC_TRANSFER_CALL/RETURN events (which
+                                    * are comparatively rare and carry actual
+                                    * cross-boundary call information) are
+                                    * unaffected by this bit and always emitted. */
   QBDITRACE_REC_DEFAULT =
       QBDITRACE_REC_NZCV | QBDITRACE_REC_REGDIFF | QBDITRACE_REC_MEM |
-      QBDITRACE_REC_SYSCALL | QBDITRACE_REC_MSGSEND | QBDITRACE_REC_CAPI,
+      QBDITRACE_REC_SYSCALL | QBDITRACE_REC_MSGSEND | QBDITRACE_REC_CAPI |
+      QBDITRACE_REC_SEQEVENTS,
+
+  /* Sampling-mode sentinel bit. `record == 0` cannot mean "record nothing":
+   * qbditrace_configure() historically treats a zero `record` field as "the
+   * caller didn't set it" (ABI forward-compat with callers built against an
+   * older/shorter config struct) and silently substitutes QBDITRACE_REC_DEFAULT.
+   * That default-substitution is load-bearing for old callers and must not
+   * change.
+   *
+   * To get a real "record (almost) nothing" mode, set
+   * `record = QBDITRACE_REC_SAMPLING` (optionally OR'd with QBDITRACE_REC_SYSCALL
+   * / QBDITRACE_REC_MSGSEND if call-site context is still wanted). This bit is
+   * deliberately excluded from every `cfg.record & QBDITRACE_REC_*` content
+   * check, so it never gates any record content by itself — its only purpose
+   * is to make `record` non-zero so the ABI shim does not override it with
+   * QBDITRACE_REC_DEFAULT.
+   *
+   * Typical "sampling trace" recipe (see qbditrace_runner.py --sampling):
+   *   record            = QBDITRACE_REC_SAMPLING
+   *   enable_pc_delta   = 1   (6-byte INST records instead of 16)
+   *   anchor_interval   = large (e.g. 1u<<20) since exact register state is
+   *                       not needed for loop/hotspot discovery
+   *   disable_embed_code= 0   (keep REC_CODE; tenet's loop/cfg passes need it
+   *                       to disassemble and classify loop bodies)
+   * The result is a trace with only REC_INST (bare PC stream, no reg/mem
+   * payload) + REC_CODE + REC_ANCHOR + REC_EVENT, which is exactly what
+   * tenet's `cfg` / `loop` / `window_stats` passes need to reconstruct basic
+   * blocks, back-edges and iteration counts precisely (they require the full
+   * per-instruction PC sequence, not a statistically down-sampled one). */
+  QBDITRACE_REC_SAMPLING = 1u << 31,
 };
 
 /*
@@ -299,6 +349,52 @@ const char *qbditrace_output_path(void);
  * Returns the number of PC entries written.
  */
 int qbditrace_dump_pcring(const char *path);
+
+/*
+ * Live statistics page — a fixed-layout struct in process memory that the
+ * tracer updates with relaxed atomics on the hot path. The Frida loader can
+ * call qbditrace_stats_page() once after qbditrace_configure() to obtain the
+ * address, then poll the fields directly via Memory.readU64() on a timer
+ * (e.g. setInterval) to display real-time progress without any function-call
+ * overhead per poll.
+ *
+ * All uint64_t counters are updated with std::memory_order_relaxed; readers
+ * may see slightly stale values (by at most one buffer-flush lag) — this is
+ * acceptable for a progress display.
+ *
+ * Layout contract: fields are at fixed byte offsets (see comments). New fields
+ * are appended at the end; existing offsets never change. Frida JS reads by
+ * offset, so binary compatibility is maintained as long as we only append.
+ */
+typedef struct {
+  uint64_t total_instructions;  /* offset  0: total instructions executed (all threads) */
+  uint64_t total_anchors;       /* offset  8: ANCHOR records emitted */
+  uint64_t total_mem_accesses;  /* offset 16: memory access sub-records emitted */
+  uint64_t total_events;        /* offset 24: EVENT records emitted */
+  uint64_t total_svc;           /* offset 32: SVC records emitted */
+  uint64_t total_objc;          /* offset 40: OBJC records emitted */
+  uint64_t total_code_entries;  /* offset 48: CODE records emitted (distinct PCs) */
+  uint64_t total_capi;          /* offset 56: CAPICALL records emitted */
+  uint64_t bytes_written;       /* offset 64: raw bytes submitted to BackgroundWriter */
+  uint64_t elapsed_ns;          /* offset 72: wall-clock nanoseconds since configure() */
+  uint64_t start_time_ns;       /* offset 80: mach_absolute_time() at configure() [internal] */
+  uint64_t _reserved[5];        /* offset 88: future use, zero-initialized */
+} qbditrace_stats_t;
+
+/*
+ * Returns a pointer to the live statistics page. The pointer is valid for the
+ * lifetime of the process (the stats struct is a static global). Returns NULL
+ * only if the library failed to initialize.
+ *
+ * Typical Frida usage:
+ *   var statsPtr = new NativeFunction(ex.qbditrace_stats_page, 'pointer', [])();
+ *   setInterval(function() {
+ *     var insns = statsPtr.readU64();
+ *     var bytes = statsPtr.add(64).readU64();
+ *     send({ type: 'stats', instructions: insns.toString(), ... });
+ *   }, 500);
+ */
+const qbditrace_stats_t *qbditrace_stats_page(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

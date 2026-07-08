@@ -109,6 +109,15 @@ public:
   bool ok() const { return file_ != nullptr; }
   bool compressed() const { return compress_; }
 
+  /* Optional external atomic counter that the writer increments after each
+   * chunk flush. Set by the caller (e.g. Tracer) to point at the stats page's
+   * bytes_written field. When null (the default), no accounting is done. */
+  void setStatsCounter(std::atomic<uint64_t> *bytes_written,
+                       void (*elapsed_fn)()) {
+    ext_bytes_written_ = bytes_written;
+    ext_elapsed_fn_ = elapsed_fn;
+  }
+
 private:
   void loop();
   void recycle(uint8_t *mem);
@@ -155,6 +164,10 @@ private:
   std::thread worker_;
   std::atomic<bool> running_{false};
   bool header_written_ = false;
+
+  /* External stats hooks (set via setStatsCounter). */
+  std::atomic<uint64_t> *ext_bytes_written_ = nullptr;
+  void (*ext_elapsed_fn_)() = nullptr;
 };
 
 inline bool BackgroundWriter::start(const char *path, size_t chunk_bytes,
@@ -419,6 +432,12 @@ inline void BackgroundWriter::loop() {
     }
     if (file_ && c.data && c.used) {
       writeBytes(c.data, c.used, io_error_reported);
+      if (ext_bytes_written_) {
+        ext_bytes_written_->fetch_add(c.used, std::memory_order_relaxed);
+      }
+      if (ext_elapsed_fn_) {
+        ext_elapsed_fn_();
+      }
     }
     recycle(c.data);
   }

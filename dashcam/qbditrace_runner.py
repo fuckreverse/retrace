@@ -95,6 +95,34 @@ import time
 
 
 # =============================================================================
+# Record bitmask constants (must mirror QBDITrace.h QBDITRACE_REC_* exactly)
+# =============================================================================
+
+QBDITRACE_REC_NZCV      = 1 << 0
+QBDITRACE_REC_REGDIFF   = 1 << 1
+QBDITRACE_REC_MEM       = 1 << 2
+QBDITRACE_REC_SYSCALL   = 1 << 3
+QBDITRACE_REC_MSGSEND   = 1 << 4
+QBDITRACE_REC_CAPI      = 1 << 5
+QBDITRACE_REC_SEQEVENTS = 1 << 6
+QBDITRACE_REC_DEFAULT = (QBDITRACE_REC_NZCV | QBDITRACE_REC_REGDIFF |
+                         QBDITRACE_REC_MEM | QBDITRACE_REC_SYSCALL |
+                         QBDITRACE_REC_MSGSEND | QBDITRACE_REC_CAPI |
+                         QBDITRACE_REC_SEQEVENTS)
+# Sentinel bit: forces `record` non-zero without turning on any content bit,
+# so the native ABI shim (which treats record==0 as "caller didn't set it"
+# and substitutes QBDITRACE_REC_DEFAULT) does not override it. See the
+# QBDITRACE_REC_SAMPLING comment in QBDITrace.h for the full rationale.
+QBDITRACE_REC_SAMPLING = 1 << 31
+
+# Large but finite default anchor interval for --sampling: exact register
+# state is not needed for loop/hotspot discovery, only the PC stream, so
+# resync checkpoints can be very sparse. Kept finite (not 0, which would mean
+# "use the library's small 1024 default") to actually reduce ANCHOR volume.
+SAMPLING_DEFAULT_ANCHOR_INTERVAL = 1 << 20
+
+
+# =============================================================================
 # Typed argument parsing for --invoke mode
 # =============================================================================
 
@@ -286,14 +314,16 @@ def parse_args():
 
     # --- Recording options ---
     rec = p.add_argument_group('Recording options')
-    rec.add_argument('--record', type=lambda x: int(x, 0), default=31,
+    rec.add_argument('--record', type=lambda x: int(x, 0), default=None,
                      help='Record bitmask: 1=NZCV 2=REGDIFF 4=MEM 8=SVC 16=OBJC '
-                          '(default: 31 = all)')
+                          '32=CAPI 64=SEQEVENTS (default: 127 = all, i.e. '
+                          'QBDITRACE_REC_DEFAULT). Ignored if --sampling is set.')
     rec.add_argument('--no-objc', action='store_true',
                      help='Disable ObjC msgSend resolution')
-    rec.add_argument('--anchor-interval', type=int, default=0,
+    rec.add_argument('--anchor-interval', type=int, default=None,
                      help='Instructions between full register snapshots '
-                          '(0 = library default 1024)')
+                          '(default: library default 1024, or a much larger '
+                          'value automatically under --sampling)')
     rec.add_argument('--ring-bytes', type=lambda x: int(x, 0), default=0,
                      help='Per-thread ring buffer size in bytes '
                           '(0 = default 64 MiB)')
@@ -301,7 +331,8 @@ def parse_args():
                      help='Disable embedding deduplicated code table in trace')
     rec.add_argument('--pc-delta', action='store_true',
                      help='Enable v5 PC-delta encoding (2-byte delta instead of '
-                          '8-byte absolute PC, ~40-60%% smaller for straight-line code)')
+                          '8-byte absolute PC, ~40-60%% smaller for straight-line code). '
+                          'Implied by --sampling.')
     rec.add_argument('--fpr', action='store_true',
                      help='Enable v7 FPR/NEON register recording '
                           '(128-bit vector regs, essential for AES/SHA analysis)')
@@ -312,6 +343,24 @@ def parse_args():
                           'START:SIZE, hex). Can be specified multiple times (max 8). '
                           'Code in excluded ranges executes natively without recording. '
                           'Example: --exclude-range 0x1234-0x5678 --exclude-range 0xA000:0x200')
+    rec.add_argument('--sampling', action='store_true',
+                     help='Reconnaissance mode: produce a small, bare PC-stream trace '
+                          '(record = QBDITRACE_REC_SAMPLING, i.e. only REC_INST + '
+                          'REC_CODE + REC_ANCHOR — no reg diffs, no memory accesses, '
+                          'no SEQ_ENTRY/EXIT bookkeeping) meant to be fed to tenet\'s '
+                          '`loop`/`cfg`/`window_stats` passes BEFORE committing to a '
+                          'full trace. This still walks every instruction (so loop '
+                          'iteration counts and back-edges are exact, unlike a '
+                          'statistically down-sampled profile) but skips all the '
+                          'expensive per-instruction payload, typically shrinking the '
+                          'trace by 80%%+ in loop-heavy code. Workflow: run with '
+                          '--sampling first, run `tenet --run-pass loop` (or '
+                          '--suggest-excludes) on the result to find huge, likely-'
+                          'irrelevant loops, confirm them statically in IDA, then '
+                          'pass the confirmed ranges as --exclude-range on the real, '
+                          'fully-recorded trace. Implies --pc-delta and a large '
+                          '--anchor-interval unless explicitly overridden; --record '
+                          'is ignored when this is set.')
 
     # --- Pre-trace memory patches ---
     patch = p.add_argument_group('Pre-trace memory patches')
@@ -367,6 +416,36 @@ def parse_args():
                          '(default in "once" mode)')
 
     args = p.parse_args()
+
+    # --- Apply --sampling preset (before generic record/anchor defaulting) ---
+    # Sampling mode overrides --record entirely (a real "record almost
+    # nothing" requires the QBDITRACE_REC_SAMPLING sentinel bit — see
+    # QBDITrace.h — which a plain numeric --record can't express safely) and
+    # implies --pc-delta plus a large --anchor-interval unless the user
+    # explicitly passed one.
+    if args.sampling:
+        if args.record is not None:
+            print('[!] WARNING: --record is ignored because --sampling is set '
+                  '(sampling forces record=QBDITRACE_REC_SAMPLING)', file=sys.stderr)
+        args.record = QBDITRACE_REC_SAMPLING
+        args.pc_delta = True
+        if args.anchor_interval is None:
+            args.anchor_interval = SAMPLING_DEFAULT_ANCHOR_INTERVAL
+        # embed_code must stay on (default) — tenet's cfg/loop passes need the
+        # REC_CODE table to disassemble and classify loop bodies.
+        if args.no_embed_code:
+            print('[!] WARNING: --no-embed-code with --sampling will prevent '
+                  'tenet from disassembling the trace; re-enabling embed-code.',
+                  file=sys.stderr)
+            args.no_embed_code = False
+
+    # Fill in the conventional defaults for callers that didn't ask for
+    # --sampling (kept as None above so --sampling can tell "unset" apart
+    # from "explicitly 0").
+    if args.record is None:
+        args.record = QBDITRACE_REC_DEFAULT
+    if args.anchor_interval is None:
+        args.anchor_interval = 0
 
     # Apply platform-specific defaults
     if args.dylib is None:
@@ -466,7 +545,7 @@ def parse_args():
 def build_config(args):
     record = args.record
     if args.no_objc:
-        record &= ~(1 << 4)  # clear MSGSEND bit
+        record &= ~QBDITRACE_REC_MSGSEND
 
     cfg = {
         'dylibPath': args.dylib,
@@ -632,6 +711,9 @@ class TracerSession:
                 else:
                     print(text)
 
+            elif msg_type == 'stats':
+                self._handle_stats(payload)
+
             elif msg_type == 'status':
                 event = payload.get('event', '')
                 detail = payload.get('detail', {})
@@ -656,6 +738,50 @@ class TracerSession:
         if crash:
             print(f'    Crash: {crash}')
         self.stop_event.set()
+
+    def _handle_stats(self, payload):
+        """Display live trace statistics (called from setInterval in the JS agent)."""
+        is_final = payload.get('final', False)
+        insns = int(payload.get('insns', 0))
+        anchors = int(payload.get('anchors', 0))
+        mem = int(payload.get('mem', 0))
+        events = int(payload.get('events', 0))
+        svc = int(payload.get('svc', 0))
+        objc = int(payload.get('objc', 0))
+        code = int(payload.get('code', 0))
+        capi = int(payload.get('capi', 0))
+        raw_bytes = int(payload.get('bytes', 0))
+        elapsed_ns = int(payload.get('elapsedNs', 0))
+
+        elapsed_s = elapsed_ns / 1e9 if elapsed_ns > 0 else 0
+        rate = insns / elapsed_s if elapsed_s > 0 else 0
+        mb = raw_bytes / (1024 * 1024)
+
+        # Build a compact one-line status string
+        parts = [f'{insns:,} insns']
+        if elapsed_s > 0:
+            parts.append(f'{elapsed_s:.1f}s')
+            parts.append(f'{rate / 1e6:.1f}M/s')
+        parts.append(f'{mb:.1f}MB')
+        # Optional record counts (only show if non-zero)
+        extras = []
+        if anchors: extras.append(f'anch={anchors:,}')
+        if mem:     extras.append(f'mem={mem:,}')
+        if svc:     extras.append(f'svc={svc:,}')
+        if objc:    extras.append(f'objc={objc:,}')
+        if capi:    extras.append(f'capi={capi:,}')
+        if code:    extras.append(f'code={code:,}')
+        if events:  extras.append(f'ev={events:,}')
+        if extras:
+            parts.append(' '.join(extras))
+
+        line = ' | '.join(parts)
+        if is_final:
+            # Final stats: print on a new line with a marker
+            print(f'\r\033[K[+] Stats: {line}')
+        else:
+            # In-progress: overwrite the current terminal line
+            print(f'\r\033[K[*] Tracing: {line}', end='', flush=True)
 
     def _handle_status(self, event, detail):
         """Process status events from the agent."""
@@ -685,7 +811,8 @@ class TracerSession:
             output = detail.get('output', '?')
             ret = detail.get('ret', '?')
             self.traces_done += 1
-            print(f'[+] Trace #{idx} complete -> {output} (ret={ret})')
+            # Clear the in-progress stats line before printing the completion message
+            print(f'\r\033[K[+] Trace #{idx} complete -> {output} (ret={ret})')
         elif event == 'gcd_trace_done':
             idx = detail.get('index', '?')
             path = detail.get('path', '?')
@@ -718,16 +845,30 @@ def main():
     if args.range_size:
         print(f'  Fallback:    range-size 0x{args.range_size:X} (if module resolution fails)')
     print(f'  Output:      {args.output}')
-    print(f'  Record:      0x{args.record:02X} '
-          f'(NZCV={bool(args.record & 1)}, REGDIFF={bool(args.record & 2)}, '
-          f'MEM={bool(args.record & 4)}, SVC={bool(args.record & 8)}, '
-          f'OBJC={bool(args.record & 16)})')
+    if args.sampling:
+        print(f'  Record:      0x{args.record:08X} (SAMPLING — bare PC stream only: '
+              f'REC_INST + REC_CODE + REC_ANCHOR, no reg/mem/seqevent payload)')
+    else:
+        print(f'  Record:      0x{args.record:02X} '
+              f'(NZCV={bool(args.record & QBDITRACE_REC_NZCV)}, '
+              f'REGDIFF={bool(args.record & QBDITRACE_REC_REGDIFF)}, '
+              f'MEM={bool(args.record & QBDITRACE_REC_MEM)}, '
+              f'SVC={bool(args.record & QBDITRACE_REC_SYSCALL)}, '
+              f'OBJC={bool(args.record & QBDITRACE_REC_MSGSEND)}, '
+              f'CAPI={bool(args.record & QBDITRACE_REC_CAPI)}, '
+              f'SEQEVENTS={bool(args.record & QBDITRACE_REC_SEQEVENTS)})')
     extras = []
+    if args.sampling:    extras.append('SAMPLING (reconnaissance mode)')
     if args.pc_delta:    extras.append('pc-delta(v5)')
     if args.fpr:         extras.append('fpr(v7)')
     if args.no_compress: extras.append('no-compress')
     else:                extras.append('zstd-compress')
     print(f'  Features:    {" | ".join(extras)}')
+    if args.sampling:
+        print(f'  Anchor int.: {args.anchor_interval} instructions (sparse — sampling '
+              f'mode only needs the PC stream, not exact register state)')
+        print(f'  Next steps:  tenet --run-pass loop {args.output}   '
+              f'(or --suggest-excludes once available)')
     for i, er in enumerate(args._exclude_ranges):
         print(f'  Exclude[{i}]:  0x{er["start"]:X} - 0x{er["end"]:X} '
               f'(size 0x{er["end"] - er["start"]:X})')
