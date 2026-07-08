@@ -236,18 +236,30 @@ void TenetService::remove_observer(TenetServiceObserver* obs) {
 }
 
 void TenetService::notify_navigation(uint64_t inst_id) {
-    std::lock_guard lock(observers_mutex_);
-    for (auto* obs : observers_) obs->on_navigation(inst_id);
+    std::vector<TenetServiceObserver*> snapshot;
+    {
+        std::lock_guard lock(observers_mutex_);
+        snapshot = observers_;
+    }
+    for (auto* obs : snapshot) obs->on_navigation(inst_id);
 }
 
 void TenetService::notify_pass_completed(std::string_view name) {
-    std::lock_guard lock(observers_mutex_);
-    for (auto* obs : observers_) obs->on_pass_completed(name);
+    std::vector<TenetServiceObserver*> snapshot;
+    {
+        std::lock_guard lock(observers_mutex_);
+        snapshot = observers_;
+    }
+    for (auto* obs : snapshot) obs->on_pass_completed(name);
 }
 
 void TenetService::notify_bookmark_changed() {
-    std::lock_guard lock(observers_mutex_);
-    for (auto* obs : observers_) obs->on_bookmark_changed();
+    std::vector<TenetServiceObserver*> snapshot;
+    {
+        std::lock_guard lock(observers_mutex_);
+        snapshot = observers_;
+    }
+    for (auto* obs : snapshot) obs->on_bookmark_changed();
 }
 
 }  // namespace tenet
