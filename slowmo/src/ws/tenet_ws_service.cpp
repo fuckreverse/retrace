@@ -38,8 +38,8 @@ uint16_t TenetWSService::start(uint16_t port) {
         event_loop_main(port);
     });
 
-    // Wait for the actual port (or failure).
-    while (!running_.load() && loop_thread_.joinable()) {
+    // Wait for the event loop thread to finish setup (success or failure).
+    while (!ready_.load() && loop_thread_.joinable()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return port_.load();
@@ -49,29 +49,37 @@ void TenetWSService::stop() {
     if (!running_.load()) return;
     running_.store(false);
 
-    // Close the listen socket from the event loop thread
-    if (loop_) {
-        auto* loop = static_cast<uWS::Loop*>(loop_);
+    // Close the listen socket and all client connections from the event loop thread
+    auto* loop_ptr = loop_.load();
+    if (loop_ptr) {
+        auto* loop = static_cast<uWS::Loop*>(loop_ptr);
         loop->defer([this]() {
             if (listen_socket_) {
                 us_listen_socket_close(0, listen_socket_);
                 listen_socket_ = nullptr;
             }
-            // Close all client connections
-            // (uWS will clean up once all sockets are closed)
+            // Close all active client connections so app.run() can exit
+            for (auto* client : clients_) {
+                static_cast<uWS::WebSocket<false, true, PerSocketData>*>(client)->close();
+            }
+            clients_.clear();
         });
     }
 
     if (loop_thread_.joinable()) {
         loop_thread_.join();
     }
-    loop_ = nullptr;
+    loop_.store(nullptr);
 }
 
 // ─── Event Loop ─────────────────────────────────────────────────────────────
 
 void TenetWSService::event_loop_main(uint16_t port) {
     uWS::App app;
+
+    // Assign loop_ BEFORE app.listen() so observer callbacks can use it
+    // as soon as running_ becomes true.
+    loop_.store(uWS::Loop::get());
 
     app.ws<PerSocketData>("/*", {
         .compression = uWS::DISABLED,
@@ -112,9 +120,9 @@ void TenetWSService::event_loop_main(uint16_t port) {
         } else {
             LOG_INFO_M(log::Module::Mcp, "[ws] failed to listen on port {}", port);
         }
+        ready_.store(true);  // signal start() that setup is done (success or failure)
     });
 
-    loop_ = uWS::Loop::get();
     app.run();  // blocks until all sockets closed
     running_.store(false);
 }
@@ -226,8 +234,10 @@ void TenetWSService::send_error(void* ws, uint32_t msg_id, uint32_t code,
 // ─── Observer Callbacks (called from any thread) ────────────────────────────
 
 void TenetWSService::on_navigation(uint64_t inst_id) {
-    if (!running_.load() || !loop_) return;
-    static_cast<uWS::Loop*>(loop_)->defer([this, inst_id]() {
+    if (!running_.load()) return;
+    auto* loop_ptr = loop_.load();
+    if (!loop_ptr) return;
+    static_cast<uWS::Loop*>(loop_ptr)->defer([this, inst_id]() {
         flatbuffers::FlatBufferBuilder fbb(64);
         auto evt = CreateEvtNavigationMsg(fbb, inst_id);
         fbb.Finish(evt);
@@ -241,9 +251,11 @@ void TenetWSService::on_navigation(uint64_t inst_id) {
 }
 
 void TenetWSService::on_pass_completed(std::string_view name) {
-    if (!running_.load() || !loop_) return;
+    if (!running_.load()) return;
+    auto* loop_ptr = loop_.load();
+    if (!loop_ptr) return;
     std::string name_copy(name);
-    static_cast<uWS::Loop*>(loop_)->defer([this, name_copy]() {
+    static_cast<uWS::Loop*>(loop_ptr)->defer([this, name_copy]() {
         flatbuffers::FlatBufferBuilder fbb(256);
         auto evt = CreateEvtPassCompletedMsg(fbb, fbb.CreateString(name_copy),
                                               true, 0);
@@ -258,8 +270,10 @@ void TenetWSService::on_pass_completed(std::string_view name) {
 }
 
 void TenetWSService::on_bookmark_changed() {
-    if (!running_.load() || !loop_) return;
-    static_cast<uWS::Loop*>(loop_)->defer([this]() {
+    if (!running_.load()) return;
+    auto* loop_ptr = loop_.load();
+    if (!loop_ptr) return;
+    static_cast<uWS::Loop*>(loop_ptr)->defer([this]() {
         auto& bm = service_.bookmarks();
         flatbuffers::FlatBufferBuilder fbb(64 + bm.size() * 8);
         auto bm_vec = fbb.CreateVector(bm.data(), bm.size());

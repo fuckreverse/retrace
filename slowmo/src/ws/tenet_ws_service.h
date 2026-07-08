@@ -74,10 +74,11 @@ private:
     TenetService& service_;
     std::thread loop_thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> ready_{false};   // set when event_loop_main finishes setup (success or failure)
     std::atomic<uint16_t> port_{0};
 
     // uWS internals (opaque here; cast in .cpp)
-    void* loop_ = nullptr;           // uWS::Loop*
+    std::atomic<void*> loop_{nullptr};  // uWS::Loop* — atomic for cross-thread access
     us_listen_socket_t* listen_socket_ = nullptr;
 
     // Connected clients — accessed ONLY from the event loop thread.
