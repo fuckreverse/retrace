@@ -15,6 +15,10 @@ struct us_listen_socket_t;
 
 namespace tenet {
 
+// Forward declaration — the generic analysis channel reuses the MCP tool
+// registry (TenetMcpService::call_tool) to dispatch any analysis tool by name.
+class TenetMcpService;
+
 /// High-performance WebSocket service using uWebSockets + FlatBuffers.
 /// Exposes the full TenetService API over binary WebSocket frames.
 class TenetWSService : public TenetServiceObserver {
@@ -70,8 +74,13 @@ private:
     void handle_get_last_writer(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_write_history(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_functions(void* ws, uint32_t msg_id);
+    void handle_run_analysis(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
 
     TenetService& service_;
+    // Owns an MCP service bound to the same TenetService backend, used ONLY as
+    // an in-process tool dispatcher for the generic RunAnalysis channel (no
+    // transport started). Accessed only from the event loop thread.
+    std::unique_ptr<TenetMcpService> mcp_dispatch_;
     std::thread loop_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> ready_{false};   // set when event_loop_main finishes setup (success or failure)

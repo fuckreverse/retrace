@@ -1,0 +1,38 @@
+.mem-panel {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.mem-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  height: 28px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  font-size: var(--fs-sm);
+}
+.mem-row:hover { background: var(--bg-hover); }
+.mem-type {
+  font-weight: 700;
+  font-size: var(--fs-xs);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+.mem-read { background: var(--danger-soft); color: var(--danger); }
+.mem-write { background: var(--success-soft); color: var(--success); }
+.mem-field { color: var(--text-tertiary); font-size: var(--fs-xs); }
+.mem-addr { color: var(--hl-addr); cursor: pointer; }
+.mem-addr:hover { text-decoration: underline; }
+.mem-valcol { color: var(--hl-reg); }
+.mem-hex-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+}
+.mem-hex-btn:hover { background: var(--bg-active); color: var(--text-primary); }

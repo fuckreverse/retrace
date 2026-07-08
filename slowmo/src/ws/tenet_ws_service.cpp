@@ -1,6 +1,7 @@
 // tools/tenet/src/ws/tenet_ws_service.cpp
 #include "ws/tenet_ws_service.h"
 #include "common/logger.h"
+#include "io/mcp/mcp_server.h"  // TenetMcpService — in-process tool dispatcher
 
 // uWebSockets includes (only in .cpp, not in header)
 #include <App.h>
@@ -22,6 +23,10 @@ struct PerSocketData {};
 TenetWSService::TenetWSService(TenetService& service)
     : service_(service) {
     service_.add_observer(this);
+    // Build an in-process MCP dispatcher over the same backend. No transport is
+    // started; we only use its call_tool() registry for the generic RunAnalysis
+    // channel. Runs synchronously on the event loop thread like other handlers.
+    mcp_dispatch_ = std::make_unique<TenetMcpService>(service_);
 }
 
 TenetWSService::~TenetWSService() {
@@ -196,6 +201,10 @@ void TenetWSService::handle_message(void* ws, const uint8_t* data, size_t len) {
         handle_get_write_history(ws, msg_id, payload_data, payload_len); break;
     case MessageType_GetFunctionsReq:
         handle_get_functions(ws, msg_id); break;
+
+    // Generic analysis channel (dispatches to any registered MCP tool by name)
+    case MessageType_RunAnalysisReq:
+        handle_run_analysis(ws, msg_id, payload_data, payload_len); break;
 
     default:
         send_error(ws, msg_id, 1,

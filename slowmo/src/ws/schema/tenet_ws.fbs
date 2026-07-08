@@ -32,6 +32,10 @@ enum MessageType : uint16 {
     GetWriteHistoryReq = 42,
     GetFunctionsReq = 43,
 
+    // Generic analysis channel — dispatches to any registered analysis tool
+    // (reuses TenetMcpService::call_tool), returns serialized JSON bytes.
+    RunAnalysisReq = 50,
+
     // Responses (server → client)
     FetchRowsResp = 101,
     GetRegsResp = 102,
@@ -55,6 +59,7 @@ enum MessageType : uint16 {
     GetLastWriterResp = 141,
     GetWriteHistoryResp = 142,
     GetFunctionsResp = 143,
+    RunAnalysisResp = 150,
 
     // Server push (server → client, msg_id=0)
     EvtNavigation = 200,
@@ -305,6 +310,26 @@ table EvtPassProgressMsg {
 }
 
 table EvtBookmarkChangedMsg { bookmarks: [uint64]; }
+
+// ─── Generic Analysis Channel ───────────────────────────────────────────────
+//
+// A single request/response pair that dispatches to ANY registered analysis
+// tool by name (via TenetMcpService::call_tool). This lets the WS protocol
+// cover every MCP analysis capability without a bespoke strong-typed message
+// per tool. The response payload is the tool's JSON result serialized to bytes;
+// the frontend JSON.parse()s json_data into the same shape it got over MCP.
+
+table RunAnalysisRequest {
+    tool_name: string;    // registered tool name, e.g. "pattern_scan", "cfg_export"
+    params_json: string;  // JSON object of tool arguments (empty/"{}" if none)
+}
+
+table RunAnalysisResponse {
+    tool_name: string;
+    ok: bool;
+    json_data: [ubyte];   // UTF-8 JSON bytes of the tool result (valid when ok)
+    error: string;        // error message (when ok == false)
+}
 
 // ─── Error ──────────────────────────────────────────────────────────────────
 

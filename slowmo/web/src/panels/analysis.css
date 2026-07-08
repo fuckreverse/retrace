@@ -1,0 +1,81 @@
+.analysis-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+.analysis-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: calc(var(--panel-header-h, 30px) + 8px);
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.analysis-banner.running { color: var(--accent); }
+.mini-spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--border-default);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.analysis-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--space-3) var(--space-4); }
+.pass-group { margin-bottom: var(--space-4); }
+.pass-group-title {
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: var(--space-2);
+  padding-left: var(--space-2);
+}
+.pass-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  margin-bottom: 1px;
+}
+.pass-row:hover { background: var(--bg-hover); }
+.pass-icon {
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.pi-not_run { color: var(--text-tertiary); }
+.pi-running { color: var(--accent); }
+.pi-completed { color: var(--success); background: var(--success-soft); }
+.pi-failed { color: var(--danger); background: var(--danger-soft); }
+.pass-main { flex: 1; min-width: 0; }
+.pass-name { font-size: var(--fs-sm); color: var(--text-primary); }
+.pass-summary { font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pass-progress {
+  height: 4px;
+  background: var(--bg-inset);
+  border-radius: var(--radius-full);
+  margin-top: 4px;
+  overflow: hidden;
+}
+.pass-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s var(--ease);
+}
+.pass-ctrl { flex-shrink: 0; display: flex; align-items: center; }
+.pass-btn {
+  width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+}
+.pass-btn:hover { background: var(--bg-active); color: var(--accent); }
+.pass-btn svg { width: 14px; height: 14px; }

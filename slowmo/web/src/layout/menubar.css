@@ -1,0 +1,84 @@
+/* HTML 下拉菜单栏样式 —— 贴合 tenet 主题，模拟原生菜单观感 */
+
+.menu-top-trigger {
+  height: 26px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  background: transparent;
+  border: none;
+  cursor: default;
+  -webkit-app-region: no-drag;
+}
+.menu-top-trigger:hover,
+.menu-top-trigger[data-state='open'] {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.menu-content {
+  min-width: 220px;
+  padding: var(--space-2);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  z-index: 1000;
+  animation: menu-in 90ms ease-out;
+}
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  height: 28px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm, 4px);
+  font-size: var(--fs-sm);
+  color: var(--text-primary);
+  cursor: default;
+  outline: none;
+  user-select: none;
+}
+.menu-item[data-highlighted] {
+  background: var(--accent);
+  color: #fff;
+}
+.menu-item[data-disabled] {
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.menu-item-label {
+  flex: 1;
+  white-space: nowrap;
+}
+.menu-item-shortcut {
+  margin-left: auto;
+  padding-left: var(--space-6);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.menu-item[data-highlighted] .menu-item-shortcut {
+  color: rgba(255, 255, 255, 0.75);
+}
+.menu-item-arrow {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.menu-item[data-highlighted] .menu-item-arrow {
+  color: #fff;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: var(--space-2) var(--space-2);
+  background: var(--border-subtle);
+}

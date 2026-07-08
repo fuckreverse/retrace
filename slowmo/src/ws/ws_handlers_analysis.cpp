@@ -9,12 +9,15 @@
 #include "analysis/pass_manager.h"
 #include "analysis/passes/structure/function_pass.h"
 #include "core/memory_model.h"
+#include "io/mcp/mcp_server.h"  // TenetMcpService::call_tool for generic channel
 
 // uWebSockets
 #include <App.h>
 
 // FlatBuffers generated header
 #include "tenet_ws_generated.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <string>
@@ -341,6 +344,61 @@ void TenetWSService::handle_get_functions(void* ws, uint32_t msg_id) {
     auto resp = fbs::CreateGetFunctionsResponse(fbb, fv);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_GetFunctionsResp, fbb);
+}
+
+// ─── Generic Analysis Channel ───────────────────────────────────────────────
+//
+// Dispatches to any registered analysis tool by name via the in-process MCP
+// service (call_tool), then returns the tool's JSON result as raw bytes. This
+// covers every MCP analysis capability over WS without a bespoke message type.
+
+void TenetWSService::handle_run_analysis(void* ws, uint32_t msg_id,
+                                          const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "RunAnalysis: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::RunAnalysisRequest>(payload);
+    std::string tool_name = req->tool_name() ? req->tool_name()->str() : "";
+    std::string params_json = req->params_json() ? req->params_json()->str() : "";
+
+    if (tool_name.empty()) {
+        send_error(ws, msg_id, 2, "RunAnalysis: empty tool_name");
+        return;
+    }
+    if (!mcp_dispatch_) {
+        send_error(ws, msg_id, 3, "RunAnalysis: dispatcher unavailable");
+        return;
+    }
+
+    // Parse params (default to empty object) and invoke the tool synchronously.
+    bool ok = true;
+    std::string error;
+    std::string json_out;
+    try {
+        nlohmann::json args = nlohmann::json::object();
+        if (!params_json.empty()) {
+            args = nlohmann::json::parse(params_json);
+            if (!args.is_object()) args = nlohmann::json::object();
+        }
+        nlohmann::json result = mcp_dispatch_->call_tool(tool_name, args);
+        json_out = result.dump();
+    } catch (const std::exception& e) {
+        ok = false;
+        error = e.what();
+    }
+
+    flatbuffers::FlatBufferBuilder fbb(json_out.size() + 256);
+    auto name_off = fbb.CreateString(tool_name);
+    auto err_off = fbb.CreateString(error);
+    flatbuffers::Offset<flatbuffers::Vector<uint8_t>> data_off = 0;
+    if (ok && !json_out.empty()) {
+        data_off = fbb.CreateVector(
+            reinterpret_cast<const uint8_t*>(json_out.data()), json_out.size());
+    }
+    auto resp = fbs::CreateRunAnalysisResponse(fbb, name_off, ok, data_off, err_off);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_RunAnalysisResp, fbb);
 }
 
 }  // namespace tenet
