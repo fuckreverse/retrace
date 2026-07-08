@@ -305,6 +305,22 @@ if(TENET_ENABLE_WS)
     set(FLATBUFFERS_BUILD_SHAREDLIB OFF CACHE BOOL "" FORCE)
     set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(flatbuffers)
+
+    # Generate C++ headers from FlatBuffers schema
+    set(FBS_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/src/ws/schema/tenet_ws.fbs)
+    set(FBS_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    file(MAKE_DIRECTORY ${FBS_GENERATED_DIR})
+
+    add_custom_command(
+        OUTPUT ${FBS_GENERATED_DIR}/tenet_ws_generated.h
+        COMMAND flatc --cpp --gen-object-api
+                -o ${FBS_GENERATED_DIR}
+                ${FBS_SCHEMA}
+        DEPENDS ${FBS_SCHEMA} flatc
+        COMMENT "Compiling FlatBuffers schema: tenet_ws.fbs"
+    )
+
+    add_custom_target(tenet_ws_schema DEPENDS ${FBS_GENERATED_DIR}/tenet_ws_generated.h)
 endif()
 
 # ── uWebSockets + uSockets (WebSocket transport for WS service) ──────────────

@@ -1,0 +1,314 @@
+// tools/tenet/src/ws/schema/tenet_ws.fbs
+//
+// FlatBuffers schema for TenetWSService binary WebSocket protocol.
+// Compiled by flatc into tenet_ws_generated.h (C++) and tenet_ws_generated.ts (TypeScript).
+
+namespace tenet.ws;
+
+// ─── Message Type Enum ──────────────────────────────────────────────────────
+
+enum MessageType : uint16 {
+    // Requests (client → server)
+    FetchRowsReq = 1,
+    GetRegsReq = 2,
+    ReadMemoryReq = 3,
+    NavigateReq = 10,
+    NavBackReq = 11,
+    NavForwardReq = 12,
+    ToggleBookmarkReq = 13,
+    GetBookmarksReq = 14,
+    GetTraceInfoReq = 15,
+    SearchForwardReq = 20,
+    SearchClearReq = 21,
+    GetSearchResultsReq = 22,
+    RunPassReq = 30,
+    RunDefaultPassesReq = 31,
+    ClearAnalysisReq = 32,
+    GetPassStateReq = 33,
+    GetPassResultReq = 34,
+    GetPassCatalogReq = 35,
+    GetCallStackReq = 40,
+    GetLastWriterReq = 41,
+    GetWriteHistoryReq = 42,
+    GetFunctionsReq = 43,
+
+    // Responses (server → client)
+    FetchRowsResp = 101,
+    GetRegsResp = 102,
+    ReadMemoryResp = 103,
+    NavigateResp = 110,
+    NavBackResp = 111,
+    NavForwardResp = 112,
+    ToggleBookmarkResp = 113,
+    GetBookmarksResp = 114,
+    GetTraceInfoResp = 115,
+    SearchForwardResp = 120,
+    SearchClearResp = 121,
+    GetSearchResultsResp = 122,
+    RunPassResp = 130,
+    RunDefaultPassesResp = 131,
+    ClearAnalysisResp = 132,
+    GetPassStateResp = 133,
+    GetPassResultResp = 134,
+    GetPassCatalogResp = 135,
+    GetCallStackResp = 140,
+    GetLastWriterResp = 141,
+    GetWriteHistoryResp = 142,
+    GetFunctionsResp = 143,
+
+    // Server push (server → client, msg_id=0)
+    EvtNavigation = 200,
+    EvtPassCompleted = 201,
+    EvtPassProgress = 202,
+    EvtBookmarkChanged = 203,
+
+    // Error
+    ErrorResp = 255,
+}
+
+enum PassState : uint8 {
+    NotRun = 0,
+    Running = 1,
+    Completed = 2,
+    Failed = 3,
+    Cancelled = 4,
+}
+
+// ─── Envelope ───────────────────────────────────────────────────────────────
+
+table Envelope {
+    msg_id: uint32;
+    type: MessageType = FetchRowsReq;  // always set explicitly by sender; default just satisfies flatc (enum has no 0 member)
+    payload: [ubyte];            // Nested FlatBuffers message (type-specific, manually parsed)
+}
+
+root_type Envelope;
+
+// ─── Hot Path ───────────────────────────────────────────────────────────────
+
+table FetchRowsRequest {
+    start_id: uint64;
+    count: uint32;
+}
+
+table InstructionRowMsg {
+    inst_id: uint64;
+    pc: uint64;
+    static_pc: uint64;
+    mnemonic: string;
+    operands: string;
+    nzcv: uint8;
+    reg_diff_count: uint8;
+    mem_access_count: uint8;
+    has_bookmark: bool;
+}
+
+table FetchRowsResponse {
+    rows: [InstructionRowMsg];
+    total_inst: uint64;
+    current_inst: uint64;
+}
+
+table GetRegsRequest {
+    inst_id: uint64;
+    when: uint8 = 0;
+    include_fpr: bool = false;
+}
+
+table GetRegsResponse {
+    inst_id: uint64;
+    gpr: [uint64];
+    fpr: [ubyte];
+}
+
+table ReadMemoryRequest {
+    addr: uint64;
+    size: uint32;
+    inst_id: uint64;
+}
+
+table ReadMemoryResponse {
+    addr: uint64;
+    inst_id: uint64;
+    data: [ubyte];
+    known: [ubyte];
+}
+
+// ─── Navigation ─────────────────────────────────────────────────────────────
+
+table NavigateRequest { inst_id: uint64; }
+table NavigateResponse { inst_id: uint64; }
+
+table NavBackResponse { inst_id: uint64; ok: bool; }
+table NavForwardResponse { inst_id: uint64; ok: bool; }
+
+table ToggleBookmarkRequest { inst_id: uint64; }
+table ToggleBookmarkResponse { bookmarks: [uint64]; }
+
+table GetBookmarksResponse { bookmarks: [uint64]; }
+
+// ─── Trace Info ─────────────────────────────────────────────────────────────
+
+table GetTraceInfoResponse {
+    total_inst: uint64;
+    current_inst: uint64;
+    module_name: string;
+    module_base: uint64;
+    module_slide: uint64;
+    trace_path: string;
+    format_version: uint32;
+    target_os: uint8;
+    has_fpr: bool;
+    has_code: bool;
+    num_gpr: uint32;
+}
+
+// ─── Search ─────────────────────────────────────────────────────────────────
+
+table SearchForwardRequest {
+    query: string;
+    from_inst: uint64;
+}
+
+table SearchForwardResponse {
+    results: [uint64];
+    count: uint32;
+}
+
+table GetSearchResultsResponse {
+    results: [uint64];
+    current: uint32;
+    active: bool;
+}
+
+// ─── Pass Management ────────────────────────────────────────────────────────
+
+table RunPassRequest {
+    name: string;
+    taint_regs: [uint8];
+    taint_inst_id: uint64;
+}
+
+table RunPassResponse {
+    name: string;
+    ok: bool;
+    message: string;
+}
+
+table RunDefaultPassesResponse {
+    ok: bool;
+    message: string;
+}
+
+table ClearAnalysisResponse { ok: bool; }
+
+table GetPassStateRequest { name: string; }
+table GetPassStateResponse {
+    name: string;
+    state: PassState;
+    progress: float;
+    message: string;
+}
+
+table GetPassResultRequest {
+    name: string;
+    format: string;
+    offset: uint32 = 0;
+    limit: uint32 = 1000;
+}
+
+table GetPassResultResponse {
+    name: string;
+    format: string;
+    data: [ubyte];
+    has_more: bool;
+    next_offset: uint32;
+}
+
+table PassCatalogEntry {
+    name: string;
+    display_name: string;
+    category: string;
+    state: PassState;
+}
+
+table GetPassCatalogResponse {
+    passes: [PassCatalogEntry];
+}
+
+// ─── Call Stack & Memory ────────────────────────────────────────────────────
+
+table GetCallStackRequest { inst_id: uint64; }
+
+table CallStackEntry {
+    depth: uint32;
+    call_inst_id: uint64;
+    return_inst_id: uint64;
+    call_site_pc: uint64;
+    target_pc: uint64;
+    function_name: string;
+}
+
+table GetCallStackResponse {
+    entries: [CallStackEntry];
+    current_function: string;
+}
+
+table GetLastWriterRequest {
+    addr: uint64;
+    size: uint32;
+    before_inst: uint64;
+}
+
+table GetLastWriterResponse {
+    writer_inst_id: uint64;
+}
+
+table GetWriteHistoryRequest {
+    addr: uint64;
+    size: uint32;
+    offset: uint32 = 0;
+    limit: uint32 = 100;
+}
+
+table GetWriteHistoryResponse {
+    writers: [uint64];
+    has_more: bool;
+    next_offset: uint32;
+}
+
+table FunctionEntry {
+    entry_pc: uint64;
+    name: string;
+    total_calls: uint32;
+    total_instructions: uint64;
+}
+
+table GetFunctionsResponse {
+    functions: [FunctionEntry];
+}
+
+// ─── Server Push Events ─────────────────────────────────────────────────────
+
+table EvtNavigationMsg { inst_id: uint64; }
+
+table EvtPassCompletedMsg {
+    name: string;
+    ok: bool;
+    summary: string;
+}
+
+table EvtPassProgressMsg {
+    name: string;
+    progress: float;
+    message: string;
+}
+
+table EvtBookmarkChangedMsg { bookmarks: [uint64]; }
+
+// ─── Error ──────────────────────────────────────────────────────────────────
+
+table ErrorResponse {
+    code: uint32;
+    message: string;
+}
