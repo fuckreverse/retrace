@@ -7,6 +7,9 @@
 #include "core/memory_model.h"
 #include "tui/tui_app.h"
 #include "service/tenet_service.h"
+#if TENET_HAS_WS
+#include "ws/tenet_ws_service.h"
+#endif
 #if TENET_HAS_GUI
 #include "gui/gui_app.h"
 #endif
@@ -275,6 +278,21 @@ int main(int argc, char** argv) {
 
     // Create TenetService — shared by all paths (batch, GUI, TUI).
     TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+
+    // ─── Start WebSocket service (if requested) ────────────────────────────
+#if TENET_HAS_WS
+    std::unique_ptr<TenetWSService> ws_service;
+    if (opts.ws_port > 0) {
+        ws_service = std::make_unique<TenetWSService>(service);
+        auto actual = ws_service->start(opts.ws_port);
+        if (actual > 0) {
+            fmt::print(info_out, "WebSocket service listening on ws://127.0.0.1:{}\n", actual);
+        } else {
+            fmt::print(stderr, "Warning: WebSocket service failed to start on port {}\n",
+                       opts.ws_port);
+        }
+    }
+#endif
 
     // ─── Run analysis options (batch mode) ─────────────────────────────────
     if (has_analysis_option) {

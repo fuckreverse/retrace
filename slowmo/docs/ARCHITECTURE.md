@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart TB
-    UI[Frontend Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
+    UI[Frontend Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP · WS] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
     SVC --> ANA[Analysis Layer\nPassManager · Pass Registry · TraceScanEngine]
     ANA --> CORE[Core Layer\nRegisterFile · MemoryModel · InstructionDecoder · TritonBridge]
     CORE --> IO[IO Layer\nTraceReader · TraceIndex · CodeTable · StreamingIndex]
@@ -103,6 +103,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | RPC | `--rpc` | Unix socket JSON-RPC，适合本地工具接入 |
 | MCP stdio | `--mcp` | AI 客户端拉起 tenet 子进程时使用 |
 | MCP HTTP | `--mcp-http` | 远程或无 stdio 场景，使用 Streamable HTTP |
+| WS | `--ws-port <port>` | 高性能 WebSocket 二进制协议（uWebSockets + FlatBuffers），面向 Web/Electron 前端 |
 | Streaming | `--streaming` | tail 正在增长的 trace，做实时增量索引 |
 
 ## 关键不变量

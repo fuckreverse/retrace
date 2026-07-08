@@ -185,6 +185,9 @@ struct CliOptions {
     // --- P3: MCP server ---
     bool opt_mcp = false;
 
+    // --- P3: WebSocket service ---
+    uint16_t ws_port = 0;                      ///< --ws-port <port>: start WS service (0 = disabled)
+
     // --- P3: MCP Streamable HTTP server ---
     bool opt_mcp_http = false;
     McpHttpConfig mcp_http_cfg;

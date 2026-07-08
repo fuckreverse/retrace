@@ -1,0 +1,346 @@
+// tools/tenet/src/ws/ws_handlers_analysis.cpp
+//
+// Pass management and data query WebSocket handlers.
+// Heavy operations (RunPass, RunDefaultPasses) are synchronous — TenetService
+// is not thread-safe, so we block the event loop rather than race.
+
+#include "ws/tenet_ws_service.h"
+#include "common/types.h"
+#include "analysis/pass_manager.h"
+#include "analysis/passes/structure/function_pass.h"
+#include "core/memory_model.h"
+
+// uWebSockets
+#include <App.h>
+
+// FlatBuffers generated header
+#include "tenet_ws_generated.h"
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+namespace tenet {
+
+// Use namespace alias — `using namespace tenet::ws` would clash with
+// tenet::PassState, tenet::CallStackEntry, tenet::FunctionEntry, etc.
+namespace fbs = tenet::ws;
+
+struct PerSocketData {};
+
+namespace {
+
+void send_envelope(void* ws_ptr, uint32_t msg_id, fbs::MessageType type,
+                    flatbuffers::FlatBufferBuilder& fbb) {
+    flatbuffers::FlatBufferBuilder env_fbb(fbb.GetSize() + 64);
+    auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
+    auto env = fbs::CreateEnvelope(env_fbb, msg_id, type, pv);
+    env_fbb.Finish(env);
+
+    auto sv = std::string_view(
+        reinterpret_cast<const char*>(env_fbb.GetBufferPointer()),
+        env_fbb.GetSize());
+    static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws_ptr)->send(sv, uWS::BINARY);
+}
+
+}  // namespace
+
+// ─── Pass Management ────────────────────────────────────────────────────────
+
+void TenetWSService::handle_run_pass(void* ws, uint32_t msg_id,
+                                      const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "RunPass: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::RunPassRequest>(payload);
+    std::string name = req->name() ? req->name()->str() : "";
+    if (name.empty()) {
+        send_error(ws, msg_id, 2, "RunPass: empty pass name");
+        return;
+    }
+
+    // Ensure PassManager exists
+    service_.ensure_pass_manager();
+
+    // Build PassRunCtx from request fields
+    PassRunCtx ctx{};
+    ctx.current_inst = service_.current_inst();
+    ctx.total_inst   = service_.total_inst();
+    if (req->taint_inst_id() != 0) {
+        ctx.current_inst = req->taint_inst_id();
+    }
+    if (req->taint_regs() && req->taint_regs()->size() > 0) {
+        ctx.current_reg = static_cast<uint8_t>((*req->taint_regs())[0]);
+    }
+
+    // Synchronous: blocks event loop. TenetService is not thread-safe.
+    bool ok = service_.run_pass(name, ctx);
+
+    flatbuffers::FlatBufferBuilder fbb(256);
+    auto name_off = fbb.CreateString(name);
+    auto msg_off = fbb.CreateString(ok ? "completed" : "failed");
+    auto resp = fbs::CreateRunPassResponse(fbb, name_off, ok, msg_off);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_RunPassResp, fbb);
+}
+
+void TenetWSService::handle_run_default_passes(void* ws, uint32_t msg_id) {
+    // Synchronous: blocks event loop.
+    service_.run_default_passes();
+
+    flatbuffers::FlatBufferBuilder fbb(64);
+    auto msg_off = fbb.CreateString("default passes completed");
+    auto resp = fbs::CreateRunDefaultPassesResponse(fbb, true, msg_off);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_RunDefaultPassesResp, fbb);
+}
+
+void TenetWSService::handle_clear_analysis(void* ws, uint32_t msg_id) {
+    service_.clear_analysis();
+
+    flatbuffers::FlatBufferBuilder fbb(32);
+    auto resp = fbs::CreateClearAnalysisResponse(fbb, true);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_ClearAnalysisResp, fbb);
+}
+
+void TenetWSService::handle_get_pass_state(void* ws, uint32_t msg_id,
+                                            const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "GetPassState: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::GetPassStateRequest>(payload);
+    std::string name = req->name() ? req->name()->str() : "";
+
+    auto* pm = service_.pass_manager();
+    fbs::PassState fb_state = fbs::PassState_NotRun;
+    float progress = 0.0f;
+    std::string msg;
+
+    if (pm) {
+        auto pm_state = pm->state(name);
+        switch (pm_state) {
+        case PassManager::PassState::NotRun:    fb_state = fbs::PassState_NotRun; break;
+        case PassManager::PassState::Running:   fb_state = fbs::PassState_Running; break;
+        case PassManager::PassState::Completed: fb_state = fbs::PassState_Completed; break;
+        case PassManager::PassState::Failed:    fb_state = fbs::PassState_Failed; break;
+        }
+        progress = pm->progress_of(name);
+        msg = pm->progress_msg_of(name);
+    }
+
+    flatbuffers::FlatBufferBuilder fbb(256);
+    auto name_off = fbb.CreateString(name);
+    auto msg_off = fbb.CreateString(msg);
+    auto resp = fbs::CreateGetPassStateResponse(fbb, name_off, fb_state, progress, msg_off);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetPassStateResp, fbb);
+}
+
+void TenetWSService::handle_get_pass_result(void* ws, uint32_t msg_id,
+                                             const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "GetPassResult: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::GetPassResultRequest>(payload);
+    std::string name = req->name() ? req->name()->str() : "";
+    std::string format = req->format() ? req->format()->str() : "json";
+
+    auto* pm = service_.pass_manager();
+    if (!pm) {
+        send_error(ws, msg_id, 3, "PassManager not initialized");
+        return;
+    }
+
+    auto sp = pm->require_shared(name);
+    if (!sp || !sp->ok()) {
+        send_error(ws, msg_id, 3, "Pass '" + name + "' not available");
+        return;
+    }
+
+    // Stub JSON response — full pass result serialization is complex
+    // (25+ result types). Will reuse MCP tool handlers' JSON serialization.
+    std::string json_stub = "{\"pass\":\"" + name + "\",\"status\":\"completed\"}";
+
+    flatbuffers::FlatBufferBuilder fbb(json_stub.size() + 256);
+    auto name_off = fbb.CreateString(name);
+    auto format_off = fbb.CreateString(format);
+    auto data_vec = fbb.CreateVector(
+        reinterpret_cast<const uint8_t*>(json_stub.data()), json_stub.size());
+    auto resp = fbs::CreateGetPassResultResponse(fbb, name_off, format_off,
+                                                  data_vec, false, 0);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetPassResultResp, fbb);
+}
+
+void TenetWSService::handle_get_pass_catalog(void* ws, uint32_t msg_id) {
+    auto* pm = service_.pass_manager();
+
+    flatbuffers::FlatBufferBuilder fbb(1024);
+    std::vector<flatbuffers::Offset<fbs::PassCatalogEntry>> entries;
+
+    if (pm) {
+        auto passes = pm->all_passes();
+        entries.reserve(passes.size());
+        for (auto pass_name : passes) {
+            auto pm_state = pm->state(pass_name);
+            fbs::PassState fb_state = fbs::PassState_NotRun;
+            switch (pm_state) {
+            case PassManager::PassState::NotRun:    fb_state = fbs::PassState_NotRun; break;
+            case PassManager::PassState::Running:   fb_state = fbs::PassState_Running; break;
+            case PassManager::PassState::Completed: fb_state = fbs::PassState_Completed; break;
+            case PassManager::PassState::Failed:    fb_state = fbs::PassState_Failed; break;
+            }
+            auto name_off = fbb.CreateString(pass_name.data(), pass_name.size());
+            auto display_off = fbb.CreateString(pass_name.data(), pass_name.size());
+            auto cat_off = fbb.CreateString("");
+            entries.push_back(fbs::CreatePassCatalogEntry(fbb, name_off, display_off,
+                                                           cat_off, fb_state));
+        }
+    }
+
+    auto entries_vec = fbb.CreateVector(entries);
+    auto resp = fbs::CreateGetPassCatalogResponse(fbb, entries_vec);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetPassCatalogResp, fbb);
+}
+
+// ─── Data Queries ───────────────────────────────────────────────────────────
+
+void TenetWSService::handle_get_call_stack(void* ws, uint32_t msg_id,
+                                            const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "GetCallStack: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::GetCallStackRequest>(payload);
+    uint64_t inst_id = req->inst_id();
+
+    // Need the function pass result
+    auto* func_result = service_.pass_result<FunctionResult>("function");
+    if (!func_result) {
+        service_.ensure_pass_manager();
+        service_.run_pass("function");
+        func_result = service_.pass_result<FunctionResult>("function");
+    }
+
+    flatbuffers::FlatBufferBuilder fbb(1024);
+    std::vector<flatbuffers::Offset<fbs::CallStackEntry>> stack_entries;
+    std::string current_func_name;
+
+    if (func_result) {
+        auto stack = func_result->call_stack_at(inst_id);
+        stack_entries.reserve(stack.size());
+        for (const auto* evt : stack) {
+            std::string fname;
+            auto it = func_result->functions.find(evt->target_pc);
+            if (it != func_result->functions.end()) {
+                fname = it->second.name;
+            }
+            auto fname_off = fbb.CreateString(fname);
+            stack_entries.push_back(fbs::CreateCallStackEntry(
+                fbb,
+                static_cast<uint32_t>(evt->depth),
+                evt->call_inst_id,
+                evt->return_inst_id,
+                evt->call_site_pc,
+                evt->target_pc,
+                fname_off));
+        }
+
+        const auto* fi = func_result->function_at(inst_id);
+        if (fi) current_func_name = fi->name;
+    }
+
+    auto stack_vec = fbb.CreateVector(stack_entries);
+    auto cfn = fbb.CreateString(current_func_name);
+    auto resp = fbs::CreateGetCallStackResponse(fbb, stack_vec, cfn);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetCallStackResp, fbb);
+}
+
+void TenetWSService::handle_get_last_writer(void* ws, uint32_t msg_id,
+                                             const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "GetLastWriter: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::GetLastWriterRequest>(payload);
+    uint64_t addr = req->addr();
+    uint32_t size = req->size();
+    uint64_t before = req->before_inst();
+
+    uint64_t writer = service_.memory().last_writer(
+        addr, static_cast<uint8_t>(std::min(size, 8u)), before);
+
+    flatbuffers::FlatBufferBuilder fbb(64);
+    auto resp = fbs::CreateGetLastWriterResponse(fbb, writer);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetLastWriterResp, fbb);
+}
+
+void TenetWSService::handle_get_write_history(void* ws, uint32_t msg_id,
+                                               const uint8_t* payload, size_t len) {
+    if (!payload || len == 0) {
+        send_error(ws, msg_id, 2, "GetWriteHistory: missing payload");
+        return;
+    }
+    auto* req = flatbuffers::GetRoot<fbs::GetWriteHistoryRequest>(payload);
+    uint64_t addr = req->addr();
+    uint32_t size = req->size();
+    uint32_t offset = req->offset();
+    uint32_t limit = std::min(req->limit(), 10000u);
+
+    auto all_writers = service_.memory().write_history(
+        addr, static_cast<uint8_t>(std::min(size, 8u)));
+
+    // Apply offset + limit pagination
+    bool has_more = false;
+    uint32_t next_offset = 0;
+    std::vector<uint64_t> page;
+    if (offset < all_writers.size()) {
+        auto end = std::min(static_cast<size_t>(offset + limit), all_writers.size());
+        page.assign(all_writers.begin() + offset, all_writers.begin() + end);
+        has_more = end < all_writers.size();
+        next_offset = static_cast<uint32_t>(end);
+    }
+
+    flatbuffers::FlatBufferBuilder fbb(page.size() * 8 + 64);
+    auto wv = fbb.CreateVector(page.data(), page.size());
+    auto resp = fbs::CreateGetWriteHistoryResponse(fbb, wv, has_more, next_offset);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetWriteHistoryResp, fbb);
+}
+
+void TenetWSService::handle_get_functions(void* ws, uint32_t msg_id) {
+    auto* func_result = service_.pass_result<FunctionResult>("function");
+    if (!func_result) {
+        service_.ensure_pass_manager();
+        service_.run_pass("function");
+        func_result = service_.pass_result<FunctionResult>("function");
+    }
+
+    flatbuffers::FlatBufferBuilder fbb(4096);
+    std::vector<flatbuffers::Offset<fbs::FunctionEntry>> func_entries;
+
+    if (func_result) {
+        func_entries.reserve(func_result->functions.size());
+        for (const auto& [pc, info] : func_result->functions) {
+            auto name_off = fbb.CreateString(info.name);
+            func_entries.push_back(fbs::CreateFunctionEntry(
+                fbb, pc, name_off,
+                static_cast<uint32_t>(info.total_calls),
+                info.total_instructions));
+        }
+    }
+
+    auto fv = fbb.CreateVector(func_entries);
+    auto resp = fbs::CreateGetFunctionsResponse(fbb, fv);
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetFunctionsResp, fbb);
+}
+
+}  // namespace tenet

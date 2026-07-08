@@ -137,6 +137,7 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --mcp-host <addr>                 Bind address for --mcp-http (e.g. 0.0.0.0)\n");
     fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 7080)\n");
     fmt::print(stderr, "  --mcp-auth user:pass              Enable Basic Auth for --mcp-http\n");
+    fmt::print(stderr, "  --ws-port <port>                  Start WebSocket service on port (binary FlatBuffers protocol)\n");
     fmt::print(stderr, "  --mcp-hub [host:port]             Enable MCP hub mode (multi-instance coordination).\n");
     fmt::print(stderr, "                                    First instance becomes hub (flock election),\n");
     fmt::print(stderr, "                                    others connect as workers. Default: 127.0.0.1:10444\n");
@@ -440,6 +441,8 @@ CliOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--mcp") {
             opts.opt_mcp = true;
+        } else if (arg == "--ws-port" && i + 1 < argc) {
+            opts.ws_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--mcp-http") {
             opts.opt_mcp_http = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {

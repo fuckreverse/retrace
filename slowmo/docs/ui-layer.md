@@ -13,6 +13,7 @@
 | MCP stdio | `src/io/mcp/` | `--mcp` | AI 客户端通过子进程 stdio 接入 |
 | MCP HTTP | `src/io/mcp/` | `--mcp-http [host:port]` | 远程 / GUI 宿主 / 无 stdio 场景 |
 | MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | 多实例统一入口，自动 failover |
+| WS | `src/ws/` | `--ws-port <port>` | 高性能二进制 WebSocket，面向 Web/Electron 前端 |
 | Streaming | `src/io/streaming_index.*` | `--streaming` | 边录制边索引边分析 |
 
 ```mermaid
@@ -32,6 +33,8 @@ flowchart TD
     M -- lose --> O[Worker: reverse-connect to Hub]
     C --> K{--streaming?}
     K -- yes --> L[StreamingIndex]
+    S --> P{--ws-port?}
+    P -- yes --> Q[TenetWSService]
 ```
 
 ## GUI
@@ -120,6 +123,34 @@ GUI 用 ~20 个独立悬浮窗口展示各 pass 结果；终端空间有限，�
 - 这一设计让**每个 catalog pass 在 TUI 里都有真实可浏览的结果**，而不是过去仅有的 `last_pass_status_` 单行摘要；同时只需一份 `build_result_entries()` 实现即可覆盖所有 pass，避免像 GUI 那样为每个 pass 单开一个面板类。
 - `:pass <name>` / `:passes` / `:analyze` 命令与 `A` 键共享同一套 `pass_registry` 注册与摘要逻辑，保证 TUI 命令行路径与面板路径结果一致。
 
+## WebSocket 服务
+
+`TenetWSService`（`src/ws/`）是面向 Web/Electron 前端的高性能二进制服务，使用 uWebSockets 做传输、FlatBuffers 做序列化。
+
+### 组成
+
+- `tenet_ws_service.h/.cpp`：WS 服务生命周期（start/stop）、uWS 事件循环、消息分发、观察者回调。
+- `ws_handlers_hotpath.cpp`：高频操作——FetchRows、GetRegs、ReadMemory。
+- `ws_handlers_nav.cpp`：导航、书签、trace 信息、搜索。
+- `ws_handlers_analysis.cpp`：pass 管理、调用栈、内存写历史、函数列表等数据查询。
+- `schema/tenet_ws.fbs`：FlatBuffers 协议定义（40+ 消息类型）。
+
+### 协议设计
+
+所有消息包装在 Envelope 中：`{msg_id, type: MessageType, payload: [ubyte]}`。msg_id 由客户端分配，服务端原样返回；服务端主动推送事件时 msg_id 为 0。payload 里装各 MessageType 对应的 FlatBuffers 表。
+
+### 线程模型
+
+uWS 事件循环在独立线程运行。由于 TenetService 不是线程安全的，所有 handler 均在事件循环线程上同步执行（包括重操作如 RunPass）。观察者回调（on_navigation、on_pass_completed、on_bookmark_changed）可能从任意线程触发，通过 `uWS::Loop::defer()` 安全地转回事件循环线程。
+
+### 与 TenetService 的关系
+
+`TenetWSService` 实现 `TenetServiceObserver` 接口，通过 `TenetService&` 共享全部核心对象。它与 GUI、TUI、MCP 是并列的前端入口，不重复实现分析逻辑。
+
+### 开启方式
+
+`--ws-port <port>` 启动 WS 服务，可与 GUI、TUI、MCP 等其他前端同时运行。port=0 时由操作系统分配端口。CMake 选项 `TENET_ENABLE_WS=ON/OFF` 控制是否编译 WS 服务（默认 ON）。
+
 ## CLI 批处理
 
 CLI 由两部分组成：
@@ -137,7 +168,7 @@ CLI 由两部分组成：
 | 内存与字符串 | `--memread`, `--mem-history`, `--strings`, `--memory-strings`, `--memory-snapshot*`, `--mem-search*`（`--literal-search*` 为弃用别名）, `--entropy` |
 | 算法与语义 | `--pattern`, `--constants*`, `--loop-semantics`, `--algorithm-summary`, `--objc*`, `--syscall-intercept*`, `--taint-source-annotation`, `--vm-abstract` |
 | 轨迹与性能 | `--trace-diff`, `--trace-fold*`, `--reg-timeline*`, `--window-stats*`, `--yara-mem-scan*`, `--thread-filter` |
-| 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--mcp-hub`, `--streaming`, `--stats` |
+| 运行模式 | `--rpc`, `--mcp`, `--mcp-http`, `--mcp-hub`, `--ws-port`, `--streaming`, `--stats` |
 | 调试 / 管理 | `--run-pass`, `--list-passes`, `--index-build`, `--cache-list`, `--cache-delete`, `--no-parallel-scan` |
 
 ### CLI 的特点
