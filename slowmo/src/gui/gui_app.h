@@ -28,6 +28,7 @@
 #include "io/mcp/mcp_server.h"
 #include "io/mcp/mcp_hub.h"
 #include "io/vm_profiles.h"
+#include "service/tenet_service.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
@@ -89,6 +90,10 @@ public:
     GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
            InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
            const std::filesystem::path& trace_path = {});
+
+    /// New constructor — delegates shared state to TenetService.
+    GuiApp(TenetService& service, const std::filesystem::path& trace_path = {});
+
     ~GuiApp();
 
     /// Set VM hints / decoder file paths from CLI options.
@@ -99,6 +104,9 @@ public:
     int run();
 
 private:
+    // ─── TenetService (optional; when set, shared state is delegated) ──
+    TenetService* service_ = nullptr;
+
     // ─── Data references ──────────────────────────────────────────────
     TraceReader& reader_;
     TraceIndex& index_;

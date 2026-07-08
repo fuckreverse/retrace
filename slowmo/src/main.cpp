@@ -286,9 +286,12 @@ int main(int argc, char** argv) {
         return app.batch_mode(opts.start_id, opts.display_count, opts.show_regs, opts.show_mem);
     }
 
+    // Create a shared TenetService for both GUI and TUI paths.
+    TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+
 #if TENET_HAS_GUI
     if (!opts.force_tui) {
-        GuiApp gui(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+        GuiApp gui(service, opts.trace_path);
         gui.set_vm_paths(opts.vm_hints_file, opts.vm_decoder_file);
         return gui.run();
     }
@@ -297,7 +300,6 @@ int main(int argc, char** argv) {
 #endif
 
     // Fallback to TUI (or --tui explicitly requested)
-    TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
     TuiApp app(service);
     return app.run();
 }

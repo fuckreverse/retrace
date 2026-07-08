@@ -66,6 +66,21 @@ GuiApp::GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
     restore_vm_profile();
 }
 
+GuiApp::GuiApp(TenetService& service, const std::filesystem::path& trace_path)
+    : reader_(service.reader()), index_(service.index()),
+      code_table_(service.code_table()), decoder_(service.decoder()),
+      regfile_(service.regfile()), memory_(service.memory()),
+      trace_path_(trace_path.empty() ? std::filesystem::path(service.trace_path()) : trace_path),
+      service_(&service) {
+    total_inst_ = service_->total_inst();
+    current_inst_ = service_->current_inst();
+    bookmarks_ = service_->bookmarks();
+
+    // Load VM profiles and restore hints/decoder paths for this module
+    vm_profiles_ = VMProfiles::load();
+    restore_vm_profile();
+}
+
 GuiApp::~GuiApp() {
     shutdown();
 }

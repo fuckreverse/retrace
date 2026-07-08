@@ -16,6 +16,8 @@ namespace tenet {
 // ─── Data helpers ───────────────────────────────────────────────────────────
 
 InstructionRow GuiApp::fetch_row(uint64_t inst_id) {
+    if (service_) return service_->fetch_row(inst_id);
+
     auto cached = row_cache_.get(inst_id);
     if (cached) return *cached;
 
@@ -82,6 +84,12 @@ void GuiApp::nav_push(uint64_t inst_id) {
 }
 
 void GuiApp::nav_back() {
+    if (service_) {
+        service_->nav_back();
+        current_inst_ = service_->current_inst();
+        scroll_to_current_ = true;
+        return;
+    }
     if (!can_nav_back()) return;
     nav_history_navigating_ = true;
     nav_history_pos_--;
@@ -90,6 +98,12 @@ void GuiApp::nav_back() {
 }
 
 void GuiApp::nav_forward() {
+    if (service_) {
+        service_->nav_forward();
+        current_inst_ = service_->current_inst();
+        scroll_to_current_ = true;
+        return;
+    }
     if (!can_nav_forward()) return;
     nav_history_navigating_ = true;
     nav_history_pos_++;
@@ -106,6 +120,13 @@ bool GuiApp::can_nav_forward() const {
 }
 
 void GuiApp::navigate_to(uint64_t inst_id) {
+    if (service_) {
+        service_->navigate_to(inst_id);
+        current_inst_ = service_->current_inst();
+        scroll_to_current_ = true;
+        taint_sorted_ids_dirty_ = true;
+        return;
+    }
     if (inst_id >= total_inst_) inst_id = total_inst_ > 0 ? total_inst_ - 1 : 0;
     nav_push(inst_id);
     current_inst_ = inst_id;
@@ -124,6 +145,12 @@ void GuiApp::navigate_to_instructions(uint64_t inst_id) {
 }
 
 void GuiApp::toggle_bookmark() {
+    if (service_) {
+        service_->toggle_bookmark(current_inst_);
+        bookmarks_ = service_->bookmarks();
+        row_cache_.put(current_inst_, fetch_row(current_inst_));
+        return;
+    }
     auto it = std::lower_bound(bookmarks_.begin(), bookmarks_.end(), current_inst_);
     if (it != bookmarks_.end() && *it == current_inst_) {
         bookmarks_.erase(it);
