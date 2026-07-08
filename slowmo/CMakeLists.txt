@@ -85,6 +85,7 @@ option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" 
 option(TENET_BUILD_TESTS "Build unit tests" ON)
 option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
 option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
+option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
 option(TENET_ENABLE_PROFILING "Enable os_signpost profiling instrumentation (macOS only, visible in Instruments)" ON)
 
 # ─── FetchContent global shared cache ──────────────────────────────────────
@@ -290,6 +291,59 @@ FetchContent_Declare(
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
+
+# ── FlatBuffers (binary serialization for WS service) ────────────────────────
+if(TENET_ENABLE_WS)
+    FetchContent_Declare(
+        flatbuffers
+        GIT_REPOSITORY https://github.com/google/flatbuffers.git
+        GIT_TAG        v25.2.10
+        GIT_SHALLOW    TRUE
+    )
+    set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
+    set(FLATBUFFERS_BUILD_SHAREDLIB OFF CACHE BOOL "" FORCE)
+    set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(flatbuffers)
+endif()
+
+# ── uWebSockets + uSockets (WebSocket transport for WS service) ──────────────
+if(TENET_ENABLE_WS)
+    FetchContent_Declare(
+        uwebsockets
+        GIT_REPOSITORY https://github.com/uNetworking/uWebSockets.git
+        GIT_TAG        v20.73.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Declare(
+        usockets
+        GIT_REPOSITORY https://github.com/uNetworking/uSockets.git
+        GIT_TAG        v0.8.8
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(uwebsockets usockets)
+
+    # uSockets — build as a static C library (no SSL, no libuv)
+    file(GLOB USOCKETS_SRCS
+        ${usockets_SOURCE_DIR}/src/*.c
+        ${usockets_SOURCE_DIR}/src/eventing/epoll_kqueue.c
+        ${usockets_SOURCE_DIR}/src/crypto/openssl.c
+    )
+    # Remove SSL source if present (we don't need TLS)
+    list(FILTER USOCKETS_SRCS EXCLUDE REGEX ".*ssl\\.c$")
+
+    add_library(usockets STATIC ${USOCKETS_SRCS})
+    target_include_directories(usockets PUBLIC ${usockets_SOURCE_DIR}/src)
+    target_compile_definitions(usockets PUBLIC LIBUS_NO_SSL=1)
+    # Link zlib for permessage-deflate
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(usockets PUBLIC ZLIB::ZLIB)
+
+    # uWebSockets — header-only C++ wrapper
+    add_library(uwebsockets INTERFACE)
+    target_include_directories(uwebsockets INTERFACE ${uwebsockets_SOURCE_DIR}/src)
+    target_link_libraries(uwebsockets INTERFACE usockets)
+endif()
 
 # ankerl::unordered_dense - fast flat hash map for LRU cache hot path
 FetchContent_Declare(
