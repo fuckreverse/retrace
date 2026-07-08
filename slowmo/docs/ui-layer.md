@@ -1,6 +1,6 @@
-# UI / Service 层
+# Frontend / Service 层
 
-这一层负责把 tenet 的核心能力暴露成“人能用、脚本能调、AI 能接”的入口。它本身不实现分析算法，而是复用 Core 与 Analysis 的结果。
+这一层负责把 tenet 的核心能力暴露成"人能用、脚本能调、AI 能接"的入口。它本身不实现分析算法，而是通过 `TenetService` 统一访问 Core 与 Analysis 的结果。`TenetService` 的详细职责见 [`ARCHITECTURE.md` — Service Layer](ARCHITECTURE.md#service-layer)。
 
 ## 入口总览
 
@@ -19,7 +19,8 @@
 flowchart TD
     A[main.cpp] --> B{has_analysis_option?}
     B -- yes --> C[run_batch_analysis]
-    B -- no --> D{--tui or no GUI?}
+    B -- no --> S[TenetService]
+    S --> D{--tui or no GUI?}
     D -- no --> E[GuiApp]
     D -- yes --> F[TuiApp]
     C --> G{service mode?}
@@ -42,10 +43,14 @@ flowchart TD
 - `panels_*.cpp`（约 30 个翻译单元）：每个功能面板独立成文件，其中大部分是**参数驱动型 Pass 的专属悬浮窗口**（见下）。
 - `navigation.cpp` / `popups.cpp` / `gui_settings.cpp`：导航、弹窗、设置与持久化。
 
+### 与 TenetService 的关系
+
+`GuiApp` 的唯一构造参数是 `TenetService&`。导航（光标跳转、前进/后退历史）、书签管理、指令行获取和 pass 运行均委托给 TenetService。GUI 自身保留独立的异步分析线程和渲染缓存（纹理、布局尺寸等），这些是 UI 侧特有的关注点，不属于共享状态。
+
 ### 核心特性
 
 - 多面板：指令、寄存器、内存、调用栈、函数、字符串、线程、CFG、分析结果等。
-- 浏览器式导航历史。
+- 浏览器式导航历史（由 TenetService 管理状态，GUI 驱动渲染）。
 - 右键上下文菜单触发污点、切片、导出 CFG、设断点等动作。
 - 启动后可异步预热核心 pass，不阻塞 UI。
 - 关闭时走异步 shutdown 流程，先取消分析、再安全回收。
@@ -80,8 +85,8 @@ flowchart TD
 
 ### GUI 与 Analysis 的关系
 
-- 即时显示（比如当前行、寄存器、Hex Dump）直接走 `RegisterFile` / `MemoryModel` / `InstructionDecoder`。
-- 高层结果（比如 CFG、污点、函数列表）全部通过 `PassManager::require()` 获取。
+- 即时显示（比如当前行、寄存器、Hex Dump）通过 `TenetService` 的行缓存和底层 `RegisterFile` / `MemoryModel` / `InstructionDecoder` 获取。
+- 高层结果（比如 CFG、污点、函数列表）通过 `TenetService::run_pass()` 触发，最终委托 `PassManager::require()`。
 - 每个独立窗口自行管理"是否已运行 / 参数是否变化 / 是否需要重跑"的状态，不经过 Analysis 面板的统一列表。
 
 ## TUI
@@ -95,9 +100,13 @@ flowchart TD
 - `hex_dump_view.*`：终端 Hex Dump 视图。
 - `key_bindings.h`：按键绑定与命令分发。
 
+### 与 TenetService 的关系
+
+`TuiApp` 的唯一构造参数是 `TenetService&`。先前 TUI 自行维护的 `pass_manager_` 和 `row_cache_` 已移除，统一由 TenetService 提供。导航、书签、行获取和 pass 管理全部委托给 TenetService，TUI 只负责终端渲染和键盘事件处理。
+
 ### 核心特性
 
-- 与 GUI 共享 `InstructionRow` 模型和同一套 `PassManager` / `pass_catalog()`。
+- 与 GUI 共享 `InstructionRow` 模型和同一套 `PassManager` / `pass_catalog()`（均由 TenetService 管理）。
 - 支持 Goto、搜索、书签、断点、污点跳转、XRef 跳转。
 - 适合无图形环境下的长时间分析（远程 SSH）。
 
@@ -145,7 +154,7 @@ CLI 由两部分组成：
 
 - 适合本地工具链接入。
 - 默认是单连接串行处理。
-- 与 GUI / CLI 共用相同的 reader / index / regfile / memory / pass manager。
+- 通过 `TenetService` 与 GUI / CLI 共用相同的 reader / index / regfile / memory / pass manager。
 
 ### 适合的场景
 
@@ -315,11 +324,11 @@ tenet 的日志（`src/common/logger.h`，纯头文件）在 Level 之外叠加�
 - 按 batch 刷新新增记录到索引
 - 直到 idle timeout 或收到中断后结束
 
-## UI / Service 层设计准则
+## Frontend / Service 层设计准则
 
-1. **不重复实现分析逻辑**：入口层只触发 pass，不复写算法。
+1. **不重复实现分析逻辑**：前端只通过 TenetService 触发 pass，不复写算法。
 2. **保持结构化输出**：CLI / RPC / MCP 优先返回 JSON / DOT / 文本摘要，而不是不可解析日志。
-3. **共享核心对象**：同一个服务实例里所有请求共享 reader / index / regfile / memory / pass manager。
+3. **共享核心对象**：所有前端通过同一个 `TenetService` 实例共享 reader / index / regfile / memory / pass manager。
 4. **入口语义清晰**：GUI/TUI 偏交互；CLI 偏批处理；RPC/MCP 偏集成；streaming 偏实时索引。
 
 ## 继续阅读

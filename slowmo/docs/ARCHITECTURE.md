@@ -10,15 +10,17 @@
 
 ```mermaid
 flowchart TB
-    UI[Frontend / Service Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP] --> ANA[Analysis Layer\nPassManager · Pass Registry · TraceScanEngine]
+    UI[Frontend Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
+    SVC --> ANA[Analysis Layer\nPassManager · Pass Registry · TraceScanEngine]
     ANA --> CORE[Core Layer\nRegisterFile · MemoryModel · InstructionDecoder · TritonBridge]
     CORE --> IO[IO Layer\nTraceReader · TraceIndex · CodeTable · StreamingIndex]
 ```
 
 - **IO 层**负责把 trace 暴露成零拷贝记录流，并建立持久化索引。
-- **Core 层**负责把记录流还原成“任意时刻的程序状态”。
+- **Core 层**负责把记录流还原成"任意时刻的程序状态"。
 - **Analysis 层**负责把状态和索引组织成可复用的分析 pass。
-- **UI / Service 层**负责交互、导出和对外服务，不承担核心分析逻辑。
+- **Service 层**管理应用状态（导航、缓存、pass 生命周期），为所有前端提供统一操作入口。
+- **Frontend 层**负责交互、导出和对外服务，不承担核心分析逻辑。
 
 ## 启动装配流程
 
@@ -37,9 +39,10 @@ flowchart TD
     H --> I[MemoryModel]
     I --> J{has_analysis_option?}
     J -- yes --> K[run_batch_analysis]
-    J -- no --> L{--tui? GUI available?}
-    L -- GUI --> M[GuiApp]
-    L -- TUI --> N[TuiApp]
+    J -- no --> L[TenetService]
+    L --> M{--tui? GUI available?}
+    M -- GUI --> N[GuiApp]
+    M -- TUI --> O[TuiApp]
 ```
 
 ### 启动阶段细分
@@ -52,6 +55,7 @@ flowchart TD
 | 载入代码字节 | `CodeTable` | 从索引或 trace 提取 opcode，供反汇编和 CFG 使用 |
 | 可选镜像回填 | `ImageFallback` | 处理 trace 内缺失 code bytes 的 PC |
 | 初始化 Core | `InstructionDecoder`, `RegisterFile`, `MemoryModel` | 构造任意时刻寄存器、内存和指令语义 |
+| 构建 Service | `TenetService` | 封装导航、缓存、pass 生命周期，供交互入口共享 |
 | 分流到入口 | `run_batch_analysis`, `GuiApp`, `TuiApp` | 批处理、交互或服务化 |
 
 ## 运行时对象模型
@@ -66,7 +70,19 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | `InstructionDecoder` | 进程级 | 每线程独立 Capstone handle（无锁）+ opcode 缓存读写锁 | 按 opcode（非 PC）缓存反汇编结果 |
 | `RegisterFile` | 进程级或 pass 私有 | 缓存偏向单线程 | ANCHOR+diff 状态重建 |
 | `MemoryModel` | 进程级 | 并发安全 | 时间感知内存读取与写历史 |
+| `TenetService` | 入口级 / 会话级 | 单线程（UI 线程调用） | 导航状态、行缓存、pass 生命周期、观察者通知 |
 | `PassManager` | 入口级 / 会话级 | 内部同步 | 调度、缓存、依赖解析 |
+
+## Service Layer
+
+`TenetService`（`src/service/tenet_service.h`）是所有前端（GUI、TUI、CLI、MCP）共享的应用状态管理器。它拥有：
+
+- **PassManager 生命周期** — `ensure_pass_manager()`、`run_pass()`、`run_default_passes()`
+- **导航状态** — 光标位置、浏览器式前进/后退历史、书签
+- **指令行缓存** — LRU 缓存（4096 条目），缓存已解码的指令行数据
+- **Pass 结果生命周期** — 以 `shared_ptr` 钉住结果，保证线程安全的跨组件访问
+
+前端在构造时接收 `TenetService&`，并将所有共享状态操作委托给它。观察者模式（`TenetServiceObserver`）向已订阅的前端异步推送通知（pass 完成、导航变更、书签切换等）。后端对象（TraceReader、TraceIndex、RegisterFile、MemoryModel、CodeTable、InstructionDecoder）在 `main()` 中创建并以引用传入——TenetService 不持有它们的所有权。
 
 ## 模式分流
 
@@ -98,7 +114,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | 寄存器重建基于 ANCHOR | `RegisterFile` 的正确性依赖 trace 中周期性快照 |
 | 内存读取是时间感知的 | `MemoryModel` 不读“最终值”，而读某时刻值 |
 | pass 结果可缓存且幂等 | 同一个 pass 在同一上下文里不会重复执行 |
-| 上层只依赖下层 | UI 不直接持有分析实现，Analysis 不直接改写 IO |
+| 上层只依赖下层 | Frontend 通过 TenetService 间接使用 Analysis，Analysis 不直接改写 IO |
 
 ## 典型数据流
 
@@ -109,12 +125,12 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 3. `RegisterFile::state_before(inst_id)` 找到最近 anchor 并回放 diff。
 4. `CodeTable::opcode_at(pc)` 取 opcode，必要时走 `ImageFallback`。
 5. `InstructionDecoder` 把 opcode 反汇编成 mnemonic / operands。
-6. GUI/TUI 把这些信息封装成 `InstructionRow` 渲染。
+6. GUI/TUI 通过 `TenetService` 的行缓存获取 `InstructionRow` 并渲染。
 
-### 从“点击分析按钮”到“拿到结果”
+### 从"点击分析按钮"到"拿到结果"
 
-1. UI 或 CLI 请求某个能力，例如 `cfg_layout`。
-2. `PassManager::require("cfg_layout")` 自动解析依赖链。
+1. Frontend 调用 `TenetService::run_pass("cfg_layout")`。
+2. TenetService 委托 `PassManager::require("cfg_layout")` 自动解析依赖链。
 3. 依赖 pass 先执行，结果缓存进 `PassEntry`。
 4. 当前 pass 消费 `PassContext` 与上游结果，生成 `PassResult`。
 5. UI / CLI / MCP 读取 typed result 并做展示或序列化。
