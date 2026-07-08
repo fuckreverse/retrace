@@ -87,11 +87,7 @@ struct DataflowGraphResult;      // defined in dataflow_graph_pass.h (now includ
 /// Main GUI Application using Dear ImGui + SDL3 + Metal
 class GuiApp {
 public:
-    GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
-           InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
-           const std::filesystem::path& trace_path = {});
-
-    /// New constructor — delegates shared state to TenetService.
+    /// Constructs the GUI from a shared TenetService instance.
     GuiApp(TenetService& service, const std::filesystem::path& trace_path = {});
 
     ~GuiApp();

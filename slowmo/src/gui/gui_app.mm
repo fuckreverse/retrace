@@ -44,28 +44,6 @@ namespace tenet {
 
 // ─── Constructor / Destructor ───────────────────────────────────────────────
 
-GuiApp::GuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
-               InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory,
-               const std::filesystem::path& trace_path)
-    : reader_(reader), index_(index), code_table_(code_table),
-      decoder_(decoder), regfile_(regfile), memory_(memory),
-      trace_path_(trace_path.empty() ? reader.path() : trace_path) {
-    total_inst_ = index.inst_count();
-
-    // Restore bookmarks from the index (persisted in RocksDB META CF)
-    bookmarks_ = index_.load_bookmarks();
-
-    // Restore last cursor position ("continue where you left off")
-    uint64_t last = index_.load_last_inst();
-    if (last > 0 && last < total_inst_) {
-        current_inst_ = last;
-    }
-
-    // Load VM profiles and restore hints/decoder paths for this module
-    vm_profiles_ = VMProfiles::load();
-    restore_vm_profile();
-}
-
 GuiApp::GuiApp(TenetService& service, const std::filesystem::path& trace_path)
     : reader_(service.reader()), index_(service.index()),
       code_table_(service.code_table()), decoder_(service.decoder()),
@@ -333,15 +311,9 @@ void GuiApp::render_shutdown_overlay() {
 // thread accesses any of these objects any more.
 
 void GuiApp::auto_start_mcp() {
-    ensure_pass_manager();
+ensure_pass_manager();
 
-    if (service_) {
-        mcp_service_ = std::make_unique<TenetMcpService>(*service_);
-    } else {
-        mcp_service_ = std::make_unique<TenetMcpService>(
-            reader_, index_, regfile_, memory_,
-            pass_manager_.get(), &code_table_, &decoder_);
-    }
+mcp_service_ = std::make_unique<TenetMcpService>(*service_);
 
     // ── Hub mode: try to become hub first ──────────────────────────────
     // The hub listens on a fixed port (default 10444). If we win the flock
@@ -1754,16 +1726,10 @@ int GuiApp::run() {
                 // result and apply it back on the UI thread via post_apply.
                 ensure_pass_manager();  // pass_manager_ is thread-safe for init
 
-                // Build a temporary TenetMcpService and try to bind a port.
-                // This is the only blocking part; everything else is quick.
-                std::unique_ptr<TenetMcpService> svc;
-                if (service_) {
-                    svc = std::make_unique<TenetMcpService>(*service_);
-                } else {
-                    svc = std::make_unique<TenetMcpService>(
-                        reader_, index_, regfile_, memory_,
-                        pass_manager_.get(), &code_table_, &decoder_);
-                }
+// Build a temporary TenetMcpService and try to bind a port.
+// This is the only blocking part; everything else is quick.
+std::unique_ptr<TenetMcpService> svc;
+svc = std::make_unique<TenetMcpService>(*service_);
 
                 McpHttpConfig cfg;
                 cfg.host = mcp_gui_.host;

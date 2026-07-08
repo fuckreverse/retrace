@@ -746,13 +746,7 @@ void GuiApp::render_settings_window() {
                 if (ImGui::Button("Start##mcp", ImVec2(90, 0))) {
                     ensure_pass_manager();
 
-                    if (service_) {
-                        mcp_service_ = std::make_unique<TenetMcpService>(*service_);
-                    } else {
-                        mcp_service_ = std::make_unique<TenetMcpService>(
-                            reader_, index_, regfile_, memory_,
-                            pass_manager_.get(), &code_table_, &decoder_);
-                    }
+mcp_service_ = std::make_unique<TenetMcpService>(*service_);
 
                     // Try hub mode first, then worker, then standalone
                     McpHubConfig hub_cfg;

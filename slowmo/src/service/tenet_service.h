@@ -99,6 +99,9 @@ public:
     // ── Instruction row fetching (cached) ───────────────────────────────
     InstructionRow fetch_row(uint64_t inst_id);
 
+    /// Drop all cached rows (e.g. after external state changes).
+    void clear_row_cache() { row_cache_.clear(); }
+
     // ── Pass management ─────────────────────────────────────────────────
 
     /// Ensure PassManager is created and wired to backend objects.

@@ -41,12 +41,8 @@ namespace tenet {
 
 class TuiApp {
 public:
-    /// New constructor — preferred.  Delegates shared state to TenetService.
+    /// Constructs the TUI from a shared TenetService instance.
     explicit TuiApp(TenetService& service);
-
-    /// Old constructor — retained for backward compat during migration.
-    TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
-           InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory);
 
     /// Run the interactive TUI loop. Returns 0 on clean exit.
     int run();
@@ -92,11 +88,8 @@ private:
     bool show_nzcv_ = true;      // register display sub-option
     bool show_fpr_ = false;      // register display sub-option
 
-    // ─── Service layer (nullptr when using old constructor) ──────────
+    // ─── Service layer ─────────────────────────────────────────────────
     TenetService* service_ = nullptr;
-
-    // ─── Cached rows ──────────────────────────────────────────────────
-    LRUCache<uint64_t, InstructionRow> row_cache_{1024};
 
     // ─── FTXUI components ───────────────────────────────────────────────
     ftxui::ScreenInteractive screen_;
@@ -190,7 +183,6 @@ private:
     std::unique_ptr<HexDumpView> hex_dump_view_;
 
     // ─── Analysis passes ──────────────────────────────────────────────
-    std::unique_ptr<PassManager> pass_manager_;
     bool show_taint_ = false;
     bool show_backward_taint_ = false;
 
