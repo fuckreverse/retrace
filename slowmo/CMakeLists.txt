@@ -584,6 +584,7 @@ endif()
 if(TENET_ENABLE_WS)
     target_sources(tenet_lib PRIVATE
         src/ws/tenet_ws_service.cpp
+        src/ws/ws_handlers_hotpath.cpp
         src/ws/ws_handlers_stub.cpp
     )
     target_link_libraries(tenet_lib PUBLIC uwebsockets flatbuffers)

@@ -4,18 +4,6 @@
 
 namespace tenet {
 
-void TenetWSService::handle_fetch_rows(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: FetchRows");
-}
-
-void TenetWSService::handle_get_regs(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: GetRegs");
-}
-
-void TenetWSService::handle_read_memory(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
-    send_error(ws, msg_id, 4, "not implemented: ReadMemory");
-}
-
 void TenetWSService::handle_navigate(void* ws, uint32_t msg_id, const uint8_t*, size_t) {
     send_error(ws, msg_id, 4, "not implemented: Navigate");
 }
