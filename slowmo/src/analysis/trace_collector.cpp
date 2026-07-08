@@ -16,20 +16,33 @@ namespace {
 
 /// Compute record size from raw pointer.
 /// is_v6: if true, INST records use 48-byte memacc structs (HF_OLD_VALUE set).
-inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr, bool is_v6 = false) {
+/// is_v7: if true, INST records use v7 header (24 bytes) with FPR diff section,
+///        and ANCHOR records include 512-byte FPR snapshot.
+inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
+                               bool is_v6 = false, bool is_v7 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
         uint8_t n_mem = ptr[3];
+        uint8_t n_fprdiff = 0;
+        size_t hdr_sz;
+        if (is_v7) {
+            hdr_sz = sizeof(qbditrace::qbditrace_inst_head_v7_t);  // 24 bytes
+            n_fprdiff = ptr[16]; // n_fprdiff at offset 16
+        } else {
+            hdr_sz = sizeof(qbditrace::qbditrace_inst_head_t);     // 16 bytes
+        }
         const size_t memacc_size = is_v6
             ? sizeof(qbditrace::qbditrace_memacc_v6_t)
             : sizeof(qbditrace::qbditrace_memacc_t);
-        return sizeof(qbditrace::qbditrace_inst_head_t)
+        return hdr_sz
             + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+            + n_fprdiff * (is_v7 ? sizeof(qbditrace::qbditrace_fprdiff_t) : 0)
             + n_mem     * memacc_size;
     }
     case 1: // ANCHOR
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8
+             + (is_v7 ? 32 * 16 : 0);  // +512 bytes FPR (v7)
     case 2: // THREAD
         return sizeof(qbditrace::qbditrace_thread_head_t);
     case 3: // EVENT
@@ -64,7 +77,7 @@ struct ScanShard {
 /// Only on_inst() is called; non-INST records are skipped.
 /// Uses a per-thread ThreadReader to avoid mutex contention on the shared cache.
 void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
-                           bool is_v6,
+                           bool is_v6, bool is_v7,
                            const std::vector<TraceCollector*>& clones,
                            std::atomic<uint64_t>& progress_counter,
                            const TraceReader::ThreadReader& thread_reader,
@@ -76,6 +89,13 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
     const size_t memacc_size = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)
         : sizeof(qbditrace::qbditrace_memacc_t);
+    const size_t inst_hdr_sz = is_v7
+        ? sizeof(qbditrace::qbditrace_inst_head_v7_t)   // 24 bytes
+        : sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
+    const size_t fprdiff_sz = is_v7
+        ? sizeof(qbditrace::qbditrace_fprdiff_t)          // 24 bytes
+        : 0;
+    const size_t fprdiff_offset = 16; // v7 non-v5: n_fprdiff at offset 16
     const bool has_excludes = !exclude_ranges.empty();
 
     while (offset < end_offset) {
@@ -83,11 +103,30 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
         uint8_t kind = ptr[0];
 
         if (kind == 0) { // INST — hot path
-            const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
+            uint64_t pc;
+            uint8_t nzcv_val;
+            uint8_t n_regdiff;
+            uint8_t n_mem;
+            const uint8_t* raw_diffs;
+
+            if (is_v7) {
+                const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_t*>(ptr);
+                pc = hdr->pc;
+                nzcv_val = hdr->nzcv;
+                n_regdiff = hdr->n_regdiff;
+                n_mem = hdr->n_mem;
+                raw_diffs = ptr + inst_hdr_sz;
+            } else {
+                const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
+                pc = hdr->pc;
+                nzcv_val = hdr->nzcv;
+                n_regdiff = hdr->n_regdiff;
+                n_mem = hdr->n_mem;
+                raw_diffs = ptr + inst_hdr_sz;
+            }
 
             bool excluded = false;
             if (has_excludes) {
-                uint64_t pc = hdr->pc;
                 for (const auto& [start, end] : exclude_ranges) {
                     if (pc >= start && pc < end) { excluded = true; break; }
                 }
@@ -95,12 +134,13 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
 
             if (!excluded) {
                 InstView inst;
-                inst.pc = hdr->pc;
-                inst.nzcv = hdr->nzcv;
-                inst.reg_diff_count = hdr->n_regdiff;
-                inst.mem_access_count = hdr->n_mem;
-                inst.raw_diffs = ptr + sizeof(qbditrace::qbditrace_inst_head_t);
-                inst.raw_mems = inst.raw_diffs + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t);
+                inst.pc = pc;
+                inst.nzcv = nzcv_val;
+                inst.reg_diff_count = n_regdiff;
+                inst.mem_access_count = n_mem;
+                inst.raw_diffs = raw_diffs;
+                inst.raw_mems = raw_diffs + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                              + (is_v7 ? ptr[fprdiff_offset] * fprdiff_sz : 0);
                 inst.is_v5 = false;
 
                 for (auto* c : clones) {
@@ -108,9 +148,11 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 }
             }
 
-            offset += sizeof(qbditrace::qbditrace_inst_head_t)
-                + hdr->n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                + hdr->n_mem     * memacc_size;
+            uint8_t n_fprdiff = is_v7 ? ptr[fprdiff_offset] : 0;
+            offset += inst_hdr_sz
+                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_fprdiff * fprdiff_sz
+                + n_mem     * memacc_size;
             inst_id++;
 
             // Update shared progress counter every 64K instructions
@@ -124,7 +166,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
             }
         } else {
             // Non-INST record: skip (is_v6 propagated for completeness)
-            offset += raw_record_size(ptr, num_gpr, is_v6);
+            offset += raw_record_size(ptr, num_gpr, is_v6, is_v7);
         }
     }
 
@@ -281,10 +323,11 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
 
     bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    bool is_v7 = (reader_.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
 
-    // Fallback to sequential if: no parallel collectors, no index, small trace, or v5 format
+    // Fallback to sequential if: no parallel collectors, no index, small trace, or v5/v7 format
     if (par_collectors.empty() || index_ == nullptr ||
-        inst_count_ < 50000 || is_v5) {
+        inst_count_ < 50000 || is_v5 || is_v7) {
         return run(start_inst_id, end_inst_id);
     }
 
@@ -372,13 +415,13 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     const std::atomic<bool>* cancel_tok = cancel_token_;
     const auto& excludes = exclude_pc_ranges_;
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, num_gpr, is_v6, cancel_tok, i]() {
-            scan_shard_collectors(shards[i], num_gpr, is_v6, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, num_gpr, is_v6, is_v7, cancel_tok, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v6, is_v7, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, is_v6, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes);
+    scan_shard_collectors(shards[0], num_gpr, is_v6, is_v7, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes);
 
     // Report progress while waiting
     if (progress_fn_) {

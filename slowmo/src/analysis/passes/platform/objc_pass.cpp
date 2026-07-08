@@ -348,20 +348,31 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
 }
 
 /// Compute record size from raw pointer (same logic as trace_collector.cpp).
-inline size_t objc_raw_record_size(const uint8_t* ptr, uint32_t num_gpr, bool is_v6) {
+inline size_t objc_raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
+                                   bool is_v6, bool is_v7 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
         uint8_t n_mem = ptr[3];
+        uint8_t n_fprdiff = 0;
+        size_t hdr_sz;
+        if (is_v7) {
+            hdr_sz = sizeof(qbditrace::qbditrace_inst_head_v7_t);  // 24 bytes
+            n_fprdiff = ptr[16];
+        } else {
+            hdr_sz = sizeof(qbditrace::qbditrace_inst_head_t);     // 16 bytes
+        }
         const size_t memacc_size = is_v6
             ? sizeof(qbditrace::qbditrace_memacc_v6_t)
             : sizeof(qbditrace::qbditrace_memacc_t);
-        return sizeof(qbditrace::qbditrace_inst_head_t)
+        return hdr_sz
             + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+            + n_fprdiff * (is_v7 ? sizeof(qbditrace::qbditrace_fprdiff_t) : 0)
             + n_mem     * memacc_size;
     }
     case 1: // ANCHOR
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8
+             + (is_v7 ? 32 * 16 : 0);
     case 2: // THREAD
         return sizeof(qbditrace::qbditrace_thread_head_t);
     case 3: // EVENT
@@ -426,6 +437,13 @@ PassResult ObjcPass::run(PassContext& ctx) {
 
     const uint32_t num_gpr = reader.header().num_gpr;
     const bool is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool is_v7 = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+    const size_t inst_hdr_sz = is_v7
+        ? sizeof(qbditrace::qbditrace_inst_head_v7_t)   // 24 bytes
+        : sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
+    const size_t fprdiff_sz = is_v7
+        ? sizeof(qbditrace::qbditrace_fprdiff_t)          // 24 bytes
+        : 0;
 
     // Create a thread reader for lock-free access
     auto thread_reader = reader.create_thread_reader(16);
@@ -462,11 +480,13 @@ PassResult ObjcPass::run(PassContext& ctx) {
         if (kind == 0) { // INST — fast skip
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
+            uint8_t n_fprdiff = is_v7 ? ptr[16] : 0;
             const size_t memacc_size = is_v6
                 ? sizeof(qbditrace::qbditrace_memacc_v6_t)
                 : sizeof(qbditrace::qbditrace_memacc_t);
-            offset += sizeof(qbditrace::qbditrace_inst_head_t)
+            offset += inst_hdr_sz
                 + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_fprdiff * fprdiff_sz
                 + n_mem     * memacc_size;
             inst_id++;
 
@@ -586,7 +606,7 @@ PassResult ObjcPass::run(PassContext& ctx) {
             offset += sizeof(qbditrace::qbditrace_objc_head_t);
         } else {
             // Other record types: skip quickly
-            offset += objc_raw_record_size(ptr, num_gpr, is_v6);
+            offset += objc_raw_record_size(ptr, num_gpr, is_v6, is_v7);
         }
     }
 

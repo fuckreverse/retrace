@@ -45,24 +45,42 @@ namespace {
 ///   qbditrace_objc_head_t    = 80 (4B+4B pad+8B pc+8B recv+8B sel+48B cls)
 ///   qbditrace_code_head_t    = 16 (4B fields + 4B pad + 8B pc)
 /// P1.7: is_v6 controls whether memacc uses the 48-byte v6 layout.
+/// P1.8: is_v7 controls whether INST records use the v7 header (24 bytes)
+///        and include an FPR diff section (n_fprdiff × 24 bytes).
+///        ANCHOR records also grow by 512 bytes (32 × 16-byte FPR values).
 inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
-                               bool is_v5 = false, bool is_v6 = false) {
+                               bool is_v5 = false, bool is_v6 = false,
+                               bool is_v7 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
         uint8_t n_mem = ptr[3];
-        size_t hdr = is_v5
-            ? sizeof(qbditrace::qbditrace_inst_head_v5_t)    // 6 bytes
-            : sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
+        size_t hdr;
+        uint8_t n_fprdiff = 0;
+        if (is_v7 && is_v5) {
+            // qbditrace_inst_head_v7_v5_t = 8 bytes
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+            n_fprdiff = ptr[5];
+        } else if (is_v7) {
+            // qbditrace_inst_head_v7_t = 24 bytes
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+            n_fprdiff = ptr[16]; // n_fprdiff at offset 16 (after 4B fields + 8B pc)
+        } else if (is_v5) {
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v5_t);    // 6 bytes
+        } else {
+            hdr = sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
+        }
         size_t macc = is_v6
             ? sizeof(qbditrace::qbditrace_memacc_v6_t)       // 48 bytes
             : sizeof(qbditrace::qbditrace_memacc_t);         // 32 bytes
         return hdr
-            + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
-            + n_mem     * macc;
+            + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
+            + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)   // 24 bytes each (v7 only)
+            + n_mem      * macc;
     }
     case 1: // ANCHOR
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;   // 16 + N*8
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8   // 16 + N*8
+             + (is_v7 ? 32 * 16 : 0);                                  // +512 bytes FPR (v7)
     case 2: // THREAD
         return sizeof(qbditrace::qbditrace_thread_head_t);  // 16
     case 3: // EVENT
@@ -78,10 +96,16 @@ inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
     }
 }
 
-/// Extract PC from a v4 INST record.
-/// qbditrace_inst_head_t layout: kind(1)+nzcv(1)+n_regdiff(1)+n_mem(1)+pad(4)+pc(8)
-/// PC is at byte offset 8 (not 4!), due to alignment padding before the uint64_t field.
-inline uint64_t raw_inst_pc(const uint8_t* ptr) {
+/// Extract PC from an INST record.
+/// v4: qbditrace_inst_head_t layout: kind(1)+nzcv(1)+n_regdiff(1)+n_mem(1)+pad(4)+pc(8)
+///     PC is at byte offset 8 (not 4!), due to alignment padding before the uint64_t field.
+/// v7: qbditrace_inst_head_v7_t layout: kind(1)+nzcv(1)+n_regdiff(1)+n_mem(1)+pc(8)+n_fprdiff(1)+pad(7)
+///     PC is at byte offset 4 (no padding before pc in v7).
+inline uint64_t raw_inst_pc(const uint8_t* ptr, bool is_v7 = false) {
+    if (is_v7) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v7_t*>(ptr);
+        return hdr->pc;
+    }
     const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_t*>(ptr);
     return hdr->pc;
 }
@@ -142,7 +166,7 @@ struct ShardResult {
 /// For v5 (HF_PC_DELTA) traces, shard.seed_pc seeds the running PC accumulator;
 /// ANCHOR records resync it from their absolute PC field.
 void scan_shard(const Shard& shard, uint32_t num_gpr,
-                bool is_v5, bool is_v6, ShardResult& out,
+                bool is_v5, bool is_v6, bool is_v7, ShardResult& out,
                 const TraceReader::ThreadReader& thread_reader,
                 const std::atomic<bool>& cancelled,
                 const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges = {}) {
@@ -151,12 +175,20 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     uint64_t inst_id = shard.start_inst_id;
 
     // Pre-compute sizes to avoid branching in the inner loop.
-    const size_t inst_hdr_sz = is_v5
-        ? sizeof(qbditrace::qbditrace_inst_head_v5_t)  // 6 bytes
-        : sizeof(qbditrace::qbditrace_inst_head_t);    // 16 bytes
+    const size_t inst_hdr_sz = is_v7
+        ? (is_v5 ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)   // 8 bytes
+                 : sizeof(qbditrace::qbditrace_inst_head_v7_t))      // 24 bytes
+        : (is_v5 ? sizeof(qbditrace::qbditrace_inst_head_v5_t)      // 6 bytes
+                 : sizeof(qbditrace::qbditrace_inst_head_t));        // 16 bytes
     const size_t memacc_sz = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)     // 48 bytes
         : sizeof(qbditrace::qbditrace_memacc_t);       // 32 bytes
+    const size_t fprdiff_sz = is_v7
+        ? sizeof(qbditrace::qbditrace_fprdiff_t)       // 24 bytes
+        : 0;
+    // For v7 (non-v5), n_fprdiff is at offset 16 in the header.
+    // For v7+v5, n_fprdiff is at offset 5.
+    const size_t fprdiff_offset = is_v5 ? 5 : 16;
 
     // Per-PC bulk context cache: avoid repeated ART lookups in roaring64
     // We cache the last-used PC's bitmap + bulk context for temporal locality.
@@ -189,7 +221,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 running_pc += static_cast<int64_t>(delta);
                 pc = running_pc;
             } else {
-                pc = raw_inst_pc(ptr);
+                pc = raw_inst_pc(ptr, is_v7);
             }
 
             // Skip excluded PC ranges
@@ -217,9 +249,11 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
 
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
+            uint8_t n_fprdiff = is_v7 ? ptr[fprdiff_offset] : 0;
             offset += inst_hdr_sz
-                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                + n_mem     * memacc_sz;
+                + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_fprdiff  * fprdiff_sz
+                + n_mem      * memacc_sz;
             inst_id++;
         } else {
             // For v5 traces, resync running_pc from ANCHOR records.
@@ -227,7 +261,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 const auto* a_hdr = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
                 running_pc = a_hdr->pc;
             }
-            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6);
+            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7);
         }
     }
 }
@@ -785,6 +819,7 @@ PassResult XrefPass::run(PassContext& ctx) {
     // Determine trace format flags for the shard scanner
     const bool xref_is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool xref_is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool xref_is_v7 = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR)    != 0;
 
     // Create per-shard ThreadReaders to eliminate mutex contention.
     std::vector<TraceReader::ThreadReader> thread_readers;
@@ -798,13 +833,13 @@ PassResult XrefPass::run(PassContext& ctx) {
     const auto& excludes = range.exclude_pc_ranges;
 
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, &excludes, num_gpr, xref_is_v5, xref_is_v6, i]() {
-            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, shard_results[i], thread_readers[i], cancel_flag, excludes);
+        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, &excludes, num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, i]() {
+            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, shard_results[i], thread_readers[i], cancel_flag, excludes);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, shard_results[0], thread_readers[0], cancel_flag, excludes);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, shard_results[0], thread_readers[0], cancel_flag, excludes);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 

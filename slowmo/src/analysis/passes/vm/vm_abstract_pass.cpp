@@ -573,13 +573,11 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
             }
             continue;
         }
-        cand.header_inst_ids.reserve(
-            std::min(static_cast<uint64_t>(10000), cand.iteration_count));
+        cand.header_inst_ids.reserve(cand.iteration_count);
         for (uint64_t iid : xref.inst_ids_at(cand.header_pc)) {
             if (iid < range.start_inst_id) continue;
             if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
             cand.header_inst_ids.push_back(iid);
-            if (cand.header_inst_ids.size() >= 10000) break;
         }
         LOG_INFO_M(::tenet::log::Module::Analysis,
             "VM abstract: hinted PC {:#x} hit {} time(s) in [{}, {}) "

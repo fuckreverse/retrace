@@ -619,6 +619,11 @@ RecordView TraceReader::record_at(uint64_t offset) const {
     rv.kind = static_cast<RecordKind>(ptr[0]);
     rv.file_offset = offset;
     rv.raw_ptr = ptr;
+    // Set format flags from header so byte_size() computes correct sizes
+    // (e.g. v7 ANCHOR records include a 512-byte FPR snapshot).
+    rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+    rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
     return rv;
 }
 
