@@ -140,8 +140,12 @@ register_tool(
             if (vm_decoder_ && vm_decoder_path_ == path) {
                 decoder = vm_decoder_;
             } else {
+                // load_decoder_from_json() returns nullptr (not an
+                // exception) for file-not-found / JSON-parse errors, so
+                // vm_decoder_ may legitimately end up null here — callers
+                // must check before dereferencing.
                 vm_decoder_ = std::shared_ptr<VMBytecodeDecoder>(
-                    load_decoder_from_json(path).release());
+                    load_decoder_from_json(path));
                 vm_decoder_path_ = path;
                 decoder = vm_decoder_;
             }
