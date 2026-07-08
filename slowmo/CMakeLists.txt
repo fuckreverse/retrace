@@ -580,6 +580,20 @@ if(APPLE)
     target_link_libraries(tenet_lib PUBLIC "-framework CoreFoundation" "-framework IOKit")
 endif()
 
+# WebSocket service (uWebSockets + FlatBuffers)
+if(TENET_ENABLE_WS)
+    target_sources(tenet_lib PRIVATE
+        src/ws/tenet_ws_service.cpp
+        src/ws/ws_handlers_stub.cpp
+    )
+    target_link_libraries(tenet_lib PUBLIC uwebsockets flatbuffers)
+    target_include_directories(tenet_lib PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    add_dependencies(tenet_lib tenet_ws_schema)
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_WS=1)
+else()
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_WS=0)
+endif()
+
 # ─── GUI library (tenet_gui_lib) ────────────────────────────────────────────
 if(TENET_ENABLE_GUI)
 add_library(tenet_gui_lib STATIC
