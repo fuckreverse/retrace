@@ -58,7 +58,12 @@ namespace tenet {
 //      2 GB macOS pread SST limit, allow zero-copy reads, and eliminate
 //      compaction overhead.  The pass_cache/ directory is wiped together
 //      with the index when DestroyDB removes the .tenet directory.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 10;
+// v11: Added v7 (HF_HAS_FPR) support to index builder.  Previous versions
+//      miscalculated INST/ANCHOR record sizes for v7 traces, causing the
+//      record walk to desynchronize and produce non-monotonic keys for
+//      SstFileWriter — resulting in "Keys must be added in strict ascending
+//      order" errors.  Caches built with schema ≤v10 for v7 traces are invalid.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 11;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -811,14 +816,22 @@ Result<TraceIndex> TraceIndex::build(
     const uint32_t num_gpr     = reader.header().num_gpr;
     const bool     is_v5       = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool     is_v6       = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool     is_v7       = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR)  != 0;
 
     // P1.7: correct memacc struct size depending on format version
     const size_t memacc_sz = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)   // 48 bytes
         : sizeof(qbditrace::qbditrace_memacc_t);      // 32 bytes
-    const size_t inst_hdr_sz = is_v5
-        ? sizeof(qbditrace::qbditrace_inst_head_v5_t) // 6 bytes
-        : sizeof(qbditrace::qbditrace_inst_head_t);   // 16 bytes
+    // v7 headers are larger: v7+v5 = 8 bytes, v7 = 24 bytes
+    const size_t inst_hdr_sz = (is_v7 && is_v5)
+        ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)  // 8 bytes
+        : is_v7
+        ? sizeof(qbditrace::qbditrace_inst_head_v7_t)     // 24 bytes
+        : is_v5
+        ? sizeof(qbditrace::qbditrace_inst_head_v5_t)     // 6 bytes
+        : sizeof(qbditrace::qbditrace_inst_head_t);       // 16 bytes
+    // v7: n_fprdiff byte offset within the INST header
+    const size_t fprdiff_byte_offset = (is_v7 && is_v5) ? 6 : 16;
 
     // ── P1.5: Parallel build ──────────────────────────────────────────────
     // Strategy:
@@ -853,7 +866,8 @@ Result<TraceIndex> TraceIndex::build(
 
         uint64_t scan_id = 0;
         const uint64_t hdr_sz = sizeof(qbditrace::qbditrace_file_header_t);
-        const size_t anchor_rec_sz = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+        const size_t anchor_fpr_sz = is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+        const size_t anchor_rec_sz = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + anchor_fpr_sz;
 
         // Progress reporting for Phase 0 (anchor discovery).
         // For large traces (especially block-compressed), this scan can take
@@ -892,8 +906,10 @@ Result<TraceIndex> TraceIndex::build(
                 switch (kind) {
                 case RecordKind::Inst: {
                     if (remaining < inst_hdr_sz) return pos;  // partial record
+                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
                     rec_size = inst_hdr_sz
                         + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                        + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
                         + ptr[3] * memacc_sz;
                     if (remaining < rec_size) return pos;  // partial record
                     scan_id++;
@@ -1009,14 +1025,17 @@ Result<TraceIndex> TraceIndex::build(
                 auto kind = static_cast<RecordKind>(ptr[0]);
                 size_t rec_size = 0;
                 switch (kind) {
-                case RecordKind::Inst:
+                case RecordKind::Inst: {
+                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
                     rec_size = inst_hdr_sz
                         + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                        + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
                         + ptr[3] * memacc_sz;
                     scan_id++;
                     break;
+                }
                 case RecordKind::Anchor: {
-                    rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                    rec_size = anchor_rec_sz;
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
                     raw_anchors.push_back({scan_id, scan_offset, ah->pc});
                     break;
@@ -1339,8 +1358,10 @@ struct ShardResult {
             switch (kind) {
             case RecordKind::Inst: {
                 if (remaining < inst_hdr_sz) return 0;
+                uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
                 rec_size = inst_hdr_sz
                     + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                    + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
                     + ptr[3] * memacc_sz;
                 if (remaining < rec_size) return 0;
                 // P1.6: Sparse offset with adaptive interval
@@ -1377,7 +1398,8 @@ struct ShardResult {
                 break;
             }
             case RecordKind::Anchor: {
-                rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                size_t anchor_fpr = is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+                rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + anchor_fpr;
                 if (remaining < rec_size) return 0;
                 char anchor_key_buf[8];
                 encode_u64_to(inst_id, anchor_key_buf);
@@ -1849,6 +1871,7 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
     uint64_t current_offset = offset;
     const uint32_t num_gpr = reader.header().num_gpr;
     const bool is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+    const bool is_v7_scan = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
 
     // For v5 traces we track the running PC so we can return seed_pc to callers
     // (they need it to correctly call as_inst() on the resulting offset).
@@ -1879,13 +1902,20 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
                     const size_t wmacc_sz = wis_v6
                         ? sizeof(qbditrace::qbditrace_memacc_v6_t)
                         : sizeof(qbditrace::qbditrace_memacc_t);
-                    walk_offset += sizeof(qbditrace::qbditrace_inst_head_v5_t)
+                    // v7+v5: inst header is 8 bytes, n_fprdiff at byte 6
+                    const size_t whdr_sz = is_v7_scan
+                        ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)
+                        : sizeof(qbditrace::qbditrace_inst_head_v5_t);
+                    uint8_t wfpr = is_v7_scan ? wp[6] : 0;
+                    walk_offset += whdr_sz
                         + wp[2] * sizeof(qbditrace::qbditrace_regdiff_t)
+                        + wfpr  * sizeof(qbditrace::qbditrace_fprdiff_t)
                         + wp[3] * wmacc_sz;
                 } else if (wkind == RecordKind::Anchor) {
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(wp);
                     running_pc = ah->pc;
-                    walk_offset += sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8;
+                    size_t afpr = is_v7_scan ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+                    walk_offset += sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + afpr;
                 } else {
                     auto rec = reader.record_at(walk_offset);
                     walk_offset += rec.byte_size(num_gpr);
@@ -1918,22 +1948,30 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
                 return result;
             }
             current_id++;
-            // Compute record size directly from raw bytes, respecting v4/v5 layout.
-            // (RecordView::byte_size() now uses the is_v5 flag; however this hot path
+            // Compute record size directly from raw bytes, respecting v4/v5/v7 layout.
+            // (RecordView::byte_size() now uses the is_v5/is_v7 flags; however this hot path
             //  avoids constructing a RecordView at all for speed.)
-            size_t hdr_size = is_v5
-                ? sizeof(qbditrace::qbditrace_inst_head_v5_t)   // 6 bytes
-                : sizeof(qbditrace::qbditrace_inst_head_t);     // 16 bytes (with padding)
+            size_t hdr_size = (is_v7_scan && is_v5)
+                ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)  // 8 bytes
+                : is_v7_scan
+                ? sizeof(qbditrace::qbditrace_inst_head_v7_t)     // 24 bytes
+                : is_v5
+                ? sizeof(qbditrace::qbditrace_inst_head_v5_t)     // 6 bytes
+                : sizeof(qbditrace::qbditrace_inst_head_t);       // 16 bytes
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
+            // v7: read n_fprdiff from the correct byte offset
+            const size_t fpr_off = (is_v7_scan && is_v5) ? 6 : 16;
+            uint8_t n_fprdiff_scan = is_v7_scan ? ptr[fpr_off] : 0;
             // P1.7: use v6-aware memacc size in linear scan
             const bool is_v6_scan = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
             const size_t macc_scan_sz = is_v6_scan
                 ? sizeof(qbditrace::qbditrace_memacc_v6_t)   // 48 bytes
                 : sizeof(qbditrace::qbditrace_memacc_t);      // 32 bytes
             current_offset += hdr_size
-                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
-                + n_mem     * macc_scan_sz;
+                + n_regdiff      * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
+                + n_fprdiff_scan * sizeof(qbditrace::qbditrace_fprdiff_t)   // 24 bytes each
+                + n_mem          * macc_scan_sz;
         } else {
             // For non-INST records, use the generic byte_size() helper.
             // These records (Anchor, Code, Event, etc.) have the same layout in v4/v5.

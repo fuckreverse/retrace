@@ -8,21 +8,27 @@ namespace tenet {
 RegisterFile::RegisterFile(const TraceReader& reader, const TraceIndex& index)
     : reader_(reader), index_(index) {}
 
-const RegState& RegisterFile::state_before(uint64_t inst_id) {
+RegState RegisterFile::state_before(uint64_t inst_id) {
     TENET_ZONE;
-    // Check LRU cache first
-    if (auto cached = cache_.get(inst_id)) {
-        cache_stats_.hits++;
-        return cached->get();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Check LRU cache first
+        if (auto cached = cache_.get(inst_id)) {
+            cache_stats_.hits++;
+            return cached->get();
+        }
+        cache_stats_.misses++;
     }
 
-    // Cache miss: rebuild from nearest anchor
-    cache_stats_.misses++;
+    // Cache miss: rebuild from nearest anchor. Done outside the lock since
+    // rebuild() only touches reader_/index_ (safe for concurrent readers) and
+    // can be relatively expensive (anchor-to-target replay) — holding the
+    // mutex here would serialize unrelated threads on unrelated inst_ids.
     RegState state = rebuild(inst_id);
-    cache_.put(inst_id, state);
 
-    // Return reference to the cached value
-    return cache_.get(inst_id)->get();
+    std::lock_guard<std::mutex> lock(mutex_);
+    cache_.put(inst_id, state);
+    return state;
 }
 
 RegState RegisterFile::state_after(uint64_t inst_id) {
@@ -63,8 +69,14 @@ RegState RegisterFile::state_after(uint64_t inst_id) {
 }
 
 void RegisterFile::warm_at(uint64_t inst_id) {
-    if (!cache_.get(inst_id)) {
+    bool cached;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cached = static_cast<bool>(cache_.get(inst_id));
+    }
+    if (!cached) {
         RegState state = rebuild(inst_id);
+        std::lock_guard<std::mutex> lock(mutex_);
         cache_.put(inst_id, state);
         cache_stats_.warm_samples++;
     }
@@ -100,8 +112,14 @@ void RegisterFile::warm_range(uint64_t start_id, uint64_t end_id,
 
     for (uint64_t id = start_id; id < end_id; id += stride) {
         // Skip if already cached (avoid rebuilding what we already have).
-        if (!cache_.get(id)) {
+        bool cached;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cached = static_cast<bool>(cache_.get(id));
+        }
+        if (!cached) {
             RegState state = rebuild(id);
+            std::lock_guard<std::mutex> lock(mutex_);
             cache_.put(id, state);
             cache_stats_.warm_samples++;
         }

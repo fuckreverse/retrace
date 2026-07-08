@@ -240,6 +240,32 @@ if(TENET_ENABLE_GUI)
         "-framework AppKit"
     )
 
+    # imgui_impl_sdl3.cpp's multi-viewport support (ImGui_ImplSDL3_SetupPlatformHandles)
+    # branches on `#elif defined(__APPLE__) && defined(SDL_VIDEO_DRIVER_COCOA)` to fetch
+    # the real NSWindow* via SDL_GetPointerProperty(..., SDL_PROP_WINDOW_COCOA_WINDOW_POINTER).
+    # SDL_VIDEO_DRIVER_COCOA is normally only defined in SDL's own *private*
+    # build_config/SDL_build_config.h (SDL3's own CMakeLists.txt marks that
+    # include dir PRIVATE — by design it is not propagated to consumers via
+    # the public SDL3::SDL3 target). Since imgui_lib only links the public
+    # SDL3 headers, that macro is invisible here and the branch is silently
+    # skipped, leaving ImGuiViewport::PlatformHandleRaw == nullptr.
+    #
+    # imgui_impl_metal.mm's ImGui_ImplMetal_CreateWindow() then falls back to
+    # PlatformHandle, which SDL3 sets to a small SDL_WindowID integer (NOT a
+    # pointer) — treating that as an NSWindow* and sending it -contentView
+    # crashes with SIGSEGV (bad access at a tiny address, e.g. 0x4 for
+    # window ID 4). This only manifests once ImGuiConfigFlags_ViewportsEnable
+    # is on and a panel is dragged into its own OS window.
+    #
+    # Fix: this app only ever builds/runs on macOS, where SDL3 always uses
+    # the Cocoa video backend, so it's safe to define the macro directly for
+    # this translation unit instead of trying to reach into SDL3's private
+    # generated-header directory.
+    set_source_files_properties(
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        PROPERTIES COMPILE_DEFINITIONS "SDL_VIDEO_DRIVER_COCOA=1"
+    )
+
     set_source_files_properties(
         ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
         PROPERTIES LANGUAGE OBJCXX

@@ -339,7 +339,9 @@ Total: 16 + 272 + 512 = 800 字节
 **语义**：在该 ANCHOR 之后的第一条 INST 执行**前**，CPU 的完整寄存器状态。
 
 **频率**：qbditrace 默认每 1024 条 INST 记录一个 ANCHOR（可通过 `config_t.anchor_interval` 配置）。
-另外在 SEQ_ENTRY 事件后也会强制写入 ANCHOR。
+另外在 XFER_CALL/XFER_RETURN（跨 instrumented range 边界的调用/返回）之后也会强制写入下一条 ANCHOR，
+作为“重新进入追踪范围”的重同步检查点；SEQ_ENTRY/SEQ_EXIT（普通基本块/序列切换，频率远高于
+XFER_CALL/RETURN）**不**触发 ANCHOR——寄存器 diff 存的是绝对值，跨 sequence 边界无需重同步。
 
 **tenet 使用**：RegisterFile 的重建基准点。通过 RocksDB "anchor" CF 缓存所有 ANCHOR 的位置，实现 O(1) 定位最近的 ANCHOR。
 
@@ -382,9 +384,16 @@ Total: 24 字节 (`sizeof(qbditrace_event_head_t)`，含对齐 padding)
 | 3 | XFER_CALL | 调用了未被 instrument 的函数（addr=目标, site=调用者 PC） |
 | 4 | XFER_RETURN | 从外部函数返回追踪范围（addr=返回目标） |
 
+**写入条件**：SEQ_ENTRY/SEQ_EXIT 受 `qbditrace_config_t.record` 的 `QBDITRACE_REC_SEQEVENTS`
+位控制（默认开启）。它们大约每次 taken 分支/循环回边触发一对，是 loop-heavy 代码里数量最多的
+记录类型之一，但**没有任何 tenet pass 依赖其语义**——基本块与循环边界完全由 `cfg`/`loop` pass
+从裸 PC 流 + 静态反汇编重建。因此 qbditrace 的 sampling 模式（`record = QBDITRACE_REC_SAMPLING`，
+见下方“采样侦察 trace”）会关闭这两个事件以大幅缩减体积，且不影响 `cfg`/`loop`/`window_stats`
+等 pass 的正确性。XFER_CALL/XFER_RETURN 不受此位影响，始终发射。
+
 **tenet 使用**：
 - XFER_CALL/RETURN 用于 CallStack 重建
-- SEQ_ENTRY 后期待一个 ANCHOR
+- SEQ_ENTRY/SEQ_EXIT 目前仅在 TraceReader 解析层被消费，任何 pass 均不依赖其内容
 
 ---
 
@@ -577,13 +586,48 @@ runtime_address = static_address + module_slide
 
 ---
 
+## 采样侦察 trace（QBDITRACE_REC_SAMPLING）
+
+**动机**：做一次完整 trace 之前，先用一次代价小得多的"侦察"trace 摸清目标函数的执行情况
+（有没有巨大的、明显与业务逻辑无关的循环——如 memset 式清零、CRC/校验和、反调试忙等延时），
+再决定用 `--exclude-range` 排除哪些区域做正式的完整 trace。
+
+**关键设计约束**：`record == 0` 在 ABI 层历史上被当作"调用方没设置该字段"（兼容旧结构体大小的
+调用方），会被静默替换为 `QBDITRACE_REC_DEFAULT`（见 `qbditrace_configure` 内 ABI 兼容 shim）。
+因此不能靠传 `record = 0` 得到"什么都不记录"的效果。为此新增了一个不参与任何记录内容判断的
+哨兵位 `QBDITRACE_REC_SAMPLING`（`1u << 31`）：只要 `record` 非零就不会被替换为默认值，而这个
+哨兵位本身不出现在任何 `cfg.record & QBDITRACE_REC_*` 的判断里，因此效果等价于"真正的 0"。
+
+**采样模式产出的记录构成**：仅 `REC_INST`（裸 PC，无寄存器 diff/无内存访问）+ `REC_CODE`（去重
+指令字节表）+ `REC_ANCHOR`（线程/PC 定位用，间隔可调大）+ `REC_THREAD`；`REC_EVENT` 的
+SEQ_ENTRY/SEQ_EXIT 由 `QBDITRACE_REC_SEQEVENTS` 位控制，sampling 模式下默认关闭
+（XFER_CALL/XFER_RETURN 不受影响，仍然发射，因为它们数量少且携带跨界调用信息）。
+
+**为什么这样瘦身而不是"跳过部分指令采样"**：tenet 的 `cfg`/`loop`/`window_stats` 等 pass 都是
+基于**完整、连续的 PC 执行序列**做静态反汇编 + 动态边计数重建基本块和循环的（见 `cfg_pass.cpp`
+Phase 1-4），任何跳过指令的统计采样都会直接破坏边计数和循环回边识别的正确性。因此 sampling 模式
+的思路是"保留完整 PC 流，只裁剪掉每条记录里不必要的载荷"，而不是抽样跳过指令——这样 `loop` pass
+识别出的循环迭代次数和 `cfg` pass 统计的边 taken_count 仍然是精确值，不是估计值。
+
+**实测收益**（20 万次迭代热循环 + 少量分支逻辑的合成用例）：完整记录 55 MB → sampling 关闭
+REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B→6B）后 9.6 MB，
+体积降至约 17%，且 `cfg`/`loop` pass 在瘦身后的 trace 上精确复现了 199876~199877 次的循环边计数。
+
+**使用方式**：见 `tools/qbditrace/qbditrace_runner.py --sampling`（一键应用
+`record=QBDITRACE_REC_SAMPLING` + `enable_pc_delta=1` + 较大的 `anchor_interval`），配合
+`tenet --suggest-excludes`（基于 `loop` pass 结果生成候选 `--exclude-range` 建议，见
+`tools/tenet/src/batch_analysis.cpp` 的 `run_suggest_excludes`）或 `tenet --run-pass loop` 人工
+检查循环明细。
+
+---
+
 ## tenet 核心假设
 
 | # | 假设 | 违反时处理 |
 |---|------|-----------|
 | 1 | Header 为 536 字节，magic = "QBDT" | 拒绝打开 |
 | 2 | version >= 4 | < 4 拒绝；> 7 警告并尝试继续 |
-| 3 | flags 包含 REG_DIFF | 不含则不支持（v1/v2 格式） |
+| 3 | flags 包含 REG_DIFF（常规完整 trace） | 不强制：REG_DIFF/NZCV/MEM 均可关闭（见 `QBDITRACE_REC_SAMPLING`），此时 RegisterFile/MemoryModel 相关能力降级，但 `xref`/`cfg`/`loop`/`window_stats` 等只需 PC 流 + REC_CODE 的 pass 正常工作 |
 | 4 | flags 包含 HAS_CODE | 不含则需要外部 image |
 | 5 | 记录按写入顺序排列（时间单调递增） | 索引依赖此假设 |
 | 6 | ANCHOR 间隔 ≤ 65536 条 INST | 超过则性能退化 |

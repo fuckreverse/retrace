@@ -30,7 +30,7 @@ TEST_CASE("RegisterFile reconstructs state from anchor", "[unit][core][register_
     REQUIRE(env != nullptr);
 
     SECTION("state_before inst 0 matches anchor") {
-        auto& state = env->regfile->state_before(0);
+        auto state = env->regfile->state_before(0);
         REQUIRE(state.gpr[0] == 0x1111);
         REQUIRE(state.gpr[1] == 0x2222);
         REQUIRE(state.sp() == 0x7F000000ULL);
@@ -57,7 +57,7 @@ TEST_CASE("RegisterFile replays register diffs", "[unit][core][register_file]") 
     REQUIRE(env != nullptr);
 
     SECTION("state_before inst 0 has anchor values") {
-        auto& s = env->regfile->state_before(0);
+        auto s = env->regfile->state_before(0);
         // TraceWriter::emit() applies diffs to ms *before* the auto-anchor
         // check (inst_count % anchor_interval == 0).  Since inst_count==0 and
         // anchor_interval==256, an auto-anchor fires that captures the
@@ -124,7 +124,7 @@ TEST_CASE("RegisterFile PC tracking", "[unit][core][register_file]") {
     REQUIRE(env != nullptr);
 
     SECTION("state_before has previous PC") {
-        auto& s0 = env->regfile->state_before(0);
+        auto s0 = env->regfile->state_before(0);
         REQUIRE(s0.pc() == rt_pc(0x1000));
 
         auto s1 = env->regfile->state_before(1);
@@ -157,11 +157,11 @@ TEST_CASE("RegisterFile cache hits on repeated access", "[unit][core][register_f
     REQUIRE(env != nullptr);
 
     // First access: cache miss
-    auto& s1 = env->regfile->state_before(5);
+    auto s1 = env->regfile->state_before(5);
     uint64_t misses = env->regfile->cache_stats().misses;
 
     // Second access to same inst_id: should be a cache hit
-    auto& s2 = env->regfile->state_before(5);
+    auto s2 = env->regfile->state_before(5);
     uint64_t hits = env->regfile->cache_stats().hits;
 
     REQUIRE(hits > 0);

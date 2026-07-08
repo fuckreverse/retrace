@@ -1101,8 +1101,20 @@ void GuiApp::load_vm_decoder() {
     }
 
     try {
-        vm_decoder_ = std::shared_ptr<VMBytecodeDecoder>(
-            load_decoder_from_json(path).release());
+        // load_decoder_from_json() returns nullptr (not an exception) for
+        // file-not-found / JSON-parse errors — only mapping-level errors
+        // raise std::runtime_error. Must check for null before dereferencing
+        // below, otherwise a bad path silently produces a shared_ptr wrapping
+        // a null pointer and vm_decoder_->name() segfaults.
+        auto decoder = load_decoder_from_json(path);
+        if (!decoder) {
+            vm_decoder_.reset();
+            vm_decoder_status_ = fmt::format(
+                ICON_FA_CIRCLE_XMARK "  Failed to load decoder: file not found "
+                "or invalid JSON: {}", path);
+            return;
+        }
+        vm_decoder_ = std::shared_ptr<VMBytecodeDecoder>(std::move(decoder));
         vm_decoder_status_ = fmt::format(
             ICON_FA_CIRCLE_CHECK "  Decoder '{}' loaded from {}",
             vm_decoder_->name(), path);

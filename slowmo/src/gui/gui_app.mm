@@ -127,6 +127,16 @@ bool GuiApp::init_imgui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
+    // Multi-viewport: lets any dockable/floating window (Instructions,
+    // Registers, VM Workspace, ...) be dragged clean outside the main SDL
+    // window into its own OS-level window — including onto a second
+    // monitor. Both the SDL3 and Metal backends implement the platform
+    // (Platform_CreateWindow/...) and renderer (Renderer_CreateWindow/...)
+    // callbacks needed for this; each extra viewport gets its own
+    // CAMetalLayer + command queue, fully independent from the main
+    // window's hand-rolled Metal render loop below.
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+
     // Disable imgui.ini persistence — window/table layout is fully managed
     // by our own GuiSettings and code-side TableSetupColumn defaults.
     io.IniFilename = nullptr;
@@ -531,6 +541,20 @@ void GuiApp::setup_style() {
 
     // Scale for HiDPI
     style.ScaleAllSizes(dpi_scale_);
+
+    // ── Multi-viewport platform windows ───────────────────────────────
+    // When a window is dragged outside the main SDL window it becomes its
+    // own borderless OS window (a "platform window"). Such windows are
+    // always fully opaque and rectangular — rounded corners / borders on
+    // the *outer* edge would just get clipped by the OS window shape, and
+    // per-pixel alpha would show the desktop behind unrendered corners.
+    // This is imgui's own recommended recipe (see imgui_demo.cpp /
+    // example apps): keep the docked-in-main-window look untouched, but
+    // flatten rounding/alpha for the platform-window class only.
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
 }
 
 // ─── Font Setup ─────────────────────────────────────────────────────────────
@@ -1829,6 +1853,27 @@ int GuiApp::run() {
             }];
 
             [commandBuffer commit];
+
+            // ─── 6.5. Multi-viewport platform windows ────────────────
+            // Any window dragged outside the main SDL window (e.g. the VM
+            // Workspace, or a native panel undocked to a second monitor)
+            // became its own ImGuiViewport during render_frame() above.
+            // UpdatePlatformWindows() creates/destroys/moves the backing
+            // OS windows (SDL_Window + NSWindow) to match, and
+            // RenderPlatformWindowsDefault() draws each one through the
+            // Metal backend's own Renderer_RenderWindow callback — a
+            // fully separate CAMetalLayer/command queue per platform
+            // window (see ImGui_ImplMetal_RenderWindow), so this does not
+            // touch metal_command_queue_ / metal_layer_ used above for
+            // the main window.
+            //
+            // Unlike the OpenGL examples, Metal has no "current context"
+            // to save/restore around this call, so no backup/rebind dance
+            // is needed here.
+            if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+                ImGui::UpdatePlatformWindows();
+                ImGui::RenderPlatformWindowsDefault();
+            }
 
             // ─── 7. Release the drawable texture reference immediately ──
             // metal_render_pass_desc_ is a long-lived GuiApp member.  Its

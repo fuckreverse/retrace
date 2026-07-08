@@ -922,6 +922,7 @@ private:
     // When non-zero, memory write events at this address are shown as
     // orange markers in the timeline's taint lane.
     uint64_t timeline_watch_addr_ = 0;
+    bool     timeline_ctx_open_   = false;  // deferred right-click popup trigger
 
     // ─── Initialization ─────────────────────────────────────────────
     bool init_sdl();

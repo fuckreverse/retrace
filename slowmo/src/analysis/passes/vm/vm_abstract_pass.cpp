@@ -970,6 +970,46 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     // you need this programmatically.
     result.arch_type = config_.arch_type_hint;
 
+    // ── Step 6c: Warm the register-file cache for the step-building pass ──
+    //
+    // Step 7 below calls regfile.state_before() twice per execution
+    // (dispatch_inst_id and handler_first_inst_id) and `executions` is
+    // produced by a single sequential trace scan, so these inst_ids are
+    // visited in strictly increasing order. Despite that ordering,
+    // RegisterFile::state_before() has NO notion of "the last id we
+    // rebuilt" — a cache miss unconditionally rebuilds from the nearest
+    // ANCHOR record (by default every 1024 instructions, see
+    // TraceFormat.h), replaying every INST diff in between. Without
+    // pre-warming, two increasing-but-not-identical inst_ids that both
+    // miss the small LRU cache each pay that full anchor-to-target
+    // replay cost independently — for a trace with hundreds of thousands
+    // to millions of VM steps this dominates total pass runtime, which is
+    // why Step 7 looks disproportionately slow for how little work it
+    // conceptually does per iteration.
+    //
+    // warm_range() does one forward sweep over the whole span up front,
+    // inserting a cached checkpoint every `stride` instructions. Step 7's
+    // state_before() calls then only need to replay at most `stride`
+    // records from the nearest checkpoint instead of the nearest anchor
+    // (which can be much farther away), turning the common case into a
+    // handful of diff replays instead of hundreds.
+    if (!executions.empty()) {
+        uint64_t warm_start = executions.front().dispatch_inst_id;
+        uint64_t warm_end   = executions.back().handler_last_inst_id;
+        // handler_last_inst_id may be 0 (FetchOnly / handler never closed)
+        // or land before dispatch_inst_id in edge cases — fall back to
+        // dispatch_inst_id + 1 so warm_range() always sees a valid range.
+        if (warm_end <= warm_start) warm_end = warm_start + 1;
+        regfile.warm_range(warm_start, warm_end + 1, /*stride=*/0,
+            [&](uint64_t done, uint64_t total) {
+                if (total > 0) {
+                    ctx.progress(0.72f + 0.08f * static_cast<float>(done) /
+                                 static_cast<float>(total));
+                }
+            });
+    }
+    if (ctx.cancelled()) return PassResult::failed("Cancelled");
+
     // ── Step 7: Build VM execution trace (step sequence) ────────────────
 
     ctx.progress(0.8f, "VM abstract: building VM step sequence...");
@@ -997,7 +1037,31 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         }
     }
 
+    // This loop (one VMStep built per handler execution — register-state
+    // reconstruction via regfile.state_before(), optional memory reads for
+    // Mode-A opcode decode, plus the deobfuscation pipeline below) is the
+    // single most expensive part of VMAbstractPass for large traces:
+    // `executions` commonly holds hundreds of thousands to millions of
+    // entries, yet previously this whole block ran between the 0.8 and 1.0
+    // progress marks with NO intermediate update — the UI would sit at 80%
+    // for the entire duration and then jump straight to 100%, and a
+    // cancellation request wasn't observed until the loop finished. Report
+    // progress in batches (cheap, no string formatting) and check
+    // ctx.cancelled() periodically so both the progress bar and Cancel
+    // button behave responsively here too.
+    const size_t total_execs = executions.size();
+    constexpr size_t kProgressBatch = 4096;
+    size_t exec_idx = 0;
     for (const auto& exec : executions) {
+        if ((exec_idx % kProgressBatch) == 0) {
+            if (ctx.cancelled()) return PassResult::failed("Cancelled");
+            if (total_execs > 0) {
+                ctx.progress(0.8f + 0.2f * static_cast<float>(exec_idx) /
+                             static_cast<float>(total_execs));
+            }
+        }
+        ++exec_idx;
+
         VMStep step;
         step.inst_id_start = exec.dispatch_inst_id;
         step.inst_id_end = exec.handler_last_inst_id;

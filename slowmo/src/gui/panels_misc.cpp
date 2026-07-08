@@ -482,8 +482,16 @@ void GuiApp::render_progress_overlay() {
     if (total_inst_ == 0) return;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float bar_height = 32.0f;   // taller: 4 lanes + depth sparkline
-    const float bar_y = vp->WorkPos.y + ImGui::GetFrameHeight() * 2.2f;
+    // Timeline must sit exactly between the toolbar and the dockspace.
+    // Use the same constants as render_frame() so the overlay never
+    // bleeds into the dockspace tab bar area.
+    //
+    // IMPORTANT: The window uses NoMouseInputs so it never steals clicks
+    // from the dockspace tab bar directly below.  Mouse interaction
+    // (click-to-seek, hover tooltip, right-click context menu) is handled
+    // manually via ImGui::GetIO() after the rendering section.
+    const float bar_height = kTimelineHeight;             // 32 px
+    const float bar_y = vp->WorkPos.y + kToolbarHeight;   // right below toolbar
     ImVec2 bar_pos(vp->WorkPos.x, bar_y);
     ImVec2 bar_size(vp->WorkSize.x, bar_height);
 
@@ -498,7 +506,7 @@ void GuiApp::render_progress_overlay() {
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_NoDecoration;
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMouseInputs;
 
     if (!ImGui::Begin("##Timeline", nullptr, flags)) {
         ImGui::End();
@@ -799,27 +807,73 @@ void GuiApp::render_progress_overlay() {
                   ImVec2(p0.x + W, p0.y + H - 0.5f),
                   kTimelineBottomBorder, 1.0f);
 
-    // ── Interaction: hover tooltip + click/drag to seek ──────────────
-    ImGui::SetCursorPos(ImVec2(0, 0));
-    ImGui::InvisibleButton("##timeline_btn", ImVec2(W, H),
-        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    // ── Interaction: manual hit-test (NoMouseInputs window) ─────────
+    // Because the window uses NoMouseInputs to avoid stealing clicks from
+    // the dockspace tab bar, we do our own hit-testing against the
+    // timeline rect using raw ImGui::GetIO() mouse state.
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 
-    bool is_hovered = ImGui::IsItemHovered();
-    bool is_active  = ImGui::IsItemActive();
+    // Manual hit-test: is mouse inside the timeline bar?
+    ImVec2 mpos = ImGui::GetIO().MousePos;
+    bool tl_hovered = (mpos.x >= p0.x && mpos.x < p0.x + W &&
+                       mpos.y >= p0.y && mpos.y < p0.y + H);
 
-    if ((is_active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) || ImGui::IsItemClicked()) {
-        float mx = ImGui::GetIO().MousePos.x;
-        float rel = (mx - p0.x) / W;
-        if (rel >= 0.0f && rel <= 1.0f) {
-            uint64_t target = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
-            if (target >= total_inst_) target = total_inst_ - 1;
-            navigate_to(target);
+    // Don't interact when another window (popup, modal) is capturing mouse
+    bool any_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+
+    if (tl_hovered && !any_popup) {
+        // Left-click / drag to seek
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float rel = (mpos.x - p0.x) / W;
+            if (rel >= 0.0f && rel <= 1.0f) {
+                uint64_t target = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
+                if (target >= total_inst_) target = total_inst_ - 1;
+                navigate_to(target);
+            }
         }
+
+        // Right-click context menu
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            timeline_ctx_open_ = true;
+        }
+
+        // Hover tooltip + vertical cursor line
+        float rel = (mpos.x - p0.x) / W;
+        if (rel >= 0.0f && rel <= 1.0f) {
+            uint64_t hover_id = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
+            if (hover_id >= total_inst_) hover_id = total_inst_ - 1;
+            auto hover_row = fetch_row(hover_id);
+
+            std::string depth_info;
+            if (function_result_) {
+                auto stk = function_result_->call_stack_at(hover_id);
+                if (!stk.empty()) {
+                    depth_info = fmt::format("\nCall depth: {}", stk.size());
+                    auto* func = function_result_->function_at(hover_id);
+                    if (func) depth_info += fmt::format(" ({})", func->name);
+                }
+            }
+
+            ImGui::SetTooltip("#%llu  0x%llx\n%s%s\n(left-click/drag: seek | right-click: watch addr)",
+                (unsigned long long)hover_id,
+                (unsigned long long)hover_row.static_pc,
+                hover_row.disasm.c_str(),
+                depth_info.c_str());
+        }
+
+        // Vertical hover line (drawn on foreground so it appears above docked panels)
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        fg->AddLine(ImVec2(mpos.x, p0.y),
+                    ImVec2(mpos.x, p0.y + H),
+                    kHoverLine, 1.0f);
     }
 
-    // Right-click to watch/unwatch memory address
-    if (is_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    // Right-click context menu — rendered as a standalone popup window
+    // (must live outside the NoMouseInputs window).
+    if (timeline_ctx_open_) {
         ImGui::OpenPopup("##timeline_ctx");
+        timeline_ctx_open_ = false;
     }
     if (ImGui::BeginPopup("##timeline_ctx")) {
         ImGui::TextDisabled("Timeline Options");
@@ -832,7 +886,6 @@ void GuiApp::render_progress_overlay() {
         } else {
             ImGui::TextDisabled("No memory address watched");
         }
-        // Show watch from current hex dump address
         if (ctx_mem_addr_ != 0) {
             char lbl[64];
             snprintf(lbl, sizeof(lbl), "Watch 0x%llx in Timeline",
@@ -843,44 +896,6 @@ void GuiApp::render_progress_overlay() {
         }
         ImGui::EndPopup();
     }
-
-    if (is_hovered) {
-        float mx = ImGui::GetIO().MousePos.x;
-        float rel = (mx - p0.x) / W;
-        if (rel >= 0.0f && rel <= 1.0f) {
-            uint64_t hover_id = static_cast<uint64_t>(rel * static_cast<float>(total_inst_));
-            if (hover_id >= total_inst_) hover_id = total_inst_ - 1;
-            auto hover_row = fetch_row(hover_id);
-
-            // Show call depth in tooltip if available
-            std::string depth_info;
-            if (function_result_) {
-                auto stk = function_result_->call_stack_at(hover_id);
-                if (!stk.empty()) {
-                    depth_info = fmt::format("\nCall depth: {}", stk.size());
-                    if (!stk.empty()) {
-                        auto* func = function_result_->function_at(hover_id);
-                        if (func) depth_info += fmt::format(" ({})", func->name);
-                    }
-                }
-            }
-
-            ImGui::SetTooltip("#%llu  0x%llx\n%s%s\n(left-click/drag: seek | right-click: watch addr)",
-                (unsigned long long)hover_id,
-                (unsigned long long)hover_row.static_pc,
-                hover_row.disasm.c_str(),
-                depth_info.c_str());
-        }
-
-        // Vertical hover line (dim)
-        float mx_screen = ImGui::GetIO().MousePos.x;
-        draw->AddLine(ImVec2(mx_screen, p0.y),
-                      ImVec2(mx_screen, p0.y + H),
-                      kHoverLine, 1.0f);
-    }
-
-    ImGui::End();
-    ImGui::PopStyleVar(2);
 }
 
 // ─── Minimap Pixel Cache ─────────────────────────────────────────────────────
