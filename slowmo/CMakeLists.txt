@@ -443,6 +443,7 @@ add_library(tenet_lib STATIC
     src/tui/panels/thread_panel.cpp
     src/tui/panels/breakpoint_panel.cpp
     src/tui/panels/results_panel.cpp
+    src/service/tenet_service.cpp
 )
 
 target_include_directories(tenet_lib BEFORE PUBLIC
