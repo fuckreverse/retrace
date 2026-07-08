@@ -1,8 +1,7 @@
 // tools/tenet/src/ws/ws_handlers_nav.cpp
 //
 // Navigation, bookmark, trace-info, and search WebSocket handlers.
-// All synchronous except handle_search_forward which dispatches to a worker
-// thread and sends the response back via loop->defer().
+// All handlers are synchronous (run on the uWS event loop thread).
 #include "ws/tenet_ws_service.h"
 #include "common/types.h"
 #include "io/trace_reader.h"
@@ -15,7 +14,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 namespace tenet {
@@ -161,28 +159,22 @@ void TenetWSService::handle_search_forward(void* ws, uint32_t msg_id,
     std::string query = req->query() ? req->query()->str() : "";
     uint64_t from = req->from_inst();
 
-    // Heavy operation: dispatch to a worker thread, then send the response
-    // back on the event loop thread via loop->defer().
-    auto* loop_ptr = loop_.load();
-    if (!loop_ptr) {
-        send_error(ws, msg_id, 3, "SearchForward: event loop not available");
-        return;
-    }
+    // Synchronous: blocks the event loop for the duration of the search.
+    // This is intentional — TenetService is not thread-safe, so dispatching
+    // to a worker thread would race with other handlers touching service_
+    // state (row cache, search results, register file, etc.).
+    // TODO: async search requires TenetService-level locking or a
+    //       copy-on-write snapshot mechanism before it can be safely
+    //       offloaded to a background thread.
+    service_.search_forward(query, from);
 
-    std::thread([this, ws, msg_id, query = std::move(query), from, loop_ptr]() {
-        service_.search_forward(query, from);
-
-        auto* loop = static_cast<uWS::Loop*>(loop_ptr);
-        loop->defer([this, ws, msg_id]() {
-            auto& results = service_.search_results();
-            flatbuffers::FlatBufferBuilder fbb(results.size() * 8 + 64);
-            auto rv = fbb.CreateVector(results.data(), results.size());
-            auto resp = CreateSearchForwardResponse(fbb, rv,
-                                                     static_cast<uint32_t>(results.size()));
-            fbb.Finish(resp);
-            send_envelope(ws, msg_id, MessageType_SearchForwardResp, fbb);
-        });
-    }).detach();
+    auto& results = service_.search_results();
+    flatbuffers::FlatBufferBuilder fbb(results.size() * 8 + 64);
+    auto rv = fbb.CreateVector(results.data(), results.size());
+    auto resp = CreateSearchForwardResponse(fbb, rv,
+                                             static_cast<uint32_t>(results.size()));
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, MessageType_SearchForwardResp, fbb);
 }
 
 void TenetWSService::handle_search_clear(void* ws, uint32_t msg_id) {
