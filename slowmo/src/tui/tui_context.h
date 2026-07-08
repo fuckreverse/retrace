@@ -17,6 +17,7 @@ class InstructionDecoder;
 class RegisterFile;
 class MemoryModel;
 class PassManager;
+class TenetService;
 struct TaintResult;
 struct BackwardTaintResult;
 struct FunctionResult;
@@ -66,6 +67,10 @@ struct TuiContext {
     InstructionDecoder* decoder = nullptr;
     RegisterFile*       regfile = nullptr;
     MemoryModel*        memory = nullptr;
+
+    /// If non-null, the shared application service. Panels can use this for
+    /// navigation and data access instead of raw backend pointers.
+    TenetService* service = nullptr;
 
     // ─── Navigation state (read/write by panels) ──────────────────────
     uint64_t total_inst = 0;

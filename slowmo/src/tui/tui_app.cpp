@@ -81,6 +81,63 @@ static Color inst_color(const std::string& disasm) {
 
 // ─── Constructor ────────────────────────────────────────────────────────────
 
+TuiApp::TuiApp(TenetService& service)
+    : reader_(service.reader()), index_(service.index()),
+      code_table_(service.code_table()), decoder_(service.decoder()),
+      regfile_(service.regfile()), memory_(service.memory()),
+      screen_(ScreenInteractive::Fullscreen()),
+      service_(&service) {
+    // Initialize shared context
+    ctx_.reader = &reader_;
+    ctx_.index = &index_;
+    ctx_.code_table = &code_table_;
+    ctx_.decoder = &decoder_;
+    ctx_.regfile = &regfile_;
+    ctx_.memory = &memory_;
+    ctx_.service = service_;
+    ctx_.fetch_row = &TuiApp::fetch_row_trampoline;
+    ctx_.fetch_row_self = this;
+    ctx_.navigate_to_fn = &TuiApp::navigate_to_trampoline;
+    ctx_.navigate_self = this;
+    ctx_.run_pass_fn = &TuiApp::run_pass_trampoline;
+    ctx_.run_pass_self = this;
+
+    // Derive navigation state from service
+    total_inst_ = service_->total_inst();
+    current_inst_ = service_->current_inst();
+    ctx_.bookmarks = service_->bookmarks();
+
+    int h = screen_.dimy();
+    viewport_height_ = (h > 6) ? h - 4 : 20;
+    if (current_inst_ > 0) update_viewport();
+
+    // Initialize hex dump view
+    hex_dump_view_ = std::make_unique<HexDumpView>(memory_);
+    hex_dump_view_->set_time(0);
+    hex_dump_view_->set_address(0);
+
+    // Create panels
+    register_panel_ = std::make_unique<RegisterPanel>(ctx_);
+    memory_panel_ = std::make_unique<MemoryPanel>(ctx_);
+    callstack_panel_ = std::make_unique<CallstackPanel>(ctx_);
+    functions_panel_ = std::make_unique<FunctionsPanel>(ctx_);
+    strings_panel_ = std::make_unique<StringsPanel>(ctx_);
+    thread_panel_ = std::make_unique<ThreadPanel>(ctx_);
+    results_panel_ = std::make_unique<ResultsPanel>(ctx_);
+
+    right_panels_ = {
+        register_panel_.get(),
+        memory_panel_.get(),
+        callstack_panel_.get(),
+        functions_panel_.get(),
+        strings_panel_.get(),
+        thread_panel_.get(),
+        results_panel_.get(),
+    };
+
+    init_key_bindings();
+}
+
 TuiApp::TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
                InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory)
     : reader_(reader), index_(index), code_table_(code_table),
@@ -149,7 +206,8 @@ void TuiApp::sync_context() {
     ctx_.show_backward_taint = show_backward_taint_;
     ctx_.show_nzcv = show_nzcv_;
     ctx_.show_fpr = show_fpr_;
-    ctx_.pass_manager = pass_manager_.get();
+    ctx_.pass_manager = service_ ? service_->pass_manager()
+                                 : pass_manager_.get();
 }
 
 void TuiApp::focus_panel(Panel* p) {
@@ -161,6 +219,8 @@ void TuiApp::focus_panel(Panel* p) {
 // ─── Row fetching ───────────────────────────────────────────────────────────
 
 InstructionRow TuiApp::fetch_row(uint64_t inst_id) {
+    if (service_) return service_->fetch_row(inst_id);
+
     auto cached = row_cache_.get(inst_id);
     if (cached) return *cached;
 
@@ -491,6 +551,13 @@ void TuiApp::nav_push(uint64_t inst_id) {
 }
 
 void TuiApp::nav_back() {
+    if (service_) {
+        if (!service_->can_nav_back()) return;
+        service_->nav_back();
+        current_inst_ = service_->current_inst();
+        update_viewport();
+        return;
+    }
     if (nav_history_.empty() || nav_history_pos_ == 0) return;
     nav_history_pos_--;
     nav_history_navigating_ = true;
@@ -499,6 +566,13 @@ void TuiApp::nav_back() {
 }
 
 void TuiApp::nav_forward() {
+    if (service_) {
+        if (!service_->can_nav_forward()) return;
+        service_->nav_forward();
+        current_inst_ = service_->current_inst();
+        update_viewport();
+        return;
+    }
     if (nav_history_.empty() || nav_history_pos_ >= nav_history_.size() - 1) return;
     nav_history_pos_++;
     nav_history_navigating_ = true;
@@ -507,6 +581,12 @@ void TuiApp::nav_forward() {
 }
 
 void TuiApp::navigate_to(uint64_t inst_id) {
+    if (service_) {
+        service_->navigate_to(inst_id);
+        current_inst_ = service_->current_inst();
+        update_viewport();
+        return;
+    }
     if (inst_id >= total_inst_) inst_id = total_inst_ > 0 ? total_inst_ - 1 : 0;
     nav_push(inst_id);  // record in history (no-op when back/forward navigating)
     current_inst_ = inst_id;
@@ -578,6 +658,11 @@ void TuiApp::search_prev() {
 // ─── Bookmarks ──────────────────────────────────────────────────────────────
 
 void TuiApp::toggle_bookmark() {
+    if (service_) {
+        service_->toggle_bookmark(current_inst_);
+        ctx_.bookmarks = service_->bookmarks();
+        return;
+    }
     auto it = std::lower_bound(ctx_.bookmarks.begin(), ctx_.bookmarks.end(), current_inst_);
     if (it != ctx_.bookmarks.end() && *it == current_inst_) {
         ctx_.bookmarks.erase(it);
@@ -1377,15 +1462,8 @@ void TuiApp::goto_taint_prev() {
 // ─── Analysis passes ────────────────────────────────────────────────────────
 
 void TuiApp::run_taint_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
+    ensure_pass_manager();
+    auto* pm = service_ ? service_->pass_manager() : pass_manager_.get();
 
     // Configure taint: start with current instruction's modified registers as sources
     TaintConfig config;
@@ -1406,25 +1484,18 @@ void TuiApp::run_taint_analysis() {
         }
     }
 
-    pass_manager_->register_pass(std::make_unique<TaintPass>(config));
-    auto& result = pass_manager_->require("taint");
+    pm->register_pass(std::make_unique<TaintPass>(config));
+    auto& result = pm->require("taint");
     if (result.ok()) {
-ctx_.taint_result = &result.get<TaintResult>();
-show_taint_ = true;
-taint_jump_list_.clear();  // Will be rebuilt lazily
-}
+        ctx_.taint_result = &result.get<TaintResult>();
+        show_taint_ = true;
+        taint_jump_list_.clear();  // Will be rebuilt lazily
+    }
 }
 
 void TuiApp::run_backward_taint_analysis() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-    }
+    ensure_pass_manager();
+    auto* pm = service_ ? service_->pass_manager() : pass_manager_.get();
 
     // Configure backward taint: current instruction is the sink
     BackwardTaintConfig config;
@@ -1449,14 +1520,14 @@ void TuiApp::run_backward_taint_analysis() {
         config.add_sink_reg(0);
     }
 
-    pass_manager_->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
-    auto& result = pass_manager_->require("backward_taint");
+    pm->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
+    auto& result = pm->require("backward_taint");
     if (result.ok()) {
         ctx_.backward_taint_result = &result.get<BackwardTaintResult>();
-show_backward_taint_ = true;
-show_taint_ = false;
-taint_jump_list_.clear();
-}
+        show_backward_taint_ = true;
+        show_taint_ = false;
+        taint_jump_list_.clear();
+    }
 }
 
 void TuiApp::clear_analysis() {
@@ -1510,7 +1581,9 @@ callstack_panel_->set_visible(false);
     functions_panel_->set_focused(false);
     callstack_panel_->set_focused(false);
     memory_panel_->set_focused(false);
-    if (pass_manager_) {
+    if (service_) {
+        service_->clear_analysis();
+    } else if (pass_manager_) {
         pass_manager_->invalidate_all();
     }
 }
@@ -1521,6 +1594,10 @@ callstack_panel_->set_visible(false);
 // the TUI, mirroring the GUI "All Passes" section and the CLI --run-pass flag.
 
 void TuiApp::ensure_pass_manager() {
+    if (service_) {
+        service_->ensure_pass_manager();
+        return;
+    }
     if (!pass_manager_) {
         pass_manager_ = std::make_unique<PassManager>();
         pass_manager_->set_reader(&reader_);
@@ -1615,6 +1692,7 @@ void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
 
 void TuiApp::run_pass_by_name(std::string_view name) {
     ensure_pass_manager();
+    auto* pm = service_ ? service_->pass_manager() : pass_manager_.get();
 
     if (!tenet::is_known_pass(name)) {
         last_pass_status_ = fmt::format("unknown pass '{}'", name);
@@ -1632,12 +1710,12 @@ void TuiApp::run_pass_by_name(std::string_view name) {
         ctx.current_reg = (inst.reg_diff_count > 0) ? inst.reg_diff(0).index : 0;
     }
 
-    if (!tenet::register_pass_by_name(*pass_manager_, name, ctx)) {
+    if (!tenet::register_pass_by_name(*pm, name, ctx)) {
         last_pass_status_ = fmt::format("'{}' could not be registered", name);
         return;
     }
 
-    auto& raw = pass_manager_->require(name);
+    auto& raw = pm->require(name);
     last_pass_status_ = fmt::format("{}: {}", name,
                                     tenet::summarize_pass_result(name, raw));
     wire_pass_result(name, raw);
@@ -1652,10 +1730,11 @@ void TuiApp::run_pass_by_name(std::string_view name) {
 
 void TuiApp::run_default_analysis() {
     ensure_pass_manager();
+    auto* pm = service_ ? service_->pass_manager() : pass_manager_.get();
 
-    tenet::register_default_passes(*pass_manager_);
+    tenet::register_default_passes(*pm);
     for (auto name : tenet::default_ui_pass_names()) {
-        auto& raw = pass_manager_->require(name);
+        auto& raw = pm->require(name);
         wire_pass_result(name, raw);
     }
     last_pass_status_ = fmt::format("ran {} default passes",

@@ -22,6 +22,7 @@
 #include "tui/panels/breakpoint_panel.h"
 #include "tui/panels/results_panel.h"
 #include "analysis/pass_manager.h"
+#include "service/tenet_service.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -40,6 +41,10 @@ namespace tenet {
 
 class TuiApp {
 public:
+    /// New constructor — preferred.  Delegates shared state to TenetService.
+    explicit TuiApp(TenetService& service);
+
+    /// Old constructor — retained for backward compat during migration.
     TuiApp(TraceReader& reader, TraceIndex& index, CodeTable& code_table,
            InstructionDecoder& decoder, RegisterFile& regfile, MemoryModel& memory);
 
@@ -86,6 +91,9 @@ private:
     bool show_mem_ = false;      // inline memory in instruction list (not the memory panel)
     bool show_nzcv_ = true;      // register display sub-option
     bool show_fpr_ = false;      // register display sub-option
+
+    // ─── Service layer (nullptr when using old constructor) ──────────
+    TenetService* service_ = nullptr;
 
     // ─── Cached rows ──────────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{1024};

@@ -6,6 +6,7 @@
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
 #include "tui/tui_app.h"
+#include "service/tenet_service.h"
 #if TENET_HAS_GUI
 #include "gui/gui_app.h"
 #endif
@@ -280,7 +281,8 @@ int main(int argc, char** argv) {
 
     // ─── Run interactive mode (GUI / TUI) or batch mode ──────────────────
     if (opts.batch_mode) {
-        TuiApp app(reader, index, code_table, decoder, regfile, memory);
+        TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+        TuiApp app(service);
         return app.batch_mode(opts.start_id, opts.display_count, opts.show_regs, opts.show_mem);
     }
 
@@ -295,6 +297,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Fallback to TUI (or --tui explicitly requested)
-    TuiApp app(reader, index, code_table, decoder, regfile, memory);
+    TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+    TuiApp app(service);
     return app.run();
 }
