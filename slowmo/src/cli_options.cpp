@@ -30,6 +30,7 @@ bool CliOptions::has_analysis_option() const {
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
            opt_vm_abstract ||
+           opt_suggest_excludes ||
            opt_index_build ||
            !run_pass_names.empty() ||
            opt_cache_list ||
@@ -104,6 +105,15 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --vm-handler <hex>            Hint: handler entry PC (hex, repeatable)\n");
     fmt::print(stderr, "  --vm-hints <file.json>        Load VM static-analysis hints from a JSON file\n");
     fmt::print(stderr, "  --vm-decoder <file.json>      Load VM bytecode decoder definition (JSON)\n");
+    fmt::print(stderr, "  --suggest-excludes            Suggest qbditrace --exclude-range spans from "
+                                                        "high-iteration loops\n");
+    fmt::print(stderr, "                                (run on a qbditrace --sampling trace before "
+                                                        "the full recording)\n");
+    fmt::print(stderr, "  --suggest-excludes-min-iter <N>  Minimum loop iteration count to suggest "
+                                                          "(default: 10000)\n");
+    fmt::print(stderr, "  --suggest-excludes-top <N>       Limit to top N loops by iteration count "
+                                                          "(default: 20, 0 = unlimited)\n");
+    fmt::print(stderr, "  --suggest-excludes-output <file> Also write suggestions as .json or .txt\n");
     fmt::print(stderr, "  --image <path>                Load binary image for code/string fallback\n");
     fmt::print(stderr, "  --dump-memaccess <start> <count>  Dump memory reads/writes + register ASCII in inst_id range\n");
     fmt::print(stderr, "  --dump-ma-strings              With --dump-memaccess: only output decoded strings\n");
@@ -277,6 +287,14 @@ CliOptions parse_args(int argc, char** argv) {
             opts.vm_hints_file = argv[++i];
         } else if (arg == "--vm-decoder" && i + 1 < argc) {
             opts.vm_decoder_file = argv[++i];
+        } else if (arg == "--suggest-excludes") {
+            opts.opt_suggest_excludes = true;
+        } else if (arg == "--suggest-excludes-min-iter" && i + 1 < argc) {
+            opts.suggest_excludes_min_iterations = std::stoull(argv[++i]);
+        } else if (arg == "--suggest-excludes-top" && i + 1 < argc) {
+            opts.suggest_excludes_top_n = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--suggest-excludes-output" && i + 1 < argc) {
+            opts.suggest_excludes_output_path = argv[++i];
         } else if (arg == "--memread" && i + 3 < argc) {
             opts.opt_memread = true;
             opts.memread_addr = std::stoull(argv[++i], nullptr, 16);

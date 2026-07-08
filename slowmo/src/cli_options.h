@@ -155,6 +155,18 @@ struct CliOptions {
     std::string vm_hints_file;             // --vm-hints <path.json>
     std::string vm_decoder_file;           // --vm-decoder <path.json>
 
+    // --- Suggest excludes (sampling-trace workflow) ---
+    // Runs the loop pass and prints candidate --exclude-range spans for the
+    // qbditrace re-record (or for --exclude-range on this very trace's other
+    // analyses): large, high-iteration loops that are likely noise (memset-
+    // style spins, busy-waits, anti-debug delays, etc.) rather than logic
+    // worth tracing in full. Intended to be run on a small --sampling trace
+    // (see qbditrace_runner.py --sampling) before committing to a full trace.
+    bool opt_suggest_excludes = false;
+    uint64_t suggest_excludes_min_iterations = 10000;  // --suggest-excludes-min-iter
+    size_t suggest_excludes_top_n = 20;                // --suggest-excludes-top <N> (0 = unlimited)
+    std::string suggest_excludes_output_path;          // --suggest-excludes-output <file> (.json or .txt); empty = stdout only
+
     // --- Generic pass runner ---
     bool opt_index_build = false;
     std::vector<std::string> run_pass_names;

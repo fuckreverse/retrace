@@ -435,6 +435,149 @@ static int run_call_graph(PassManager& pm, const std::string& output_path) {
     return 0;
 }
 
+// ── --suggest-excludes ──────────────────────────────────────────────────
+// Turns the `loop` pass output into candidate qbditrace --exclude-range
+// spans: large, high-iteration loops that dominate instruction count but
+// are usually noise (memset-style spins, checksum/CRC padding loops,
+// anti-debug busy-waits, ...) rather than logic worth tracing in full.
+//
+// Intended workflow (see qbditrace_runner.py --sampling):
+//   1. Record a cheap --sampling trace (bare PC stream, no reg/mem payload).
+//   2. Run `tenet --suggest-excludes sampling.bin` on it.
+//   3. Statically confirm the suggested ranges are indeed irrelevant (IDA).
+//   4. Re-record the real trace with the confirmed ranges passed as
+//      --exclude-range so the full, fully-recorded trace stays small.
+//
+// This only ever *suggests* — it never decides for the user. Nested loops
+// are deliberately not merged: an outer loop and its inner loop can both be
+// reported (the outer span is a superset address range), and it's up to the
+// user to pick the granularity that matches what they've statically
+// confirmed as safe to exclude.
+static int run_suggest_excludes(PassManager& pm, uint64_t min_iterations,
+                                 size_t top_n, const std::string& output_path) {
+    const auto& result_raw = pm.require("loop");
+    if (!result_raw.ok()) {
+        fmt::print(stderr, "[suggest-excludes] Loop pass failed: {}\n",
+                   result_raw.error_message);
+        return 1;
+    }
+    const auto& loops = result_raw.get<LoopResult>();
+
+    // Candidate = a loop whose iteration_count clears the threshold and that
+    // has at least one body PC (so we can derive an address range from it).
+    struct Candidate {
+        uint64_t header_pc;
+        uint64_t range_start;   // min body PC
+        uint64_t range_end;     // max body PC + 4 (exclusive, AArch64 fixed-width)
+        uint64_t iteration_count;
+        uint32_t nesting_depth;
+        size_t num_body_pcs;
+    };
+
+    std::vector<Candidate> candidates;
+    for (const auto& loop : loops.loops) {
+        if (loop.iteration_count < min_iterations) continue;
+        if (loop.body_pcs.empty()) continue;
+        // body_pcs is sorted (see LoopPass::run), so front/back are the
+        // address extremes of this loop's body.
+        Candidate c;
+        c.header_pc = loop.header_pc;
+        c.range_start = loop.body_pcs.front();
+        c.range_end = loop.body_pcs.back() + 4;  // +1 instruction, AArch64 fixed 4B
+        c.iteration_count = loop.iteration_count;
+        c.nesting_depth = loop.nesting_depth;
+        c.num_body_pcs = loop.body_pcs.size();
+        candidates.push_back(c);
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  return a.iteration_count > b.iteration_count;
+              });
+
+    if (top_n > 0 && candidates.size() > top_n) {
+        candidates.resize(top_n);
+    }
+
+    if (candidates.empty()) {
+        fmt::print(stderr,
+            "[suggest-excludes] No loops with iteration_count >= {} found "
+            "({} total loops detected). Nothing to suggest — either the "
+            "trace has no dominant loops, or --suggest-excludes-min-iter "
+            "is set too high.\n",
+            min_iterations, loops.loops.size());
+        return 0;
+    }
+
+    fmt::print("[suggest-excludes] {} candidate loop(s) (of {} total, "
+               "iteration_count >= {}):\n\n",
+               candidates.size(), loops.loops.size(), min_iterations);
+    fmt::print("  {:<12} {:<22} {:<14} {:<6} {:<8}\n",
+               "ITERATIONS", "RANGE", "HEADER_PC", "DEPTH", "BODY_PCS");
+    for (const auto& c : candidates) {
+        fmt::print("  {:<12} 0x{:X}-0x{:X}   0x{:<10X}  {:<6} {:<8}\n",
+                   c.iteration_count, c.range_start, c.range_end,
+                   c.header_pc, c.nesting_depth, c.num_body_pcs);
+    }
+
+    fmt::print("\n[suggest-excludes] qbditrace_runner.py flags "
+               "(copy/paste for the full-record run):\n  ");
+    for (const auto& c : candidates) {
+        fmt::print("--exclude-range 0x{:X}-0x{:X} ", c.range_start, c.range_end);
+    }
+    fmt::print("\n");
+    fmt::print(
+        "\n[suggest-excludes] NOTE: these are *candidates*, not verdicts. "
+        "Confirm statically (IDA/disassembly) that a suggested range is "
+        "genuinely irrelevant (e.g. a memset/CRC/busy-wait loop) before "
+        "excluding it — a loop with huge iteration_count can still be the "
+        "exact logic you care about (e.g. a crypto round function).\n");
+
+    if (!output_path.empty()) {
+        bool json_output = (output_path.size() >= 5 &&
+                             output_path.substr(output_path.size() - 5) == ".json");
+        if (json_output) {
+            json output;
+            output["min_iterations"] = min_iterations;
+            output["total_loops"] = loops.loops.size();
+            json arr = json::array();
+            for (const auto& c : candidates) {
+                arr.push_back({
+                    {"header_pc", fmt::format("0x{:X}", c.header_pc)},
+                    {"range_start", fmt::format("0x{:X}", c.range_start)},
+                    {"range_end", fmt::format("0x{:X}", c.range_end)},
+                    {"iteration_count", c.iteration_count},
+                    {"nesting_depth", c.nesting_depth},
+                    {"num_body_pcs", c.num_body_pcs},
+                });
+            }
+            output["candidates"] = std::move(arr);
+            std::ofstream out(output_path);
+            if (!out.is_open()) {
+                fmt::print(stderr, "[suggest-excludes] Cannot open output file: {}\n",
+                           output_path);
+                return 1;
+            }
+            out << output.dump(2);
+        } else {
+            std::ofstream out(output_path);
+            if (!out.is_open()) {
+                fmt::print(stderr, "[suggest-excludes] Cannot open output file: {}\n",
+                           output_path);
+                return 1;
+            }
+            for (const auto& c : candidates) {
+                out << fmt::format("--exclude-range 0x{:X}-0x{:X}\n",
+                                    c.range_start, c.range_end);
+            }
+        }
+        fmt::print(stderr, "[suggest-excludes] wrote {} candidate(s) -> {}\n",
+                   candidates.size(), output_path);
+    }
+
+    return 0;
+}
+
 static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_reg) {
     const auto& result_raw = pm.require("backward_taint");
     if (!result_raw.ok()) {
@@ -751,6 +894,13 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<VMAbstractPass>(std::move(vm_cfg)));
     }
 
+    // --suggest-excludes needs xref -> cfg -> loop
+    if (opts.opt_suggest_excludes) {
+        pm.register_pass(std::make_unique<XrefPass>());
+        pm.register_pass(std::make_unique<CFGPass>());
+        pm.register_pass(std::make_unique<LoopPass>());
+    }
+
     // --taint-source-annotation: annotate backward taint sources with ObjC context
     if (opts.opt_taint_source_annotation) {
         // Needs backward_taint (already registered if --backward-taint) and objc
@@ -859,6 +1009,12 @@ int tenet::run_batch_analysis(const CliOptions& opts,
 
     if (!opts.call_graph_path.empty()) {
         rc |= run_call_graph(pm, opts.call_graph_path);
+    }
+
+    if (opts.opt_suggest_excludes) {
+        rc |= run_suggest_excludes(pm, opts.suggest_excludes_min_iterations,
+                                    opts.suggest_excludes_top_n,
+                                    opts.suggest_excludes_output_path);
     }
 
     if (opts.opt_backward_taint) {
@@ -1218,9 +1374,19 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             std::unique_ptr<VMBytecodeDecoder> vm_decoder;
             if (!opts.vm_decoder_file.empty()) {
                 try {
+                    // load_decoder_from_json() returns nullptr (not an
+                    // exception) for file-not-found / JSON-parse errors —
+                    // only mapping-level errors raise std::runtime_error.
+                    // Must check for null before dereferencing below.
                     vm_decoder = load_decoder_from_json(opts.vm_decoder_file);
-                    fmt::print(stderr, "[vm-decoder] Loaded '{}' from {}\n",
-                               vm_decoder->name(), opts.vm_decoder_file);
+                    if (!vm_decoder) {
+                        fmt::print(stderr,
+                            "[vm-decoder] Failed to load {}: file not found "
+                            "or invalid JSON\n", opts.vm_decoder_file);
+                    } else {
+                        fmt::print(stderr, "[vm-decoder] Loaded '{}' from {}\n",
+                                   vm_decoder->name(), opts.vm_decoder_file);
+                    }
                 } catch (const std::exception& e) {
                     fmt::print(stderr, "[vm-decoder] Failed to load {}: {}\n",
                                opts.vm_decoder_file, e.what());
