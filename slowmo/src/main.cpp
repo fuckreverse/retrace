@@ -273,21 +273,19 @@ int main(int argc, char** argv) {
     } shutdown_guard{&memory, &index};
 
 
+    // Create TenetService — shared by all paths (batch, GUI, TUI).
+    TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
+
     // ─── Run analysis options (batch mode) ─────────────────────────────────
     if (has_analysis_option) {
-        return tenet::run_batch_analysis(opts, reader, index, code_table, decoder, regfile, memory);
+        return tenet::run_batch_analysis(opts, service);
     }
-
 
     // ─── Run interactive mode (GUI / TUI) or batch mode ──────────────────
     if (opts.batch_mode) {
-        TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
         TuiApp app(service);
         return app.batch_mode(opts.start_id, opts.display_count, opts.show_regs, opts.show_mem);
     }
-
-    // Create a shared TenetService for both GUI and TUI paths.
-    TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
 
 #if TENET_HAS_GUI
     if (!opts.force_tui) {

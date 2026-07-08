@@ -2326,3 +2326,11 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
 
     return rc;
 }
+
+// ─── Convenience overload ────────────────────────────────────────────────────
+
+int tenet::run_batch_analysis(const CliOptions& opts, TenetService& service) {
+    return run_batch_analysis(opts, service.reader(), service.index(),
+                              service.code_table(), service.decoder(),
+                              service.regfile(), service.memory());
+}

@@ -14,6 +14,7 @@
 #include "core/register_file.h"
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
+#include "service/tenet_service.h"
 
 namespace tenet {
 
@@ -26,5 +27,8 @@ int run_batch_analysis(const CliOptions& opts,
                        InstructionDecoder& decoder,
                        RegisterFile& regfile,
                        MemoryModel& memory);
+
+/// Convenience overload — delegates to the 7-argument version.
+int run_batch_analysis(const CliOptions& opts, TenetService& service);
 
 }  // namespace tenet
