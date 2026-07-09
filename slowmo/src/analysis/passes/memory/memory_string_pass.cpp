@@ -7,6 +7,7 @@
 #include "core/register_file.h"
 #include <fmt/core.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 
@@ -160,23 +161,42 @@ void MemoryStringCollector::on_objc(uint64_t inst_id, const ObjcView& objc) {
 // ─── String scanning in a byte buffer ─────────────────────────────────────
 
 std::vector<MemoryStringPass::ScanHit>
-MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
-                                    const std::vector<bool>& known,
+MemoryStringPass::scan_for_strings(const uint8_t* data,
+                                    const uint8_t* known,
+                                    size_t size,
                                     size_t min_len, size_t max_len) {
     std::vector<ScanHit> hits;
-    const size_t size = data.size();
+    if (size == 0) return hits;
+    // Most windows contain only a handful of strings; reserve once to avoid
+    // repeated reallocs across the (potentially tens of thousands of) call
+    // sites this runs for.
+    hits.reserve(8);
 
     // Tracks which offsets already produced an ASCII/UTF-8 hit, so the
     // UTF-16LE pass below can skip duplicate-offset checks in O(1) instead
-    // of an O(hits) linear scan per candidate (this loop runs per call site,
-    // and there can be tens of thousands of call sites in a large trace).
-    ankerl::unordered_dense::set<size_t> ascii_hit_offsets;
+    // of an O(hits) linear scan per candidate.  A flat bitmap is dramatically
+    // cheaper than the previous ankerl::unordered_dense::set<size_t> which
+    // allocated a bucket array on every call.
+    //
+    // The common scan windows are <= 512 bytes (scan_size=256, stack 512),
+    // so a stack array covers them with zero allocation; larger windows fall
+    // back to a heap vector.
+    constexpr size_t STACK_BMP = 512;
+    std::array<uint8_t, STACK_BMP> stack_bmp{};
+    std::vector<uint8_t> heap_bmp;
+    uint8_t* bmp;
+    if (size <= STACK_BMP) {
+        bmp = stack_bmp.data();
+    } else {
+        heap_bmp.assign(size, 0);
+        bmp = heap_bmp.data();
+    }
 
     // ─── Phase 1: ASCII / UTF-8 scan ─────────────────────────────────────
     size_t i = 0;
     while (i < size) {
         // Skip unknown or non-printable bytes
-        if (!known[i] || !std::isprint(static_cast<unsigned char>(data[i]))) {
+        if (!known[i] || !std::isprint(data[i])) {
             i++;
             continue;
         }
@@ -186,8 +206,7 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
         while (i < size && known[i]) {
             uint8_t c = data[i];
             // Accept printable ASCII + common whitespace (tab, newline, CR)
-            if (std::isprint(static_cast<unsigned char>(c)) ||
-                c == '\t' || c == '\n' || c == '\r') {
+            if (std::isprint(c) || c == '\t' || c == '\n' || c == '\r') {
                 i++;
             } else {
                 break;
@@ -198,8 +217,8 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
         if (len >= min_len) {
             ScanHit hit;
             hit.offset = start;
-            hit.content = std::string(reinterpret_cast<const char*>(data.data() + start),
-                                      std::min(len, max_len));
+            hit.content.assign(reinterpret_cast<const char*>(data + start),
+                               std::min(len, max_len));
             // Trim trailing whitespace/newlines
             while (!hit.content.empty() &&
                    (hit.content.back() == '\n' || hit.content.back() == '\r' ||
@@ -216,7 +235,7 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
                     }
                 }
                 hit.encoding = has_multibyte ? MemoryString::UTF8 : MemoryString::ASCII;
-                ascii_hit_offsets.insert(start);
+                bmp[start] = 1;
                 hits.push_back(std::move(hit));
             }
         }
@@ -227,7 +246,7 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
     i = 0;
     while (i + 1 < size) {
         if (!known[i] || !known[i + 1] || data[i + 1] != 0x00 ||
-            !std::isprint(static_cast<unsigned char>(data[i]))) {
+            !std::isprint(data[i])) {
             i += 2;
             continue;
         }
@@ -236,8 +255,7 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
         std::string utf8_content;
         while (i + 1 < size && known[i] && known[i + 1] && data[i + 1] == 0x00) {
             uint8_t c = data[i];
-            if (std::isprint(static_cast<unsigned char>(c)) ||
-                c == '\t' || c == '\n' || c == '\r') {
+            if (std::isprint(c) || c == '\t' || c == '\n' || c == '\r') {
                 utf8_content += static_cast<char>(c);
                 i += 2;
             } else {
@@ -247,12 +265,11 @@ MemoryStringPass::scan_for_strings(const std::vector<uint8_t>& data,
 
         if (utf8_content.size() >= min_len) {
             // Avoid duplicate if we already found this exact run as ASCII at
-            // the same offset. O(1) set lookup instead of an O(hits) linear
+            // the same offset. O(1) bitmap lookup instead of an O(hits) linear
             // scan — this function runs once per call site (potentially
             // tens of thousands of times per trace), so the difference
             // between O(1) and O(hits) here is significant in aggregate.
-            bool duplicate = ascii_hit_offsets.count(start) != 0;
-            if (!duplicate) {
+            if (!bmp[start]) {
                 ScanHit hit;
                 hit.offset = start;
                 hit.content = utf8_content.substr(0, max_len);
@@ -435,6 +452,16 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     // ─── Phase 2: analyze each call site with regfile + memory ────────────
     MemoryStringResult result;
 
+    // Reusable byte buffer for the "known" mask. MemoryModel::read_region
+    // returns std::vector<bool> (bit-packed); probing it byte-by-byte inside
+    // the scan hot loops is slow because every access is a word-fetch + bit
+    // shift. We flatten it to 1 byte per element once per read_region and
+    // hand scan_for_strings raw pointers — the scan loops then become plain
+    // byte arrays the compiler can vectorise. The buffer is resized (never
+    // reallocated after the first large window) and reused across every call
+    // site, so it costs zero per-iteration allocation.
+    std::vector<uint8_t> known_bytes;
+
     // Helper: add a discovered string to result (with deduplication).
     auto add_string = [&](MemoryString&& ms) {
         // Dedup: same content at same address — keep earliest discovery
@@ -446,6 +473,51 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         result.by_addr[ms.addr].push_back(idx);
         result.by_call_site[ms.call_site_inst_id].push_back(idx);
         result.strings.push_back(std::move(ms));
+    };
+
+    // Helper: read-scan-probe a single memory window. Shared by the register
+    // and stack paths so the flattening + deep-probe logic lives in one place.
+    auto scan_region = [&](const MemoryModel::RegionReadResult& region,
+                           uint64_t base_addr, uint64_t inst_id, uint64_t pc,
+                           MemoryString::Source src, uint8_t src_reg) {
+        if (region.known_count < config_.min_string_len) return;
+
+        const size_t sz = region.data.size();
+        if (known_bytes.size() < sz) known_bytes.resize(sz);
+        for (size_t i = 0; i < sz; ++i)
+            known_bytes[i] = region.known[i] ? 1 : 0;
+
+        auto hits = scan_for_strings(region.data.data(), known_bytes.data(), sz,
+                                      config_.min_string_len, config_.max_string_len);
+
+        for (auto& hit : hits) {
+            // Deep probe: only worth attempting when this hit was
+            // actually truncated by the edge of the scanned window
+            // (i.e. it runs all the way to the last byte we read) —
+            // a hit that ends earlier already hit a NUL terminator or a
+            // non-printable byte within the window, so it is complete
+            // and re-probing would be wasted MemoryModel/RocksDB work.
+            // Applies to every hit in the window, not just offset==0:
+            // a register can point into the middle of a struct whose
+            // string field starts mid-window just as validly as one
+            // whose string starts at the pointer itself.
+            std::string full_content = hit.content;
+            if (config_.deep_probe && is_hit_truncated(hit, region)) {
+                full_content = deep_probe_string(memory, base_addr + hit.offset,
+                                                 inst_id, hit.content);
+            }
+
+            MemoryString ms;
+            ms.addr = base_addr + hit.offset;
+            ms.discovered_at = inst_id;
+            ms.content = std::move(full_content);
+            ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
+            ms.source = src;
+            ms.source_reg = src_reg;
+            ms.call_site_inst_id = inst_id;
+            ms.call_site_pc = pc;
+            add_string(std::move(ms));
+        }
     };
 
     size_t call_sites_processed = 0;
@@ -471,76 +543,43 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         // ─── Get register state at this call site ─────────────────────────
         const RegState& regs = regfile.state_before(site.inst_id);
 
+        // Per-call-site pointer dedup. It is common for several of x0-x7
+        // (or SP) to hold the same pointer (e.g. x0 and x1 aliasing the same
+        // buffer, or SP == a register). Re-reading and re-scanning the same
+        // address at the same instant is pure waste — the hits would be
+        // identical and deduplicated by add_string anyway. A 9-slot linear
+        // scan is cheaper than a single read_region, so this is a strict win.
+        uint64_t seen_ptrs[9];
+        int n_seen = 0;
+        auto already_seen = [&](uint64_t v) {
+            for (int k = 0; k < n_seen; ++k)
+                if (seen_ptrs[k] == v) return true;
+            return false;
+        };
+        auto remember = [&](uint64_t v) {
+            if (n_seen < 9) seen_ptrs[n_seen++] = v;
+        };
+
         // ─── Scan x0-x7 for pointer-like values ──────────────────────────
         for (int r = 0; r < 8; ++r) {
             uint64_t val = regs.gpr[r];
             if (val < config_.min_pointer_value) continue;
+            if (already_seen(val)) continue;
+            remember(val);
 
-            // Read memory at this pointer
             auto region = memory.read_region(val, config_.scan_size, site.inst_id);
-            if (region.known_count < config_.min_string_len) continue;
-
-            // Scan for strings in the read region
-            auto hits = scan_for_strings(region.data, region.known,
-                                          config_.min_string_len, config_.max_string_len);
-
-            for (auto& hit : hits) {
-                // Deep probe: only worth attempting when this hit was
-                // actually truncated by the edge of the scanned window
-                // (i.e. it runs all the way to the last byte we read) —
-                // a hit that ends earlier already hit a NUL terminator or a
-                // non-printable byte within the window, so it is complete
-                // and re-probing would be wasted MemoryModel/RocksDB work.
-                // Applies to every hit in the window, not just offset==0:
-                // a register can point into the middle of a struct whose
-                // string field starts mid-window just as validly as one
-                // whose string starts at the pointer itself.
-                std::string full_content = hit.content;
-                if (config_.deep_probe && is_hit_truncated(hit, region)) {
-                    full_content = deep_probe_string(memory, val + hit.offset,
-                                                     site.inst_id, hit.content);
-                }
-
-                MemoryString ms;
-                ms.addr = val + hit.offset;
-                ms.discovered_at = site.inst_id;
-                ms.content = std::move(full_content);
-                ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
-                ms.source = MemoryString::RegPointer;
-                ms.source_reg = static_cast<uint8_t>(r);
-                ms.call_site_inst_id = site.inst_id;
-                ms.call_site_pc = site.pc;
-                add_string(std::move(ms));
-            }
+            scan_region(region, val, site.inst_id, site.pc,
+                        MemoryString::RegPointer, static_cast<uint8_t>(r));
         }
 
         // ─── Scan stack (SP-relative) ────────────────────────────────────
         if (config_.scan_stack) {
             uint64_t sp = regs.sp();
-            if (sp >= config_.min_pointer_value) {
+            if (sp >= config_.min_pointer_value && !already_seen(sp)) {
+                remember(sp);
                 auto region = memory.read_region(sp, config_.stack_scan_size, site.inst_id);
-                if (region.known_count >= config_.min_string_len) {
-                    auto hits = scan_for_strings(region.data, region.known,
-                                                  config_.min_string_len, config_.max_string_len);
-                    for (auto& hit : hits) {
-                        std::string full_content = hit.content;
-                        if (config_.deep_probe && is_hit_truncated(hit, region)) {
-                            full_content = deep_probe_string(memory, sp + hit.offset,
-                                                             site.inst_id, hit.content);
-                        }
-
-                        MemoryString ms;
-                        ms.addr = sp + hit.offset;
-                        ms.discovered_at = site.inst_id;
-                        ms.content = std::move(full_content);
-                        ms.encoding = static_cast<MemoryString::Encoding>(hit.encoding);
-                        ms.source = MemoryString::StackLocal;
-                        ms.source_reg = 31;  // SP
-                        ms.call_site_inst_id = site.inst_id;
-                        ms.call_site_pc = site.pc;
-                        add_string(std::move(ms));
-                    }
-                }
+                scan_region(region, sp, site.inst_id, site.pc,
+                            MemoryString::StackLocal, 31);  // SP
             }
         }
     }

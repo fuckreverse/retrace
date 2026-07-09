@@ -197,13 +197,21 @@ public:
 private:
     /// Scan a memory region for printable strings.
     /// Returns all strings found (may be multiple within one region).
+    ///
+    /// `data` points at `size` raw bytes; `known` points at `size` bytes that
+    /// are 1 when the corresponding data byte was observed (written) at the
+    /// queried point in time and 0 otherwise.  Passing `known` as a plain byte
+    /// array (instead of the std::vector<bool> returned by MemoryModel) keeps
+    /// the inner scan loops branch-light and vectorisable — bit-packed
+    /// vector<bool> access dominated the hot loop profile.
     struct ScanHit {
         size_t offset;        // offset within the scanned region
         std::string content;
         MemoryString::Encoding encoding;
     };
-    std::vector<ScanHit> scan_for_strings(const std::vector<uint8_t>& data,
-                                           const std::vector<bool>& known,
+    std::vector<ScanHit> scan_for_strings(const uint8_t* data,
+                                           const uint8_t* known,
+                                           size_t size,
                                            size_t min_len, size_t max_len);
 
     /// Whether a hit was cut off by the edge of the scanned region (as
