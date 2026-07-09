@@ -22,7 +22,12 @@
 #      bundle.externalBin 打包进 .app/Contents/MacOS/。
 #
 # 用法：
-#   bash tools/tenet/web/src-tauri/scripts/prepare-sidecar.sh [--debug]
+#   bash tools/tenet/web/src-tauri/scripts/prepare-sidecar.sh [--debug|--release]
+#
+# 默认构建类型为 RelWithDebInfo（与 tools/tenet/build 的默认配置一致，
+# 增量编译快、运行性能约为 Debug 的 2-3×）。
+#   --debug   切到 Debug（-O0 -g，最快编译，最慢运行）
+#   --release 切到 Release（-O3 + ThinLTO + -mcpu，最慢编译，最快运行，发布用）
 #
 # 幂等：可重复运行；每次都会覆盖 binaries/ 下的产物。
 #
@@ -38,9 +43,11 @@ BUILD_DIR="${TENET_DIR}/build"
 BIN_OUT_DIR="${SRC_TAURI_DIR}/binaries"
 LIB_OUT_DIR="${BIN_OUT_DIR}/lib"
 
-BUILD_TYPE="Release"
+BUILD_TYPE="RelWithDebInfo"
 if [[ "${1:-}" == "--debug" ]]; then
   BUILD_TYPE="Debug"
+elif [[ "${1:-}" == "--release" ]]; then
+  BUILD_TYPE="Release"
 fi
 
 echo "==> tenet sidecar 准备脚本"
