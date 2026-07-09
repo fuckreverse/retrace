@@ -134,14 +134,25 @@ invalidate_tl_page_cache();
 static constexpr const char* SENTINEL_KEY = "__mem_model_built__";
 
 std::string MemoryModel::compute_trace_fingerprint() const {
-    // Fingerprint = file_size (8 bytes LE) + inst_count from index (8 bytes LE)
-    // This is sufficient to detect whether the trace file has changed.
+    // Fingerprint = schema_version (1 byte) + file_size (8 bytes LE) +
+    //               inst_count (8 bytes LE).
+    // file_size + inst_count detect whether the trace file has changed.
+    // schema_version detects whether the on-disk KV encoding semantics have
+    // changed between tenet builds; bump it whenever the stored key/value
+    // layout or visibility semantics change so stale indexes are rebuilt.
+    //
+    // Schema history:
+    //   1 = initial time-indexed layout
+    //   2 = read-derived entries stored at inst_id-1 (read observed value is
+    //       visible at the instruction that read it, not one inst later)
+    static constexpr uint8_t kMemModelSchemaVersion = 2;
     uint64_t fsize = reader_.file_size();
     uint64_t icount = index_.inst_count();
-    char fp[16];
-    std::memcpy(fp, &fsize, 8);
-    std::memcpy(fp + 8, &icount, 8);
-    return std::string(fp, 16);
+    char fp[17];
+    fp[0] = static_cast<char>(kMemModelSchemaVersion);
+    std::memcpy(fp + 1, &fsize, 8);
+    std::memcpy(fp + 9, &icount, 8);
+    return std::string(fp, 17);
 }
 
 bool MemoryModel::check_persisted_sentinel() const {
@@ -471,7 +482,23 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                 auto emit_entry = [&](uint64_t page, uint16_t offset,
                                       const uint8_t* data, uint8_t size, bool is_rd) {
                     KVEntry e;
-                    encode_key_to(page, offset, inst_id, e.key);
+                    // Visibility semantics: queries use search_id = at_inst_id - 1
+                    // and match entries with entry.inst_id <= search_id, i.e. an
+                    // entry stored at inst_id K becomes visible at at_inst_id >= K+1.
+                    //
+                    //  - WRITE at inst N: the new value only exists AFTER N runs, so
+                    //    storing it at inst_id = N (visible at at_inst_id >= N+1) is
+                    //    correct.
+                    //  - READ at inst N: the observed value was already present in
+                    //    memory BEFORE/AT N (the read does not modify memory).  To
+                    //    make that value visible starting at at_inst_id = N (the very
+                    //    instruction that observed it -- which is what a caller
+                    //    naturally queries), the read-derived entry is stored at
+                    //    inst_id = N-1.  A real write to the same byte at inst N wins
+                    //    ties because it is stored at the higher inst_id = N.
+                    uint64_t entry_inst_id = inst_id;
+                    if (is_rd && entry_inst_id > 0) entry_inst_id -= 1;
+                    encode_key_to(page, offset, entry_inst_id, e.key);
                     e.val_size = size;
                     std::memcpy(e.val_data, data, size);
                     if (size < 16) std::memset(e.val_data + size, 0, 16 - size);

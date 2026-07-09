@@ -146,6 +146,236 @@ TEST_CASE("MemoryModel: sequential writes — read returns latest value",
     }
 }
 
+TEST_CASE("MemoryModel: read-observed value is visible at the reading instruction",
+          "[unit][core][memory_model]") {
+    // Regression test for the "memread returns unknown for a read-but-never-written
+    // address" bug.  When the trace contains a READ mem-access at inst N (e.g. a
+    // table lookup of memory that was initialised before the trace started), the
+    // observed value must be queryable at at_inst_id == N — the very instruction
+    // that read it — not only at N+1.  A read does not modify memory, so the value
+    // it observed was already present.
+    constexpr uint64_t kBuf = 0x169504400ULL;   // never written, only read
+    constexpr uint64_t kVal = 0x70DF3432ULL;     // 4-byte value observed by the LDR
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        // inst 0: some unrelated setup instruction so the read is at inst 1
+        //         (mirrors the real trace where ADD precedes the LDR).
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        // inst 1: LDR w8, [kBuf] — a 4-byte READ that observes kVal.
+        tw.emit(ms, 0x1004, enc::nop(),
+                {{8, kVal}, {33, tw.rt(0x1008)}},
+                {{kRead, 4, kBuf, kVal}});
+        tw.emit_anchor(ms);
+    }, "mm_read_recovery");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("value is known at the reading instruction (at_inst_id == 1)") {
+        auto res = env->memory->read(kBuf, 4, 1);
+        for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+        uint32_t got = 0;
+        std::memcpy(&got, res.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal));
+    }
+    SECTION("value is still known just after the read (at_inst_id == 2)") {
+        auto res = env->memory->read(kBuf, 4, 2);
+        for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+        uint32_t got = 0;
+        std::memcpy(&got, res.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal));
+    }
+    SECTION("read_region path also recovers the value at the reading instruction") {
+        auto rr = env->memory->read_region(kBuf, 4, 1);
+        REQUIRE(rr.known_count == 4);
+        uint32_t got = 0;
+        std::memcpy(&got, rr.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal));
+    }
+    SECTION("a real write to the same byte wins over the read-derived value") {
+        // Build a separate trace: inst 0 reads (observes kVal), inst 1 writes a
+        // different value.  At at_inst_id == 2 the WRITE must win.
+        constexpr uint64_t kVal2 = 0x11223344ULL;
+        auto env2 = make_mem_env([&](TraceWriter& tw) {
+            tw.anchor_interval = 256;
+            tw.write_header();
+            MachineState ms; ms.sp() = 0x16F000000ULL;
+            tw.emit(ms, 0x2000, enc::nop(),
+                    {{8, kVal}, {33, tw.rt(0x2004)}},
+                    {{kRead, 4, kBuf, kVal}});
+            tw.emit(ms, 0x2004, enc::str_imm(9, 31, 0),
+                    {{9, kVal2}, {33, tw.rt(0x2008)}},
+                    {{kWrite, 4, kBuf, kVal2}});
+            tw.emit_anchor(ms);
+        }, "mm_read_then_write");
+        REQUIRE(env2 != nullptr);
+        auto res = env2->memory->read(kBuf, 4, 2);
+        for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+        uint32_t got = 0;
+        std::memcpy(&got, res.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal2));
+    }
+}
+
+TEST_CASE("MemoryModel: read-recovery — full bug-report reproduction "
+          "(consecutive reads over a never-written VM table)",
+          "[unit][core][memory_model][regression]") {
+    // Faithful reproduction of the reported bug:
+    //   PC 0x1008E98AC  `LDR W8, [X8, X0]` reads a VM lookup table that was never
+    //   written inside the trace (initialised before tracing started).  The table
+    //   base is 0x169504400 and the loop reads it in 4-byte strides.  Before the
+    //   fix, `memread(addr, at_inst_id == <the read inst>)` returned known_count 0
+    //   even though the trace clearly recorded the observed value.
+    //
+    // We model N consecutive reads: read #k happens at inst_id = k (k = 1..N),
+    // observing addr = base + 4*(k-1) with value 0xAABB0000 | k.
+    constexpr uint64_t kBase = 0x169504400ULL;
+    constexpr int kN = 64;  // 64 reads → covers 256 bytes of the table
+
+    auto read_val = [](int k) -> uint32_t {
+        return 0xAABB0000u | static_cast<uint32_t>(k);
+    };
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 1024;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        // inst 0: setup (so first read is at inst 1, mirroring ADD;LDR pairing).
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        for (int k = 1; k <= kN; ++k) {
+            uint64_t addr = kBase + 4ULL * (k - 1);
+            uint32_t val = read_val(k);
+            uint64_t pc = 0x1008E98ACULL;  // same PC executed repeatedly
+            tw.emit(ms, pc, enc::nop(),
+                    {{8, val}, {33, tw.rt(pc + 4)}},
+                    {{kRead, 4, addr, val}});
+        }
+        tw.emit_anchor(ms);
+    }, "mm_bugreport_repro");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("each read is visible at the exact inst_id where it occurs") {
+        // This is the precise assertion that failed before the fix.
+        for (int k = 1; k <= kN; ++k) {
+            uint64_t addr = kBase + 4ULL * (k - 1);
+            auto res = env->memory->read(addr, 4, /*at_inst_id=*/static_cast<uint64_t>(k));
+            INFO("k=" << k << " addr=" << addr << " at_inst_id=" << k);
+            for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+            uint32_t got = 0;
+            std::memcpy(&got, res.data.data(), 4);
+            REQUIRE(got == read_val(k));
+        }
+    }
+
+    SECTION("after all reads, the whole table region is fully recovered") {
+        // read_region over the entire 256-byte span at the last-read+1 point.
+        auto rr = env->memory->read_region(kBase, 4 * kN,
+                                           /*at_inst_id=*/static_cast<uint64_t>(kN + 1));
+        REQUIRE(rr.known_count == static_cast<size_t>(4 * kN));
+        for (int k = 1; k <= kN; ++k) {
+            uint32_t got = 0;
+            std::memcpy(&got, rr.data.data() + 4 * (k - 1), 4);
+            INFO("region byte block k=" << k);
+            REQUIRE(got == read_val(k));
+        }
+    }
+}
+
+TEST_CASE("MemoryModel: read-recovery — value must NOT leak before the read happens",
+          "[unit][core][memory_model][regression]") {
+    // Guards the *other* side of the off-by-one boundary: shifting read entries to
+    // inst_id-1 must not make the observed value appear arbitrarily early.  A read
+    // at inst N confirms the value existed just before N, so it becomes visible at
+    // at_inst_id == N.  Querying strictly earlier than the read (at a point before
+    // any instruction that could have established the value) must remain unknown.
+    constexpr uint64_t kBuf = 0x169504400ULL;
+    constexpr uint64_t kVal = 0x70DF3432ULL;
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        // inst 0,1,2: unrelated setup — no access to kBuf.
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        // inst 3: the LDR that reads kBuf.
+        tw.emit(ms, 0x100C, enc::nop(),
+                {{8, kVal}, {33, tw.rt(0x1010)}},
+                {{kRead, 4, kBuf, kVal}});
+        tw.emit_anchor(ms);
+    }, "mm_read_no_early_leak");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("unknown well before the read (at_inst_id == 1)") {
+        auto res = env->memory->read(kBuf, 4, 1);
+        for (int i = 0; i < 4; ++i) REQUIRE_FALSE(res.known[i]);
+    }
+    SECTION("unknown one instruction before the read (at_inst_id == 2)") {
+        // read is at inst 3 → stored at inst_id 2 → visible at at_inst_id >= 3.
+        auto res = env->memory->read(kBuf, 4, 2);
+        for (int i = 0; i < 4; ++i) REQUIRE_FALSE(res.known[i]);
+    }
+    SECTION("known exactly at the read (at_inst_id == 3)") {
+        auto res = env->memory->read(kBuf, 4, 3);
+        for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+        uint32_t got = 0;
+        std::memcpy(&got, res.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal));
+    }
+    SECTION("byte_at agrees with read at the boundary") {
+        REQUIRE_FALSE(env->memory->byte_at(kBuf, 2).has_value());
+        auto b = env->memory->byte_at(kBuf, 3);
+        REQUIRE(b.has_value());
+        REQUIRE(*b == static_cast<uint8_t>(kVal & 0xFF));  // 0x32, little-endian LSB
+    }
+}
+
+TEST_CASE("MemoryModel: read-recovery — read at the very first instruction "
+          "(inst_id-1 clamp, no underflow)",
+          "[unit][core][memory_model][regression]") {
+    // Edge case: a read on inst_id 0 would compute inst_id-1 = underflow without the
+    // clamp in emit_entry(); the build clamps the read entry to inst_id 0.
+    //
+    // Note on visibility: read() short-circuits at_inst_id == 0 to all-unknown
+    // ("state before the very first instruction executes"), so the earliest point a
+    // value can be observed is at_inst_id == 1.  A read stored at inst_id 0 is
+    // therefore visible from at_inst_id >= 1.  The key property this test locks in
+    // is that the clamp does NOT underflow to a huge inst_id (which would make the
+    // value never visible, reproducing the original all-unknown symptom).
+    constexpr uint64_t kBuf = 0x169504400ULL;
+    constexpr uint64_t kVal = 0x70DF3432ULL;
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        // inst 0 itself performs the read (no preceding setup instruction).
+        tw.emit(ms, 0x1000, enc::nop(),
+                {{8, kVal}, {33, tw.rt(0x1004)}},
+                {{kRead, 4, kBuf, kVal}});
+        tw.emit_anchor(ms);
+    }, "mm_read_first_inst");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("at_inst_id == 0 is all-unknown by definition") {
+        auto res = env->memory->read(kBuf, 4, 0);
+        for (int i = 0; i < 4; ++i) REQUIRE_FALSE(res.known[i]);
+    }
+    SECTION("value is known from at_inst_id == 1 (clamp did not underflow)") {
+        auto res = env->memory->read(kBuf, 4, 1);
+        for (int i = 0; i < 4; ++i) REQUIRE(res.known[i]);
+        uint32_t got = 0;
+        std::memcpy(&got, res.data.data(), 4);
+        REQUIRE(got == static_cast<uint32_t>(kVal));
+    }
+}
+
 TEST_CASE("MemoryModel: last_writer identifies correct instruction",
           "[unit][core][memory_model]") {
     constexpr uint64_t kBuf = 0x16F400000ULL;

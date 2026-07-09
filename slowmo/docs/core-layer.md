@@ -111,6 +111,15 @@ trace 里不会为每条指令保存完整寄存器快照，而是：
 
 如果 trace 里有 read 访问，并且 read 记录带着当时读到的值，那么 `MemoryModel` 可以用 `mem_read` CF 去“回填”这部分历史。这是它非常有价值的一点。
 
+#### read / write 的时刻可见性语义（重要）
+
+查询用 `search_id = at_inst_id - 1` 并匹配 `entry.inst_id <= search_id`，即入库 inst_id 为 K 的记录在 `at_inst_id >= K+1` 时才可见。据此，`build()` 对 read / write 采用**不同**的入库 inst_id：
+
+- **写（write）@ inst N**：新值在 N 执行**之后**才存在，入库为 `inst_id = N`（`at_inst_id >= N+1` 可见），正确。
+- **读（read）@ inst N**：被观察到的值在 N **之前/之时**就已存在（read 不改内存）。为让该值在 `at_inst_id = N`（即那条读指令当刻，也是调用方最自然的查询点）即可见，read 派生记录入库为 `inst_id = N-1`。同一字节若 inst N 还有真实写入，写入以更高的 `inst_id = N` 胜出。
+
+> 若不做此 -1 偏移，`memread(addr, at_inst_id=N)` 在读指令当刻会返回 `unknown`（而 `disasm` 直接读原始 record 却能看到值），造成两者矛盾。该语义变更通过 `compute_trace_fingerprint()` 的 schema 版本号（当前 = 2）失效旧的持久化索引以触发重建。
+
 ### 关键接口
 
 | 接口 | 作用 |
