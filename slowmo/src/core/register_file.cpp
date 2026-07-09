@@ -210,6 +210,23 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
                 n_fprdiff = ptr[16];
             }
 
+            // Update PC for this instruction.
+            // The writer excludes PC from reg_diffs (it's captured via
+            // anchors), so we must reconstruct it ourselves:
+            //   v5: accumulate pc_delta (int16 at byte offset 4)
+            //   v4/v7-non-v5: read absolute PC from the INST header
+            if (is_v5) {
+                int16_t pc_delta;
+                std::memcpy(&pc_delta, ptr + 4, 2);
+                state.gpr[IDX_PC] += static_cast<int64_t>(pc_delta);
+            } else if (is_v7) {
+                // qbditrace_inst_head_v7_t: pc at byte offset 4
+                std::memcpy(&state.gpr[IDX_PC], ptr + 4, 8);
+            } else {
+                // qbditrace_inst_head_t: pc at byte offset 8 (after 4B fields + 4B pad)
+                std::memcpy(&state.gpr[IDX_PC], ptr + 8, 8);
+            }
+
             // GPR diffs start right after the header
             const uint8_t* diffs = ptr + inst_hdr_size;
 
@@ -271,6 +288,18 @@ RegState RegisterFile::rebuild(uint64_t target_id) {
             rec.is_v7 = is_v7;  // needed for anchor byte_size()
             scan_offset += rec.byte_size(num_gpr);
         }
+    }
+
+    // Set PC to the target instruction's PC.
+    // The writer excludes PC from reg_diffs (captured via anchors only), so
+    // the replay loop above never updates PC through diffs. We read the PC
+    // directly from the target instruction's record:
+    //   v5: offset_of_with_pc returns the accumulated running PC as seed_pc
+    //   v4/v7: as_inst() reads the absolute PC from the INST header
+    auto [target_offset, target_seed_pc] = index_.offset_of_with_pc(target_id, reader_);
+    auto target_rec = reader_.record_at(target_offset, target_seed_pc);
+    if (target_rec.kind == RecordKind::Inst) {
+        state.gpr[IDX_PC] = target_rec.as_inst().pc;
     }
 
     reader_.unpin_all();

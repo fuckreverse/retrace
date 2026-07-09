@@ -59,8 +59,9 @@ inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
         uint8_t n_fprdiff = 0;
         if (is_v7 && is_v5) {
             // qbditrace_inst_head_v7_v5_t = 8 bytes
+            // [kind(1), nzcv(1), n_regdiff(1), n_mem(1), delta_lo(1), delta_hi(1), n_fprdiff(1), reserved(1)]
             hdr = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
-            n_fprdiff = ptr[5];
+            n_fprdiff = ptr[6];
         } else if (is_v7) {
             // qbditrace_inst_head_v7_t = 24 bytes
             hdr = sizeof(qbditrace::qbditrace_inst_head_v7_t);
@@ -187,8 +188,8 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
         ? sizeof(qbditrace::qbditrace_fprdiff_t)       // 24 bytes
         : 0;
     // For v7 (non-v5), n_fprdiff is at offset 16 in the header.
-    // For v7+v5, n_fprdiff is at offset 5.
-    const size_t fprdiff_offset = is_v5 ? 5 : 16;
+    // For v7+v5, n_fprdiff is at offset 6 (after kind,nzcv,n_regdiff,n_mem,pc_delta_lo,pc_delta_hi).
+    const size_t fprdiff_offset = (is_v7 && is_v5) ? 6 : 16;
 
     // Per-PC bulk context cache: avoid repeated ART lookups in roaring64
     // We cache the last-used PC's bitmap + bulk context for temporal locality.
