@@ -4,10 +4,10 @@
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
 
+#include "common/byte_codec.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
-#include <cstring>
 #include <map>
 
 namespace tenet {
@@ -44,103 +44,77 @@ static constexpr uint32_t DFGR_BLOB_MAGIC   = 0x44464752u;  // "DFGR"
 static constexpr uint32_t DFGR_BLOB_VERSION = 2u;
 
 std::string dataflow_graph_serialize(const DataflowGraphResult& res) {
-    size_t total = 4 + 4 + 8;  // magic, version, num_nodes
-    for (const auto& n : res.nodes) {
-        total += 8 + 8;  // inst_id, pc
-        total += 4 + n.mnemonic.size();
-        total += 4 + n.regs_read.size();
-        total += 4 + n.regs_written.size();
-    }
-    total += 8;  // num_edges
-    total += res.edges.size() * (8 + 8 + 1 + 8);  // from, to, reg, mem_addr
-
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { *reinterpret_cast<uint8_t*>(p) = v; p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(DFGR_BLOB_MAGIC);
-    write_u32(DFGR_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.nodes.size()));
+    ByteWriter w;
+    w.u32(DFGR_BLOB_MAGIC);
+    w.u32(DFGR_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.nodes.size()));
 
     for (const auto& n : res.nodes) {
-        write_u64(n.inst_id);
-        write_u64(n.pc);
-        write_u32(static_cast<uint32_t>(n.mnemonic.size()));
-        std::memcpy(p, n.mnemonic.data(), n.mnemonic.size()); p += n.mnemonic.size();
-        write_u32(static_cast<uint32_t>(n.regs_read.size()));
-        std::memcpy(p, n.regs_read.data(), n.regs_read.size()); p += n.regs_read.size();
-        write_u32(static_cast<uint32_t>(n.regs_written.size()));
-        std::memcpy(p, n.regs_written.data(), n.regs_written.size()); p += n.regs_written.size();
+        w.u64(n.inst_id);
+        w.u64(n.pc);
+        w.u32(static_cast<uint32_t>(n.mnemonic.size()));
+        w.bytes(n.mnemonic.data(), n.mnemonic.size());
+        w.u32(static_cast<uint32_t>(n.regs_read.size()));
+        w.bytes(n.regs_read.data(), n.regs_read.size());
+        w.u32(static_cast<uint32_t>(n.regs_written.size()));
+        w.bytes(n.regs_written.data(), n.regs_written.size());
     }
 
-    write_u64(static_cast<uint64_t>(res.edges.size()));
+    w.u64(static_cast<uint64_t>(res.edges.size()));
     for (const auto& e : res.edges) {
-        write_u64(e.from_inst_id);
-        write_u64(e.to_inst_id);
-        write_u8(e.via_reg);
-        write_u64(e.via_mem_addr);
+        w.u64(e.from_inst_id);
+        w.u64(e.to_inst_id);
+        w.u8(e.via_reg);
+        w.u64(e.via_mem_addr);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool dataflow_graph_deserialize(const std::string& blob, DataflowGraphResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v = *reinterpret_cast<const uint8_t*>(p); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != DFGR_BLOB_MAGIC)   return false;
+    if (r.u32() != DFGR_BLOB_VERSION) return false;
 
-    if (read_u32() != DFGR_BLOB_MAGIC)   return false;
-    if (read_u32() != DFGR_BLOB_VERSION) return false;
-
-    uint64_t n_nodes = read_u64();
+    uint64_t n_nodes = r.u64();
     out.nodes.reserve(static_cast<size_t>(n_nodes));
 
     for (uint64_t i = 0; i < n_nodes; i++) {
         DataflowNode n;
-        if (p + 8 + 8 > end) return false;
-        n.inst_id = read_u64();
-        n.pc      = read_u64();
-        if (p + 4 > end) return false;
-        uint32_t mnem_len = read_u32();
-        if (p + mnem_len > end) return false;
-        n.mnemonic.assign(p, mnem_len); p += mnem_len;
-        if (p + 4 > end) return false;
-        uint32_t nr = read_u32();
-        if (p + nr > end) return false;
-        n.regs_read.assign(reinterpret_cast<const uint8_t*>(p),
-                           reinterpret_cast<const uint8_t*>(p) + nr);
-        p += nr;
-        if (p + 4 > end) return false;
-        uint32_t nw = read_u32();
-        if (p + nw > end) return false;
-        n.regs_written.assign(reinterpret_cast<const uint8_t*>(p),
-                              reinterpret_cast<const uint8_t*>(p) + nw);
-        p += nw;
+        n.inst_id = r.u64();
+        n.pc      = r.u64();
+        uint32_t mnem_len = r.u32();
+        if (!r.ok() || r.remaining() < mnem_len) return false;
+        n.mnemonic.resize(mnem_len);
+        r.bytes(n.mnemonic.data(), mnem_len);
+        uint32_t nr = r.u32();
+        if (!r.ok()) return false;
+        n.regs_read.resize(nr);
+        r.bytes(n.regs_read.data(), nr);
+        uint32_t nw = r.u32();
+        if (!r.ok()) return false;
+        n.regs_written.resize(nw);
+        r.bytes(n.regs_written.data(), nw);
+        if (!r.ok()) return false;
 
         size_t node_idx = out.nodes.size();
         out.inst_to_node[n.inst_id] = node_idx;
         out.nodes.push_back(std::move(n));
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_edges = read_u64();
+    uint64_t n_edges = r.u64();
+    if (!r.ok()) return false;
     out.edges.reserve(static_cast<size_t>(n_edges));
     for (uint64_t i = 0; i < n_edges; i++) {
-        if (p + 8 + 8 + 1 + 8 > end) return false;
         DFGEdge e;
-        e.from_inst_id = read_u64();
-        e.to_inst_id   = read_u64();
-        e.via_reg      = read_u8();
-        e.via_mem_addr = read_u64();
+        e.from_inst_id = r.u64();
+        e.to_inst_id   = r.u64();
+        e.via_reg      = r.u8();
+        e.via_mem_addr = r.u64();
         out.edges.push_back(e);
     }
+    if (!r.ok()) return false;
 
     // Rebuild adjacency index
     out.build_adjacency();

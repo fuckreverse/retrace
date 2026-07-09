@@ -9,6 +9,8 @@
 
 #include <sys/mman.h>
 
+#include "common/byte_codec.h"
+
 // Pull CRoaring C API types into our namespace
 using roaring::api::roaring64_bitmap_t;
 using roaring::api::roaring64_bulk_context_t;
@@ -510,19 +512,13 @@ bool xref_write_bitmaps_file(
 /// for storage via save_pass_blob (zstd-compressed).
 std::string xref_serialize_header(const XrefResult& res) {
     const uint64_t n = res.pc_exec_count.size();
-    // Header: 4+4+8+8+8 = 32 bytes; each entry: 8+8 = 16 bytes
-    size_t total = 32 + n * 16;
-    std::string buf(total, '\0');
-    char* p = buf.data();
+    ByteWriter w;
 
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(XREH_MAGIC);
-    write_u32(XREH_VERSION);
-    write_u64(res.total_indexed);
-    write_u64(static_cast<uint64_t>(res.unique_pc_count));
-    write_u64(n);
+    w.u32(XREH_MAGIC);
+    w.u32(XREH_VERSION);
+    w.u64(res.total_indexed);
+    w.u64(static_cast<uint64_t>(res.unique_pc_count));
+    w.u64(n);
 
     // Sort PCs for deterministic iteration
     std::vector<uint64_t> sorted_pcs;
@@ -532,23 +528,19 @@ std::string xref_serialize_header(const XrefResult& res) {
 
     for (uint64_t pc : sorted_pcs) {
         auto it = res.pc_exec_count.find(pc);
-        write_u64(pc);
-        write_u64(it != res.pc_exec_count.end() ? it->second : 0);
+        w.u64(pc);
+        w.u64(it != res.pc_exec_count.end() ? it->second : 0);
     }
-    return buf;
+    return std::move(w).take();
 }
 
 /// Deserialize the lightweight header blob back into an XrefResult
 /// (only populates pc_exec_count / unique_pc_count / total_indexed).
 bool xref_deserialize_header(const std::string& blob, XrefResult& out) {
-    if (blob.size() < 32) return false;
-    const char* p = blob.data();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-
-    uint32_t magic   = read_u32();
-    uint32_t version = read_u32();
+    uint32_t magic   = r.u32();
+    uint32_t version = r.u32();
 
     // Accept both the new XREH format and the legacy XREF v1 format so that
     // old cache blobs still trigger a graceful fallback to the v1 path.
@@ -558,19 +550,19 @@ bool xref_deserialize_header(const std::string& blob, XrefResult& out) {
     }
     if (magic != XREH_MAGIC || version != XREH_VERSION) return false;
 
-    out.total_indexed   = read_u64();
-    out.unique_pc_count = static_cast<size_t>(read_u64());
-    uint64_t n_entries  = read_u64();
+    out.total_indexed   = r.u64();
+    out.unique_pc_count = static_cast<size_t>(r.u64());
+    uint64_t n_entries  = r.u64();
 
-    if (blob.size() < 32 + n_entries * 16) return false;
+    if (!r.ok() || r.remaining() < n_entries * 16) return false;
 
     out.pc_exec_count.reserve(static_cast<size_t>(n_entries));
     for (uint64_t i = 0; i < n_entries; ++i) {
-        uint64_t pc         = read_u64();
-        uint64_t exec_count = read_u64();
+        uint64_t pc         = r.u64();
+        uint64_t exec_count = r.u64();
         out.pc_exec_count.emplace(pc, exec_count);
     }
-    return true;
+    return r.ok();
 }
 
 /// Legacy v1 full deserialisation (in-memory bitmaps).  Used as fallback

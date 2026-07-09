@@ -5,6 +5,7 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
+#include "common/byte_codec.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
@@ -35,70 +36,49 @@ static constexpr uint32_t MSTR_BLOB_MAGIC   = 0x4D535452u;  // "MSTR"
 static constexpr uint32_t MSTR_BLOB_VERSION = 1u;
 
 std::string memory_string_serialize(const MemoryStringResult& res) {
-    size_t total = 4 + 4 + 8;  // magic, version, num_strings
-    for (const auto& s : res.strings) {
-        total += 8 + 8;                     // addr, discovered_at
-        total += 4 + s.content.size();      // content
-        total += 1 + 1 + 1 + 8 + 8;        // encoding, source, source_reg, call_site ids
-    }
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(MSTR_BLOB_MAGIC);
-    write_u32(MSTR_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.strings.size()));
+    w.u32(MSTR_BLOB_MAGIC);
+    w.u32(MSTR_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.strings.size()));
 
     for (const auto& s : res.strings) {
-        write_u64(s.addr);
-        write_u64(s.discovered_at);
-        write_u32(static_cast<uint32_t>(s.content.size()));
-        std::memcpy(p, s.content.data(), s.content.size());
-        p += s.content.size();
-        write_u8(static_cast<uint8_t>(s.encoding));
-        write_u8(static_cast<uint8_t>(s.source));
-        write_u8(s.source_reg);
-        write_u64(s.call_site_inst_id);
-        write_u64(s.call_site_pc);
+        w.u64(s.addr);
+        w.u64(s.discovered_at);
+        w.u32(static_cast<uint32_t>(s.content.size()));
+        w.bytes(s.content.data(), s.content.size());
+        w.u8(static_cast<uint8_t>(s.encoding));
+        w.u8(static_cast<uint8_t>(s.source));
+        w.u8(s.source_reg);
+        w.u64(s.call_site_inst_id);
+        w.u64(s.call_site_pc);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool memory_string_deserialize(const std::string& blob, MemoryStringResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != MSTR_BLOB_MAGIC)   return false;
+    if (r.u32() != MSTR_BLOB_VERSION) return false;
 
-    if (read_u32() != MSTR_BLOB_MAGIC)   return false;
-    if (read_u32() != MSTR_BLOB_VERSION) return false;
-
-    uint64_t n = read_u64();
+    uint64_t n = r.u64();
     out.strings.reserve(static_cast<size_t>(n));
 
     for (uint64_t i = 0; i < n; i++) {
-        if (p + 8 + 8 + 4 > end) return false;
         MemoryString s;
-        s.addr         = read_u64();
-        s.discovered_at = read_u64();
-        uint32_t clen   = read_u32();
-        if (p + clen > end) return false;
-        s.content.assign(p, clen);
-        p += clen;
-        if (p + 1 + 1 + 1 + 8 + 8 > end) return false;
-        s.encoding        = static_cast<MemoryString::Encoding>(read_u8());
-        s.source          = static_cast<MemoryString::Source>(read_u8());
-        s.source_reg      = read_u8();
-        s.call_site_inst_id = read_u64();
-        s.call_site_pc    = read_u64();
+        s.addr         = r.u64();
+        s.discovered_at = r.u64();
+        uint32_t clen   = r.u32();
+        if (!r.ok()) return false;
+        s.content.resize(clen);
+        r.bytes(s.content.data(), clen);
+        s.encoding        = static_cast<MemoryString::Encoding>(r.u8());
+        s.source          = static_cast<MemoryString::Source>(r.u8());
+        s.source_reg      = r.u8();
+        s.call_site_inst_id = r.u64();
+        s.call_site_pc    = r.u64();
 
         // Rebuild index structures
         size_t idx = out.strings.size();
@@ -110,7 +90,7 @@ bool memory_string_deserialize(const std::string& blob, MemoryStringResult& out)
         out.strings.push_back(std::move(s));
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (memory_string serialization)

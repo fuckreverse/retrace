@@ -5,6 +5,7 @@
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/memory_model.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -44,146 +45,62 @@ namespace {
 static constexpr uint32_t SICA_BLOB_MAGIC   = 0x53494341u;  // "SICA"
 static constexpr uint32_t SICA_BLOB_VERSION = 1u;
 
-// Helper: compute serialized size of an InterceptedCall
-static size_t call_serial_size(const InterceptedCall& c) {
-    size_t sz = 8 + 8 + 8;  // inst_id, call_site_pc, callee_pc
-    sz += 4 + c.callee_name.size();  // callee_name
-    sz += 1 + 1 + 8 * 8;  // category, arg_count, raw_args
-    sz += 4 + c.decoded_summary.size();  // summary
-    sz += 1;  // has_key_bytes
-    if (c.key_bytes.has_value()) sz += 4 + c.key_bytes->size();
-    sz += 1;  // has_iv_bytes
-    if (c.iv_bytes.has_value()) sz += 4 + c.iv_bytes->size();
-    sz += 1;  // has_data_bytes
-    if (c.data_bytes.has_value()) sz += 4 + c.data_bytes->size();
-    sz += 8 + 8 + 8 + 1;  // key_length, data_length, return_value, has_return
-    sz += 1;  // has_objc_ctx
-    if (c.objc_context.has_value()) sz += 4 + c.objc_context->size();
-    return sz;
-}
-
 std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
-    size_t total = 4 + 4 + 8;  // magic, version, num_calls
-    for (const auto& c : res.calls) total += call_serial_size(c);
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        std::memcpy(p, s.data(), s.size()); p += s.size();
-    };
-    auto write_opt_bytes = [&](const std::optional<std::vector<uint8_t>>& ob) {
-        if (ob.has_value()) {
-            write_u8(1u);
-            write_u32(static_cast<uint32_t>(ob->size()));
-            std::memcpy(p, ob->data(), ob->size()); p += ob->size();
-        } else {
-            write_u8(0u);
-        }
-    };
-    auto write_opt_str = [&](const std::optional<std::string>& os) {
-        if (os.has_value()) {
-            write_u8(1u);
-            write_str(*os);
-        } else {
-            write_u8(0u);
-        }
-    };
-
-    write_u32(SICA_BLOB_MAGIC);
-    write_u32(SICA_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.calls.size()));
+    w.u32(SICA_BLOB_MAGIC);
+    w.u32(SICA_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.calls.size()));
 
     for (const auto& c : res.calls) {
-        write_u64(c.inst_id);
-        write_u64(c.call_site_pc);
-        write_u64(c.callee_pc);
-        write_str(c.callee_name);
-        write_u8(static_cast<uint8_t>(c.category));
-        write_u8(c.arg_count);
-        for (uint64_t a : c.raw_args) write_u64(a);
-        write_str(c.decoded_summary);
-        write_opt_bytes(c.key_bytes);
-        write_opt_bytes(c.iv_bytes);
-        write_opt_bytes(c.data_bytes);
-        write_u64(c.key_length);
-        write_u64(c.data_length);
-        write_u64(c.return_value);
-        write_u8(c.has_return ? 1u : 0u);
-        write_opt_str(c.objc_context);
+        w.u64(c.inst_id);
+        w.u64(c.call_site_pc);
+        w.u64(c.callee_pc);
+        w.str(c.callee_name);
+        w.u8(static_cast<uint8_t>(c.category));
+        w.u8(c.arg_count);
+        for (uint64_t a : c.raw_args) w.u64(a);
+        w.str(c.decoded_summary);
+        w.opt_bytes(c.key_bytes);
+        w.opt_bytes(c.iv_bytes);
+        w.opt_bytes(c.data_bytes);
+        w.u64(c.key_length);
+        w.u64(c.data_length);
+        w.u64(c.return_value);
+        w.u8(c.has_return ? 1u : 0u);
+        w.opt_str(c.objc_context);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool syscall_intercept_deserialize(const std::string& blob, SyscallInterceptResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_str = [&](std::string& s) -> bool {
-        if (p + 4 > end) return false;
-        uint32_t len = read_u32();
-        if (p + len > end) return false;
-        s.assign(p, len); p += len;
-        return true;
-    };
-    auto read_opt_bytes = [&](std::optional<std::vector<uint8_t>>& ob) -> bool {
-        if (p + 1 > end) return false;
-        uint8_t has = read_u8();
-        if (has) {
-            if (p + 4 > end) return false;
-            uint32_t len = read_u32();
-            if (p + len > end) return false;
-            ob.emplace(p, p + len); p += len;
-        }
-        return true;
-    };
-    auto read_opt_str = [&](std::optional<std::string>& os) -> bool {
-        if (p + 1 > end) return false;
-        uint8_t has = read_u8();
-        if (has) {
-            std::string s;
-            if (!read_str(s)) return false;
-            os = std::move(s);
-        }
-        return true;
-    };
+    if (r.u32() != SICA_BLOB_MAGIC)   return false;
+    if (r.u32() != SICA_BLOB_VERSION) return false;
 
-    if (read_u32() != SICA_BLOB_MAGIC)   return false;
-    if (read_u32() != SICA_BLOB_VERSION) return false;
-
-    uint64_t n = read_u64();
+    uint64_t n = r.u64();
     out.calls.reserve(static_cast<size_t>(n));
 
     for (uint64_t i = 0; i < n; i++) {
-        if (p + 8 + 8 + 8 > end) return false;
         InterceptedCall c;
-        c.inst_id      = read_u64();
-        c.call_site_pc = read_u64();
-        c.callee_pc    = read_u64();
-        if (!read_str(c.callee_name)) return false;
-        if (p + 1 + 1 + 8 * 8 > end) return false;
-        c.category  = static_cast<ApiCategory>(read_u8());
-        c.arg_count = read_u8();
-        for (uint64_t& a : c.raw_args) a = read_u64();
-        if (!read_str(c.decoded_summary)) return false;
-        if (!read_opt_bytes(c.key_bytes)) return false;
-        if (!read_opt_bytes(c.iv_bytes)) return false;
-        if (!read_opt_bytes(c.data_bytes)) return false;
-        if (p + 8 + 8 + 8 + 1 > end) return false;
-        c.key_length   = read_u64();
-        c.data_length  = read_u64();
-        c.return_value = read_u64();
-        c.has_return   = read_u8() != 0;
-        if (!read_opt_str(c.objc_context)) return false;
+        c.inst_id      = r.u64();
+        c.call_site_pc = r.u64();
+        c.callee_pc    = r.u64();
+        if (!r.str(c.callee_name)) return false;
+        c.category  = static_cast<ApiCategory>(r.u8());
+        c.arg_count = r.u8();
+        for (uint64_t& a : c.raw_args) a = r.u64();
+        if (!r.str(c.decoded_summary)) return false;
+        if (!r.opt_bytes(c.key_bytes)) return false;
+        if (!r.opt_bytes(c.iv_bytes)) return false;
+        if (!r.opt_bytes(c.data_bytes)) return false;
+        c.key_length   = r.u64();
+        c.data_length  = r.u64();
+        c.return_value = r.u64();
+        c.has_return   = r.u8() != 0;
+        if (!r.opt_str(c.objc_context)) return false;
 
         size_t idx = out.calls.size();
         out.by_callee[c.callee_name].push_back(idx);
@@ -191,7 +108,7 @@ bool syscall_intercept_deserialize(const std::string& blob, SyscallInterceptResu
         out.calls.push_back(std::move(c));
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (syscall_intercept serialization)

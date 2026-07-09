@@ -5,6 +5,7 @@
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
 #include "core/register_file.h"
+#include "common/byte_codec.h"
 
 #ifdef TENET_HAS_YARA
 #include <yara.h>
@@ -40,117 +41,72 @@ static constexpr uint32_t PATTERN_BLOB_VERSION = 2u;
 /// (known_match, identified_indices, by_algorithm rebuilt on deserialize via
 ///  PatternCollector::lookup_known_constant())
 static std::string pattern_serialize(const PatternResult& res) {
-    // Estimate buffer size
-    size_t est = 4 + 4 + 8;
-    for (const auto& m : res.matches) {
-        est += 4 + m.pattern_name.size() + 2 + 24 + 4 + m.description.size()
-             + 4 + m.related_inst_ids.size() * 8
-             + 4 + m.constants_found.size() * 8;
-    }
-    est += 8 + res.constants.constants.size() * (8 * 5 + 8);
+    ByteWriter w;
 
-    std::string buf;
-    buf.reserve(est);
-
-    auto write = [&](const void* data, size_t n) {
-        buf.append(reinterpret_cast<const char*>(data), n);
-    };
-    auto write_u8  = [&](uint8_t v)  { write(&v, 1); };
-    auto write_u32 = [&](uint32_t v) { write(&v, 4); };
-    auto write_u64 = [&](uint64_t v) { write(&v, 8); };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        if (!s.empty()) write(s.data(), s.size());
-    };
-
-    write_u32(PATTERN_BLOB_MAGIC);
-    write_u32(PATTERN_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.matches.size()));
+    w.u32(PATTERN_BLOB_MAGIC);
+    w.u32(PATTERN_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.matches.size()));
 
     for (const auto& m : res.matches) {
-        write_str(m.pattern_name);
-        write_u8(static_cast<uint8_t>(m.category));
-        write_u8(static_cast<uint8_t>(m.confidence));
-        write_u64(m.start_inst_id);
-        write_u64(m.end_inst_id);
-        write_u64(m.anchor_pc);
-        write_str(m.description);
-        write_u32(static_cast<uint32_t>(m.related_inst_ids.size()));
-        for (uint64_t id : m.related_inst_ids) write_u64(id);
-        write_u32(static_cast<uint32_t>(m.constants_found.size()));
-        for (uint64_t c : m.constants_found) write_u64(c);
+        w.str(m.pattern_name);
+        w.u8(static_cast<uint8_t>(m.category));
+        w.u8(static_cast<uint8_t>(m.confidence));
+        w.u64(m.start_inst_id);
+        w.u64(m.end_inst_id);
+        w.u64(m.anchor_pc);
+        w.str(m.description);
+        w.u32(static_cast<uint32_t>(m.related_inst_ids.size()));
+        for (uint64_t id : m.related_inst_ids) w.u64(id);
+        w.u32(static_cast<uint32_t>(m.constants_found.size()));
+        for (uint64_t c : m.constants_found) w.u64(c);
     }
 
-    write_u64(static_cast<uint64_t>(res.constants.constants.size()));
+    w.u64(static_cast<uint64_t>(res.constants.constants.size()));
     for (const auto& c : res.constants.constants) {
-        write_u64(c.value);
-        write_u64(c.first_inst_id);
-        write_u64(c.last_inst_id);
-        write_u64(c.pc_first);
-        write_u64(c.pc_last);
-        write_u8(c.dst_reg);
-        write_u8(c.num_parts);
-        static const char pad[6] = {};
-        write(pad, sizeof(pad));
+        w.u64(c.value);
+        w.u64(c.first_inst_id);
+        w.u64(c.last_inst_id);
+        w.u64(c.pc_first);
+        w.u64(c.pc_last);
+        w.u8(c.dst_reg);
+        w.u8(c.num_parts);
+        w.pad(6);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 /// Deserialize PatternResult from a binary blob. Returns false on corruption.
 static bool pattern_deserialize(const std::string& blob, PatternResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto remaining = [&]() -> size_t { return static_cast<size_t>(end - p); };
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_str = [&](std::string& s) -> bool {
-        if (remaining() < 4) return false;
-        uint32_t len = read_u32();
-        if (remaining() < len) return false;
-        s.assign(p, len);
-        p += len;
-        return true;
-    };
-
-    uint32_t magic = read_u32();
-    uint32_t version = read_u32();
+    uint32_t magic = r.u32();
+    uint32_t version = r.u32();
     if (magic != PATTERN_BLOB_MAGIC || version != PATTERN_BLOB_VERSION) return false;
 
-    uint64_t num_matches = read_u64();
+    uint64_t num_matches = r.u64();
     out.matches.resize(static_cast<size_t>(num_matches));
 
     for (size_t i = 0; i < num_matches; i++) {
         auto& m = out.matches[i];
-        if (!read_str(m.pattern_name)) return false;
-        if (remaining() < 2 + 24) return false;
-        m.category   = static_cast<PatternCategory>(read_u8());
-        m.confidence = static_cast<PatternConfidence>(read_u8());
-        m.start_inst_id = read_u64();
-        m.end_inst_id   = read_u64();
-        m.anchor_pc     = read_u64();
-        if (!read_str(m.description)) return false;
+        if (!r.str(m.pattern_name)) return false;
+        m.category   = static_cast<PatternCategory>(r.u8());
+        m.confidence = static_cast<PatternConfidence>(r.u8());
+        m.start_inst_id = r.u64();
+        m.end_inst_id   = r.u64();
+        m.anchor_pc     = r.u64();
+        if (!r.str(m.description)) return false;
 
-        if (remaining() < 4) return false;
-        uint32_t num_related = read_u32();
-        if (remaining() < num_related * 8) return false;
+        uint32_t num_related = r.u32();
         m.related_inst_ids.resize(num_related);
-        for (uint32_t j = 0; j < num_related; j++) m.related_inst_ids[j] = read_u64();
+        for (uint32_t j = 0; j < num_related; j++) m.related_inst_ids[j] = r.u64();
 
-        if (remaining() < 4) return false;
-        uint32_t num_consts = read_u32();
-        if (remaining() < num_consts * 8) return false;
+        uint32_t num_consts = r.u32();
         m.constants_found.resize(num_consts);
-        for (uint32_t j = 0; j < num_consts; j++) m.constants_found[j] = read_u64();
+        for (uint32_t j = 0; j < num_consts; j++) m.constants_found[j] = r.u64();
     }
 
-    if (remaining() < 8) return false;
-    uint64_t num_materialized = read_u64();
-    constexpr size_t MC_ENTRY_SIZE = 8 * 5 + 8;  // 5×u64 + 2×u8 + 6-byte pad
-    if (remaining() < num_materialized * MC_ENTRY_SIZE) return false;
+    uint64_t num_materialized = r.u64();
 
     // Ensure the known-constants database is populated before looking up
     // known_match below — this cache fast-path can run before any
@@ -160,14 +116,14 @@ static bool pattern_deserialize(const std::string& blob, PatternResult& out) {
     out.constants.constants.reserve(static_cast<size_t>(num_materialized));
     for (uint64_t i = 0; i < num_materialized; i++) {
         MaterializedConstant c{};
-        c.value         = read_u64();
-        c.first_inst_id = read_u64();
-        c.last_inst_id  = read_u64();
-        c.pc_first      = read_u64();
-        c.pc_last       = read_u64();
-        c.dst_reg       = read_u8();
-        c.num_parts     = read_u8();
-        p += 6;  // skip padding
+        c.value         = r.u64();
+        c.first_inst_id = r.u64();
+        c.last_inst_id  = r.u64();
+        c.pc_first      = r.u64();
+        c.pc_last       = r.u64();
+        c.dst_reg       = r.u8();
+        c.num_parts     = r.u8();
+        r.skip(6);  // skip padding
         c.known_match   = PatternCollector::lookup_known_constant(c.value);
         out.constants.constants.push_back(c);
     }
@@ -180,7 +136,7 @@ static bool pattern_deserialize(const std::string& blob, PatternResult& out) {
         }
     }
 
-    return true;
+    return r.ok();
 }
 
 // ─── AArch64 MOVZ/MOVK opcode bit-field extraction ────────────────────────

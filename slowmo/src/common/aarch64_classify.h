@@ -144,6 +144,70 @@ inline bool is_svc_mnemonic(std::string_view m) noexcept {
     return m == "svc";
 }
 
+// ─── Branch target extraction (pure opcode, no Capstone) ──────────────────
+//
+// These helpers extract the PC-relative branch target directly from the
+// opcode's immediate fields, avoiding the need for a Capstone decode pass.
+// All return the absolute target PC = pc + sign_extended_immediate * 4.
+// Callers should first classify the instruction with is_b/is_bl/is_b_cond/
+// is_cbz/is_cbnz/is_tbz/is_tbnz to determine which function to call.
+
+/// Sign-extend a value from `bits` bits to int64_t.
+inline int64_t sign_extend(uint64_t val, int bits) noexcept {
+    uint64_t m = 1ULL << (bits - 1);
+    return static_cast<int64_t>((val ^ m) - m);
+}
+
+/// Extract B/BL target: imm26 at bits [25:0], scaled by 4.
+/// Works for both is_b() and is_bl().
+inline uint64_t b_bl_target(uint64_t pc, uint32_t opcode) noexcept {
+    int64_t imm26 = sign_extend(opcode & 0x03FFFFFFu, 26);
+    return pc + (imm26 << 2);
+}
+
+/// Extract B.cond target: imm19 at bits [23:5], scaled by 4.
+inline uint64_t b_cond_target(uint64_t pc, uint32_t opcode) noexcept {
+    int64_t imm19 = sign_extend((opcode >> 5) & 0x7FFFFu, 19);
+    return pc + (imm19 << 2);
+}
+
+/// Returns true if opcode is CBZ or CBNZ (32-bit or 64-bit).
+inline bool is_cbz_or_cbnz(uint32_t opcode) noexcept {
+    uint32_t top7 = (opcode >> 25) & 0x7Fu;
+    return (top7 & 0x7Eu) == 0x1Au && (top7 & 0x04u) == 0x00u;
+    // top7 in {0b0110100, 0b0110101, 0b1110100, 0b1110101} = CBZ/CBNZ 32/64
+}
+
+/// Extract CBZ/CBNZ target: imm19 at bits [23:5], scaled by 4.
+inline uint64_t cbz_target(uint64_t pc, uint32_t opcode) noexcept {
+    return b_cond_target(pc, opcode);  // same imm19 layout
+}
+
+/// Returns true if opcode is TBZ or TBNZ.
+inline bool is_tbz_or_tbnz(uint32_t opcode) noexcept {
+    uint32_t top7 = (opcode >> 25) & 0x7Fu;
+    return (top7 & 0x7Eu) == 0x1Bu && (top7 & 0x04u) == 0x00u;
+}
+
+/// Extract TBZ/TBNZ target: imm14 at bits [18:5], scaled by 4.
+inline uint64_t tbz_target(uint64_t pc, uint32_t opcode) noexcept {
+    int64_t imm14 = sign_extend((opcode >> 5) & 0x3FFFu, 14);
+    return pc + (imm14 << 2);
+}
+
+/// Unified branch target extraction: given a PC and opcode, returns the
+/// target PC for any direct branch (B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ).
+/// Returns 0 if the opcode is not a direct branch with a PC-relative target.
+inline uint64_t direct_branch_target(uint64_t pc, uint32_t opcode) noexcept {
+    if (is_b(opcode) || is_bl(opcode))
+        return b_bl_target(pc, opcode);
+    if (is_b_cond(opcode) || is_cbz_or_cbnz(opcode))
+        return b_cond_target(pc, opcode);
+    if (is_tbz_or_tbnz(opcode))
+        return tbz_target(pc, opcode);
+    return 0;
+}
+
 // ─── MOVZ/MOVK constant materialization helpers ───────────────────────────
 
 /// Extract the 16-bit immediate from MOVZ/MOVK instruction.

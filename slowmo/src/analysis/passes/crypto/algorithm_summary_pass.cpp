@@ -4,6 +4,7 @@
 #include "analysis/passes/structure/function_pass.h"
 #include "analysis/passes/structure/call_graph_pass.h"
 #include "io/index_builder.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -171,123 +172,75 @@ std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
     // Pre-compute json string
     std::string json_str = res.summary_json.dump();
 
-    size_t total = 4 + 4;  // magic, version
-    total += 4 + res.summary_text.size();
-    total += 4 + json_str.size();
-    total += 8;  // num_candidates
+    ByteWriter w;
+
+    w.u32(ALGO_BLOB_MAGIC);
+    w.u32(ALGO_BLOB_VERSION);
+    w.str(res.summary_text);
+    w.str(json_str);
+
+    w.u64(static_cast<uint64_t>(res.candidates.size()));
     for (const auto& c : res.candidates) {
-        total += 4 + c.name.size();
-        total += 4;  // confidence (f32)
-        total += 4 + c.evidence.size();
-        total += 8 + 8;  // estimated_start, estimated_end
-        total += 8 + c.key_pcs.size() * 8;
-        total += 8 + c.key_inst_ids.size() * 8;
-        total += 1 + 1;  // family, is_speculative (v2+)
+        w.str(c.name);
+        w.f32(c.confidence);
+        w.str(c.evidence);
+        w.u64(c.estimated_start);
+        w.u64(c.estimated_end);
+        w.u64(static_cast<uint64_t>(c.key_pcs.size()));
+        for (uint64_t pc : c.key_pcs) w.u64(pc);
+        w.u64(static_cast<uint64_t>(c.key_inst_ids.size()));
+        for (uint64_t id : c.key_inst_ids) w.u64(id);
+        w.u8(static_cast<uint8_t>(c.family));
+        w.u8(c.is_speculative ? 1 : 0);
     }
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        std::memcpy(p, s.data(), s.size());
-        p += s.size();
-    };
-
-    write_u32(ALGO_BLOB_MAGIC);
-    write_u32(ALGO_BLOB_VERSION);
-    write_str(res.summary_text);
-    write_str(json_str);
-
-    write_u64(static_cast<uint64_t>(res.candidates.size()));
-    for (const auto& c : res.candidates) {
-        write_str(c.name);
-        write_f32(c.confidence);
-        write_str(c.evidence);
-        write_u64(c.estimated_start);
-        write_u64(c.estimated_end);
-        write_u64(static_cast<uint64_t>(c.key_pcs.size()));
-        for (uint64_t pc : c.key_pcs) write_u64(pc);
-        write_u64(static_cast<uint64_t>(c.key_inst_ids.size()));
-        for (uint64_t id : c.key_inst_ids) write_u64(id);
-        write_u8(static_cast<uint8_t>(c.family));
-        write_u8(c.is_speculative ? 1 : 0);
-    }
-
-    return buf;
+    return std::move(w).take();
 }
 
 bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResult& out) {
-    if (blob.size() < 4 + 4) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_str = [&](std::string& s) -> bool {
-        if (p + 4 > end) return false;
-        uint32_t len = read_u32();
-        if (p + len > end) return false;
-        s.assign(p, len);
-        p += len;
-        return true;
-    };
-
-    if (read_u32() != ALGO_BLOB_MAGIC) return false;
-    uint32_t version = read_u32();
+    if (r.u32() != ALGO_BLOB_MAGIC) return false;
+    uint32_t version = r.u32();
     if (version != 1u && version != 2u) return false;
 
-    if (!read_str(out.summary_text)) return false;
+    if (!r.str(out.summary_text)) return false;
 
     std::string json_str;
-    if (!read_str(json_str)) return false;
+    if (!r.str(json_str)) return false;
     try {
         out.summary_json = nlohmann::json::parse(json_str);
     } catch (...) {
         return false;
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_cands = read_u64();
+    uint64_t n_cands = r.u64();
     out.candidates.reserve(static_cast<size_t>(n_cands));
     for (uint64_t i = 0; i < n_cands; i++) {
         AlgorithmCandidate c;
-        if (!read_str(c.name)) return false;
-        if (p + 4 > end) return false;
-        c.confidence = read_f32();
-        if (!read_str(c.evidence)) return false;
-        if (p + 8 + 8 > end) return false;
-        c.estimated_start = read_u64();
-        c.estimated_end   = read_u64();
+        if (!r.str(c.name)) return false;
+        c.confidence = r.f32();
+        if (!r.str(c.evidence)) return false;
+        c.estimated_start = r.u64();
+        c.estimated_end   = r.u64();
 
-        if (p + 8 > end) return false;
-        uint64_t n_pcs = read_u64();
-        if (p + n_pcs * 8 > end) return false;
+        uint64_t n_pcs = r.u64();
         c.key_pcs.resize(static_cast<size_t>(n_pcs));
-        for (uint64_t j = 0; j < n_pcs; j++) c.key_pcs[j] = read_u64();
+        for (uint64_t j = 0; j < n_pcs; j++) c.key_pcs[j] = r.u64();
 
-        if (p + 8 > end) return false;
-        uint64_t n_ids = read_u64();
-        if (p + n_ids * 8 > end) return false;
+        uint64_t n_ids = r.u64();
         c.key_inst_ids.resize(static_cast<size_t>(n_ids));
-        for (uint64_t j = 0; j < n_ids; j++) c.key_inst_ids[j] = read_u64();
+        for (uint64_t j = 0; j < n_ids; j++) c.key_inst_ids[j] = r.u64();
 
         if (version >= 2u) {
-            if (p + 2 > end) return false;
-            c.family = static_cast<AlgorithmFamily>(read_u8());
-            c.is_speculative = read_u8() != 0;
+            c.family = static_cast<AlgorithmFamily>(r.u8());
+            c.is_speculative = r.u8() != 0;
         }
 
         out.candidates.push_back(std::move(c));
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (algo serialization)

@@ -7,7 +7,8 @@
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <sstream>
-#include <cstring>
+
+#include "common/byte_codec.h"
 
 namespace tenet {
 
@@ -41,122 +42,92 @@ static constexpr uint32_t CFLY_BLOB_MAGIC   = 0x43464C59u;  // "CFLY"
 static constexpr uint32_t CFLY_BLOB_VERSION = 1u;
 
 std::string cfg_layout_serialize(const CFGLayoutResult& res) {
-    size_t total = 4 + 4 + 4 + 4;  // magic, version, canvas_width, canvas_height
-    total += 8;                     // num_blocks
-    total += res.block_layouts.size() * (8 + 4 + 4 + 4 + 4);  // pc, x,y,w,h
-    total += 8;                     // num_edges
-    for (const auto& e : res.edge_layouts) {
-        total += 8 + 8 + 4;         // from_block, to_block, arrow
-        total += 8 + e.polyline.size() * (4 + 4);  // num_points + (fx,fy)*N
-    }
-    total += 4 + res.dot.size();
-    total += 4 + res.dot_annotated.size();
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
+    w.u32(CFLY_BLOB_MAGIC);
+    w.u32(CFLY_BLOB_VERSION);
+    w.s32(res.canvas_width);
+    w.s32(res.canvas_height);
 
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_s32 = [&](int32_t  v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
-
-    write_u32(CFLY_BLOB_MAGIC);
-    write_u32(CFLY_BLOB_VERSION);
-    write_s32(res.canvas_width);
-    write_s32(res.canvas_height);
-
-    write_u64(static_cast<uint64_t>(res.block_layouts.size()));
+    w.u64(static_cast<uint64_t>(res.block_layouts.size()));
     for (const auto& [pc, bl] : res.block_layouts) {
-        write_u64(pc);
-        write_s32(bl.x);
-        write_s32(bl.y);
-        write_s32(bl.width);
-        write_s32(bl.height);
+        w.u64(pc);
+        w.s32(bl.x);
+        w.s32(bl.y);
+        w.s32(bl.width);
+        w.s32(bl.height);
     }
 
-    write_u64(static_cast<uint64_t>(res.edge_layouts.size()));
+    w.u64(static_cast<uint64_t>(res.edge_layouts.size()));
     for (const auto& el : res.edge_layouts) {
-        write_u64(el.from_block);
-        write_u64(el.to_block);
-        write_u32(static_cast<uint32_t>(el.arrow));
-        write_u64(static_cast<uint64_t>(el.polyline.size()));
+        w.u64(el.from_block);
+        w.u64(el.to_block);
+        w.u32(static_cast<uint32_t>(el.arrow));
+        w.u64(static_cast<uint64_t>(el.polyline.size()));
         for (const auto& pt : el.polyline) {
-            write_f32(pt.x);
-            write_f32(pt.y);
+            w.f32(pt.x);
+            w.f32(pt.y);
         }
     }
 
-    write_u32(static_cast<uint32_t>(res.dot.size()));
-    std::memcpy(p, res.dot.data(), res.dot.size());
-    p += res.dot.size();
+    w.u32(static_cast<uint32_t>(res.dot.size()));
+    w.bytes(res.dot.data(), res.dot.size());
 
-    write_u32(static_cast<uint32_t>(res.dot_annotated.size()));
-    std::memcpy(p, res.dot_annotated.data(), res.dot_annotated.size());
-    p += res.dot_annotated.size();
+    w.u32(static_cast<uint32_t>(res.dot_annotated.size()));
+    w.bytes(res.dot_annotated.data(), res.dot_annotated.size());
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool cfg_layout_deserialize(const std::string& blob, CFGLayoutResult& out) {
-    if (blob.size() < 4 + 4 + 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_s32 = [&]() -> int32_t  { int32_t  v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+    if (r.u32() != CFLY_BLOB_MAGIC)   return false;
+    if (r.u32() != CFLY_BLOB_VERSION) return false;
 
-    if (read_u32() != CFLY_BLOB_MAGIC)   return false;
-    if (read_u32() != CFLY_BLOB_VERSION) return false;
+    out.canvas_width  = r.s32();
+    out.canvas_height = r.s32();
 
-    out.canvas_width  = read_s32();
-    out.canvas_height = read_s32();
-
-    uint64_t n_blocks = read_u64();
+    uint64_t n_blocks = r.u64();
     for (uint64_t i = 0; i < n_blocks; i++) {
-        if (p + 8 + 4*4 > end) return false;
-        uint64_t pc = read_u64();
+        uint64_t pc = r.u64();
         BlockLayout bl;
-        bl.x      = read_s32();
-        bl.y      = read_s32();
-        bl.width  = read_s32();
-        bl.height = read_s32();
+        bl.x      = r.s32();
+        bl.y      = r.s32();
+        bl.width  = r.s32();
+        bl.height = r.s32();
         out.block_layouts[pc] = bl;
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_edges = read_u64();
+    uint64_t n_edges = r.u64();
+    if (!r.ok()) return false;
     out.edge_layouts.reserve(static_cast<size_t>(n_edges));
     for (uint64_t i = 0; i < n_edges; i++) {
-        if (p + 8 + 8 + 4 + 8 > end) return false;
         EdgeLayout el;
-        el.from_block = read_u64();
-        el.to_block   = read_u64();
-        el.arrow      = static_cast<GraphEdge::ArrowDirection>(read_u32());
-        uint64_t n_pts = read_u64();
-        if (p + n_pts * 8 > end) return false;
+        el.from_block = r.u64();
+        el.to_block   = r.u64();
+        el.arrow      = static_cast<GraphEdge::ArrowDirection>(r.u32());
+        uint64_t n_pts = r.u64();
+        if (!r.ok()) return false;
         el.polyline.resize(static_cast<size_t>(n_pts));
         for (uint64_t j = 0; j < n_pts; j++) {
-            el.polyline[j].x = read_f32();
-            el.polyline[j].y = read_f32();
+            el.polyline[j].x = r.f32();
+            el.polyline[j].y = r.f32();
         }
         out.edge_layouts.push_back(std::move(el));
     }
 
-    if (p + 4 > end) return false;
-    uint32_t dot_len = read_u32();
-    if (p + dot_len > end) return false;
-    out.dot.assign(p, dot_len);
-    p += dot_len;
+    uint32_t dot_len = r.u32();
+    if (!r.ok() || r.remaining() < dot_len) return false;
+    out.dot.resize(dot_len);
+    r.bytes(out.dot.data(), dot_len);
 
-    if (p + 4 > end) return false;
-    uint32_t dot_ann_len = read_u32();
-    if (p + dot_ann_len > end) return false;
-    out.dot_annotated.assign(p, dot_ann_len);
-    p += dot_ann_len;
+    uint32_t dot_ann_len = r.u32();
+    if (!r.ok() || r.remaining() < dot_ann_len) return false;
+    out.dot_annotated.resize(dot_ann_len);
+    r.bytes(out.dot_annotated.data(), dot_ann_len);
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace

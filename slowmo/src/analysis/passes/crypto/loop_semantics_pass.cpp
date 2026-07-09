@@ -5,6 +5,7 @@
 #include "io/index_builder.h"
 #include "core/instruction_decoder.h"
 #include "core/register_file.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -49,107 +50,71 @@ static constexpr uint32_t LSMN_BLOB_MAGIC   = 0x4C534D4Eu;  // "LSMN"
 static constexpr uint32_t LSMN_BLOB_VERSION = 2u;
 
 std::string loop_semantics_serialize(const LoopSemanticsResult& res) {
-    size_t total = 4 + 4 + 8;  // magic, version, num_loop_semantics
-    for (const auto& li : res.loop_semantics) {
-        total += 8 + 8 + 1 + 4;  // header_pc, iter_count, kind, confidence
-        total += 4 + li.description.size();  // desc
-        total += 8;  // body_instruction_count
-        total += 6;  // 6 bool flags (5 original + sbox_pattern_data_dependent)
-        total += 8 + 8;  // sample_iter_start/end
-        total += 8 + li.active_regs.size();
-        total += 8 + li.invariant_regs.size();
-    }
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(LSMN_BLOB_MAGIC);
-    write_u32(LSMN_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.loop_semantics.size()));
+    w.u32(LSMN_BLOB_MAGIC);
+    w.u32(LSMN_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.loop_semantics.size()));
 
     for (const auto& li : res.loop_semantics) {
-        write_u64(li.header_pc);
-        write_u64(li.iteration_count);
-        write_u8(static_cast<uint8_t>(li.kind));
-        write_f32(li.confidence);
-        write_u32(static_cast<uint32_t>(li.description.size()));
-        std::memcpy(p, li.description.data(), li.description.size());
-        p += li.description.size();
-        write_u64(li.body_instruction_count);
-        write_u8(li.has_sbox_pattern ? 1u : 0u);
-        write_u8(li.has_xor_mix ? 1u : 0u);
-        write_u8(li.has_shift_rotate ? 1u : 0u);
-        write_u8(li.has_addition_chain ? 1u : 0u);
-        write_u8(li.has_modular_arithmetic ? 1u : 0u);
-        write_u8(li.sbox_pattern_data_dependent ? 1u : 0u);
-        write_u64(li.sample_iter_start);
-        write_u64(li.sample_iter_end);
-        write_u64(static_cast<uint64_t>(li.active_regs.size()));
-        for (uint8_t r : li.active_regs) write_u8(r);
-        write_u64(static_cast<uint64_t>(li.invariant_regs.size()));
-        for (uint8_t r : li.invariant_regs) write_u8(r);
+        w.u64(li.header_pc);
+        w.u64(li.iteration_count);
+        w.u8(static_cast<uint8_t>(li.kind));
+        w.f32(li.confidence);
+        w.str(li.description);
+        w.u64(li.body_instruction_count);
+        w.u8(li.has_sbox_pattern ? 1u : 0u);
+        w.u8(li.has_xor_mix ? 1u : 0u);
+        w.u8(li.has_shift_rotate ? 1u : 0u);
+        w.u8(li.has_addition_chain ? 1u : 0u);
+        w.u8(li.has_modular_arithmetic ? 1u : 0u);
+        w.u8(li.sbox_pattern_data_dependent ? 1u : 0u);
+        w.u64(li.sample_iter_start);
+        w.u64(li.sample_iter_end);
+        w.u64(static_cast<uint64_t>(li.active_regs.size()));
+        for (uint8_t r : li.active_regs) w.u8(r);
+        w.u64(static_cast<uint64_t>(li.invariant_regs.size()));
+        for (uint8_t r : li.invariant_regs) w.u8(r);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool loop_semantics_deserialize(const std::string& blob, LoopSemanticsResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != LSMN_BLOB_MAGIC)   return false;
+    if (r.u32() != LSMN_BLOB_VERSION) return false;
 
-    if (read_u32() != LSMN_BLOB_MAGIC)   return false;
-    if (read_u32() != LSMN_BLOB_VERSION) return false;
-
-    uint64_t n = read_u64();
+    uint64_t n = r.u64();
     out.loop_semantics.reserve(static_cast<size_t>(n));
 
     for (uint64_t i = 0; i < n; i++) {
-        if (p + 8 + 8 + 1 + 4 > end) return false;
         LoopSemanticInfo li;
-        li.header_pc      = read_u64();
-        li.iteration_count = read_u64();
-        li.kind           = static_cast<LoopKind>(read_u8());
-        li.confidence     = read_f32();
-        if (p + 4 > end) return false;
-        uint32_t desc_len = read_u32();
-        if (p + desc_len > end) return false;
-        li.description.assign(p, desc_len);
-        p += desc_len;
-        if (p + 8 + 6 + 8 + 8 > end) return false;
-        li.body_instruction_count  = read_u64();
-        li.has_sbox_pattern        = read_u8() != 0;
-        li.has_xor_mix             = read_u8() != 0;
-        li.has_shift_rotate        = read_u8() != 0;
-        li.has_addition_chain      = read_u8() != 0;
-        li.has_modular_arithmetic  = read_u8() != 0;
-        li.sbox_pattern_data_dependent = read_u8() != 0;
-        li.sample_iter_start       = read_u64();
-        li.sample_iter_end         = read_u64();
-        if (p + 8 > end) return false;
-        uint64_t n_act = read_u64();
-        if (p + n_act > end) return false;
+        li.header_pc      = r.u64();
+        li.iteration_count = r.u64();
+        li.kind           = static_cast<LoopKind>(r.u8());
+        li.confidence     = r.f32();
+        if (!r.str(li.description)) return false;
+        li.body_instruction_count  = r.u64();
+        li.has_sbox_pattern        = r.u8() != 0;
+        li.has_xor_mix             = r.u8() != 0;
+        li.has_shift_rotate        = r.u8() != 0;
+        li.has_addition_chain      = r.u8() != 0;
+        li.has_modular_arithmetic  = r.u8() != 0;
+        li.sbox_pattern_data_dependent = r.u8() != 0;
+        li.sample_iter_start       = r.u64();
+        li.sample_iter_end         = r.u64();
+        uint64_t n_act = r.u64();
         li.active_regs.resize(static_cast<size_t>(n_act));
-        for (uint64_t j = 0; j < n_act; j++) li.active_regs[j] = read_u8();
-        if (p + 8 > end) return false;
-        uint64_t n_inv = read_u64();
-        if (p + n_inv > end) return false;
+        for (uint64_t j = 0; j < n_act; j++) li.active_regs[j] = r.u8();
+        uint64_t n_inv = r.u64();
         li.invariant_regs.resize(static_cast<size_t>(n_inv));
-        for (uint64_t j = 0; j < n_inv; j++) li.invariant_regs[j] = read_u8();
+        for (uint64_t j = 0; j < n_inv; j++) li.invariant_regs[j] = r.u8();
         out.loop_semantics.push_back(std::move(li));
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (loop_semantics serialization)

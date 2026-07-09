@@ -3,6 +3,7 @@
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "core/memory_model.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -27,91 +28,53 @@ static constexpr uint32_t STRING_BLOB_VERSION = 1u;
 ///     [num_refs:u32] per ref: [inst_id:u64][pc:u64]
 /// (addr_to_index and inst_to_strings are rebuilt on deserialization)
 static std::string string_serialize(const StringResult& res) {
-    // Estimate buffer size
-    size_t est = 4 + 4 + 8;
-    for (const auto& s : res.strings) {
-        est += 8 + 8 + 1 + 3          // addr, discovered_at, encoding, pad
-             + 4 + s.content.size()    // content
-             + 4 + s.references.size() * 16;  // references
-    }
+    ByteWriter w;
 
-    std::string buf;
-    buf.reserve(est);
-
-    auto write = [&](const void* data, size_t n) {
-        buf.append(reinterpret_cast<const char*>(data), n);
-    };
-    auto write_u8  = [&](uint8_t v)  { write(&v, 1); };
-    auto write_u32 = [&](uint32_t v) { write(&v, 4); };
-    auto write_u64 = [&](uint64_t v) { write(&v, 8); };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        if (!s.empty()) write(s.data(), s.size());
-    };
-
-    write_u32(STRING_BLOB_MAGIC);
-    write_u32(STRING_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.strings.size()));
+    w.u32(STRING_BLOB_MAGIC);
+    w.u32(STRING_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.strings.size()));
 
     for (const auto& s : res.strings) {
-        write_u64(s.addr);
-        write_u64(s.discovered_at);
-        write_u8(static_cast<uint8_t>(s.encoding));
-        write_u8(0); write_u8(0); write_u8(0);  // padding
-        write_str(s.content);
-        write_u32(static_cast<uint32_t>(s.references.size()));
-        for (const auto& r : s.references) {
-            write_u64(r.inst_id);
-            write_u64(r.pc);
+        w.u64(s.addr);
+        w.u64(s.discovered_at);
+        w.u8(static_cast<uint8_t>(s.encoding));
+        w.u8(0); w.u8(0); w.u8(0);  // padding
+        w.str(s.content);
+        w.u32(static_cast<uint32_t>(s.references.size()));
+        for (const auto& ref : s.references) {
+            w.u64(ref.inst_id);
+            w.u64(ref.pc);
         }
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 /// Deserialize StringResult from a binary blob. Returns false on corruption.
 /// Rebuilds addr_to_index and inst_to_strings derived indices.
 static bool string_deserialize(const std::string& blob, StringResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto remaining = [&]() -> size_t { return static_cast<size_t>(end - p); };
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_str = [&](std::string& s) -> bool {
-        if (remaining() < 4) return false;
-        uint32_t len = read_u32();
-        if (remaining() < len) return false;
-        s.assign(p, len);
-        p += len;
-        return true;
-    };
-
-    uint32_t magic = read_u32();
-    uint32_t version = read_u32();
+    uint32_t magic = r.u32();
+    uint32_t version = r.u32();
     if (magic != STRING_BLOB_MAGIC || version != STRING_BLOB_VERSION) return false;
 
-    uint64_t num_strings = read_u64();
+    uint64_t num_strings = r.u64();
     out.strings.resize(static_cast<size_t>(num_strings));
 
     for (size_t i = 0; i < num_strings; i++) {
         auto& s = out.strings[i];
-        if (remaining() < 8 + 8 + 4) return false;  // addr + discovered_at + encoding + pad
-        s.addr          = read_u64();
-        s.discovered_at = read_u64();
-        s.encoding      = static_cast<StringRef::Encoding>(read_u8());
-        read_u8(); read_u8(); read_u8();  // skip padding
-        if (!read_str(s.content)) return false;
+        s.addr          = r.u64();
+        s.discovered_at = r.u64();
+        s.encoding      = static_cast<StringRef::Encoding>(r.u8());
+        r.u8(); r.u8(); r.u8();  // skip padding
+        if (!r.str(s.content)) return false;
 
-        if (remaining() < 4) return false;
-        uint32_t num_refs = read_u32();
-        if (remaining() < num_refs * 16) return false;
+        uint32_t num_refs = r.u32();
         s.references.resize(num_refs);
         for (uint32_t j = 0; j < num_refs; j++) {
-            s.references[j].inst_id = read_u64();
-            s.references[j].pc      = read_u64();
+            s.references[j].inst_id = r.u64();
+            s.references[j].pc      = r.u64();
         }
 
         // Rebuild addr_to_index — last-written entry for a given address wins,
@@ -119,12 +82,12 @@ static bool string_deserialize(const std::string& blob, StringResult& out) {
         // semantics (see the incremental construction in run()).
         out.addr_to_index[s.addr] = i;
         // Rebuild inst_to_strings
-        for (const auto& r : s.references) {
-            out.inst_to_strings[r.inst_id].push_back(i);
+        for (const auto& ref : s.references) {
+            out.inst_to_strings[ref.inst_id].push_back(i);
         }
     }
 
-    return true;
+    return r.ok();
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

@@ -7,7 +7,8 @@
 #include <stack>
 #include <queue>
 #include <numeric>
-#include <cstring>
+
+#include "common/byte_codec.h"
 
 namespace tenet {
 
@@ -39,122 +40,96 @@ static constexpr uint32_t LOOP_BLOB_MAGIC   = 0x4C4F4F50u;  // "LOOP"
 static constexpr uint32_t LOOP_BLOB_VERSION = 1u;
 
 std::string loop_serialize(const LoopResult& res) {
-    size_t total = 4 + 4 + 8 + 4 + 8;  // magic, version, total_back_edges, max_nesting, num_loops
+    ByteWriter w;
+
+    w.u32(LOOP_BLOB_MAGIC);
+    w.u32(LOOP_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.total_back_edges));
+    w.u32(res.max_nesting_depth);
+    w.u64(static_cast<uint64_t>(res.loops.size()));
 
     for (const auto& li : res.loops) {
-        total += 8 + 8 + 8 + 4;         // header_pc, back_edge_pc, iteration_count, nesting_depth
-        total += 8 + li.body_pcs.size() * 8;  // num_body_pcs + body_pcs
+        w.u64(li.header_pc);
+        w.u64(li.back_edge_pc);
+        w.u64(li.iteration_count);
+        w.u32(li.nesting_depth);
+        w.u64(static_cast<uint64_t>(li.body_pcs.size()));
+        for (uint64_t pc : li.body_pcs) w.u64(pc);
     }
 
-    total += 8 + res.pc_loop_depth.size() * (8 + 4);
-    total += 8 + res.pc_is_loop_header.size() * (8 + 1);
-    total += 8 + res.pc_innermost_loop.size() * (8 + 8);
-
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(LOOP_BLOB_MAGIC);
-    write_u32(LOOP_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.total_back_edges));
-    write_u32(res.max_nesting_depth);
-    write_u64(static_cast<uint64_t>(res.loops.size()));
-
-    for (const auto& li : res.loops) {
-        write_u64(li.header_pc);
-        write_u64(li.back_edge_pc);
-        write_u64(li.iteration_count);
-        write_u32(li.nesting_depth);
-        write_u64(static_cast<uint64_t>(li.body_pcs.size()));
-        for (uint64_t pc : li.body_pcs) write_u64(pc);
-    }
-
-    write_u64(static_cast<uint64_t>(res.pc_loop_depth.size()));
+    w.u64(static_cast<uint64_t>(res.pc_loop_depth.size()));
     for (const auto& [pc, depth] : res.pc_loop_depth) {
-        write_u64(pc);
-        write_u32(depth);
+        w.u64(pc);
+        w.u32(depth);
     }
 
-    write_u64(static_cast<uint64_t>(res.pc_is_loop_header.size()));
+    w.u64(static_cast<uint64_t>(res.pc_is_loop_header.size()));
     for (const auto& [pc, is_hdr] : res.pc_is_loop_header) {
-        write_u64(pc);
-        write_u8(is_hdr ? 1u : 0u);
+        w.u64(pc);
+        w.u8(is_hdr ? 1u : 0u);
     }
 
-    write_u64(static_cast<uint64_t>(res.pc_innermost_loop.size()));
+    w.u64(static_cast<uint64_t>(res.pc_innermost_loop.size()));
     for (const auto& [pc, idx] : res.pc_innermost_loop) {
-        write_u64(pc);
-        write_u64(static_cast<uint64_t>(idx));
+        w.u64(pc);
+        w.u64(static_cast<uint64_t>(idx));
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool loop_deserialize(const std::string& blob, LoopResult& out) {
-    if (blob.size() < 4 + 4 + 8 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != LOOP_BLOB_MAGIC)   return false;
+    if (r.u32() != LOOP_BLOB_VERSION) return false;
 
-    if (read_u32() != LOOP_BLOB_MAGIC)   return false;
-    if (read_u32() != LOOP_BLOB_VERSION) return false;
+    out.total_back_edges  = static_cast<size_t>(r.u64());
+    out.max_nesting_depth = r.u32();
 
-    out.total_back_edges  = static_cast<size_t>(read_u64());
-    out.max_nesting_depth = read_u32();
-
-    uint64_t n_loops = read_u64();
+    uint64_t n_loops = r.u64();
     out.loops.reserve(static_cast<size_t>(n_loops));
     for (uint64_t i = 0; i < n_loops; i++) {
-        if (p + 8 + 8 + 8 + 4 + 8 > end) return false;
         LoopInfo li;
-        li.header_pc      = read_u64();
-        li.back_edge_pc   = read_u64();
-        li.iteration_count = read_u64();
-        li.nesting_depth  = read_u32();
-        uint64_t n_pcs    = read_u64();
-        if (p + n_pcs * 8 > end) return false;
+        li.header_pc      = r.u64();
+        li.back_edge_pc   = r.u64();
+        li.iteration_count = r.u64();
+        li.nesting_depth  = r.u32();
+        uint64_t n_pcs    = r.u64();
+        if (!r.ok()) return false;
         li.body_pcs.resize(static_cast<size_t>(n_pcs));
-        for (uint64_t j = 0; j < n_pcs; j++) li.body_pcs[j] = read_u64();
+        for (uint64_t j = 0; j < n_pcs; j++) li.body_pcs[j] = r.u64();
         out.loops.push_back(std::move(li));
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_depth = read_u64();
+    uint64_t n_depth = r.u64();
+    if (!r.ok()) return false;
     out.pc_loop_depth.reserve(static_cast<size_t>(n_depth));
     for (uint64_t i = 0; i < n_depth; i++) {
-        if (p + 8 + 4 > end) return false;
-        uint64_t pc = read_u64();
-        uint32_t d  = read_u32();
+        uint64_t pc = r.u64();
+        uint32_t d  = r.u32();
         out.pc_loop_depth[pc] = d;
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_hdr = read_u64();
+    uint64_t n_hdr = r.u64();
+    if (!r.ok()) return false;
     out.pc_is_loop_header.reserve(static_cast<size_t>(n_hdr));
     for (uint64_t i = 0; i < n_hdr; i++) {
-        if (p + 8 + 1 > end) return false;
-        uint64_t pc   = read_u64();
-        bool is_hdr   = read_u8() != 0;
+        uint64_t pc   = r.u64();
+        bool is_hdr   = r.u8() != 0;
         out.pc_is_loop_header[pc] = is_hdr;
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_inner = read_u64();
+    uint64_t n_inner = r.u64();
+    if (!r.ok()) return false;
     out.pc_innermost_loop.reserve(static_cast<size_t>(n_inner));
     for (uint64_t i = 0; i < n_inner; i++) {
-        if (p + 8 + 8 > end) return false;
-        uint64_t pc  = read_u64();
-        uint64_t idx = read_u64();
+        uint64_t pc  = r.u64();
+        uint64_t idx = r.u64();
         out.pc_innermost_loop[pc] = static_cast<size_t>(idx);
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (loop serialization)

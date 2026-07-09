@@ -4,6 +4,7 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -224,112 +225,69 @@ static constexpr uint32_t OBJC_BLOB_MAGIC   = 0x4F424A43u;  // "OBJC"
 static constexpr uint32_t OBJC_BLOB_VERSION  = 1u;
 
 std::string objc_serialize(const ObjcResult& res) {
-    // Estimate size: header + messages + classes
-    size_t est = 4 + 4 + 8;  // magic + version + num_messages
-    est += res.messages.size() * 256;  // rough estimate per message
-    est += res.classes.size() * 128;
+    ByteWriter w;
 
-    std::string buf;
-    buf.reserve(est);
-
-    auto write_u8  = [&](uint8_t v)  { buf.append(reinterpret_cast<const char*>(&v), 1); };
-    auto write_u32 = [&](uint32_t v) { buf.append(reinterpret_cast<const char*>(&v), 4); };
-    auto write_u64 = [&](uint64_t v) { buf.append(reinterpret_cast<const char*>(&v), 8); };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        buf.append(s);
-    };
-    auto write_opt_str = [&](const std::optional<std::string>& s) {
-        if (s.has_value()) {
-            write_u8(1);
-            write_str(*s);
-        } else {
-            write_u8(0);
-        }
-    };
-
-    write_u32(OBJC_BLOB_MAGIC);
-    write_u32(OBJC_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.messages.size()));
+    w.u32(OBJC_BLOB_MAGIC);
+    w.u32(OBJC_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.messages.size()));
 
     for (const auto& msg : res.messages) {
-        write_u64(msg.inst_id);
-        write_u64(msg.pc);
-        write_u64(msg.receiver);
-        write_u64(msg.selector);
-        write_str(msg.class_name);
-        write_str(msg.selector_name);
-        write_u8(msg.variant);
-        write_u8(msg.arg_count);
+        w.u64(msg.inst_id);
+        w.u64(msg.pc);
+        w.u64(msg.receiver);
+        w.u64(msg.selector);
+        w.str(msg.class_name);
+        w.str(msg.selector_name);
+        w.u8(msg.variant);
+        w.u8(msg.arg_count);
 
         uint8_t n = std::min(msg.arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
         for (uint8_t k = 0; k < n; ++k) {
-            write_u64(msg.args[k].value);
-            write_opt_str(msg.args[k].deref_str);
+            w.u64(msg.args[k].value);
+            w.opt_str(msg.args[k].deref_str);
         }
 
-        write_u8(msg.has_return ? 1 : 0);
+        w.u8(msg.has_return ? 1 : 0);
         if (msg.has_return) {
-            write_u64(msg.return_value);
-            write_opt_str(msg.return_deref_str);
+            w.u64(msg.return_value);
+            w.opt_str(msg.return_deref_str);
         }
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool objc_deserialize(const std::string& blob, ObjcResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_str = [&]() -> std::string {
-        uint32_t len = read_u32();
-        if (p + len > end) return {};
-        std::string s(p, len);
-        p += len;
-        return s;
-    };
-    auto read_opt_str = [&]() -> std::optional<std::string> {
-        uint8_t has = read_u8();
-        if (has) return read_str();
-        return std::nullopt;
-    };
+    if (r.u32() != OBJC_BLOB_MAGIC)   return false;
+    if (r.u32() != OBJC_BLOB_VERSION) return false;
 
-    if (read_u32() != OBJC_BLOB_MAGIC)   return false;
-    if (read_u32() != OBJC_BLOB_VERSION) return false;
-
-    uint64_t n_msgs = read_u64();
+    uint64_t n_msgs = r.u64();
     out.messages.reserve(static_cast<size_t>(n_msgs));
 
     for (uint64_t i = 0; i < n_msgs; i++) {
-        if (p + 8 * 4 > end) return false;
         ObjcMessage msg;
-        msg.inst_id       = read_u64();
-        msg.pc            = read_u64();
-        msg.receiver      = read_u64();
-        msg.selector      = read_u64();
-        msg.class_name    = read_str();
-        msg.selector_name = read_str();
-        msg.variant       = read_u8();
-        msg.arg_count     = read_u8();
+        msg.inst_id       = r.u64();
+        msg.pc            = r.u64();
+        msg.receiver      = r.u64();
+        msg.selector      = r.u64();
+        r.str(msg.class_name);
+        r.str(msg.selector_name);
+        msg.variant       = r.u8();
+        msg.arg_count     = r.u8();
 
         uint8_t n = std::min(msg.arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
         for (uint8_t k = 0; k < n; ++k) {
-            if (p + 8 > end) return false;
-            msg.args[k].value = read_u64();
-            msg.args[k].deref_str = read_opt_str();
+            msg.args[k].value = r.u64();
+            r.opt_str(msg.args[k].deref_str);
         }
 
-        uint8_t has_ret = read_u8();
+        uint8_t has_ret = r.u8();
         msg.has_return = (has_ret != 0);
         if (msg.has_return) {
-            if (p + 8 > end) return false;
-            msg.return_value = read_u64();
-            msg.return_deref_str = read_opt_str();
+            msg.return_value = r.u64();
+            r.opt_str(msg.return_deref_str);
         }
 
         // Rebuild class info
@@ -344,7 +302,7 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
         out.messages.push_back(std::move(msg));
     }
 
-    return true;
+    return r.ok();
 }
 
 /// Compute record size from raw pointer — now delegates to the shared

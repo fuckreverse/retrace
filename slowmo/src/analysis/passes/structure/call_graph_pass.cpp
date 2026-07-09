@@ -5,7 +5,9 @@
 #include <ankerl/unordered_dense.h>
 #include <fmt/core.h>
 #include <algorithm>
-#include <cstring>
+#include <queue>
+
+#include "common/byte_codec.h"
 
 namespace tenet {
 
@@ -50,109 +52,79 @@ uint64_t make_root_key(uint64_t call_site_pc) {
 }
 
 std::string call_graph_serialize(const CallGraphResult& res) {
-    size_t total = 4 + 4 + 8 + 8 + 8;  // magic, version, max_depth, total_call_events, num_edges
-    for (const auto& e : res.edges) {
-        total += 8 + 8 + 8 + 8 + e.call_site_pcs.size() * 8;
-    }
-    total += 8;  // num_nodes
-    for (const auto& [pc, node] : res.nodes) {
-        total += 8 + 8 + 8;  // entry_pc, total_calls_made, total_calls_received
-        total += 4 + node.name.size();  // name_len + name
-        total += 8 + node.outgoing_edges.size() * 8;
-        total += 8 + node.incoming_edges.size() * 8;
-    }
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(CALG_BLOB_MAGIC);
-    write_u32(CALG_BLOB_VERSION);
-    write_u64(res.max_depth);
-    write_u64(res.total_call_events);
-    write_u64(static_cast<uint64_t>(res.edges.size()));
+    w.u32(CALG_BLOB_MAGIC);
+    w.u32(CALG_BLOB_VERSION);
+    w.u64(res.max_depth);
+    w.u64(res.total_call_events);
+    w.u64(static_cast<uint64_t>(res.edges.size()));
 
     for (const auto& e : res.edges) {
-        write_u64(e.caller_pc);
-        write_u64(e.callee_pc);
-        write_u64(e.call_count);
-        write_u64(static_cast<uint64_t>(e.call_site_pcs.size()));
-        for (uint64_t cs : e.call_site_pcs) write_u64(cs);
+        w.u64(e.caller_pc);
+        w.u64(e.callee_pc);
+        w.u64(e.call_count);
+        w.u64(static_cast<uint64_t>(e.call_site_pcs.size()));
+        for (uint64_t cs : e.call_site_pcs) w.u64(cs);
     }
 
-    write_u64(static_cast<uint64_t>(res.nodes.size()));
+    w.u64(static_cast<uint64_t>(res.nodes.size()));
     for (const auto& [pc, node] : res.nodes) {
-        write_u64(node.entry_pc);
-        write_u64(node.total_calls_made);
-        write_u64(node.total_calls_received);
-        write_u32(static_cast<uint32_t>(node.name.size()));
-        std::memcpy(p, node.name.data(), node.name.size());
-        p += node.name.size();
-        write_u64(static_cast<uint64_t>(node.outgoing_edges.size()));
-        for (size_t idx : node.outgoing_edges) write_u64(static_cast<uint64_t>(idx));
-        write_u64(static_cast<uint64_t>(node.incoming_edges.size()));
-        for (size_t idx : node.incoming_edges) write_u64(static_cast<uint64_t>(idx));
+        w.u64(node.entry_pc);
+        w.u64(node.total_calls_made);
+        w.u64(node.total_calls_received);
+        w.str(node.name);
+        w.u64(static_cast<uint64_t>(node.outgoing_edges.size()));
+        for (size_t idx : node.outgoing_edges) w.u64(static_cast<uint64_t>(idx));
+        w.u64(static_cast<uint64_t>(node.incoming_edges.size()));
+        for (size_t idx : node.incoming_edges) w.u64(static_cast<uint64_t>(idx));
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool call_graph_deserialize(const std::string& blob, CallGraphResult& out) {
-    if (blob.size() < 4 + 4 + 8 + 8 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != CALG_BLOB_MAGIC)   return false;
+    if (r.u32() != CALG_BLOB_VERSION) return false;
 
-    if (read_u32() != CALG_BLOB_MAGIC)   return false;
-    if (read_u32() != CALG_BLOB_VERSION) return false;
+    out.max_depth         = r.u64();
+    out.total_call_events = r.u64();
 
-    out.max_depth         = read_u64();
-    out.total_call_events = read_u64();
-
-    uint64_t n_edges = read_u64();
+    uint64_t n_edges = r.u64();
     out.edges.reserve(static_cast<size_t>(n_edges));
     for (uint64_t i = 0; i < n_edges; i++) {
-        if (p + 8 + 8 + 8 + 8 > end) return false;
         CallGraphEdge e;
-        e.caller_pc  = read_u64();
-        e.callee_pc  = read_u64();
-        e.call_count = read_u64();
-        uint64_t n_cs = read_u64();
-        if (p + n_cs * 8 > end) return false;
+        e.caller_pc  = r.u64();
+        e.callee_pc  = r.u64();
+        e.call_count = r.u64();
+        uint64_t n_cs = r.u64();
+        if (!r.ok()) return false;
         e.call_site_pcs.resize(static_cast<size_t>(n_cs));
-        for (uint64_t j = 0; j < n_cs; j++) e.call_site_pcs[j] = read_u64();
+        for (uint64_t j = 0; j < n_cs; j++) e.call_site_pcs[j] = r.u64();
         out.edges.push_back(std::move(e));
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_nodes = read_u64();
+    uint64_t n_nodes = r.u64();
+    if (!r.ok()) return false;
     out.nodes.reserve(static_cast<size_t>(n_nodes));
     for (uint64_t i = 0; i < n_nodes; i++) {
-        if (p + 8 + 8 + 8 + 4 > end) return false;
         CallGraphNode node;
-        node.entry_pc              = read_u64();
-        node.total_calls_made      = read_u64();
-        node.total_calls_received  = read_u64();
-        uint32_t name_len          = read_u32();
-        if (p + name_len > end) return false;
-        node.name.assign(p, name_len);
-        p += name_len;
-        if (p + 8 > end) return false;
-        uint64_t n_out = read_u64();
+        node.entry_pc              = r.u64();
+        node.total_calls_made      = r.u64();
+        node.total_calls_received  = r.u64();
+        if (!r.str(node.name)) return false;
+        uint64_t n_out = r.u64();
+        if (!r.ok()) return false;
         node.outgoing_edges.resize(static_cast<size_t>(n_out));
-        if (p + n_out * 8 > end) return false;
         for (uint64_t j = 0; j < n_out; j++)
-            node.outgoing_edges[j] = static_cast<size_t>(read_u64());
-        if (p + 8 > end) return false;
-        uint64_t n_in = read_u64();
+            node.outgoing_edges[j] = static_cast<size_t>(r.u64());
+        uint64_t n_in = r.u64();
+        if (!r.ok()) return false;
         node.incoming_edges.resize(static_cast<size_t>(n_in));
-        if (p + n_in * 8 > end) return false;
         for (uint64_t j = 0; j < n_in; j++)
-            node.incoming_edges[j] = static_cast<size_t>(read_u64());
+            node.incoming_edges[j] = static_cast<size_t>(r.u64());
         // Deserialized nodes are always fully populated (blob format has no
         // "empty placeholder" concept) — mark initialized so downstream code
         // never mistakes it for a fresh default-constructed node. `is_root`
@@ -162,6 +134,8 @@ bool call_graph_deserialize(const std::string& blob, CallGraphResult& out) {
         node.is_root      = call_graph_is_root_key(node.entry_pc);
         out.nodes.emplace(node.entry_pc, std::move(node));
     }
+
+    if (!r.ok()) return false;
 
     // Rebuild edge_map_ from edges
     for (size_t ei = 0; ei < out.edges.size(); ei++) {
@@ -247,79 +221,74 @@ PassResult CallGraphPass::run(PassContext& ctx) {
     // Access function names directly from FunctionResult instead of copying.
     const auto& func_names = func_result.functions;
 
-    // Step 2: Walk through call events in order to build edges.
-    // We simulate the call stack: when we see a call event, the caller is
-    // the top of the stack (or "root" if stack is empty), then we push the callee.
-    // When we see a return, we pop.
+    // ── Process call events with O(N log D) merge instead of O(N log N) sort ──
+    //
+    // CallEvents are already sorted by call_inst_id.  Return events are NOT
+    // globally sorted by return_inst_id (they follow LIFO call-stack order),
+    // but we can interleave them with calls using a min-heap of pending
+    // returns.  The heap size is bounded by the call depth D (typically < 1000),
+    // so total complexity is O(N log D) instead of O(N log N).
+    //
+    // At the same inst_id, calls are processed before returns (matching the
+    // original sort comparator's tie-break rule).
 
-    // We need to process events in inst_id order. CallEvents are already in order
-    // by call_inst_id, but returns may come out of order. We'll process using
-    // both the call_site_map_ and return_site_map_ from FunctionResult.
-
-    // Build a timeline of events (call and return) sorted by inst_id.
-    struct TimelineEvent {
-        uint64_t inst_id;
-        bool is_call;       // true = call, false = return
-        size_t event_index; // index into call_events
-    };
-    std::vector<TimelineEvent> timeline;
-    timeline.reserve(func_result.call_events.size() * 2);
+    // Min-heap: (return_inst_id, event_index), ordered by return_inst_id.
+    std::priority_queue<
+        std::pair<uint64_t, size_t>,
+        std::vector<std::pair<uint64_t, size_t>>,
+        std::greater<>> pending_returns;
 
     for (size_t i = 0; i < func_result.call_events.size(); i++) {
         if ((i % 1000) == 0 && ctx.cancelled()) {
             return PassResult::failed("cancelled by user");
         }
         const auto& evt = func_result.call_events[i];
-        timeline.push_back({evt.call_inst_id, true, i});
-        if (evt.return_inst_id != 0) {
-            timeline.push_back({evt.return_inst_id, false, i});
-        }
-    }
 
-    // Sort by inst_id, calls before returns at same inst_id
-    std::sort(timeline.begin(), timeline.end(),
-              [](const TimelineEvent& a, const TimelineEvent& b) {
-                  if (a.inst_id != b.inst_id) return a.inst_id < b.inst_id;
-                  // At same inst_id, calls come before returns
-                  return a.is_call && !b.is_call;
-              });
-
-    // Process timeline
-    for (const auto& te : timeline) {
-        if (ctx.cancelled()) {
-            return PassResult::failed("cancelled by user");
-        }
-        const auto& evt = func_result.call_events[te.event_index];
-
-        if (te.is_call) {
-            // Determine caller: top of stack, or a synthetic per-call-site
-            // root pseudo-key if the stack is empty (see
-            // kCallGraphRootTagBit in call_graph_pass.h for why we don't
-            // collapse all of these into a single PC-0 node).
-            uint64_t caller_entry_pc = call_stack_funcs.empty()
-                                           ? make_root_key(evt.call_site_pc)
-                                           : call_stack_funcs.back();
-            uint64_t callee_entry_pc = evt.target_pc;
-
-            // Update max depth
-            if (evt.depth > max_depth) {
-                max_depth = evt.depth;
-            }
-
-            // Accumulate edge
-            EdgeKey key{caller_entry_pc, callee_entry_pc};
-            auto& acc = edge_accum[key];
-            acc.first++;
-            acc.second.push_back(evt.call_site_pc);
-
-            // Push callee onto stack
-            call_stack_funcs.push_back(callee_entry_pc);
-        } else {
-            // Return: pop from stack
+        // Drain all returns that happen strictly before this call.
+        // (Using < not <= ensures calls precede returns at the same inst_id.)
+        while (!pending_returns.empty() &&
+               pending_returns.top().first < evt.call_inst_id) {
             if (!call_stack_funcs.empty()) {
                 call_stack_funcs.pop_back();
             }
+            pending_returns.pop();
         }
+
+        // Determine caller: top of stack, or a synthetic per-call-site
+        // root pseudo-key if the stack is empty (see
+        // kCallGraphRootTagBit in call_graph_pass.h for why we don't
+        // collapse all of these into a single PC-0 node).
+        uint64_t caller_entry_pc = call_stack_funcs.empty()
+                                       ? make_root_key(evt.call_site_pc)
+                                       : call_stack_funcs.back();
+        uint64_t callee_entry_pc = evt.target_pc;
+
+        // Update max depth
+        if (evt.depth > max_depth) {
+            max_depth = evt.depth;
+        }
+
+        // Accumulate edge
+        EdgeKey key{caller_entry_pc, callee_entry_pc};
+        auto& acc = edge_accum[key];
+        acc.first++;
+        acc.second.push_back(evt.call_site_pc);
+
+        // Push callee onto stack
+        call_stack_funcs.push_back(callee_entry_pc);
+
+        // Schedule return if present
+        if (evt.return_inst_id != 0) {
+            pending_returns.emplace(evt.return_inst_id, i);
+        }
+    }
+
+    // Drain remaining returns after all calls have been processed.
+    while (!pending_returns.empty()) {
+        if (!call_stack_funcs.empty()) {
+            call_stack_funcs.pop_back();
+        }
+        pending_returns.pop();
     }
 
     result.max_depth = max_depth;

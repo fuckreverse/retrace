@@ -9,8 +9,9 @@
 
 #include <fmt/core.h>
 #include <algorithm>
-#include <cstring>
 #include <string_view>
+
+#include "common/byte_codec.h"
 
 namespace tenet {
 
@@ -40,89 +41,67 @@ static constexpr uint32_t CFG_BLOB_MAGIC   = 0x43464700u;  // "CFG\0"
 static constexpr uint32_t CFG_BLOB_VERSION = 1u;
 
 std::string cfg_serialize(const CFGResult& res) {
-    // Compute total size first
-    size_t total = 4 + 4 + 8;  // magic + version + num_blocks
-    for (const auto& [start_pc, blk] : res.blocks) {
-        total += 8 + 8 + 8 + 1 + 8;  // start_pc, end_pc, exec_count, terminator, num_insns
-        total += blk.instructions.size() * 8;
-    }
-    total += 8;  // num_edges
-    total += res.edges.size() * (8 + 8 + 8 + 1);  // from, to, count, fallthrough
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(CFG_BLOB_MAGIC);
-    write_u32(CFG_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.blocks.size()));
+    w.u32(CFG_BLOB_MAGIC);
+    w.u32(CFG_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.blocks.size()));
 
     for (const auto& [start_pc, blk] : res.blocks) {
-        write_u64(blk.start_pc);
-        write_u64(blk.end_pc);
-        write_u64(blk.execution_count);
-        write_u8(static_cast<uint8_t>(blk.terminator));
-        write_u64(static_cast<uint64_t>(blk.instructions.size()));
-        for (uint64_t pc : blk.instructions) write_u64(pc);
+        w.u64(blk.start_pc);
+        w.u64(blk.end_pc);
+        w.u64(blk.execution_count);
+        w.u8(static_cast<uint8_t>(blk.terminator));
+        w.u64(static_cast<uint64_t>(blk.instructions.size()));
+        for (uint64_t pc : blk.instructions) w.u64(pc);
     }
 
-    write_u64(static_cast<uint64_t>(res.edges.size()));
+    w.u64(static_cast<uint64_t>(res.edges.size()));
     for (const auto& e : res.edges) {
-        write_u64(e.from_block);
-        write_u64(e.to_block);
-        write_u64(e.taken_count);
-        write_u8(e.is_fallthrough ? 1u : 0u);
+        w.u64(e.from_block);
+        w.u64(e.to_block);
+        w.u64(e.taken_count);
+        w.u8(e.is_fallthrough ? 1u : 0u);
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool cfg_deserialize(const std::string& blob, CFGResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != CFG_BLOB_MAGIC)   return false;
+    if (r.u32() != CFG_BLOB_VERSION) return false;
 
-    if (read_u32() != CFG_BLOB_MAGIC)   return false;
-    if (read_u32() != CFG_BLOB_VERSION) return false;
-
-    uint64_t n_blocks = read_u64();
+    uint64_t n_blocks = r.u64();
     for (uint64_t i = 0; i < n_blocks; i++) {
-        if (p + 8 + 8 + 8 + 1 + 8 > end) return false;
         BasicBlock blk;
-        blk.start_pc        = read_u64();
-        blk.end_pc          = read_u64();
-        blk.execution_count = read_u64();
-        blk.terminator      = static_cast<TerminatorKind>(read_u8());
-        uint64_t n_insns    = read_u64();
-        if (p + n_insns * 8 > end) return false;
+        blk.start_pc        = r.u64();
+        blk.end_pc          = r.u64();
+        blk.execution_count = r.u64();
+        blk.terminator      = static_cast<TerminatorKind>(r.u8());
+        uint64_t n_insns    = r.u64();
+        if (!r.ok()) return false;
         blk.instructions.resize(static_cast<size_t>(n_insns));
         for (uint64_t j = 0; j < n_insns; j++) {
-            blk.instructions[j] = read_u64();
+            blk.instructions[j] = r.u64();
         }
         out.blocks.emplace(blk.start_pc, std::move(blk));
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_edges = read_u64();
+    uint64_t n_edges = r.u64();
+    if (!r.ok()) return false;
     out.edges.reserve(static_cast<size_t>(n_edges));
     for (uint64_t i = 0; i < n_edges; i++) {
-        if (p + 8 + 8 + 8 + 1 > end) return false;
         CFGEdge e;
-        e.from_block     = read_u64();
-        e.to_block       = read_u64();
-        e.taken_count    = read_u64();
-        e.is_fallthrough = read_u8() != 0;
+        e.from_block     = r.u64();
+        e.to_block       = r.u64();
+        e.taken_count    = r.u64();
+        e.is_fallthrough = r.u8() != 0;
         out.edges.push_back(e);
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (cfg serialization)
@@ -212,38 +191,13 @@ std::optional<TerminatorKind> classify_terminator(std::string_view mnemonic) {
     return std::nullopt;
 }
 
-/// Extract the branch target PC from a decoded instruction's operand string.
-/// For AArch64, Capstone encodes the target as "#0xADDR" in the op_str.
-std::optional<uint64_t> extract_branch_target(std::string_view op_str) {
-    // Look for "#0x" pattern which Capstone uses for branch targets
-    auto pos = op_str.find("#0x");
-    if (pos == std::string_view::npos) {
-        pos = op_str.find("#0X");
-    }
-    if (pos == std::string_view::npos) {
-        // For cbz/cbnz/tbz/tbnz, the target is the last operand
-        // e.g. "cbz x0, #0x1000" — find the last "#0x"
-        pos = op_str.rfind('#');
-        if (pos == std::string_view::npos) return std::nullopt;
-        if (pos + 1 < op_str.size() && (op_str[pos + 1] == '0') &&
-            (op_str[pos + 2] == 'x' || op_str[pos + 2] == 'X')) {
-            // OK, found "#0x"
-        } else {
-            return std::nullopt;
-        }
-    } else {
-        // Skip "#0x" prefix
-        pos += 3;  // skip past "#0x"
-    }
-
-    // Parse hex number starting at pos
-    // op_str is backed by a null-terminated char[] so .data() + pos is safe for strtoull
-    char* endp = nullptr;
-    uint64_t target = std::strtoull(op_str.data() + pos, &endp, 16);
-    if (endp != op_str.data() + pos && target != 0) {
-        return target;
-    }
-    return std::nullopt;
+/// Extract the branch target PC directly from the 32-bit AArch64 opcode.
+/// Uses pure bitfield extraction — no Capstone decode needed.
+/// Returns nullopt for indirect branches (BR/BLR/RET) whose target is
+/// not statically determinable.
+std::optional<uint64_t> extract_branch_target_from_opcode(uint64_t pc, uint32_t opcode) {
+    uint64_t target = aarch64::direct_branch_target(pc, opcode);
+    return target != 0 ? std::optional<uint64_t>{target} : std::nullopt;
 }
 
 }  // anonymous namespace
@@ -272,7 +226,6 @@ PassResult CFGPass::run(PassContext& ctx) {
     // Require xref pass results to get the set of executed PCs
     const auto& xref = ctx.require<XrefResult>("xref");
     auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
     auto& reader = ctx.reader();
 
     CFGResult result;
@@ -328,16 +281,19 @@ PassResult CFGPass::run(PassContext& ctx) {
         }
 
         // The target of a direct branch starts a new block.
-        // We need Capstone only here to extract the branch target immediate.
+        // Extract the target PC directly from the opcode bits — no Capstone
+        // decode needed.  BLR/BR/RET are indirect (target unknown statically).
         if (kind == TerminatorKind::Branch ||
             kind == TerminatorKind::ConditionalBranch ||
             kind == TerminatorKind::Call) {
-            auto d = decoder.decode(pc, *opcode);
-            if (d) {
-                auto target = extract_branch_target(d->op_str);
-                if (target && xref.has_pc(*target)) {
-                    block_leaders.insert(*target);
-                }
+            // Only B/BL/B.cond/CBZ/CBNZ/TBZ/TBNZ have PC-relative targets.
+            // BLR is Call but indirect — skip target extraction for it.
+            if (aarch64::is_blr(*opcode) || aarch64::is_br(*opcode) ||
+                aarch64::is_ret(*opcode))
+                continue;
+            auto target = extract_branch_target_from_opcode(pc, *opcode);
+            if (target && xref.has_pc(*target)) {
+                block_leaders.insert(*target);
             }
         }
         // Indirect branches (blr, br, ret) — target unknown statically,

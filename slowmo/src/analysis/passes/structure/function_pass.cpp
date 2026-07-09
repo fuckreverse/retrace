@@ -10,6 +10,8 @@
 #include <numeric>
 #include <string_view>
 
+#include "common/byte_codec.h"
+
 namespace tenet {
 
 // ─── FunctionResult serialization helpers ────────────────────────────────────
@@ -94,18 +96,12 @@ std::string function_serialize(const FunctionResult& res) {
 
 bool function_deserialize(const std::string& blob, FunctionResult& out,
                           bool full_mode = false) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+    if (r.u32() != FUNC_BLOB_MAGIC)   return false;
+    if (r.u32() != FUNC_BLOB_VERSION) return false;
 
-    if (read_u32() != FUNC_BLOB_MAGIC)   return false;
-    if (read_u32() != FUNC_BLOB_VERSION) return false;
-
-    uint64_t n_events = read_u64();
+    uint64_t n_events = r.u64();
     // In default mode: apply the same cap as during live analysis so loading a
     // legacy blob (written before the cap was in place) does not exhaust memory.
     // In full_mode: load everything.
@@ -116,38 +112,33 @@ bool function_deserialize(const std::string& blob, FunctionResult& out,
     out.call_events.reserve(static_cast<size_t>(load_events));
 
     for (uint64_t i = 0; i < n_events; i++) {
-        if (p + 48 > end) return false;
         CallEvent evt;
-        evt.call_inst_id   = read_u64();
-        evt.return_inst_id = read_u64();
-        evt.call_site_pc   = read_u64();
-        evt.target_pc      = read_u64();
-        evt.depth          = read_u64();
-        evt.is_tail_call   = read_u8() != 0;
-        p += 7;  // skip padding
+        evt.call_inst_id   = r.u64();
+        evt.return_inst_id = r.u64();
+        evt.call_site_pc   = r.u64();
+        evt.target_pc      = r.u64();
+        evt.depth          = r.u64();
+        evt.is_tail_call   = r.u8() != 0;
+        r.skip(7);  // skip padding
+        if (!r.ok()) return false;
         // Only store events within the cap; consume the bytes regardless.
         if (i < load_events) {
             out.call_events.push_back(evt);
         }
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_funcs = read_u64();
+    uint64_t n_funcs = r.u64();
+    if (!r.ok()) return false;
     out.functions.reserve(static_cast<size_t>(n_funcs));
 
     for (uint64_t i = 0; i < n_funcs; i++) {
-        if (p + 8 + 8 + 8 + 4 > end) return false;
         FunctionInfo fi;
-        fi.entry_pc            = read_u64();
-        fi.total_calls         = read_u64();
-        fi.total_instructions  = read_u64();
-        uint32_t name_len      = read_u32();
-        if (p + name_len > end) return false;
-        fi.name.assign(p, name_len);
-        p += name_len;
-        if (p + 8 > end) return false;
-        uint64_t n_idx = read_u64();
-        if (p + n_idx * 8 > end) return false;
+        fi.entry_pc            = r.u64();
+        fi.total_calls         = r.u64();
+        fi.total_instructions  = r.u64();
+        if (!r.str(fi.name)) return false;
+        uint64_t n_idx = r.u64();
+        if (!r.ok()) return false;
         // In default mode: apply the same cap as end() so deserialized data
         // doesn't exceed the in-memory limit even with legacy blobs.
         // In full_mode: load all indices (filtered only for validity).
@@ -159,7 +150,7 @@ bool function_deserialize(const std::string& blob, FunctionResult& out,
         // How many valid call_event_indices to keep (capped and within bounds)
         size_t loaded_idx_count = 0;
         for (uint64_t j = 0; j < n_idx; j++) {
-            uint64_t idx_val = read_u64();  // must consume all bytes
+            uint64_t idx_val = r.u64();  // must consume all bytes
             // Filter: only include indices that are within the loaded
             // call_events array.  This handles legacy blobs that were written
             // before the cap existed.
@@ -169,6 +160,7 @@ bool function_deserialize(const std::string& blob, FunctionResult& out,
                 ++loaded_idx_count;
             }
         }
+        if (!r.ok()) return false;
         out.functions.emplace(fi.entry_pc, std::move(fi));
     }
 

@@ -5,10 +5,10 @@
 #include "io/index_builder.h"
 #include "core/register_file.h"
 
+#include "common/byte_codec.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
-#include <cstring>
 
 namespace tenet {
 
@@ -37,156 +37,123 @@ static constexpr uint32_t TFLD_BLOB_MAGIC   = 0x54464C44u;  // "TFLD"
 static constexpr uint32_t TFLD_BLOB_VERSION = 2u;
 
 std::string trace_fold_serialize(const TraceFoldResult& res) {
-    size_t total = 4 + 4 + 8 + 8 + 8 + 4 + 8;
-    total += res.kept_ranges.size() * (8 + 8);
-    total += 8;
-    for (const auto& fr : res.folded_regions) {
-        total += 8 + 8 + 8;
-        total += 8 + 8 + 8;
-        total += 8 + fr.kept_iterations.size() * (8 + 8);
-        total += 8 + fr.reg_changes.size() * (1 + 8 + 8 + 1);
-        total += 8 + fr.fpr_changes.size() * (1 + 8 + 8 + 8 + 8);
-    }
+    ByteWriter w;
+    w.u32(TFLD_BLOB_MAGIC);
+    w.u32(TFLD_BLOB_VERSION);
+    w.u64(res.original_inst_count);
+    w.u64(res.folded_inst_count);
+    w.u64(res.total_instructions_removed);
+    w.f32(res.compression_ratio);
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u8  = [&](uint8_t  v) { std::memcpy(p, &v, 1); p += 1; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
-
-    write_u32(TFLD_BLOB_MAGIC);
-    write_u32(TFLD_BLOB_VERSION);
-    write_u64(res.original_inst_count);
-    write_u64(res.folded_inst_count);
-    write_u64(res.total_instructions_removed);
-    write_f32(res.compression_ratio);
-
-    write_u64(static_cast<uint64_t>(res.kept_ranges.size()));
+    w.u64(static_cast<uint64_t>(res.kept_ranges.size()));
     for (const auto& kr : res.kept_ranges) {
-        write_u64(kr.start);
-        write_u64(kr.end);
+        w.u64(kr.start);
+        w.u64(kr.end);
     }
 
-    write_u64(static_cast<uint64_t>(res.folded_regions.size()));
+    w.u64(static_cast<uint64_t>(res.folded_regions.size()));
     for (const auto& fr : res.folded_regions) {
-        write_u64(fr.header_pc);
-        write_u64(fr.first_inst_id);
-        write_u64(fr.last_inst_id);
-        write_u64(fr.total_iterations);
-        write_u64(fr.instructions_per_iteration);
-        write_u64(fr.total_instructions_folded);
+        w.u64(fr.header_pc);
+        w.u64(fr.first_inst_id);
+        w.u64(fr.last_inst_id);
+        w.u64(fr.total_iterations);
+        w.u64(fr.instructions_per_iteration);
+        w.u64(fr.total_instructions_folded);
 
-        write_u64(static_cast<uint64_t>(fr.kept_iterations.size()));
+        w.u64(static_cast<uint64_t>(fr.kept_iterations.size()));
         for (const auto& ir : fr.kept_iterations) {
-            write_u64(ir.start);
-            write_u64(ir.end);
+            w.u64(ir.start);
+            w.u64(ir.end);
         }
 
-        write_u64(static_cast<uint64_t>(fr.reg_changes.size()));
+        w.u64(static_cast<uint64_t>(fr.reg_changes.size()));
         for (const auto& rc : fr.reg_changes) {
-            write_u8(rc.reg);
-            write_u64(rc.first_val);
-            write_u64(rc.last_val);
-            write_u8(static_cast<uint8_t>(rc.pattern));
+            w.u8(rc.reg);
+            w.u64(rc.first_val);
+            w.u64(rc.last_val);
+            w.u8(static_cast<uint8_t>(rc.pattern));
         }
 
-        write_u64(static_cast<uint64_t>(fr.fpr_changes.size()));
+        w.u64(static_cast<uint64_t>(fr.fpr_changes.size()));
         for (const auto& fc : fr.fpr_changes) {
-            write_u8(fc.reg);
-            write_u64(fc.first_lo);
-            write_u64(fc.first_hi);
-            write_u64(fc.last_lo);
-            write_u64(fc.last_hi);
+            w.u8(fc.reg);
+            w.u64(fc.first_lo);
+            w.u64(fc.first_hi);
+            w.u64(fc.last_lo);
+            w.u64(fc.last_hi);
         }
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool trace_fold_deserialize(const std::string& blob, TraceFoldResult& out) {
-    if (blob.size() < 4 + 4 + 8 + 8 + 8 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u8  = [&]() -> uint8_t  { uint8_t  v; std::memcpy(&v, p, 1); p += 1; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
+    if (r.u32() != TFLD_BLOB_MAGIC)   return false;
+    if (r.u32() != TFLD_BLOB_VERSION) return false;  // reject older/newer versions
 
-    if (read_u32() != TFLD_BLOB_MAGIC)   return false;
-    if (read_u32() != TFLD_BLOB_VERSION) return false;  // reject older/newer versions
+    out.original_inst_count       = r.u64();
+    out.folded_inst_count         = r.u64();
+    out.total_instructions_removed = r.u64();
+    out.compression_ratio         = r.f32();
 
-    out.original_inst_count       = read_u64();
-    out.folded_inst_count         = read_u64();
-    out.total_instructions_removed = read_u64();
-    out.compression_ratio         = read_f32();
-
-    if (p + 8 > end) return false;
-    uint64_t n_kept = read_u64();
+    uint64_t n_kept = r.u64();
+    if (!r.ok()) return false;
     out.kept_ranges.reserve(static_cast<size_t>(n_kept));
     for (uint64_t i = 0; i < n_kept; i++) {
-        if (p + 8 + 8 > end) return false;
-        uint64_t s = read_u64();
-        uint64_t e = read_u64();
+        uint64_t s = r.u64();
+        uint64_t e = r.u64();
         out.kept_ranges.push_back({s, e});
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_regions = read_u64();
+    uint64_t n_regions = r.u64();
+    if (!r.ok()) return false;
     out.folded_regions.reserve(static_cast<size_t>(n_regions));
     for (uint64_t i = 0; i < n_regions; i++) {
-        if (p + 8 * 6 > end) return false;
         FoldedRegion fr{};
-        fr.header_pc                   = read_u64();
-        fr.first_inst_id               = read_u64();
-        fr.last_inst_id                = read_u64();
-        fr.total_iterations            = read_u64();
-        fr.instructions_per_iteration  = read_u64();
-        fr.total_instructions_folded   = read_u64();
+        fr.header_pc                   = r.u64();
+        fr.first_inst_id               = r.u64();
+        fr.last_inst_id                = r.u64();
+        fr.total_iterations            = r.u64();
+        fr.instructions_per_iteration  = r.u64();
+        fr.total_instructions_folded   = r.u64();
 
-        if (p + 8 > end) return false;
-        uint64_t n_iter = read_u64();
+        uint64_t n_iter = r.u64();
         fr.kept_iterations.reserve(static_cast<size_t>(n_iter));
         for (uint64_t j = 0; j < n_iter; j++) {
-            if (p + 8 + 8 > end) return false;
-            uint64_t s = read_u64();
-            uint64_t e = read_u64();
+            uint64_t s = r.u64();
+            uint64_t e = r.u64();
             fr.kept_iterations.push_back({s, e});
         }
 
-        if (p + 8 > end) return false;
-        uint64_t n_rc = read_u64();
+        uint64_t n_rc = r.u64();
         fr.reg_changes.reserve(static_cast<size_t>(n_rc));
         for (uint64_t j = 0; j < n_rc; j++) {
-            if (p + 1 + 8 + 8 + 1 > end) return false;
             FoldedRegion::RegChange rc{};
-            rc.reg       = read_u8();
-            rc.first_val = read_u64();
-            rc.last_val  = read_u64();
-            rc.pattern   = static_cast<RegChangePattern>(read_u8());
+            rc.reg       = r.u8();
+            rc.first_val = r.u64();
+            rc.last_val  = r.u64();
+            rc.pattern   = static_cast<RegChangePattern>(r.u8());
             fr.reg_changes.push_back(rc);
         }
 
-        if (p + 8 > end) return false;
-        uint64_t n_fc = read_u64();
+        uint64_t n_fc = r.u64();
         fr.fpr_changes.reserve(static_cast<size_t>(n_fc));
         for (uint64_t j = 0; j < n_fc; j++) {
-            if (p + 1 + 8 + 8 + 8 + 8 > end) return false;
             FoldedRegion::FprChange fc{};
-            fc.reg      = read_u8();
-            fc.first_lo = read_u64();
-            fc.first_hi = read_u64();
-            fc.last_lo  = read_u64();
-            fc.last_hi  = read_u64();
+            fc.reg      = r.u8();
+            fc.first_lo = r.u64();
+            fc.first_hi = r.u64();
+            fc.last_lo  = r.u64();
+            fc.last_hi  = r.u64();
             fr.fpr_changes.push_back(fc);
         }
 
         out.folded_regions.push_back(std::move(fr));
     }
 
-    return true;
+    return r.ok();
 }
 
 /// Classify how a register changed across `samples` (chronologically ordered

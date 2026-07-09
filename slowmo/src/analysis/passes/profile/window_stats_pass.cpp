@@ -6,11 +6,11 @@
 #include "core/instruction_decoder.h"
 #include "common/aarch64_classify.h"
 
+#include "common/byte_codec.h"
 #include <fmt/core.h>
 #include <ankerl/unordered_dense.h>
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 
 namespace tenet {
 
@@ -55,117 +55,88 @@ static constexpr uint32_t WSTS_BLOB_VERSION_1 = 1u;
 static constexpr uint32_t WSTS_BLOB_VERSION   = 2u;
 
 std::string window_stats_serialize(const WindowStatsResult& res) {
-    size_t total = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8;  // header fields
-    for (const auto& w : res.windows) {
-        total += 8 * 7;   // start,end,inst_count,mem_r,mem_w,unique_mem,unique_pcs
-        total += 4 + 4;   // mnemonic_entropy (f32), branch_density (f32)
-        total += 4 * 34;  // reg_write_counts
-        total += 4;       // num_top_mnemonics
-        for (const auto& ms : w.top_mnemonics) {
-            total += 2 + 8 + 1 + ms.mnemonic.size();  // id(u16)+count(u64)+len(u8)+chars
-        }
-    }
+    ByteWriter w;
+    w.u32(WSTS_BLOB_MAGIC);
+    w.u32(WSTS_BLOB_VERSION);
+    w.u64(res.window_size);
+    w.u64(res.total_windows);
+    w.u64(static_cast<uint64_t>(res.hottest_mem_window));
+    w.u64(static_cast<uint64_t>(res.most_diverse_window));
+    w.u64(static_cast<uint64_t>(res.densest_branch_window));
+    w.u64(static_cast<uint64_t>(res.windows.size()));
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u16 = [&](uint16_t v) { std::memcpy(p, &v, 2); p += 2; };
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_f32 = [&](float    v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-
-    write_u32(WSTS_BLOB_MAGIC);
-    write_u32(WSTS_BLOB_VERSION);
-    write_u64(res.window_size);
-    write_u64(res.total_windows);
-    write_u64(static_cast<uint64_t>(res.hottest_mem_window));
-    write_u64(static_cast<uint64_t>(res.most_diverse_window));
-    write_u64(static_cast<uint64_t>(res.densest_branch_window));
-    write_u64(static_cast<uint64_t>(res.windows.size()));
-
-    for (const auto& w : res.windows) {
-        write_u64(w.start_inst_id);
-        write_u64(w.end_inst_id);
-        write_u64(w.instruction_count);
-        write_u64(w.mem_read_count);
-        write_u64(w.mem_write_count);
-        write_u64(w.unique_mem_addrs);
-        write_u64(w.unique_pcs);
-        write_f32(w.mnemonic_entropy);
-        write_f32(w.branch_density);
-        for (uint32_t c : w.reg_write_counts) write_u32(c);
-        write_u32(static_cast<uint32_t>(w.top_mnemonics.size()));
-        for (const auto& ms : w.top_mnemonics) {
-            write_u16(ms.mnemonic_id);
-            write_u64(ms.count);
+    for (const auto& wnd : res.windows) {
+        w.u64(wnd.start_inst_id);
+        w.u64(wnd.end_inst_id);
+        w.u64(wnd.instruction_count);
+        w.u64(wnd.mem_read_count);
+        w.u64(wnd.mem_write_count);
+        w.u64(wnd.unique_mem_addrs);
+        w.u64(wnd.unique_pcs);
+        w.f32(wnd.mnemonic_entropy);
+        w.f32(wnd.branch_density);
+        for (uint32_t c : wnd.reg_write_counts) w.u32(c);
+        w.u32(static_cast<uint32_t>(wnd.top_mnemonics.size()));
+        for (const auto& ms : wnd.top_mnemonics) {
+            w.u16(ms.mnemonic_id);
+            w.u64(ms.count);
             uint8_t len = static_cast<uint8_t>(std::min<size_t>(ms.mnemonic.size(), 255));
-            p[0] = static_cast<char>(len);
-            p += 1;
-            std::memcpy(p, ms.mnemonic.data(), len);
-            p += len;
+            w.u8(len);
+            w.bytes(ms.mnemonic.data(), len);
         }
     }
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool window_stats_deserialize(const std::string& blob, WindowStatsResult& out) {
-    if (blob.size() < 4 + 4 + 8 * 6) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u16 = [&]() -> uint16_t { uint16_t v; std::memcpy(&v, p, 2); p += 2; return v; };
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_f32 = [&]() -> float    { float    v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-
-    if (read_u32() != WSTS_BLOB_MAGIC) return false;
-    const uint32_t version = read_u32();
+    if (r.u32() != WSTS_BLOB_MAGIC) return false;
+    const uint32_t version = r.u32();
     if (version != WSTS_BLOB_VERSION && version != WSTS_BLOB_VERSION_1) return false;
 
-    out.window_size           = read_u64();
-    out.total_windows         = read_u64();
-    out.hottest_mem_window    = static_cast<size_t>(read_u64());
-    out.most_diverse_window   = static_cast<size_t>(read_u64());
-    out.densest_branch_window = static_cast<size_t>(read_u64());
+    out.window_size           = r.u64();
+    out.total_windows         = r.u64();
+    out.hottest_mem_window    = static_cast<size_t>(r.u64());
+    out.most_diverse_window   = static_cast<size_t>(r.u64());
+    out.densest_branch_window = static_cast<size_t>(r.u64());
 
-    uint64_t n = read_u64();
+    uint64_t n = r.u64();
+    if (!r.ok()) return false;
     out.windows.reserve(static_cast<size_t>(n));
 
     for (uint64_t i = 0; i < n; i++) {
-        if (p + 8 * 7 + 4 + 4 + 4 * 34 + 4 > end) return false;
         WindowSnapshot w;
-        w.start_inst_id      = read_u64();
-        w.end_inst_id        = read_u64();
-        w.instruction_count  = read_u64();
-        w.mem_read_count     = read_u64();
-        w.mem_write_count    = read_u64();
-        w.unique_mem_addrs   = read_u64();
-        w.unique_pcs         = read_u64();
-        w.mnemonic_entropy   = read_f32();
-        w.branch_density     = read_f32();
-        for (uint32_t j = 0; j < 34; j++) w.reg_write_counts[j] = read_u32();
-        uint32_t nm = read_u32();
+        w.start_inst_id      = r.u64();
+        w.end_inst_id        = r.u64();
+        w.instruction_count  = r.u64();
+        w.mem_read_count     = r.u64();
+        w.mem_write_count    = r.u64();
+        w.unique_mem_addrs   = r.u64();
+        w.unique_pcs         = r.u64();
+        w.mnemonic_entropy   = r.f32();
+        w.branch_density     = r.f32();
+        for (uint32_t j = 0; j < 34; j++) w.reg_write_counts[j] = r.u32();
+        uint32_t nm = r.u32();
+        if (!r.ok()) return false;
         w.top_mnemonics.reserve(nm);
         for (uint32_t j = 0; j < nm; j++) {
-            if (p + 2 + 8 > end) return false;
             WindowSnapshot::MnemonicStat ms;
-            ms.mnemonic_id = read_u16();
-            ms.count       = read_u64();
+            ms.mnemonic_id = r.u16();
+            ms.count       = r.u64();
             if (version >= 2) {
-                if (p + 1 > end) return false;
-                uint8_t len = static_cast<uint8_t>(*p);
-                p += 1;
-                if (p + len > end) return false;
-                ms.mnemonic.assign(p, len);
-                p += len;
+                uint8_t len = r.u8();
+                if (!r.ok()) return false;
+                ms.mnemonic.resize(len);
+                r.bytes(ms.mnemonic.data(), len);
             }
             w.top_mnemonics.push_back(std::move(ms));
         }
         out.windows.push_back(std::move(w));
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (window_stats serialization)

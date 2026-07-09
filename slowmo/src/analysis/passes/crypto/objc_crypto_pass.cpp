@@ -3,6 +3,7 @@
 #include "analysis/passes/platform/objc_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
+#include "common/byte_codec.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -41,120 +42,77 @@ static constexpr uint32_t OCRZ_BLOB_MAGIC   = 0x4F43525Au;  // "OCRZ"
 static constexpr uint32_t OCRZ_BLOB_VERSION = 1u;
 
 std::string objc_crypto_serialize(const ObjcCryptoResult& res) {
-    size_t total = 4 + 4 + 8;  // magic, version, num_hits
-    for (const auto& h : res.hits) {
-        total += 4 + h.pattern_name.size();
-        total += 4 + 4;  // category, confidence (enums as u32)
-        total += 8 + 8 + 8;  // pattern_start_inst, pattern_end_inst, anchor_pc
-        total += 4 + h.description.size();
-        total += 8;  // num_stack_frames
-        for (const auto& f : h.objc_stack) {
-            total += 8 + 8 + 8;  // inst_id, objc_pc, receiver
-            total += 4 + f.class_name.size();
-            total += 4 + f.selector_name.size();
-        }
-    }
-    total += 8 + res.bare_pattern_indices.size() * 8;
-    total += 8 + res.objc_pattern_indices.size() * 8;
+    ByteWriter w;
 
-    std::string buf(total, '\0');
-    char* p = buf.data();
-
-    auto write_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
-    auto write_u64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    auto write_str = [&](const std::string& s) {
-        write_u32(static_cast<uint32_t>(s.size()));
-        std::memcpy(p, s.data(), s.size()); p += s.size();
-    };
-
-    write_u32(OCRZ_BLOB_MAGIC);
-    write_u32(OCRZ_BLOB_VERSION);
-    write_u64(static_cast<uint64_t>(res.hits.size()));
+    w.u32(OCRZ_BLOB_MAGIC);
+    w.u32(OCRZ_BLOB_VERSION);
+    w.u64(static_cast<uint64_t>(res.hits.size()));
 
     for (const auto& h : res.hits) {
-        write_str(h.pattern_name);
-        write_u32(static_cast<uint32_t>(h.category));
-        write_u32(static_cast<uint32_t>(h.confidence));
-        write_u64(h.pattern_start_inst);
-        write_u64(h.pattern_end_inst);
-        write_u64(h.anchor_pc);
-        write_str(h.description);
-        write_u64(static_cast<uint64_t>(h.objc_stack.size()));
+        w.str(h.pattern_name);
+        w.u32(static_cast<uint32_t>(h.category));
+        w.u32(static_cast<uint32_t>(h.confidence));
+        w.u64(h.pattern_start_inst);
+        w.u64(h.pattern_end_inst);
+        w.u64(h.anchor_pc);
+        w.str(h.description);
+        w.u64(static_cast<uint64_t>(h.objc_stack.size()));
         for (const auto& f : h.objc_stack) {
-            write_u64(f.inst_id);
-            write_u64(f.objc_pc);
-            write_u64(f.receiver);
-            write_str(f.class_name);
-            write_str(f.selector_name);
+            w.u64(f.inst_id);
+            w.u64(f.objc_pc);
+            w.u64(f.receiver);
+            w.str(f.class_name);
+            w.str(f.selector_name);
         }
     }
 
-    write_u64(static_cast<uint64_t>(res.bare_pattern_indices.size()));
-    for (size_t idx : res.bare_pattern_indices) write_u64(static_cast<uint64_t>(idx));
-    write_u64(static_cast<uint64_t>(res.objc_pattern_indices.size()));
-    for (size_t idx : res.objc_pattern_indices) write_u64(static_cast<uint64_t>(idx));
+    w.u64(static_cast<uint64_t>(res.bare_pattern_indices.size()));
+    for (size_t idx : res.bare_pattern_indices) w.u64(static_cast<uint64_t>(idx));
+    w.u64(static_cast<uint64_t>(res.objc_pattern_indices.size()));
+    for (size_t idx : res.objc_pattern_indices) w.u64(static_cast<uint64_t>(idx));
 
-    return buf;
+    return std::move(w).take();
 }
 
 bool objc_crypto_deserialize(const std::string& blob, ObjcCryptoResult& out) {
-    if (blob.size() < 4 + 4 + 8) return false;
-    const char* p = blob.data();
-    const char* end = p + blob.size();
+    ByteReader r(blob.data(), blob.size());
 
-    auto read_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
-    auto read_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-    auto read_str = [&](std::string& s) -> bool {
-        if (p + 4 > end) return false;
-        uint32_t len = read_u32();
-        if (p + len > end) return false;
-        s.assign(p, len); p += len;
-        return true;
-    };
+    if (r.u32() != OCRZ_BLOB_MAGIC)   return false;
+    if (r.u32() != OCRZ_BLOB_VERSION) return false;
 
-    if (read_u32() != OCRZ_BLOB_MAGIC)   return false;
-    if (read_u32() != OCRZ_BLOB_VERSION) return false;
-
-    uint64_t n_hits = read_u64();
+    uint64_t n_hits = r.u64();
     out.hits.reserve(static_cast<size_t>(n_hits));
 
     for (uint64_t i = 0; i < n_hits; i++) {
         ObjcCryptoHit h;
-        if (!read_str(h.pattern_name)) return false;
-        if (p + 4 + 4 + 8 + 8 + 8 > end) return false;
-        h.category   = static_cast<PatternCategory>(read_u32());
-        h.confidence = static_cast<PatternConfidence>(read_u32());
-        h.pattern_start_inst = read_u64();
-        h.pattern_end_inst   = read_u64();
-        h.anchor_pc          = read_u64();
-        if (!read_str(h.description)) return false;
-        if (p + 8 > end) return false;
-        uint64_t n_frames = read_u64();
+        if (!r.str(h.pattern_name)) return false;
+        h.category   = static_cast<PatternCategory>(r.u32());
+        h.confidence = static_cast<PatternConfidence>(r.u32());
+        h.pattern_start_inst = r.u64();
+        h.pattern_end_inst   = r.u64();
+        h.anchor_pc          = r.u64();
+        if (!r.str(h.description)) return false;
+        uint64_t n_frames = r.u64();
         h.objc_stack.reserve(static_cast<size_t>(n_frames));
         for (uint64_t j = 0; j < n_frames; j++) {
             ObjcCallFrame f;
-            if (p + 8 + 8 + 8 > end) return false;
-            f.inst_id  = read_u64();
-            f.objc_pc  = read_u64();
-            f.receiver = read_u64();
-            if (!read_str(f.class_name))    return false;
-            if (!read_str(f.selector_name)) return false;
+            f.inst_id  = r.u64();
+            f.objc_pc  = r.u64();
+            f.receiver = r.u64();
+            if (!r.str(f.class_name))    return false;
+            if (!r.str(f.selector_name)) return false;
             h.objc_stack.push_back(std::move(f));
         }
         out.hits.push_back(std::move(h));
     }
 
-    if (p + 8 > end) return false;
-    uint64_t n_bare = read_u64();
+    uint64_t n_bare = r.u64();
     out.bare_pattern_indices.resize(static_cast<size_t>(n_bare));
-    if (p + n_bare * 8 > end) return false;
-    for (auto& idx : out.bare_pattern_indices) idx = static_cast<size_t>(read_u64());
+    for (auto& idx : out.bare_pattern_indices) idx = static_cast<size_t>(r.u64());
 
-    if (p + 8 > end) return false;
-    uint64_t n_objc = read_u64();
+    uint64_t n_objc = r.u64();
     out.objc_pattern_indices.resize(static_cast<size_t>(n_objc));
-    if (p + n_objc * 8 > end) return false;
-    for (auto& idx : out.objc_pattern_indices) idx = static_cast<size_t>(read_u64());
+    for (auto& idx : out.objc_pattern_indices) idx = static_cast<size_t>(r.u64());
 
     // Rebuild by_selector and by_class indices from hits
     for (size_t hi = 0; hi < out.hits.size(); hi++) {
@@ -166,7 +124,7 @@ bool objc_crypto_deserialize(const std::string& blob, ObjcCryptoResult& out) {
         }
     }
 
-    return true;
+    return r.ok();
 }
 
 }  // anonymous namespace (objc_crypto serialization)
