@@ -450,6 +450,7 @@ add_library(tenet_lib STATIC
     src/io/index_builder.cpp
     src/io/recent_files.cpp
     src/io/vm_profiles.cpp
+    src/io/trace_lock.cpp
     src/core/register_file.cpp
     src/core/instruction_decoder.cpp
     src/core/memory_model.cpp

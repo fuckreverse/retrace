@@ -18,6 +18,13 @@
         { "url": "http://localhost:*" }
       ]
     },
-    "dialog:default"
+    "dialog:default",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "binaries/tenet", "sidecar": true, "args": true }
+      ]
+    },
+    "shell:allow-kill"
   ]
 }

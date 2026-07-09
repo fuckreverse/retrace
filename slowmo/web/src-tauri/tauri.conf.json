@@ -35,6 +35,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": ["binaries/tenet"],
+    "resources": {
+      "binaries/lib/*": "lib/"
+    },
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

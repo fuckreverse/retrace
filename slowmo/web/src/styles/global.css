@@ -38,6 +38,16 @@ button {
   border: none;
   background: none;
   color: inherit;
+  /*
+   * WebKit's UA stylesheet defaults <button> to `text-align: -webkit-center`,
+   * a non-standard value that (unlike plain `center`) also re-centers
+   * block/flex-level children — not just inline text. Any button used as a
+   * flex container (icon + label rows, radio/checkbox options, etc.) would
+   * otherwise have its children visually centered instead of respecting the
+   * flex layout's own alignment. Reset it globally so buttons behave like
+   * any other block element.
+   */
+  text-align: left;
 }
 
 input {

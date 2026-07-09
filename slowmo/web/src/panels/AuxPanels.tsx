@@ -14,6 +14,8 @@ import {
 } from '@/store/settingsStore';
 import { getDataSource } from '@/api/service';
 import { api } from '@/api/service';
+import { isTauri } from '@/lib/env';
+import { subscribeBackendLog } from '@/lib/backendLog';
 import type {
   CacheEntry,
   DwarfEntry,
@@ -122,7 +124,16 @@ const LOG_LEVELS = ['all', 'debug', 'info', 'warn', 'error'] as const;
 export function LogPanel() {
   const [rows, setRows] = useState<LogEntry[]>([]);
   const [level, setLevel] = useState<(typeof LOG_LEVELS)[number]>('all');
-  useEffect(() => { api.log().then(setRows); }, []);
+
+  useEffect(() => {
+    api.log().then(setRows);
+    // Tauri 环境下日志来自真实的 tenet 后端（sidecar）进程，会持续产生新行
+    // （见 src/lib/backendLog.ts）；订阅更新使面板打开时能实时滚动追加，
+    // 而不是只在挂载那一刻拍一张快照。浏览器 / mock 模式没有真实后端，
+    // 不需要订阅。
+    if (!isTauri()) return;
+    return subscribeBackendLog(setRows);
+  }, []);
 
   const filtered = level === 'all' ? rows : rows.filter((r) => r.level === level);
 

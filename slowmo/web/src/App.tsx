@@ -5,6 +5,12 @@ import { WelcomePage } from './layout/WelcomePage';
 import { isPanelWindow } from './lib/panelWindow';
 import { useAppStore } from './store/appStore';
 import { initFromTauri } from './store/settingsStore';
+import { startBackendLogCapture } from './lib/backendLog';
+
+// 尽早启动 tenet 后端（sidecar）日志采集：模块加载时立即执行，而非等某个
+// 组件挂载，这样 open_trace 阶段（index 构建等）的日志也不会被漏掉。
+// 浏览器环境下 isTauri() 为 false，内部 no-op。
+startBackendLogCapture();
 
 /** Boot / loading screen — reuses existing boot-screen styling from shell.css */
 function LoadingPage() {
@@ -12,7 +18,7 @@ function LoadingPage() {
     <div className="boot-screen">
       <div className="boot-logo">tenet</div>
       <div className="boot-spinner" />
-      <div className="boot-hint">Starting backend\u2026</div>
+      <div className="boot-hint">Starting backend…</div>
     </div>
   );
 }

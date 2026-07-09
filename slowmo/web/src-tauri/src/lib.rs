@@ -6,6 +6,7 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     Emitter, Manager,
 };
+use tauri_plugin_shell::{process::CommandChild, ShellExt};
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -24,33 +25,91 @@ struct BackendPorts {
     trace_path: String,
 }
 
+/// One line of `tenet` sidecar output, broadcast to the frontend so the
+/// "Output (Log)" panel can show real backend logs instead of mock data.
+///
+/// `level` is a best-effort classification parsed from the line text (tenet's
+/// own logger emits lines like `[+  0.123s  42.1MB] INFO  [mcp] message`,
+/// see `tools/tenet/src/common/logger.h`); anything unrecognised falls back
+/// to `"info"` for stdout and `"error"` for the `Error`/non-zero-exit cases.
+#[derive(Clone, serde::Serialize)]
+struct BackendLogLine {
+    /// Canonicalized trace path this sidecar instance belongs to (matches
+    /// `BackendPorts::trace_path`), so a multi-window frontend can filter.
+    trace_path: String,
+    level: String,
+    message: String,
+}
+
+/// Strip ANSI SGR escape sequences (`\x1b[...m`) from a line of text.
+///
+/// tenet's logger (`common/logger.h`) always colorizes its stderr output via
+/// `fmt::print(stderr, fmt::fg(fmt::color::xxx), ...)` — `{fmt}` does not do
+/// its own `isatty()` check, so the escape codes are emitted unconditionally,
+/// even when stderr is a pipe (as it is here: Tauri captures the sidecar's
+/// stdout/stderr via `CommandEvent`, not a real terminal). Left unstripped,
+/// these bytes show up as garbled `←[36m`-style text in the frontend's log
+/// panel (which just renders the message as plain text) and also break the
+/// prefix matching in `classify_log_line` below (the color code sits between
+/// the timestamp block and the `INFO`/`ERROR`/... tag).
+fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Consume parameter bytes (0x30-0x3F) and intermediate bytes
+            // (0x20-0x2F), then the final byte (0x40-0x7E, e.g. 'm').
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Classify a raw sidecar output line into a `LogLevel` string for the
+/// frontend. tenet's logger prefixes lines with `ERROR`/`WARN `/`INFO `/
+/// `DEBUG`/`TRACE` after the `[+<secs>s <mem>MB]` timestamp block; plain
+/// `fmt::print` progress/info lines (no such prefix) are classified as info.
+/// Expects `line` to already have ANSI escapes stripped (see
+/// `strip_ansi_codes`), otherwise the color code sitting right before the
+/// level tag would defeat the `starts_with` checks below.
+fn classify_log_line(line: &str) -> &'static str {
+    // Look at the text after the "] " timestamp block if present, otherwise
+    // the whole line, so we don't accidentally match inside a message body.
+    let tail = line.split_once("] ").map(|(_, t)| t).unwrap_or(line);
+    let tail = tail.trim_start();
+    if tail.starts_with("ERROR") || line.contains("Error:") || line.contains("error:") {
+        "error"
+    } else if tail.starts_with("WARN") || line.contains("Warning:") || line.contains("warning:") {
+        "warn"
+    } else if tail.starts_with("DEBUG") {
+        "debug"
+    } else if tail.starts_with("TRACE") {
+        "trace"
+    } else {
+        "info"
+    }
+}
+
 // ── Managed state ───────────────────────────────────────────────────────────
 
 struct OpenTraces(Mutex<HashSet<String>>);
-struct BackendProcesses(Mutex<HashMap<String, std::process::Child>>);
 
-// ── Helper: locate the tenet C++ binary ─────────────────────────────────────
-
-fn find_tenet_binary(app: &tauri::AppHandle) -> String {
-    // 1. Sibling of the running executable (works in dev and bundled builds)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("tenet");
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
-    }
-    // 2. Tauri resource directory
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let candidate = resource_dir.join("tenet");
-        if candidate.exists() {
-            return candidate.to_string_lossy().to_string();
-        }
-    }
-    // 3. Fallback: rely on $PATH
-    "tenet".to_string()
-}
+/// Handles to spawned `tenet` sidecar processes, keyed by canonicalized trace path.
+///
+/// The `tenet` C++ backend binary is bundled as a Tauri sidecar (see
+/// `tauri.conf.json`'s `bundle.externalBin` + `src-tauri/scripts/prepare-sidecar.sh`),
+/// so it ships inside the .app bundle (`Contents/MacOS/`) together with its
+/// third-party dylibs (`Contents/Resources/lib/`, rewritten to load via
+/// `@executable_path/../Resources/lib`). `app.shell().sidecar("tenet")` resolves
+/// the correct path for both `tauri dev` and a bundled release build.
+struct BackendProcesses(Mutex<HashMap<String, CommandChild>>);
 
 // ── Helper: read recent.json ────────────────────────────────────────────────
 
@@ -145,27 +204,119 @@ async fn open_trace(
     // rejected even if the spawn is slow.
     state.0.lock().unwrap().insert(abs_path.clone());
 
-    // Locate the C++ tenet binary.
-    let tenet_bin = find_tenet_binary(&app);
-
+    // Spawn the backend via the Tauri sidecar mechanism. `app.shell().sidecar("tenet")`
+    // resolves to `src-tauri/binaries/tenet-<target-triple>` in both `tauri dev`
+    // and a bundled release build (where it lives at `Contents/MacOS/tenet`),
+    // so we no longer need to hand-roll path lookup via `find_tenet_binary`.
+    //
     // Spawn the backend with --mcp-hub (hub/worker election) instead of
     // --mcp-http.  First instance wins flock and becomes hub on port 10444;
     // subsequent instances auto-connect as workers via TCP (no extra port).
-    let child = std::process::Command::new(&tenet_bin)
-        .args([
-            "--ws-port",
-            &ws_port.to_string(),
-            "--mcp-hub",
-            &abs_path,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    //
+    // IMPORTANT: the trace path must NOT immediately follow `--mcp-hub` on
+    // the command line. tenet's CLI parser greedily consumes the very next
+    // non-flag token after `--mcp-hub` as an optional `host:port` override
+    // (see cli_options.cpp), so `--mcp-hub <abs_path>` would swallow the
+    // trace path as a bogus host:port, leave `trace_path` empty, and cause
+    // tenet to print usage and exit(1) — which is what "backend didn't
+    // start in time" actually was. Placing the trace path *before*
+    // `--mcp-hub` avoids the ambiguity entirely.
+    let sidecar = app
+        .shell()
+        .sidecar("tenet")
+        .map_err(|e| format!("Failed to resolve tenet sidecar: {e}"))?;
+
+    let (mut rx, child) = sidecar
+        .args(["--ws-port", &ws_port.to_string(), &abs_path, "--mcp-hub"])
         .spawn()
         .map_err(|e| {
             // Roll back the open-traces set on failure.
             state.0.lock().unwrap().remove(&abs_path);
             format!("Failed to spawn tenet: {e}")
         })?;
+
+    // Drain stdout/stderr on a background task so the sidecar never blocks on a
+    // full pipe buffer; forward lines to the app log for debugging.
+    //
+    // If the sidecar exits on its own (e.g. tenet hit an argument-parsing
+    // error, a port conflict with a stale hub instance, etc.), `spawn()`
+    // above has *already* returned `Ok` — the frontend is holding a
+    // BackendPorts it can never connect to. Without cleanup here, the entry
+    // in `OpenTraces`/`BackendProcesses` would linger forever and the user
+    // could never retry opening the same file (`open_trace` would keep
+    // rejecting it as "already open"). Clean up on Terminated and notify the
+    // frontend so it can reset its own state instead of waiting out a
+    // connect timeout.
+    let terminated_path = abs_path.clone();
+    let terminated_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_shell::process::CommandEvent;
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
+                    let raw = String::from_utf8_lossy(&line);
+                    let raw = raw.trim_end_matches(['\r', '\n']);
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    // tenet colorizes its stderr output unconditionally (no
+                    // isatty check — see `strip_ansi_codes` doc comment), so
+                    // strip the escape codes before logging/classifying/
+                    // forwarding, otherwise the frontend log panel renders
+                    // garbled `←[36m`-style text instead of plain messages.
+                    let text = strip_ansi_codes(raw);
+                    let text = text.as_str();
+                    log::info!(target: "tenet-backend", "{text}");
+                    // Broadcast to the frontend regardless of build type (the
+                    // `log` crate sink below is debug-only / best-effort), so
+                    // the "Output (Log)" panel can show real backend output.
+                    let _ = terminated_app.emit(
+                        "backend-log",
+                        BackendLogLine {
+                            trace_path: terminated_path.clone(),
+                            level: classify_log_line(text).to_string(),
+                            message: text.to_string(),
+                        },
+                    );
+                }
+                CommandEvent::Error(err) => {
+                    log::error!(target: "tenet-backend", "sidecar error: {err}");
+                    let _ = terminated_app.emit(
+                        "backend-log",
+                        BackendLogLine {
+                            trace_path: terminated_path.clone(),
+                            level: "error".to_string(),
+                            message: format!("sidecar error: {err}"),
+                        },
+                    );
+                }
+                CommandEvent::Terminated(payload) => {
+                    log::info!(target: "tenet-backend", "exited: {payload:?}");
+                    let exit_ok = payload.code == Some(0);
+                    let _ = terminated_app.emit(
+                        "backend-log",
+                        BackendLogLine {
+                            trace_path: terminated_path.clone(),
+                            level: if exit_ok { "info".to_string() } else { "error".to_string() },
+                            message: format!("[process exited] {payload:?}"),
+                        },
+                    );
+                    {
+                        let open_state = terminated_app.state::<OpenTraces>();
+                        open_state.0.lock().unwrap().remove(&terminated_path);
+                    }
+                    {
+                        let procs_state = terminated_app.state::<BackendProcesses>();
+                        procs_state.0.lock().unwrap().remove(&terminated_path);
+                    }
+                    if !exit_ok {
+                        let _ = terminated_app.emit("backend-crashed", &terminated_path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
 
     // Stash the child handle for later cleanup.
     {
@@ -191,9 +342,8 @@ fn close_trace(
     state.0.lock().unwrap().remove(&path);
     let state_ref = app.state::<BackendProcesses>();
     let mut procs = state_ref.0.lock().unwrap();
-    if let Some(mut child) = procs.remove(&path) {
+    if let Some(child) = procs.remove(&path) {
         let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -202,9 +352,8 @@ fn close_trace(
 fn kill_all_backends(app: &tauri::AppHandle) {
     let state_ref = app.state::<BackendProcesses>();
     let mut procs = state_ref.0.lock().unwrap();
-    for (_path, mut child) in procs.drain() {
+    for (_path, child) in procs.drain() {
         let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -458,6 +607,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(OpenTraces(Mutex::new(HashSet::new())))
         .manage(BackendProcesses(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
@@ -469,13 +619,24 @@ pub fn run() {
             load_config,
         ])
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            // Registered unconditionally (not just in debug builds) so the
+            // `tenet-backend` target lines (forwarded sidecar stdout/stderr,
+            // see `open_trace` above) are still captured somewhere durable
+            // in release/bundled builds — the frontend "Output (Log)" panel
+            // consumes the `backend-log` event directly, but this on-disk
+            // copy is the fallback for post-mortem debugging (e.g. the app
+            // crashed before the panel could be opened).
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets([
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                            file_name: None,
+                        }),
+                    ])
+                    .build(),
+            )?;
             build_and_set_menu(app)?;
             Ok(())
         })

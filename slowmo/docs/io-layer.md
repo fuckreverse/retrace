@@ -15,6 +15,7 @@ IO 层负责把 trace 从“磁盘文件”变成“上层可以高效查询的�
 | `TraceReader` | `trace_reader.{h,cpp}` | `mmap` 映射 trace，提供顺序 / 随机访问记录视图 |
 | `BlockCacheReader` | `block_cache_reader.h` | 分块压缩 trace（`HF_BLOCK_COMPRESSED`）的按需解压 + LRU 缓存，为 `TraceReader` 提供 block 模式后端 |
 | `TraceIndex` | `index_builder.{h,cpp}` | 构建并持久化 RocksDB 倒排索引 |
+| `TraceFileLock` | `trace_lock.{h,cpp}` | 基于 `flock` 的单实例独占锁，防止同一 trace 被多个 tenet 进程同时打开 |
 | `CodeTable` | `code_table.{h,cpp}` | 缓存 `PC -> opcode`，供反汇编与 CFG 使用 |
 | `ImageFallback` | `code_table.{h,cpp}` | 当 trace 缺少 code bytes 时，从原始镜像补码 |
 | `StreamingIndex` / `YaraRuleWatcher` | `streaming_index.{h,cpp}` | tail 增长中的 trace 并增量更新索引；监听 YARA 规则目录变化并触发重载 |
@@ -27,6 +28,7 @@ flowchart LR
     A[trace.bin] --> B[TraceReader\nmmap + RecordView]
     B --> BC[BlockCacheReader\nblock-compressed 模式]
     B --> C[TraceIndex\nRocksDB CFs]
+    B --> L[TraceFileLock\nflock session.lock]
     C --> D[CodeTable]
     D --> IF[ImageFallback]
     C --> E[RegisterFile / MemoryModel]
@@ -145,7 +147,30 @@ flowchart LR
 - **Pass 结果 blob 缓存**：`save_pass_blob()` / `load_pass_blob()` / `delete_pass_blob()` / `list_pass_blobs()` / `delete_all_pass_blobs()` / `pass_blob_file_path()`——这组 API 把 pass 全量结果序列化为**普通文件**（不是 RocksDB KV）存放，详见 [`profiling.md`](profiling.md) 的 Blob 持久化章节
 - **会话持久化**：`save_bookmarks()`/`load_bookmarks()`（书签）、`save_last_inst()`/`load_last_inst()`（光标位置）
 
-## 3. CodeTable 与 ImageFallback：补齐代码字节视图
+## 3. TraceFileLock：单实例独占锁
+
+多个 tenet 实例（GUI/TUI/批处理/RPC/MCP，不区分模式）绝不能同时打开同一个 trace：它们会争用同一个 RocksDB 索引目录（RocksDB 自身的 `DB::Open` 会报出不友好的底层 `LOCK` 文件错误），交互模式还假定独占持有导航/书签这类持久化在 `meta` CF 里的会话状态。`TraceFileLock`（`src/io/trace_lock.{h,cpp}`）在 `main()` 里、`TraceReader::open()` 成功之后、`TraceIndex::open_or_build()` 之前抢占式地解决这个问题。
+
+### 锁文件位置
+
+锁文件 `session.lock` 放在该 trace 的索引目录内（`TraceIndex::index_dir_for(reader)`，即 `<trace_dir>/<trace_name>.tenet/session.lock`）——天然与该 trace 的元数据绑定，不污染只读的 trace 文件本身。
+
+### 为什么用 `flock` 而不是「PID + kill(pid, 0)」
+
+- `flock(2)` 的锁绑定在内核持有的 `struct file*` 上，只要进程还存在（不管是否响应）锁就有效；进程退出——无论是正常 `exit()`、崩溃、还是被 `kill -9`/OOM killer 强杀——内核都会自动关闭其所有 fd，从而**自动释放锁**，不存在“死锁文件”需要人工清理的窗口期。
+- 反之，“锁文件里记 PID，靠 `kill(pid, 0)` 判断存活”并不可靠：操作系统会回收并复用 PID，进程崩溃后如果该 PID 被无关进程复用，`kill(pid, 0)` 会返回“存活”，导致永久性的误报“已被占用”，且无法自愈。
+
+因此，`try_acquire()` 是否成功完全由 `flock(LOCK_EX | LOCK_NB)` 的返回值决定；锁文件里持久化的 pid/host/mode/时间戳等字段**只用于失败时的诊断展示**，绝不参与「是否已被占用」的判定。这与 `mcp_hub.cpp` 里 `HubElection` 的 hub 选举锁是同一套模式，但两者互不影响：hub 选举锁（`~/.tenet/mcp-hub.lock`）决定“谁来当多实例协调的 hub”，而 `TraceFileLock` 决定“这个 trace 文件本身能否被打开”，锁的对象完全不同。
+
+### 失败时的行为
+
+加锁失败（即已被占用）时，`main()` 直接打印占用者的 pid、host、mode（gui/tui/batch-analysis/rpc/mcp/mcp-hub/streaming 等）、打开时间，然后以非零退出码退出——**不**做等待重试、不自动强制解锁、不删除旧锁文件。锁获取本身若因基础设施问题失败（例如目录不可写），则退化为“不加锁继续运行”而不是阻塞正常使用。
+
+### 覆盖范围
+
+加锁逻辑只在 `main.cpp` 一处调用，覆盖所有运行模式——因为它们共享同一个 `main()` 入口，在分流到 `GuiApp`/`TuiApp`/`run_batch_analysis`/RPC/MCP 之前完成检查。持有的 `TraceFileLock` 对象在 `main()` 栈上一直存活到函数返回，覆盖整个进程运行期。
+
+## 4. CodeTable 与 ImageFallback：补齐代码字节视图
 
 ### CodeTable
 
@@ -175,7 +200,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 
 其他接口：`read_bytes_at()`（任意多字节读取）、`segment_count()`（段数）、`ready()`（是否已成功加载）。
 
-## 4. StreamingIndex：边录边建索引
+## 5. StreamingIndex：边录边建索引
 
 `StreamingIndex` 面向增长中的 trace 文件。
 
@@ -202,7 +227,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 
 同一个头文件里还定义了 `YaraRuleWatcher`：监听一个目录下 `.yar` 规则文件的新增/修改，检测到变化时触发重载回调，用于流式分析场景下的 YARA 规则热更新。
 
-## 5. RpcServer：本地程序接入入口
+## 6. RpcServer：本地程序接入入口
 
 虽然 RPC 位于 IO 层，但它做的是**最底层的服务暴露**：把当前 trace 和核心对象以 Unix socket JSON-RPC 的形式暴露出去。
 
@@ -230,7 +255,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 适合本地脚本、插件、调试工具
 - 不承担 AI 约束语义，和 MCP 是不同定位
 
-## 5b. MCP 子系统：面向 AI 的服务层
+## 6b. MCP 子系统：面向 AI 的服务层
 
 `src/io/mcp/` 是一套独立于 RPC 的、面向 AI 客户端的服务实现，比 RPC 复杂得多，核心类是 `TenetMcpService`。完整设计见 [`ui-layer.md`](ui-layer.md) 的 MCP 服务章节，这里只列出 IO 层视角下的组成：
 
@@ -248,7 +273,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 只读工具走 `shared_mutex` 读锁，可并发执行；写工具（如 `set_image_base`）需要独占写锁
 - 支持 IDA 场景下的 PC rebase，便于静态/动态地址互相映射
 
-## 6. RecentFiles：GUI 的会话辅助
+## 7. RecentFiles：GUI 的会话辅助
 
 `RecentFiles` 本身不复杂，但很实用：
 
@@ -256,7 +281,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 记录模块名和指令数等摘要信息
 - 给 GUI 启动页提供最近文件列表
 
-## 7. IO 层如何服务上层
+## 8. IO 层如何服务上层
 
 ### 给 Core 层
 
@@ -276,7 +301,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - CLI `--stats`、`--streaming` 直接读取索引统计
 - RPC / MCP 都依赖当前 trace 的只读对象集
 
-## 8. 性能与资源取舍
+## 9. 性能与资源取舍
 
 | 项目 | 设计选择 | 原因 |
 |------|----------|------|
@@ -286,8 +311,9 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 | 内存写索引 | 写粒度 KV | 避免逐字节存储膨胀 |
 | 代码字节 | 单独 `code_bytes` CF | 避免重复扫 trace |
 | code 缺失 | `ImageFallback` | 保证上层分析不被 trace 缺码拖死 |
+| 会话独占 | `flock` 而非 PID 存活检查 | 进程崩溃/被杀时内核自动释放锁，无死锁文件风险 |
 
-## 9. 改这一层代码时优先检查什么
+## 10. 改这一层代码时优先检查什么
 
 - 这个能力是顺序扫描型，还是需要新倒排索引？
 - key 设计是否会导致 RocksDB 膨胀过快？
@@ -296,6 +322,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 是否兼容 `HF_BLOCK_COMPRESSED` 的按块随机访问模式？
 - 是否真的需要新增 CF，还是复用现有索引就够？
 - 是否要同步更新 `trace-format.md` 或与 `qbditrace` 的格式契约？
+- 涉及会话独占/多实例协调时，判定依据是否仍然是内核对象（`flock`）而不是可复用的 PID？
 
 ## 继续阅读
 

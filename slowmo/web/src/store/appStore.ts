@@ -206,6 +206,25 @@ export const useAppStore = create<AppState>((set, get) => ({
       setWsPort(ports.ws_port);
       resetWsTransport();
 
+      // Listen for an early "backend-crashed" signal from the Rust side
+      // (emitted when the sidecar process exits with a non-zero code before
+      // we ever see it come up) so we can fail fast instead of always
+      // waiting out the full poll timeout below. Rust also cleans up its
+      // own OpenTraces/BackendProcesses bookkeeping when this fires, so a
+      // retry of the same path won't be rejected as "already open".
+      let crashed = false;
+      let unlistenCrash: (() => void) | null = null;
+      if (isTauri()) {
+        try {
+          const { listen } = await import('@tauri-apps/api/event');
+          unlistenCrash = await listen<string>('backend-crashed', (event) => {
+            if (event.payload === path) crashed = true;
+          });
+        } catch {
+          /* event API unavailable — fall back to timeout-only detection */
+        }
+      }
+
       // Wait for the C++ backend to become ready (WS handshake).
       // The backend needs time to open the trace, build/load the index, etc.
       const maxWait = 60_000; // 60s timeout (large traces can take a while)
@@ -213,9 +232,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       const start = Date.now();
       let ready = false;
       while (Date.now() - start < maxWait) {
+        if (crashed) break;
         ready = await probeWs();
         if (ready) break;
         await new Promise((r) => setTimeout(r, pollInterval));
+      }
+      unlistenCrash?.();
+      if (crashed) {
+        set({ view: 'welcome', error: 'Backend exited unexpectedly. Check the app logs for details.' });
+        return;
       }
       if (!ready) {
         set({ view: 'welcome', error: 'Backend did not start in time. Check the trace file.' });

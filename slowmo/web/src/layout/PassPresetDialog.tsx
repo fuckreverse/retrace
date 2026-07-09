@@ -96,76 +96,78 @@ export function PassPresetDialog() {
       <Dialog.Portal>
         <Dialog.Overlay className="pp-overlay" />
         <Dialog.Content className="pp-dialog" aria-describedby={undefined}>
-          {/* Header */}
-          <div className="pp-header">
-            <Dialog.Title className="pp-title">Choose Analysis Passes</Dialog.Title>
-            <Dialog.Close className="pp-close" aria-label="Close">
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                <path d="M1 1l12 12M13 1L1 13" />
-              </svg>
-            </Dialog.Close>
-          </div>
+          <div className="pp-dialog-card">
+            {/* Header */}
+            <div className="pp-header">
+              <Dialog.Title className="pp-title">Choose Analysis Passes</Dialog.Title>
+              <Dialog.Close className="pp-close" aria-label="Close">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <path d="M1 1l12 12M13 1L1 13" />
+                </svg>
+              </Dialog.Close>
+            </div>
 
-          {/* Body */}
-          <div className="pp-body">
-            {PRESETS.map((p) => (
-              <div key={p.key}>
-                <button
-                  className={clsx('pp-option', preset === p.key && 'selected')}
-                  onClick={() => setPreset(p.key)}
-                  type="button"
-                >
-                  <span className="pp-radio">
-                    <span className="pp-radio-dot" />
-                  </span>
-                  <span className="pp-option-text">
-                    <span className="pp-option-label">
-                      {p.label} ({p.labelCN})
+            {/* Body */}
+            <div className="pp-body">
+              {PRESETS.map((p) => (
+                <div key={p.key}>
+                  <button
+                    className={clsx('pp-option', preset === p.key && 'selected')}
+                    onClick={() => setPreset(p.key)}
+                    type="button"
+                  >
+                    <span className="pp-radio">
+                      <span className="pp-radio-dot" />
                     </span>
-                    <span className="pp-option-desc">{p.desc}</span>
-                  </span>
-                </button>
+                    <span className="pp-option-text">
+                      <span className="pp-option-label">
+                        {p.label} ({p.labelCN})
+                      </span>
+                      <span className="pp-option-desc">{p.desc}</span>
+                    </span>
+                  </button>
 
-                {/* Custom checklist — shown only when custom is selected */}
-                {p.key === 'custom' && preset === 'custom' && (
-                  <div className="pp-custom-section">
-                    {passesByCategory.map((group) => (
-                      <div key={group.category}>
-                        <div className="pp-category-title">{group.category}</div>
-                        <div className="pp-category-passes">
-                          {group.passes.map((pass) => {
-                            const checked = customPasses.includes(pass.name);
-                            return (
-                              <button
-                                key={pass.name}
-                                className={clsx('pp-pass', checked && 'checked')}
-                                onClick={() => togglePass(pass.name)}
-                                type="button"
-                              >
-                                <span className="pp-checkbox">
-                                  <CheckIcon />
-                                </span>
-                                {pass.display}
-                              </button>
-                            );
-                          })}
+                  {/* Custom checklist — shown only when custom is selected */}
+                  {p.key === 'custom' && preset === 'custom' && (
+                    <div className="pp-custom-section">
+                      {passesByCategory.map((group) => (
+                        <div key={group.category}>
+                          <div className="pp-category-title">{group.category}</div>
+                          <div className="pp-category-passes">
+                            {group.passes.map((pass) => {
+                              const checked = customPasses.includes(pass.name);
+                              return (
+                                <button
+                                  key={pass.name}
+                                  className={clsx('pp-pass', checked && 'checked')}
+                                  onClick={() => togglePass(pass.name)}
+                                  type="button"
+                                >
+                                  <span className="pp-checkbox">
+                                    <CheckIcon />
+                                  </span>
+                                  {pass.display}
+                                </button>
+                              );
+                            })}
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
 
-          {/* Footer */}
-          <div className="pp-footer">
-            <button className="pp-btn-cancel" onClick={cancel} type="button">
-              Cancel
-            </button>
-            <button className="pp-btn-start" onClick={confirmAndOpen} type="button">
-              Start Analysis
-            </button>
+            {/* Footer */}
+            <div className="pp-footer">
+              <button className="pp-btn-cancel" onClick={cancel} type="button">
+                Cancel
+              </button>
+              <button className="pp-btn-start" onClick={confirmAndOpen} type="button">
+                Start Analysis
+              </button>
+            </div>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

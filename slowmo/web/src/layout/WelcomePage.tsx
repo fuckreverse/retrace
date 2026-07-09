@@ -132,10 +132,8 @@ export function WelcomePage() {
       return;
     }
     try {
-      // Use Tauri invoke to call the dialog plugin — avoids needing
-      // @tauri-apps/plugin-dialog JS package as a dependency.
-      const { invoke } = await import('@tauri-apps/api/core');
-      const result = await invoke<string | null>('plugin:dialog|open', {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const result = await open({
         title: 'Open Trace File',
         filters: [{ name: 'Trace Files', extensions: ['bin'] }],
         multiple: false,
@@ -187,7 +185,7 @@ export function WelcomePage() {
           >
             <FolderOpenIcon />
             <button className="welcome-open-btn" type="button" tabIndex={-1}>
-              Open Trace\u2026
+              Open Trace…
             </button>
             <span className="welcome-drop-hint">or drag &amp; drop a .bin file here</span>
           </div>
@@ -232,9 +230,11 @@ export function WelcomePage() {
 
       {/* Error toast */}
       {error && (
-        <div className="welcome-error">
-          <span>{error}</span>
-          <button onClick={() => setError(null)} type="button">dismiss</button>
+        <div className="welcome-error-wrap">
+          <div className="welcome-error">
+            <span>{error}</span>
+            <button onClick={() => setError(null)} type="button">dismiss</button>
+          </div>
         </div>
       )}
 

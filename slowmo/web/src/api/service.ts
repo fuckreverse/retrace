@@ -16,7 +16,8 @@
 import { wsTransport } from './ws';
 import * as ws from './ws-api';
 import * as mock from '@/mock/data';
-import { isMockMode } from '@/lib/env';
+import { isMockMode, isTauri } from '@/lib/env';
+import { getBackendLogSnapshot } from '@/lib/backendLog';
 import type {
   AlgorithmEntry,
   ApiCallEntry,
@@ -413,7 +414,10 @@ export const api = {
   },
 
   async log(): Promise<LogEntry[]> {
-    // 引擎日志由前端本地聚合，直接用 mock
+    // Tauri 环境下返回真实的 tenet 后端（sidecar）日志缓冲区（见
+    // src/lib/backendLog.ts，由 Rust 侧 `backend-log` 事件填充）。
+    // 浏览器 / mock 模式下没有真实后端进程可言，退回 mock 数据。
+    if (isTauri()) return getBackendLogSnapshot();
     return mock.mockLog();
   },
 };

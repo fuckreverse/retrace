@@ -29,7 +29,9 @@ flowchart TB
 ```mermaid
 flowchart TD
     A[parse_args] --> B[TraceReader::open]
-    B --> C[TraceIndex::open_or_build]
+    B --> LOCK[TraceFileLock::try_acquire]
+    LOCK -- 已被占用 --> FAIL[打印占用者信息，退出]
+    LOCK -- 获取成功 --> C[TraceIndex::open_or_build]
     C --> D[index.load_code_table]
     D --> E{--image?}
     E -- yes --> F[ImageFallback]
@@ -51,6 +53,7 @@ flowchart TD
 |------|----------|------|
 | 参数解析 | `CliOptions` | 决定交互模式、批处理能力、服务模式 |
 | 打开 trace | `TraceReader` | `mmap` 整个 trace，解析头，提供顺序/随机记录访问 |
+| 抢占会话锁 | `TraceFileLock` | 基于 `flock` 拒绝同一 trace 的并发打开（已被占用则打印占用者信息并退出，不自动重建/等待） |
 | 载入或构建索引 | `TraceIndex` | 建立 offset / anchor / mem / reg / code 等 RocksDB CF |
 | 载入代码字节 | `CodeTable` | 从索引或 trace 提取 opcode，供反汇编和 CFG 使用 |
 | 可选镜像回填 | `ImageFallback` | 处理 trace 内缺失 code bytes 的 PC |
@@ -65,6 +68,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | 对象 | 生命周期 | 线程模型 | 备注 |
 |------|----------|----------|------|
 | `TraceReader` | 进程级 / 单 trace | 只读并发安全 | mmap 零拷贝底座 |
+| `TraceFileLock` | 进程级 / 单 trace | 单实例持有 | `flock` 独占锁，析构（含进程终止）时内核自动释放 |
 | `TraceIndex` | 进程级 / 单 trace | RocksDB 并发安全 | 持久化索引与元信息 |
 | `CodeTable` | 进程级 / 单 trace | 读多写少 | 缓存 PC→opcode 映射 |
 | `InstructionDecoder` | 进程级 | 每线程独立 Capstone handle（无锁）+ opcode 缓存读写锁 | 按 opcode（非 PC）缓存反汇编结果 |

@@ -109,8 +109,8 @@ export function runMenuAction(id: string): void {
     void (async () => {
       if (!isTauri()) return;
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const result = await invoke<string | null>('plugin:dialog|open', {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const result = await open({
           title: 'Open Trace File',
           filters: [{ name: 'Trace Files', extensions: ['bin'] }],
           multiple: false,

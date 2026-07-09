@@ -274,12 +274,25 @@
   flex-shrink: 0;
 }
 
-/* ---- Error toast ---- */
-.welcome-error {
+/* ---- Error toast ----
+ * `.welcome-error-wrap` is a full-width fixed layer that centers its child
+ * via flexbox. We avoid the classic `left: 50%; transform: translateX(-50%)`
+ * recipe here because it computes against the *unzoomed* viewport in some
+ * WebKit versions when an ancestor has CSS `zoom` applied (see
+ * styles/global.css — app supports a user-adjustable zoom level), which
+ * visually shifts the toast away from center. */
+.welcome-error-wrap {
   position: fixed;
+  left: 0;
+  right: 0;
   bottom: var(--space-8);
-  left: 50%;
-  transform: translateX(-50%);
+  display: flex;
+  justify-content: center;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.welcome-error {
   display: flex;
   align-items: center;
   gap: var(--space-4);
@@ -290,7 +303,7 @@
   border-radius: var(--radius-lg);
   font-size: var(--fs-sm);
   box-shadow: var(--shadow-lg);
-  z-index: 100;
+  pointer-events: auto;
   animation: welcome-fade-in 0.3s var(--ease);
 }
 
