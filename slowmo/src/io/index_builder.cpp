@@ -102,12 +102,7 @@ uint64_t decode_u64(const rocksdb::Slice& s) {
 }
 
 std::filesystem::path index_path_for(const TraceReader& reader) {
-    auto trace_dir = reader.path().parent_path();
-    auto trace_name = reader.path().stem().string();
-    // P2: use <name>.tenet/ as the index directory name.
-    // This matches macOS package conventions (Finder shows it as a single unit)
-    // and makes it obvious which trace the cache belongs to.
-    return trace_dir / (trace_name + ".tenet");
+    return TraceIndex::index_dir_for(reader);
 }
 
 // ─── xxHash-64 (single-pass, zero dependency) ─────────────────────────────
@@ -244,6 +239,15 @@ static uint64_t sample_trace_hash(const TraceReader& reader) {
 }  // anonymous namespace
 
 // ─── TraceIndex lifecycle ─────────────────────────────────────────────────
+
+std::filesystem::path TraceIndex::index_dir_for(const TraceReader& reader) {
+    auto trace_dir = reader.path().parent_path();
+    auto trace_name = reader.path().stem().string();
+    // P2: use <name>.tenet/ as the index directory name.
+    // This matches macOS package conventions (Finder shows it as a single unit)
+    // and makes it obvious which trace the cache belongs to.
+    return trace_dir / (trace_name + ".tenet");
+}
 
 TraceIndex::~TraceIndex() {
 close();

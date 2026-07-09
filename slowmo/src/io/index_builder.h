@@ -104,6 +104,13 @@ public:
         const TraceReader& reader,
         ProgressCallback progress = nullptr);
 
+    /// Returns the RocksDB index directory for a given trace file
+    /// (`<trace_dir>/<trace_name>.tenet/`), without opening or building
+    /// anything. Useful for callers that need to reference the index
+    /// directory before (or without) calling open_or_build(), e.g. to
+    /// place a session lock file alongside the index data.
+    static std::filesystem::path index_dir_for(const TraceReader& reader);
+
     /// Result of offset_of_with_pc(): file offset + resolved PC at that offset.
     /// `seed_pc` is only meaningful for v5 (HF_PC_DELTA) traces;
     /// it equals the absolute PC of the target instruction so callers can

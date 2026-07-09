@@ -2,6 +2,7 @@
 #include "io/trace_reader.h"
 #include "io/code_table.h"
 #include "io/index_builder.h"
+#include "io/trace_lock.h"
 #include "core/register_file.h"
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
@@ -82,10 +83,56 @@ int main(int argc, char** argv) {
         fmt::print(stderr, "Error: {}\n", reader_result.error().message);
         return 1;
     }
-    auto& reader = *reader_result;
-    LOG_INFO("trace opened in {:.1f}ms  size={:.2f}MB",
-             TENET_TIMER_MS(t_open),
-             reader.file_size() / (1024.0 * 1024.0));
+auto& reader = *reader_result;
+LOG_INFO("trace opened in {:.1f}ms  size={:.2f}MB",
+TENET_TIMER_MS(t_open),
+reader.file_size() / (1024.0 * 1024.0));
+
+// ─── Acquire exclusive trace session lock ────────────────────────────
+// Only one tenet instance (GUI/TUI/batch/RPC/MCP — any mode) may hold a
+// given trace open at a time: concurrent instances would race on the same
+// RocksDB index directory and on interactive navigation/bookmark state.
+// See io/trace_lock.h for why this uses flock() rather than a PID check
+// (crash-safe: the kernel releases the lock automatically on process exit,
+// no matter how the process terminates).
+std::string session_mode = "batch";
+if (opts.opt_mcp_hub)        session_mode = "mcp-hub";
+else if (opts.opt_mcp_http)  session_mode = "mcp-http";
+else if (opts.opt_mcp)       session_mode = "mcp";
+else if (opts.opt_rpc)       session_mode = "rpc";
+else if (opts.opt_streaming) session_mode = "streaming";
+else if (has_analysis_option) session_mode = "batch-analysis";
+else if (opts.batch_mode)    session_mode = "tui-batch";
+#if TENET_HAS_GUI
+else if (!opts.force_tui)    session_mode = "gui";
+#endif
+else                          session_mode = "tui";
+
+TraceLockHolderInfo lock_holder;
+auto trace_lock = TraceFileLock::try_acquire(
+    TraceIndex::index_dir_for(reader),
+    std::filesystem::absolute(opts.trace_path).string(),
+    session_mode, &lock_holder);
+
+if (!trace_lock && lock_holder.pid != 0) {
+    // A live holder was identified (flock() denied us the lock) — refuse
+    // to proceed. Do NOT attempt to clean up, wait, or retry: an existing
+    // instance is actively using this trace.
+    fmt::print(stderr,
+        "Error: trace '{}' is already open in another tenet instance\n"
+        "  pid:        {}\n"
+        "  host:       {}\n"
+        "  mode:       {}\n"
+        "  opened at:  {}\n"
+        "\n"
+        "Close that instance before opening this trace again.\n",
+        opts.trace_path, lock_holder.pid, lock_holder.host,
+        lock_holder.mode, lock_holder.opened_at);
+    return 1;
+}
+// If trace_lock is empty but lock_holder.pid == 0, acquisition hit a soft
+// I/O error (see trace_lock.cpp) — proceed without a lock rather than
+// blocking normal usage on lock-file infrastructure problems.
 
     const auto& hdr = reader.header();
     fmt::print(info_out, "  Magic:     0x{:08X}\n", hdr.magic);
