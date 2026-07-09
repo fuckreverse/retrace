@@ -87,6 +87,7 @@ option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
 option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
 option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
 option(TENET_ENABLE_PROFILING "Enable os_signpost profiling instrumentation (macOS only, visible in Instruments)" ON)
+option(TENET_ENABLE_TBB "Enable Intel oneTBB for parallel algorithms and task scheduling" ON)
 
 # ─── FetchContent global shared cache ──────────────────────────────────────
 # All build trees (build/, build-triton/, build-no-triton/, …) share a single
@@ -183,6 +184,26 @@ FetchContent_Declare(
 set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ftxui)
+
+# oneTBB - parallel algorithms & task scheduling (optional)
+# Used by MemoryModel (parallel_sort), TraceIndex (parallel_sort), and
+# MemorySnapshotPass (parallel_for_each).  Gated behind TENET_HAS_TBB so
+# source files can #if-guard the <tbb/*> includes.
+if(TENET_ENABLE_TBB)
+    FetchContent_Declare(
+        onetbb
+        GIT_REPOSITORY https://github.com/oneapi-src/oneTBB.git
+        GIT_TAG        v2023.0.0
+        GIT_SHALLOW    TRUE
+    )
+    set(TBB_TEST OFF CACHE BOOL "" FORCE)
+    set(TBB_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(TBB_STRICT OFF CACHE BOOL "" FORCE)
+    # Keep TBB's own LTO off — it slows rebuilds of the tbb static lib and we
+    # don't need it for the parallel-algorithm hot paths.
+    set(TBB_ENABLE_IPO OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(onetbb)
+endif()
 
 # ─── GUI dependencies (ImGui + SDL3 + imgui-node-editor) ────────────────────
 if(TENET_ENABLE_GUI)
@@ -567,6 +588,18 @@ if(TARGET libzstd_static)
 else()
     target_compile_definitions(tenet_lib PUBLIC TENET_HAS_ZSTD=0)
     message(STATUS "Zstd NOT available — compressed traces will be rejected")
+endif()
+
+# oneTBB linkage (optional). When enabled, TENET_HAS_TBB=1 lights up the
+# parallel_sort / parallel_for_each code paths in MemoryModel, TraceIndex,
+# and MemorySnapshotPass.
+if(TENET_ENABLE_TBB AND TARGET TBB::tbb)
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TBB=1)
+    target_link_libraries(tenet_lib PUBLIC TBB::tbb)
+    message(STATUS "oneTBB linked for parallel algorithm support")
+else()
+    target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TBB=0)
+    message(STATUS "oneTBB NOT available — parallel algorithms disabled")
 endif()
 
 # os_signpost profiling compile definition

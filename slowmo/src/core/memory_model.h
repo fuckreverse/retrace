@@ -229,7 +229,13 @@ private:
     /// Load all write entries for `page` from RocksDB into a sorted PageWriteIndex.
     /// Returns nullptr on error or if RocksDB is not available.
     /// Result is inserted into page_index_cache_ under cache_mutex_.
-    const PageWriteIndex* load_page_index(uint64_t page,
+    ///
+    /// Returns a shared_ptr so callers can hold the index alive across an
+    /// unlocked query window without fear of LRU eviction destroying it
+    /// mid-read (which would be a use-after-free under concurrent
+    /// read_region() from parallel passes).  The PageWriteIndex itself is
+    /// immutable once loaded, so a stale-by-eviction copy is still correct.
+    std::shared_ptr<const PageWriteIndex> load_page_index(uint64_t page,
                                            rocksdb::Iterator* write_iter,
                                            rocksdb::Iterator* read_iter);
 
@@ -305,9 +311,15 @@ private:
 
     // Per-page sorted write index — the fast query path (protected by cache_mutex_).
     // Key: page number (addr >> kPageShift).
-    // Value: sorted vector of PageWriteEntry (see above).
-    // Capacity: 512 pages × ~1000 entries × 32 B ≈ 16 MB worst-case.
-    LRUCache<uint64_t, PageWriteIndex> page_index_cache_{512};
+    // Value: shared_ptr to a sorted vector of PageWriteEntry (see above).
+    //
+    // shared_ptr (rather than PageWriteIndex by value) makes read_region()
+    // safe under concurrent access from parallel passes: a query copies out a
+    // shared_ptr under the lock, releases the lock, and then reads the vector
+    // without fear that an LRU eviction on another thread move-assigns over
+    // the slot it is iterating.  Capacity: 512 pages × ~1000 entries × 32 B
+    // ≈ 16 MB worst-case.
+    LRUCache<uint64_t, std::shared_ptr<PageWriteIndex>> page_index_cache_{512};
 
     mutable std::mutex cache_mutex_;  // protects page_cache_ AND page_index_cache_
 

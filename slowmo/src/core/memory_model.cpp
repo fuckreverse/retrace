@@ -27,13 +27,16 @@ thread_local MemoryModel::IteratorPair MemoryModel::tl_iterators_;
 // ─── Thread-local page cache (for read_region fast path) ──────────────────
 // Caches the last PageWriteIndex pointer to skip mutex + hash map lookup when
 // consecutive reads hit the same page (common for try_deref_string chunks).
-// We store idx as `const void*` because PageWriteIndex is a private type alias
-// inside MemoryModel; the pointer is cast back inside read_region().
+//
+// We hold a shared_ptr<const void> (a type-erased shared_ptr<const
+// PageWriteIndex>) rather than a raw pointer so the cached index stays alive
+// even if a concurrent LRU eviction on another thread removes it from
+// page_index_cache_ — this is what makes read_region() safe to call from
+// parallel passes without holding cache_mutex_ for the whole read.
 struct TLPageCache {
     const void* owner = nullptr;  // &page_index_cache_ of owning MemoryModel
     uint64_t page = UINT64_MAX;
-    uint64_t gen  = 0;            // LRU generation at snapshot time
-    const void* idx = nullptr;    // actually const PageWriteIndex*
+    std::shared_ptr<const void> idx;  // actually shared_ptr<const PageWriteIndex>
 };
 
 static TLPageCache& tl_page_cache() {
@@ -116,8 +119,7 @@ void MemoryModel::invalidate_tl_page_cache() {
     if (tl.owner == &page_index_cache_) {
         tl.owner = nullptr;
         tl.page  = UINT64_MAX;
-        tl.gen   = 0;
-        tl.idx   = nullptr;
+        tl.idx.reset();
     }
 }
 
@@ -825,10 +827,10 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
             uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
             // Get (or load) the PageWriteIndex for this page.
-            const PageWriteIndex* idx_ptr = nullptr;
+            std::shared_ptr<const PageWriteIndex> idx_ptr;
             {
                 std::lock_guard<std::mutex> lk(cache_mutex_);
-                idx_ptr = page_index_cache_.get_mutable(page);
+                if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
             }
             if (!idx_ptr) {
                 idx_ptr = load_page_index(page,
@@ -867,7 +869,7 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 // index_read_byte() uses std::upper_bound to find the last write at or before
 // search_id that covers the target byte, in O(log W) comparisons.
 
-const MemoryModel::PageWriteIndex*
+std::shared_ptr<const MemoryModel::PageWriteIndex>
 MemoryModel::load_page_index(uint64_t page,
                               rocksdb::Iterator* write_iter,
                               rocksdb::Iterator* read_iter) {
@@ -928,11 +930,11 @@ MemoryModel::load_page_index(uint64_t page,
     // Sort by (page_offset, inst_id) ascending.
     std::sort(idx.begin(), idx.end(), PageWriteEntryLess{});
 
-    // Store in LRU cache and return a stable pointer.
+    // Store in LRU cache and return a shared_ptr copy.
     std::lock_guard<std::mutex> lk(cache_mutex_);
-    page_index_cache_.put(page, std::move(idx));
+    page_index_cache_.put(page, std::make_shared<PageWriteIndex>(std::move(idx)));
     auto* cached = page_index_cache_.get_mutable(page);
-    return cached;
+    return cached ? *cached : nullptr;
 }
 
 bool MemoryModel::index_read_byte(const PageWriteIndex& idx,
@@ -1269,18 +1271,19 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
         uint64_t page      = page_of(byte_addr);
 
         // --- Get (or load) the PageWriteIndex for this page ---------------
-        const PageWriteIndex* idx_ptr = nullptr;
+        std::shared_ptr<const PageWriteIndex> idx_ptr;
 
-        // Fast path: same page as last lookup AND no eviction since snapshot
-        // AND same MemoryModel instance — skip lock entirely.
+        // Fast path: same page as last lookup AND same MemoryModel instance.
+        // The thread-local cache holds a shared_ptr copy of the index, so it
+        // stays valid even if a concurrent LRU eviction removes it from
+        // page_index_cache_ — no generation check needed.
         if (tl_page.owner == &page_index_cache_ &&
-            page == tl_page.page && tl_page.idx &&
-            tl_page.gen == page_index_cache_.generation()) {
-            idx_ptr = static_cast<const PageWriteIndex*>(tl_page.idx);
+            page == tl_page.page && tl_page.idx) {
+            idx_ptr = std::static_pointer_cast<const PageWriteIndex>(tl_page.idx);
         } else {
             {
                 std::lock_guard<std::mutex> lk(cache_mutex_);
-                idx_ptr = page_index_cache_.get_mutable(page);
+                if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
             }
             if (!idx_ptr) {
                 // Cache miss: load whole page from RocksDB (one forward scan).
@@ -1289,11 +1292,11 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
                                           iters.write_iter.get(),
                                           iters.read_iter.get());
             }
-            // Update thread-local cache with current generation and owner.
+            // Cache the shared_ptr (not a raw pointer) so the index survives
+            // across evictions while this thread keeps using it.
             tl_page.owner = &page_index_cache_;
             tl_page.page  = page;
-            tl_page.gen   = page_index_cache_.generation();
-            tl_page.idx   = static_cast<const void*>(idx_ptr);
+            tl_page.idx   = std::static_pointer_cast<const void>(idx_ptr);
         }
 
         // Resolve all bytes on this page using batch range read.
@@ -1673,10 +1676,10 @@ uint64_t MemoryModel::last_writer(uint64_t addr, uint8_t size, uint64_t before_i
             uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
 
             // Get (or load) the PageWriteIndex for this page.
-            const PageWriteIndex* idx_ptr = nullptr;
+            std::shared_ptr<const PageWriteIndex> idx_ptr;
             {
                 std::lock_guard<std::mutex> lk(cache_mutex_);
-                idx_ptr = page_index_cache_.get_mutable(page);
+                if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
             }
             if (!idx_ptr) {
                 idx_ptr = load_page_index(page,
@@ -1780,10 +1783,10 @@ std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) 
         // Fast path: use per-page sorted write index (O(log W) per byte)
         // instead of raw RocksDB SeekForPrev.
         auto& iters = get_thread_iterators();
-        const PageWriteIndex* idx_ptr = nullptr;
+        std::shared_ptr<const PageWriteIndex> idx_ptr;
         {
             std::lock_guard<std::mutex> lk(cache_mutex_);
-            idx_ptr = page_index_cache_.get_mutable(page);
+            if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
         }
         if (!idx_ptr) {
             idx_ptr = load_page_index(page,
