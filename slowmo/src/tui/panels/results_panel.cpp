@@ -271,9 +271,9 @@ std::vector<ResultEntry> build_result_entries(const TuiContext& ctx, std::string
         }
     } else if (name == "vm_abstract") {
         if (auto* r = ctx.vm_abstract_result) {
-            out.push_back({fmt::format("dispatcher @0x{:x}  arch={}  vm_pc_reg={}  steps={}",
+            out.push_back({fmt::format("dispatcher @0x{:x}  arch={}  vm_pc={}  steps={}",
                                        r->dispatcher.loop_header_pc, static_cast<int>(r->arch_type),
-                                       r->vm_pc_reg, r->total_vm_steps),
+                                       r->vm_pc_tracked ? "tracked" : "unknown", r->total_vm_steps),
                            0, false});
             for (auto* h : r->handlers_by_frequency()) {
                 out.push_back({

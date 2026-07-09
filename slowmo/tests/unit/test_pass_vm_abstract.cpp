@@ -226,7 +226,7 @@ TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
     }
 }
 
-TEST_CASE("VMAbstractPass: VM-PC hint drives vm_pc_reg (no inference)",
+TEST_CASE("VMAbstractPass: VM-PC derived from vm_registers pc field",
           "[unit][pass][vm_abstract]") {
     auto env = make_vm_trace(12);
     REQUIRE(env != nullptr);
@@ -239,11 +239,13 @@ TEST_CASE("VMAbstractPass: VM-PC hint drives vm_pc_reg (no inference)",
     dh.loop_header_pc = rt_pc(HEADER_PC);
     cfg.dispatcher = dh;
 
-    // Provide a VM-PC hint for x1
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0xDEAD0000ULL;
-    cfg.vm_pc = vph;
+    // Provide a VM-PC via vm_register_file with a "pc" register mapped to x1
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -256,7 +258,7 @@ TEST_CASE("VMAbstractPass: VM-PC hint drives vm_pc_reg (no inference)",
     auto& res = raw.get<VMAbstractResult>();
 
     SECTION("VM-PC uses hinted register") {
-        CHECK(res.vm_pc_reg == 1);
+        CHECK(res.vm_pc_tracked);
     }
 
     SECTION("bytecode base matches hint") {
@@ -457,11 +459,13 @@ TEST_CASE("VMAbstractPass: opcode decode with OpcodeFormatHint",
         cfg.dispatcher = dh;
     }
 
-    // VM-PC hint: x1 points to bytecode, base at BYTECODE_BASE
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0x4000ULL + BYTECODE_BASE;  // slide + BYTECODE_BASE
-    cfg.vm_pc = vph;
+    // VM-PC: x1 points to bytecode, defined via vm_register_file
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     // Opcode format: 4 bytes, low byte is the opcode
     OpcodeFormatHint ofmt;
@@ -1077,11 +1081,13 @@ TEST_CASE("VMAbstractPass: bytecode_end uses opcode_size from hint",
         cfg.dispatcher = dh;
     }
 
-    // Provide a VM-PC hint for x1 (no longer inferred automatically)
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0xDEAD0000ULL;
-    cfg.vm_pc = vph;
+    // Provide a VM-PC via vm_register_file with a "pc" register mapped to x1
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     OpcodeFormatHint ofmt;
     ofmt.opcode_size = 4;
@@ -1093,7 +1099,7 @@ TEST_CASE("VMAbstractPass: bytecode_end uses opcode_size from hint",
     pm->register_pass(std::make_unique<VMAbstractPass>(std::move(cfg)));
 
     auto& res = pm->require("vm_abstract").get<VMAbstractResult>();
-    REQUIRE(res.vm_pc_reg == 1);
+    REQUIRE(res.vm_pc_tracked);
 
     // bytecode_end should be max_vpc + opcode_size(4)
     // x1 ranges from 0xDEAD0000 to 0xDEAD0000 + 12*4 = 0xDEAD0030
@@ -1167,9 +1173,12 @@ TEST_CASE("VMAbstractPass: VM-PC hint works even with very few iterations",
     DispatcherHint dh;
     dh.loop_header_pc = rt_pc(HEADER_PC);
     cfg.dispatcher = dh;
-    VMPCHint vph;
-    vph.reg = 1;
-    cfg.vm_pc = vph;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -1180,7 +1189,7 @@ TEST_CASE("VMAbstractPass: VM-PC hint works even with very few iterations",
     REQUIRE(raw.ok());
     auto& res = raw.get<VMAbstractResult>();
 
-    CHECK(res.vm_pc_reg == 1);
+    CHECK(res.vm_pc_tracked);
     CHECK(res.total_vm_steps == res.steps.size());
 }
 
@@ -1261,10 +1270,12 @@ TEST_CASE("VMAbstractPass: opcode decode fails for unwritten memory",
         cfg.dispatcher = dh;
     }
 
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0xDEAD0000ULL;
-    cfg.vm_pc = vph;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     OpcodeFormatHint ofmt;
     ofmt.opcode_size = 4;
@@ -1278,7 +1289,7 @@ TEST_CASE("VMAbstractPass: opcode decode fails for unwritten memory",
 
     auto& res = pm->require("vm_abstract").get<VMAbstractResult>();
     // vm_pc should be valid (from hint), but opcode decoding should all fail
-    CHECK(res.vm_pc_reg == 1);
+    CHECK(res.vm_pc_tracked);
     for (const auto& step : res.steps) {
         CHECK(step.vm_pc_valid);         // VM-PC known from hint
         CHECK_FALSE(step.opcode_valid);  // memory never written
@@ -1443,10 +1454,12 @@ TEST_CASE("VMAbstractPass: opcode_byte_offset extracts opcode from non-zero offs
         cfg.dispatcher = dh;
     }
 
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0x4000ULL + BYTECODE_BASE2;
-    cfg.vm_pc = vph;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     // Read 2 bytes from vm_pc+0; isolate byte1 via mask=0xFF00 and shift=8.
     OpcodeFormatHint ofmt;
@@ -1575,10 +1588,12 @@ TEST_CASE("VMAbstractPass: not_ deobfuscation op recovers original opcode",
         cfg.dispatcher = dh;
     }
 
-    VMPCHint vph;
-    vph.reg = 1;
-    vph.bytecode_base = 0x4000ULL + BYTECODE_NOT;
-    cfg.vm_pc = vph;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     // Read 1 byte; deobfuscate with NOT (no imm needed)
     OpcodeFormatHint ofmt;
@@ -1717,10 +1732,12 @@ TEST_CASE("VMAbstractPass: neg deobfuscation op recovers negated opcode",
         cfg.dispatcher = dh;
     }
 
-    VMPCHint vph4;
-    vph4.reg = 1;
-    vph4.bytecode_base = 0x4000ULL + BYTECODE_NEG;
-    cfg.vm_pc = vph4;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
 
     OpcodeFormatHint ofmt4;
     ofmt4.opcode_size  = 1;
@@ -2186,12 +2203,15 @@ TEST_CASE("VMConfig::has_any_static_hint detects handler_entry_pcs",
     CHECK(cfg.has_any_static_hint());
 }
 
-TEST_CASE("VMConfig::has_any_static_hint detects vm_pc hint",
+TEST_CASE("VMConfig::has_any_static_hint detects vm_register_file with pc field",
           "[unit][pass][vm_abstract][hints]") {
     VMConfig cfg;
-    VMPCHint vph;
-    vph.reg = 1;
-    cfg.vm_pc = vph;
+    VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;
+    rfh.regs.push_back(vreg_pc);
+    cfg.vm_register_file = rfh;
     CHECK(cfg.has_any_static_hint());
 }
 
@@ -2434,27 +2454,6 @@ TEST_CASE("load_vm_hints_from_json parses dispatch_type and threaded_dispatch_pc
     CHECK(cfg.threaded_dispatch_pcs[1] == 0x6000);
 }
 
-TEST_CASE("load_vm_hints_from_json parses vm_pc_reg with x-prefix and bytecode_base",
-          "[unit][pass][vm_abstract][hints][json]") {
-    TempJsonFile f(R"({
-        "vm_pc_reg": "x19",
-        "bytecode_base": "0x100000"
-    })");
-    VMConfig cfg;
-    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
-    REQUIRE(cfg.vm_pc.has_value());
-    CHECK(cfg.vm_pc->reg == 19);
-    CHECK(cfg.vm_pc->bytecode_base == 0x100000);
-}
-
-TEST_CASE("load_vm_hints_from_json parses vm_pc_reg as a bare number",
-          "[unit][pass][vm_abstract][hints][json]") {
-    TempJsonFile f(R"({ "vm_pc_reg": 20 })");
-    VMConfig cfg;
-    REQUIRE(load_vm_hints_from_json(f.path(), cfg));
-    REQUIRE(cfg.vm_pc.has_value());
-    CHECK(cfg.vm_pc->reg == 20);
-}
 
 TEST_CASE("load_vm_hints_from_json parses full opcode format with deobf steps",
           "[unit][pass][vm_abstract][hints][json]") {
@@ -2614,7 +2613,7 @@ TEST_CASE("load_vm_hints_from_json parsing a full hints file satisfies has_any_s
         "dispatcher_pc": "0x1000",
         "indirect_branch_pc": "0x100C",
         "handler_entry_pcs": ["0x2000", "0x3000", "0x4000"],
-        "vm_pc_reg": "x1"
+        "vm_registers": [{"name": "pc", "from_host_reg": "x1"}]
     })");
     VMConfig cfg;
     REQUIRE(load_vm_hints_from_json(f.path(), cfg));
@@ -2734,7 +2733,7 @@ TEST_CASE("VMAbstractPass: xor_rolling deobfuscation decodes rolling-key encrypt
     VMConfig cfg;
     cfg.min_handler_count = 2;
     { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
-    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
+    { VMRegisterFileHint rfh; VMRegisterFileHint::VMReg pc; pc.name = "pc"; pc.from_host_reg = 1; rfh.regs.push_back(pc); cfg.vm_register_file = rfh; }
     {
         OpcodeFormatHint ofmt;
         ofmt.opcode_size = 1;
@@ -2779,12 +2778,15 @@ TEST_CASE("VMAbstractPass: from_host_reg reads VM register from host register fi
     VMConfig cfg;
     cfg.min_handler_count = 2;
     { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
-    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
-
-    // Configure two VM registers: one from host x4, one from host x7.
+    // Configure VM registers: "pc" from host x1 (VM-PC), plus VA from x4, VC from x7.
     // In the test trace, x4 and x7 are modified by handlers A and C
     // respectively, so their values change across steps.
     VMRegisterFileHint rfh;
+    VMRegisterFileHint::VMReg vreg_pc;
+    vreg_pc.name = "pc";
+    vreg_pc.from_host_reg = 1;  // x1 = VM-PC
+    rfh.regs.push_back(vreg_pc);
+
     VMRegisterFileHint::VMReg vreg_a;
     vreg_a.name = "VA";
     vreg_a.from_host_reg = 4;  // x4
@@ -2922,7 +2924,7 @@ TEST_CASE("VMAbstractPass: operand fields are decoded from bytecode",
     VMConfig cfg;
     cfg.min_handler_count = 2;
     { DispatcherHint dh; dh.loop_header_pc = rt_pc(HEADER_PC); cfg.dispatcher = dh; }
-    { VMPCHint vph; vph.reg = 1; cfg.vm_pc = vph; }
+    { VMRegisterFileHint rfh; VMRegisterFileHint::VMReg pc; pc.name = "pc"; pc.from_host_reg = 1; rfh.regs.push_back(pc); cfg.vm_register_file = rfh; }
     {
         OpcodeFormatHint ofmt;
         ofmt.opcode_size = 1;

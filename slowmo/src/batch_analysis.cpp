@@ -870,11 +870,6 @@ int tenet::run_batch_analysis(const CliOptions& opts,
                 ? rebase_cli_pc(opts.vm_indirect_br_pc) : 0;
             vm_cfg.dispatcher = dh;
         }
-        if (opts.vm_pc_reg != 0xFF) {
-            VMPCHint vph;
-            vph.reg = opts.vm_pc_reg;
-            vm_cfg.vm_pc = vph;
-        }
         for (uint64_t hpc : opts.vm_handler_pcs) {
             vm_cfg.handler_entry_pcs.push_back(rebase_cli_pc(hpc));
         }
@@ -882,7 +877,7 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         if (!vm_cfg.has_any_static_hint()) {
             fmt::print(stderr,
                 "Error: --vm-abstract requires at least one static-analysis hint\n"
-                "  (--vm-dispatcher, --vm-handler, --vm-pc-reg, --vm-hints <file>, ...).\n"
+                "  (--vm-dispatcher, --vm-handler, --vm-hints <file>, ...).\n"
                 "  vm_abstract does not scan the trace looking for VM candidates — static\n"
                 "  analysis (IDA/Ghidra) must supply the dispatcher location.\n");
             return 1;
@@ -1365,8 +1360,8 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
             }
             vm_json["handlers"] = handlers_arr;
             vm_json["arch_type"] = vm_arch_name(vm_result.arch_type);
-            if (vm_result.vm_pc_reg != 0xFF) {
-                vm_json["vm_pc_reg"] = vm_result.vm_pc_reg;
+            if (vm_result.vm_pc_tracked) {
+                vm_json["vm_pc_tracked"] = true;
             }
             vm_json["total_steps"] = vm_result.steps.size();
 

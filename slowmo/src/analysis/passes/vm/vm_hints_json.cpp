@@ -118,15 +118,6 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
             }
         }
 
-        if (j.contains("vm_pc_reg")) {
-            VMPCHint vph;
-            vph.reg = parse_reg_field(j["vm_pc_reg"]);
-            if (j.contains("bytecode_base")) {
-                vph.bytecode_base = rebase(parse_hex_str(j["bytecode_base"].get<std::string>()));
-            }
-            cfg.vm_pc = vph;
-        }
-
         if (j.contains("opcode_size") || j.contains("opcode_from_reg") ||
             j.contains("opcode_deobf_steps") || j.contains("opcode_byte_offset")) {
             OpcodeFormatHint ofh;
@@ -277,6 +268,11 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
                 hah.handler_asm[static_pc] = std::move(entries);
             }
             cfg.handler_asm = std::move(hah);
+        }
+
+        if (j.contains("inst_file_offset_base") && j["inst_file_offset_base"].is_string()) {
+            cfg.inst_file_offset_base = rebase(parse_hex_str(j["inst_file_offset_base"].get<std::string>()));
+            cfg.inst_file_offset_base_set = true;
         }
 
         if (j.contains("handler_names") && j["handler_names"].is_object()) {

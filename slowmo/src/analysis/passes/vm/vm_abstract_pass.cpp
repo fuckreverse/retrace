@@ -843,25 +843,92 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         }
     }
 
-    // ── Step 5: Identify VM-PC register ─────────────────────────────────
+    // ── Step 5: Identify VM-PC source ───────────────────────────────────
     //
-    // VM-PC is always taken from the hint. Which host register holds the
-    // bytecode pointer is a static fact (readable straight from the
-    // dispatcher's fetch instruction in IDA); guessing it from "which
-    // register increments by a small constant step across a dozen
-    // iterations" is unreliable (false-positives on any other monotonic
-    // counter, e.g. the interpreter's own loop counter) and unnecessary.
+    // VM-PC is derived from a field named "pc" or "ip" in either
+    // vm_context->ctx_fields or vm_register_file->regs.  This unifies the
+    // formerly separate vm_pc_reg hint with the ctx/regs definitions,
+    // eliminating the duplicate "pc" definition problem.
+    //
+    // The field can be:
+    //   (a) Host-register-backed (vm_registers with from_host_reg set) —
+    //       read directly from RegisterFile.
+    //   (b) Memory-backed (ctx_fields or vm_registers with offset) —
+    //       read via MemoryModel at ctx_base/rf_base + offset.
 
-    ctx.progress(0.65f, "VM abstract: identifying VM-PC register...");
+    ctx.progress(0.65f, "VM abstract: identifying VM-PC source...");
 
-    if (config_.vm_pc.has_value() && config_.vm_pc->reg != 0xFF) {
-        result.vm_pc_reg = config_.vm_pc->reg;
-        result.bytecode_base = config_.vm_pc->bytecode_base;
+    // Find the VM-PC field in ctx_fields or vm_registers.
+    const VMContextHint::Field* ctx_pc_field = nullptr;
+    if (config_.vm_context.has_value() && config_.vm_context->ctx_base_reg != 0xFF) {
+        for (const auto& f : config_.vm_context->fields) {
+            if (f.name == "pc" || f.name == "ip") {
+                ctx_pc_field = &f;
+                break;
+            }
+        }
     }
+    const VMRegisterFileHint::VMReg* vmreg_pc = nullptr;
+    if (config_.vm_register_file.has_value()) {
+        for (const auto& r : config_.vm_register_file->regs) {
+            if (r.name == "pc" || r.name == "ip") {
+                vmreg_pc = &r;
+                break;
+            }
+        }
+    }
+    bool has_vm_pc = (ctx_pc_field != nullptr) || (vmreg_pc != nullptr);
+
+    // Helper: read VM-PC value at a given dispatch inst_id.
+    // Returns nullopt if the value cannot be read.
+    auto& memory_ref = ctx.memory();
+    auto read_vm_pc = [&](uint64_t inst_id) -> std::optional<uint64_t> {
+        auto state = regfile.state_before(inst_id);
+        if (vmreg_pc) {
+            // Mode (b): host-register-backed
+            if (vmreg_pc->from_host_reg != 0xFF && vmreg_pc->from_host_reg <= 28) {
+                return state.gpr[vmreg_pc->from_host_reg];
+            }
+            // Mode (a): memory-backed via rf_base or ctx_base
+            uint64_t base = 0;
+            bool base_valid = false;
+            if (config_.vm_register_file->rf_base_reg != 0xFF) {
+                base = state.gpr[config_.vm_register_file->rf_base_reg];
+                base_valid = true;
+            } else if (config_.vm_context.has_value() &&
+                       config_.vm_context->ctx_base_reg != 0xFF) {
+                base = state.gpr[config_.vm_context->ctx_base_reg];
+                base_valid = true;
+            }
+            if (!base_valid) return std::nullopt;
+            uint8_t sz = (vmreg_pc->size > 0 && vmreg_pc->size <= 8)
+                             ? vmreg_pc->size : uint8_t(8);
+            auto mem = memory_ref.read(base + vmreg_pc->offset, sz, inst_id);
+            for (uint8_t b = 0; b < sz; ++b)
+                if (!mem.known[b]) return std::nullopt;
+            uint64_t val = 0;
+            std::memcpy(&val, mem.data.data(), sz);
+            return val;
+        }
+        if (ctx_pc_field && config_.vm_context->ctx_base_reg != 0xFF) {
+            uint64_t base = state.gpr[config_.vm_context->ctx_base_reg];
+            uint8_t sz = (ctx_pc_field->size > 0 && ctx_pc_field->size <= 8)
+                             ? ctx_pc_field->size : uint8_t(8);
+            auto mem = memory_ref.read(base + ctx_pc_field->offset, sz, inst_id);
+            for (uint8_t b = 0; b < sz; ++b)
+                if (!mem.known[b]) return std::nullopt;
+            uint64_t val = 0;
+            std::memcpy(&val, mem.data.data(), sz);
+            return val;
+        }
+        return std::nullopt;
+    };
+
+    result.vm_pc_tracked = has_vm_pc;
 
     // Infer bytecode address range from observed VM-PC values.
     // For ThreadedCode, sample from dispatch inst_ids recorded by the collector.
-    if (result.vm_pc_reg != 0xFF) {
+    if (has_vm_pc) {
         uint32_t n;
         std::vector<uint64_t> sample_inst_ids;
         if (use_threaded) {
@@ -882,10 +949,10 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         uint32_t n_real = static_cast<uint32_t>(sample_inst_ids.size());
         uint64_t min_vpc = UINT64_MAX, max_vpc = 0;
         for (uint32_t i = 0; i < n_real; ++i) {
-            auto state = regfile.state_before(sample_inst_ids[i]);
-            uint64_t vpc = state.gpr[result.vm_pc_reg];
-            if (vpc < min_vpc) min_vpc = vpc;
-            if (vpc > max_vpc) max_vpc = vpc;
+            auto vpc = read_vm_pc(sample_inst_ids[i]);
+            if (!vpc) continue;
+            if (*vpc < min_vpc) min_vpc = *vpc;
+            if (*vpc > max_vpc) max_vpc = *vpc;
         }
         if (min_vpc != UINT64_MAX) {
             result.bytecode_base = min_vpc;
@@ -1082,14 +1149,19 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         //       has fully executed the opcode-decode stub (e.g. bl 0x885F48 for
         //       the bnlabel VMP), so any decode result in a scratch register
         //       (e.g. x0) reflects the decoded opcode for this step.
-        if (result.vm_pc_reg != 0xFF) {
+        if (has_vm_pc) {
             // VM-PC: read at dispatcher entry — it holds the bytecode pointer
             // that the dispatcher is about to decode.  Using dispatch_inst_id
             // is intentional here (it hasn't been advanced yet by this
             // iteration's fetch logic).
+            auto vpc = read_vm_pc(exec.dispatch_inst_id);
+            if (vpc) {
+                step.vm_pc_value = *vpc;
+                step.vm_pc_valid = true;
+            }
+
+            // state_dispatch is needed below for opcode decode and ctx/regs.
             auto state_dispatch = regfile.state_before(exec.dispatch_inst_id);
-            step.vm_pc_value = state_dispatch.gpr[result.vm_pc_reg];
-            step.vm_pc_valid = true;
 
             if (config_.opcode_format.has_value()) {
                 auto& ofmt = *config_.opcode_format;
@@ -1218,8 +1290,8 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         // ── VM context / register file snapshot ─────────────────────────
         //
         // state_dispatch (state_before dispatch_inst_id) is needed below
-        // even when vm_pc_reg == 0xFF.  Compute it lazily here if not already
-        // computed by the vm_pc_reg block above (where it was declared in scope).
+        // even when VM-PC is not configured.  Compute it lazily here if not
+        // already computed by the VM-PC block above.
         // We use a lambda-initialized const ref to avoid the double-call cost.
         //
         // For the ctx_base and rf_base pointers: these are almost always
@@ -1238,19 +1310,14 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                                config_.vm_context->ctx_base_reg != 0xFF) ||
                               config_.vm_register_file.has_value() ||
                               config_.operand_format.has_value();
-        // Use the state already fetched by vm_pc_reg block, or fetch it now.
+        // Use the state already fetched by VM-PC block, or fetch it now.
         // We re-fetch unconditionally when needed; RegisterFile caches states,
         // so a second call with the same inst_id is an O(1) LRU hit.
         const RegState* p_state_dispatch = nullptr;
         RegState lazy_state_dispatch;
         if (need_ctx_state) {
-            if (result.vm_pc_reg != 0xFF) {
-                // Already computed as state_dispatch inside the block above.
-                // Re-fetch (LRU cache hit, ~ns).
-                lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
-            } else {
-                lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
-            }
+            // Always fetch (LRU cache hit if VM-PC block already fetched it).
+            lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
             p_state_dispatch = &lazy_state_dispatch;
         }
 
@@ -1274,6 +1341,31 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                     uint64_t val = 0;
                     std::memcpy(&val, mem.data.data(), fsz);
                     step.ctx_fields.emplace_back(field.name, val);
+                }
+            }
+
+            // ── Compute inst_file_offset (vm_pc - bytecode_base) ─────────
+            // The base can come from:
+            //   (a) config_.inst_file_offset_base (explicitly configured), or
+            //   (b) a ctx_field named "bytecode_base" (read above into step.ctx_fields)
+            if (step.vm_pc_valid) {
+                uint64_t base = 0;
+                bool base_found = false;
+                if (config_.inst_file_offset_base_set) {
+                    base = config_.inst_file_offset_base;
+                    base_found = true;
+                } else {
+                    for (const auto& [name, val] : step.ctx_fields) {
+                        if (name == "bytecode_base") {
+                            base = val;
+                            base_found = true;
+                            break;
+                        }
+                    }
+                }
+                if (base_found && step.vm_pc_value >= base) {
+                    step.inst_file_offset = step.vm_pc_value - base;
+                    step.inst_file_offset_valid = true;
                 }
             }
         }
@@ -1515,7 +1607,7 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         result.dispatcher.loop_header_pc,
         result.handlers.size(),
         result.total_vm_steps,
-        result.vm_pc_reg != 0xFF ? fmt::format("x{}", result.vm_pc_reg) : "unknown");
+        result.vm_pc_tracked ? "tracked" : "unknown");
     ctx.progress(1.0f, final_msg);
     // Always visible at the default log level (not gated behind
     // TENET_LOG=DEBUG like the generic progress-message log path) — this is

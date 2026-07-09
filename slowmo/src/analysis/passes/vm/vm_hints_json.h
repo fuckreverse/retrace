@@ -40,7 +40,6 @@
 //     "handler_entry_pcs": ["0x...", ...],
 //     "dispatch_type": "WhileSwitch|IndirectBranch|CallTable|ThreadedCode|Trampoline",
 //     "threaded_dispatch_pcs": ["0x...", ...],
-//     "vm_pc_reg": "x19", "bytecode_base": "0x...",
 //     "opcode_size": 1, "opcode_byte_offset": 0, "opcode_mask": "0x...",
 //     "opcode_shift": 0, "opcode_from_reg": "x0",
 //     "opcode_deobf_steps": [{"op": "xor", "imm": "0xE0"}, ...],

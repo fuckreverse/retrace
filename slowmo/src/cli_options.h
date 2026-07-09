@@ -150,7 +150,6 @@ struct CliOptions {
     bool opt_vm_abstract = false;
     uint64_t vm_dispatcher_pc = 0;         // --vm-dispatcher <hex>
     uint64_t vm_indirect_br_pc = 0;        // --vm-indirect-br <hex>
-    uint8_t  vm_pc_reg = 0xFF;             // --vm-pc-reg <index>
     std::vector<uint64_t> vm_handler_pcs;  // --vm-handler <hex> (repeatable)
     std::string vm_hints_file;             // --vm-hints <path.json>
     std::string vm_decoder_file;           // --vm-decoder <path.json>

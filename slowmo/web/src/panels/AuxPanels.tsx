@@ -106,7 +106,6 @@ export function VmWorkspacePanel() {
   const [indirectBranchPc, setIndirectBranchPc] = useState('');
   const [memAnchorAddr, setMemAnchorAddr] = useState('');
   const [dispatchType, setDispatchType] = useState('auto');
-  const [vmPcReg, setVmPcReg] = useState('');
   const [opcodeSize, setOpcodeSize] = useState('4');
 
   const run = async () => {
@@ -122,7 +121,6 @@ export function VmWorkspacePanel() {
         indirectBranchPc: indirectBranchPc.trim() || undefined,
         memAnchorAddr: memAnchorAddr.trim() || undefined,
         dispatchType: dispatchType === 'auto' ? undefined : dispatchType,
-        vmPcReg: vmPcReg.trim() || undefined,
         opcodeSize: Number(opcodeSize) || undefined,
         forceRerun: true,
       });
@@ -144,7 +142,6 @@ export function VmWorkspacePanel() {
         <select className="settings-select" value={dispatchType} onChange={(e) => setDispatchType(e.target.value)}>
           {VM_DISPATCH_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
-        <input className="input mono" style={{ width: 70 }} value={vmPcReg} onChange={(e) => setVmPcReg(e.target.value)} placeholder="vm_pc_reg" />
         <input className="input mono" style={{ width: 50 }} value={opcodeSize} onChange={(e) => setOpcodeSize(e.target.value)} placeholder="op size" />
         <Button variant="primary" size="sm" onClick={() => void run()} disabled={busy}>
           {busy ? '分析中…' : '运行去虚拟化'}

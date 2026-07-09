@@ -56,6 +56,7 @@ static json step_to_json(const VMAbstractResult& result, const VMStep& s,
     };
     if (s.opcode_valid) sj["opcode"] = fmt::format("0x{:X}", s.opcode_value);
     if (s.vm_pc_valid)  sj["vm_pc"]  = fmt::format("0x{:X}", s.vm_pc_value);
+    if (s.inst_file_offset_valid) sj["inst_file_offset"] = fmt::format("0x{:X}", s.inst_file_offset);
 
     const VMHandler* handler = result.handler_at(s.handler_entry_pc);
     if (handler && !handler->label.empty()) sj["label"] = handler->label;
@@ -365,8 +366,9 @@ register_tool(
                     // Add handler label for context
                     const VMHandler* h = result.handler_at(s.handler_entry_pc);
                     if (h && !h->label.empty()) entry["handler_label"] = h->label;
-                    if (s.opcode_valid) entry["opcode"] = fmt::format("0x{:X}", s.opcode_value);
-                    if (s.vm_pc_valid) entry["vm_pc"] = fmt::format("0x{:X}", s.vm_pc_value);
+if (s.opcode_valid) entry["opcode"] = fmt::format("0x{:X}", s.opcode_value);
+if (s.vm_pc_valid) entry["vm_pc"] = fmt::format("0x{:X}", s.vm_pc_value);
+if (s.inst_file_offset_valid) entry["inst_file_offset"] = fmt::format("0x{:X}", s.inst_file_offset);
 
                     changes.push_back(std::move(entry));
                 }
@@ -535,8 +537,10 @@ register_tool(
                 hop["handler_label"] = handler->label;
             if (ws.opcode_valid)
                 hop["opcode"] = fmt::format("0x{:X}", ws.opcode_value);
-            if (ws.vm_pc_valid)
-                hop["vm_pc"] = fmt::format("0x{:X}", ws.vm_pc_value);
+if (ws.vm_pc_valid)
+hop["vm_pc"] = fmt::format("0x{:X}", ws.vm_pc_value);
+if (ws.inst_file_offset_valid)
+hop["inst_file_offset"] = fmt::format("0x{:X}", ws.inst_file_offset);
 
             // Show old value (from the step before the writer)
             if (writer_step > 0) {
@@ -686,8 +690,8 @@ register_tool(
             {"handlers",        std::move(handlers_arr)},
             {"vm_reg_names",    std::move(reg_names)}
         };
-        if (result.vm_pc_reg != 0xFF)
-            resp["vm_pc_reg"] = fmt::format("x{}", result.vm_pc_reg);
+        if (result.vm_pc_tracked)
+            resp["vm_pc_tracked"] = true;
         if (result.bytecode_base != 0)
             resp["bytecode_range"] = {
                 {"base", fmt::format("0x{:X}", result.bytecode_base)},

@@ -167,3 +167,70 @@ TEST_CASE("RegisterFile cache hits on repeated access", "[unit][core][register_f
     REQUIRE(hits > 0);
     REQUIRE(s1.gpr[0] == s2.gpr[0]);  // same result
 }
+
+// ─── Regression: Bug 2 — RegisterFile::rebuild never updates PC ────────
+// The real qbditrace writer excludes PC (reg index 33) from reg_diffs — PC
+// is captured only via ANCHOR snapshots and the INST header. Previously,
+// RegisterFile::rebuild() never read the PC from INST headers during replay,
+// so state_before(N).pc() returned the anchor's PC for all N, not the actual
+// per-instruction PC.
+//
+// This test emits instructions WITHOUT PC in reg_diffs (simulating the real
+// writer), uses a large anchor_interval so rebuild must walk multiple diffs,
+// and verifies that PC is correct for each instruction.
+TEST_CASE("RegisterFile reconstructs PC without PC in reg_diffs", "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;  // large interval: rebuild must walk diffs
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+
+        // Emit 5 instructions WITHOUT PC (index 33) in reg_diffs.
+        // Only x0 is updated — PC must be reconstructed from the INST header.
+        tw.emit(ms, 0x1000, enc::nop(), {{0, 0xAAAAULL}}, {});
+        tw.emit(ms, 0x1004, enc::nop(), {{0, 0xBBBBULL}}, {});
+        tw.emit(ms, 0x1008, enc::nop(), {{0, 0xCCCCULL}}, {});
+        tw.emit(ms, 0x100C, enc::nop(), {{0, 0xDDDDULL}}, {});
+        tw.emit(ms, 0x1010, enc::nop(), {{0, 0xEEEEULL}}, {});
+        tw.emit_anchor(ms);
+    }, "regfile_pc_no_diff");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("state_before has correct PC for each instruction") {
+        auto s0 = env->regfile->state_before(0);
+        REQUIRE(s0.pc() == rt_pc(0x1000));
+
+        auto s1 = env->regfile->state_before(1);
+        REQUIRE(s1.pc() == rt_pc(0x1004));
+
+        auto s2 = env->regfile->state_before(2);
+        REQUIRE(s2.pc() == rt_pc(0x1008));
+
+        auto s3 = env->regfile->state_before(3);
+        REQUIRE(s3.pc() == rt_pc(0x100C));
+
+        auto s4 = env->regfile->state_before(4);
+        REQUIRE(s4.pc() == rt_pc(0x1010));
+    }
+
+    SECTION("state_after has instruction's own PC (PC not in diffs)") {
+        // Since PC is excluded from reg_diffs, state_after(N).pc() equals
+        // state_before(N).pc() — the instruction's own PC, not the next PC.
+        auto s0 = env->regfile->state_after(0);
+        REQUIRE(s0.pc() == rt_pc(0x1000));
+
+        auto s4 = env->regfile->state_after(4);
+        REQUIRE(s4.pc() == rt_pc(0x1010));
+    }
+
+    SECTION("non-PC registers are still correct") {
+        auto s2 = env->regfile->state_before(2);
+        REQUIRE(s2.gpr[0] == 0xBBBBULL);  // x0 after inst 1
+
+        auto s4 = env->regfile->state_after(4);
+        REQUIRE(s4.gpr[0] == 0xEEEEULL);
+    }
+}

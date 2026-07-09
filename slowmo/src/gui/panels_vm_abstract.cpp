@@ -285,8 +285,10 @@ void GuiApp::render_vmws_steps_panel() {
                     step.handler_entry_pc - slide);
                 if (step.opcode_valid)
                     tip += fmt::format("\nOpcode idx: {}", step.opcode_value);
-                if (step.vm_pc_valid)
-                    tip += fmt::format("\nVM-PC: 0x{:x}", step.vm_pc_value);
+if (step.vm_pc_valid)
+tip += fmt::format("\nVM-PC: 0x{:x}", step.vm_pc_value);
+if (step.inst_file_offset_valid)
+tip += fmt::format("\nFile offset: +0x{:x}", step.inst_file_offset);
                 if (!step.vm_regs.empty()) {
                     tip += "\nVM regs:";
                     for (auto& [n, v] : step.vm_regs)
@@ -391,21 +393,28 @@ void GuiApp::render_vmws_steps_panel() {
             // is known — this maps directly to the offset you see in a hex editor
             // or IDA's bytecode view.  The full runtime address is in the tooltip.
             ImGui::TableSetColumnIndex(4);
-            if (step.vm_pc_valid) {
-                if (vm.bytecode_base != 0 && step.vm_pc_value >= vm.bytecode_base) {
-                    uint64_t bc_off = step.vm_pc_value - vm.bytecode_base;
-                    ImGui::TextDisabled("+0x%llx", (unsigned long long)bc_off);
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Bytecode offset +0x%llx\nRuntime: 0x%llx",
-                            (unsigned long long)bc_off,
-                            (unsigned long long)step.vm_pc_value);
-                    }
-                } else {
-                    // No base known: show raw runtime address
-                    ImGui::TextDisabled("0x%llx", (unsigned long long)step.vm_pc_value);
-                }
-            } else {
-                ImGui::TextDisabled("-");
+if (step.vm_pc_valid) {
+if (step.inst_file_offset_valid) {
+ImGui::TextDisabled("+0x%llx", (unsigned long long)step.inst_file_offset);
+if (ImGui::IsItemHovered()) {
+ImGui::SetTooltip("Bytecode offset +0x%llx\nRuntime: 0x%llx",
+(unsigned long long)step.inst_file_offset,
+(unsigned long long)step.vm_pc_value);
+}
+} else if (vm.bytecode_base != 0 && step.vm_pc_value >= vm.bytecode_base) {
+uint64_t bc_off = step.vm_pc_value - vm.bytecode_base;
+ImGui::TextDisabled("+0x%llx", (unsigned long long)bc_off);
+if (ImGui::IsItemHovered()) {
+ImGui::SetTooltip("Bytecode offset +0x%llx\nRuntime: 0x%llx",
+(unsigned long long)bc_off,
+(unsigned long long)step.vm_pc_value);
+}
+} else {
+// No base known: show raw runtime address
+ImGui::TextDisabled("0x%llx", (unsigned long long)step.vm_pc_value);
+}
+} else {
+ImGui::TextDisabled("-");
             }
 
             ImGui::PopID();
@@ -474,14 +483,8 @@ void GuiApp::render_vmws_bytecode_panel() {
                 row("Avg insts/step:", buf);
             }
 
-            if (vm.vm_pc_reg != 0xFF) {
-                const char* rnames[34] = {
-                    "x0","x1","x2","x3","x4","x5","x6","x7",
-                    "x8","x9","x10","x11","x12","x13","x14","x15",
-                    "x16","x17","x18","x19","x20","x21","x22","x23",
-                    "x24","x25","x26","x27","x28","fp","lr","sp","nzcv","pc"
-                };
-                row("VM-PC register:", rnames[vm.vm_pc_reg < 34 ? vm.vm_pc_reg : 0]);
+            if (vm.vm_pc_tracked) {
+                row("VM-PC:", "tracked");
             }
 
             if (vm.arch_type != VMArchType::Unknown)

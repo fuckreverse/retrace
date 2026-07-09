@@ -137,12 +137,6 @@ struct DispatcherHint {
     uint8_t  mem_anchor_size = 4;      // Byte width of the write to watch for (1/2/4/8)
 };
 
-/// Hint about which register holds the VM program counter.
-struct VMPCHint {
-    uint8_t  reg = 0xFF;               // Host register index (0-28); 0xFF = unknown
-    uint64_t bytecode_base = 0;        // Base address of bytecode buffer (optional)
-};
-
 /// One step in an opcode deobfuscation pipeline.
 /// Applied in order after loading the raw bytes from memory.
 ///
@@ -363,7 +357,6 @@ struct VMConfig {
     // ── Static hints ─────────────────────────────────────────────────────
     std::optional<DispatcherHint>  dispatcher;
     std::vector<uint64_t>          handler_entry_pcs;    // Known handler entry PCs
-    std::optional<VMPCHint>        vm_pc;
     std::optional<OpcodeFormatHint> opcode_format;
     std::optional<VMContextHint>   vm_context;
 
@@ -374,6 +367,16 @@ struct VMConfig {
     /// VM register file layout (for the VM Workspace register panel).
     /// Optional — when absent the panel falls back to showing vm_context fields.
     std::optional<VMRegisterFileHint> vm_register_file;
+
+    /// Base address for computing inst_file_offset per step.
+    /// When set, the pass computes `inst_file_offset = vm_pc - inst_file_offset_base`
+    /// for every VM step.  This is the offset of the current instruction within
+    /// the bytecode buffer — useful for disassemblers and cross-referencing
+    /// with static bytecode dumps.
+    /// If 0 (default), the pass tries to read a ctx_field named "bytecode_base"
+    /// and use its value as the base.
+    uint64_t inst_file_offset_base = 0;
+    bool     inst_file_offset_base_set = false;  // true when explicitly configured
 
     /// Static asm annotations for each handler body (for the VM instruction panel).
     /// Optional — when absent the panel shows native PC ranges only.
@@ -394,9 +397,9 @@ struct VMConfig {
     };
     struct OperandFormatHint {
         /// Total instruction width in bytes (opcode + operands).
-        /// When non-zero AND vm_pc_reg is set, the pass computes
-        /// `instruction_size = max(opcode_byte_offset+opcode_size, max(operand ends))`
-        /// and can report it per-step (useful for disassemblers).
+    /// When non-zero AND a VM-PC field is configured, the pass computes
+    /// `instruction_size = max(opcode_byte_offset+opcode_size, max(operand ends))`
+    /// and can report it per-step (useful for disassemblers).
         uint8_t instruction_size = 0;
         /// Ordered list of operand field descriptors.
         std::vector<OperandFieldDesc> fields;
@@ -412,7 +415,6 @@ struct VMConfig {
     bool has_any_static_hint() const {
         return dispatcher.has_value()
             || !handler_entry_pcs.empty()
-            || vm_pc.has_value()
             || opcode_format.has_value()
             || vm_context.has_value()
             || vm_register_file.has_value()
@@ -468,6 +470,11 @@ struct VMStep {
     uint64_t vm_pc_value = 0;
     bool     vm_pc_valid = false;
 
+    /// Bytecode offset of this instruction (vm_pc - bytecode_base).
+    /// Populated when a "bytecode_base" ctx_field or inst_file_offset_base hint is configured.
+    uint64_t inst_file_offset = 0;
+    bool     inst_file_offset_valid = false;
+
     /// VM context field snapshots at this step (from VMContextHint).
     /// Pairs of (field_name, value) read from the context struct.
     std::vector<std::pair<std::string, uint64_t>> ctx_fields;
@@ -506,9 +513,13 @@ struct VMAbstractResult {
     VMArchType arch_type = VMArchType::Unknown;
 
     // ── VM-PC identification ─────────────────────────────────────────────
-    uint8_t  vm_pc_reg = 0xFF;         // Host register holding VM-PC (0xFF=unknown)
-    uint64_t bytecode_base = 0;        // Inferred bytecode base address
-    uint64_t bytecode_end = 0;         // Inferred bytecode end address
+    // VM-PC is no longer a separate hint — it is derived from a field named
+    // "pc" or "ip" in vm_context->ctx_fields or vm_register_file->regs.
+    // vm_pc_tracked is true when such a field was found and successfully
+    // read at least once.
+    bool     vm_pc_tracked = false;    // True if VM-PC field found in ctx/regs
+    uint64_t bytecode_base = 0;        // Inferred bytecode base address (min VM-PC)
+    uint64_t bytecode_end = 0;         // Inferred bytecode end address (max VM-PC + opcode_size)
 
     // ── Handlers ─────────────────────────────────────────────────────────
     std::vector<VMHandler> handlers;

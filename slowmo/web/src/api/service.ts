@@ -546,7 +546,6 @@ export const api = {
     indirectBranchPc?: string;
     memAnchorAddr?: string;
     dispatchType?: string;
-    vmPcReg?: string;
     opcodeSize?: number;
     forceRerun?: boolean;
   }): Promise<VmHandler[]> {
@@ -555,7 +554,6 @@ export const api = {
     if (hints?.indirectBranchPc) params.indirect_branch_pc = hints.indirectBranchPc;
     if (hints?.memAnchorAddr) params.mem_anchor_addr = hints.memAnchorAddr;
     if (hints?.dispatchType) params.dispatch_type = hints.dispatchType;
-    if (hints?.vmPcReg) params.vm_pc_reg = hints.vmPcReg;
     if (hints?.opcodeSize) params.opcode_size = hints.opcodeSize;
     if (hints?.forceRerun) params.force_rerun = true;
     return analysis<VmHandler[]>(

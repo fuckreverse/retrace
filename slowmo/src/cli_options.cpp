@@ -274,14 +274,6 @@ CliOptions parse_args(int argc, char** argv) {
             opts.vm_dispatcher_pc = std::stoull(argv[++i], nullptr, 16);
         } else if (arg == "--vm-indirect-br" && i + 1 < argc) {
             opts.vm_indirect_br_pc = std::stoull(argv[++i], nullptr, 16);
-        } else if (arg == "--vm-pc-reg" && i + 1 < argc) {
-            auto val = std::stoul(argv[++i]);
-            if (val > 28) {
-                fmt::print(stderr, "Error: --vm-pc-reg must be 0-28 (x0-x28)\n");
-                opts.parse_status = 1;
-                return opts;
-            }
-            opts.vm_pc_reg = static_cast<uint8_t>(val);
         } else if (arg == "--vm-handler" && i + 1 < argc) {
             opts.vm_handler_pcs.push_back(std::stoull(argv[++i], nullptr, 16));
         } else if (arg == "--vm-hints" && i + 1 < argc) {

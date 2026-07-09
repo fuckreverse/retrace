@@ -1221,9 +1221,6 @@ void TenetMcpService::register_pass_tools() {
               // ── Dispatch topology ──
               {"dispatch_type",        {{"type", "string"},  {"description", "Hint: force dispatch topology: 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'|'FetchOnly'. 'FetchOnly' skips handler/opcode discovery entirely and just snapshots VM state (vm_pc/ctx_fields/vm_registers) once per hit of 'dispatcher_pc' — use when the handler-selection logic itself is too obfuscated to recognize (e.g. a CFF-wrapped opcode-compare tree) but there is still one stable per-VM-instruction 'fetch/loop-back' anchor PC. Default: auto-detect."}}},
               {"threaded_dispatch_pcs",{{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint (ThreadedCode only): set of runtime fetch/dispatch tail PCs shared by every handler (hex array). E.g. the LDR+BR pair at the end of each handler. Required when dispatch_type='ThreadedCode'."}}},
-              // ── VM-PC ──
-              {"vm_pc_reg",            {{"type", "string"},  {"description", "Hint: host register holding VM program counter (e.g. 'x19', 'x20')."}}},
-              {"bytecode_base",        {{"type", "string"},  {"description", "Hint: base address of bytecode buffer (hex)."}}},
               // ── Opcode format ──
               {"opcode_size",          {{"type", "integer"}, {"description", "Hint: bytes per opcode (1, 2, or 4). Mode A (memory read)."}}},
               {"opcode_byte_offset",   {{"type", "integer"}, {"description", "Hint: byte offset of the opcode field within the instruction word (default 0). E.g. if insn layout is [imm16][opcode8], set opcode_size=1, opcode_byte_offset=2. Mode A only."}}},
@@ -1237,6 +1234,7 @@ void TenetMcpService::register_pass_tools() {
               // ── VM register file ──
               {"vm_registers",         {{"type", "array"},   {"items", {{"type", "object"}}}, {"description", "Hint: VM register file layout. Each element: {\"name\":\"R0\", \"offset\":0, \"size\":8, \"is_float\":false, \"is_pointer\":false}. size 1/2/4/8/16 (16=SIMD, shown as _lo/_hi pair). offset from rf_base_reg (or ctx_base_reg). Enables VM register panel."}}},
               {"rf_base_reg",          {{"type", "string"},  {"description", "Hint: host register holding VM register-file base pointer (overrides ctx_base_reg for RF reads). E.g. 'x20'."}}},
+              {"inst_file_offset_base",{{"type", "string"},  {"description", "Hint: base address for computing per-step inst_file_offset (vm_pc - base). Hex string. If omitted, auto-detected from a ctx_field named 'bytecode_base'."}}},
               // ── VM stack ──
               {"vm_stack_sp_offset",   {{"type", "integer"}, {"description", "Hint: byte offset within vm_ctx/rf_base where VM stack pointer lives. Enables stack panel (can coexist with vm_registers for mixed-type VMs)."}}},
               {"vm_stack_depth",       {{"type", "integer"}, {"description", "Hint: stack slots visible in VM stack panel (default 8)."}}},
@@ -1257,7 +1255,7 @@ void TenetMcpService::register_pass_tools() {
 
             // ── hints_file: load JSON file and merge with inline args ──────────
             // File values are the base; inline args override them. Loaded up
-            // front so that EVERY hint field below (dispatcher_pc, vm_pc_reg,
+            // front so that EVERY hint field below (dispatcher_pc, ctx_fields,
             // opcode format, ctx_base_reg, ...) can come from either source —
             // this makes "hints_file only, no inline args" a fully supported
             // usage pattern, which matters now that hints are required.
@@ -1325,15 +1323,6 @@ void TenetMcpService::register_pass_tools() {
                     cfg.threaded_dispatch_pcs.push_back(
                         unrebase(parse_hex(pc_str.get<std::string>())));
                 }
-            }
-
-            if (const json* vpr = get_hint("vm_pc_reg")) {
-                VMPCHint vph;
-                vph.reg = parse_reg(*vpr);
-                if (const json* bb = get_hint("bytecode_base")) {
-                    vph.bytecode_base = parse_hex(bb->get<std::string>());
-                }
-                cfg.vm_pc = vph;
             }
 
             // ── Opcode format / deobfuscation ──────────────────────────────
@@ -1510,6 +1499,12 @@ void TenetMcpService::register_pass_tools() {
                 }
             }
 
+            // ── inst_file_offset_base ──
+            if (const json* ifob = get_hint("inst_file_offset_base")) {
+                cfg.inst_file_offset_base = parse_hex(ifob->get<std::string>());
+                cfg.inst_file_offset_base_set = true;
+            }
+
             // ── Require at least one static hint ──
             // vm_abstract never scans the trace looking for "VM-shaped"
             // loops — dispatcher location must come from static analysis.
@@ -1562,8 +1557,8 @@ void TenetMcpService::register_pass_tools() {
 
             // Architecture
             output["arch_type"] = vm_arch_name(result.arch_type);
-            if (result.vm_pc_reg != 0xFF) {
-                output["vm_pc_reg"] = std::string(kRegNames[result.vm_pc_reg]);
+            if (result.vm_pc_tracked) {
+                output["vm_pc_tracked"] = true;
             }
             if (result.bytecode_base != 0) {
                 output["bytecode_range"] = {
@@ -1606,6 +1601,7 @@ void TenetMcpService::register_pass_tools() {
                 };
                 if (s.opcode_valid) sj["opcode"] = fmt::format("0x{:X}", s.opcode_value);
                 if (s.vm_pc_valid) sj["vm_pc"] = fmt::format("0x{:X}", s.vm_pc_value);
+                if (s.inst_file_offset_valid) sj["inst_file_offset"] = fmt::format("0x{:X}", s.inst_file_offset);
 
                 // Add handler label if available
                 const VMHandler* handler = result.handler_at(s.handler_entry_pc);
