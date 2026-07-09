@@ -350,6 +350,115 @@ struct FileHeader {
     bool has_branch_hint() const  { return flags & qbditrace::QBDITRACE_HF_BRANCH_HINT; }
 };
 
+// ─── Shared raw record size calculation ───────────────────────────────────
+//
+// Computes the byte size of a trace record from a raw pointer.
+// Handles ALL 8 record types (INST, ANCHOR, THREAD, EVENT, SVC, OBJC, CODE,
+// CapiCall) and ALL 4 INST header formats (v4=16B, v5=6B, v7=24B, v7+v5=8B).
+//
+// This is the single source of truth for raw-pointer-based record sizing.
+// All fast-scan passes (xref, objc, trace_collector) should use this instead
+// of maintaining their own copies, to prevent format-parsing divergence.
+//
+// Parameters:
+//   ptr     — pointer to the record's first byte (kind field)
+//   num_gpr — number of GPR registers (from file header, typically 34)
+//   is_v5   — HF_PC_DELTA: INST head is 6B (v4/v7) or 8B (v7+v5) with pc_delta
+//   is_v6   — HF_OLD_VALUE: memacc uses 48-byte layout (with old_value)
+//   is_v7   — HF_HAS_FPR: INST head includes n_fprdiff, ANCHOR includes 512B FPR
+inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
+                               bool is_v5 = false, bool is_v6 = false,
+                               bool is_v7 = false) {
+    switch (ptr[0]) {
+    case 0: { // INST
+        uint8_t n_regdiff = ptr[2];
+        uint8_t n_mem = ptr[3];
+        size_t hdr;
+        uint8_t n_fprdiff = 0;
+        if (is_v7 && is_v5) {
+            // qbditrace_inst_head_v7_v5_t = 8 bytes
+            // [kind, nzcv, n_regdiff, n_mem, delta_lo, delta_hi, n_fprdiff, reserved]
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+            n_fprdiff = ptr[6];  // n_fprdiff at byte offset 6
+        } else if (is_v7) {
+            // qbditrace_inst_head_v7_t = 24 bytes
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+            n_fprdiff = ptr[16]; // n_fprdiff at byte offset 16
+        } else if (is_v5) {
+            // qbditrace_inst_head_v5_t = 6 bytes (no n_fprdiff field)
+            hdr = sizeof(qbditrace::qbditrace_inst_head_v5_t);
+        } else {
+            // qbditrace_inst_head_t = 16 bytes (v4 baseline)
+            hdr = sizeof(qbditrace::qbditrace_inst_head_t);
+        }
+        size_t macc = is_v6
+            ? sizeof(qbditrace::qbditrace_memacc_v6_t)       // 48 bytes
+            : sizeof(qbditrace::qbditrace_memacc_t);          // 32 bytes
+        return hdr
+            + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
+            + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)   // 24 bytes each (v7 only)
+            + n_mem      * macc;
+    }
+    case 1: // ANCHOR
+        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8   // 16 + N*8
+             + (is_v7 ? 32 * 16 : 0);                                      // +512 bytes FPR (v7)
+    case 2: // THREAD
+        return sizeof(qbditrace::qbditrace_thread_head_t);  // 16
+    case 3: // EVENT
+        return sizeof(qbditrace::qbditrace_event_head_t);   // 24
+    case 4: // SVC
+        return sizeof(qbditrace::qbditrace_svc_head_t);     // 72
+    case 5: // OBJC
+        return sizeof(qbditrace::qbditrace_objc_head_t);    // 80
+    case 6: // CODE
+        return sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];  // 16 + size
+    case 7: { // CapiCall — variable length (fixed header + string captures)
+        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+        size_t sz = sizeof(qbditrace::qbditrace_capicall_head_t);  // 88 bytes
+        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+        for (uint8_t s = 0; s < cc->str_count; ++s) {
+            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+            uint16_t data_bytes = sh->str_len + 1;
+            uint16_t padded = (data_bytes + 3u) & ~3u;
+            sz += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        }
+        return sz;
+    }
+    default:
+        return 1; // shouldn't happen
+    }
+}
+
+/// Convenience overload: extract format flags from a FileHeader.
+inline size_t raw_record_size(const uint8_t* ptr, const FileHeader& hdr) {
+    return raw_record_size(
+        ptr, hdr.num_gpr,
+        (hdr.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0,
+        (hdr.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0,
+        (hdr.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0);
+}
+
+/// Compute the byte offset of n_fprdiff within an INST header.
+///   v7+v5: offset 6  (qbditrace_inst_head_v7_v5_t)
+///   v7:    offset 16 (qbditrace_inst_head_v7_t)
+///   v4/v5: N/A (no FPR diffs, returns 0)
+inline size_t fprdiff_byte_offset(bool is_v5, bool is_v7) {
+    return (is_v7 && is_v5) ? 6 : (is_v7 ? 16 : 0);
+}
+
+/// Compute INST header size for the given format flags.
+///   v4:    16 bytes (qbditrace_inst_head_t)
+///   v5:     6 bytes (qbditrace_inst_head_v5_t)
+///   v7:    24 bytes (qbditrace_inst_head_v7_t)
+///   v7+v5:  8 bytes (qbditrace_inst_head_v7_v5_t)
+inline size_t inst_header_size(bool is_v5, bool is_v7) {
+    if (is_v7 && is_v5) return sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+    if (is_v7)          return sizeof(qbditrace::qbditrace_inst_head_v7_t);
+    if (is_v5)          return sizeof(qbditrace::qbditrace_inst_head_v5_t);
+    return                     sizeof(qbditrace::qbditrace_inst_head_t);
+}
+
 // ─── TraceReader ──────────────────────────────────────────────────────────
 
 class TraceReader {

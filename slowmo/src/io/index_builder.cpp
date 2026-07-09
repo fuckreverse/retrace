@@ -827,15 +827,9 @@ Result<TraceIndex> TraceIndex::build(
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)   // 48 bytes
         : sizeof(qbditrace::qbditrace_memacc_t);      // 32 bytes
     // v7 headers are larger: v7+v5 = 8 bytes, v7 = 24 bytes
-    const size_t inst_hdr_sz = (is_v7 && is_v5)
-        ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)  // 8 bytes
-        : is_v7
-        ? sizeof(qbditrace::qbditrace_inst_head_v7_t)     // 24 bytes
-        : is_v5
-        ? sizeof(qbditrace::qbditrace_inst_head_v5_t)     // 6 bytes
-        : sizeof(qbditrace::qbditrace_inst_head_t);       // 16 bytes
+    const size_t inst_hdr_sz = inst_header_size(is_v5, is_v7);
     // v7: n_fprdiff byte offset within the INST header
-    const size_t fprdiff_byte_offset = (is_v7 && is_v5) ? 6 : 16;
+    const size_t fprdiff_off = fprdiff_byte_offset(is_v5, is_v7);
 
     // ── P1.5: Parallel build ──────────────────────────────────────────────
     // Strategy:
@@ -910,7 +904,7 @@ Result<TraceIndex> TraceIndex::build(
                 switch (kind) {
                 case RecordKind::Inst: {
                     if (remaining < inst_hdr_sz) return pos;  // partial record
-                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
+                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_off] : 0;
                     rec_size = inst_hdr_sz
                         + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
                         + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
@@ -1030,7 +1024,7 @@ Result<TraceIndex> TraceIndex::build(
                 size_t rec_size = 0;
                 switch (kind) {
                 case RecordKind::Inst: {
-                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
+                    uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_off] : 0;
                     rec_size = inst_hdr_sz
                         + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
                         + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
@@ -1362,7 +1356,7 @@ struct ShardResult {
             switch (kind) {
             case RecordKind::Inst: {
                 if (remaining < inst_hdr_sz) return 0;
-                uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_byte_offset] : 0;
+                uint8_t n_fprdiff_val = is_v7 ? ptr[fprdiff_off] : 0;
                 rec_size = inst_hdr_sz
                     + ptr[2] * sizeof(qbditrace::qbditrace_regdiff_t)
                     + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
@@ -1965,7 +1959,7 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
             uint8_t n_regdiff = ptr[2];
             uint8_t n_mem = ptr[3];
             // v7: read n_fprdiff from the correct byte offset
-            const size_t fpr_off = (is_v7_scan && is_v5) ? 6 : 16;
+            const size_t fpr_off = fprdiff_byte_offset(is_v5, is_v7_scan);
             uint8_t n_fprdiff_scan = is_v7_scan ? ptr[fpr_off] : 0;
             // P1.7: use v6-aware memacc size in linear scan
             const bool is_v6_scan = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;

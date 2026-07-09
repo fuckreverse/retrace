@@ -28,74 +28,12 @@ using roaring::api::roaring64_iterator_free;
 namespace tenet {
 
 // ─── Helpers for raw pointer record parsing ──────────────────────────────────
+//
+// raw_record_size(), fprdiff_byte_offset(), and inst_header_size() are now
+// shared from trace_reader.h to prevent format-parsing divergence.
+// This file uses the shared ::tenet::raw_record_size directly.
 
 namespace {
-
-/// Compute record size from raw pointer (avoids virtual dispatch and RecordView overhead)
-/// All sizes include compiler alignment padding (structures NOT packed):
-///   qbditrace_inst_head_t    = 16 (4B fields + 4B pad + 8B pc)
-///   qbditrace_inst_head_v5_t = 6  (kind+nzcv+n_regdiff+n_mem+pc_delta)
-///   qbditrace_regdiff_t      = 16 (1B index + 7B pad + 8B value)
-///   qbditrace_memacc_t       = 32 (4B fields + 4B pad + 8B addr + 8B value + 8B value_hi)
-///   qbditrace_memacc_v6_t    = 48 (v5 + 16B old_value fields)
-///   qbditrace_anchor_head_t  = 16 (4B fields + 4B pad + 8B pc)
-///   qbditrace_thread_head_t  = 16 (4B fields + 4B pad + 8B thread_id)
-///   qbditrace_event_head_t   = 24 (4B fields + 4B pad + 8B addr + 8B site)
-///   qbditrace_svc_head_t     = 72 (4B+4B pad+8B pc+8B syscall_no+48B args)
-///   qbditrace_objc_head_t    = 80 (4B+4B pad+8B pc+8B recv+8B sel+48B cls)
-///   qbditrace_code_head_t    = 16 (4B fields + 4B pad + 8B pc)
-/// P1.7: is_v6 controls whether memacc uses the 48-byte v6 layout.
-/// P1.8: is_v7 controls whether INST records use the v7 header (24 bytes)
-///        and include an FPR diff section (n_fprdiff × 24 bytes).
-///        ANCHOR records also grow by 512 bytes (32 × 16-byte FPR values).
-inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
-                               bool is_v5 = false, bool is_v6 = false,
-                               bool is_v7 = false) {
-    switch (ptr[0]) {
-    case 0: { // INST
-        uint8_t n_regdiff = ptr[2];
-        uint8_t n_mem = ptr[3];
-        size_t hdr;
-        uint8_t n_fprdiff = 0;
-        if (is_v7 && is_v5) {
-            // qbditrace_inst_head_v7_v5_t = 8 bytes
-            // [kind(1), nzcv(1), n_regdiff(1), n_mem(1), delta_lo(1), delta_hi(1), n_fprdiff(1), reserved(1)]
-            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
-            n_fprdiff = ptr[6];
-        } else if (is_v7) {
-            // qbditrace_inst_head_v7_t = 24 bytes
-            hdr = sizeof(qbditrace::qbditrace_inst_head_v7_t);
-            n_fprdiff = ptr[16]; // n_fprdiff at offset 16 (after 4B fields + 8B pc)
-        } else if (is_v5) {
-            hdr = sizeof(qbditrace::qbditrace_inst_head_v5_t);    // 6 bytes
-        } else {
-            hdr = sizeof(qbditrace::qbditrace_inst_head_t);      // 16 bytes
-        }
-        size_t macc = is_v6
-            ? sizeof(qbditrace::qbditrace_memacc_v6_t)       // 48 bytes
-            : sizeof(qbditrace::qbditrace_memacc_t);         // 32 bytes
-        return hdr
-            + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)   // 16 bytes each
-            + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)   // 24 bytes each (v7 only)
-            + n_mem      * macc;
-    }
-    case 1: // ANCHOR
-        return sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8   // 16 + N*8
-             + (is_v7 ? 32 * 16 : 0);                                  // +512 bytes FPR (v7)
-    case 2: // THREAD
-        return sizeof(qbditrace::qbditrace_thread_head_t);  // 16
-    case 3: // EVENT
-        return sizeof(qbditrace::qbditrace_event_head_t);   // 24
-    case 4: // SVC
-        return sizeof(qbditrace::qbditrace_svc_head_t);     // 72
-    case 5: // OBJC
-        return sizeof(qbditrace::qbditrace_objc_head_t);    // 80
-    case 6: // CODE
-        return sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];  // 16 + size
-    default:
-        return 1; // shouldn't happen
-    }
-}
 
 /// Extract PC from an INST record.
 /// v4: qbditrace_inst_head_t layout: kind(1)+nzcv(1)+n_regdiff(1)+n_mem(1)+pad(4)+pc(8)
@@ -176,20 +114,14 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     uint64_t inst_id = shard.start_inst_id;
 
     // Pre-compute sizes to avoid branching in the inner loop.
-    const size_t inst_hdr_sz = is_v7
-        ? (is_v5 ? sizeof(qbditrace::qbditrace_inst_head_v7_v5_t)   // 8 bytes
-                 : sizeof(qbditrace::qbditrace_inst_head_v7_t))      // 24 bytes
-        : (is_v5 ? sizeof(qbditrace::qbditrace_inst_head_v5_t)      // 6 bytes
-                 : sizeof(qbditrace::qbditrace_inst_head_t));        // 16 bytes
+    const size_t inst_hdr_sz = inst_header_size(is_v5, is_v7);
     const size_t memacc_sz = is_v6
         ? sizeof(qbditrace::qbditrace_memacc_v6_t)     // 48 bytes
         : sizeof(qbditrace::qbditrace_memacc_t);       // 32 bytes
     const size_t fprdiff_sz = is_v7
         ? sizeof(qbditrace::qbditrace_fprdiff_t)       // 24 bytes
         : 0;
-    // For v7 (non-v5), n_fprdiff is at offset 16 in the header.
-    // For v7+v5, n_fprdiff is at offset 6 (after kind,nzcv,n_regdiff,n_mem,pc_delta_lo,pc_delta_hi).
-    const size_t fprdiff_offset = (is_v7 && is_v5) ? 6 : 16;
+    const size_t fprdiff_offset = fprdiff_byte_offset(is_v5, is_v7);
 
     // Per-PC bulk context cache: avoid repeated ART lookups in roaring64
     // We cache the last-used PC's bitmap + bulk context for temporal locality.

@@ -139,3 +139,139 @@ TEST_CASE("XrefPass empty trace", "[unit][pass][xref]") {
     REQUIRE(xr.unique_pc_count == 0);
     REQUIRE(xr.total_indexed == 0);
 }
+
+// ─── Regression: Bug 3 — raw_record_size missing CapiCall (kind=7) ───────
+// When a CapiCall record appears between INST records, scan_shard must skip
+// the entire CapiCall record (88-byte header + string captures). Previously
+// raw_record_size lacked a `case 7`, returning 1 byte and desynchronising
+// the scanner — all INSTs after the CapiCall were mis-indexed or lost.
+TEST_CASE("XrefPass handles CapiCall records between INSTs", "[unit][pass][xref]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // inst 0 at PC 0x1000
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        // inst 1 at PC 0x1004
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+
+        // Interleave a CapiCall record (non-INST, kind=7)
+        tw.emit_capicall(/*api_id=*/1, /*pc=*/tw.rt(0x1004),
+                         /*target=*/0xDEADBEEF, {0xAAAA, 0xBBBB},
+                         /*strs=*/{{0, 0, "hello"}});
+
+        // inst 2 at PC 0x1008 — this is the one that was lost before the fix
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        // inst 3 at PC 0x100C
+        tw.emit(ms, 0x100C, enc::nop(), {{33, tw.rt(0x1010)}}, {});
+        tw.emit_anchor(ms);
+    }, "xref_capicall");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    auto& xr = pm->require("xref").get<XrefResult>();
+
+    SECTION("all 4 instructions indexed") {
+        REQUIRE(xr.total_indexed == 4);
+    }
+
+    SECTION("all 4 unique PCs present") {
+        REQUIRE(xr.unique_pc_count == 4);
+        REQUIRE(xr.has_pc(rt_pc(0x1000)));
+        REQUIRE(xr.has_pc(rt_pc(0x1004)));
+        REQUIRE(xr.has_pc(rt_pc(0x1008)));
+        REQUIRE(xr.has_pc(rt_pc(0x100C)));
+    }
+
+    SECTION("inst_ids_at returns correct IDs after CapiCall") {
+        // inst 2 (at PC 0x1008) must be indexed as inst_id 2
+        auto ids = xr.inst_ids_at(rt_pc(0x1008));
+        REQUIRE(ids.size() == 1);
+        REQUIRE(ids[0] == 2);
+
+        // inst 3 (at PC 0x100C) must be indexed as inst_id 3
+        auto ids3 = xr.inst_ids_at(rt_pc(0x100C));
+        REQUIRE(ids3.size() == 1);
+        REQUIRE(ids3[0] == 3);
+    }
+}
+
+// ─── Regression: Bug 1 — v7+v5 n_fprdiff read at wrong offset ──────────
+// In v7+v5 format (HF_HAS_FPR + HF_PC_DELTA), the INST head is 8 bytes:
+//   kind(1) nzcv(1) n_regdiff(1) n_mem(1) pc_delta(2) n_fprdiff(1) reserved(1)
+// n_fprdiff is at byte offset 6, but raw_record_size and scan_shard
+// fprdiff_offset both read it from offset 5, causing wrong record sizes
+// and scan desynchronisation whenever FPR diffs are present.
+TEST_CASE("XrefPass handles v7+v5 format with FPR diffs", "[unit][pass][xref]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_v7_v5();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+
+        // inst 0: one GPR diff + one FPR diff
+        tw.emit_v7_v5(ms, 0x1000, enc::nop(),
+                      {{33, tw.rt(0x1004)}},  // GPR diff (PC)
+                      {},                       // no mem acc
+                      {{0, 0x4242, 0}});       // FPR diff: v0 = 0x4242
+        // inst 1: no FPR diff
+        tw.emit_v7_v5(ms, 0x1004, enc::nop(),
+                      {{33, tw.rt(0x1008)}}, {}, {});
+        // inst 2: two FPR diffs to stress n_fprdiff parsing
+        tw.emit_v7_v5(ms, 0x1008, enc::nop(),
+                      {{33, tw.rt(0x100C)}}, {},
+                      {{1, 0x1111, 0}, {2, 0x2222, 0}});
+        tw.emit_anchor_v7(ms);
+    }, "xref_v7v5_fprdiff");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    auto& xr = pm->require("xref").get<XrefResult>();
+
+    SECTION("all 3 instructions indexed") {
+        REQUIRE(xr.total_indexed == 3);
+    }
+
+    SECTION("all 3 unique PCs present") {
+        REQUIRE(xr.unique_pc_count == 3);
+        REQUIRE(xr.has_pc(rt_pc(0x1000)));
+        REQUIRE(xr.has_pc(rt_pc(0x1004)));
+        REQUIRE(xr.has_pc(rt_pc(0x1008)));
+    }
+
+    SECTION("inst_ids_at returns correct IDs") {
+        REQUIRE(xr.inst_ids_at(rt_pc(0x1000))[0] == 0);
+        REQUIRE(xr.inst_ids_at(rt_pc(0x1004))[0] == 1);
+        REQUIRE(xr.inst_ids_at(rt_pc(0x1008))[0] == 2);
+    }
+}
+
+// ─── v7 (non-v5) format with FPR diffs — ensures absolute-PC path works ─
+TEST_CASE("XrefPass handles v7 (non-v5) format with FPR diffs", "[unit][pass][xref]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_v7();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+
+        tw.emit_v7(ms, 0x1000, enc::nop(),
+                   {{33, tw.rt(0x1004)}}, {},
+                   {{0, 0x4242, 0}});
+        tw.emit_v7(ms, 0x1004, enc::nop(),
+                   {{33, tw.rt(0x1008)}}, {}, {});
+        tw.emit_v7(ms, 0x1008, enc::nop(),
+                   {{33, tw.rt(0x100C)}}, {},
+                   {{1, 0x1111, 0}, {2, 0x2222, 0}});
+        tw.emit_anchor_v7(ms);
+    }, "xref_v7_fprdiff");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    auto& xr = pm->require("xref").get<XrefResult>();
+
+    REQUIRE(xr.total_indexed == 3);
+    REQUIRE(xr.has_pc(rt_pc(0x1000)));
+    REQUIRE(xr.has_pc(rt_pc(0x1004)));
+    REQUIRE(xr.has_pc(rt_pc(0x1008)));
+}

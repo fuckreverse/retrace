@@ -586,6 +586,188 @@ struct TraceWriter {
         inst_count++;
     }
 
+    // ─── v7 (HF_HAS_FPR) support ──────────────────────────────────────
+
+    /// FPR diff: index (0..31) + 128-bit value (lo, hi).
+    struct FprDiff { uint8_t index; uint64_t lo; uint64_t hi; };
+
+    /// Write a v7 header (HF_HAS_FPR set, version bumped to V7_HAS_FPR).
+    void write_header_v7(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V7_HAS_FPR;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_HAS_FPR;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+        // v7: reset prev_pc_ for potential v5+v5 combined use
+        prev_pc_ = 0;
+    }
+
+    /// Write a v7+v5 header (HF_HAS_FPR + HF_PC_DELTA).
+    void write_header_v7_v5(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V7_HAS_FPR;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_HAS_FPR | QBDITRACE_HF_PC_DELTA;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+        prev_pc_ = 0;
+    }
+
+    /// Emit a v7 anchor (includes 512-byte FPR snapshot after GPR block).
+    void emit_anchor_v7(const MachineState& state,
+                        const uint64_t fpr[32] = nullptr) {
+        qbditrace::qbditrace_anchor_head_t h = {};
+        h.kind = QBDITRACE_REC_ANCHOR; h.pc = state.gpr[33];
+        fwrite(&h, sizeof(h), 1, fp);
+        fwrite(state.gpr, sizeof(uint64_t), num_gpr, fp);
+        // 512 bytes: fpr_lo[32] then fpr_hi[32] (per TraceFormat.h)
+        uint64_t fpr_block[64] = {};
+        if (fpr) {
+            for (int i = 0; i < 32; i++) {
+                fpr_block[i]      = fpr[i];  // lo (simplified: only low 64 bits)
+                fpr_block[32 + i] = 0;       // hi
+            }
+        }
+        fwrite(fpr_block, sizeof(uint64_t), 64, fp);  // 512 bytes
+        prev_pc_ = state.gpr[33];
+    }
+
+    /// Emit a v7 INST record (24-byte head with absolute PC + n_fprdiff).
+    /// Must be called after write_header_v7().
+    void emit_v7(MachineState& ms, uint64_t spc, uint32_t opcode,
+                 std::vector<RegDiff> diffs, std::vector<MemAcc> mems,
+                 std::vector<FprDiff> fpr_diffs = {},
+                 uint8_t nzcv = 0) {
+        uint64_t rpc = rt(spc);
+        for (auto& d : diffs) ms.gpr[d.index] = d.value;
+        ms.nzcv() = nzcv;
+        ms.pc() = rpc;
+
+        // Auto-anchor (v7 variant with FPR snapshot)
+        if (inst_count % anchor_interval == 0) {
+            emit_anchor_v7(ms);
+        }
+
+        // Emit code
+        emit_code(rpc, opcode);
+
+        // Emit v7 INST head (24 bytes)
+        qbditrace::qbditrace_inst_head_v7_t ih = {};
+        ih.kind = QBDITRACE_REC_INST;
+        ih.nzcv = nzcv;
+        ih.n_regdiff = (uint8_t)diffs.size();
+        ih.n_mem = (uint8_t)mems.size();
+        ih.pc = rpc;
+        ih.n_fprdiff = (uint8_t)fpr_diffs.size();
+        fwrite(&ih, sizeof(ih), 1, fp);
+
+        for (auto& d : diffs) {
+            qbditrace::qbditrace_regdiff_t rd = {};
+            rd.reg_index = d.index;
+            rd.value = d.value;
+            fwrite(&rd, sizeof(rd), 1, fp);
+        }
+        for (auto& f : fpr_diffs) {
+            qbditrace::qbditrace_fprdiff_t fd = {};
+            fd.fpr_index = f.index;
+            fd.lo = f.lo;
+            fd.hi = f.hi;
+            fwrite(&fd, sizeof(fd), 1, fp);
+        }
+        for (auto& m : mems) {
+            qbditrace::qbditrace_memacc_t ma = {};
+            ma.mem_type = m.type;
+            ma.mem_flags = 0;
+            ma.size = m.size;
+            ma.addr = m.addr;
+            ma.value = m.value;
+            ma.value_hi = 0;
+            fwrite(&ma, sizeof(ma), 1, fp);
+        }
+        inst_count++;
+    }
+
+    /// Emit a v7+v5 INST record (8-byte head with pc_delta + n_fprdiff).
+    /// Must be called after write_header_v7_v5().
+    void emit_v7_v5(MachineState& ms, uint64_t spc, uint32_t opcode,
+                    std::vector<RegDiff> diffs, std::vector<MemAcc> mems,
+                    std::vector<FprDiff> fpr_diffs = {},
+                    uint8_t nzcv = 0) {
+        uint64_t rpc = rt(spc);
+        for (auto& d : diffs) ms.gpr[d.index] = d.value;
+        ms.nzcv() = nzcv;
+        ms.pc() = rpc;
+
+        // Auto-anchor (v7 variant)
+        if (inst_count % anchor_interval == 0) {
+            emit_anchor_v7(ms);
+        }
+
+        // Compute pc_delta; overflow → anchor first
+        int64_t raw_delta = static_cast<int64_t>(rpc) - static_cast<int64_t>(prev_pc_);
+        if (raw_delta < -32768 || raw_delta > 32767) {
+            emit_anchor_v7(ms);
+            raw_delta = 0;
+        }
+        int16_t delta = static_cast<int16_t>(raw_delta);
+        prev_pc_ = rpc;
+
+        // Emit code
+        emit_code(rpc, opcode);
+
+        // Emit v7+v5 INST head (8 bytes)
+        qbditrace::qbditrace_inst_head_v7_v5_t ih = {};
+        ih.kind = QBDITRACE_REC_INST;
+        ih.nzcv = nzcv;
+        ih.n_regdiff = (uint8_t)diffs.size();
+        ih.n_mem = (uint8_t)mems.size();
+        ih.pc_delta = delta;
+        ih.n_fprdiff = (uint8_t)fpr_diffs.size();
+        fwrite(&ih, sizeof(ih), 1, fp);
+
+        for (auto& d : diffs) {
+            qbditrace::qbditrace_regdiff_t rd = {};
+            rd.reg_index = d.index;
+            rd.value = d.value;
+            fwrite(&rd, sizeof(rd), 1, fp);
+        }
+        for (auto& f : fpr_diffs) {
+            qbditrace::qbditrace_fprdiff_t fd = {};
+            fd.fpr_index = f.index;
+            fd.lo = f.lo;
+            fd.hi = f.hi;
+            fwrite(&fd, sizeof(fd), 1, fp);
+        }
+        for (auto& m : mems) {
+            qbditrace::qbditrace_memacc_t ma = {};
+            ma.mem_type = m.type;
+            ma.mem_flags = 0;
+            ma.size = m.size;
+            ma.addr = m.addr;
+            ma.value = m.value;
+            ma.value_hi = 0;
+            fwrite(&ma, sizeof(ma), 1, fp);
+        }
+        inst_count++;
+    }
+
     /// Emit a v5+v6 INST record: 6-byte pc_delta inst head + 48-byte memacc_v6_t.
     /// Must be called after write_header_v5v6().
     void emit_v5v6(MachineState& ms, uint64_t spc, uint32_t opcode,
