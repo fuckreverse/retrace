@@ -139,7 +139,7 @@ Collector 可按记录类型覆写回调：
 
 | pass | 主要用途 |
 |------|----------|
-| `vm_abstract` | VMP（虚拟机保护）执行抽象，**完全由静态分析 hint 驱动**（不在 trace 里猜测 dispatcher/VM-PC/拓扑/架构类型，也不再提供任何 auto-detect 回退开关——`VMConfig` 里已移除 `auto_detect`/`vm_auto_detect` 字段，无 hint 直接拒绝注册）：给定 dispatcher 位置（WhileSwitch / IndirectBranch / CallTable / **ThreadedCode** / **FetchOnly**）后提取 handler 执行次数、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）；`arch_type_hint` 与 dispatch 类型的机械判定（`classify_dispatch_type()`）也都只读取已 hint 位置的指令编码，不做统计推断。归类为 Structure（见上表）|
+| `vm_abstract` | VMP（虚拟机保护）执行抽象，**完全由静态分析 hint 驱动**（不在 trace 里猜测 dispatcher/VM-PC/拓扑/架构类型，也不再提供任何 auto-detect 回退开关——`VMConfig` 里已移除 `auto_detect`/`vm_auto_detect` 字段，无 hint 直接拒绝注册）：给定 anchor 位置（三种形式：单 PC `loop_header_pc` / PC 集 `anchor_pcs` / 内存写 `mem_anchor_addr`）后，在每个 anchor 命中点快照 VM 上下文（regs/mem），派生 handler 执行次数（纯 hint 驱动的 `handler_entry_pcs`）、解码 opcode（含 ror/bswap/neg/not_ 去混淆、`opcode_byte_offset`）、读取 VM context（可配 field 粒度 size）、VM 寄存器文件（支持混合 RF+Stack、`StackDirection`）；`DispatchType` 是**纯显示标签**（WhileSwitch/IndirectBranch/CallTable/ThreadedCode/Trampoline/FetchOnly），不选执行路径——pass 永远走统一 anchor-based 模型；`arch_type_hint` 与 dispatch 标签的机械判定（`classify_dispatch_type()`）也都只读取已 hint 位置的指令编码，不做统计推断。归类为 Structure（见上表）|
 
 ### 4. Memory / String
 
@@ -217,9 +217,10 @@ loop_semantics --> algorithm_summary
 - `syscall_intercept` 根据 target_os 加载不同的 API 签名表（Darwin→known_apis，Android/Linux→known_android_apis）。
 - `syscall_intercept` 优先消费 REC_CAPICALL 记录（`on_capicall()`），已处理的 callee PC 写入 `capicall_seen_` 防止后续 XFER_CALL Event 重复生成记录；无 REC_CAPICALL 时降级为 XFER_CALL 启发式。
 - `pattern` 的 YARA syscall buffer 根据 target_os 从 x16 或 x8 读取 syscall 号。
-- `vm_abstract` 依赖 `xref + cfg + loop`，使用 TraceScanEngine 做单遍 handler 发现；**完全由 hint 驱动**（`VMConfig::has_any_static_hint()` 为 false 时拒绝运行，且已不存在 auto-detect 回退——`auto_detect`/`vm_auto_detect` 字段、`--vm-auto-detect` CLI 开关、MCP `auto_detect` 参数均已删除）——dispatcher 位置、VM-PC 寄存器、dispatch 拓扑、VM 架构类型均需通过 `VMConfig` 由静态分析（IDA/Ghidra）提供，pass 本身不做启发式扫描/推断。`classify_dispatch_type()` 仅在未提供 `dispatch_type_hint` 时做一次纯机械判定（读取已定位的 dispatch 指令是否为 BLR，不做统计推测）；`find_indirect_branch_in_loop()` 仅在已 hint 的 loop 内做结构补全（用户只给了 `loop_header_pc` 时，在其 body 内查找唯一的间接跳转指令）。新增能力：
-  - **ThreadedCode 拓扑**：`dispatch_type_hint = ThreadedCode` + `threaded_dispatch_pcs`，切换为 `ThreadedCollector`（无中央 loop，每条 handler 尾部自行 fetch+dispatch）。
-  - **扩展去混淆 op**：`OpcodeDeobfStep::Op` 新增 `ror`（循环右移）、`bswap`（字节序反转）、`neg`（取负）、`not_`（按位取反）。
+- `vm_abstract` 依赖 `xref + cfg + loop`（loop 仅用于单 PC anchor 的显示标签自动分类）；**完全由 hint 驱动**（`VMConfig::has_any_static_hint()` 为 false 时拒绝运行，且已不存在 auto-detect 回退——`auto_detect`/`vm_auto_detect` 字段、`--vm-auto-detect` CLI 开关、MCP `auto_detect` 参数均已删除）——anchor 位置、VM-PC 寄存器、dispatch 拓扑标签、VM 架构类型均需通过 `VMConfig` 由静态分析（IDA/Ghidra）提供，pass 本身不做启发式扫描/推断。`classify_dispatch_type()` 仅在未提供 `dispatch_type_hint` 时做一次纯机械判定（读取已定位的 dispatch 指令是否为 BLR，不做统计推测）；`find_indirect_branch_in_loop()` 仅在已 hint 的 loop 内做结构补全（用户只给了 `loop_header_pc` 时，在其 body 内查找唯一的间接跳转指令）。**统一 anchor 模型**：不再有 `VMCollector`/`ThreadedCollector` 状态机——所有拓扑走同一路径，收集 "anchor inst_ids"（每条 VM 指令命中一次），在每次命中时快照 VM 上下文，native 指令范围由相邻 anchor 的 inst_id 派生。handler 归因纯 hint 驱动（`handler_entry_pcs`），无动态发现。新增能力：
+- **PC-set anchor（ThreadedCode）**：`DispatcherHint::anchor_pcs`（原 `threaded_dispatch_pcs` 的正式名），一组 runtime fetch/dispatch PC，其中恰好一个每条 VM 指令命中一次。用于直接线索化 VM（每个 handler 尾部内联 fetch+dispatch，无中央 loop）。
+- **Memory-write anchor**：`DispatcherHint::mem_anchor_addr` + `mem_anchor_size`，一个每条 VM 指令被写一次的内存地址（如 VM-PC/instruction-counter 字段）。用于重度 CFF 混淆、fetch/PC++ 逻辑被克隆到多条路径、无稳定 anchor PC 的 VM。
+- **扩展去混淆 op**：`OpcodeDeobfStep::Op` 新增 `ror`（循环右移）、`bswap`（字节序反转）、`neg`（取负）、`not_`（按位取反）。
   - **opcode_byte_offset**：从 vm_pc 偏移 N 字节处读取 opcode，而非固定从 0 字节读。
   - **`VMContextHint::Field::size`**：可按 1/2/4/8 字节粒度读取 ctx 字段，不再固定为 8 字节。
   - **混合 RF+Stack 架构**：`VMRegisterFileHint` 允许 `regs`（命名寄存器）与 `stack_sp_offset`（操作数栈）共存（`is_mixed() = true`）；SIMD 宽寄存器（size=16）拆为 `_lo`/`_hi` 双条目。

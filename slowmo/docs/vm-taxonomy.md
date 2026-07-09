@@ -153,9 +153,11 @@ VM 上下文的承载方式各异：固定结构体（如阿里 SGAVMP 的 `vm_c
 | While-Switch | ✅ 支持 | `DispatchType::WhileSwitch` |
 | Indirect Branch | ✅ 支持 | `DispatchType::IndirectBranch`，BR Xn 识别 |
 | Call Table | ✅ 支持 | `DispatchType::CallTable`，BLR Xn 识别 |
-| Threaded Code | ✅ 支持 | `DispatchType::ThreadedCode`，专用 `ThreadedCollector` |
-| Trampoline | ✅ 支持 | `DispatchType::Trampoline` |
-| FetchOnly | ✅ 支持 | 专为重度 CFF 混淆设计，支持 PC anchor 和 Memory anchor |
+| Threaded Code | ✅ 支持 | `DispatchType::ThreadedCode`，PC-set anchor（`anchor_pcs`），每个 handler 尾部的内联 fetch PC 合并为一个 anchor 集 |
+| Trampoline | ✅ 支持 | `DispatchType::Trampoline`，单 PC anchor（trampoline 入口） |
+| FetchOnly | ✅ 支持 | 仅快照 VM 上下文，不做 handler/opcode 归因；支持单 PC / PC-set / Memory-write 三种 anchor 形式 |
+
+> **统一 anchor 模型**：pass 内部不再为不同拓扑维护不同的 collector 状态机。所有拓扑都走同一条路径——收集 "anchor inst_ids"（每条 VM 指令命中一次），在每次命中时快照 VM 上下文。`DispatchType` 退化为**纯显示标签**，不再选择执行路径。三种 anchor 形式：(a) 单 PC（`loop_header_pc`）、(b) PC 集（`anchor_pcs`）、(c) 内存写（`mem_anchor_addr`）。详见 `DispatcherHint` 文档。
 | Token/Indirect Threaded | ⚠️ 近似 | 可用 `ThreadedCode` 建模（handler 末尾跳转），查表步骤需额外提示 |
 | Subroutine Threaded | ❌ 不支持 | 字节码流是 CALL 指令序列，无 opcode 提取过程，与当前"读内存/读寄存器获取 opcode"的基本假设冲突 |
 | Exception-based | ❌ 不支持 | 基于异常/信号分发，没有固定的分发点 PC，当前 collector 的 PC 命中切分逻辑无法处理 |
@@ -199,6 +201,8 @@ VM 上下文的承载方式各异：固定结构体（如阿里 SGAVMP 的 `vm_c
 ## 关键缺口优先级排序
 
 ### P1 — ✅ 已解决
+
+**统一 anchor 模型**：移除 `VMCollector` / `ThreadedCollector` 状态机，所有拓扑（WhileSwitch / IndirectBranch / CallTable / ThreadedCode / Trampoline / FetchOnly）统一为 anchor-based 执行模型——收集 "anchor inst_ids"（每条 VM 指令命中一次），在每次命中时快照 VM 上下文（regs/mem）。native 指令范围由相邻 anchor 的 inst_id 差值派生。`DispatchType` 降级为纯显示标签。handler 归因改为纯 hint 驱动（`handler_entry_pcs`），不再做动态发现。三种 anchor 形式：(a) 单 PC、(b) PC 集（`anchor_pcs`）、(c) 内存写（`mem_anchor_addr`，用于重度 CFF 混淆且无稳定 anchor PC 的 VM）。
 
 **Rolling key 解密**：`OpcodeDeobfStep::Op` 新增 `xor_rolling`/`add_rolling`/`sub_rolling` 有状态步骤，`OpcodeFormatHint::rolling_key_update` 控制密钥更新规则（XorOpcode/AddOpcode/SubOpcode/HashOpcode）。每个 rolling 步骤的 `imm` 字段作为初始密钥种子，跨 VM 步骤自动演进。
 

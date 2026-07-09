@@ -2,7 +2,6 @@
 #include "analysis/passes/structure/loop_pass.h"
 #include "analysis/passes/structure/cfg_pass.h"
 #include "analysis/passes/structure/xref_pass.h"
-#include "analysis/trace_collector.h"
 #include "common/aarch64_classify.h"
 #include "common/logger.h"
 #include "core/register_file.h"
@@ -89,251 +88,23 @@ DispatchType classify_dispatch_type(bool is_blr) {
     return is_blr ? DispatchType::CallTable : DispatchType::IndirectBranch;
 }
 
-// ─── VMCollector — single-pass trace scan for handler discovery ──────────
-
-/// Collector that observes every INST record to:
-///   1. Track which handler PC follows each dispatch indirect-branch PC
-///   2. Record the inst_id boundaries of each handler execution
-///   3. Accumulate register/memory effects per handler
-///
-/// This replaces the naïve "seek to each header inst_id" approach with a
-/// single sequential O(N) scan that is scan-fusion friendly.
+// ─── HandlerExecution — one VM-instruction's native span ────────────────
+//
+// In the unified anchor-based model, one HandlerExecution is created per
+// anchor hit (one per VM instruction).  The native instruction range
+// [handler_first_inst_id, handler_last_inst_id] is computed from adjacent
+// anchor inst_ids — no state-machine scan is needed.
 
 struct HandlerExecution {
-    uint64_t dispatch_inst_id = 0;   // inst_id of the header hit
-    uint64_t handler_entry_pc = 0;
-    uint64_t handler_first_inst_id = 0;
-    uint64_t handler_last_inst_id = 0;
+    uint64_t dispatch_inst_id = 0;   // inst_id of the anchor hit
+    uint64_t handler_entry_pc = 0;   // Always 0 in the unified model (no handler attribution)
+    uint64_t handler_first_inst_id = 0;  // dispatch_inst_id + 1 (for post-fetch register reads)
+    uint64_t handler_last_inst_id = 0;   // next_anchor_inst_id - 1 (or dispatch_inst_id for the last step)
     uint64_t regs_read_mask = 0;
     uint64_t regs_written_mask = 0;
     uint32_t mem_reads = 0;
     uint32_t mem_writes = 0;
-    std::vector<uint64_t> body_pcs;  // unique PCs visited during this execution
-};
-
-class VMCollector final : public TraceCollector {
-public:
-    VMCollector(uint64_t dispatch_header_pc,
-                uint64_t indirect_branch_pc,
-                const ankerl::unordered_dense::set<uint64_t>& body_pc_set)
-        : dispatch_header_pc_(dispatch_header_pc)
-        , indirect_branch_pc_(indirect_branch_pc)
-        , body_pc_set_(body_pc_set) {}
-
-    std::string_view name() const override { return "VMCollector"; }
-
-    void on_inst(uint64_t inst_id, const InstView& inst) override {
-        uint64_t pc = inst.pc;
-
-        // ── State machine: track dispatch → handler transitions ──────────
-
-        if (pc == dispatch_header_pc_) {
-            // Entering a new dispatch iteration.
-            // If we were inside a handler, close it.
-            if (state_ == State::InHandler && !executions_.empty()) {
-                executions_.back().handler_last_inst_id = last_inst_id_;
-            }
-            state_ = State::InDispatcher;
-            current_dispatch_inst_id_ = inst_id;
-        }
-        else if (state_ == State::InDispatcher) {
-            if (pc == indirect_branch_pc_) {
-                // Hit the dispatch branch — next instruction is handler entry
-                state_ = State::AwaitHandler;
-            } else if (!body_pc_set_.contains(pc)) {
-                // PC left the loop body (subroutine call etc.) — abort this dispatch
-                state_ = State::Idle;
-            }
-        }
-        else if (state_ == State::AwaitHandler) {
-            // First instruction after BR — this is the handler entry
-            HandlerExecution exec;
-            exec.dispatch_inst_id = current_dispatch_inst_id_;
-            exec.handler_entry_pc = pc;
-            exec.handler_first_inst_id = inst_id;
-            executions_.push_back(exec);
-            state_ = State::InHandler;
-            handler_pc_set_.clear();
-            handler_pc_set_.insert(pc);
-            // Record effects from this first instruction too
-            accumulate_effects(inst);
-        }
-        else if (state_ == State::InHandler && !executions_.empty()) {
-            // Inside a handler — accumulate effects
-            auto& exec = executions_.back();
-            if (handler_pc_set_.insert(pc).second) {
-                exec.body_pcs.push_back(pc);
-            }
-            accumulate_effects(inst);
-        }
-
-        last_inst_id_ = inst_id;
-    }
-
-    void end() override {
-        // Close the last handler if we ended mid-execution
-        if (state_ == State::InHandler && !executions_.empty()) {
-            executions_.back().handler_last_inst_id = last_inst_id_;
-        }
-    }
-
-    std::vector<HandlerExecution>& executions() { return executions_; }
-
-private:
-    void accumulate_effects(const InstView& inst) {
-        if (executions_.empty()) return;
-        auto& exec = executions_.back();
-
-        for (uint8_t d = 0; d < inst.reg_diff_count; ++d) {
-            auto rd = inst.reg_diff(d);
-            if (rd.index < 34) {
-                exec.regs_written_mask |= (1ULL << rd.index);
-            }
-        }
-
-        // Track register reads from instruction encoding
-        // (approximation: any register that is NOT only written is likely read)
-        // For now, use the code table if available — but InstView doesn't expose
-        // read registers directly. We accumulate from mem_access base regs instead.
-        for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
-            auto ma = inst.mem_access(m);
-            if (ma.type & 0x01) exec.mem_reads++;    // MEMORY_READ bit
-            else if (ma.type & 0x02) exec.mem_writes++;  // MEMORY_WRITE bit
-        }
-    }
-
-    enum class State { Idle, InDispatcher, AwaitHandler, InHandler };
-
-    uint64_t dispatch_header_pc_;
-    uint64_t indirect_branch_pc_;
-    const ankerl::unordered_dense::set<uint64_t>& body_pc_set_;
-
-    State state_ = State::Idle;
-    uint64_t current_dispatch_inst_id_ = 0;
-    uint64_t last_inst_id_ = 0;
-
-    std::vector<HandlerExecution> executions_;
-    ankerl::unordered_dense::set<uint64_t> handler_pc_set_;  // PCs in current handler execution
-};
-
-// ─── ThreadedCollector — single-pass scan for threaded-code VMs ──────────
-//
-// Threaded-code (direct-threaded / indirect-threaded) VMs have no central
-// dispatcher loop.  Instead every handler ends with an inline "fetch next
-// opcode + branch to next handler" sequence.  The observable pattern in the
-// trace is:
-//
-//   handler_A body ... → dispatch_pc_1 (fetch/decode) → BR Xn → handler_B body
-//   handler_B body ... → dispatch_pc_2 (fetch/decode) → BR Xn → handler_C body
-//   ...
-//
-// where dispatch_pc_* is one of the "threaded dispatch PCs" provided by the
-// user (the common tail-fetch PCs shared by every handler).
-//
-// Detection strategy:
-//   1. The user supplies a set of "dispatch PCs" (the common fetch+dispatch
-//      instruction addresses that appear in every handler's tail).
-//   2. The collector observes every instruction.  When it hits a dispatch PC,
-//      it closes the current handler and begins watching for the next handler
-//      entry (the first new PC after the next BR Xn in the dispatch sequence).
-//
-// This is architecturally identical to VMCollector's InDispatcher→AwaitHandler
-// transition, except that "loop header hit" is replaced by "dispatch PC hit".
-
-class ThreadedCollector final : public TraceCollector {
-public:
-    ThreadedCollector(const ankerl::unordered_dense::set<uint64_t>& dispatch_pc_set,
-                      const ankerl::unordered_dense::set<uint64_t>& indirect_branch_pcs)
-        : dispatch_pc_set_(dispatch_pc_set)
-        , indirect_branch_pcs_(indirect_branch_pcs) {}
-
-    std::string_view name() const override { return "ThreadedCollector"; }
-
-    void on_inst(uint64_t inst_id, const InstView& inst) override {
-        uint64_t pc = inst.pc;
-
-        switch (state_) {
-            case State::Idle:
-            case State::InHandler:
-                if (dispatch_pc_set_.contains(pc)) {
-                    // Entering the tail-dispatch sequence; close the current handler.
-                    if (state_ == State::InHandler && !executions_.empty()) {
-                        executions_.back().handler_last_inst_id = last_inst_id_;
-                    }
-                    state_ = State::InDispatch;
-                    current_dispatch_inst_id_ = inst_id;
-                } else if (state_ == State::InHandler && !executions_.empty()) {
-                    auto& exec = executions_.back();
-                    if (handler_pc_set_.insert(pc).second) {
-                        exec.body_pcs.push_back(pc);
-                    }
-                    accumulate_effects(inst);
-                }
-                break;
-
-            case State::InDispatch:
-                if (indirect_branch_pcs_.contains(pc)) {
-                    // The dispatch BR — next instruction is the new handler entry.
-                    state_ = State::AwaitHandler;
-                } else if (!dispatch_pc_set_.contains(pc)) {
-                    // Unexpected PC in dispatch sequence — reset.
-                    state_ = State::Idle;
-                }
-                break;
-
-            case State::AwaitHandler:
-                // First instruction after BR — handler entry.
-                {
-                    HandlerExecution exec;
-                    exec.dispatch_inst_id     = current_dispatch_inst_id_;
-                    exec.handler_entry_pc     = pc;
-                    exec.handler_first_inst_id = inst_id;
-                    executions_.push_back(exec);
-                    state_ = State::InHandler;
-                    handler_pc_set_.clear();
-                    handler_pc_set_.insert(pc);
-                    accumulate_effects(inst);
-                }
-                break;
-        }
-
-        last_inst_id_ = inst_id;
-    }
-
-    void end() override {
-        if (state_ == State::InHandler && !executions_.empty()) {
-            executions_.back().handler_last_inst_id = last_inst_id_;
-        }
-    }
-
-    std::vector<HandlerExecution>& executions() { return executions_; }
-
-private:
-    void accumulate_effects(const InstView& inst) {
-        if (executions_.empty()) return;
-        auto& exec = executions_.back();
-        for (uint8_t d = 0; d < inst.reg_diff_count; ++d) {
-            auto rd = inst.reg_diff(d);
-            if (rd.index < 34) exec.regs_written_mask |= (1ULL << rd.index);
-        }
-        for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
-            auto ma = inst.mem_access(m);
-            if (ma.type & 0x01) exec.mem_reads++;
-            else if (ma.type & 0x02) exec.mem_writes++;
-        }
-    }
-
-    enum class State { Idle, InDispatch, AwaitHandler, InHandler };
-
-    const ankerl::unordered_dense::set<uint64_t>& dispatch_pc_set_;
-    const ankerl::unordered_dense::set<uint64_t>& indirect_branch_pcs_;
-
-    State    state_                    = State::Idle;
-    uint64_t current_dispatch_inst_id_ = 0;
-    uint64_t last_inst_id_             = 0;
-
-    std::vector<HandlerExecution>       executions_;
-    ankerl::unordered_dense::set<uint64_t> handler_pc_set_;
+    std::vector<uint64_t> body_pcs;  // unused in the unified model (kept for struct compatibility)
 };
 
 }  // anonymous namespace
@@ -354,482 +125,235 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     ctx.progress(0.0f, "VM abstract: scanning for dispatcher candidates...");
 
-    // ── Step 2: Resolve the hinted dispatcher into a Candidate ───────────
+    // ── Step 2: Resolve anchor and collect inst_ids ──────────────────────
     //
-    // There is exactly one source of truth for "where is the VM dispatcher":
-    // the caller's hint (`dispatcher`, `threaded_dispatch_pcs`, or a FetchOnly
-    // anchor). This block never scores or ranks loops — it only resolves the
-    // hint into the loop/PC bookkeeping the rest of the pass needs.
+    // The unified model: collect "anchor inst_ids" — one per VM instruction
+    // — from one of three anchor forms (see DispatcherHint docs):
+    //   (a) single PC  (b) PC set  (c) memory write
+    // No state machine, no trace scan — the anchor hit list IS the execution
+    // list.  Native instruction ranges are derived from adjacent anchors.
 
-    struct Candidate {
-        size_t   loop_index = 0;
-        uint64_t header_pc = 0;
-        uint64_t indirect_branch_pc = 0;
-        uint64_t iteration_count = 0;
-        float    score = 0.0f;
-        bool     is_blr = false;          // BLR dispatch (call-table style)
-        std::vector<uint64_t> header_inst_ids;
-    };
+    std::vector<uint64_t> anchor_inst_ids;  // sorted, one per VM instruction
+    uint64_t anchor_header_pc = 0;          // primary PC (for display), 0 for mem anchor
+    uint64_t anchor_ibp = 0;                // indirect branch PC (for display-label auto-classification)
+    bool is_mem_anchor = false;
 
-    std::vector<Candidate> candidates;
-
-    // ── FetchOnly short-circuit ───────────────────────────────────────────
-    //
-    // Some VMs obfuscate the handler-dispatch decision itself beyond what any
-    // generic collector state-machine can recognize — e.g. a CFF-wrapped
-    // binary-search / linear opcode-compare tree where *every* comparison
-    // node (not just the final "handler selected" edge) routes through the
-    // same "BL cff_stub -> computed RET" primitive.  In that case there is no
-    // PC that unambiguously means "handler entry", so VMCollector/
-    // ThreadedCollector cannot attribute executions to handlers at all.
-    //
-    // FetchOnly sidesteps handler discovery entirely: it only requires a
-    // single stable "fetch / loop-back" anchor PC (`dispatcher.loop_header_pc`)
-    // that is hit exactly once per VM instruction (e.g. the interpreter
-    // loop's back-edge landing point). At each hit, it snapshots VM state
-    // (vm_pc, ctx_fields, vm_registers) via the same Step-7 logic used by the
-    // other topologies — no loop/CFG dependency, no handler classification,
-    // no opcode decoding.
-    // A FetchOnly hint may anchor on either a code PC (`loop_header_pc`,
-    // resolved via xref below) or a memory location (`mem_anchor_addr`,
-    // resolved via MemoryModel::write_history below) — see DispatcherHint
-    // for why the memory anchor exists (heavily CFF-obfuscated VMs where the
-    // fetch/PC++ logic has no single stable PC).
-    bool fetch_only_pc_anchor =
-        (config_.dispatch_type_hint == DispatchType::FetchOnly) &&
-        config_.dispatcher.has_value() &&
-        config_.dispatcher->loop_header_pc != 0;
-    bool fetch_only_mem_anchor =
-        (config_.dispatch_type_hint == DispatchType::FetchOnly) &&
-        config_.dispatcher.has_value() &&
-        config_.dispatcher->mem_anchor_addr != 0;
-    bool fetch_only_short_circuit = fetch_only_pc_anchor || fetch_only_mem_anchor;
-
-    // ── ThreadedCode short-circuit ───────────────────────────────────────
-    //
-    // ThreadedCode topology has no real dispatch loop header: every handler
-    // tail-chains directly into the next handler via a shared "fetch+decode"
-    // instruction sequence (threaded_dispatch_pcs) followed by an indirect
-    // (or, on heavily-CFF'd binaries, a *computed-RET*-based) transfer.
-    // On such binaries the "loop" pass — which only sees back-edges realized
-    // as direct B/B.cond/BR/BLR in the *dynamic* CFG — frequently cannot
-    // detect the real interpreter loop at all (CFF stubs implement every
-    // control-flow edge, including the loop back-edge, as
-    // "BL stub -> computed index -> ADD LR,LR,offset -> RET", which the CFG
-    // call/return pairing does not recognize as a loop back-edge).
-    //
-    // When the caller explicitly asks for ThreadedCode via dispatch_type_hint
-    // and supplies threaded_dispatch_pcs, skip the loop-lookup requirement
-    // entirely and go straight to the ThreadedCollector path below — it only
-    // needs the dispatch PC set + indirect-branch PC set, never a LoopInfo.
-    bool threaded_short_circuit =
-        (config_.dispatch_type_hint == DispatchType::ThreadedCode) &&
-        !config_.threaded_dispatch_pcs.empty();
-
-    if (fetch_only_mem_anchor) {
-        // Memory-anchor FetchOnly: header_inst_ids come from
-        // MemoryModel::write_history() on `mem_anchor_addr`, not from an
-        // xref PC lookup. Populate header_inst_ids right here (the generic
-        // "Collect header inst_ids for each candidate from XRef" loop below
-        // skips this candidate since header_pc == 0 has no xref entry — see
-        // the `cand.header_pc != 0` guard there).
-        Candidate cand;
-        cand.header_pc = 0;  // no single code PC for this anchor — see mem_anchor_addr
-        cand.score = 10.0f;
-
+    if (config_.dispatcher.has_value() &&
+        config_.dispatcher->mem_anchor_addr != 0) {
+        // ── Form (c): memory-write anchor ────────────────────────────────
+        is_mem_anchor = true;
+        anchor_header_pc = 0;
         auto write_ids = ctx.memory().write_history(
             config_.dispatcher->mem_anchor_addr, config_.dispatcher->mem_anchor_size);
-        cand.header_inst_ids.reserve(std::min<size_t>(write_ids.size(), 20000));
+        anchor_inst_ids.reserve(std::min<size_t>(write_ids.size(), 20000));
         for (uint64_t iid : write_ids) {
             if (iid < range.start_inst_id) continue;
             if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
-            cand.header_inst_ids.push_back(iid);
-            if (cand.header_inst_ids.size() >= 20000) break;
+            anchor_inst_ids.push_back(iid);
+            if (anchor_inst_ids.size() >= 20000) break;
         }
-        candidates.push_back(std::move(cand));
+    } else {
+        // ── Form (a)/(b): PC anchor (single PC or PC set) ────────────────
+        // Build the PC set from: dispatcher->anchor_pcs + loop_header_pc
+        // + threaded_dispatch_pcs (deprecated alias).
+        std::vector<uint64_t> pcs;
+        if (config_.dispatcher.has_value()) {
+            if (config_.dispatcher->loop_header_pc != 0)
+                pcs.push_back(config_.dispatcher->loop_header_pc);
+            for (uint64_t pc : config_.dispatcher->anchor_pcs)
+                pcs.push_back(pc);
+            anchor_ibp = config_.dispatcher->indirect_branch_pc;
+        }
+        for (uint64_t pc : config_.threaded_dispatch_pcs)
+            pcs.push_back(pc);
 
-    } else if (fetch_only_pc_anchor) {
-        Candidate cand;
-        cand.header_pc = config_.dispatcher->loop_header_pc;
-        cand.score = 10.0f;
-        candidates.push_back(std::move(cand));
+        // Deduplicate
+        std::sort(pcs.begin(), pcs.end());
+        pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
 
-    } else if (threaded_short_circuit) {
-        Candidate cand;
-        cand.header_pc = *config_.threaded_dispatch_pcs.begin();
-        cand.indirect_branch_pc = config_.dispatcher.has_value()
-            ? config_.dispatcher->indirect_branch_pc : 0;
-        cand.score = 10.0f;
-        candidates.push_back(std::move(cand));
+        anchor_header_pc = pcs.empty() ? 0 : pcs.front();
 
-    } else if (config_.dispatcher.has_value()) {
-        // ── Hint-driven ─────────────────────────────────────────────────
-        const auto& hint = *config_.dispatcher;
-        Candidate cand;
-        cand.header_pc = hint.loop_header_pc;
-        cand.indirect_branch_pc = hint.indirect_branch_pc;
+        // Collect xref hits for each PC (with slide fixup for the primary PC)
+        uint64_t slide = ctx.reader().header().module_slide;
+        uint64_t base  = ctx.reader().header().module_base;
+        for (uint64_t pc : pcs) {
+            uint64_t effective_pc = pc;
+            if (!xref.has_pc(pc)) {
+                uint64_t guess_plus  = pc + slide;
+                uint64_t guess_minus = pc - slide;
+                bool plus_hits  = xref.has_pc(guess_plus);
+                bool minus_hits = xref.has_pc(guess_minus);
 
-        bool loop_found = false;
-        for (size_t i = 0; i < loop_result.loops.size(); ++i) {
-            if (loop_result.loops[i].header_pc == hint.loop_header_pc) {
-                cand.loop_index = i;
-                cand.iteration_count = loop_result.loops[i].iteration_count;
-                loop_found = true;
-                break;
+                if (plus_hits) {
+                    if (pc == pcs.front()) {
+                        LOG_WARN_M(::tenet::log::Module::Analysis,
+                            "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
+                            "but {:#x} (= hint + module_slide {:#x}) WAS executed {} time(s). "
+                            "Your hints file almost certainly has the STATIC/file address — "
+                            "use {:#x} as dispatcher_pc instead (this trace's module_base={:#x}).",
+                            pc, guess_plus, slide,
+                            xref.execution_count(guess_plus), guess_plus, base);
+                    }
+                    effective_pc = guess_plus;
+                } else if (minus_hits) {
+                    if (pc == pcs.front()) {
+                        LOG_WARN_M(::tenet::log::Module::Analysis,
+                            "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
+                            "but {:#x} (= hint - module_slide {:#x}) WAS executed {} time(s). "
+                            "Your hints file may have a runtime address from a DIFFERENT "
+                            "trace/run (ASLR slide changes per launch) — use {:#x} as "
+                            "dispatcher_pc for THIS trace instead.",
+                            pc, guess_minus, slide,
+                            xref.execution_count(guess_minus), guess_minus);
+                    }
+                    effective_pc = guess_minus;
+                } else {
+                    if (pc == pcs.front()) {
+                        LOG_WARN_M(::tenet::log::Module::Analysis,
+                            "VM abstract: hinted PC {:#x} was never executed in this trace "
+                            "(0 xref hits), and neither hint+slide ({:#x}) nor hint-slide "
+                            "({:#x}) was executed either — this trace's module_base={:#x} "
+                            "module_slide={:#x}. Double-check the address comes from THIS "
+                            "binary/run (not a stale IDA bookmark or a different trace), and "
+                            "that it's inside the traced range.",
+                            pc, guess_plus, guess_minus, base, slide);
+                    }
+                    continue;
+                }
             }
+            for (uint64_t iid : xref.inst_ids_at(effective_pc)) {
+                if (iid < range.start_inst_id) continue;
+                if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
+                anchor_inst_ids.push_back(iid);
+            }
+            LOG_INFO_M(::tenet::log::Module::Analysis,
+                "VM abstract: anchor PC {:#x} hit in [{}, {})",
+                effective_pc, range.start_inst_id,
+                range.end_inst_id == UINT64_MAX ? -1 : static_cast<int64_t>(range.end_inst_id));
         }
-
-        if (!loop_found) {
-            std::string msg = fmt::format(
-                "VM abstract: hinted dispatcher at {:#x} not found in loop results "
-                "(if this VM's back-edge is realized via CFF-computed RET rather than "
-                "a direct B/BR, try dispatch_type_hint=ThreadedCode + threaded_dispatch_pcs "
-                "instead of dispatcher_pc)",
-                hint.loop_header_pc);
-            ctx.progress(1.0f, msg);
-            // Use WARN (not the default DEBUG progress-log path) so this is
-            // visible in the GUI Log panel / stderr at the default log level
-            // — without this, a bad hints_file silently produces an
-            // all-zero VMAbstractResult with no visible explanation.
-            LOG_WARN_M(::tenet::log::Module::Analysis, "{}", msg);
-            LOG_WARN_M(::tenet::log::Module::Analysis,
-                "VM abstract: is loop_header_pc a RUNTIME address (static_pc + "
-                "module_slide)? {} loop(s) were detected in this trace.",
-                loop_result.loops.size());
-            return PassResult::success(std::move(result));
-        }
-
-        bool hint_is_blr = false;
-        if (cand.indirect_branch_pc == 0) {
-            cand.indirect_branch_pc = find_indirect_branch_in_loop(
-                loop_result.loops[cand.loop_index], cfg_result, code_table, hint_is_blr);
-        } else {
-            // Check if the hinted PC is BLR
-            auto code = code_table.opcode_at(cand.indirect_branch_pc);
-            if (code.has_value()) hint_is_blr = aarch64::is_blr(*code);
-        }
-
-        cand.is_blr = hint_is_blr;
-        cand.score = 10.0f;
-        candidates.push_back(std::move(cand));
+        // Merge-sort the collected inst_ids (multiple PC streams may interleave)
+        std::sort(anchor_inst_ids.begin(), anchor_inst_ids.end());
     }
 
-    // No candidate means the caller didn't supply a usable dispatcher hint
-    // (FetchOnly anchor, ThreadedCode dispatch PCs, or a plain dispatcher
-    // hint). This pass never scans loops looking for "VM-shaped" candidates
-    // — see VMConfig's class comment — so an empty candidate list here is a
-    // caller error, not "no VM found".
-    if (candidates.empty()) {
-        static constexpr const char* kMsg =
-            "VM abstract: no dispatcher hint provided (set VMConfig::dispatcher, "
-            "threaded_dispatch_pcs, or a FetchOnly anchor from static analysis)";
-        ctx.progress(1.0f, kMsg);
-        LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
+    // No anchor inst_ids means the caller didn't supply a usable hint, or the
+    // hinted PC(s) were never executed.  This pass never scans loops looking
+    // for "VM-shaped" candidates — see VMConfig's class comment.
+    if (anchor_inst_ids.empty()) {
+        if (!config_.dispatcher.has_value() && config_.threaded_dispatch_pcs.empty()) {
+            static constexpr const char* kMsg =
+                "VM abstract: no dispatcher hint provided (set VMConfig::dispatcher "
+                "with loop_header_pc / anchor_pcs / mem_anchor_addr from static analysis)";
+            ctx.progress(1.0f, kMsg);
+            LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
+        } else {
+            static constexpr const char* kMsg =
+                "VM abstract: no valid VM anchor found (hinted PC(s) matched "
+                "fewer than 3 times in the analysis range — see prior log lines "
+                "for per-PC hit counts)";
+            ctx.progress(1.0f, kMsg);
+            LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
+        }
         return PassResult::success(std::move(result));
     }
 
-    // Collect header inst_ids for each candidate from XRef
-    // (mem-anchor FetchOnly candidates already populated header_inst_ids
-    // above and have header_pc == 0, which has no xref entry — skip them
-    // here via the has_pc() guard so they aren't accidentally cleared.)
-    for (auto& cand : candidates) {
-        if (cand.header_pc == 0) continue;  // mem-anchor FetchOnly: already populated
-        if (!xref.has_pc(cand.header_pc)) {
-            uint64_t slide = ctx.reader().header().module_slide;
-            uint64_t base  = ctx.reader().header().module_base;
-            uint64_t guess_plus  = cand.header_pc + slide;   // hint was static, needs +slide
-            uint64_t guess_minus = cand.header_pc - slide;   // hint was runtime from another run
-            bool plus_hits  = xref.has_pc(guess_plus);
-            bool minus_hits = xref.has_pc(guess_minus);
-
-            if (plus_hits) {
-                // High-confidence fix: the caller almost certainly hinted the
-                // STATIC (IDA/file) address. Tell them exactly what to use.
-                LOG_WARN_M(::tenet::log::Module::Analysis,
-                    "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
-                    "but {:#x} (= hint + module_slide {:#x}) WAS executed {} time(s). "
-                    "Your hints file almost certainly has the STATIC/file address — "
-                    "use {:#x} as dispatcher_pc instead (this trace's module_base={:#x}).",
-                    cand.header_pc, guess_plus, slide,
-                    xref.execution_count(guess_plus), guess_plus, base);
-            } else if (minus_hits) {
-                LOG_WARN_M(::tenet::log::Module::Analysis,
-                    "VM abstract: hinted PC {:#x} was never executed (0 xref hits), "
-                    "but {:#x} (= hint - module_slide {:#x}) WAS executed {} time(s). "
-                    "Your hints file may have a runtime address from a DIFFERENT "
-                    "trace/run (ASLR slide changes per launch) — use {:#x} as "
-                    "dispatcher_pc for THIS trace instead.",
-                    cand.header_pc, guess_minus, slide,
-                    xref.execution_count(guess_minus), guess_minus);
-            } else {
-                LOG_WARN_M(::tenet::log::Module::Analysis,
-                    "VM abstract: hinted PC {:#x} was never executed in this trace "
-                    "(0 xref hits), and neither hint+slide ({:#x}) nor hint-slide "
-                    "({:#x}) was executed either — this trace's module_base={:#x} "
-                    "module_slide={:#x}. Double-check the address comes from THIS "
-                    "binary/run (not a stale IDA bookmark or a different trace), and "
-                    "that it's inside the traced range.",
-                    cand.header_pc, guess_plus, guess_minus, base, slide);
-            }
-            continue;
-        }
-        cand.header_inst_ids.reserve(cand.iteration_count);
-        for (uint64_t iid : xref.inst_ids_at(cand.header_pc)) {
-            if (iid < range.start_inst_id) continue;
-            if (range.end_inst_id != UINT64_MAX && iid >= range.end_inst_id) break;
-            cand.header_inst_ids.push_back(iid);
-        }
-        LOG_INFO_M(::tenet::log::Module::Analysis,
-            "VM abstract: hinted PC {:#x} hit {} time(s) in [{}, {}) "
-            "(need >= 3 to be usable as a dispatcher candidate)",
-            cand.header_pc, cand.header_inst_ids.size(),
-            range.start_inst_id,
-            range.end_inst_id == UINT64_MAX ? -1 : static_cast<int64_t>(range.end_inst_id));
-    }
-
-    // Pick the best candidate that has enough header hits
-    Candidate* best = nullptr;
-    for (auto& c : candidates) {
-        if (c.header_inst_ids.size() >= 3) {
-            best = &c;
-            break;
-        }
-    }
-
-    if (!best) {
-        static constexpr const char* kMsg =
-            "VM abstract: no valid VM dispatcher found (hinted PC(s) matched "
-            "fewer than 3 times in the analysis range — see prior log lines "
-            "for per-candidate hit counts)";
-        ctx.progress(1.0f, kMsg);
-        LOG_WARN_M(::tenet::log::Module::Analysis, "{}", kMsg);
+    if (anchor_inst_ids.size() < 3) {
+        ctx.progress(1.0f, fmt::format(
+            "VM abstract: only {} anchor hits (need >= 3), not a VM",
+            anchor_inst_ids.size()));
+        LOG_WARN_M(::tenet::log::Module::Analysis,
+            "VM abstract: only {} anchor hits (need >= 3)", anchor_inst_ids.size());
         return PassResult::success(std::move(result));
     }
 
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
-
-    // Decide which collector to use.
-    bool use_threaded = (config_.dispatch_type_hint == DispatchType::ThreadedCode)
-                     && !config_.threaded_dispatch_pcs.empty();
-    bool use_fetch_only = fetch_only_short_circuit;
-
-    // `loop` is only meaningful for the loop-based (!use_threaded && !use_fetch_only)
-    // path below (classify_dispatch_type() at the bottom of this block). The
-    // threaded_short_circuit / fetch_only_short_circuit candidate's loop_index
-    // is a dummy (0) — never dereference loop_result.loops with it.
-    static const LoopInfo kEmptyLoop{};
-    const LoopInfo& loop = (use_threaded || use_fetch_only || best->loop_index >= loop_result.loops.size())
-        ? kEmptyLoop
-        : loop_result.loops[best->loop_index];
 
     ctx.progress(0.15f, fmt::format(
-        "VM abstract: dispatcher at {:#x} ({} iterations), running trace scan...",
-        best->header_pc, best->iteration_count));
+        "VM abstract: anchor resolved ({} hits), building VM steps...",
+        anchor_inst_ids.size()));
 
-    // ── Step 3: Single-pass trace scan to discover handlers ─────────────
+    // ── Step 3: Build HandlerExecution list from anchor inst_ids ────────
     //
-    // Two modes depending on dispatch topology:
-    //
-    //   WhileSwitch / IndirectBranch / CallTable:
-    //     Use VMCollector (state: InDispatcher → AwaitHandler → InHandler).
-    //     Anchored on the loop header PC.
-    //
-    //   ThreadedCode:
-    //     Use ThreadedCollector (state: InDispatch → AwaitHandler → InHandler).
-    //     Anchored on the set of threaded_dispatch_pcs provided by the user.
-    //     Falls back to VMCollector if no threaded_dispatch_pcs are given.
+    // One HandlerExecution per anchor hit.  The native instruction range
+    // [handler_first_inst_id, handler_last_inst_id] is derived from adjacent
+    // anchors: step N spans [anchor_N, anchor_{N+1}).  The last step has no
+    // next anchor, so its range is just [anchor_N, anchor_N] (conservative —
+    // we don't know where the final VM instruction ends).
 
-    // Storage for whichever collector is active.
-    // One of these will be engaged; executions_ points to the live one.
-    std::vector<HandlerExecution>* executions_ptr = nullptr;
-
-    // VMCollector path (default)
-    ankerl::unordered_dense::set<uint64_t> body_pc_set;
-    std::unique_ptr<VMCollector> vm_collector;
-
-    // ThreadedCollector path
-    ankerl::unordered_dense::set<uint64_t> threaded_dispatch_pc_set;
-    ankerl::unordered_dense::set<uint64_t> threaded_br_pc_set;
-    std::unique_ptr<ThreadedCollector> threaded_collector;
-
-    // FetchOnly path: no state machine, no trace scan engine at all — the
-    // XRef-derived `best->header_inst_ids` (every hit of dispatcher_pc) *is*
-    // the full execution list. One HandlerExecution per hit, all fields
-    // beyond dispatch_inst_id left at their zero defaults (no handler concept).
-    std::vector<HandlerExecution> fetch_only_executions;
-
-    if (use_fetch_only) {
-        fetch_only_executions.reserve(best->header_inst_ids.size());
-        for (uint64_t iid : best->header_inst_ids) {
-            HandlerExecution exec;
-            exec.dispatch_inst_id      = iid;
-            exec.handler_entry_pc      = 0;   // no handler concept in this mode
-            // Set handler_first to dispatch+1 so that opcode_from_reg reads
-            // state_before(iid+1) == state_after(iid), capturing the value
-            // written by the fetch instruction (e.g. LDR W1,[X8,X0]).
-            exec.handler_first_inst_id = iid + 1;
-            exec.handler_last_inst_id  = iid; // step "ends" at the same fetch point
-            fetch_only_executions.push_back(exec);
-        }
-        executions_ptr = &fetch_only_executions;
-
-        // Synthesise dispatcher info: the fetch anchor IS the loop header.
-        result.dispatcher.loop_header_pc     = best->header_pc;
-        result.dispatcher.indirect_branch_pc = 0;
-        result.dispatcher.iteration_count    = fetch_only_executions.size();
-        result.dispatcher.dispatch_type      = DispatchType::FetchOnly;
-        result.dispatcher.confidence         = 0.9f;  // user-provided hint
-
-    } else if (use_threaded) {
-        // Build dispatch PC set from user hints.
-        // threaded_dispatch_pcs are stored as runtime addresses (with slide)
-        // consistent with how dispatcher_hint.loop_header_pc is stored.
-        for (uint64_t pc : config_.threaded_dispatch_pcs) {
-            threaded_dispatch_pc_set.insert(pc);
-        }
-        // Collect all indirect-branch PCs reachable from any of the dispatch PCs.
-        // We scan the CFG for BR/BLR instructions within a short window around
-        // each dispatch PC.  Alternatively, the user can include the BR itself in
-        // threaded_dispatch_pcs and we will detect it via the CFG.
-        // For now, add any BR/BLR that immediately follows a dispatch PC in the
-        // code_table (this covers the common "LDR X8, [X20, X0, LSL #3]; BR X8"
-        // pattern).
-        for (uint64_t dpc : threaded_dispatch_pc_set) {
-            // Walk up to 8 instructions forward looking for a BR/BLR
-            uint64_t probe = dpc;
-            for (int step_i = 0; step_i < 8; ++step_i) {
-                auto code = code_table.opcode_at(probe);
-                if (code.has_value()) {
-                    if (aarch64::is_br(*code) || aarch64::is_blr(*code)) {
-                        threaded_br_pc_set.insert(probe);
-                        break;
-                    }
-                }
-                probe += 4;  // AArch64: fixed 4-byte instruction
-            }
-        }
-        // Also include any indirect branch PC from the best candidate if
-        // it was auto-detected (handles mixed-topology traces).
-        if (best->indirect_branch_pc != 0) {
-            threaded_br_pc_set.insert(best->indirect_branch_pc);
-        }
-
-        threaded_collector = std::make_unique<ThreadedCollector>(
-            threaded_dispatch_pc_set, threaded_br_pc_set);
-
-        auto engine = ctx.make_scan_engine();
-        engine.add_collector(threaded_collector.get());
-        engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                ctx.progress(0.15f + 0.45f * static_cast<float>(processed) /
-                             static_cast<float>(total));
-            }
-        });
-        engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        engine.run(range.start_inst_id, range.end_inst_id);
-
-        executions_ptr = &threaded_collector->executions();
-
-        // Synthesise dispatcher info (no real loop, fill with sentinel values)
-        result.dispatcher.loop_header_pc     = 0;
-        result.dispatcher.indirect_branch_pc =
-            threaded_br_pc_set.empty() ? 0 : *threaded_br_pc_set.begin();
-        result.dispatcher.iteration_count    = executions_ptr->size();
-        result.dispatcher.dispatch_type      = DispatchType::ThreadedCode;
-        result.dispatcher.confidence         = 0.9f;  // user-provided hint
-
-    } else {
-        // ── WhileSwitch / IndirectBranch / CallTable path (original) ────
-        body_pc_set.insert(loop.body_pcs.begin(), loop.body_pcs.end());
-        vm_collector = std::make_unique<VMCollector>(
-            best->header_pc, best->indirect_branch_pc, body_pc_set);
-
-        {
-            auto engine = ctx.make_scan_engine();
-            engine.add_collector(vm_collector.get());
-            engine.set_progress([&](uint64_t processed, uint64_t total) {
-                if (total > 0) {
-                    ctx.progress(0.15f + 0.45f * static_cast<float>(processed) /
-                                 static_cast<float>(total));
-                }
-            });
-            engine.set_cancel_check([&]() { return ctx.cancelled(); });
-            engine.run(range.start_inst_id, range.end_inst_id);
-        }
-
-        executions_ptr = &vm_collector->executions();
+    std::vector<HandlerExecution> executions;
+    executions.reserve(anchor_inst_ids.size());
+    for (size_t i = 0; i < anchor_inst_ids.size(); ++i) {
+        uint64_t iid = anchor_inst_ids[i];
+        HandlerExecution exec;
+        exec.dispatch_inst_id      = iid;
+        exec.handler_entry_pc      = 0;   // no handler attribution in unified model
+        // handler_first = dispatch+1 so that opcode_from_reg reads
+        // state_before(iid+1) == state_after(iid), capturing the value
+        // written by the fetch instruction (e.g. LDR W1,[X8,X0]).
+        exec.handler_first_inst_id = iid + 1;
+        // handler_last = next_anchor - 1 (the instruction just before the
+        // next fetch cycle).  For the last step, use iid itself.
+        exec.handler_last_inst_id  = (i + 1 < anchor_inst_ids.size())
+            ? anchor_inst_ids[i + 1] - 1
+            : iid;
+        executions.push_back(exec);
     }
-
-    if (ctx.cancelled()) return PassResult::failed("Cancelled");
-
-    auto& executions = *executions_ptr;
 
     if (executions.empty()) {
         ctx.progress(1.0f, "VM abstract: no handler executions found");
         return PassResult::success(std::move(result));
     }
 
-    // Count distinct handler entry PCs
-    ankerl::unordered_dense::set<uint64_t> unique_handler_pcs;
-    for (const auto& exec : executions) {
-        if (exec.handler_entry_pc != 0) {
-            unique_handler_pcs.insert(exec.handler_entry_pc);
-        }
-    }
+    // In the unified model there is no dynamic handler discovery —
+    // handler_entry_pc is always 0.  The handler list (Step 6) is built
+    // purely from config_.handler_entry_pcs hints.
+    ctx.progress(0.6f, fmt::format(
+        "VM abstract: {} anchor-based VM steps", executions.size()));
 
-    // FetchOnly has no handler concept at all — skip the min_handler_count
-    // gate entirely (unique_handler_pcs will always be empty/0 since every
-    // exec.handler_entry_pc is 0 in this mode).
-    if (!use_fetch_only && unique_handler_pcs.size() < config_.min_handler_count) {
-        ctx.progress(1.0f, fmt::format(
-            "VM abstract: only {} distinct targets (need >= {}), not a VM",
-            unique_handler_pcs.size(), config_.min_handler_count));
-        return PassResult::success(std::move(result));
-    }
+    // ── Step 4: Fill dispatcher info + auto-classify display label ──────
 
-    if (use_fetch_only) {
-        ctx.progress(0.6f, fmt::format(
-            "VM abstract: FetchOnly mode — {} fetch-cycle snapshots", executions.size()));
+    result.dispatcher.loop_header_pc     = anchor_header_pc;
+    result.dispatcher.indirect_branch_pc = anchor_ibp;
+    result.dispatcher.iteration_count    = executions.size();
+    result.dispatcher.confidence         = 0.9f;  // user-provided hint
+
+    // Dispatch type: use the caller's explicit hint when available, else
+    // try mechanical auto-classification (BLR → CallTable, BR → IndirectBranch)
+    // for single-PC anchors with a found loop.  This is a display label only.
+    if (config_.dispatch_type_hint != DispatchType::Unknown &&
+        config_.dispatch_type_hint != DispatchType::FetchOnly) {
+        result.dispatcher.dispatch_type = config_.dispatch_type_hint;
     } else {
-        ctx.progress(0.6f, fmt::format(
-            "VM abstract: found {} handlers across {} executions",
-            unique_handler_pcs.size(), executions.size()));
+        bool is_blr = false;
+        uint64_t ibp = anchor_ibp;
+        if (ibp == 0 && anchor_header_pc != 0 && !is_mem_anchor) {
+            // Find indirect branch in the loop at anchor_header_pc
+            for (size_t i = 0; i < loop_result.loops.size(); ++i) {
+                if (loop_result.loops[i].header_pc == anchor_header_pc) {
+                    ibp = find_indirect_branch_in_loop(
+                        loop_result.loops[i], cfg_result, code_table, is_blr);
+                    break;
+                }
+            }
+        } else if (ibp != 0) {
+            auto code = code_table.opcode_at(ibp);
+            if (code.has_value()) is_blr = aarch64::is_blr(*code);
+        }
+        if (ibp != 0) {
+            result.dispatcher.indirect_branch_pc = ibp;
+            result.dispatcher.dispatch_type = classify_dispatch_type(is_blr);
+        } else {
+            result.dispatcher.dispatch_type = DispatchType::FetchOnly;
+        }
     }
 
-    // ── Step 4: Build dispatcher info ───────────────────────────────────
-    //
-    // ThreadedCode / FetchOnly paths: dispatcher info was already filled
-    // during Step 3 (no real loop header, or the anchor PC IS the header
-    // with no separate indirect-branch/handler classification).  Only fill
-    // for loop-based topologies here.
-
-    if (!use_threaded && !use_fetch_only) {
-        result.dispatcher.loop_header_pc   = best->header_pc;
-        result.dispatcher.indirect_branch_pc = best->indirect_branch_pc;
-        result.dispatcher.iteration_count  = best->iteration_count;
-        result.dispatcher.confidence       = std::min(1.0f, best->score);
-
-        // Prefer the caller's explicit hint (from static analysis) for the
-        // loop-based topologies; only fall back to the mechanical BLR/BR
-        // read when the caller didn't say WhileSwitch/IndirectBranch/CallTable.
-        switch (config_.dispatch_type_hint) {
-            case DispatchType::WhileSwitch:
-            case DispatchType::IndirectBranch:
-            case DispatchType::CallTable:
-                result.dispatcher.dispatch_type = config_.dispatch_type_hint;
-                break;
-            default:
-                result.dispatcher.dispatch_type = classify_dispatch_type(best->is_blr);
-                break;
-        }
-
-        // Identify state vs invariant registers across dispatch iterations
-        uint32_t n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
+    // Identify state vs invariant registers across dispatch iterations
+    {
+        uint32_t n = std::min(static_cast<uint32_t>(anchor_inst_ids.size()),
                               MAX_SAMPLE_ITERATIONS);
         std::vector<RegState> states;
         states.reserve(n);
         for (uint32_t i = 0; i < n; ++i) {
-            states.push_back(regfile.state_before(best->header_inst_ids[i]));
+            states.push_back(regfile.state_before(anchor_inst_ids[i]));
         }
         for (uint8_t r = 0; r <= 28; ++r) {
             bool changed = false;
@@ -927,25 +451,13 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     result.vm_pc_tracked = has_vm_pc;
 
     // Infer bytecode address range from observed VM-PC values.
-    // For ThreadedCode, sample from dispatch inst_ids recorded by the collector.
+    // Sample from the first N anchor inst_ids.
     if (has_vm_pc) {
-        uint32_t n;
-        std::vector<uint64_t> sample_inst_ids;
-        if (use_threaded) {
-            // Sample dispatch inst_ids from the first N executions
-            n = std::min(static_cast<uint32_t>(executions.size()),
-                         MAX_SAMPLE_ITERATIONS);
-            sample_inst_ids.reserve(n);
-            for (uint32_t i = 0; i < n; ++i) {
-                sample_inst_ids.push_back(executions[i].dispatch_inst_id);
-            }
-        } else {
-            n = std::min(static_cast<uint32_t>(best->header_inst_ids.size()),
-                         MAX_SAMPLE_ITERATIONS);
-            sample_inst_ids = std::vector<uint64_t>(
-                best->header_inst_ids.begin(),
-                best->header_inst_ids.begin() + n);
-        }
+        uint32_t n = std::min(static_cast<uint32_t>(anchor_inst_ids.size()),
+                              MAX_SAMPLE_ITERATIONS);
+        std::vector<uint64_t> sample_inst_ids(
+            anchor_inst_ids.begin(),
+            anchor_inst_ids.begin() + n);
         uint32_t n_real = static_cast<uint32_t>(sample_inst_ids.size());
         uint64_t min_vpc = UINT64_MAX, max_vpc = 0;
         for (uint32_t i = 0; i < n_real; ++i) {
@@ -975,7 +487,9 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         if (handler_pc_set.insert(pc).second) handler_pcs.push_back(pc);
     };
     for (uint64_t pc : config_.handler_entry_pcs) add_handler_pc(pc);
-    for (uint64_t pc : unique_handler_pcs) add_handler_pc(pc);
+    // In the unified model, handler_entry_pc is always 0, so there are no
+    // dynamically discovered handler PCs — the handler list comes entirely
+    // from config_.handler_entry_pcs (hints from static analysis).
     std::sort(handler_pcs.begin(), handler_pcs.end());
 
     // Group executions by handler entry PC
@@ -1603,23 +1117,23 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     result.handler_asm      = config_.handler_asm;
 
     std::string final_msg = fmt::format(
-        "VM abstract: dispatcher at {:#x}, {} handlers, {} VM steps, VM-PC={}",
+        "VM abstract: anchor at {:#x} ({}), {} VM steps, VM-PC={}",
         result.dispatcher.loop_header_pc,
-        result.handlers.size(),
+        dispatch_type_name(result.dispatcher.dispatch_type),
         result.total_vm_steps,
         result.vm_pc_tracked ? "tracked" : "unknown");
     ctx.progress(1.0f, final_msg);
     // Always visible at the default log level (not gated behind
     // TENET_LOG=DEBUG like the generic progress-message log path) — this is
     // the single most useful line for confirming a hints file actually
-    // "took": dispatcher != 0x0 and handlers/steps > 0.
+    // "took": dispatcher != 0x0 and steps > 0.
     LOG_INFO_M(::tenet::log::Module::Analysis, "{}", final_msg);
-    if (result.handlers.empty() || result.total_vm_steps == 0) {
+    if (result.total_vm_steps == 0) {
         LOG_WARN_M(::tenet::log::Module::Analysis,
-            "VM abstract: dispatcher was found but produced 0 handlers/steps — "
-            "this usually means the indirect-branch PC or handler classification "
-            "inside the dispatch loop didn't match this binary. Check "
-            "indirect_branch_pc in the hints and dispatch_type_hint.");
+            "VM abstract: anchor was resolved but produced 0 VM steps — "
+            "this usually means the anchor PC was never hit in the analysis "
+            "range, or the hint has a stale/wrong address. Check "
+            "loop_header_pc / anchor_pcs / mem_anchor_addr in the hints.");
     }
 
     return PassResult::success(std::move(result));

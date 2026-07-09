@@ -485,12 +485,15 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 # VMP（虚拟机保护）执行抽象
 ./tenet trace.bin --vm-abstract
 
-# 带静态 hint（dispatcher + VM-PC 寄存器 + handler 地址）
+# 带静态 hint（anchor PC + VM-PC 寄存器 + handler 地址）
 ./tenet trace.bin --vm-abstract \
     --vm-dispatcher-pc 0x100005000 \
     --vm-indirect-br-pc 0x100005014 \
     --vm-pc-reg 19 \
     --vm-handler-pc 0x100006000 --vm-handler-pc 0x100007000
+
+# 用 JSON hints 文件（推荐，支持 anchor_pcs / mem_anchor_addr 等完整字段）
+./tenet trace.bin --vm-abstract --vm-hints vm_hints.json
 ```
 
 **内存与字符串：**

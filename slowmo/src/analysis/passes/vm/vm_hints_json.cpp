@@ -94,6 +94,13 @@ bool load_vm_hints_from_json(const std::string& path, VMConfig& cfg,
             if (j.contains("mem_anchor_size")) {
                 dh.mem_anchor_size = static_cast<uint8_t>(j["mem_anchor_size"].get<int>());
             }
+            // PC-set anchor (form b) — alternative to single-PC anchor
+            // (loop_header_pc).  See DispatcherHint docs.
+            if (j.contains("anchor_pcs")) {
+                for (const auto& pc_str : j["anchor_pcs"]) {
+                    dh.anchor_pcs.push_back(rebase(parse_hex_str(pc_str.get<std::string>())));
+                }
+            }
             cfg.dispatcher = dh;
         }
 

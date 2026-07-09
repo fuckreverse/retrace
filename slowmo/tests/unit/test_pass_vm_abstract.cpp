@@ -197,6 +197,7 @@ TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
     // Don't provide indirect_branch_pc — let the pass find it (structural
     // completion within the already-hinted loop, not detection).
     cfg.dispatcher = dh;
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
     cfg.min_handler_count = 2;
 
     pm->register_pass(std::make_unique<XrefPass>());
@@ -217,8 +218,10 @@ TEST_CASE("VMAbstractPass: hint-driven mode with dispatcher hint",
         CHECK(res.dispatcher.indirect_branch_pc != 0);
     }
 
-    SECTION("handlers are still discovered") {
-        CHECK(res.handlers.size() >= 3);
+    SECTION("handlers are provided from hints") {
+        // In the unified anchor-based model, handlers are NOT discovered
+        // dynamically — they come from handler_entry_pcs hints.
+        CHECK(res.handlers.size() == 3);
     }
 
     SECTION("steps are produced") {
@@ -286,6 +289,7 @@ TEST_CASE("VMAbstractPass: handler lookup by PC works",
     DispatcherHint dh;
     dh.loop_header_pc = rt_pc(HEADER_PC);
     cfg.dispatcher = dh;
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
 
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
@@ -300,7 +304,9 @@ TEST_CASE("VMAbstractPass: handler lookup by PC works",
         auto* ha = res.handler_at(rt_pc(HANDLER_A));
         REQUIRE(ha != nullptr);
         CHECK(ha->entry_pc == rt_pc(HANDLER_A));
-        CHECK(ha->execution_count > 0);
+        // In the unified model, handlers are hint-only (no dynamic
+        // attribution), so execution_count is always 0.
+        CHECK(ha->execution_count == 0);
     }
 
     SECTION("handler_at returns nullptr for unknown PC") {
@@ -458,6 +464,7 @@ TEST_CASE("VMAbstractPass: opcode decode with OpcodeFormatHint",
         dh.loop_header_pc = rt_pc(HEADER_PC);
         cfg.dispatcher = dh;
     }
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
 
     // VM-PC: x1 points to bytecode, defined via vm_register_file
     VMRegisterFileHint rfh;
@@ -498,35 +505,27 @@ TEST_CASE("VMAbstractPass: opcode decode with OpcodeFormatHint",
         CHECK(valid_count == static_cast<uint32_t>(N));
     }
 
-    SECTION("opcode values match handler mapping") {
-        for (const auto& step : res.steps) {
+    SECTION("opcode values match expected pattern") {
+        // In the unified model, handler_entry_pc is always 0 (no dynamic
+        // attribution), so we check opcodes by step index instead.
+        // Handlers cycle A, B, C, A, B, C, ... so step i has opcode
+        // OPCODE_A + (i % 3).
+        for (size_t i = 0; i < res.steps.size(); ++i) {
+            const auto& step = res.steps[i];
             if (!step.opcode_valid) continue;
-            if (step.handler_entry_pc == rt_pc(HANDLER_A))
-                CHECK(step.opcode_value == OPCODE_A);
-            else if (step.handler_entry_pc == rt_pc(HANDLER_B))
-                CHECK(step.opcode_value == OPCODE_B);
-            else if (step.handler_entry_pc == rt_pc(HANDLER_C))
-                CHECK(step.opcode_value == OPCODE_C);
+            uint8_t expected = OPCODE_A + static_cast<uint8_t>(i % 3);
+            CHECK(step.opcode_value == expected);
         }
     }
 
-    SECTION("handler.opcode_values populated correctly") {
-        auto* ha = res.handler_at(rt_pc(HANDLER_A));
-        auto* hb = res.handler_at(rt_pc(HANDLER_B));
-        auto* hc = res.handler_at(rt_pc(HANDLER_C));
-        REQUIRE(ha != nullptr);
-        REQUIRE(hb != nullptr);
-        REQUIRE(hc != nullptr);
-
-        // Each handler should have exactly one unique opcode value
-        REQUIRE(ha->opcode_values.size() == 1);
-        CHECK(ha->opcode_values[0] == OPCODE_A);
-
-        REQUIRE(hb->opcode_values.size() == 1);
-        CHECK(hb->opcode_values[0] == OPCODE_B);
-
-        REQUIRE(hc->opcode_values.size() == 1);
-        CHECK(hc->opcode_values[0] == OPCODE_C);
+    SECTION("hinted handlers exist") {
+        // In the unified model, opcode→handler mapping is not populated
+        // (handler_entry_pc = 0), so we just verify handlers were created
+        // from the handler_entry_pcs hint.
+        CHECK(res.handlers.size() == 3);
+        REQUIRE(res.handler_at(rt_pc(HANDLER_A)) != nullptr);
+        REQUIRE(res.handler_at(rt_pc(HANDLER_B)) != nullptr);
+        REQUIRE(res.handler_at(rt_pc(HANDLER_C)) != nullptr);
     }
 }
 
@@ -668,13 +667,15 @@ TEST_CASE("VMAbstractPass: dispatch type is CallTable for BLR-based dispatch",
     REQUIRE(env != nullptr);
     auto pm = make_pm(*env);
 
-    VMConfig cfg;
+        VMConfig cfg;
     cfg.min_handler_count = 2;
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
     {
         DispatcherHint dh;
         dh.loop_header_pc = rt_pc(HEADER_PC);
         cfg.dispatcher = dh;
     }
+
     pm->register_pass(std::make_unique<XrefPass>());
     pm->register_pass(std::make_unique<CFGPass>());
     pm->register_pass(std::make_unique<LoopPass>());
@@ -684,7 +685,7 @@ TEST_CASE("VMAbstractPass: dispatch type is CallTable for BLR-based dispatch",
     REQUIRE(raw.ok());
     auto& res = raw.get<VMAbstractResult>();
     CHECK(res.dispatcher.dispatch_type == DispatchType::CallTable);
-    CHECK(res.handlers.size() >= 3);
+    CHECK(res.handlers.size() == 3);
     CHECK(res.steps.size() >= 10);
 }
 
@@ -950,6 +951,7 @@ TEST_CASE("VMAbstractPass: handler_names labels are applied",
         dh.loop_header_pc = rt_pc(HEADER_PC);
         cfg.dispatcher = dh;
     }
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
     cfg.handler_names[rt_pc(HANDLER_A)] = "VM_ADD";
     cfg.handler_names[rt_pc(HANDLER_B)] = "VM_XOR";
 
@@ -970,7 +972,7 @@ TEST_CASE("VMAbstractPass: handler_names labels are applied",
     CHECK(hc->label.empty());  // no name provided → empty
 }
 
-TEST_CASE("VMAbstractPass: handler_entry_pcs merges with discovered handlers",
+TEST_CASE("VMAbstractPass: handler_entry_pcs are used as hint-only handler list",
           "[unit][pass][vm_abstract]") {
     auto env = make_vm_trace(12);
     REQUIRE(env != nullptr);
@@ -983,7 +985,7 @@ TEST_CASE("VMAbstractPass: handler_entry_pcs merges with discovered handlers",
         dh.loop_header_pc = rt_pc(HEADER_PC);
         cfg.dispatcher = dh;
     }
-    // Pre-provide one known handler PC + one fictional handler PC
+    // Provide known handler PCs + one fictional handler PC
     cfg.handler_entry_pcs = {rt_pc(HANDLER_A), 0xF000F000ULL};
 
     pm->register_pass(std::make_unique<XrefPass>());
@@ -993,15 +995,16 @@ TEST_CASE("VMAbstractPass: handler_entry_pcs merges with discovered handlers",
 
     auto& res = pm->require("vm_abstract").get<VMAbstractResult>();
 
-    // Should have at least 4 handlers: A, B, C (discovered) + 0xF000F000 (from hint)
-    CHECK(res.handlers.size() >= 4);
+    // In the unified model, handlers are NOT discovered dynamically —
+    // the list is exactly the hinted handler_entry_pcs.
+    CHECK(res.handlers.size() == 2);
 
     // The fictional handler should exist with execution_count == 0
     auto* hf = res.handler_at(0xF000F000ULL);
     REQUIRE(hf != nullptr);
     CHECK(hf->execution_count == 0);
 
-    // Handler A should NOT be duplicated (appears in both hint and discovered)
+    // Handler A should NOT be duplicated
     uint32_t count_a = 0;
     for (const auto& h : res.handlers) {
         if (h.entry_pc == rt_pc(HANDLER_A)) count_a++;
@@ -1120,6 +1123,7 @@ TEST_CASE("VMAbstractPass: hint-driven with explicit indirect_branch_pc",
     dh.loop_header_pc = rt_pc(HEADER_PC);
     dh.indirect_branch_pc = rt_pc(HEADER_PC + 0xC);  // explicit BR PC
     cfg.dispatcher = dh;
+    cfg.handler_entry_pcs = {rt_pc(HANDLER_A), rt_pc(HANDLER_B), rt_pc(HANDLER_C)};
     cfg.min_handler_count = 2;
 
     pm->register_pass(std::make_unique<XrefPass>());
@@ -1129,7 +1133,7 @@ TEST_CASE("VMAbstractPass: hint-driven with explicit indirect_branch_pc",
 
     auto& res = pm->require("vm_abstract").get<VMAbstractResult>();
     CHECK(res.dispatcher.indirect_branch_pc == rt_pc(HEADER_PC + 0xC));
-    CHECK(res.handlers.size() >= 3);
+    CHECK(res.handlers.size() == 3);
     CHECK(res.steps.size() >= 10);
 }
 

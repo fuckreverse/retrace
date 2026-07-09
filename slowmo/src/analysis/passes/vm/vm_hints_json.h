@@ -33,13 +33,22 @@
 // (typically computed at hint-authoring time from an observed heap
 // pointer), so it is passed through unchanged — same as the MCP tool.
 //
+// ── Hard precondition ────────────────────────────────────────────────────────
+// The anchor (single PC, PC set, or memory write) MUST fire exactly once per
+// VM instruction.  If it fires zero or 2+ times for a single VM instruction,
+// steps will be missing or wrongly split, and the pass CANNOT detect this
+// from the trace — there is no handler-entry-PC cross-validation.  Static
+// analysis must guarantee this property.
+//
 // JSON schema (all fields optional):
 //
 //   {
 //     "dispatcher_pc": "0x...", "indirect_branch_pc": "0x...",
 //     "handler_entry_pcs": ["0x...", ...],
-//     "dispatch_type": "WhileSwitch|IndirectBranch|CallTable|ThreadedCode|Trampoline",
-//     "threaded_dispatch_pcs": ["0x...", ...],
+//     "dispatch_type": "WhileSwitch|IndirectBranch|CallTable|ThreadedCode|Trampoline|FetchOnly",
+//     "anchor_pcs": ["0x...", ...],          // PC-set anchor (form b)
+//     "threaded_dispatch_pcs": ["0x...", ...], // Deprecated alias for anchor_pcs
+//     "mem_anchor_addr": "0x...", "mem_anchor_size": 4,  // Memory-write anchor (form c)
 //     "opcode_size": 1, "opcode_byte_offset": 0, "opcode_mask": "0x...",
 //     "opcode_shift": 0, "opcode_from_reg": "x0",
 //     "opcode_deobf_steps": [{"op": "xor", "imm": "0xE0"}, ...],

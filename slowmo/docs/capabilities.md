@@ -173,7 +173,7 @@ profiling
 | ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点（仅 Darwin 目标） |
 | ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑（仅 Darwin 目标） |
 | 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL） |
-| VMP 抽象 | `--vm-abstract`, `vm_abstract` | **需静态分析 hint**（dispatcher_pc 等，来自 IDA/Ghidra）：提取 handler 执行次数、解码 opcode、读取 VM context/寄存器文件/栈快照 |
+| VMP 抽象 | `--vm-abstract`, `vm_abstract` | **需静态分析 hint**（anchor PC/PC集/内存写，来自 IDA/Ghidra）：在每条 VM 指令的 anchor 命中点快照 VM 上下文，派生 handler 执行次数、解码 opcode、读取 VM context/寄存器文件/栈快照 |
 
 典型命令：
 

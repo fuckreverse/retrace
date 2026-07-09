@@ -1219,8 +1219,9 @@ void TenetMcpService::register_pass_tools() {
               {"mem_anchor_size",      {{"type", "integer"}, {"description", "Hint (FetchOnly + mem_anchor_addr): byte width of the write to watch for (1/2/4/8, default 4)."}}},
               {"handler_entry_pcs",    {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: known handler entry PCs (hex array). From IDA jump table analysis."}}},
               // ── Dispatch topology ──
-              {"dispatch_type",        {{"type", "string"},  {"description", "Hint: force dispatch topology: 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'|'FetchOnly'. 'FetchOnly' skips handler/opcode discovery entirely and just snapshots VM state (vm_pc/ctx_fields/vm_registers) once per hit of 'dispatcher_pc' — use when the handler-selection logic itself is too obfuscated to recognize (e.g. a CFF-wrapped opcode-compare tree) but there is still one stable per-VM-instruction 'fetch/loop-back' anchor PC. Default: auto-detect."}}},
-              {"threaded_dispatch_pcs",{{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint (ThreadedCode only): set of runtime fetch/dispatch tail PCs shared by every handler (hex array). E.g. the LDR+BR pair at the end of each handler. Required when dispatch_type='ThreadedCode'."}}},
+              {"dispatch_type",        {{"type", "string"},  {"description", "Hint: dispatch topology label (display only, does NOT select execution path — the pass always uses the unified anchor-based model): 'WhileSwitch'|'IndirectBranch'|'CallTable'|'ThreadedCode'|'Trampoline'|'FetchOnly'. Default: auto-detect from indirect branch encoding."}}},
+              {"anchor_pcs",           {{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint: PC-set anchor — a set of runtime fetch/dispatch PCs where exactly one is hit per VM instruction (hex array). Used for direct-threaded VMs whose fetch+dispatch logic is inlined into every handler. Alternative to dispatcher_pc (single-PC anchor). See DispatcherHint docs."}}},
+              {"threaded_dispatch_pcs",{{"type", "array"},   {"items", {{"type", "string"}}}, {"description", "Hint (deprecated alias for anchor_pcs): set of runtime fetch/dispatch tail PCs shared by every handler (hex array)."}}},
               // ── Opcode format ──
               {"opcode_size",          {{"type", "integer"}, {"description", "Hint: bytes per opcode (1, 2, or 4). Mode A (memory read)."}}},
               {"opcode_byte_offset",   {{"type", "integer"}, {"description", "Hint: byte offset of the opcode field within the instruction word (default 0). E.g. if insn layout is [imm16][opcode8], set opcode_size=1, opcode_byte_offset=2. Mode A only."}}},
@@ -1280,23 +1281,29 @@ void TenetMcpService::register_pass_tools() {
             // dispatcher_pc / indirect_branch_pc: normally both describe a
             // classic loop-based dispatcher (loop_header_pc + the BR/BLR that
             // selects handlers). But indirect_branch_pc is also meaningful on
-            // its own for dispatch_type=ThreadedCode, where there is no real
-            // loop header — it just tells the ThreadedCollector which PC(s)
-            // mark "handler selected, next instruction is the new handler
-            // entry". So construct a DispatcherHint (loop_header_pc left 0)
-            // even when only indirect_branch_pc is present.
+            // its own for PC-set anchors, where it's used for display-label
+            // auto-classification only. So construct a DispatcherHint
+            // (loop_header_pc left 0) even when only indirect_branch_pc is
+            // present.
             {
                 const json* dp  = get_hint("dispatcher_pc");
                 const json* ibp = get_hint("indirect_branch_pc");
                 const json* maa = get_hint("mem_anchor_addr");
                 const json* mas = get_hint("mem_anchor_size");
-                if (dp || ibp || maa) {
+                const json* apc = get_hint("anchor_pcs");
+                if (dp || ibp || maa || apc) {
                     DispatcherHint dh;
                     if (dp)  dh.loop_header_pc     = unrebase(parse_hex(dp->get<std::string>()));
                     if (ibp) dh.indirect_branch_pc = unrebase(parse_hex(ibp->get<std::string>()));
                     // mem_anchor_addr is a runtime address (already has ASLR slide)
                     if (maa) dh.mem_anchor_addr = parse_hex(maa->get<std::string>());
                     if (mas) dh.mem_anchor_size = static_cast<uint8_t>(mas->get<int>());
+                    // PC-set anchor (form b): runtime addresses, rebased.
+                    if (apc) {
+                        for (const auto& pc_str : *apc) {
+                            dh.anchor_pcs.push_back(unrebase(parse_hex(pc_str.get<std::string>())));
+                        }
+                    }
                     cfg.dispatcher = dh;
                 }
             }

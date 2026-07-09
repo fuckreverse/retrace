@@ -53,33 +53,22 @@ enum class VMArchType : uint8_t {
     RegisterMachine, // Operands stored in VM register file (fixed offsets in ctx)
 };
 
+/// Dispatch topology — a **diagnostic label** from static analysis, NOT a
+/// path selector.  The pass always uses the same anchor-based execution model
+/// (see `DispatcherHint`); this enum only records what topology static
+/// analysis identified, for display in the UI and for choosing which anchor
+/// type to supply.  It never branches the execution logic.
 enum class DispatchType : uint8_t {
     Unknown,
-    WhileSwitch,       // Classic while(1){switch(opcode){...}}
-    IndirectBranch,    // Computed BR Xn via jump table
-    CallTable,         // BLR Xn dispatch — handlers return via RET
-    ThreadedCode,      // Handler tail-chains to next handler directly
-    Trampoline,        // Handlers return to a small "next" trampoline
-    FetchOnly,         // No handler/opcode modeling — just snapshot VM state
-                       // once per fetch cycle. Anchored on EITHER:
-                       //   (a) `dispatcher.loop_header_pc` — a single stable
-                       //       PC hit exactly once per VM instruction (via
-                       //       xref), or
-                       //   (b) `dispatcher.mem_anchor_addr` — a memory
-                       //       location written exactly once per VM
-                       //       instruction (via MemoryModel::write_history),
-                       //       for VMs so heavily CFF-obfuscated that NO
-                       //       single PC satisfies (a) (the fetch/PC++ logic
-                       //       is cloned across many code paths, but always
-                       //       targets the same memory field).
-                       // For VMs where the handler dispatch itself is
-                       // obfuscated beyond recognition (e.g. a CFF-wrapped
-                       // binary-search opcode-compare tree with no single
-                       // "handler selected" PC), this sidesteps handler
-                       // discovery entirely and just answers "what does VM
-                       // state look like at each fetch cycle". No loop/CFG
-                       // dependency, no handler classification, no opcode
-                       // decoding required.
+    WhileSwitch,       // Classic while(1){switch(opcode){...}} — anchor: single PC (loop header)
+    IndirectBranch,    // Computed BR Xn via jump table — anchor: single PC (loop header)
+    CallTable,         // BLR Xn dispatch — anchor: single PC (loop header)
+    ThreadedCode,      // Handler tail-chains directly — anchor: PC set (inline fetch PCs) or single PC (shared trampoline)
+    Trampoline,        // Handlers return to a small "next" trampoline — anchor: single PC (trampoline entry)
+    FetchOnly,         // Anchor-only mode: no topology assumption, just snapshot VM state
+                       // at each anchor hit.  Used when the dispatch structure is too
+                       // obfuscated to classify, or when the caller only wants context
+                       // snapshots and doesn't care about handler/opcode attribution.
 };
 
 inline const char* vm_arch_name(VMArchType t) {
@@ -106,34 +95,56 @@ inline const char* dispatch_type_name(DispatchType t) {
 
 // ─── Static hints (from IDA / LLM) ──────────────────────────────────────────
 
-/// Hint about the dispatcher location (from static analysis).
+/// Hint about the dispatcher anchor (from static analysis).
+///
+/// The pass uses a **single unified execution model**: it collects "anchor
+/// inst_ids" — one per VM instruction — and snapshots VM context at each.
+/// The anchor can be one of three forms, determined by which fields are set:
+///
+///   (a) **Single-PC anchor** — `loop_header_pc != 0`:
+///       A single native PC hit exactly once per VM instruction (e.g. the
+///       interpreter loop's back-edge landing point).  Resolved via
+///       `xref.inst_ids_at(loop_header_pc)`.  Covers WhileSwitch,
+///       IndirectBranch, CallTable, Trampoline, and shared-trampoline
+///       ThreadedCode.
+///
+///   (b) **PC-set anchor** — `!anchor_pcs.empty()`:
+///       A set of native PCs where exactly one is hit per VM instruction.
+///       Used for direct-threaded VMs whose fetch+dispatch logic is inlined
+///       into every handler (no single PC is hit every time, but the union
+///       of inline fetch PCs has exactly one hit per VM instruction).
+///       Resolved by merging `xref.inst_ids_at(pc)` for each PC in the set,
+///       then sorting.  `loop_header_pc` (if also set) is implicitly added
+///       to the set.
+///
+///   (c) **Memory-write anchor** — `mem_anchor_addr != 0`:
+///       A memory location written exactly once per VM instruction (e.g. a
+///       VM-PC / instruction-counter field inside the VM context struct).
+///       Used for heavily CFF-obfuscated VMs where the fetch/PC++ logic is
+///       cloned across so many code paths that NO single PC (or small PC
+///       set) is hit exactly once per VM instruction, but the write target
+///       is always the same memory field.  Resolved via
+///       `MemoryModel::write_history()`.
+///
+/// **Hard precondition (all three forms)**: the anchor must fire exactly
+/// once per VM instruction.  If it fires zero or 2+ times for a single VM
+/// instruction, steps will be missing or wrongly split, and the pass
+/// **cannot detect this from the trace** — there is no handler-entry-PC
+/// cross-validation in the unified model.  Static analysis must guarantee
+/// this property; the pass trusts the hint.
+///
+/// `mem_anchor_addr` is a **runtime address** (with ASLR slide applied).
+/// All PC fields are also runtime addresses.
 struct DispatcherHint {
-    uint64_t loop_header_pc = 0;       // PC of the dispatch loop header
-    uint64_t indirect_branch_pc = 0;   // PC of the dispatch BR/BLR instruction (optional)
+    uint64_t loop_header_pc = 0;       // Single-PC anchor (form a); also added to PC-set anchor (form b) if set
+    uint64_t indirect_branch_pc = 0;   // PC of the dispatch BR/BLR (optional, for display-label auto-classification only)
 
-    // ── Memory-write anchor (alternative to loop_header_pc) ──────────────
-    //
-    // Some VMs are obfuscated (e.g. control-flow flattening) to the point
-    // where NO single native PC is hit exactly once per VM instruction: the
-    // "fetch" logic (e.g. `ldr x8,[ctx,#off]; add x8,x8,#1; str x8,[ctx,#off]`)
-    // gets cloned across many CFF-duplicated code paths, so its PC varies
-    // from one VM instruction to the next even though it always targets the
-    // same memory location (e.g. a VM-PC/instruction-counter field inside a
-    // heap-allocated VM context struct).
-    //
-    // When `mem_anchor_addr` is non-zero, VMAbstractPass (in FetchOnly mode)
-    // derives the fetch-cycle inst_id list from `MemoryModel::write_history()`
-    // on this address instead of `xref.inst_ids_at(loop_header_pc)`. This
-    // sidesteps the "no stable anchor PC" problem entirely: the anchor is a
-    // memory location, not code.
-    //
-    // `mem_anchor_addr` is a **runtime address** (with ASLR slide applied),
-    // typically `ctx_base + field_offset` for some fixed field_offset that
-    // is stable across runs (the ctx struct itself may be allocated at a
-    // different heap address each run, but the field offset within it is
-    // stable — resolve mem_anchor_addr at hint-construction time using the
-    // observed runtime ctx_base for THIS trace).
-    uint64_t mem_anchor_addr = 0;
+    /// PC-set anchor (form b).  When non-empty, the pass merges xref hits
+    /// from all PCs in this set (plus `loop_header_pc` if set).
+    std::vector<uint64_t> anchor_pcs;
+
+    // ── Memory-write anchor (form c) ─────────────────────────────────────
+    uint64_t mem_anchor_addr = 0;      // Runtime address written once per VM instruction
     uint8_t  mem_anchor_size = 4;      // Byte width of the write to watch for (1/2/4/8)
 };
 
@@ -337,21 +348,19 @@ struct VMConfig {
     /// from memory-access statistics.
     VMArchType arch_type_hint = VMArchType::Unknown;
 
-    // ── Dispatch topology hints ──────────────────────────────────────────
-    /// Dispatch topology, from static analysis. DispatchType::Unknown means
-    /// the pass falls back to a purely mechanical, non-statistical
-    /// classification for loop-based topologies (CallTable if the dispatch
-    /// instruction is BLR, IndirectBranch otherwise) — see
-    /// `classify_dispatch_type()`. This is NOT a detection heuristic: it
-    /// reads a single already-hinted instruction's encoding, it does not
-    /// search for or score anything.
+    // ── Dispatch topology label ───────────────────────────────────────────
+    /// Dispatch topology, from static analysis.  This is a **display label**
+    /// only — it does NOT select an execution path (the pass always uses the
+    /// unified anchor-based model).  When left at Unknown, the pass attempts
+    /// a purely mechanical auto-classification for single-PC anchors (CallTable
+    /// if the dispatch instruction is BLR, IndirectBranch otherwise) for
+    /// display purposes.  Set it explicitly when you know the topology.
     DispatchType dispatch_type_hint = DispatchType::Unknown;
 
-    /// ThreadedCode: set of "fetch+dispatch" PCs that appear in every handler's
-    /// tail before the BR Xn that chains to the next handler.
-    /// These are the tail-call trampolines or inline fetch sequences.
-    /// When provided together with dispatch_type_hint == ThreadedCode,
-    /// the pass uses a ThreadedCollector instead of VMCollector.
+    /// **Deprecated alias** for `dispatcher->anchor_pcs`.  When non-empty and
+    /// `dispatcher->anchor_pcs` is empty, the pass treats these as anchor PCs
+    /// (merged into the PC-set anchor).  New code should use
+    /// `DispatcherHint::anchor_pcs` directly.
     std::vector<uint64_t> threaded_dispatch_pcs;
 
     // ── Static hints ─────────────────────────────────────────────────────
