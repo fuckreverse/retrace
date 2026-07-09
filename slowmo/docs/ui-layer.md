@@ -92,6 +92,8 @@ flowchart TD
 - 高层结果（比如 CFG、污点、函数列表）通过 `TenetService::run_pass()` 触发，最终委托 `PassManager::require()`。
 - 每个独立窗口自行管理"是否已运行 / 参数是否变化 / 是否需要重跑"的状态，不经过 Analysis 面板的统一列表。
 
+> 每个 pass 的详细作用、对应 GUI 面板的完整使用说明及 TUI 对应，见 [`analysis-layer.md` — Pass 详解与面板使用](analysis-layer.md#pass-详解与面板使用)。
+
 ## TUI
 
 ### 组成
