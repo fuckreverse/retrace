@@ -13,7 +13,7 @@ import type {
   LoopEntry,
   RegTimeline,
 } from '@/types/tenet';
-import { Chip, ConfidenceBar, Input } from '@/components/ui';
+import { Button, Chip, ConfidenceBar, Input } from '@/components/ui';
 import './lists.css';
 
 /* ---------- Constants ---------- */
@@ -236,10 +236,26 @@ export function RegTimelinePanel() {
     navigateTo(Math.max(0, Math.min(total - 1, Math.round(frac * total))));
   };
 
+  const [customReg, setCustomReg] = useState('');
+  const commitCustomReg = () => {
+    const v = customReg.trim().toLowerCase();
+    if (v) setReg(v);
+  };
+
   return (
     <div className="list-panel">
-      <div className="list-toolbar">
+      <div className="list-toolbar" style={{ flexWrap: 'wrap', rowGap: 6 }}>
         {TIMELINE_REGS.map((rn) => <Chip key={rn} active={reg === rn} onClick={() => setReg(rn)}>{rn}</Chip>)}
+        <input
+          className="input mono"
+          style={{ width: 90 }}
+          value={customReg}
+          onChange={(e) => setCustomReg(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && commitCustomReg()}
+          placeholder="自定义 (如 x21/v0)"
+        />
+        <Button variant="default" size="sm" onClick={commitCustomReg} disabled={!customReg.trim()}>Go</Button>
+        <span className="dim">当前：<span className="mono">{reg}</span></span>
         <span className="list-count" style={{ marginLeft: 'auto' }}>{data?.points.length ?? 0} samples</span>
       </div>
       <div className="regtl-canvas-wrap">

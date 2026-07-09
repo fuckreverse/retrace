@@ -14,6 +14,7 @@ import { StatusBar } from './StatusBar';
 import { CenterArea } from './CenterArea';
 import { SidebarLeft } from './SidebarLeft';
 import { SidebarRight } from './SidebarRight';
+import { GotoDialog, SearchDialog } from './GotoSearchDialog';
 import './shell.css';
 
 export function Shell() {
@@ -22,6 +23,12 @@ export function Shell() {
   const navBack = useTraceStore((s) => s.navBack);
   const navForward = useTraceStore((s) => s.navForward);
   const step = useTraceStore((s) => s.step);
+  const openGotoDialog = useTraceStore((s) => s.openGotoDialog);
+  const openSearchDialog = useTraceStore((s) => s.openSearchDialog);
+  const toggleBookmark = useTraceStore((s) => s.toggleBookmark);
+  const navigateTo = useTraceStore((s) => s.navigateTo);
+  const currentInst = useTraceStore((s) => s.currentInst);
+  const totalInst = useTraceStore((s) => s.totalInst);
 
   // 原生菜单事件桥接（仅 Tauri 生效，浏览器 no-op）
   useNativeMenu();
@@ -42,10 +49,15 @@ export function Shell() {
       else if (e.altKey && e.key === 'ArrowRight') { navForward(); e.preventDefault(); }
       else if (e.key === 'ArrowDown' && !e.metaKey) { step(1); e.preventDefault(); }
       else if (e.key === 'ArrowUp' && !e.metaKey) { step(-1); e.preventDefault(); }
+      else if (e.key === 'g' || e.key === 'G') { openGotoDialog(); e.preventDefault(); }
+      else if (e.key === '/') { openSearchDialog(); e.preventDefault(); }
+      else if (e.key === 'b' || e.key === 'B') { toggleBookmark(currentInst); e.preventDefault(); }
+      else if (e.key === 'Home') { navigateTo(0); e.preventDefault(); }
+      else if (e.key === 'End') { navigateTo(Math.max(0, totalInst - 1)); e.preventDefault(); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [navBack, navForward, step]);
+  }, [navBack, navForward, step, openGotoDialog, openSearchDialog, toggleBookmark, currentInst, navigateTo, totalInst]);
 
   if (loading) {
     return (
@@ -69,6 +81,8 @@ export function Shell() {
         </div>
         <Timeline />
         <StatusBar />
+        <GotoDialog />
+        <SearchDialog />
       </div>
     </Tooltip.Provider>
   );

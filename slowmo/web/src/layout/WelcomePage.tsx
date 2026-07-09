@@ -158,6 +158,12 @@ export function WelcomePage() {
   // Sort recent files by last_opened desc
   const sortedRecent = [...recentFiles].sort((a, b) => b.last_opened - a.last_opened);
 
+  // 浏览器环境没有原生文件系统访问能力：Tauri file-drop 事件不会触发，
+  // <input type=file> 拿到的也只是浏览器沙箱内的 File 对象、没有可用的绝对路径，
+  // 后端 open_trace 需要真实文件路径才能 mmap 打开，所以浏览器下这里只能提示、
+  // 不能伪装成"可用"——避免用户拖入文件后不知道为什么卡住。
+  const browserMode = !isTauri();
+
   return (
     <div className="welcome">
       {/* Drag area (also functions as titlebar for window dragging) */}
@@ -174,20 +180,25 @@ export function WelcomePage() {
         <div className="welcome-content">
           {/* Drop zone */}
           <div
-            className={`welcome-drop-zone${dragging ? ' dragging' : ''}`}
-            onDragOver={onDragOver}
-            onDragLeave={onDragLeave}
-            onDrop={onDrop}
+            className={`welcome-drop-zone${dragging ? ' dragging' : ''}${browserMode ? ' browser-mode' : ''}`}
+            onDragOver={browserMode ? undefined : onDragOver}
+            onDragLeave={browserMode ? undefined : onDragLeave}
+            onDrop={browserMode ? undefined : onDrop}
             onClick={onClickOpen}
             role="button"
             tabIndex={0}
             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onClickOpen(); }}
           >
+            {browserMode && <span className="welcome-browser-badge">浏览器模式 · 只读演示</span>}
             <FolderOpenIcon />
-            <button className="welcome-open-btn" type="button" tabIndex={-1}>
+            <button className="welcome-open-btn" type="button" tabIndex={-1} disabled={browserMode}>
               Open Trace…
             </button>
-            <span className="welcome-drop-hint">or drag &amp; drop a .bin file here</span>
+            <span className="welcome-drop-hint">
+              {browserMode
+                ? '浏览器无法访问本地文件系统，打开真实 trace 需运行 Tauri 桌面版'
+                : 'or drag & drop a .bin file here'}
+            </span>
           </div>
 
           {/* Recent traces */}

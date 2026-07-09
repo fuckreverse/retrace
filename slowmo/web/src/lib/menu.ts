@@ -153,8 +153,8 @@ export const MENU_BAR: TopMenu[] = [
     id: 'navigate',
     label: 'Navigate',
     items: [
-      item('nav_goto', 'Go to Instruction…', 'G', true),
-      item('nav_search', 'Search…', '/', true),
+      item('nav_goto', 'Go to Instruction…', 'G'),
+      item('nav_search', 'Search…', '/'),
       sep,
       item('nav_back', 'Back', 'Alt+←'),
       item('nav_forward', 'Forward', 'Alt+→'),

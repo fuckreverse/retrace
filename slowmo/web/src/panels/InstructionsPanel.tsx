@@ -39,6 +39,7 @@ export function InstructionsPanel() {
   const [viewH, setViewH] = useState(600);
   const [rows, setRows] = useState<Map<number, InstRow>>(new Map());
   const [searchInput, setSearchInput] = useState('');
+  const [taintBusy, setTaintBusy] = useState<number | null>(null);
 
   const searchSet = new Set(searchResults);
 
@@ -90,21 +91,21 @@ export function InstructionsPanel() {
     }
   }, [cur]);
 
-  const doSearch = useCallback(() => {
-    const q = searchInput.trim().toLowerCase();
+  const [searching, setSearching] = useState(false);
+
+  const doSearch = useCallback(async () => {
+    const q = searchInput.trim();
     if (!q) { clearSearch(); return; }
-    // mock: 简单在已加载的行里找 mnemonic/operands 匹配, 并散布若干命中
-    const hits: number[] = [];
-    for (const [id, r] of rows) {
-      if (`${r.mnemonic} ${r.operands}`.toLowerCase().includes(q)) hits.push(id);
+    setSearching(true);
+    try {
+      // 真实调用后端 SearchForward（对齐 GUI Search 弹窗语义：从当前游标开始
+      // 正向线性扫描反汇编文本，子串匹配 mnemonic+operands）。
+      const hits = await api.searchForward(q, 0);
+      setSearch(q, hits);
+    } finally {
+      setSearching(false);
     }
-    // 兜底: 若无命中，按 hash 散布
-    if (hits.length === 0) {
-      for (let i = 0; i < total; i += Math.max(1, Math.floor(total / 60))) hits.push(i);
-    }
-    hits.sort((a, b) => a - b);
-    setSearch(q, hits.slice(0, 200));
-  }, [searchInput, rows, total, clearSearch, setSearch]);
+  }, [searchInput, clearSearch, setSearch]);
 
   const rowClass = (id: number) => {
     if (id === cur) return 'inst-cur';
@@ -114,6 +115,17 @@ export function InstructionsPanel() {
     if (searchSet.has(id)) return 'inst-search';
     return '';
   };
+
+  /** 右键 "Taint Forward (x0)"：真实调用后端 taint_forward pass，从该指令处 x0 寄存器开始正向污点传播 */
+  const runTaintForward = useCallback(async (instId: number) => {
+    setTaintBusy(instId);
+    try {
+      const steps = await api.taintForward(0 /* x0 */, instId);
+      setTaintFwd(steps.map((s) => s.inst_id));
+    } finally {
+      setTaintBusy(null);
+    }
+  }, [setTaintFwd]);
 
   const visible: number[] = [];
   for (let i = first; i < last; i++) visible.push(i);
@@ -142,6 +154,8 @@ export function InstructionsPanel() {
           </div>
         )}
         <span className="inst-bm dim">★ {bookmarks.size}</span>
+        {searching && <span className="dim mono" style={{ marginLeft: 8 }}>搜索中…</span>}
+        {taintBusy != null && <span className="dim mono" style={{ marginLeft: 8 }}>污点分析中…</span>}
       </div>
 
       <div
@@ -163,7 +177,7 @@ export function InstructionsPanel() {
                 onClick={() => navigateTo(id)}
                 onBookmark={() => toggleBookmark(id)}
                 onHex={() => row && setHexAddr(row.pc)}
-                onTaint={() => setTaintFwd(mockTaintIds(id, total))}
+                onTaint={() => runTaintForward(id)}
               />
             );
           })}
@@ -171,17 +185,6 @@ export function InstructionsPanel() {
       </div>
     </div>
   );
-}
-
-function mockTaintIds(start: number, total: number): number[] {
-  const ids: number[] = [];
-  let c = start;
-  for (let i = 0; i < 40; i++) {
-    c += 1 + Math.floor(Math.random() * 40);
-    if (c >= total) break;
-    ids.push(c);
-  }
-  return ids;
 }
 
 function InstRowView({

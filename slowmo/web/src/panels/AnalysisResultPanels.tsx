@@ -2,13 +2,15 @@
  * 分析结果类面板集合 —— Patterns / Strings / ObjC / CallGraph。
  * 均为"表格 + 过滤 + 点击 inst_id 跳转"的统一交互范式。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { CallGraphResult, ObjcMessage, PatternMatch, StringEntry } from '@/types/tenet';
-import { Chip, ConfidenceBar, Input } from '@/components/ui';
+import { Button, Chip, ConfidenceBar, IconButton, Input } from '@/components/ui';
+import { Icon } from '@/components/icons';
 import './lists.css';
+import './cfg.css';
 
 function categoryTone(cat: string): 'accent' | 'danger' | 'warning' | 'default' {
   if (cat === 'Crypto') return 'accent';
@@ -133,38 +135,211 @@ export function ObjcPanel() {
 }
 
 /* ---------- Call Graph ---------- */
+const CG_NODE_W = 150;
+const CG_NODE_H = 36;
+const CG_COL_GAP = 80;
+const CG_ROW_GAP = 16;
+
+interface CgLayoutNode {
+  pc: string;
+  name: string;
+  is_root: boolean;
+  calls_made: number;
+  calls_received: number;
+  x: number;
+  y: number;
+}
+
+/** 简单分层布局：从 root 节点 BFS 分层，未被 root 触达的节点归入末层。列=深度，行=同层顺序 */
+function layoutCallGraph(data: CallGraphResult): { nodes: CgLayoutNode[]; width: number; height: number } {
+  const outAdj = new Map<string, string[]>();
+  for (const e of data.edges) {
+    if (!outAdj.has(e.caller)) outAdj.set(e.caller, []);
+    outAdj.get(e.caller)!.push(e.callee);
+  }
+  const depth = new Map<string, number>();
+  const roots = data.nodes.filter((n) => n.is_root);
+  const queue: string[] = [];
+  for (const r of roots) { depth.set(r.pc, 0); queue.push(r.pc); }
+  if (queue.length === 0 && data.nodes.length > 0) {
+    // 没有显式 root：退化为最高 calls_received 作为根，避免全部落在同一层
+    const fallback = [...data.nodes].sort((a, b) => b.calls_received - a.calls_received)[0];
+    depth.set(fallback.pc, 0);
+    queue.push(fallback.pc);
+  }
+  let qi = 0;
+  while (qi < queue.length) {
+    const cur = queue[qi++];
+    const d = depth.get(cur)!;
+    for (const next of outAdj.get(cur) ?? []) {
+      if (!depth.has(next)) { depth.set(next, d + 1); queue.push(next); }
+    }
+  }
+  const maxKnownDepth = Math.max(0, ...Array.from(depth.values()));
+  const byDepth = new Map<number, CallGraphResult['nodes']>();
+  for (const n of data.nodes) {
+    const d = depth.get(n.pc) ?? maxKnownDepth + 1; // 未触达节点统一放最后一列
+    if (!byDepth.has(d)) byDepth.set(d, []);
+    byDepth.get(d)!.push(n);
+  }
+  const nodes: CgLayoutNode[] = [];
+  let maxRows = 0;
+  const depths = Array.from(byDepth.keys()).sort((a, b) => a - b);
+  for (const d of depths) {
+    const col = byDepth.get(d)!.sort((a, b) => b.calls_received - a.calls_received);
+    maxRows = Math.max(maxRows, col.length);
+    col.forEach((n, row) => {
+      nodes.push({
+        ...n,
+        x: 20 + d * (CG_NODE_W + CG_COL_GAP),
+        y: 20 + row * (CG_NODE_H + CG_ROW_GAP),
+      });
+    });
+  }
+  const width = 40 + (depths.length || 1) * (CG_NODE_W + CG_COL_GAP);
+  const height = 40 + maxRows * (CG_NODE_H + CG_ROW_GAP);
+  return { nodes, width, height };
+}
+
+type CgView = 'graph' | 'table';
+
 export function CallGraphPanel() {
   const [data, setData] = useState<CallGraphResult | null>(null);
+  const [view, setView] = useState<CgView>('graph');
+  const [selected, setSelected] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 20, y: 10 });
+  const dragRef = useRef<{ x: number; y: number } | null>(null);
   const navigateTo = useTraceStore((s) => s.navigateTo);
 
   useEffect(() => { api.callGraph().then(setData); }, []);
-  if (!data) return null;
+
+  const layout = useMemo(() => (data ? layoutCallGraph(data) : null), [data]);
+  const nodeByPc = useMemo(() => new Map(layout?.nodes.map((n) => [n.pc, n])), [layout]);
+
+  if (!data || !layout) return <div className="empty-state">正在加载调用图…</div>;
 
   const nameOf = (pc: string) => data.nodes.find((n) => n.pc === pc)?.name ?? pc;
   const hot = [...data.nodes].sort((a, b) => b.calls_received - a.calls_received).slice(0, 50);
+  const maxCalls = Math.max(1, ...data.nodes.map((n) => n.calls_received));
+
+  const gotoFunc = async (pc: string) => {
+    const xref = await api.xref(pc);
+    if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]);
+  };
+
+  const onWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    setZoom((z) => Math.min(4, Math.max(0.15, z - e.deltaY * 0.001)));
+  };
+  const onDown = (e: React.MouseEvent) => { dragRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; };
+  const onMove = (e: React.MouseEvent) => {
+    if (dragRef.current) setPan({ x: e.clientX - dragRef.current.x, y: e.clientY - dragRef.current.y });
+  };
+  const onUp = () => { dragRef.current = null; };
 
   return (
-    <div className="list-panel">
-      <div className="list-toolbar">
-        <span className="list-count">Hot Callees · {data.nodes.length} nodes / {data.edges.length} edges</span>
+    <div className="cfg-panel">
+      <div className="cfg-toolbar">
+        <Chip active={view === 'graph'} onClick={() => setView('graph')}>Graph</Chip>
+        <Chip active={view === 'table'} onClick={() => setView('table')}>Table</Chip>
+        {view === 'graph' && (
+          <>
+            <div className="toolbar-sep" />
+            <IconButton title="放大" onClick={() => setZoom((z) => Math.min(4, z + 0.2))}><Icon.Forward /></IconButton>
+            <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>
+            <IconButton title="缩小" onClick={() => setZoom((z) => Math.max(0.15, z - 0.2))}><Icon.Back /></IconButton>
+            <Button size="sm" variant="ghost" onClick={() => { setZoom(1); setPan({ x: 20, y: 10 }); }}>Reset View</Button>
+          </>
+        )}
+        <span className="dim" style={{ marginLeft: 'auto' }}>{data.nodes.length} nodes · {data.edges.length} edges</span>
       </div>
-      <div className="list-scroll">
-        <table className="data-table">
-          <thead><tr><th>Function</th><th style={{ width: 90 }}>Received</th><th style={{ width: 80 }}>Made</th></tr></thead>
-          <tbody>
-            {hot.map((n) => (
-              <tr key={n.pc} onClick={() => navigateTo(0)}>
-                <td className={clsx('mono', n.name.startsWith('-[') && 'objc-name')}>
-                  {n.is_root && <span className="cat-tag cat-accent" style={{ marginRight: 6 }}>root</span>}
-                  {nameOf(n.pc)}
-                </td>
-                <td className="mono num">{n.calls_received}</td>
-                <td className="mono num dim">{n.calls_made}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {view === 'table' ? (
+        <div className="list-scroll">
+          <table className="data-table">
+            <thead><tr><th>Function</th><th style={{ width: 90 }}>Received</th><th style={{ width: 80 }}>Made</th></tr></thead>
+            <tbody>
+              {hot.map((n) => (
+                <tr key={n.pc} onClick={() => void gotoFunc(n.pc)}>
+                  <td className={clsx('mono', n.name.startsWith('-[') && 'objc-name')}>
+                    {n.is_root && <span className="cat-tag cat-accent" style={{ marginRight: 6 }}>root</span>}
+                    {nameOf(n.pc)}
+                  </td>
+                  <td className="mono num">{n.calls_received}</td>
+                  <td className="mono num dim">{n.calls_made}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div
+          className="cfg-canvas"
+          onWheel={onWheel}
+          onMouseDown={onDown}
+          onMouseMove={onMove}
+          onMouseUp={onUp}
+          onMouseLeave={onUp}
+        >
+          <svg width="100%" height="100%">
+            <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
+              <defs>
+                <marker id="cg-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0 0L8 4L0 8z" fill="var(--border-strong)" />
+                </marker>
+              </defs>
+              {data.edges.map((e, i) => {
+                const a = nodeByPc.get(e.caller);
+                const b = nodeByPc.get(e.callee);
+                if (!a || !b) return null;
+                const x1 = a.x + CG_NODE_W, y1 = a.y + CG_NODE_H / 2;
+                const x2 = b.x, y2 = b.y + CG_NODE_H / 2;
+                const mx = (x1 + x2) / 2;
+                const highlighted = selected === e.caller || selected === e.callee;
+                return (
+                  <path
+                    key={i}
+                    d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
+                    fill="none"
+                    stroke={highlighted ? 'var(--accent)' : 'var(--border-strong)'}
+                    strokeWidth={highlighted ? 2 : Math.min(3, 1 + (e.call_count ?? 1) / 200)}
+                    opacity={highlighted ? 0.9 : 0.5}
+                    markerEnd="url(#cg-arrow)"
+                  />
+                );
+              })}
+              {layout.nodes.map((n) => {
+                const heat = n.calls_received / maxCalls;
+                const isSel = selected === n.pc;
+                return (
+                  <g
+                    key={n.pc}
+                    className="df-node"
+                    transform={`translate(${n.x},${n.y})`}
+                    onClick={(ev) => { ev.stopPropagation(); setSelected(n.pc); void gotoFunc(n.pc); }}
+                  >
+                    <rect
+                      width={CG_NODE_W}
+                      height={CG_NODE_H}
+                      rx={8}
+                      fill="var(--bg-elevated)"
+                      stroke={isSel ? 'var(--accent)' : n.is_root ? 'var(--success)' : 'var(--border-strong)'}
+                      strokeWidth={isSel || n.is_root ? 2 : 1}
+                    />
+                    <rect width={Math.max(2, CG_NODE_W * heat)} height={3} y={CG_NODE_H - 3} fill="var(--accent)" opacity={0.6} />
+                    <text x={8} y={16} className={clsx('df-node-label', n.name.startsWith('-[') && 'objc-name')}>
+                      {n.name.length > 20 ? n.name.slice(0, 20) + '…' : n.name}
+                    </text>
+                    <text x={8} y={30} className="df-node-inst" textAnchor="start">
+                      recv {n.calls_received} · made {n.calls_made}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        </div>
+      )}
     </div>
   );
 }

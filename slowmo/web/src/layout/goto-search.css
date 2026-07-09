@@ -1,0 +1,151 @@
+/* ================================================================== */
+/*  GotoDialog / SearchDialog — 对齐 GUI popups.cpp 的轻量输入弹窗       */
+/* ================================================================== */
+
+.gs-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 300;
+  animation: gs-overlay-in 0.15s var(--ease);
+}
+
+@keyframes gs-overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.gs-dialog {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 14vh;
+  z-index: 301;
+}
+
+.gs-card {
+  width: 480px;
+  max-width: 92vw;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-6);
+  animation: gs-card-in 0.18s var(--ease);
+}
+
+@keyframes gs-card-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.gs-title {
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+}
+
+.gs-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-3);
+}
+
+.gs-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+.gs-input:focus {
+  border-color: var(--accent-border);
+}
+
+.gs-list {
+  margin-top: var(--space-3);
+  max-height: 260px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-2);
+}
+
+.gs-list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.gs-list-item:hover,
+.gs-list-item.selected {
+  background: var(--bg-hover);
+}
+
+.gs-list-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  color: var(--text-primary);
+}
+
+.gs-list-pc {
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
+}
+
+.gs-list-calls {
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
+  width: 70px;
+  text-align: right;
+}
+
+.gs-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.gs-btn {
+  height: 28px;
+  padding: 0 var(--space-5);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+}
+
+.gs-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.gs-btn-primary {
+  color: #fff;
+  background: var(--accent);
+  border: none;
+}
+
+.gs-btn-primary:hover { background: var(--accent-hover); }
+.gs-btn-primary:disabled { opacity: 0.6; cursor: default; }
+
+.gs-key-hint {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+}

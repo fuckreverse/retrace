@@ -135,6 +135,12 @@ export function runMenuAction(id: string): void {
       if (isTauri()) return; // 交给系统预定义项处理（此分支一般不会触发）
       window.close();
       return;
+    case 'nav_goto':
+      trace.openGotoDialog();
+      return;
+    case 'nav_search':
+      trace.openSearchDialog();
+      return;
     case 'nav_back':
       trace.navBack();
       return;

@@ -159,6 +159,32 @@ export const api = {
   },
 
   /**
+   * 真正触发后端运行一个 pass（阻塞式：RunPassReq 在事件循环上同步执行，
+   * 响应返回时 pass 已完成或失败）。WS 不可用时在 mock 模式下本地模拟。
+   */
+  async runPass(name: string): Promise<{ ok: boolean; message: string }> {
+    if (wsUnavailable) return mock.mockRunPass(name);
+    try {
+      const res = await ws.wsRunPass(name);
+      dataSource = 'live';
+      return res;
+    } catch (e) {
+      if (!wsTransport().isEverConnected()) wsUnavailable = true;
+      return { ok: false, message: e instanceof Error ? e.message : String(e) };
+    }
+  },
+
+  /** 清空全部分析结果（对齐 GUI "Clear All Analysis"），失败静默忽略 */
+  async clearAnalysis(): Promise<void> {
+    if (wsUnavailable) return;
+    try {
+      await ws.wsClearAnalysis();
+    } catch {
+      /* best-effort */
+    }
+  },
+
+  /**
    * 通知后端导航到指定指令（用于跨客户端 / 与 GUI 状态同步）。
    * 仅在 WS 可用时生效；失败静默忽略（前端本地状态已更新）。
    */
@@ -175,6 +201,23 @@ export const api = {
   onServerNavigation(cb: (instId: number) => void): () => void {
     if (wsUnavailable) return () => {};
     return ws.onServerNavigation(cb);
+  },
+
+  /**
+   * 正向线性搜索反汇编文本（对齐 GUI Search 弹窗：子串匹配 mnemonic+operands）。
+   * 服务端从 fromInst 开始扫描，同步阻塞直到扫完（后端限流，见 TenetService::search_forward）。
+   */
+  async searchForward(query: string, fromInst: number): Promise<number[]> {
+    return route(() => ws.wsSearchForward(query, fromInst), () => mock.mockSearchForward(query, fromInst));
+  },
+
+  /** 服务端持久书签：跨客户端/GUI 同步，而非纯前端本地 Set */
+  async toggleBookmark(instId: number): Promise<number[]> {
+    return route(() => ws.wsToggleBookmark(instId), () => mock.mockToggleBookmark(instId));
+  },
+
+  async getBookmarks(): Promise<number[]> {
+    return route(() => ws.wsGetBookmarks(), () => mock.mockGetBookmarks());
   },
 
   // ─── 通用分析通道：wsRunAnalysis(后端工具名, 参数) ──────────────────────
@@ -197,11 +240,41 @@ export const api = {
     );
   },
 
+  /**
+   * 导出控制流图（对齐后端 cfg_export，见 mcp_tools_core.cpp register_graph_tools）。
+   * blocks[].executions / disasm 与 edges[].kind / taken_count 均为可选：
+   * 大 CFG（>500 blocks）时后端会跳过 disasm 反汇编预览以控制 payload 体积。
+   */
   async cfg(): Promise<CfgResult> {
     return analysis<CfgResult>(
       'cfg_export',
       { format: 'json' },
-      (raw) => raw as CfgResult,
+      (raw) => {
+        const r = raw as Record<string, unknown>;
+        const blocks = arr<Record<string, unknown>>(r, 'blocks').map((b) => ({
+          pc: String(b.pc ?? ''),
+          x: Number(b.x ?? 0),
+          y: Number(b.y ?? 0),
+          width: Number(b.width ?? 0),
+          height: Number(b.height ?? 0),
+          executions: b.executions != null ? Number(b.executions) : undefined,
+          disasm: Array.isArray(b.disasm) ? b.disasm as string[] : undefined,
+        }));
+        const edges = arr<Record<string, unknown>>(r, 'edges').map((e) => ({
+          from: String(e.from ?? ''),
+          to: String(e.to ?? ''),
+          arrow: typeof e.arrow === 'string' ? e.arrow : undefined,
+          kind: e.kind === 'fallthrough' ? 'fallthrough' as const : e.kind === 'branch' ? 'branch' as const : undefined,
+          taken_count: e.taken_count != null ? Number(e.taken_count) : undefined,
+        }));
+        return {
+          format: String(r.format ?? 'json'),
+          blocks,
+          edges,
+          canvas_width: r.canvas_width != null ? Number(r.canvas_width) : undefined,
+          canvas_height: r.canvas_height != null ? Number(r.canvas_height) : undefined,
+        };
+      },
       () => mock.mockCfg(),
     );
   },
@@ -288,12 +361,42 @@ export const api = {
     );
   },
 
-  async memSearch(query: string): Promise<MemSearchHit[]> {
+  /**
+   * 内存/寄存器/立即数搜索，对齐后端 mem_search 工具真实参数（见
+   * mcp_tools_analysis.cpp register_search_tools）：
+   *   - mode='pattern': hex_pattern（空格分隔字节，'??' 为通配符）或 text（ASCII 子串）
+   *   - mode='exact':   exact_value（十六进制或十进制标量，如 crypto IV / 指针）
+   *   - searchRegisters: 同时扫描寄存器差异（search_registers）
+   *   - searchImmediates: 同时扫描 MOVZ/MOVK 立即数（仅对 exact 模式生效，search_immediates）
+   */
+  async memSearch(opts: {
+    mode: 'pattern' | 'exact';
+    pattern?: string;
+    isText?: boolean;
+    exactValue?: string;
+    searchRegisters?: boolean;
+    searchImmediates?: boolean;
+  }): Promise<MemSearchHit[]> {
+    const params: Record<string, unknown> = {};
+    if (opts.mode === 'pattern' && opts.pattern) {
+      if (opts.isText) params.text = opts.pattern;
+      else params.hex_pattern = opts.pattern;
+    } else if (opts.mode === 'exact' && opts.exactValue) {
+      params.exact_value = opts.exactValue;
+    }
+    if (opts.searchRegisters) params.search_registers = true;
+    if (opts.searchImmediates) params.search_immediates = true;
     return analysis<MemSearchHit[]>(
       'mem_search',
-      { query },
-      (raw) => arr<MemSearchHit>(raw, 'hits'),
-      () => mock.mockMemSearch(query),
+      params,
+      (raw) => arr<Record<string, unknown>>(raw, 'hits').map((h): MemSearchHit => ({
+        addr: String(h.addr ?? ''),
+        inst_id: Number(h.inst_id ?? 0),
+        match_type: h.source === 'mem_write' ? 'write' : 'read',
+        value: String(h.matched_value ?? h.addr ?? ''),
+        context: String(h.source ?? ''),
+      })),
+      () => mock.mockMemSearch(opts.pattern ?? opts.exactValue ?? ''),
     );
   },
 
@@ -315,11 +418,24 @@ export const api = {
     );
   },
 
-  async yara(): Promise<YaraMatch[]> {
+  /** 对齐后端 yara_mem_scan 可选参数（见 mcp_tools_analysis.cpp），全部留空即用默认内置规则全量扫描 */
+  async yara(opts?: { rulesDir?: string; minEntropy?: number; scanCode?: boolean; minWritesPerPage?: number }): Promise<YaraMatch[]> {
+    const params: Record<string, unknown> = {};
+    if (opts?.rulesDir) params.rules_dir = opts.rulesDir;
+    if (opts?.minEntropy != null) params.min_entropy = opts.minEntropy;
+    if (opts?.scanCode != null) params.scan_code = opts.scanCode;
+    if (opts?.minWritesPerPage != null) params.min_writes_per_page = opts.minWritesPerPage;
     return analysis<YaraMatch[]>(
       'yara_mem_scan',
-      {},
-      (raw) => arr<YaraMatch>(raw, 'matches'),
+      params,
+      (raw) => arr<Record<string, unknown>>(raw, 'matches').map((m): YaraMatch => ({
+        rule: String(m.rule_name ?? ''),
+        namespace: String(m.category ?? ''),
+        tags: Array.isArray(m.tags) ? m.tags as string[] : [],
+        addr: String(m.addr ?? ''),
+        inst_id: Number(m.inst_id ?? 0),
+        strings_matched: Number(m.strings_matched ?? 0),
+      })),
       () => mock.mockYara(),
     );
   },
@@ -328,7 +444,21 @@ export const api = {
     return analysis<WindowStat[]>(
       'window_stats',
       {},
-      (raw) => arr<WindowStat>(raw, 'windows'),
+      // 后端字段名（start/end/instruction_count/mem_read_count/...）与前端展示字段不同，需显式映射
+      (raw) => arr<Record<string, unknown>>(raw, 'windows').map((w): WindowStat => {
+        const topMnem = Array.isArray(w.top_mnemonics) ? w.top_mnemonics as Array<{ mnemonic?: string }> : [];
+        return {
+          window_start: Number(w.start ?? 0),
+          window_end: Number(w.end ?? 0),
+          inst_count: Number(w.instruction_count ?? 0),
+          mem_reads: Number(w.mem_read_count ?? 0),
+          mem_writes: Number(w.mem_write_count ?? 0),
+          branch_density: Number(w.branch_density ?? 0),
+          unique_pcs: Number(w.unique_pcs ?? 0),
+          mnemonic_entropy: Number(w.mnemonic_entropy ?? 0),
+          dominant_mnemonic: topMnem[0]?.mnemonic ?? '',
+        };
+      }),
       () => mock.mockWindowStats(),
     );
   },
@@ -342,11 +472,30 @@ export const api = {
     );
   },
 
-  async traceDiff(): Promise<DiffEntry[]> {
+  /**
+   * 比较两段指令区间的寄存器/内存差异（对齐后端 trace_diff 必填参数）。
+   * rangeA/rangeB 均为 [start, end) inst_id 区间；traceBPath 可选，指向另一份
+   * trace 文件做跨文件比较，留空则在同一份 trace 内比较两段。
+   */
+  async traceDiff(rangeA: [number, number], rangeB: [number, number], traceBPath?: string): Promise<DiffEntry[]> {
+    const params: Record<string, unknown> = {
+      range_a_start: rangeA[0],
+      range_a_end: rangeA[1],
+      range_b_start: rangeB[0],
+      range_b_end: rangeB[1],
+    };
+    if (traceBPath) params.trace_b_path = traceBPath;
     return analysis<DiffEntry[]>(
       'trace_diff',
-      {},
-      (raw) => arr<DiffEntry>(raw, 'diffs'),
+      params,
+      // 后端返回 segments[]（divergence 段），映射为前端 DiffEntry 展示形状
+      (raw) => arr<Record<string, unknown>>(raw, 'segments').map((s): DiffEntry => ({
+        inst_id: Number(s.start_inst_a ?? 0),
+        kind: s.resynced ? 'changed' : 'removed',
+        left: `#${s.start_inst_a} @ ${s.start_pc}`,
+        right: s.resynced ? `resync #${s.resync_inst_b} @ ${s.resync_pc}` : `#${s.start_inst_b}`,
+        note: String(s.detail ?? s.type ?? ''),
+      })),
       () => mock.mockTraceDiff(),
     );
   },
@@ -387,11 +536,41 @@ export const api = {
     );
   },
 
-  async vmHandlers(): Promise<VmHandler[]> {
+  /**
+   * VM 去虚拟化（对齐后端 vm_abstract 静态分析 hint 参数，见 mcp_tools_analysis.cpp）。
+   * 后端要求至少提供一个静态 hint（dispatcher_pc / indirect_branch_pc / mem_anchor_addr
+   * / hints_file），否则直接报错——本工具不做无提示的自动结构发现。
+   */
+  async vmHandlers(hints?: {
+    dispatcherPc?: string;
+    indirectBranchPc?: string;
+    memAnchorAddr?: string;
+    dispatchType?: string;
+    vmPcReg?: string;
+    opcodeSize?: number;
+    forceRerun?: boolean;
+  }): Promise<VmHandler[]> {
+    const params: Record<string, unknown> = {};
+    if (hints?.dispatcherPc) params.dispatcher_pc = hints.dispatcherPc;
+    if (hints?.indirectBranchPc) params.indirect_branch_pc = hints.indirectBranchPc;
+    if (hints?.memAnchorAddr) params.mem_anchor_addr = hints.memAnchorAddr;
+    if (hints?.dispatchType) params.dispatch_type = hints.dispatchType;
+    if (hints?.vmPcReg) params.vm_pc_reg = hints.vmPcReg;
+    if (hints?.opcodeSize) params.opcode_size = hints.opcodeSize;
+    if (hints?.forceRerun) params.force_rerun = true;
     return analysis<VmHandler[]>(
       'vm_abstract',
-      {},
-      (raw) => arr<VmHandler>(raw, 'handlers'),
+      params,
+      (raw) => arr<Record<string, unknown>>(raw, 'handlers').map((h, i): VmHandler => {
+        const opcodes = Array.isArray(h.opcode_values) ? h.opcode_values as string[] : [];
+        return {
+          id: i,
+          handler_pc: String(h.entry_pc ?? ''),
+          opcode: opcodes[0] ?? '?',
+          semantics: String(h.label ?? ''),
+          hit_count: Number(h.execution_count ?? 0),
+        };
+      }),
       () => mock.mockVmHandlers(),
     );
   },

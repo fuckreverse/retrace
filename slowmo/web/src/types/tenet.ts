@@ -299,16 +299,21 @@ export interface YaraMatch {
   strings_matched: number;
 }
 
-/** window_stats —— 指令窗口统计 */
+/** window_stats —— 指令窗口统计（字段对齐后端 mcp_tools_analysis.cpp window_stats 输出） */
 export interface WindowStat {
-  window_start: number;
-  window_end: number;
-  inst_count: number;
-  mem_reads: number;
-  mem_writes: number;
-  branches: number;
-  calls: number;
-  dominant_func: string;
+window_start: number;
+window_end: number;
+inst_count: number;
+mem_reads: number;
+mem_writes: number;
+/** 分支密度 0..1（branches / instruction_count），非计数值 */
+branch_density: number;
+/** 窗口内唯一 PC 数（指令多样性） */
+unique_pcs: number;
+/** 助记符分布的香农熵（越高越分散） */
+mnemonic_entropy: number;
+/** Top mnemonic（按出现次数排序，取第一个作为"主导指令"展示） */
+dominant_mnemonic: string;
 }
 
 /** trace_fold —— 折叠/去重后的执行段(循环/重复块压缩) */

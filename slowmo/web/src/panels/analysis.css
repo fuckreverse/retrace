@@ -70,6 +70,15 @@
   background: var(--accent);
   transition: width 0.2s var(--ease);
 }
+/* 不确定态进度条：协议是同步阻塞式的，没有中途百分比，只能展示"正在跑" */
+.pass-progress-indeterminate {
+  width: 40% !important;
+  animation: pass-indeterminate 1.1s ease-in-out infinite;
+}
+@keyframes pass-indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
 .pass-ctrl { flex-shrink: 0; display: flex; align-items: center; }
 .pass-btn {
   width: 26px; height: 26px;

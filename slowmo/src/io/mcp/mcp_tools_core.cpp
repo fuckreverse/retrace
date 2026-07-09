@@ -606,19 +606,80 @@ void TenetMcpService::register_graph_tools() {
             if (format == "dot") {
                 return {{"format", "dot"}, {"dot", layout.dot_annotated}};
             }
+
+            // Pull execution counts / instruction PCs / edge kind from the
+            // underlying CFGResult (cfg_layout only carries geometry).
+            const auto& cfg_raw = require_pass_nb(pm_, "cfg");
+            const CFGResult* cfg = (cfg_raw.ok()) ? &cfg_raw.get<CFGResult>() : nullptr;
+
+            // Cap per-block disassembly preview: large CFGs would otherwise
+            // produce a huge JSON payload just for text nobody scrolls to.
+            constexpr size_t kMaxDisasmLines = 24;
+            constexpr size_t kMaxBlocksForDisasm = 500;
+            bool emit_disasm = cfg && cfg->blocks.size() <= kMaxBlocksForDisasm;
+
+            static const char* kArrowNames[] = {"down", "left", "up", "right", "none"};
+            auto arrow_name = [](GraphEdge::ArrowDirection a) -> const char* {
+                auto idx = static_cast<size_t>(a);
+                return idx < 5 ? kArrowNames[idx] : "down";
+            };
+
             json blocks = json::array();
             for (const auto& [pc, bl] : layout.block_layouts) {
-                blocks.push_back({{"pc", fmt::format("0x{:X}", rebase(pc))},
-                                  {"x", bl.x}, {"y", bl.y},
-                                  {"width", bl.width}, {"height", bl.height}});
+                json block = {{"pc", fmt::format("0x{:X}", rebase(pc))},
+                              {"x", bl.x}, {"y", bl.y},
+                              {"width", bl.width}, {"height", bl.height}};
+
+                if (cfg) {
+                    auto it = cfg->blocks.find(pc);
+                    if (it != cfg->blocks.end()) {
+                        const auto& blk = it->second;
+                        block["executions"] = blk.execution_count;
+                        if (emit_disasm && code_table_ && decoder_) {
+                            json disasm = json::array();
+                            size_t n = 0;
+                            for (uint64_t insn_pc : blk.instructions) {
+                                if (n++ >= kMaxDisasmLines) break;
+                                auto opcode = code_table_->opcode_at(insn_pc);
+                                std::string line;
+                                if (opcode) {
+                                    auto d = decoder_->decode(insn_pc, *opcode);
+                                    if (d) {
+                                        line = fmt::format("0x{:x}  {} {}", rebase(insn_pc), d->mnemonic, d->op_str);
+                                    } else {
+                                        line = fmt::format("0x{:x}  .word 0x{:08x}", rebase(insn_pc), *opcode);
+                                    }
+                                } else {
+                                    line = fmt::format("0x{:x}  <no code>", rebase(insn_pc));
+                                }
+                                disasm.push_back(std::move(line));
+                            }
+                            block["disasm"] = std::move(disasm);
+                        }
+                    }
+                }
+                blocks.push_back(std::move(block));
             }
+
             json edges = json::array();
             for (const auto& el : layout.edge_layouts) {
-                edges.push_back({
+                json edge = {
                     {"from", fmt::format("0x{:X}", rebase(el.from_block))},
                     {"to",   fmt::format("0x{:X}", rebase(el.to_block))},
-                    {"arrow", static_cast<int>(el.arrow)}
-                });
+                    {"arrow", arrow_name(el.arrow)}
+                };
+                if (cfg) {
+                    // O(1) lookup via cfg's adjacency index instead of an O(E) linear
+                    // scan per layout edge (which would make this loop O(E^2)).
+                    for (const auto* e : cfg->successors(el.from_block)) {
+                        if (e->to_block == el.to_block) {
+                            edge["taken_count"] = e->taken_count;
+                            edge["kind"] = e->is_fallthrough ? "fallthrough" : "branch";
+                            break;
+                        }
+                    }
+                }
+                edges.push_back(std::move(edge));
             }
             return {{"format", "json"}, {"blocks", std::move(blocks)}, {"edges", std::move(edges)}};
         }

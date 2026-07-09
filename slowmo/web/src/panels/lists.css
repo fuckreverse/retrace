@@ -150,10 +150,24 @@
 
 /* ---------- mem search ---------- */
 .mem-search-icon {
-  display: inline-flex;
-  align-items: center;
-  color: var(--text-tertiary);
-  margin-right: 4px;
+display: inline-flex;
+align-items: center;
+color: var(--text-tertiary);
+margin-right: 4px;
+}
+.mem-search-toggle {
+display: inline-flex;
+align-items: center;
+gap: 4px;
+font-size: var(--fs-xs);
+color: var(--text-secondary);
+white-space: nowrap;
+cursor: pointer;
+user-select: none;
+}
+.mem-search-toggle input[type="checkbox"] {
+accent-color: var(--accent);
+cursor: pointer;
 }
 .mem-search-row { display: flex; align-items: center; gap: 4px; flex: 1; }
 
@@ -172,6 +186,16 @@
   font-size: var(--fs-sm);
   color: var(--text-secondary);
   cursor: pointer;
+}
+.diff-range-label {
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  color: var(--text-tertiary);
+  padding: 0 2px;
+}
+.diff-range-input {
+  width: 72px;
+  text-align: center;
 }
 
 /* ---------- log panel ---------- */

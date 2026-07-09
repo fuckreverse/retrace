@@ -23,7 +23,7 @@ import type {
   SnapshotEntry,
   VmHandler,
 } from '@/types/tenet';
-import { Chip } from '@/components/ui';
+import { Button, Chip } from '@/components/ui';
 import './lists.css';
 
 function fmtBytes(n: number): string {
@@ -92,28 +92,91 @@ export function DwarfPanel() {
 }
 
 /* ---------- VM Workspace ---------- */
+const VM_DISPATCH_TYPES = ['auto', 'WhileSwitch', 'IndirectBranch', 'CallTable', 'ThreadedCode', 'Trampoline', 'FetchOnly'];
+
 export function VmWorkspacePanel() {
-  const [rows, setRows] = useState<VmHandler[]>([]);
-  useEffect(() => { api.vmHandlers().then(setRows); }, []);
+  const [rows, setRows] = useState<VmHandler[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // 对齐后端 vm_abstract 的静态分析 hint（见 mcp_tools_analysis.cpp register_analysis_tools）。
+  // 该工具要求至少一个定位型 hint（dispatcher_pc / indirect_branch_pc / mem_anchor_addr），
+  // 否则后端直接报错——这些是 IDA/Ghidra 静态分析给出的事实，不是动态启发式能猜出来的。
+  const [dispatcherPc, setDispatcherPc] = useState('');
+  const [indirectBranchPc, setIndirectBranchPc] = useState('');
+  const [memAnchorAddr, setMemAnchorAddr] = useState('');
+  const [dispatchType, setDispatchType] = useState('auto');
+  const [vmPcReg, setVmPcReg] = useState('');
+  const [opcodeSize, setOpcodeSize] = useState('4');
+
+  const run = async () => {
+    if (!dispatcherPc.trim() && !indirectBranchPc.trim() && !memAnchorAddr.trim()) {
+      setError('至少填写一个定位 hint：dispatcher_pc / indirect_branch_pc / mem_anchor_addr（来自 IDA/Ghidra 静态分析）');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.vmHandlers({
+        dispatcherPc: dispatcherPc.trim() || undefined,
+        indirectBranchPc: indirectBranchPc.trim() || undefined,
+        memAnchorAddr: memAnchorAddr.trim() || undefined,
+        dispatchType: dispatchType === 'auto' ? undefined : dispatchType,
+        vmPcReg: vmPcReg.trim() || undefined,
+        opcodeSize: Number(opcodeSize) || undefined,
+        forceRerun: true,
+      });
+      setRows(result);
+    } catch {
+      setError('去虚拟化失败（后端 vm_abstract 调用出错，检查 hint 是否正确）');
+      setRows(null);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="list-panel">
-      <div className="list-toolbar"><span className="list-count">{rows.length} VM handlers · 去虚拟化工作区</span></div>
+      <div className="list-toolbar" style={{ flexWrap: 'wrap', rowGap: 6 }}>
+        <input className="input mono" style={{ width: 140 }} value={dispatcherPc} onChange={(e) => setDispatcherPc(e.target.value)} placeholder="dispatcher_pc (hex)" />
+        <input className="input mono" style={{ width: 150 }} value={indirectBranchPc} onChange={(e) => setIndirectBranchPc(e.target.value)} placeholder="indirect_branch_pc (hex)" />
+        <input className="input mono" style={{ width: 150 }} value={memAnchorAddr} onChange={(e) => setMemAnchorAddr(e.target.value)} placeholder="mem_anchor_addr (hex)" />
+        <select className="settings-select" value={dispatchType} onChange={(e) => setDispatchType(e.target.value)}>
+          {VM_DISPATCH_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <input className="input mono" style={{ width: 70 }} value={vmPcReg} onChange={(e) => setVmPcReg(e.target.value)} placeholder="vm_pc_reg" />
+        <input className="input mono" style={{ width: 50 }} value={opcodeSize} onChange={(e) => setOpcodeSize(e.target.value)} placeholder="op size" />
+        <Button variant="primary" size="sm" onClick={() => void run()} disabled={busy}>
+          {busy ? '分析中…' : '运行去虚拟化'}
+        </Button>
+        {rows && <span className="list-count" style={{ marginLeft: 'auto' }}>{rows.length} VM handlers</span>}
+      </div>
       <div className="list-scroll">
-        <table className="data-table">
-          <thead><tr><th style={{ width: 50 }}>#</th><th style={{ width: 90 }}>Opcode</th><th style={{ width: 140 }}>Handler PC</th><th>Semantics</th><th style={{ width: 90 }}>Hits</th></tr></thead>
-          <tbody>
-            {rows.map((v) => (
-              <tr key={v.id}>
-                <td className="mono dim">{v.id}</td>
-                <td><span className="cat-tag cat-accent">{v.opcode}</span></td>
-                <td className="mono dim">{v.handler_pc}</td>
-                <td className="mono">{v.semantics}</td>
-                <td className="mono num">{v.hit_count.toLocaleString()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        {error ? (
+          <div className="empty-state">{error}</div>
+        ) : !rows ? (
+          <div className="empty-state">
+            填写来自 IDA/Ghidra 静态分析的 dispatcher_pc（或 indirect_branch_pc / mem_anchor_addr）等 hint，
+            点击"运行去虚拟化"抽象 VM 执行（handler 集合、opcode、执行次数）
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="empty-state">未发现 VM handler（hint 可能不匹配实际 dispatch 结构，尝试调整 dispatch_type）</div>
+        ) : (
+          <table className="data-table">
+            <thead><tr><th style={{ width: 50 }}>#</th><th style={{ width: 90 }}>Opcode</th><th style={{ width: 140 }}>Handler PC</th><th>Semantics</th><th style={{ width: 90 }}>Hits</th></tr></thead>
+            <tbody>
+              {rows.map((v) => (
+                <tr key={v.id}>
+                  <td className="mono dim">{v.id}</td>
+                  <td><span className="cat-tag cat-accent">{v.opcode}</span></td>
+                  <td className="mono dim">{v.handler_pc}</td>
+                  <td className="mono">{v.semantics}</td>
+                  <td className="mono num">{v.hit_count.toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

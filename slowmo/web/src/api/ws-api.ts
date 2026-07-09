@@ -25,11 +25,15 @@ import {
   NavigateResponse,
   NavBackResponse,
   NavForwardResponse,
+  ToggleBookmarkRequest,
+  ToggleBookmarkResponse,
+  GetBookmarksResponse,
   GetTraceInfoResponse,
   SearchForwardRequest,
   SearchForwardResponse,
   RunPassRequest,
   RunPassResponse,
+  ClearAnalysisResponse,
   GetPassCatalogResponse,
   GetCallStackRequest,
   GetCallStackResponse,
@@ -233,6 +237,39 @@ export async function wsSearchForward(query: string, fromInst: number): Promise<
   return out;
 }
 
+// ─── 书签（服务端持久，跨客户端同步） ─────────────────────────────────────────
+
+export async function wsToggleBookmark(instId: number): Promise<number[]> {
+  const resp = await wsRequest(MessageType.ToggleBookmarkReq, (b) =>
+    ToggleBookmarkRequest.createToggleBookmarkRequest(b, BigInt(instId)),
+  );
+  const bb = expect(resp, MessageType.ToggleBookmarkResp);
+  const r = ToggleBookmarkResponse.getRootAsToggleBookmarkResponse(bb);
+  const out: number[] = [];
+  const n = r.bookmarksLength();
+  for (let i = 0; i < n; i++) {
+    const v = r.bookmarks(i);
+    if (v != null) out.push(Number(v));
+  }
+  return out;
+}
+
+export async function wsGetBookmarks(): Promise<number[]> {
+  const resp = await wsRequest(MessageType.GetBookmarksReq, (b) => {
+    b.startObject(0);
+    return b.endObject();
+  });
+  const bb = expect(resp, MessageType.GetBookmarksResp);
+  const r = GetBookmarksResponse.getRootAsGetBookmarksResponse(bb);
+  const out: number[] = [];
+  const n = r.bookmarksLength();
+  for (let i = 0; i < n; i++) {
+    const v = r.bookmarks(i);
+    if (v != null) out.push(Number(v));
+  }
+  return out;
+}
+
 // ─── Pass 管理 ────────────────────────────────────────────────────────────────
 
 function mapPassState(s: FbPassState): PassState {
@@ -280,6 +317,16 @@ export async function wsRunPass(
   const bb = expect(resp, MessageType.RunPassResp);
   const r = RunPassResponse.getRootAsRunPassResponse(bb);
   return { ok: r.ok(), message: r.message() ?? '' };
+}
+
+/** 清空所有已运行分析结果（PassManager 全量 reset），对齐 GUI "Clear All Analysis" */
+export async function wsClearAnalysis(): Promise<boolean> {
+  const resp = await wsRequest(MessageType.ClearAnalysisReq, (b) => {
+    b.startObject(0);
+    return b.endObject();
+  });
+  const bb = expect(resp, MessageType.ClearAnalysisResp);
+  return ClearAnalysisResponse.getRootAsClearAnalysisResponse(bb).ok();
 }
 
 // ─── 调用栈 / 函数 ─────────────────────────────────────────────────────────────

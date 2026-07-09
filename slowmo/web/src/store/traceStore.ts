@@ -36,6 +36,14 @@ interface TraceState {
   taintBackward: Set<number>;
   producerChain: Set<number>;
 
+  // Goto / Search 弹窗（对齐 GUI nav_goto / nav_search，快捷键 G / ）
+  showGotoDialog: boolean;
+  showSearchDialog: boolean;
+  openGotoDialog: () => void;
+  closeGotoDialog: () => void;
+  openSearchDialog: () => void;
+  closeSearchDialog: () => void;
+
   // actions
   init: () => Promise<void>;
   navigateTo: (instId: number, pushHistory?: boolean, notifyBackend?: boolean) => void;
@@ -72,10 +80,16 @@ export const useTraceStore = create<TraceState>((set, get) => ({
   taintForward: new Set(),
   taintBackward: new Set(),
   producerChain: new Set(),
+  showGotoDialog: false,
+  showSearchDialog: false,
+  openGotoDialog() { set({ showGotoDialog: true }); },
+  closeGotoDialog() { set({ showGotoDialog: false }); },
+  openSearchDialog() { set({ showSearchDialog: true }); },
+  closeSearchDialog() { set({ showSearchDialog: false }); },
 
   async init() {
     set({ loading: true });
-    const info = await api.traceInfo();
+    const [info, bookmarks] = await Promise.all([api.traceInfo(), api.getBookmarks()]);
     set({
       info,
       totalInst: info.instruction_count,
@@ -84,6 +98,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       currentInst: 0,
       history: [0],
       historyPos: 0,
+      bookmarks: new Set(bookmarks),
     });
 
     // 订阅服务端导航推送（GUI / 其他客户端触发）——不回推、不入历史，避免回环
@@ -133,10 +148,15 @@ export const useTraceStore = create<TraceState>((set, get) => ({
   canForward: () => get().historyPos < get().history.length - 1,
 
   toggleBookmark(instId) {
+    // 乐观本地更新，保证点击的即时反馈
     const bm = new Set(get().bookmarks);
     if (bm.has(instId)) bm.delete(instId);
     else bm.add(instId);
     set({ bookmarks: bm });
+    // 同步到服务端（真实持久化 + 跨客户端同步），以服务端返回的权威集合为准
+    void api.toggleBookmark(instId).then((serverBm) => {
+      set({ bookmarks: new Set(serverBm) });
+    });
   },
 
   setHexAddr(addr) {

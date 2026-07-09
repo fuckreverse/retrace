@@ -216,6 +216,33 @@ export function mockMemRead(addr: string, size: number, instId: number): MemRead
   };
 }
 
+/** mock 模式下的服务端持久书签基线（模块级可变态，模拟跨客户端同步） */
+const MOCK_BOOKMARKS = new Set<number>();
+
+/** 在已生成的 mock 指令窗口内做子串匹配（贴合 GUI Search 的 mnemonic+operands 语义） */
+export function mockSearchForward(query: string, fromInst: number): number[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const hits: number[] = [];
+  const scanLimit = Math.min(TOTAL_INST, fromInst + 200_000);
+  for (let i = fromInst; i < scanLimit && hits.length < 500; i++) {
+    const row = mockInst(i);
+    const text = `${row.mnemonic ?? ''} ${row.operands ?? ''}`.toLowerCase();
+    if (text.includes(q)) hits.push(i);
+  }
+  return hits;
+}
+
+export function mockToggleBookmark(instId: number): number[] {
+  if (MOCK_BOOKMARKS.has(instId)) MOCK_BOOKMARKS.delete(instId);
+  else MOCK_BOOKMARKS.add(instId);
+  return Array.from(MOCK_BOOKMARKS).sort((a, b) => a - b);
+}
+
+export function mockGetBookmarks(): number[] {
+  return Array.from(MOCK_BOOKMARKS).sort((a, b) => a - b);
+}
+
 export function mockXref(pc: string): XrefResult {
   const r = rng(Number(BigInt(pc) & 0xffffn));
   const count = 1 + Math.floor(r() * 40);
@@ -372,26 +399,38 @@ export function mockTaintForward(regIndex: number, instId: number): { steps: Tai
   return { steps, stats: { instructions_processed: n * 40, tainted_memory_count: Math.floor(n / 3) } };
 }
 
+/** mock 模式下的 pass 状态基线（模块级可变态，供 mockRunPass 修改后持久生效） */
+const MOCK_PASS_BASELINE: PassInfo[] = [
+  { name: 'xref', display_name: 'Cross References', category: 'Structure', state: 'completed', summary: '312 unique PCs indexed' },
+  { name: 'function', display_name: 'Function Discovery', category: 'Structure', state: 'completed', summary: '8 functions' },
+  { name: 'cfg', display_name: 'Control Flow Graph', category: 'Structure', state: 'completed', summary: '7 blocks, 8 edges' },
+  { name: 'call_graph', display_name: 'Call Graph', category: 'Structure', state: 'not_run' },
+  { name: 'loop', display_name: 'Loop Detection', category: 'Structure', state: 'completed', summary: '3 loops' },
+  { name: 'taint', display_name: 'Forward Taint', category: 'Taint', state: 'not_run' },
+  { name: 'backward_taint', display_name: 'Backward Taint', category: 'Taint', state: 'not_run' },
+  { name: 'pattern', display_name: 'Crypto/AntiDebug Patterns', category: 'Crypto-Pattern', state: 'completed', summary: '4 matches' },
+  { name: 'constants', display_name: 'Constant Materialization', category: 'Crypto-Pattern', state: 'not_run' },
+  { name: 'algorithm_summary', display_name: 'Algorithm Summary', category: 'Crypto-Pattern', state: 'not_run' },
+  { name: 'strings', display_name: 'Static Strings', category: 'Memory-String', state: 'completed', summary: '10 strings' },
+  { name: 'memory_strings', display_name: 'Runtime Memory Strings', category: 'Memory-String', state: 'not_run' },
+  { name: 'objc', display_name: 'ObjC Messages', category: 'ObjC-Platform', state: 'completed', summary: '4 messages' },
+  { name: 'objc_crypto', display_name: 'ObjC × Crypto', category: 'ObjC-Platform', state: 'not_run' },
+  { name: 'syscall_intercept', display_name: 'API Intercepts', category: 'ObjC-Platform', state: 'not_run' },
+  { name: 'window_stats', display_name: 'Window Stats', category: 'Profile-Trace', state: 'not_run' },
+  { name: 'trace_fold', display_name: 'Trace Fold', category: 'Profile-Trace', state: 'not_run' },
+];
+
 export function mockPasses(): PassInfo[] {
-  return [
-    { name: 'xref', display_name: 'Cross References', category: 'Structure', state: 'completed', summary: '312 unique PCs indexed' },
-    { name: 'function', display_name: 'Function Discovery', category: 'Structure', state: 'completed', summary: '8 functions' },
-    { name: 'cfg', display_name: 'Control Flow Graph', category: 'Structure', state: 'completed', summary: '7 blocks, 8 edges' },
-    { name: 'call_graph', display_name: 'Call Graph', category: 'Structure', state: 'not_run' },
-    { name: 'loop', display_name: 'Loop Detection', category: 'Structure', state: 'completed', summary: '3 loops' },
-    { name: 'taint', display_name: 'Forward Taint', category: 'Taint', state: 'not_run' },
-    { name: 'backward_taint', display_name: 'Backward Taint', category: 'Taint', state: 'not_run' },
-    { name: 'pattern', display_name: 'Crypto/AntiDebug Patterns', category: 'Crypto-Pattern', state: 'completed', summary: '4 matches' },
-    { name: 'constants', display_name: 'Constant Materialization', category: 'Crypto-Pattern', state: 'not_run' },
-    { name: 'algorithm_summary', display_name: 'Algorithm Summary', category: 'Crypto-Pattern', state: 'not_run' },
-    { name: 'strings', display_name: 'Static Strings', category: 'Memory-String', state: 'completed', summary: '10 strings' },
-    { name: 'memory_strings', display_name: 'Runtime Memory Strings', category: 'Memory-String', state: 'not_run' },
-    { name: 'objc', display_name: 'ObjC Messages', category: 'ObjC-Platform', state: 'completed', summary: '4 messages' },
-    { name: 'objc_crypto', display_name: 'ObjC × Crypto', category: 'ObjC-Platform', state: 'not_run' },
-    { name: 'syscall_intercept', display_name: 'API Intercepts', category: 'ObjC-Platform', state: 'not_run' },
-    { name: 'window_stats', display_name: 'Window Stats', category: 'Profile-Trace', state: 'not_run' },
-    { name: 'trace_fold', display_name: 'Trace Fold', category: 'Profile-Trace', state: 'not_run' },
-  ];
+  return MOCK_PASS_BASELINE.map((p) => ({ ...p }));
+}
+
+/** mock 模式下模拟真实运行：直接标记 completed，供 AnalysisPanel 轮询感知变化 */
+export function mockRunPass(name: string): { ok: boolean; message: string } {
+  const p = MOCK_PASS_BASELINE.find((x) => x.name === name);
+  if (!p) return { ok: false, message: `unknown pass: ${name}` };
+  p.state = 'completed';
+  p.summary = p.summary ?? 'done (mock)';
+  return { ok: true, message: 'completed' };
 }
 
 export function mockConstants(): ConstantEntry[] {
@@ -525,6 +564,8 @@ export function mockYara(): YaraMatch[] {
 }
 
 /* ---------- Profile-Trace 类 ---------- */
+const MOCK_MNEMONICS = ['ldr', 'str', 'add', 'sub', 'bl', 'cmp', 'b.eq', 'mov', 'mul', 'eor'];
+
 export function mockWindowStats(): WindowStat[] {
   const r = rng(55);
   const stats: WindowStat[] = [];
@@ -538,9 +579,10 @@ export function mockWindowStats(): WindowStat[] {
       inst_count: count,
       mem_reads: Math.floor(count * (0.2 + r() * 0.15)),
       mem_writes: Math.floor(count * (0.08 + r() * 0.1)),
-      branches: Math.floor(count * (0.12 + r() * 0.08)),
-      calls: Math.floor(count * (0.03 + r() * 0.03)),
-      dominant_func: FUNCS[Math.floor(r() * FUNCS.length)].name,
+      branch_density: 0.12 + r() * 0.08,
+      unique_pcs: Math.floor(count * (0.3 + r() * 0.3)),
+      mnemonic_entropy: 1.5 + r() * 2.0,
+      dominant_mnemonic: MOCK_MNEMONICS[Math.floor(r() * MOCK_MNEMONICS.length)],
     });
   }
   return stats;
