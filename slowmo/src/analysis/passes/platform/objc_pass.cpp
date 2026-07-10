@@ -487,29 +487,26 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     }
                     msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
 
-                    RegState pre_regs{};
-                    bool have_pre_regs = false;
-                    if (msg.arg_count > 0) {
-                        pre_regs = regfile.state_before(inst_id);
-                        have_pre_regs = true;
-                    }
-                    if (have_pre_regs) {
-                        for (uint8_t k = 0; k < msg.arg_count; ++k) {
-                            uint64_t val = pre_regs.gpr[k + 2];
-                            msg.args[k].value = val;
-                            msg.args[k].deref_str = cached_deref(val, inst_id);
-                            if (!msg.args[k].deref_str.has_value()) {
-                                msg.args[k].deref_str = try_decode_reg_ascii(val);
-                            }
+                    // Fetch register state once — reused for both argument
+                    // extraction (x2-x7) and return-value capture (x0).
+                    // Previously this was two separate state_before() calls
+                    // for the same inst_id, doubling the checkpoint replay cost.
+                    RegState pre_regs = regfile.state_before(inst_id);
+
+                    for (uint8_t k = 0; k < msg.arg_count; ++k) {
+                        uint64_t val = pre_regs.gpr[k + 2];
+                        msg.args[k].value = val;
+                        msg.args[k].deref_str = cached_deref(val, inst_id);
+                        if (!msg.args[k].deref_str.has_value()) {
+                            msg.args[k].deref_str = try_decode_reg_ascii(val);
                         }
                     }
 
-                    // Extract return value (x0 after the method returns)
+                    // Extract return value (x0 at the call site)
                     {
-                        const auto inst_regs = regfile.state_before(inst_id);
-                        msg.return_value = inst_regs.gpr[0];
-                        msg.return_deref_str = cached_deref(inst_regs.gpr[0], inst_id);
-                        auto reg_str = try_decode_reg_ascii(inst_regs.gpr[0]);
+                        msg.return_value = pre_regs.gpr[0];
+                        msg.return_deref_str = cached_deref(pre_regs.gpr[0], inst_id);
+                        auto reg_str = try_decode_reg_ascii(pre_regs.gpr[0]);
                         if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
                             msg.return_deref_str = std::move(reg_str);
                         }
