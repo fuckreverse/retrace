@@ -88,8 +88,12 @@ struct MemoryStringResult {
     /// inst_id → indices (all strings visible at a call site).
     ankerl::unordered_dense::map<uint64_t, std::vector<size_t>> by_call_site;
 
-    /// Deduplicated content set (for quick "already found?" checks).
-    ankerl::unordered_dense::set<std::string> unique_contents;
+    /// Deduplicated (addr, content) hash set — used only for O(1)
+    /// "already found?" checks during add_string() and for the
+    /// unique_count() statistic.  Stores a combined hash of (addr, content)
+    /// rather than the formatted string "addr:content" to avoid per-entry
+    /// string allocation + fmt::format overhead on the hot add path.
+    ankerl::unordered_dense::set<uint64_t> unique_hashes;
 
     /// Lookup strings at a specific address.
     std::vector<const MemoryString*> at_addr(uint64_t addr) const {
@@ -115,8 +119,8 @@ struct MemoryStringResult {
     /// Total count.
     size_t total() const { return strings.size(); }
 
-    /// Count of unique string contents.
-    size_t unique_count() const { return unique_contents.size(); }
+    /// Count of unique (addr, content) pairs.
+    size_t unique_count() const { return unique_hashes.size(); }
 };
 
 // ─── MemoryStringCollector ────────────────────────────────────────────────

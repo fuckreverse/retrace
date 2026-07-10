@@ -275,7 +275,7 @@ ctest -R perf --output-on-failure
 |---|---|
 | `string_pass.h` | `addr_to_index`、`inst_to_strings` |
 | `string_pass.cpp` | `bytes_`、`addr_first_inst_`（StringCollector 热路径） |
-| `memory_string_pass.h` | `by_addr`、`by_call_site`、`unique_contents` |
+| `memory_string_pass.h` | `by_addr`、`by_call_site`、`unique_hashes` |
 | `memory_snapshot_pass.h` | `by_inst_id` |
 | `symbol_annotation_pass.h` | `by_pc`、`by_inst_id` |
 | `objc_pass.h` | `classes`、`by_pc` |
@@ -423,7 +423,7 @@ ninja -j$(nproc) tenet
 | `taint_source_annotation_pass` | 主结果表 |
 | `loop_pass`、`cfg_pass`、`xref_pass` | 块 / PC / xref 索引 |
 
-**可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_contents`、`by_addr`）、`disassembly_pass`（`pc_table`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
+**可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_hashes`、`by_addr`）、`disassembly_pass`（`pc_table`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
 
 ---
 

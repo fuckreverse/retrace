@@ -35,6 +35,27 @@ namespace {
 static constexpr uint32_t MSTR_BLOB_MAGIC   = 0x4D535452u;  // "MSTR"
 static constexpr uint32_t MSTR_BLOB_VERSION = 1u;
 
+/// Combine an address and a string content into a single 64-bit hash.
+/// Used as the dedup key in MemoryStringResult::unique_hashes, replacing
+/// the previous fmt::format("{}:{}", addr, content) string key.
+///
+/// Collisions: with a 64-bit hash and ~500K entries the birthday-bound
+/// collision probability is ~10⁻⁵, which is acceptable for a dedup
+/// statistic that only feeds unique_count().  The addr is mixed in
+/// explicitly (not just via hashing the formatted digits) so two strings
+/// with identical content at different addresses are NOT collapsed.
+inline uint64_t hash_combine_addr_content(uint64_t addr, const std::string& content) {
+    // FNV-1a on content
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (unsigned char c : content) {
+        h ^= c;
+        h *= 0x100000001b3ULL;
+    }
+    // boost::hash_combine style mix with addr
+    h ^= addr + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
 std::string memory_string_serialize(const MemoryStringResult& res) {
     ByteWriter w;
 
@@ -84,9 +105,9 @@ bool memory_string_deserialize(const std::string& blob, MemoryStringResult& out)
         size_t idx = out.strings.size();
         out.by_addr[s.addr].push_back(idx);
         out.by_call_site[s.call_site_inst_id].push_back(idx);
-        // Rebuild unique_contents set
-        std::string key = fmt::format("{}:{}", s.addr, s.content);
-        out.unique_contents.insert(key);
+        // Rebuild unique_hashes set (combined hash of addr + content)
+        uint64_t h = hash_combine_addr_content(s.addr, s.content);
+        out.unique_hashes.insert(h);
         out.strings.push_back(std::move(s));
     }
 
@@ -444,10 +465,12 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
 
     // Helper: add a discovered string to result (with deduplication).
     auto add_string = [&](MemoryString&& ms) {
-        // Dedup: same content at same address — keep earliest discovery
-        std::string key = fmt::format("{}:{}", ms.addr, ms.content);
-        if (result.unique_contents.count(key)) return;
-        result.unique_contents.insert(key);
+        // Dedup: same content at same address — keep earliest discovery.
+        // Uses a combined 64-bit hash of (addr, content) instead of the
+        // previous fmt::format("{}:{}", ...) string key — avoids per-entry
+        // string allocation + format parsing on the hot add path.
+        uint64_t h = hash_combine_addr_content(ms.addr, ms.content);
+        if (!result.unique_hashes.insert(h).second) return;
 
         size_t idx = result.strings.size();
         result.by_addr[ms.addr].push_back(idx);
