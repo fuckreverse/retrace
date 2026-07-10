@@ -15,12 +15,48 @@ void ScanOrchestrator::declare(ScanDeclaration decl) {
 uint64_t ScanOrchestrator::execute_scan(const AnalysisRange& range,
                                           const std::atomic<bool>& cancel_token,
                                           bool no_parallel) {
-    (void)range;
-    (void)cancel_token;
-    (void)no_parallel;
-    // Stub — real implementation in Task 3
+    if (declarations_.empty()) return 0;
+    if (scanned_) return 0;  // already scanned
+
+    // Create the shared scan engine
+    TraceScanEngine engine(reader_, inst_count_, index_);
+
+    // Apply exclude PC ranges from AnalysisRange
+    if (!range.exclude_pc_ranges.empty()) {
+        engine.set_exclude_pc_ranges(range.exclude_pc_ranges);
+    }
+
+    // Set cancellation
+    engine.set_cancel_token(&cancel_token);
+    engine.set_cancel_check([&cancel_token]() {
+        return cancel_token.load(std::memory_order_acquire);
+    });
+
+    // Register all declared collectors
+    for (const auto& decl : declarations_) {
+        engine.add_collector(decl.collector);
+    }
+
+    // Determine if all collectors support parallel scanning
+    bool all_parallel = !no_parallel;
+    if (all_parallel) {
+        for (const auto& decl : declarations_) {
+            if (!decl.wants_parallel) {
+                all_parallel = false;
+                break;
+            }
+        }
+    }
+
+    uint64_t processed = 0;
+    if (all_parallel) {
+        processed = engine.run_parallel(range.start_inst_id, range.end_inst_id);
+    } else {
+        processed = engine.run(range.start_inst_id, range.end_inst_id);
+    }
+
     scanned_ = true;
-    return 0;
+    return processed;
 }
 
 TraceCollector* ScanOrchestrator::collector_for(std::string_view pass_name) const {

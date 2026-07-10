@@ -473,6 +473,22 @@ void PassManager::run_all(size_t num_threads) {
              entries_.size(), num_threads,
              rss_limit_mb_ > 0 ? fmt::format("{:.0f}", rss_limit_mb_) : "none");
 
+    // ── Phase 1: Declaration — each pass's declare_scan() registers collectors ──
+    if (scan_orchestrator_) {
+        for (auto& entry : entries_) {
+            entry->pass->declare_scan(*scan_orchestrator_);
+        }
+
+        // ── Phase 2: Unified scan — one traversal serves all collectors ──
+        if (scan_orchestrator_->has_declarations()) {
+            LOG_INFO_M(::tenet::log::Module::Analysis,
+                "PassManager: executing unified scan with {} collector(s)",
+                scan_orchestrator_->has_declarations() ? "multiple" : "0");
+            scan_orchestrator_->execute_scan(range_, cancelled_, no_parallel_scan_);
+        }
+    }
+
+    // ── Phase 3: Execution — existing DAG scheduler (unchanged) ──
     if (num_threads <= 1 || entries_.size() <= 1) {
         // Sequential fallback: just require each pass in registration order.
         for (auto& entry : entries_) {

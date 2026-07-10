@@ -185,6 +185,11 @@ public:
     /// Execute the pass.
     virtual PassResult run(PassContext& ctx) = 0;
 
+    /// Declare scan collector requirements for Scan Fusion (default: none).
+    /// Override to participate in unified trace scanning.
+    /// Called before run() phase, after all passes are registered.
+    virtual void declare_scan(class ScanOrchestrator& orchestrator) { (void)orchestrator; }
+
     /// Whether this pass supports incremental update.
     virtual bool supports_incremental() const { return false; }
 
