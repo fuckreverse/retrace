@@ -401,11 +401,6 @@ PassResult CFGPass::run(PassContext& ctx) {
     // Build blocks if not already done (by declare_scan or previous call)
     build_blocks(ctx);
 
-    // Require xref pass results (needed for block building and also
-    // ensures xref is available for downstream consumers)
-    const auto& xref = ctx.require<XrefResult>("xref");
-    (void)xref;  // xref was already consumed in build_blocks()
-
     auto& reader = ctx.reader();
 
     // ── Phase 4: Walk the trace to build edges and count taken ───────────
@@ -414,26 +409,11 @@ PassResult CFGPass::run(PassContext& ctx) {
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
     if (end == 0) end = index.inst_count();
 
-    // If collector_ was populated by declare_scan() + ScanOrchestrator's
-    // execute_scan(), it already has edge_counts.  Otherwise, run the
-    // scan engine locally.
+    // collector_ must have been populated by declare_scan() + ScanOrchestrator.
+    // If not, declare_scan() was never called — this violates the scan-fusion
+    // contract.
     if (!collector_) {
-        collector_ = std::make_unique<CFGEdgeCollector>(&result_);
-        TraceScanEngine engine(reader, index.inst_count(), &index);
-        if (!ctx.range().exclude_pc_ranges.empty()) {
-            engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
-        }
-        engine.add_collector(collector_.get());
-        engine.set_progress([&](uint64_t processed, uint64_t total) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-        });
-        engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        engine.set_cancel_token(&ctx.global_cancel_flag());
-        if (ctx.no_parallel_scan()) {
-            engine.run(start, end);
-        } else {
-            engine.run_parallel(start, end);
-        }
+        return PassResult::failed("declare_scan() was not called before run()");
     }
 
     auto& edge_counts = collector_->edge_counts;
