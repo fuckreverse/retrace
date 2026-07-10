@@ -6,6 +6,7 @@
 #include "core/memory_model.h"
 #include "core/register_file.h"
 #include "common/byte_codec.h"
+#include "infra/string_resolver.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
@@ -598,6 +599,38 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     ctx.progress(1.0f, fmt::format("Done: {} strings ({} unique) from {} call sites",
                                     result.total(), result.unique_count(),
                                     call_sites_processed));
+
+    // ── Supplementary: add strings from StringResolver (PageScan source).
+    //    These are strings found via full-page scanning that were never
+    //    pointed to by registers at call sites. StringResolver caches
+    //    results across passes, so this is cheap if PageStats was already built.
+    {
+        auto& string_resolver = ctx.string_resolver();
+        string_resolver.ensure_built(ctx.index().inst_count());
+
+        const auto& resolved = string_resolver.all_strings();
+        for (const auto& rs : resolved) {
+            // Skip if we already found a string at this address via call-site scan
+            if (result.by_addr.count(rs.addr) > 0) continue;
+
+            MemoryString ms;
+            ms.addr = rs.addr;
+            ms.discovered_at = rs.inst_id;
+            ms.content = rs.value;
+            ms.encoding = MemoryString::Encoding::ASCII;
+            ms.source = MemoryString::Source::PageScan;
+            ms.source_reg = 0xFF;
+            ms.call_site_inst_id = 0;
+            ms.call_site_pc = 0;
+
+            size_t idx = result.strings.size();
+            result.strings.push_back(std::move(ms));
+            result.by_addr[rs.addr].push_back(idx);
+            result.unique_hashes.insert(
+                hash_combine_addr_content(rs.addr, result.strings[idx].content));
+        }
+    }
+
     return PassResult::success(std::move(result));
 }
 
