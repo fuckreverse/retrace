@@ -738,7 +738,9 @@ PatternPass::PatternPass(PatternPass&& o) noexcept
 #ifdef TENET_HAS_YARA
       yr_rules_(o.yr_rules_),
 #endif
-      rules_loaded_(o.rules_loaded_) {
+      rules_loaded_(o.rules_loaded_),
+      constmat_min_parts_(o.constmat_min_parts_),
+      collector_(std::move(o.collector_)) {
 #ifdef TENET_HAS_YARA
     o.yr_rules_ = nullptr;
 #endif
@@ -755,6 +757,8 @@ PatternPass& PatternPass::operator=(PatternPass&& o) noexcept {
         yr_rules_ = o.yr_rules_;
 #endif
         rules_loaded_ = o.rules_loaded_;
+        constmat_min_parts_ = o.constmat_min_parts_;
+        collector_ = std::move(o.collector_);
 #ifdef TENET_HAS_YARA
         o.yr_rules_ = nullptr;
 #endif
@@ -1257,13 +1261,27 @@ PatternMatch& PatternCollector::add_match(PatternMatch match) {
     return result_.matches.back();
 }
 
+// ─── PatternPass::declare_scan ──────────────────────────────────────────────
+
+void PatternPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& code_table = ctx.code_table();
+    auto& decoder = ctx.decoder();
+    auto& reader = ctx.reader();
+
+    // regfile is only needed when building YARA syscall buffers
+    bool has_yara = load_rules();
+    RegisterFile* regfile_ptr = has_yara ? &ctx.regfile() : nullptr;
+
+    collector_ = std::make_unique<PatternCollector>(
+        code_table, decoder, regfile_ptr, has_yara, constmat_min_parts_,
+        static_cast<uint32_t>(reader.header().target_os));
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── PatternPass::run (delegates to PatternCollector) ─────────────────────
 
 PassResult PatternPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
     auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
-    auto& decoder = ctx.decoder();
     const auto& range = ctx.range();
 
     const uint64_t total_insts = index.inst_count();
@@ -1278,6 +1296,7 @@ PassResult PatternPass::run(PassContext& ctx) {
             PatternResult cached;
             if (pattern_deserialize(blob, cached)) {
                 build_category_index(cached);
+                collector_.reset();  // not needed, free memory
                 ctx.progress(1.0f, fmt::format(
                     "Pattern: {} matches found (from cache)",
                     cached.total()));
@@ -1286,41 +1305,25 @@ PassResult PatternPass::run(PassContext& ctx) {
         }
     }
 
-    // Phase 1: Load YARA rules
-    bool has_yara = load_rules();
-
-    // Phase 2: Set up collector and run scan
-    ctx.progress(0.0f, "Pattern: scanning trace...");
-
-    // regfile is only needed when building YARA syscall buffers
-    RegisterFile* regfile_ptr = has_yara ? &ctx.regfile() : nullptr;
-    PatternCollector collector(code_table, decoder, regfile_ptr, has_yara, constmat_min_parts_,
-                               static_cast<uint32_t>(reader.header().target_os));
-
-    {
-        TraceScanEngine local_engine(reader, total_insts, &index);
-        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                ctx.progress(static_cast<float>(processed) / static_cast<float>(total) * 0.6f);
-            }
-        });
-        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        local_engine.set_cancel_token(&ctx.global_cancel_flag());
-        local_engine.add_collector(&collector);
-        local_engine.run();
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
     }
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
 
-    auto result = collector.take_result();
+    // Determine whether YARA was enabled (loaded during declare_scan)
+    bool has_yara = load_rules();
+
+    auto result = collector_->take_result();
 
     // Phase 3: Run YARA on built buffers (if enabled)
 #ifdef TENET_HAS_YARA
     if (has_yara) {
-        auto reg_buf = collector.take_reg_buf();
-        auto sys_buf = collector.take_sys_buf();
+        auto reg_buf = collector_->take_reg_buf();
+        auto sys_buf = collector_->take_sys_buf();
 
         if (ctx.cancelled()) return PassResult::failed("cancelled by user");
         ctx.progress(0.7f, "Pattern: scanning register values with YARA...");

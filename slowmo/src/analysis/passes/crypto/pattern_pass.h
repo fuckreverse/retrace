@@ -2,11 +2,13 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <array>
 #include <optional>
+#include <memory>
 #include <ankerl/unordered_dense.h>
 #include <filesystem>
 
@@ -403,6 +405,8 @@ public:
         return {};  // No dependencies — operates directly on trace + code_table + decoder.
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 12.0f; }
 
@@ -449,6 +453,7 @@ private:
 #endif
     bool rules_loaded_ = false;
     uint8_t constmat_min_parts_ = 2;
+    std::unique_ptr<PatternCollector> collector_;
 };
 
 }  // namespace tenet
