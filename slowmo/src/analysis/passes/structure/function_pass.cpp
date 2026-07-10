@@ -1,5 +1,6 @@
 #include "analysis/passes/structure/function_pass.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -912,14 +913,22 @@ void FunctionCollector::end() {
     { std::vector<PcKindEntry> tmp; tmp.swap(pc_kind_sorted_); }
 }
 
+// ─── FunctionPass::declare_scan ──────────────────────────────────────────────
+
+void FunctionPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& code_table = ctx.code_table();
+    const auto& hdr  = ctx.reader().header();
+
+    collector_ = std::make_unique<FunctionCollector>(
+        code_table, hdr.module_slide, hdr.num_gpr,
+        hdr.has_branch_hint(), config_.full_mode);
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── FunctionPass::run — now delegates to FunctionCollector ───────────────
 
 PassResult FunctionPass::run(PassContext& ctx) {
-    auto& reader     = ctx.reader();
     auto& index      = ctx.index();
-    auto& code_table = ctx.code_table();
-
-    const auto& hdr   = reader.header();
     const auto& range = ctx.range();
 
     const uint64_t total_insts = index.inst_count();
@@ -945,6 +954,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
                 cached.sorted_call_indices_.shrink_to_fit();
                 cached.call_site_map_.rehash(0);
                 cached.return_site_map_.rehash(0);
+                collector_.reset();  // not needed, free memory
                 ctx.progress(1.0f, fmt::format(
                     "Functions: {} unique, {} call events (from cache)",
                     cached.functions.size(), cached.call_events.size()));
@@ -954,56 +964,36 @@ PassResult FunctionPass::run(PassContext& ctx) {
     }
 
     // ── Progress budget allocation (based on profiling) ──────────────────
-    // Phase 1 (trace scan):         0% → 70%
-    // Phase 2 (state machine):     70% → 85%
+    // Phase 1 (trace scan):         0% → 70%  (done by ScanOrchestrator)
+    // Phase 2 (state machine):     70% → 85%  (driven by collector progress_fn)
     // Post-processing (tail/names): 85% → 90%
     // Serialize + save_blob:        90% → 100%
     constexpr float kPhase1End   = 0.70f;
     constexpr float kPhase2End   = 0.85f;
     constexpr float kPostEnd     = 0.90f;
 
-    ctx.progress(0.0f, "Function analysis: scanning trace...");
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
+    }
 
-    FunctionCollector collector(code_table, hdr.module_slide, hdr.num_gpr,
-                                 hdr.has_branch_hint(),
-                                 config_.full_mode);
+    ctx.progress(kPhase1End, "Function analysis: finalising...");
 
+    // Re-attach progress/cancel callbacks for Phase 2 post-processing (end())
     // Phase 2 progress: map [0,1] → [kPhase1End, kPhase2End]
-    collector.set_progress_fn([&](float p2_pct) {
+    collector_->set_progress_fn([&](float p2_pct) {
         ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
                      "Function analysis: building call graph...");
     });
     // Cancellation: allow end() to bail out early when user cancels.
-    collector.set_cancel_fn([&]() { return ctx.cancelled(); });
-
-    // Scan trace with local engine for FunctionCollector.
-    {
-        TraceScanEngine local_engine(reader, total_insts, &index);
-        if (!ctx.range().exclude_pc_ranges.empty()) {
-            local_engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
-        }
-        // Phase 1: map engine progress [0,1] → [0, kPhase1End]
-        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                ctx.progress(static_cast<float>(processed) /
-                             static_cast<float>(total) * kPhase1End,
-                             "Function analysis: scanning trace...");
-            }
-        });
-        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        local_engine.set_cancel_token(&ctx.global_cancel_flag());
-        local_engine.add_collector(&collector);
-        local_engine.run();
-        // Phase 2 progress is driven by the set_progress_fn callback above.
-        ctx.progress(kPhase2End, "Function analysis: finalising...");
-    }
+    collector_->set_cancel_fn([&]() { return ctx.cancelled(); });
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
 
     ctx.progress(kPostEnd, "Function analysis: post-processing...");
-    auto result = collector.take_result();
+    auto result = collector_->take_result();
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
@@ -1037,8 +1027,8 @@ PassResult FunctionPass::run(PassContext& ctx) {
         "Functions: {} unique, {} call events, {} tail calls, {} non-local unwinds",
         result.functions.size(),
         result.call_events.size(),
-        collector.tail_calls_detected(),
-        collector.non_local_unwinds()));
+        collector_->tail_calls_detected(),
+        collector_->non_local_unwinds()));
     return PassResult::success(std::move(result));
 }
 

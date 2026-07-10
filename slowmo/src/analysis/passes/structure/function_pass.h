@@ -2,11 +2,13 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <algorithm>  // std::upper_bound, std::lower_bound, std::sort
 #include <ankerl/unordered_dense.h>
+#include <memory>     // std::unique_ptr
 #include <numeric>    // std::iota
 
 namespace tenet {
@@ -298,12 +300,15 @@ public:
         return {};  // Standalone — uses efficient linear scan with pc_kind filtering
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
 
     float estimated_cost() const override { return 7.0f; }
 
 private:
     FunctionConfig config_;
+    std::unique_ptr<FunctionCollector> collector_;
 };
 
 }  // namespace tenet
