@@ -814,42 +814,89 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
     if (at_inst_id == 0) return result;
 
     if (has_rocksdb_) {
-        // Fast path: use per-page sorted write index (O(log W) per byte).
-        // Falls back to loading the page from RocksDB on the first access.
+        // Optimised path: use index_read_range() for batch reading with
+        // thread-local page cache to skip mutex on repeated same-page hits.
+        //
+        // For the common case where all requested bytes are on the same page
+        // (which is almost always true for 1-16 byte reads), we do a single
+        // index_read_range() call. The thread-local page cache avoids the
+        // mutex + hash lookup when consecutive reads hit the same page (the
+        // dominant pattern in VM abstract pass: reading ctx fields, VM
+        // registers, and stack slots all from the same vm_ctx page).
         auto& iters = get_thread_iterators();
         const uint64_t search_id = at_inst_id - 1;
+        auto& tl_page = tl_page_cache();
 
-        for (uint8_t i = 0; i < size; i++) {
-            if (result.known[i]) continue;
-
-            uint64_t byte_addr  = addr + i;
-            uint64_t page       = page_of(byte_addr);
+        uint8_t offset = 0;
+        while (offset < size) {
+            uint64_t byte_addr   = addr + offset;
+            uint64_t page        = page_of(byte_addr);
             uint16_t page_offset = static_cast<uint16_t>(byte_addr & (kPageSize - 1));
+
+            // How many bytes remain on this page from page_offset?
+            uint16_t bytes_on_page = static_cast<uint16_t>(kPageSize - page_offset);
+            uint8_t chunk = static_cast<uint8_t>(
+                std::min<uint16_t>(bytes_on_page, static_cast<uint16_t>(size - offset)));
 
             // Get (or load) the PageWriteIndex for this page.
             std::shared_ptr<const PageWriteIndex> idx_ptr;
-            {
-                std::lock_guard<std::mutex> lk(cache_mutex_);
-                if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
+
+            // Fast path: same page as last lookup AND same MemoryModel instance.
+            // The thread-local cache holds a shared_ptr copy of the index, so it
+            // stays valid even if a concurrent LRU eviction removes it from
+            // page_index_cache_ — no generation check needed.
+            if (tl_page.owner == &page_index_cache_ &&
+                page == tl_page.page && tl_page.idx) {
+                idx_ptr = std::static_pointer_cast<const PageWriteIndex>(tl_page.idx);
             }
+
             if (!idx_ptr) {
-                idx_ptr = load_page_index(page,
-                                          iters.write_iter.get(),
-                                          iters.read_iter.get());
+                // Slow path: mutex + hash lookup, or load from RocksDB.
+                {
+                    std::lock_guard<std::mutex> lk(cache_mutex_);
+                    if (auto* p = page_index_cache_.get_mutable(page)) idx_ptr = *p;
+                }
+                if (!idx_ptr) {
+                    idx_ptr = load_page_index(page,
+                                              iters.write_iter.get(),
+                                              iters.read_iter.get());
+                }
+                // Update thread-local cache.
+                if (idx_ptr) {
+                    tl_page.owner = &page_index_cache_;
+                    tl_page.page = page;
+                    tl_page.idx = std::static_pointer_cast<const void>(idx_ptr);
+                }
             }
 
             if (idx_ptr) {
-                uint8_t  val    = 0;
-                uint64_t writer = 0;
-                if (index_read_byte(*idx_ptr, page_offset, search_id, val, writer)) {
-                    result.data[i]      = val;
-                    result.known[i]     = true;
-                    result.writer_id[i] = writer;
-                    stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    stats_.rocksdb_reads.fetch_add(1, std::memory_order_relaxed);
+                // Batch read: one upper_bound + one reverse scan for all
+                // `chunk` bytes, instead of `chunk` independent queries.
+                uint8_t  buf_data[16];
+                bool     buf_known[16];
+                size_t known = index_read_range(
+                    *idx_ptr, page_offset, chunk, search_id,
+                    buf_data, buf_known);
+
+                for (uint8_t i = 0; i < chunk; ++i) {
+                    if (buf_known[i]) {
+                        result.data[offset + i]     = buf_data[i];
+                        result.known[offset + i]    = true;
+                        // writer_id not available from index_read_range;
+                        // leave as default (0). This field is only used by
+                        // last_writer() and debug tools, not by read() callers.
+                    }
+                }
+                if (known > 0) {
+                    stats_.cache_hits.fetch_add(known, std::memory_order_relaxed);
+                }
+                if (known < chunk) {
+                    stats_.rocksdb_reads.fetch_add(chunk - known,
+                                                   std::memory_order_relaxed);
                 }
             }
+
+            offset += chunk;
         }
     } else {
         return read_inmemory(addr, size, at_inst_id);

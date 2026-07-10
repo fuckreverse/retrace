@@ -549,51 +549,70 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
     // you need this programmatically.
     result.arch_type = config_.arch_type_hint;
 
-    // ── Step 6c: Warm the register-file cache for the step-building pass ──
-    //
-    // Step 7 below calls regfile.state_before() twice per execution
-    // (dispatch_inst_id and handler_first_inst_id) and `executions` is
-    // produced by a single sequential trace scan, so these inst_ids are
-    // visited in strictly increasing order. Despite that ordering,
-    // RegisterFile::state_before() has NO notion of "the last id we
-    // rebuilt" — a cache miss unconditionally rebuilds from the nearest
-    // ANCHOR record (by default every 1024 instructions, see
-    // TraceFormat.h), replaying every INST diff in between. Without
-    // pre-warming, two increasing-but-not-identical inst_ids that both
-    // miss the small LRU cache each pay that full anchor-to-target
-    // replay cost independently — for a trace with hundreds of thousands
-    // to millions of VM steps this dominates total pass runtime, which is
-    // why Step 7 looks disproportionately slow for how little work it
-    // conceptually does per iteration.
-    //
-    // warm_range() does one forward sweep over the whole span up front,
-    // inserting a cached checkpoint every `stride` instructions. Step 7's
-    // state_before() calls then only need to replay at most `stride`
-    // records from the nearest checkpoint instead of the nearest anchor
-    // (which can be much farther away), turning the common case into a
-    // handful of diff replays instead of hundreds.
-    if (!executions.empty()) {
-        uint64_t warm_start = executions.front().dispatch_inst_id;
-        uint64_t warm_end   = executions.back().handler_last_inst_id;
-        // handler_last_inst_id may be 0 (FetchOnly / handler never closed)
-        // or land before dispatch_inst_id in edge cases — fall back to
-        // dispatch_inst_id + 1 so warm_range() always sees a valid range.
-        if (warm_end <= warm_start) warm_end = warm_start + 1;
-        regfile.warm_range(warm_start, warm_end + 1, /*stride=*/0,
-            [&](uint64_t done, uint64_t total) {
-                if (total > 0) {
-                    ctx.progress(0.72f + 0.08f * static_cast<float>(done) /
-                                 static_cast<float>(total));
-                }
-            });
-    }
-    if (ctx.cancelled()) return PassResult::failed("Cancelled");
+    // ── Step 6c: (removed) ──
+    // Previously called regfile.warm_range() to pre-populate the LRU cache.
+    // Now Step 7 uses a RegisterFileCursor (forward-only sequential scan)
+    // which makes warm_range unnecessary — the cursor applies each diff
+    // exactly once, with zero cache lookup overhead.
 
     // ── Step 7: Build VM execution trace (step sequence) ────────────────
+    //
+    // Uses a RegisterFileCursor for O(1)-amortised register state
+    // reconstruction. The cursor advances forward through the trace,
+    // applying each instruction's diffs exactly once. Total cursor work
+    // across all steps = O(N) where N is the trace span, regardless of
+    // how many steps there are or how far apart their inst_ids are.
 
     ctx.progress(0.8f, "VM abstract: building VM step sequence...");
 
     result.steps.reserve(executions.size());
+
+    // Create a forward-only cursor for sequential register state access.
+    // anchor_inst_ids are sorted ascending, so the cursor only moves forward.
+    RegisterFileCursor cursor(ctx.reader(), ctx.index());
+
+    // Helper: read VM-PC value from a pre-fetched register state.
+    // This replaces the read_vm_pc lambda (which called state_before()
+    // internally) and avoids redundant register rebuilds.
+    auto read_vm_pc_with_state = [&](const RegState& state,
+                                      uint64_t inst_id) -> std::optional<uint64_t> {
+        if (vmreg_pc) {
+            if (vmreg_pc->from_host_reg != 0xFF && vmreg_pc->from_host_reg <= 28) {
+                return state.gpr[vmreg_pc->from_host_reg];
+            }
+            uint64_t base = 0;
+            bool base_valid = false;
+            if (config_.vm_register_file->rf_base_reg != 0xFF) {
+                base = state.gpr[config_.vm_register_file->rf_base_reg];
+                base_valid = true;
+            } else if (config_.vm_context.has_value() &&
+                       config_.vm_context->ctx_base_reg != 0xFF) {
+                base = state.gpr[config_.vm_context->ctx_base_reg];
+                base_valid = true;
+            }
+            if (!base_valid) return std::nullopt;
+            uint8_t sz = (vmreg_pc->size > 0 && vmreg_pc->size <= 8)
+                             ? vmreg_pc->size : uint8_t(8);
+            auto mem = memory_ref.read(base + vmreg_pc->offset, sz, inst_id);
+            for (uint8_t b = 0; b < sz; ++b)
+                if (!mem.known[b]) return std::nullopt;
+            uint64_t val = 0;
+            std::memcpy(&val, mem.data.data(), sz);
+            return val;
+        }
+        if (ctx_pc_field && config_.vm_context->ctx_base_reg != 0xFF) {
+            uint64_t base = state.gpr[config_.vm_context->ctx_base_reg];
+            uint8_t sz = (ctx_pc_field->size > 0 && ctx_pc_field->size <= 8)
+                             ? ctx_pc_field->size : uint8_t(8);
+            auto mem = memory_ref.read(base + ctx_pc_field->offset, sz, inst_id);
+            for (uint8_t b = 0; b < sz; ++b)
+                if (!mem.known[b]) return std::nullopt;
+            uint64_t val = 0;
+            std::memcpy(&val, mem.data.data(), sz);
+            return val;
+        }
+        return std::nullopt;
+    };
 
     // ── Rolling key state ────────────────────────────────────────────────
     //
@@ -663,19 +682,19 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         //       has fully executed the opcode-decode stub (e.g. bl 0x885F48 for
         //       the bnlabel VMP), so any decode result in a scratch register
         //       (e.g. x0) reflects the decoded opcode for this step.
+        // ── Advance cursor to dispatch_inst_id ──────────────────────────
+        // This is the primary register-state query for this step.
+        // The cursor advances forward from its previous position,
+        // applying diffs only for the instructions in between.
+        const RegState& state_dispatch = cursor.advance_to(exec.dispatch_inst_id);
+
         if (has_vm_pc) {
-            // VM-PC: read at dispatcher entry — it holds the bytecode pointer
-            // that the dispatcher is about to decode.  Using dispatch_inst_id
-            // is intentional here (it hasn't been advanced yet by this
-            // iteration's fetch logic).
-            auto vpc = read_vm_pc(exec.dispatch_inst_id);
+            // VM-PC: read at dispatcher entry using the cursor's state.
+            auto vpc = read_vm_pc_with_state(state_dispatch, exec.dispatch_inst_id);
             if (vpc) {
                 step.vm_pc_value = *vpc;
                 step.vm_pc_valid = true;
             }
-
-            // state_dispatch is needed below for opcode decode and ctx/regs.
-            auto state_dispatch = regfile.state_before(exec.dispatch_inst_id);
 
             if (config_.opcode_format.has_value()) {
                 auto& ofmt = *config_.opcode_format;
@@ -688,11 +707,12 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                 // header where the stub hasn't run yet.
                 if (ofmt.opcode_from_reg != 0xFF) {
                     if (exec.handler_first_inst_id != 0) {
-                        auto state_handler = regfile.state_before(
-                            exec.handler_first_inst_id);
+                        // Advance cursor to handler_first_inst_id (forward-only,
+                        // just a few instructions ahead of dispatch_inst_id).
+                        const RegState& state_handler =
+                            cursor.advance_to(exec.handler_first_inst_id);
                         step.opcode_value = state_handler.gpr[ofmt.opcode_from_reg];
                     } else {
-                        // Fallback: no handler_first recorded, use dispatch state
                         step.opcode_value = state_dispatch.gpr[ofmt.opcode_from_reg];
                     }
                     step.opcode_valid = true;
@@ -820,20 +840,15 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
         // which is exactly the state left by the PREVIOUS handler — i.e., the
         // VM register file contents that the current step's handler will see
         // as its inputs.  This is the correct semantic for a VM-register panel.
+        // state_dispatch was already obtained from the cursor above.
+        // Use it directly for ctx/register/operand reads — no redundant
+        // state_before() call needed.
         bool need_ctx_state = (config_.vm_context.has_value() &&
                                config_.vm_context->ctx_base_reg != 0xFF) ||
                               config_.vm_register_file.has_value() ||
                               config_.operand_format.has_value();
-        // Use the state already fetched by VM-PC block, or fetch it now.
-        // We re-fetch unconditionally when needed; RegisterFile caches states,
-        // so a second call with the same inst_id is an O(1) LRU hit.
-        const RegState* p_state_dispatch = nullptr;
-        RegState lazy_state_dispatch;
-        if (need_ctx_state) {
-            // Always fetch (LRU cache hit if VM-PC block already fetched it).
-            lazy_state_dispatch = regfile.state_before(exec.dispatch_inst_id);
-            p_state_dispatch = &lazy_state_dispatch;
-        }
+        const RegState* p_state_dispatch = &state_dispatch;
+        (void)need_ctx_state;  // state_dispatch is always available from cursor
 
         // Decode VM context structure fields if hint provided
         if (config_.vm_context.has_value() && config_.vm_context->ctx_base_reg != 0xFF) {
