@@ -11,12 +11,14 @@ Analysis 层把 IO / Core 提供的底层能力组织成可组合的分析 pass�
 
 | 对象 | 文件 | 职责 |
 |------|------|------|
-| `AnalysisPass` | `pass_manager.h` | 每个分析能力的统一抽象 |
+| `AnalysisPass` | `pass_manager.h` | 每个分析能力的统一抽象；`declare_scan()` 声明式注册扫描需求 |
 | `PassContext` | `pass_manager.h` | 向 pass 暴露 reader / index / regfile / memory / decoder / range / progress |
 | `PassResult` | `pass_manager.h` | 类型擦除结果容器，承载成功 / 失败 / 跳过状态 |
 | `PassManager` | `pass_manager.{h,cpp}` | 注册、依赖解析、执行、缓存、并发调度 |
 | `TraceCollector` | `trace_collector.h` | 扫描型 pass 的回调接口 |
 | `TraceScanEngine` | `trace_collector.{h,cpp}` | 单遍广播、并行分片、collector 融合扫描 |
+| `ScanOrchestrator` | `infra/scan_orchestrator.{h,cpp}` | 声明式扫描编排：收集 declare_scan 声明 → 单次 trace 遍历服务所有 collector |
+| `ScanDeclaration` | `infra/scan_orchestrator.h` | 扫描声明：pass 名 + collector 指针 + 是否并行 |
 | `pass_catalog()` | `pass_registry.cpp` | pass 名单、分类、默认 UI 集合、工厂入口 |
 
 ## 分析层的工作方式
@@ -27,10 +29,10 @@ flowchart TD
     B --> C{是否已缓存?}
     C -- yes --> D[返回 PassResult]
     C -- no --> E[递归注册/执行依赖]
-    E --> F{扫描型 pass?}
-    F -- yes --> G[TraceScanEngine 单遍广播]
+    E --> F{扫描型 pass\nhas_scan() == true?}
+    F -- yes --> G[declare_scan → ScanOrchestrator\n单次扫描服务所有 collector]
     F -- no --> H[直接调用 pass.run(ctx)]
-    G --> I[finish_scan 提取结果]
+    G --> I[run() 中读取 collector 结果]
     H --> I
     I --> J[缓存到 PassEntry]
     J --> D
@@ -43,17 +45,55 @@ flowchart TD
 - 先看 `PassEntry` 是否已有结果。
 - 如果没有，则按 `dependencies()` 递归要求上游 pass。
 - 用原子状态机避免重复执行。
+- **对于 `has_scan() == true` 的 pass**：如果尚未扫描，创建临时 `ScanOrchestrator`，调用 `declare_scan()` 注册 collector，然后执行单次扫描。`run()` 中直接读取 collector 结果。
 - 适合 GUI 点一下某面板、CLI 只跑一个能力、MCP 单次调用等按需分析场景。
 
 ### `run_all(num_threads)`
 
-- 第一阶段做 **Scan Fusion**：把同层、可扫描融合的 pass 共享一次 trace 遍历。
-- 第二阶段按 DAG 层级并行调度剩余 pass。
+- **Phase 1 — 声明**：遍历所有已注册 pass，调用 `declare_scan()`，将 collector 需求注册到 `ScanOrchestrator`。
+- **Phase 2 — 统一扫描**：如果 `ScanOrchestrator` 有声明，创建一个共享 `TraceScanEngine`，将所有 collector 挂载，单次 `run()`/`run_parallel()` 遍历 trace，结果广播给所有 collector。
+- **Phase 3 — DAG 并行执行**：按依赖 DAG 层级并行调度各 pass 的 `run()`，`run()` 只需从 collector 读取结果（扫描已在 Phase 2 完成）。
 - 适合 UI 启动阶段或需要预热一批默认 pass 的场景。
 
 ## TraceScanEngine 与 Scan Fusion
 
-多个 pass 本质上都只是“扫一遍 trace 再统计”。如果每个 pass 各扫一次，IO 成本会线性叠加。
+多个 pass 本质上都只是"扫一遍 trace 再统计"。如果每个 pass 各扫一次，IO 成本会线性叠加。
+
+### 声明式扫描模型
+
+扫描型 pass 不再自己创建 `TraceScanEngine`，而是通过 `declare_scan()` 声明需求，由框架统一编排扫描：
+
+1. **Pass 声明**：覆写 `declare_scan(ScanOrchestrator& orch, PassContext& ctx)`，构造自己的 `Collector` 并调用 `orch.declare({name(), collector_, false})`。
+2. **框架扫描**：`ScanOrchestrator` 将所有 collector 挂载到一个共享 `TraceScanEngine`，执行单次 `run()`/`run_parallel()`。
+3. **Pass 读结果**：`run()` 中从 `collector_->take_result()` 提取结果，不再自建 engine。
+
+### 已迁移的扫描型 Pass
+
+| Pass | Collector | 并行 | 备注 |
+|------|-----------|------|------|
+| `thread` | `ThreadCollector` | ❌ | 线程切换统计 |
+| `cfg` | `CfgCollector` | ❌ | 依赖 xref，通过 `try_require` 获取 |
+| `pattern` | `PatternCollector` | ❌ | 内嵌常量链识别 |
+| `function` | `FunctionCollector` | ❌ | 进度/取消回调在 declare_scan 设置 |
+| `memory_strings` | `MemoryStringCollector` | ❌ | 时间感知字符串恢复 |
+| `strings` | `StringCollector` | ❌ | 最终快照字符串 |
+| `syscall_intercept` | `SyscallInterceptCollector` | ❌ | 三路数据源 (CAPICALL/SVC/XFER_CALL) |
+| `window_stats` | `WindowStatsCollector` | ❌ | 滑动窗口统计 |
+
+### 关键约定
+
+- `has_scan()` 必须返回 `true`（框架据此判断是否走 Scan Fusion 路径）。
+- `collector_` 为 `unique_ptr` 成员，在 `declare_scan()` 中构造。
+- `run()` 首先检查 `collector_` 是否为空（缓存命中时 `collector_.reset()`，空则返回 `PassResult::failed`）。
+- 缓存命中路径：反序列化结果 → `collector_.reset()` → `run()` 检测到空 collector → 直接返回缓存结果。
+
+### 排除范围过滤（`--exclude-range`）
+
+- `--exclude-range <start_hex> <end_hex>` 可重复指定，运行时地址。
+- PC 落入排除区间的指令不会传递给分析 pass（visibility filter）。
+- `RegisterFile` 和 `MemoryModel` 的状态重建不受影响——它们仍回放所有记录。
+- 实现在 `TraceScanEngine`（覆盖大多数 pass）和 `XrefPass` 的自定义扫描器中。
+- 典型用法：先录制完整 trace，再在离线分析时逐步排除噪声区间。
 
 ### TraceCollector 接口
 
@@ -68,25 +108,10 @@ Collector 可按记录类型覆写回调：
 - `on_thread()`
 - `on_event()`
 
-### 融合扫描
-
-- pass 通过 `prepare_scan()` 返回自己的 collector。
-- `PassManager::run_fused_scans()` 把同层 collector 挂到同一个 `TraceScanEngine`。
-- 引擎只扫一遍 trace，依次广播给所有 collector。
-- pass 再通过 `finish_scan()` 把 collector 内部状态转换成 `PassResult`。
-
 ### 并行分片
 
 - 如果 collector 声明 `supports_parallel()` 且支持 `clone()` / `merge()`，引擎会按 ANCHOR 边界切分并行扫描。
 - 典型受益者：`xref` 这类大范围统计型 pass。
-
-### 排除范围过滤（`--exclude-range`）
-
-- `--exclude-range <start_hex> <end_hex>` 可重复指定，运行时地址。
-- PC 落入排除区间的指令不会传递给分析 pass（visibility filter）。
-- `RegisterFile` 和 `MemoryModel` 的状态重建不受影响——它们仍回放所有记录。
-- 实现在 `TraceScanEngine`（覆盖大多数 pass）和 `XrefPass` 的自定义扫描器中。
-- 典型用法：先录制完整 trace，再在离线分析时逐步排除噪声区间。
 
 ## Pass 分类总览
 
@@ -704,7 +729,7 @@ loop_semantics --> algorithm_summary
 
 ## 写新 pass 的建议
 
-### 最小模板
+### 最小模板（非扫描型 pass）
 
 ```cpp
 class MyPass final : public AnalysisPass {
@@ -723,9 +748,33 @@ public:
 };
 ```
 
+### 扫描型 pass 模板（声明式 Scan Fusion）
+
+```cpp
+class MyScanPass final : public AnalysisPass {
+public:
+    std::string_view name() const override { return "my_scan_pass"; }
+    std::string_view description() const override { return "..."; }
+    bool has_scan() const override { return true; }
+
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override {
+        collector_ = std::make_unique<MyCollector>(...);  // 从 ctx 获取构造参数
+        orch.declare({name(), collector_.get(), false});   // false = 不支持并行
+    }
+
+    PassResult run(PassContext& ctx) override {
+        if (!collector_) return PassResult::failed("no collector (cached)");
+        return PassResult::success(std::move(collector_->take_result()));
+    }
+
+private:
+    std::unique_ptr<MyCollector> collector_;
+};
+```
+
 ### 什么时候做扫描融合
 
-优先考虑给这类 pass 实现 `prepare_scan()` / `finish_scan()`：
+优先考虑给这类 pass 实现 `declare_scan()` + `has_scan() = true`：
 
 - 只是顺序扫一遍 trace 做统计
 - 不依赖复杂上游结果
