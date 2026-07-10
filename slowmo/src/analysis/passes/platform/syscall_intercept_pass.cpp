@@ -1273,12 +1273,26 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
     call.decoded_summary = std::move(summary);
 }
 
+// ─── SyscallInterceptPass::declare_scan ──────────────────────────────────
+
+void SyscallInterceptPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& code_table = ctx.code_table();
+    auto& memory = ctx.memory();
+    auto& reader = ctx.reader();
+
+    // Optional: get ObjC messages for context annotation.
+    // try_require only checks the cache — it does NOT trigger execution.
+    const ObjcResult* objc = ctx.try_require<ObjcResult>("objc");
+
+    collector_ = std::make_unique<SyscallInterceptCollector>(
+        config_, code_table, memory, objc,
+        static_cast<uint32_t>(reader.header().target_os));
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── SyscallInterceptPass::run ────────────────────────────────────────────
 
 PassResult SyscallInterceptPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
-    const auto& code_table = ctx.code_table();
-
     // ── Fast path: load from persisted cache ──────────────────────────────
     // Only cache when default config (no extra_api_names, no intercept_unresolved)
     // to keep the cache key unambiguous.
@@ -1290,6 +1304,7 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
         if (ctx.index().load_pass_blob("syscall_intercept", blob)) {
             SyscallInterceptResult cached;
             if (syscall_intercept_deserialize(blob, cached)) {
+                collector_.reset();  // not needed, free memory
                 ctx.progress(1.0f, fmt::format(
                     "syscall_intercept: {} calls ({} unique callees) (from cache)",
                     cached.calls.size(), cached.by_callee.size()));
@@ -1298,30 +1313,14 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
         }
     }
 
-    // Optional: get ObjC messages for context annotation.
-    const ObjcResult* objc = ctx.try_require<ObjcResult>("objc");
-
-    ctx.progress(0.01f, "syscall_intercept: scanning trace...");
-
-    SyscallInterceptCollector collector(config_, code_table, ctx.memory(), objc,
-                                       static_cast<uint32_t>(reader.header().target_os));
-
-    {
-        auto& index = ctx.index();
-        uint64_t total_insts = index.inst_count();
-        TraceScanEngine local_engine(reader, total_insts, &index);
-        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                ctx.progress(std::min(0.99f,
-                    static_cast<float>(processed) / static_cast<float>(total)));
-            }
-        });
-        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        local_engine.add_collector(&collector);
-        local_engine.run();
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
     }
 
-    auto result = collector.take_result();
+    ctx.progress(0.01f, "syscall_intercept: extracting results...");
+
+    auto result = collector_->take_result();
 
     // ── Persist result for future sessions ───────────────────────────────
     if (is_default_cfg && ctx.range().is_full_trace()) {

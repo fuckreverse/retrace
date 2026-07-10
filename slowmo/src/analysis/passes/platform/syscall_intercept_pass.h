@@ -2,12 +2,14 @@
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <optional>
 #include <array>
+#include <memory>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -279,11 +281,14 @@ public:
         return {};
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 4.0f; }
 
 private:
     SyscallInterceptConfig config_;
+    std::unique_ptr<SyscallInterceptCollector> collector_;
 };
 
 }  // namespace tenet
