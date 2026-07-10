@@ -158,9 +158,9 @@ struct TraceBenchResult {
     // Memory query latency
     LatencyStats mem_read_latency;
 
-    // Cache stats
-    uint64_t regfile_cache_hits = 0;
-    uint64_t regfile_cache_misses = 0;
+    // Checkpoint stats
+    uint64_t regfile_ckpt_queries = 0;
+    uint64_t regfile_ckpt_fallbacks = 0;
     uint64_t mem_cache_hits = 0;
     uint64_t mem_rocksdb_reads = 0;
 
@@ -197,10 +197,10 @@ struct TraceBenchResult {
         j["mem_read_latency"] = mem_read_latency.to_json();
 
         j["cache_stats"] = {
-            {"regfile_hits", regfile_cache_hits},
-            {"regfile_misses", regfile_cache_misses},
-            {"regfile_hit_rate", (regfile_cache_hits + regfile_cache_misses > 0)
-                ? (double)regfile_cache_hits / (regfile_cache_hits + regfile_cache_misses)
+            {"regfile_ckpt_queries", regfile_ckpt_queries},
+            {"regfile_ckpt_fallbacks", regfile_ckpt_fallbacks},
+            {"regfile_fallback_rate", (regfile_ckpt_queries > 0)
+                ? (double)regfile_ckpt_fallbacks / (double)regfile_ckpt_queries
                 : 0.0},
             {"mem_cache_hits", mem_cache_hits},
             {"mem_rocksdb_reads", mem_rocksdb_reads},
@@ -350,17 +350,15 @@ static TraceBenchResult benchmark_trace(const fs::path& trace_path,
 
         result.seek_latency = LatencyStats::from_samples(latencies);
         auto cs = regfile.cache_stats();
-        result.regfile_cache_hits = cs.hits;
-        result.regfile_cache_misses = cs.misses;
+        result.regfile_ckpt_queries   = cs.ckpt_queries;
+        result.regfile_ckpt_fallbacks = cs.ckpt_fallbacks;
 
         if (cfg.verbose) {
             fmt::print(stderr, "  Seek ({} samples): p50={:.1f}us p95={:.1f}us p99={:.1f}us\n",
                        cfg.seek_samples, result.seek_latency.p50_us,
                        result.seek_latency.p95_us, result.seek_latency.p99_us);
-            fmt::print(stderr, "    Cache: {}/{} hits ({:.1f}%)\n",
-                       cs.hits, cs.hits + cs.misses,
-                       (cs.hits + cs.misses > 0)
-                           ? 100.0 * cs.hits / (cs.hits + cs.misses) : 0.0);
+            fmt::print(stderr, "    Checkpoints: {} queries / {} fallbacks\n",
+                       result.regfile_ckpt_queries, result.regfile_ckpt_fallbacks);
         }
     }
 

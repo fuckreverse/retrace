@@ -163,18 +163,11 @@ PYBIND11_MODULE(_core, m) {
              "Get register state BEFORE instruction inst_id")
         .def("state_after",  &RegisterFile::state_after,  py::arg("inst_id"),
              "Get register state AFTER instruction inst_id")
-        .def("warm_range",
-            [](RegisterFile& rf, uint64_t start, uint64_t end, uint64_t stride) {
-                rf.warm_range(start, end, stride);
-            },
-            py::arg("start"), py::arg("end"), py::arg("stride") = 0,
-            "Pre-populate LRU cache for [start, end)")
         .def("cache_stats", [](const RegisterFile& rf) {
             auto s = rf.cache_stats();
             py::dict d;
-            d["hits"]   = s.hits;
-            d["misses"] = s.misses;
-            d["warm_samples"] = s.warm_samples;
+            d["ckpt_queries"]   = s.ckpt_queries;
+            d["ckpt_fallbacks"] = s.ckpt_fallbacks;
             return d;
         });
 

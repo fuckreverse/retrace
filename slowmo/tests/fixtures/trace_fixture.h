@@ -146,6 +146,10 @@ inline std::unique_ptr<TraceEnv> make_env(
 
     // ── Create RegisterFile + MemoryModel ───────────────────────────────
     env->regfile = std::make_unique<RegisterFile>(*env->reader, *env->index);
+    // Eagerly build the dense checkpoint array so state_before()/state_after()
+    // queries exercise the checkpoint fast path — mirrors production, where
+    // PassManager::init_infra() calls CheckpointManager::ensure_checkpoints().
+    env->regfile->build_checkpoints();
     // Use RocksDB-backed MemoryModel so WatchBreakpoint and mem_write CF
     // queries work correctly in tests.  The DB is owned by TraceIndex.
     env->memory  = std::make_unique<MemoryModel>(

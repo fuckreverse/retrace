@@ -132,9 +132,9 @@ namespace {  // ─── Helpers ───────────────�
 /// majority-vote counter check below (see COUNTER_PATTERN_MIN_AGREEMENT and
 /// its use in the active/invariant register classification loop) tolerates
 /// one such outlier pair while still being cheap: state_before() calls are
-/// pre-warmed in bulk beforehand (see warm_range() call site), so the
-/// incremental cost of 2 extra samples per loop is a handful of additional
-/// O(1) cache hits, not additional random trace I/O.
+/// served by the eager dense checkpoint array (built at init_infra()), so
+/// the incremental cost of 2 extra samples per loop is a handful of
+/// additional O(K) checkpoint replays, not additional random trace I/O.
 constexpr uint32_t MAX_SAMPLE_ITERATIONS = 5;
 
 /// Minimum fraction of consecutive sample pairs that must show a ±1 step for

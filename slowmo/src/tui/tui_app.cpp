@@ -1875,7 +1875,8 @@ int TuiApp::batch_mode(uint64_t start_id, uint64_t count, bool show_regs, bool s
                    state.fp(), state.lr(), state.sp());
         fmt::print("  pc =0x{:016x}  nzcv={}\n", state.pc(), state.nzcv());
         auto stats = regfile_.cache_stats();
-        fmt::print("\n  Cache stats: hits={} misses={}\n", stats.hits, stats.misses);
+        fmt::print("\n  Checkpoint stats: queries={} fallbacks={}\n",
+                   stats.ckpt_queries, stats.ckpt_fallbacks);
     }
 
     return 0;

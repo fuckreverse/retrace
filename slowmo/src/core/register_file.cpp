@@ -226,30 +226,14 @@ RegisterFile::RegisterFile(const TraceReader& reader, const TraceIndex& index)
 RegState RegisterFile::state_before(uint64_t inst_id) {
     TENET_ZONE;
 
-    // Fast path: dense checkpoint array (lock-free, immutable after build)
-    if (checkpoints_built_.load(std::memory_order_acquire)) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cache_stats_.ckpt_queries++;
-        }
-        return state_before_ckpt(inst_id);
+    // Checkpoint array is immutable after build — lock-free read.
+    // If not built yet (e.g. GUI thread queries before init_infra() completes),
+    // return empty state.
+    if (!checkpoints_built_.load(std::memory_order_acquire)) {
+        return RegState{};
     }
-
-    // Fallback: LRU cache + anchor replay
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (auto cached = cache_.get(inst_id)) {
-            cache_stats_.hits++;
-            return cached->get();
-        }
-        cache_stats_.misses++;
-    }
-
-    RegState state = rebuild(inst_id);
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    cache_.put(inst_id, state);
-    return state;
+    counters_.ckpt_queries.fetch_add(1, std::memory_order_relaxed);
+    return state_before_ckpt(inst_id);
 }
 
 RegState RegisterFile::state_after(uint64_t inst_id) {
@@ -286,194 +270,29 @@ RegState RegisterFile::state_after(uint64_t inst_id) {
     return state;
 }
 
-void RegisterFile::warm_at(uint64_t inst_id) {
-    bool cached;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        cached = static_cast<bool>(cache_.get(inst_id));
-    }
-    if (!cached) {
-        RegState state = rebuild(inst_id);
-        std::lock_guard<std::mutex> lock(mutex_);
-        cache_.put(inst_id, state);
-        cache_stats_.warm_samples++;
-    }
-}
+RegState RegisterFile::state_before_ckpt(uint64_t inst_id) {
+    if (checkpoints_.empty()) return RegState{};
 
-void RegisterFile::warm_range(uint64_t start_id, uint64_t end_id,
-                               uint64_t stride,
-                               std::function<void(uint64_t, uint64_t)> progress) {
-    // Clamp end_id to the actual trace length.
-    const uint64_t total_insts = index_.inst_count();
-    if (end_id == UINT64_MAX || end_id > total_insts) {
-        end_id = total_insts;
-    }
-    if (start_id >= end_id) {
-        return;
+    uint64_t idx = inst_id / ckpt_stride_;
+
+    if (idx >= checkpoints_.size()) {
+        // Out of range — return last checkpoint state (safe, not crash)
+        counters_.ckpt_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return checkpoints_.back().state;
     }
 
-    if (stride == 0) {
-        stride = 256;
+    const auto& ckpt = checkpoints_[idx];
+    RegState state = ckpt.state;  // copy
+
+    uint64_t base_id = idx * ckpt_stride_;
+    if (inst_id == base_id) {
+        return state;  // exact checkpoint hit
     }
 
-    uint64_t n_samples = (end_id - start_id + stride - 1) / stride;
-    uint64_t done = 0;
-
-    for (uint64_t id = start_id; id < end_id; id += stride) {
-        bool cached;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cached = static_cast<bool>(cache_.get(id));
-        }
-        if (!cached) {
-            RegState state = rebuild(id);
-            std::lock_guard<std::mutex> lock(mutex_);
-            cache_.put(id, state);
-            cache_stats_.warm_samples++;
-        }
-        ++done;
-        if (progress) {
-            progress(done, n_samples);
-        }
-    }
-}
-
-RegState RegisterFile::rebuild(uint64_t target_id) {
-    RegState state{};
-    const uint32_t num_gpr = reader_.header().num_gpr;
-    const bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
-    const bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
-    const bool is_v7 = (reader_.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
-
-    size_t inst_hdr_size;
-    if (is_v7 && is_v5)      inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
-    else if (is_v7)           inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v7_t);
-    else if (is_v5)           inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_v5_t);
-    else                      inst_hdr_size = sizeof(qbditrace::qbditrace_inst_head_t);
-
-    const size_t memacc_size = is_v6
-        ? sizeof(qbditrace::qbditrace_memacc_v6_t)
-        : sizeof(qbditrace::qbditrace_memacc_t);
-    const size_t anchor_total =
-        sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8
-        + (is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0);
-
-    auto anchor_info = index_.nearest_anchor_before(target_id);
-
-    reader_.pin_all();
-    const uint64_t file_end = reader_.file_size();
-    uint64_t scan_offset = anchor_info.file_offset;
-    const uint8_t* ptr = reader_.data_at(scan_offset);
-
-    if (scan_offset < file_end && ptr[0] == qbditrace::QBDITRACE_REC_ANCHOR) {
-        const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
-        const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
-        uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr);
-        std::memcpy(state.gpr, gpr_ptr, count * 8);
-        if (is_v7) {
-            const uint64_t* fpr_lo = reinterpret_cast<const uint64_t*>(gpr_start + num_gpr * 8);
-            const uint64_t* fpr_hi = fpr_lo + AARCH64_FPR_COUNT;
-            for (uint8_t i = 0; i < AARCH64_FPR_COUNT; ++i) {
-                state.fpr[i].lo = fpr_lo[i];
-                state.fpr[i].hi = fpr_hi[i];
-            }
-        }
-        scan_offset += anchor_total;
-    }
-
-    uint64_t current_inst_id = anchor_info.inst_id;
-
-    while (current_inst_id < target_id && scan_offset < file_end) {
-        ptr = reader_.data_at(scan_offset);
-        const uint8_t kind = ptr[0];
-
-        if (kind == qbditrace::QBDITRACE_REC_INST) {
-            const uint8_t nzcv      = ptr[1];
-            const uint8_t n_regdiff = ptr[2];
-            const uint8_t n_mem     = ptr[3];
-            uint8_t n_fprdiff = 0;
-            if (is_v7 && is_v5) {
-                n_fprdiff = ptr[6];
-            } else if (is_v7) {
-                n_fprdiff = ptr[16];
-            }
-
-            if (is_v5) {
-                int16_t pc_delta;
-                std::memcpy(&pc_delta, ptr + 4, 2);
-                state.gpr[IDX_PC] += static_cast<int64_t>(pc_delta);
-            } else if (is_v7) {
-                std::memcpy(&state.gpr[IDX_PC], ptr + 4, 8);
-            } else {
-                std::memcpy(&state.gpr[IDX_PC], ptr + 8, 8);
-            }
-
-            const uint8_t* diffs = ptr + inst_hdr_size;
-
-            for (uint8_t i = 0; i < n_regdiff; i++) {
-                const auto* d = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(
-                    diffs + i * sizeof(qbditrace::qbditrace_regdiff_t));
-                if (d->reg_index < AARCH64_GPR_COUNT) {
-                    state.gpr[d->reg_index] = d->value;
-                }
-            }
-
-            if (is_v7 && n_fprdiff > 0) {
-                const uint8_t* fpr_diffs = diffs +
-                    n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t);
-                for (uint8_t i = 0; i < n_fprdiff; i++) {
-                    const auto* d = reinterpret_cast<const qbditrace::qbditrace_fprdiff_t*>(
-                        fpr_diffs + i * sizeof(qbditrace::qbditrace_fprdiff_t));
-                    if (d->fpr_index < AARCH64_FPR_COUNT) {
-                        state.fpr[d->fpr_index].lo = d->lo;
-                        state.fpr[d->fpr_index].hi = d->hi;
-                    }
-                }
-            }
-
-            if (nzcv != 0) {
-                state.gpr[IDX_NZCV] = nzcv & 0xF;
-            }
-
-            size_t rec_size = inst_hdr_size
-                + n_regdiff  * sizeof(qbditrace::qbditrace_regdiff_t)
-                + n_fprdiff  * sizeof(qbditrace::qbditrace_fprdiff_t)
-                + n_mem      * memacc_size;
-            scan_offset += rec_size;
-
-            current_inst_id++;
-
-        } else if (kind == qbditrace::QBDITRACE_REC_ANCHOR) {
-            const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
-            const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
-            uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr);
-            std::memcpy(state.gpr, gpr_ptr, count * 8);
-            if (is_v7) {
-                const uint64_t* fpr_lo = reinterpret_cast<const uint64_t*>(gpr_start + num_gpr * 8);
-                const uint64_t* fpr_hi = fpr_lo + AARCH64_FPR_COUNT;
-                for (uint8_t i = 0; i < AARCH64_FPR_COUNT; ++i) {
-                    state.fpr[i].lo = fpr_lo[i];
-                    state.fpr[i].hi = fpr_hi[i];
-                }
-            }
-            scan_offset += anchor_total;
-
-        } else {
-            auto rec = reader_.record_at(scan_offset);
-            rec.is_v7 = is_v7;
-            scan_offset += rec.byte_size(num_gpr);
-        }
-    }
-
-    // Set PC from the target instruction's record
-    auto [target_offset, target_seed_pc] = index_.offset_of_with_pc(target_id, reader_);
-    auto target_rec = reader_.record_at(target_offset, target_seed_pc);
-    if (target_rec.kind == RecordKind::Inst) {
-        state.gpr[IDX_PC] = target_rec.as_inst().pc;
-    }
-
-    reader_.unpin_all();
-    return state;
+    // Replay diffs from base_id to inst_id using a seeded cursor
+    RegisterFileCursor cursor(reader_, index_);
+    cursor.seed(state, base_id, ckpt.file_offset);
+    return cursor.advance_to(inst_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -511,34 +330,6 @@ void RegisterFile::build_checkpoints(uint64_t stride,
     }
 
     checkpoints_built_.store(true, std::memory_order_release);
-
-    // Clear LRU cache to free memory (checkpoints subsume it)
-    std::lock_guard<std::mutex> lock(mutex_);
-    cache_.clear();
-}
-
-RegState RegisterFile::state_before_ckpt(uint64_t inst_id) {
-    uint64_t idx = inst_id / ckpt_stride_;
-    uint64_t base_id = idx * ckpt_stride_;
-
-    if (idx >= checkpoints_.size()) {
-        // Out of range — fallback to rebuild
-        std::lock_guard<std::mutex> lock(mutex_);
-        cache_stats_.ckpt_fallbacks++;
-        return rebuild(inst_id);
-    }
-
-    const auto& ckpt = checkpoints_[idx];
-    RegState state = ckpt.state;  // copy
-
-    if (inst_id == base_id) {
-        return state;  // exact checkpoint hit
-    }
-
-    // Replay diffs from base_id to inst_id using a seeded cursor
-    RegisterFileCursor cursor(reader_, index_);
-    cursor.seed(state, base_id, ckpt.file_offset);
-    return cursor.advance_to(inst_id);
 }
 
 }  // namespace tenet

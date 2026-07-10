@@ -8,6 +8,7 @@
 
 #include "fixtures/trace_fixture.h"
 #include "common/types.h"
+#include "infra/checkpoint_manager.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -140,7 +141,7 @@ TEST_CASE("RegisterFile PC tracking", "[unit][core][register_file]") {
     }
 }
 
-TEST_CASE("RegisterFile cache hits on repeated access", "[unit][core][register_file]") {
+TEST_CASE("RegisterFile repeated state_before is consistent", "[unit][core][register_file]") {
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 1;  // anchor every instruction for fast rebuild
         tw.write_header();
@@ -156,16 +157,14 @@ TEST_CASE("RegisterFile cache hits on repeated access", "[unit][core][register_f
 
     REQUIRE(env != nullptr);
 
-    // First access: cache miss
+    // Two accesses to the same inst_id must return identical results.
     auto s1 = env->regfile->state_before(5);
-    uint64_t misses = env->regfile->cache_stats().misses;
-
-    // Second access to same inst_id: should be a cache hit
     auto s2 = env->regfile->state_before(5);
-    uint64_t hits = env->regfile->cache_stats().hits;
+    REQUIRE(s1.gpr[0] == s2.gpr[0]);
 
-    REQUIRE(hits > 0);
-    REQUIRE(s1.gpr[0] == s2.gpr[0]);  // same result
+    // Both queries were served by the checkpoint array.
+    auto stats = env->regfile->cache_stats();
+    REQUIRE(stats.ckpt_queries >= 2);
 }
 
 // ─── Regression: Bug 2 — RegisterFile::rebuild never updates PC ────────
@@ -233,4 +232,119 @@ TEST_CASE("RegisterFile reconstructs PC without PC in reg_diffs", "[unit][core][
         auto s4 = env->regfile->state_after(4);
         REQUIRE(s4.gpr[0] == 0xEEEEULL);
     }
+}
+
+// ─── Edge cases for the checkpoint-only model ──────────────────────────────
+
+TEST_CASE("RegisterFile empty trace does not crash", "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        // No instructions emitted.
+    }, "regfile_empty");
+
+    REQUIRE(env != nullptr);
+
+    // build_checkpoints() is a no-op for an empty trace (total == 0 guard).
+    // state_before(0) on empty checkpoints returns RegState{}.
+    auto state = env->regfile->state_before(0);
+    REQUIRE(state.gpr[0] == 0);
+}
+
+TEST_CASE("RegisterFile out-of-range returns last checkpoint state", "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        // 10 instructions; x0 increments each.
+        for (int i = 0; i < 10; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::add_imm(0, 0, 1),
+                    {{0, (uint64_t)(i + 1)}, {33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_oor");
+
+    REQUIRE(env != nullptr);
+
+    uint64_t queries_before = env->regfile->cache_stats().ckpt_queries;
+    uint64_t fallbacks_before = env->regfile->cache_stats().ckpt_fallbacks;
+
+    // An inst_id far beyond the trace + checkpoint stride triggers the
+    // out-of-range branch: returns the last checkpoint state, no crash.
+    auto state = env->regfile->state_before(1'000'000);
+
+    REQUIRE(env->regfile->cache_stats().ckpt_queries == queries_before + 1);
+    REQUIRE(env->regfile->cache_stats().ckpt_fallbacks == fallbacks_before + 1);
+    // Returned state is a valid (non-crashing) RegState copy.
+    (void)state;
+}
+
+TEST_CASE("RegisterFile ensure_checkpoints is idempotent", "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        for (int i = 0; i < 5; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::add_imm(0, 0, 1),
+                    {{0, (uint64_t)(i + 1)}, {33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_idempotent");
+
+    REQUIRE(env != nullptr);
+
+    // make_env already built checkpoints via RegisterFile::build_checkpoints();
+    // a CheckpointManager wrapping it must observe that and treat
+    // ensure_checkpoints() as a no-op (no rebuild, no counter reset).
+    CheckpointManager cm(*env->regfile);
+    cm.ensure_checkpoints();
+    REQUIRE(cm.has_checkpoints());
+
+    auto s1 = env->regfile->state_before(2);
+    uint64_t queries_after_first = env->regfile->cache_stats().ckpt_queries;
+    REQUIRE(queries_after_first >= 1);
+    (void)s1;
+
+    cm.ensure_checkpoints();  // no-op
+    REQUIRE(cm.has_checkpoints());
+
+    auto s2 = env->regfile->state_before(2);
+    uint64_t queries_after_second = env->regfile->cache_stats().ckpt_queries;
+    // Counter continued incrementing — the second ensure_checkpoints() did
+    // not reset the array.
+    REQUIRE(queries_after_second == queries_after_first + 1);
+    REQUIRE(s1.gpr[0] == s2.gpr[0]);
+}
+
+TEST_CASE("RegisterFile create_cursor returns working cursor", "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        for (int i = 0; i < 5; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::add_imm(0, 0, 1),
+                    {{0, (uint64_t)(i + 1)}, {33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_cursor");
+
+    REQUIRE(env != nullptr);
+
+    CheckpointManager cm(*env->regfile);
+    RegisterFileCursor cursor = cm.create_cursor();
+
+    // The cursor must reproduce the same state as state_before() for a
+    // forward-only query.
+    const RegState& cursor_state = cursor.advance_to(2);
+    auto ref_state = env->regfile->state_before(2);
+    REQUIRE(cursor_state.gpr[0] == ref_state.gpr[0]);
+    REQUIRE(cursor_state.pc()  == ref_state.pc());
 }

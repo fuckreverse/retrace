@@ -167,11 +167,12 @@ Element RegisterPanel::render() {
         }
     }
 
-    // ── Cache stats ───────────────────────────────────────────────────
+    // ── Checkpoint stats ────────────────────────────────────────────
     reg_lines.push_back(separator());
     auto stats = ctx_.regfile->cache_stats();
-    reg_lines.push_back(text(fmt::format("Cache: {} hits / {} misses",
-                                         stats.hits, stats.misses))
+    reg_lines.push_back(text(fmt::format("Checkpoints: {} queries / {} fallbacks",
+                                         stats.ckpt_queries,
+                                         stats.ckpt_fallbacks))
                         | color(Color::GrayLight));
 
     return vbox(reg_lines) | size(WIDTH, GREATER_THAN, 38) | border;
