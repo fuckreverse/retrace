@@ -52,6 +52,7 @@ void GuiApp::run_trace_diff() {
     pm->set_regfile(&regfile_);
     pm->set_memory(&memory_);
     pm->set_decoder(&decoder_);
+    pm->init_infra();
     pm->register_pass(std::move(pass));
     const auto& res = pm->require("trace_diff");
     if (!res.ok()) return;

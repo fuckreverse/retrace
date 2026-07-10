@@ -68,6 +68,7 @@ void GuiApp::rebuild_reg_timeline(uint8_t reg_idx) {
     pm.set_regfile(&regfile_);
     pm.set_memory(&memory_);
     pm.set_decoder(&decoder_);
+    pm.init_infra();
     pm.register_pass(std::move(pass));
     const auto& result = pm.require("reg_timeline");
     if (!result.ok()) return;
@@ -125,6 +126,7 @@ void GuiApp::run_producer_chain(uint64_t inst_id, uint8_t reg_idx) {
     pm.set_regfile(&regfile_);
     pm.set_memory(&memory_);
     pm.set_decoder(&decoder_);
+    pm.init_infra();
     pm.register_pass(std::move(pass));
     const auto& result = pm.require("backward_taint");
     if (!result.ok()) return;

@@ -679,6 +679,7 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     pm.set_memory(&memory);
     pm.set_decoder(&decoder);
     pm.set_no_parallel_scan(opts.opt_no_parallel_scan);
+    pm.init_infra();
 
     // Apply exclude ranges to analysis
     if (!opts.exclude_pc_ranges.empty()) {

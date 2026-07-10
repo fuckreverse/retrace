@@ -51,6 +51,7 @@ void GuiApp::ensure_pass_manager() {
         pass_manager_->set_decoder(&decoder_);
         pass_manager_->set_regfile(&regfile_);
         pass_manager_->set_memory(&memory_);
+        pass_manager_->init_infra();
     }
 }
 

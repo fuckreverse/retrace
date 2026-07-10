@@ -480,6 +480,10 @@ add_library(tenet_lib STATIC
     src/analysis/pass_manager.cpp
     src/analysis/pass_registry.cpp
     src/analysis/trace_collector.cpp
+    src/infra/scan_orchestrator.cpp
+    src/infra/page_stats.cpp
+    src/infra/string_resolver.cpp
+    src/infra/checkpoint_manager.cpp
     src/analysis/annotation_view.cpp
     src/analysis/passes/taint/taint_pass.cpp
     src/analysis/passes/taint/backward_taint_pass.cpp

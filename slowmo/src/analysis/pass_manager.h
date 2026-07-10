@@ -24,6 +24,12 @@ class MemoryModel;
 class InstructionDecoder;
 class TraceScanEngine;
 
+// Infra layer forward declarations
+class ScanOrchestrator;
+class PageStats;
+class StringResolver;
+class CheckpointManager;
+
 // ─── Pass result ──────────────────────────────────────────────────────────
 
 /// Type-erased result container for pass outputs.
@@ -100,6 +106,12 @@ public:
     RegisterFile& regfile();
     MemoryModel& memory();
     InstructionDecoder& decoder();
+
+    // Infra layer services
+    ScanOrchestrator&  scan_orchestrator();
+    PageStats&         page_stats();
+    StringResolver&    string_resolver();
+    CheckpointManager& checkpoint_manager();
 
     // Pass results (triggers dependency execution if needed)
     template<typename T>
@@ -207,6 +219,10 @@ public:
     void set_regfile(RegisterFile* r) { regfile_ = r; }
     void set_memory(MemoryModel* m)  { memory_ = m; }
     void set_decoder(InstructionDecoder* d) { decoder_ = d; }
+
+    /// Initialize Infra layer services. Must be called AFTER set_reader/set_index/
+    /// set_code_table/set_regfile/set_memory/set_decoder.
+    void init_infra();
 
     /// Set analysis range.
     void set_range(const AnalysisRange& range) { range_ = range; }
@@ -414,6 +430,13 @@ private:
     RegisterFile* regfile_ = nullptr;
     MemoryModel* memory_ = nullptr;
     InstructionDecoder* decoder_ = nullptr;
+
+    // Infra layer services (owned)
+    std::unique_ptr<ScanOrchestrator>  scan_orchestrator_;
+    std::unique_ptr<PageStats>         page_stats_;
+    std::unique_ptr<StringResolver>    string_resolver_;
+    std::unique_ptr<CheckpointManager> checkpoint_manager_;
+
     TraceScanEngine* scan_engine_ = nullptr;
     bool no_parallel_scan_ = false;
 

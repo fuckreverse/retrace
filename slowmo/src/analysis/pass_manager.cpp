@@ -3,6 +3,10 @@
 #include "common/logger.h"
 #include "common/Profiling.h"
 #include "io/index_builder.h"
+#include "infra/scan_orchestrator.h"
+#include "infra/page_stats.h"
+#include "infra/string_resolver.h"
+#include "infra/checkpoint_manager.h"
 
 #include <algorithm>
 #include <cassert>
@@ -25,6 +29,11 @@ CodeTable& PassContext::code_table() { return *manager_.code_table(); }
 RegisterFile& PassContext::regfile() { return *manager_.regfile(); }
 MemoryModel& PassContext::memory()  { return *manager_.memory(); }
 InstructionDecoder& PassContext::decoder() { return *manager_.decoder(); }
+
+ScanOrchestrator&  PassContext::scan_orchestrator()  { return *manager_.scan_orchestrator_; }
+PageStats&         PassContext::page_stats()         { return *manager_.page_stats_; }
+StringResolver&    PassContext::string_resolver()    { return *manager_.string_resolver_; }
+CheckpointManager& PassContext::checkpoint_manager() { return *manager_.checkpoint_manager_; }
 
 const PassResult& PassContext::require_raw(std::string_view pass_name) {
     return manager_.require(pass_name);
@@ -65,6 +74,28 @@ bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan();
 
 PassManager::PassManager() = default;
 PassManager::~PassManager() = default;
+
+void PassManager::init_infra() {
+    // All IO/Core pointers must be set before calling this.
+    if (!reader_ || !index_ || !regfile_ || !memory_) {
+        LOG_WARN_M(::tenet::log::Module::Analysis,
+            "PassManager::init_infra(): IO/Core pointers not fully set — skipping");
+        return;
+    }
+    if (!scan_orchestrator_) {
+        scan_orchestrator_ = std::make_unique<ScanOrchestrator>(
+            *reader_, index_->inst_count(), index_);
+    }
+    if (!page_stats_) {
+        page_stats_ = std::make_unique<PageStats>(*memory_);
+    }
+    if (!string_resolver_) {
+        string_resolver_ = std::make_unique<StringResolver>(*memory_, *page_stats_);
+    }
+    if (!checkpoint_manager_) {
+        checkpoint_manager_ = std::make_unique<CheckpointManager>(*regfile_);
+    }
+}
 
 void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
