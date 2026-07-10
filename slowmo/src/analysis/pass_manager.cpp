@@ -85,6 +85,14 @@ void PassManager::init_infra() {
     if (!checkpoint_manager_) {
         checkpoint_manager_ = std::make_unique<CheckpointManager>(*regfile_);
     }
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        checkpoint_manager_->ensure_checkpoints();
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        LOG_INFO_M(::tenet::log::Module::Analysis,
+            "PassManager::init_infra(): checkpoints built in {:.1f} ms", ms);
+    }
 }
 
 void PassManager::register_pass(std::unique_ptr<AnalysisPass> pass) {

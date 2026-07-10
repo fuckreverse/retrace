@@ -197,6 +197,9 @@ public:
     /// Check if checkpoints are built.
     bool has_checkpoints() const { return checkpoints_built_.load(std::memory_order_acquire); }
 
+    const TraceReader& reader() const { return reader_; }
+    const TraceIndex&  index() const  { return index_; }
+
     struct CacheStats {
         uint64_t hits = 0;
         uint64_t misses = 0;
