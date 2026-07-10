@@ -166,6 +166,7 @@ inline std::unique_ptr<PassManager> make_pm(TraceEnv& env) {
     pm->set_regfile(&*env.regfile);
     pm->set_memory(&*env.memory);
     pm->set_decoder(&env.decoder);
+    pm->init_infra();
     return pm;
 }
 
