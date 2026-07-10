@@ -3,6 +3,7 @@
 #include "io/index_builder.h"
 #include "core/memory_model.h"
 #include "common/entropy.h"
+#include "infra/page_stats.h"
 
 #include <cmath>
 #include <cstring>
@@ -61,6 +62,74 @@ PassResult EntropyPass::run(PassContext& ctx) {
 
     const uint64_t at_id = (cfg_.at_inst_id > 0)
         ? cfg_.at_inst_id : index.inst_count();
+
+    // ── Fast path: if region is page-aligned and covers full pages,
+    //    use pre-computed PageStats entropy instead of re-reading memory.
+    {
+        auto& page_stats = ctx.page_stats();
+        const uint64_t page_size = 4096;
+        bool is_page_aligned = (cfg_.addr % page_size == 0) && (cfg_.size % page_size == 0);
+
+        if (is_page_aligned && !cfg_.compute_timeline) {
+            page_stats.ensure_built();
+
+            EntropyResult result;
+            result.addr = cfg_.addr;
+            result.region_size = cfg_.size;
+
+            // Aggregate entropy from all covered pages
+            double total_entropy_sum = 0.0;
+            uint32_t page_count = 0;
+            uint64_t total_known = 0;
+
+            for (uint64_t offset = 0; offset < cfg_.size; offset += page_size) {
+                uint64_t page_addr = ((cfg_.addr + offset) >> 12) << 12;
+                const PageSummary* ps = page_stats.page(page_addr);
+                if (ps && ps->entropy >= 0.0) {
+                    total_entropy_sum += ps->entropy;
+                    page_count++;
+                    total_known += 4096;  // conservative estimate
+                }
+            }
+
+            result.known_bytes = static_cast<uint32_t>(total_known);
+
+            if (page_count > 0) {
+                result.overall_entropy = static_cast<float>(total_entropy_sum / page_count);
+
+                // Classify based on overall entropy
+                if (total_known < 8) {
+                    result.classification = EntropyResult::Unknown;
+                } else if (result.overall_entropy > 7.5f) {
+                    result.classification = EntropyResult::Encrypted;
+                } else if (result.overall_entropy > 6.0f) {
+                    result.classification = EntropyResult::Compressed;
+                } else if (result.overall_entropy < 4.0f) {
+                    result.classification = EntropyResult::Plaintext;
+                } else if (cfg_.size <= 64) {
+                    result.classification = EntropyResult::KeyMaterial;
+                } else {
+                    result.classification = EntropyResult::Compressed;
+                }
+
+                // Per-block entropy from pages
+                for (uint64_t offset = 0; offset < cfg_.size; offset += cfg_.block_size) {
+                    uint64_t page_addr = ((cfg_.addr + offset) >> 12) << 12;
+                    const PageSummary* ps = page_stats.page(page_addr);
+                    EntropyBlock block;
+                    block.offset = static_cast<uint64_t>(offset);
+                    block.size = std::min(cfg_.block_size, cfg_.size - static_cast<uint32_t>(offset));
+                    block.is_known = (ps && ps->entropy >= 0.0);
+                    block.entropy = ps ? static_cast<float>(ps->entropy) : 0.0f;
+                    result.blocks.push_back(block);
+                }
+
+                ctx.progress(1.0f, "Entropy: complete (PageStats fast path)");
+                return PassResult::success(std::move(result));
+            }
+            // If no page stats available, fall through to slow path
+        }
+    }
 
     EntropyResult result;
     result.addr = cfg_.addr;
