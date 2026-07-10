@@ -976,7 +976,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
     // Cancellation: allow end() to bail out early when user cancels.
     collector.set_cancel_fn([&]() { return ctx.cancelled(); });
 
-    // Use shared scan engine if available; otherwise create a local one.
+    // Scan trace with local engine for FunctionCollector.
     {
         TraceScanEngine local_engine(reader, total_insts, &index);
         if (!ctx.range().exclude_pc_ranges.empty()) {
