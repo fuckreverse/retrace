@@ -1,10 +1,12 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
 #include <vector>
 #include <string>
 #include <array>
+#include <memory>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -87,17 +89,27 @@ struct WindowStatsResult {
 /// Result type: WindowStatsResult
 class WindowStatsPass final : public AnalysisPass {
 public:
-    explicit WindowStatsPass(WindowStatsConfig cfg = {}) : cfg_(std::move(cfg)) {}
+    explicit WindowStatsPass(WindowStatsConfig cfg = {});  // defined in .cpp
+    ~WindowStatsPass() override;  // defined in .cpp where WindowStatsCollector is complete
+    WindowStatsPass(WindowStatsPass&&) noexcept;  // defined in .cpp
+    WindowStatsPass& operator=(WindowStatsPass&&) noexcept;  // defined in .cpp
+    WindowStatsPass(const WindowStatsPass&) = delete;
+    WindowStatsPass& operator=(const WindowStatsPass&) = delete;
 
     std::string_view name() const override { return "window_stats"; }
     std::string_view description() const override {
         return "Sliding window statistics (mnemonic distribution, memory hotspots, etc.)";
     }
     std::vector<std::string_view> dependencies() const override { return {}; }
+
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 5.0f; }
 
 private:
+    class WindowStatsCollector;  // forward declare (defined in .cpp)
+    std::unique_ptr<WindowStatsCollector> collector_;
     WindowStatsConfig cfg_;
 };
 

@@ -1,5 +1,6 @@
 #include "analysis/passes/profile/window_stats_pass.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -13,6 +14,23 @@
 #include <cmath>
 
 namespace tenet {
+
+// ─── WindowStatsPass lifecycle (must be defined where WindowStatsCollector is complete) ──
+
+WindowStatsPass::WindowStatsPass(WindowStatsConfig cfg) : cfg_(std::move(cfg)) {}
+
+WindowStatsPass::~WindowStatsPass() = default;
+
+WindowStatsPass::WindowStatsPass(WindowStatsPass&& o) noexcept
+    : collector_(std::move(o.collector_)), cfg_(std::move(o.cfg_)) {}
+
+WindowStatsPass& WindowStatsPass::operator=(WindowStatsPass&& o) noexcept {
+    if (this != &o) {
+        collector_ = std::move(o.collector_);
+        cfg_ = std::move(o.cfg_);
+    }
+    return *this;
+}
 
 // ─── WindowStatsResult serialization helpers ──────────────────────────────
 //
@@ -153,7 +171,7 @@ inline OpcodeInfo classify_opcode(uint32_t opcode) noexcept {
 // ─── WindowStatsCollector ─────────────────────────────────────────────────
 
 /// Sequential TraceCollector that accumulates per-window statistics.
-class WindowStatsCollector final : public TraceCollector {
+class WindowStatsPass::WindowStatsCollector final : public TraceCollector {
 public:
     WindowStatsCollector(const WindowStatsConfig& cfg,
                          CodeTable& code_table,
@@ -366,12 +384,22 @@ private:
     WindowStatsResult result_;
 };
 
+// ─── WindowStatsPass::declare_scan ────────────────────────────────────────
+
+void WindowStatsPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& code_table = ctx.code_table();
+    auto& index = ctx.index();
+    uint64_t total_insts = index.inst_count();
+
+    collector_ = std::make_unique<WindowStatsCollector>(
+        cfg_, code_table, total_insts, &ctx.decoder());
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── WindowStatsPass::run ─────────────────────────────────────────────────
 
 PassResult WindowStatsPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
     auto& index = ctx.index();
-    auto& code_table = ctx.code_table();
 
     const uint64_t total_insts = index.inst_count();
     if (total_insts == 0) {
@@ -390,6 +418,7 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
         if (index.load_pass_blob("window_stats", blob)) {
             WindowStatsResult cached;
             if (window_stats_deserialize(blob, cached)) {
+                collector_.reset();  // no scan needed on cache hit
                 ctx.progress(1.0f, fmt::format(
                     "WindowStats: {} windows (from cache)", cached.windows.size()));
                 return PassResult::success(std::move(cached));
@@ -397,27 +426,16 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
         }
     }
 
-    ctx.progress(0.0f, "WindowStats: computing sliding window metrics...");
-
-    WindowStatsCollector collector(cfg_, code_table, total_insts, &ctx.decoder());
-
-    {
-        TraceScanEngine local_engine(reader, total_insts, &index);
-        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-            }
-        });
-        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        local_engine.add_collector(&collector);
-        local_engine.run();
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
     }
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
 
-    auto result = collector.take_result();
+    auto result = collector_->take_result();
 
     // ── Persist result for future sessions ───────────────────────────────
     if (is_default_cfg && ctx.range().is_full_trace()) {
