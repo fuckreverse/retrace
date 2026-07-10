@@ -267,13 +267,8 @@ void ThreadPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 // ─── ThreadPass::run ─────────────────────────────────────────────────────────
 
 PassResult ThreadPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
     auto& index = ctx.index();
     const auto& range = ctx.range();
-
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
     if (range.is_full_trace()) {
