@@ -603,9 +603,12 @@ static McpHttpEnv& shared_env() {
 
         // Bind to port 0 — OS assigns an ephemeral port atomically.
         // No TOCTOU race: the server socket stays open.
+        // Session management is explicitly enabled so that the Mcp-Session-Id
+        // header is issued/checked — the tests below rely on it.
         McpHttpConfig cfg;
         cfg.host = "127.0.0.1";
         cfg.port = 0;
+        cfg.require_session = true;
         if (!result.mcp->start_http(cfg))
             throw std::runtime_error("Failed to start HTTP server");
 
