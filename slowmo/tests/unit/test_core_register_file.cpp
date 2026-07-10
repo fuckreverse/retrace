@@ -1,8 +1,9 @@
 /*
  * test_core_register_file.cpp — Unit tests for tenet::RegisterFile
  *
- * Verifies: anchor-based state reconstruction, register diff replay,
- * state_before/state_after semantics, and LRU cache behavior.
+ * Verifies: checkpoint-based state reconstruction, register diff replay,
+ * state_before/state_after semantics, and edge cases (empty trace,
+ * out-of-range, idempotent build, cursor factory).
  */
 #include <catch2/catch_test_macros.hpp>
 

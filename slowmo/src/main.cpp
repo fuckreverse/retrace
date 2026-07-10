@@ -295,6 +295,12 @@ if (!trace_lock && lock_holder.pid != 0) {
 
     // ─── Initialize RegisterFile and MemoryModel ──────────────────────────
     RegisterFile regfile(reader, index);
+    // Eagerly build the dense checkpoint array so state_before()/state_after()
+    // queries work immediately for all UI modes (GUI/TUI/batch), even before
+    // any analysis triggers PassManager::init_infra(). init_infra()'s
+    // CheckpointManager::ensure_checkpoints() sees has_checkpoints() == true
+    // and skips the rebuild.
+    regfile.build_checkpoints();
     // Use RocksDB-backed MemoryModel for full memory read/write indexing.
     // This enables resolving pointer dereferences (e.g. ObjC selector strings,
     // NSData bytes) that were written by uninstrumented shared-cache code.

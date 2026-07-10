@@ -310,6 +310,9 @@ static TraceBenchResult benchmark_trace(const fs::path& trace_path,
 
     // ── 5. Initialize core layers ────────────────────────────────────────
     RegisterFile regfile(reader, index);
+    // Build checkpoints so seek latency measures the real O(K) checkpoint
+    // replay path, not the empty-state early return.
+    regfile.build_checkpoints();
     InstructionDecoder decoder;
     decoder.init();
 

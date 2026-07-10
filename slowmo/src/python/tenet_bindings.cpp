@@ -163,6 +163,12 @@ PYBIND11_MODULE(_core, m) {
              "Get register state BEFORE instruction inst_id")
         .def("state_after",  &RegisterFile::state_after,  py::arg("inst_id"),
              "Get register state AFTER instruction inst_id")
+        .def("build_checkpoints", &RegisterFile::build_checkpoints,
+             py::arg("stride") = 0,
+             "Build dense checkpoint array for O(K) random-access queries. "
+             "Must be called before state_before()/state_after() return meaningful results.")
+        .def("has_checkpoints", &RegisterFile::has_checkpoints,
+             "Check if the checkpoint array is built.")
         .def("cache_stats", [](const RegisterFile& rf) {
             auto s = rf.cache_stats();
             py::dict d;
