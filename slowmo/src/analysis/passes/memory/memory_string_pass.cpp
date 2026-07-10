@@ -390,12 +390,16 @@ std::string MemoryStringPass::deep_probe_string(MemoryModel& memory,
 
 // ─── Pass implementation ──────────────────────────────────────────────────
 
+void MemoryStringPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& code_table = ctx.code_table();
+    collector_ = std::make_unique<MemoryStringCollector>(code_table, config_);
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 PassResult MemoryStringPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
     auto& index = ctx.index();
     auto& memory = ctx.memory();
     auto& regfile = ctx.regfile();
-    auto& code_table = ctx.code_table();
 
     const auto& range = ctx.range();
     uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
@@ -418,6 +422,7 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         if (index.load_pass_blob("memory_strings", blob)) {
             MemoryStringResult cached;
             if (memory_string_deserialize(blob, cached)) {
+                collector_.reset();
                 ctx.progress(1.0f, fmt::format(
                     "Done: {} strings ({} unique) (from cache)",
                     cached.total(), cached.unique_count()));
@@ -426,26 +431,14 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         }
     }
 
-    ctx.progress(0.0f, "Scanning call sites for strings");
-
-    // ─── Phase 1: collect call sites via collector ─────────────────────────
-    MemoryStringCollector collector(code_table, config_);
-
-    {
-        uint64_t total_insts = index.inst_count();
-        TraceScanEngine local_engine(reader, total_insts, &index);
-        local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-            if (total > 0) {
-                // Phase 1 = first 30% of progress
-                ctx.progress(static_cast<float>(processed) / static_cast<float>(total) * 0.3f);
-            }
-        });
-        local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-        local_engine.add_collector(&collector);
-        local_engine.run();
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
     }
 
-    const auto& call_sites = collector.call_sites();
+    ctx.progress(0.3f, "Scanning call sites for strings");
+
+    const auto& call_sites = collector_->call_sites();
 
     // ─── Phase 2: analyze each call site with regfile + memory ────────────
     MemoryStringResult result;

@@ -4,7 +4,9 @@
 #include "analysis/trace_collector.h"
 #include "analysis/passes/memory/string_pass.h"  // reuse StringRef, StringResult types
 #include "core/memory_model.h"            // MemoryModel::RegionReadResult
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -195,6 +197,8 @@ public:
         return {};  // Standalone — uses raw trace + memory model + register file
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 8.0f; }
 
@@ -239,6 +243,7 @@ private:
                                    const std::string& current_content);
 
     MemoryStringConfig config_;
+    std::unique_ptr<MemoryStringCollector> collector_;
 };
 
 }  // namespace tenet
