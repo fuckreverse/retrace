@@ -1,9 +1,11 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
 #include <cstdint>
 #include <vector>
 #include <map>
+#include <memory>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -239,8 +241,66 @@ public:
         return { "xref" };
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 8.0f; }
-};
 
+private:
+    // ─── Edge key type for edge count map ────────────────────────────────
+    struct EdgeKey {
+        uint64_t from_block;
+        uint64_t to_block;
+        bool operator==(const EdgeKey& o) const {
+            return from_block == o.from_block && to_block == o.to_block;
+        }
+    };
+    struct EdgeKeyHash {
+        size_t operator()(const EdgeKey& k) const {
+            size_t h1 = std::hash<uint64_t>{}(k.from_block);
+            size_t h2 = std::hash<uint64_t>{}(k.to_block);
+            return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        }
+    };
+    using EdgeCountMap = ankerl::unordered_dense::map<EdgeKey, uint64_t, EdgeKeyHash>;
+
+    /// Collector that accumulates CFG edge counts during trace scan.
+    /// Supports parallel sharding: each shard independently tracks block
+    /// transitions, then merge() sums edge counts.
+    ///
+    /// Locality cache: most consecutive trace instructions fall within the
+    /// same basic block, so we cache the current block's [start, end] range.
+    /// On cache hit we skip the O(log B) upper_bound lookup entirely.
+    class CFGEdgeCollector final : public TraceCollector {
+    public:
+        const CFGResult* cfg;       // Shared (read-only) block map
+        EdgeCountMap edge_counts;
+        uint64_t prev_block_start = UINT64_MAX;
+        uint64_t prev_pc = UINT64_MAX;  // PC of the previous instruction
+
+        // Locality cache — avoids block_containing() for sequential PCs
+        uint64_t cached_block_start_ = 0;
+        uint64_t cached_block_end_   = 0;   // inclusive, matching BasicBlock::end_pc
+
+        explicit CFGEdgeCollector(const CFGResult* c) : cfg(c) {}
+
+        std::string_view name() const override { return "cfg_edge_collector"; }
+        bool supports_parallel() const override { return true; }
+
+        std::unique_ptr<TraceCollector> clone() const override {
+            return std::make_unique<CFGEdgeCollector>(cfg);
+        }
+
+        void merge(TraceCollector& shard) override;
+        void on_inst(uint64_t inst_id, const InstView& inst) override;
+    };
+
+    std::unique_ptr<CFGEdgeCollector> collector_;
+    CFGResult result_;
+    bool blocks_built_ = false;
+
+    /// Build basic blocks into result_ from xref data.
+    /// Returns true on success, false if xref not available.
+    bool build_blocks(PassContext& ctx);
+};
 }  // namespace tenet
