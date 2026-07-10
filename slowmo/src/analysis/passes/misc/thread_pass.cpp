@@ -1,5 +1,6 @@
 #include "analysis/passes/misc/thread_pass.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 
@@ -255,6 +256,14 @@ const ThreadSwitchEvent* ThreadResult::prev_switch_before(uint64_t inst_id) cons
     return &(*it);
 }
 
+// ─── ThreadPass::declare_scan ────────────────────────────────────────────────
+
+void ThreadPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    (void)ctx;
+    collector_ = std::make_unique<ThreadCollector>();
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── ThreadPass::run ─────────────────────────────────────────────────────────
 
 PassResult ThreadPass::run(PassContext& ctx) {
@@ -275,38 +284,30 @@ PassResult ThreadPass::run(PassContext& ctx) {
                 ctx.progress(1.0f, fmt::format(
                     "Thread: {} threads, {} switches, {} spans (from cache)",
                     cached.thread_count(), cached.switch_count(), cached.spans.size()));
+                collector_.reset();
                 return PassResult::success(std::move(cached));
             }
         }
     }
 
-    ThreadCollector collector;
-    TraceScanEngine engine(reader, index.inst_count());
-    if (!ctx.range().exclude_pc_ranges.empty()) {
-        engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
     }
-    engine.add_collector(&collector);
-    engine.set_progress([&ctx, total = end - start](uint64_t processed, uint64_t /*total_arg*/) {
-        if (total > 0) {
-            ctx.progress(static_cast<float>(processed) / static_cast<float>(total));
-        }
-    });
-    engine.set_cancel_check([&ctx]() { return ctx.cancelled(); });
-    engine.run(start, end);
 
     // ─── Persist result for future sessions ───────────────────────────────
     if (range.is_full_trace()) {
-        std::string blob = thread_serialize(collector.result);
+        std::string blob = thread_serialize(collector_->result);
         if (!blob.empty()) {
             index.save_pass_blob("thread", blob.data(), blob.size());
         }
     }
 
     ctx.progress(1.0f, fmt::format("Thread: {} threads, {} switches, {} spans",
-                                    collector.result.thread_count(),
-                                    collector.result.switch_count(),
-                                    collector.result.spans.size()));
-    return PassResult::success(std::move(collector.result));
+                                    collector_->result.thread_count(),
+                                    collector_->result.switch_count(),
+                                    collector_->result.spans.size()));
+    return PassResult::success(std::move(collector_->result));
 }
 
 }  // namespace tenet
