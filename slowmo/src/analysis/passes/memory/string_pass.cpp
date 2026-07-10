@@ -1,5 +1,6 @@
 #include "analysis/passes/memory/string_pass.h"
 #include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "core/memory_model.h"
@@ -123,61 +124,6 @@ std::vector<const StringRef*> StringResult::search(const std::string& pattern) c
     return hits;
 }
 
-// ─── WriteEventCollector ───────────────────────────────────────────────────
-
-/// Sequential TraceCollector that records every memory *write* event
-/// (address, size, inst_id, pc). Reads are intentionally skipped: a read
-/// cannot introduce new byte content into memory, so any string visible at a
-/// read address was already produced by an earlier write and will already be
-/// discovered when that write is processed. Skipping reads avoids redundant
-/// re-scanning of unchanged memory (which dominates most traces — the same
-/// buffer is typically read far more often than it is written).
-class WriteEventCollector final : public TraceCollector {
-public:
-    struct WriteEvent {
-        uint64_t inst_id;
-        uint64_t pc;
-        uint64_t addr;
-        uint16_t size;
-        uint64_t value;     // low 8 bytes of the written value (for dedup)
-        uint64_t value_hi;  // high bytes for 9-16 byte stores
-    };
-
-    WriteEventCollector(uint64_t start_inst_id, uint64_t end_inst_id)
-        : range_start_(start_inst_id), range_end_(end_inst_id) {}
-
-    std::string_view name() const override { return "WriteEventCollector"; }
-
-    bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
-        events_.clear();
-        return true;
-    }
-
-    void on_inst(uint64_t inst_id, const InstView& inst) override {
-        if (inst_id < range_start_ || inst_id >= range_end_) return;
-
-        for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
-            auto mem = inst.mem_access(m);
-            if (mem.addr == 0) continue;
-            // mem_type: bit0 = read, bit1 = write (QBDI::MemoryAccessType).
-            bool is_write = (mem.type & 0x02) != 0;
-            if (!is_write) continue;
-
-            events_.push_back({inst_id, inst.pc, mem.addr, mem.size, mem.value, mem.value_hi});
-        }
-    }
-
-    void end() override {}
-
-    const std::vector<WriteEvent>& events() const { return events_; }
-    std::vector<WriteEvent> take_events() { return std::move(events_); }
-
-private:
-    uint64_t range_start_;
-    uint64_t range_end_;
-    std::vector<WriteEvent> events_;
-};
-
 // ─── Local string scan over a reconstructed byte window ────────────────────
 
 namespace {
@@ -251,10 +197,21 @@ std::vector<WindowHit> scan_window(const std::vector<uint8_t>& data,
 
 }  // namespace
 
+// ─── StringPass::declare_scan ─────────────────────────────────────────────
+
+void StringPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
+    auto& index = ctx.index();
+    uint64_t start = ctx.range().start_inst_id;
+    uint64_t end = std::min(ctx.range().end_inst_id, index.inst_count());
+    if (end == 0) end = index.inst_count();
+
+    collector_ = std::make_unique<WriteEventCollector>(start, end);
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+}
+
 // ─── StringPass::run ─────────────────────────────────────────────────────
 
 PassResult StringPass::run(PassContext& ctx) {
-    auto& reader = ctx.reader();
     auto& index  = ctx.index();
     auto& memory = ctx.memory();
     const auto& range = ctx.range();
@@ -268,36 +225,22 @@ PassResult StringPass::run(PassContext& ctx) {
                 ctx.progress(1.0f, fmt::format(
                     "Strings: {} discovered (from cache)",
                     cached.total()));
+                collector_.reset();
                 return PassResult::success(std::move(cached));
             }
         }
     }
 
-    uint64_t start = range.start_inst_id;
-    uint64_t end   = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
-
-    // ─── Phase 1: collect all memory write events via a single scan ──────
-    WriteEventCollector collector(start, end);
-
-    TraceScanEngine local_engine(reader, index.inst_count(), &index);
-    local_engine.set_progress([&](uint64_t processed, uint64_t total) {
-        if (total > 0) {
-            // Phase 1 is 40% of total work.
-            ctx.progress(0.4f * static_cast<float>(processed) / static_cast<float>(total),
-                         "Collecting memory write events...");
-        }
-    });
-    local_engine.set_cancel_check([&]() { return ctx.cancelled(); });
-    local_engine.add_collector(&collector);
-
-    local_engine.run(start, end);
+    // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
+    if (!collector_) {
+        return PassResult::failed("declare_scan() was not called before run()");
+    }
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
     }
 
-    auto events = collector.take_events();
+    auto events = collector_->take_events();
     ctx.progress(0.4f, fmt::format("Collected {} memory write events", events.size()));
 
     // ─── Phase 2: for each write, reconstruct a time-consistent window ────

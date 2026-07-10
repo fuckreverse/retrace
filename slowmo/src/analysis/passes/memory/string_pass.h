@@ -1,11 +1,14 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <memory>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -112,6 +115,8 @@ public:
         return {};  // No dependencies — runs independently
     }
 
+    bool has_scan() const override { return true; }
+    void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 5.0f; }
 
@@ -119,6 +124,60 @@ public:
     /// a string boundary (the string may start before the write, e.g. when
     /// only the NUL terminator byte of a pre-existing string is (re)written).
     static constexpr size_t PROBE_WINDOW = 320;
+
+private:
+    /// Sequential TraceCollector that records every memory *write* event
+    /// (address, size, inst_id, pc). Reads are intentionally skipped: a read
+    /// cannot introduce new byte content into memory, so any string visible at a
+    /// read address was already produced by an earlier write and will already be
+    /// discovered when that write is processed.
+    class WriteEventCollector final : public TraceCollector {
+    public:
+        struct WriteEvent {
+            uint64_t inst_id;
+            uint64_t pc;
+            uint64_t addr;
+            uint16_t size;
+            uint64_t value;     // low 8 bytes of the written value (for dedup)
+            uint64_t value_hi;  // high bytes for 9-16 byte stores
+        };
+
+        WriteEventCollector(uint64_t start_inst_id, uint64_t end_inst_id)
+            : range_start_(start_inst_id), range_end_(end_inst_id) {}
+
+        std::string_view name() const override { return "WriteEventCollector"; }
+
+        bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
+            events_.clear();
+            return true;
+        }
+
+        void on_inst(uint64_t inst_id, const InstView& inst) override {
+            if (inst_id < range_start_ || inst_id >= range_end_) return;
+
+            for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
+                auto mem = inst.mem_access(m);
+                if (mem.addr == 0) continue;
+                // mem_type: bit0 = read, bit1 = write (QBDI::MemoryAccessType).
+                bool is_write = (mem.type & 0x02) != 0;
+                if (!is_write) continue;
+
+                events_.push_back({inst_id, inst.pc, mem.addr, mem.size, mem.value, mem.value_hi});
+            }
+        }
+
+        void end() override {}
+
+        const std::vector<WriteEvent>& events() const { return events_; }
+        std::vector<WriteEvent> take_events() { return std::move(events_); }
+
+    private:
+        uint64_t range_start_;
+        uint64_t range_end_;
+        std::vector<WriteEvent> events_;
+    };
+
+    std::unique_ptr<WriteEventCollector> collector_;
 };
 
 }  // namespace tenet
