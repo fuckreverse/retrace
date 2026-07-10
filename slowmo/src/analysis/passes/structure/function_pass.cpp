@@ -922,6 +922,19 @@ void FunctionPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
     collector_ = std::make_unique<FunctionCollector>(
         code_table, hdr.module_slide, hdr.num_gpr,
         hdr.has_branch_hint(), config_.full_mode);
+
+    // Set progress/cancel callbacks BEFORE registering with orchestrator,
+    // so FunctionCollector::end() (Phase 2 state machine) has them available
+    // during execute_scan() — which calls end() before run() is invoked.
+    // Phase 2 progress: map collector's [0,1] → [kPhase1End, kPhase2End]
+    constexpr float kPhase1End = 0.70f;
+    constexpr float kPhase2End = 0.85f;
+    collector_->set_progress_fn([&ctx, kPhase1End, kPhase2End](float p2_pct) {
+        ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
+                     "Function analysis: building call graph...");
+    });
+    collector_->set_cancel_fn([&ctx]() { return ctx.cancelled(); });
+
     orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
 }
 
@@ -978,15 +991,6 @@ PassResult FunctionPass::run(PassContext& ctx) {
     }
 
     ctx.progress(kPhase1End, "Function analysis: finalising...");
-
-    // Re-attach progress/cancel callbacks for Phase 2 post-processing (end())
-    // Phase 2 progress: map [0,1] → [kPhase1End, kPhase2End]
-    collector_->set_progress_fn([&](float p2_pct) {
-        ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
-                     "Function analysis: building call graph...");
-    });
-    // Cancellation: allow end() to bail out early when user cancels.
-    collector_->set_cancel_fn([&]() { return ctx.cancelled(); });
 
     if (ctx.cancelled()) {
         return PassResult::failed("cancelled by user");
