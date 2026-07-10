@@ -417,23 +417,15 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
 
             // Cache of interior-sample GPR values, loaded at most once per
             // region regardless of how many registers end up needing them.
-            // `state_before(iid)` returns the FULL register state (all GPRs)
-            // per call, so fetching it once per sample point and then
-            // indexing into the cached array per-register avoids N_regs
-            // redundant RegisterFile lookups (each a hash-map probe even
-            // when warmed) at every sample point.
+            // Uses the shared sample_gprs() primitive (also used by
+            // LoopSemanticsPass) to avoid a duplicated state_before() loop.
             std::vector<std::array<uint64_t, 31>> sample_gprs;  // [sample_idx][reg 0..30]
             bool samples_loaded = false;
             auto ensure_samples_loaded = [&]() {
                 if (samples_loaded) return;
                 samples_loaded = true;
-                sample_gprs.reserve(sample_ids.size());
-                for (uint64_t iid : sample_ids) {
-                    const auto& st = regfile.state_before(iid);
-                    std::array<uint64_t, 31> gprs{};
-                    std::copy(std::begin(st.gpr), std::begin(st.gpr) + 31, gprs.begin());
-                    sample_gprs.push_back(gprs);
-                }
+                sample_gprs = regfile.sample_gprs(
+                    sample_ids.data(), sample_ids.size());
             };
 
             for (uint8_t r = 0; r < 31; r++) {

@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tenet {
@@ -48,6 +49,11 @@ private:
 
     std::vector<ResolvedString> strings_;
     std::unordered_map<uint64_t, size_t> addr_index_;  // addr → index in strings_
+    /// Addresses probed via resolve() that did NOT yield a valid string.
+    /// Prevents repeated read_region + parse_cstring calls for the same
+    /// non-string pointer (common in objc_msgSend / syscall arg scanning
+    /// where many registers hold integers, not string pointers).
+    std::unordered_set<uint64_t> negative_cache_;
     bool built_ = false;
 };
 

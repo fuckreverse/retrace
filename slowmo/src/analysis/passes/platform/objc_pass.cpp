@@ -4,6 +4,7 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "core/register_file.h"
+#include "infra/string_resolver.h"
 #include "common/byte_codec.h"
 
 #include <fmt/core.h>
@@ -330,6 +331,7 @@ PassResult ObjcPass::run(PassContext& ctx) {
     auto& memory  = ctx.memory();
     auto& regfile = ctx.regfile();
     auto& code_table = ctx.code_table();
+    auto& string_resolver = ctx.string_resolver();
     const auto& range = ctx.range();
 
     uint64_t start = range.start_inst_id;
@@ -379,20 +381,23 @@ PassResult ObjcPass::run(PassContext& ctx) {
     uint64_t offset = header_size;
     uint64_t inst_id = 0;
 
-    // Selector name cache
+    // Selector name cache (still per-pass: selector refs are image addresses
+    // that StringResolver's PageStats may not cover).
     ankerl::unordered_dense::map<uint64_t, std::string> sel_name_cache;
-    // String deref cache
-    ankerl::unordered_dense::map<uint64_t, std::optional<std::string>> deref_cache;
+    // String deref cache is now delegated to StringResolver (cross-pass
+    // positive + negative caching), eliminating the per-pass deref_cache.
 
     ObjcResult result;
 
     auto cached_deref = [&](uint64_t addr, uint64_t at_inst_id) -> std::optional<std::string> {
         if (!is_likely_pointer(addr)) return std::nullopt;
-        auto [it, inserted] = deref_cache.emplace(addr, std::nullopt);
-        if (inserted) {
-            it->second = try_deref_string(memory, addr, at_inst_id);
-        }
-        return it->second;
+        // StringResolver has both positive (addr_index_) and negative
+        // (negative_cache_) caches, so repeated probes of the same
+        // non-string address are O(1) set lookups instead of 256-byte
+        // read_region + parse_cstring calls.
+        auto rs = string_resolver.resolve(addr, at_inst_id);
+        if (rs) return rs->value;
+        return std::nullopt;
     };
 
     uint64_t total = end - start;

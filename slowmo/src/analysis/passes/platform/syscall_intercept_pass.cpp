@@ -1143,35 +1143,24 @@ std::vector<uint8_t> SyscallInterceptCollector::read_memory_at(
 {
     if (addr == 0 || max_bytes == 0) return {};
 
+    // Single read_region call replaces the previous N-chunk read() loop.
+    // read_region internally uses the PageWriteIndex batch path, so this is
+    // both fewer RocksDB seeks and better cache locality.
+    auto region = memory_.read_region(addr, max_bytes, at_inst_id);
+
     std::vector<uint8_t> result;
     result.reserve(max_bytes);
 
-    uint64_t cur = addr;
-    uint32_t remaining = max_bytes;
-
-    while (remaining > 0) {
-        uint8_t chunk = static_cast<uint8_t>(std::min<uint32_t>(remaining, 16));
-        auto mem_res = memory_.read(cur, chunk, at_inst_id);
-
-        bool any_known = false;
-        for (uint8_t i = 0; i < chunk; ++i) {
-            if (mem_res.known[i]) any_known = true;
+    for (size_t i = 0; i < region.data.size(); ++i) {
+        if (!region.known[i]) {
+            // Stop if the very first byte is unknown; otherwise pad with 0.
+            if (result.empty()) break;
+            result.push_back(0);
+        } else {
+            result.push_back(region.data[i]);
         }
-        if (!any_known) break;  // Stop at first unknown region
-
-        for (uint8_t i = 0; i < chunk; ++i) {
-            if (!mem_res.known[i]) {
-                // Partial: include zeros for unknown bytes, but stop if at start
-                if (result.empty()) goto done;
-                result.push_back(0);
-            } else {
-                result.push_back(mem_res.data[i]);
-            }
-        }
-        cur       += chunk;
-        remaining -= chunk;
     }
-done:
+
     return result;
 }
 

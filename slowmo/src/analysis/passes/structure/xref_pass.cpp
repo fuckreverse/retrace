@@ -70,9 +70,26 @@ struct Shard {
 
 // ─── Per-shard scan result ───────────────────────────────────────────────────
 
+/// Hash for pair<uint64_t,uint64_t> — needed for the PC-transition map.
+struct PCPairHash {
+    size_t operator()(const std::pair<uint64_t, uint64_t>& p) const noexcept {
+        uint64_t h = p.first * 0x9E3779B97F4A7C15ULL;
+        h ^= p.second + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        return static_cast<size_t>(h);
+    }
+};
+
+/// PC transition map: (from_pc, to_pc) → count.
+/// Only non-sequential transitions (to_pc != from_pc + 4) are recorded.
+using PCTransitionMap = ankerl::unordered_dense::map<
+    std::pair<uint64_t, uint64_t>, uint32_t, PCPairHash>;
+
 struct ShardResult {
     // PC → roaring64_bitmap_t* (using C API for bulk performance)
     ankerl::unordered_dense::map<uint64_t, roaring64_bitmap_t*> pc_bitmaps;
+
+    // Non-sequential PC transitions (from_pc → to_pc) with count.
+    PCTransitionMap pc_transitions;
 
     ShardResult() { pc_bitmaps.reserve(2048); }
 
@@ -87,13 +104,15 @@ struct ShardResult {
     ShardResult& operator=(const ShardResult&) = delete;
 
     // Movable
-    ShardResult(ShardResult&& o) noexcept : pc_bitmaps(std::move(o.pc_bitmaps)) {
+    ShardResult(ShardResult&& o) noexcept
+        : pc_bitmaps(std::move(o.pc_bitmaps)), pc_transitions(std::move(o.pc_transitions)) {
         o.pc_bitmaps.clear();
     }
     ShardResult& operator=(ShardResult&& o) noexcept {
         if (this != &o) {
             for (auto& [_, bm] : pc_bitmaps) roaring64_bitmap_free(bm);
             pc_bitmaps = std::move(o.pc_bitmaps);
+            pc_transitions = std::move(o.pc_transitions);
             o.pc_bitmaps.clear();
         }
         return *this;
@@ -132,6 +151,10 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     roaring64_bulk_context_t last_ctx = {};
     const bool has_excludes = !exclude_ranges.empty();
 
+    // Previous (non-excluded) PC for transition recording.
+    // UINT64_MAX = no previous instruction in this shard yet.
+    uint64_t prev_pc = UINT64_MAX;
+
     // v5: running PC accumulator seeded from index (each shard starts at an anchor boundary).
     // For each INST: running_pc += pc_delta.  For each ANCHOR: running_pc = anchor.pc.
     uint64_t running_pc = shard.seed_pc;
@@ -168,6 +191,15 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
             }
 
             if (!excluded) {
+                // Record non-sequential PC transition (branch/call/ret target).
+                // Fallthrough (pc == prev_pc + 4) is NOT recorded — CFGPass
+                // infers it from pc_exec_count and static block layout.
+                // This limits map operations to ~5-10% of instructions.
+                if (prev_pc != UINT64_MAX && pc != prev_pc + 4) {
+                    out.pc_transitions[{prev_pc, pc}]++;
+                }
+                prev_pc = pc;
+
                 if (__builtin_expect(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
@@ -794,7 +826,12 @@ PassResult XrefPass::run(PassContext& ctx) {
                 bm = nullptr;
             }
         }
+        // Merge PC transitions (sum counts for same (from_pc, to_pc) pair)
+        for (auto& [key, cnt] : shard_results[i].pc_transitions) {
+            merged.pc_transitions[key] += cnt;
+        }
         shard_results[i].pc_bitmaps.clear();
+        shard_results[i].pc_transitions.clear();
     }
 
     ctx.progress(0.85f, "Xref: building result...");
@@ -847,6 +884,19 @@ PassResult XrefPass::run(PassContext& ctx) {
 
     result.unique_pc_count = result.pc_to_inst_ids.size();
     result.total_indexed = total_indexed;
+
+    // Transfer PC transitions from the merged shard map to the result vector.
+    // Sorted by (from_pc, to_pc) for efficient CFGPass consumption.
+    result.pc_transitions.reserve(merged.pc_transitions.size());
+    for (const auto& [key, cnt] : merged.pc_transitions) {
+        result.pc_transitions.push_back({key.first, key.second, cnt});
+    }
+    std::sort(result.pc_transitions.begin(), result.pc_transitions.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.from_pc != b.from_pc) return a.from_pc < b.from_pc;
+                  return a.to_pc < b.to_pc;
+              });
+    merged.pc_transitions.clear();
 
     // Restore madvise
     reader.advise_random();

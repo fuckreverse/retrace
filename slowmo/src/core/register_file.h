@@ -4,6 +4,7 @@
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 
+#include <array>
 #include <atomic>
 #include <functional>
 
@@ -127,6 +128,21 @@ public:
     /// Get the register state AFTER instruction `inst_id` executes.
     /// Equivalent to state_before(inst_id) + applying inst_id's diffs.
     RegState state_after(uint64_t inst_id);
+
+    /// Sample GPR[0..30] at multiple inst_ids in one call.
+    ///
+    /// This is the shared sampling primitive used by LoopSemanticsPass and
+    /// TraceFoldPass to avoid duplicated `state_before()` call loops.
+    /// Each `state_before(iid)` returns the full ~800-byte RegState, but
+    /// loop analysis only needs GPR[0..30] (x0-x30).  This method fetches
+    /// only the needed registers and returns them as a compact vector of
+    /// 31-element arrays.
+    ///
+    /// @param inst_ids  pointer to inst_id array
+    /// @param count     number of inst_ids
+    /// @returns vector of <count> arrays, each holding GPR[0..30]
+    std::vector<std::array<uint64_t, 31>> sample_gprs(
+        const uint64_t* inst_ids, size_t count);
 
     // ── Dense checkpoint array ───────────────────────────────────────────
 

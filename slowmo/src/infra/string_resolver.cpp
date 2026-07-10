@@ -68,14 +68,27 @@ void StringResolver::build(uint64_t at_inst_id) {
 }
 
 std::optional<ResolvedString> StringResolver::resolve(uint64_t addr, uint64_t at_inst_id) {
-    // Check cache first
+    // Check positive cache first
     auto it = addr_index_.find(addr);
     if (it != addr_index_.end()) {
         return strings_[it->second];
     }
 
-    // Not in cache — parse on demand
-    return parse_cstring(addr, at_inst_id);
+    // Check negative cache — this address was probed before and is NOT a string.
+    // This is the key optimisation for objc/syscall passes that probe every
+    // register value as a potential string pointer: most registers hold
+    // integers or pointers to non-string data, and without a negative cache
+    // each probe triggers a 256-byte read_region + parse.
+    if (negative_cache_.count(addr)) {
+        return std::nullopt;
+    }
+
+    // Not in either cache — parse on demand
+    auto result = parse_cstring(addr, at_inst_id);
+    if (!result) {
+        negative_cache_.insert(addr);
+    }
+    return result;
 }
 
 std::optional<ResolvedString> StringResolver::parse_cstring(uint64_t addr, uint64_t at_inst_id) {

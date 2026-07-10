@@ -5,6 +5,7 @@
 #include "io/index_builder.h"
 #include "core/instruction_decoder.h"
 #include "core/register_file.h"
+#include "common/aarch64_classify.h"
 #include "common/byte_codec.h"
 
 #include <fmt/core.h>
@@ -185,36 +186,11 @@ constexpr bool iteration_count_near_any(uint64_t count, const uint64_t (&targets
     return false;
 }
 
-/// Check if a mnemonic represents an XOR operation.
-inline bool is_xor_mnemonic(std::string_view mn) {
-    return mn == "eor" || mn == "eors";
-}
-
-/// Check if a mnemonic represents a shift/rotate operation.
-inline bool is_shift_rotate_mnemonic(std::string_view mn) {
-    return mn == "lsl" || mn == "lsr" || mn == "asr" || mn == "ror" ||
-           mn == "lsls" || mn == "lsrs" || mn == "asrs" || mn == "rors" ||
-           mn == "eon" || mn == "extr";
-}
-
-/// Check if a mnemonic represents an ADD/SUB operation (for addition chains).
-inline bool is_add_sub_mnemonic(std::string_view mn) {
-    return mn == "add" || mn == "adds" || mn == "sub" || mn == "subs" ||
-           mn == "adc" || mn == "adcs" || mn == "sbc" || mn == "sbcs";
-}
-
-/// Check if a mnemonic represents modular arithmetic (mul/div).
-inline bool is_modular_mnemonic(std::string_view mn) {
-    return mn == "mul" || mn == "madd" || mn == "msub" || mn == "smull" ||
-           mn == "umull" || mn == "udiv" || mn == "sdiv" || mn == "umulh" ||
-           mn == "smulh";
-}
-
-/// Check if a mnemonic is a load that could be a table lookup.
-inline bool is_load_mnemonic(std::string_view mn) {
-    return mn == "ldr" || mn == "ldrb" || mn == "ldrh" || mn == "ldrsb" ||
-           mn == "ldrsh" || mn == "ldrsw" || mn == "ldrw";
-}
+// Mnemonic-based classification helpers (is_xor_mnemonic etc.) were
+// removed: analyze_body_instructions now uses aarch64::OpcodeInfo pure bit
+// classification (no Capstone, no string comparison) for counting, and only
+// falls back to Capstone for loads + mixing-ops that need regs_read/
+// regs_written detail.
 
 /// Describes the operational features found in a loop body.
 struct BodyFeatures {
@@ -264,54 +240,58 @@ BodyFeatures analyze_body_instructions(
     std::array<bool, 32> mixed_reg{};
 
     for (uint64_t pc : body_pcs) {
-        auto decoded = decoder.decode(pc, code_table);
-        if (!decoded) continue;
+        auto opcode_opt = code_table.opcode_at(pc);
+        if (!opcode_opt) continue;
 
-        std::string_view mn = decoded->mnemonic_sv();
+        // ── Pure bit classification — no Capstone, no string comparison ──
+        auto info = aarch64::OpcodeInfo::classify(*opcode_opt);
         bool is_mix_op = false;
 
-        if (is_xor_mnemonic(mn)) {
+        if (info.is_eor) {
             features.xor_count++;
             is_mix_op = true;
         }
-        if (is_shift_rotate_mnemonic(mn)) {
+        if (info.is_shift_rotate) {
             features.shift_rotate_count++;
             is_mix_op = true;
         }
-        if (is_add_sub_mnemonic(mn)) {
+        if (info.is_add_sub) {
             features.add_sub_count++;
             is_mix_op = true;
         }
-        if (is_modular_mnemonic(mn)) {
+        if (info.is_modular) {
             features.modular_count++;
             is_mix_op = true;
         }
 
-        // Detect potential S-box pattern: LDR with a register used as index.
-        // In AArch64, table lookups typically use "ldr Xn, [Xbase, Xoff, lsl #3]"
-        // or similar addressing modes with a register offset. We heuristically
-        // detect this by checking if the load reads 2+ registers (base + offset).
-        if (is_load_mnemonic(mn) && decoded->regs_read_count >= 2) {
-            features.load_with_reg_offset_count++;
+        // ── Capstone fallback: only for loads (need regs_read for S-box
+        // detection) and mixing ops (need regs_written for data-flow tracking).
+        // This avoids decoding the majority of body instructions (MOV, CMP,
+        // branches, etc.) which neither load nor mix.
+        if (info.is_load || is_mix_op) {
+            auto decoded = decoder.decode(pc, *opcode_opt);
+            if (!decoded) continue;
 
-            // Strengthen the signal: is any of the read registers (candidate
-            // index/offset registers) one that a mixing instruction produced
-            // earlier in this body? Real S-box/table lookups index with a
-            // value derived from round state (post-XOR/shift byte, Feistel
-            // half, etc.), not an unrelated loop-invariant base pointer.
-            for (uint8_t i = 0; i < decoded->regs_read_count; ++i) {
-                uint8_t r = decoded->regs_read[i];
-                if (r < mixed_reg.size() && mixed_reg[r]) {
-                    features.data_dependent_load_count++;
-                    break;
+            // Detect potential S-box pattern: LDR with a register used as index.
+            if (info.is_load && decoded->regs_read_count >= 2) {
+                features.load_with_reg_offset_count++;
+
+                // Strengthen: is any of the read registers (candidate index)
+                // one that a mixing instruction produced earlier in this body?
+                for (uint8_t i = 0; i < decoded->regs_read_count; ++i) {
+                    uint8_t r = decoded->regs_read[i];
+                    if (r < mixed_reg.size() && mixed_reg[r]) {
+                        features.data_dependent_load_count++;
+                        break;
+                    }
                 }
             }
-        }
 
-        if (is_mix_op) {
-            for (uint8_t i = 0; i < decoded->regs_written_count; ++i) {
-                uint8_t r = decoded->regs_written[i];
-                if (r < mixed_reg.size()) mixed_reg[r] = true;
+            if (is_mix_op) {
+                for (uint8_t i = 0; i < decoded->regs_written_count; ++i) {
+                    uint8_t r = decoded->regs_written[i];
+                    if (r < mixed_reg.size()) mixed_reg[r] = true;
+                }
             }
         }
     }
@@ -535,13 +515,10 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
         uint32_t num_iters_sampled = static_cast<uint32_t>(
             std::min(header_inst_ids.size(), static_cast<size_t>(MAX_SAMPLE_ITERATIONS)));
 
-        // Collect register snapshots at each iteration boundary
-        std::vector<RegState> iter_states;
-        iter_states.reserve(num_iters_sampled);
-
-        for (uint32_t i = 0; i < num_iters_sampled; ++i) {
-            iter_states.push_back(regfile.state_before(header_inst_ids[i]));
-        }
+        // Collect GPR[0..30] snapshots at each iteration boundary via the
+        // shared sample_gprs() primitive (also used by TraceFoldPass).
+        auto iter_gprs = regfile.sample_gprs(
+            header_inst_ids.data(), num_iters_sampled);
 
         // Compare registers: active (changes in any pair) vs invariant (never changes)
         // We check GPR[0] through GPR[30] (skip SP/NZCV/PC which always change).
@@ -555,7 +532,7 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
             uint32_t step_pairs_pm1 = 0;   // ... of which had a ±1 step
 
             for (uint32_t i = 1; i < num_iters_sampled; ++i) {
-                if (iter_states[i].gpr[r] != iter_states[0].gpr[r]) {
+                if (iter_gprs[i][r] != iter_gprs[0][r]) {
                     changed = true;
                 }
                 // Check counter pattern: does this iteration step by ±1 from
@@ -565,8 +542,8 @@ PassResult LoopSemanticsPass::run(PassContext& ctx) {
                 // — e.g. a key-schedule warm-up step or a conditionally
                 // taken instruction on one sampled iteration — doesn't flip
                 // an otherwise-clear counter pattern to "not a counter".
-                int64_t diff = static_cast<int64_t>(iter_states[i].gpr[r]) -
-                               static_cast<int64_t>(iter_states[i - 1].gpr[r]);
+                int64_t diff = static_cast<int64_t>(iter_gprs[i][r]) -
+                               static_cast<int64_t>(iter_gprs[i - 1][r]);
                 step_pairs++;
                 if (diff == 1 || diff == -1) step_pairs_pm1++;
             }

@@ -99,6 +99,20 @@ struct XrefResult {
     /// Total inst_ids indexed.
     uint64_t total_indexed = 0;
 
+    /// A directed PC transition (from_pc → to_pc) with execution count.
+    /// Only non-sequential transitions (to_pc != from_pc + 4) are recorded;
+    /// CFGPass infers fallthrough edges from pc_exec_count + static layout.
+    struct PCTransition {
+        uint64_t from_pc;
+        uint64_t to_pc;
+        uint32_t count;
+    };
+
+    /// Non-sequential PC transitions observed during scan.
+    /// Transient — NOT serialized; empty when loaded from cache.
+    /// When non-empty, CFGPass builds edges from this without its own scan.
+    std::vector<PCTransition> pc_transitions;
+
     /// Lazy loader for full-trace results (non-null = use file-backed storage).
     std::shared_ptr<XrefBitmapLoader> lazy_loader;
 
@@ -179,10 +193,33 @@ public:
         result.pc_to_inst_ids[inst.pc].add(inst_id);
         result.pc_exec_count[inst.pc]++;
         result.total_indexed++;
+
+        // Record non-sequential PC transition for CFGPass edge reuse.
+        if (prev_pc_ != UINT64_MAX && inst.pc != prev_pc_ + 4) {
+            result.pc_transitions.push_back({prev_pc_, inst.pc, 1});
+        }
+        prev_pc_ = inst.pc;
     }
 
     void end() override {
         result.unique_pc_count = result.pc_exec_count.size();
+        // Sort and dedup transitions (sum counts for identical pairs).
+        std::sort(result.pc_transitions.begin(), result.pc_transitions.end(),
+                  [](const auto& a, const auto& b) {
+                      if (a.from_pc != b.from_pc) return a.from_pc < b.from_pc;
+                      return a.to_pc < b.to_pc;
+                  });
+        if (!result.pc_transitions.empty()) {
+            auto out = result.pc_transitions.begin();
+            for (auto it = out + 1; it != result.pc_transitions.end(); ++it) {
+                if (it->from_pc == out->from_pc && it->to_pc == out->to_pc) {
+                    out->count += it->count;
+                } else {
+                    *++out = *it;
+                }
+            }
+            result.pc_transitions.erase(out + 1, result.pc_transitions.end());
+        }
     }
 
     // ─── Parallel scanning support ───────────────────────────────────────
@@ -200,10 +237,17 @@ public:
         for (const auto& [pc, count] : other.result.pc_exec_count) {
             result.pc_exec_count[pc] += count;
         }
+        // Merge PC transitions (append; will be sorted/deduped in end()).
+        for (auto& t : other.result.pc_transitions) {
+            result.pc_transitions.push_back(t);
+        }
         result.total_indexed += other.result.total_indexed;
     }
 
     XrefResult result;
+
+private:
+    uint64_t prev_pc_ = UINT64_MAX;  // for transition recording
 };
 
 // ─── Xref pass ────────────────────────────────────────────────────────────

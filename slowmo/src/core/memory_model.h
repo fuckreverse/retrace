@@ -96,6 +96,30 @@ public:
     };
     RegionReadResult read_region(uint64_t addr, size_t size, uint64_t at_inst_id);
 
+    /// A single bulk-read request for read_batch().
+    struct ReadRequest {
+        uint64_t addr;
+        size_t   size;
+        uint64_t at_inst_id;
+    };
+
+    /// Batch-read multiple memory regions in a single call.
+    ///
+    /// Requests are internally sorted by page so that all accesses to the
+    /// same page share one PageWriteIndex load (RocksDB forward scan) and
+    /// benefit from the thread-local page cache.  Identical (addr, size,
+    /// at_inst_id) requests are deduplicated.
+    ///
+    /// This is the preferred API for passes that issue many scattered
+    /// read_region() calls (e.g. objc args, memory_string, syscall_intercept,
+    /// memory_snapshot) — it converts N random RocksDB seeks into a
+    /// page-sorted sequential access pattern, mirroring the 4.5× speedup
+    /// originally achieved inside memory_snapshot_pass but now available to
+    /// every consumer.
+    ///
+    /// Returns one RegionReadResult per input request (same order as input).
+    std::vector<RegionReadResult> read_batch(const std::vector<ReadRequest>& requests);
+
     /// Describes the activity timeline of a single memory page.
     struct PageActivity {
         uint64_t page_addr;        // page-aligned address (page_number << 12)
@@ -321,7 +345,13 @@ private:
     // ≈ 16 MB worst-case.
     LRUCache<uint64_t, std::shared_ptr<PageWriteIndex>> page_index_cache_{512};
 
-    mutable std::mutex cache_mutex_;  // protects page_cache_ AND page_index_cache_
+    // shared_mutex: page_index_cache_ stores shared_ptr<const PageWriteIndex>
+    // which is immutable once loaded, so concurrent readers use shared_lock +
+    // peek().  Only load_page_index() (insert) needs a unique_lock.  This
+    // eliminates the parallel-pass read contention that the former exclusive
+    // mutex caused under run_all(N).
+    mutable std::shared_mutex index_cache_mutex_;  // protects page_index_cache_
+    mutable std::mutex page_cache_mutex_;           // protects page_cache_ (in-mem fallback)
 
     // Page activity cache (populated during build, never changes after)
     std::vector<PageActivity> page_activity_cache_;

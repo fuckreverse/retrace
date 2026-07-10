@@ -298,9 +298,14 @@ private:
     std::unique_ptr<CFGEdgeCollector> collector_;
     CFGResult result_;
     bool blocks_built_ = false;
+    bool transitions_available_ = false;  ///< xref provides pc_transitions
 
     /// Build basic blocks into result_ from xref data.
     /// Returns true on success, false if xref not available.
     bool build_blocks(PassContext& ctx);
+
+    /// Build edges from xref pc_transitions (skip trace scan).
+    /// Returns true on success, false if transitions insufficient.
+    bool build_edges_from_transitions(PassContext& ctx);
 };
 }  // namespace tenet

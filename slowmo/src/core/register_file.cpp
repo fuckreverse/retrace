@@ -270,6 +270,22 @@ RegState RegisterFile::state_after(uint64_t inst_id) {
     return state;
 }
 
+std::vector<std::array<uint64_t, 31>> RegisterFile::sample_gprs(
+    const uint64_t* inst_ids, size_t count)
+{
+    std::vector<std::array<uint64_t, 31>> result;
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        RegState state = state_before(inst_ids[i]);
+        std::array<uint64_t, 31> gprs{};
+        // Copy GPR[0..30] (x0-x30). RegState.gpr has AARCH64_GPR_COUNT (34)
+        // entries; we only need the first 31 for loop analysis.
+        std::copy_n(state.gpr, 31, gprs.begin());
+        result.push_back(gprs);
+    }
+    return result;
+}
+
 RegState RegisterFile::state_before_ckpt(uint64_t inst_id) {
     if (checkpoints_.empty()) return RegState{};
 

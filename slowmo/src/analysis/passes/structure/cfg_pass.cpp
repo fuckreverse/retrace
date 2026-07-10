@@ -372,6 +372,14 @@ void CFGPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
     // guaranteed to be available (dependencies are resolved first).
     if (!build_blocks(ctx)) return;
 
+    // If xref recorded PC transitions, we can build edges directly without
+    // a trace scan — skip collector registration.
+    const auto* xref = ctx.try_require<XrefResult>("xref");
+    if (xref && !xref->pc_transitions.empty()) {
+        transitions_available_ = true;
+        return;  // no scan needed
+    }
+
     collector_ = std::make_unique<CFGEdgeCollector>(&result_);
     orch.declare({name(), collector_.get(), /*wants_parallel=*/true});
 }
@@ -403,20 +411,69 @@ PassResult CFGPass::run(PassContext& ctx) {
 
     auto& reader = ctx.reader();
 
-    // ── Phase 4: Walk the trace to build edges and count taken ───────────
+    // ── Phase 4: Build edges ─────────────────────────────────────────────
+    // Two paths: (a) reuse xref's pc_transitions (no scan), or (b) use the
+    // trace scan results from CFGEdgeCollector.
 
-    uint64_t start = range.start_inst_id;
-    uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
+    EdgeCountMap edge_counts;
 
-    // collector_ must have been populated by declare_scan() + ScanOrchestrator.
-    // If not, declare_scan() was never called — this violates the scan-fusion
-    // contract.
-    if (!collector_) {
-        return PassResult::failed("declare_scan() was not called before run()");
+    if (transitions_available_) {
+        // Path (a): build edges from xref pc_transitions — no scan needed.
+        // This eliminates CFGPass's separate full-trace scan entirely.
+        const auto* xref = ctx.try_require<XrefResult>("xref");
+        if (!xref) {
+            return PassResult::failed("xref result not available");
+        }
+
+        // 1. Direct edges from non-sequential transitions.
+        for (const auto& t : xref->pc_transitions) {
+            const auto* from_blk = result_.block_containing(t.from_pc);
+            const auto* to_blk   = result_.block_containing(t.to_pc);
+            if (from_blk && to_blk) {
+                edge_counts[{from_blk->start_pc, to_blk->start_pc}] += t.count;
+            }
+        }
+
+        // 2. Infer fallthrough edges (sequential, pc → pc+4).
+        // For each block, fallthrough_count = exec_count(end_pc) - taken_count.
+        // pc_transitions is sorted by from_pc, so we binary-search the range
+        // of transitions originating from each block's end_pc.
+        const auto& transitions = xref->pc_transitions;
+        for (const auto& [start_pc, block] : result_.blocks) {
+            uint64_t end_pc = block.end_pc;
+            uint64_t exec = xref->execution_count(end_pc);
+            if (exec == 0) continue;
+
+            // Sum non-sequential transition counts from end_pc.
+            uint64_t taken = 0;
+            auto it = std::lower_bound(transitions.begin(), transitions.end(), end_pc,
+                [](const XrefResult::PCTransition& t, uint64_t v) { return t.from_pc < v; });
+            for (; it != transitions.end() && it->from_pc == end_pc; ++it) {
+                taken += it->count;
+            }
+
+            uint64_t fallthrough = (exec > taken) ? (exec - taken) : 0;
+            if (fallthrough == 0) continue;
+
+            // Find the block containing end_pc + 4.
+            uint64_t next_pc = end_pc + 4;
+            if (!xref->has_pc(next_pc)) continue;
+            const auto* next_blk = result_.block_containing(next_pc);
+            if (next_blk) {
+                edge_counts[{start_pc, next_blk->start_pc}] += fallthrough;
+            }
+        }
+
+        ctx.progress(0.9f, fmt::format(
+            "CFG: {} edges from xref transitions (no scan)", edge_counts.size()));
+    } else {
+        // Path (b): use trace scan results from CFGEdgeCollector.
+        // collector_ must have been populated by declare_scan() + ScanOrchestrator.
+        if (!collector_) {
+            return PassResult::failed("declare_scan() was not called before run()");
+        }
+        edge_counts = std::move(collector_->edge_counts);
     }
-
-    auto& edge_counts = collector_->edge_counts;
 
     // ── Phase 5: Build final edge list ───────────────────────────────────
     result_.edges.reserve(edge_counts.size());
@@ -471,6 +528,7 @@ PassResult CFGPass::run(PassContext& ctx) {
     CFGResult final_result = std::move(result_);
     collector_.reset();
     blocks_built_ = false;
+    transitions_available_ = false;
     result_ = CFGResult{};  // reset for potential re-use
 
     return PassResult::success(std::move(final_result));

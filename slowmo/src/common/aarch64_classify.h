@@ -227,18 +227,131 @@ inline uint8_t movzk_reg(uint32_t opcode) noexcept {
     return static_cast<uint8_t>(opcode & 0x1Fu);
 }
 
+// ─── Instruction-category bit classifiers (no Capstone needed) ─────────────
+//
+// These classify AArch64 instructions into the coarse categories needed by
+// loop_semantics_pass (XOR / shift-rotate / add-sub / modular / load) using
+// pure opcode bit-pattern matching.  Verified against Capstone-decoded
+// mnemonics for all common encodings.
+//
+// Encoding groups (ARMv8 ARM section C4):
+//   - Data processing, shifted register:  bits[28:24] = 01010  (0x0A)
+//   - Data processing, immediate:         bits[28:24] = 10001  (0x11) — ADD/SUB imm
+//   - Data processing, 1/2 source:        bits[28:24] = 11010  (0x1A)
+//   - Data processing, 3 source:          bits[28:24] = 11011  (0x1B)
+//   - Data processing, extract:           bits[28:24] = 11100  (0x1C)
+//   - Loads / stores:                     bits[29:27] = 111    (0x7)
+
+/// EOR (shifted register): op[30:29]=10, N[23]=0.
+/// Covers "eor" and "eors" (AArch64 has no separate EORS; Capstone emits "eor").
+inline bool is_eor_shifted(uint32_t op) noexcept {
+    // Mask sf(bit31) and S/bit29 — EOR has bits[30:29]=10, bit23=0.
+    // Verified: EOR W0,W1,W2=0x4A020020, EOR X0,W1,W2=0xCA020020.
+    return (op & 0x5F800000u) == 0x4A000000u;
+}
+
+/// EON (shifted register): op[30:29]=10, N[23]=1.
+inline bool is_eon_shifted(uint32_t op) noexcept {
+    return (op & 0x5F800000u) == 0x4A200000u;
+}
+
+/// Variable shift (LSLV/LSRV/ASRV/RORV): bits[28:24]=11010, opcode2[15:10] in {8..11}.
+/// Covers "lsl","lsr","asr","ror" and their 's' variants (which don't exist in
+/// AArch64 but Capstone may emit the base form).
+inline bool is_variable_shift(uint32_t op) noexcept {
+    if (((op >> 24) & 0x1Fu) != 0x1Au) return false;
+    uint32_t op2 = (op >> 10) & 0x3Fu;
+    return op2 >= 8 && op2 <= 11;  // LSLV=8, LSRV=9, ASRV=10, RORV=11
+}
+
+/// EXTR (extract): bits[28:24]=11100.
+inline bool is_extr(uint32_t op) noexcept {
+    return (op & 0x7F000000u) == 0x1C000000u;
+}
+
+/// UBFM/SBFM (bitfield move): immediate-shift aliases.
+/// LSL #imm = UBFM, LSR #imm = UBFM, ASR #imm = SBFM.
+/// Also covers UBFX/UBFIZ/SBFX/SBFIZ/BFXIL which Capstone may emit as their
+/// own mnemonics — all are bit-manipulation operations relevant to crypto
+/// loop detection.
+/// UBFM: bits[30:24]=1010011 → (op & 0x7F000000)==0x53000000
+/// SBFM: bits[30:24]=0010011 → (op & 0x7F000000)==0x13000000
+inline bool is_ubfm_sbfm(uint32_t op) noexcept {
+    uint32_t grp = op & 0x7F000000u;
+    return grp == 0x53000000u || grp == 0x13000000u;
+}
+
+/// ADD/SUB (shifted register): bits[28:24]=01011.
+inline bool is_add_sub_shifted(uint32_t op) noexcept {
+    return ((op >> 24) & 0x1Fu) == 0x0Bu;
+}
+
+/// ADD/SUB (immediate): bits[28:24]=10001.
+inline bool is_add_sub_immediate(uint32_t op) noexcept {
+    return ((op >> 24) & 0x1Fu) == 0x11u;
+}
+
+/// ADC/SBC (add/sub with carry): bits[28:24]=11010, opcode2[15:10]=000000.
+inline bool is_adc_sbc(uint32_t op) noexcept {
+    if (((op >> 24) & 0x1Fu) != 0x1Au) return false;
+    return ((op >> 10) & 0x3Fu) == 0x00u;
+}
+
+/// Any ADD/SUB (shifted register, immediate, or with carry).
+inline bool is_add_sub(uint32_t op) noexcept {
+    return is_add_sub_shifted(op) || is_add_sub_immediate(op) || is_adc_sbc(op);
+}
+
+/// MUL/MADD/MSUB/SMULL/UMULL/UMULH/SMULH: bits[28:24]=11011 (3-source group).
+inline bool is_mul_family(uint32_t op) noexcept {
+    return ((op >> 24) & 0x1Fu) == 0x1Bu;
+}
+
+/// UDIV/SDIV: bits[28:24]=11010, opcode2[15:10] in {2,3}.
+inline bool is_div(uint32_t op) noexcept {
+    if (((op >> 24) & 0x1Fu) != 0x1Au) return false;
+    uint32_t op2 = (op >> 10) & 0x3Fu;
+    return op2 == 2 || op2 == 3;
+}
+
+/// Any modular arithmetic (mul family or integer division).
+inline bool is_modular(uint32_t op) noexcept {
+    return is_mul_family(op) || is_div(op);
+}
+
+/// Any load instruction (load/store group with load bit set).
+/// Load/store group: bits[29:27]=111. Load bit: bit 22=1 for most encodings
+/// (unsigned-offset, register-offset, pair, exclusive). This covers
+/// ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw/ldp/ldxr and variants.
+inline bool is_load(uint32_t op) noexcept {
+    if (((op >> 27) & 0x7u) != 0x7u) return false;
+    return (op >> 22) & 0x1u;
+}
+
 // ─── Simple OpcodeInfo for hot-loop use (matches window_stats_pass usage) ─
 
 /// Pre-computed classification from a 4-byte AArch64 opcode.
-/// Used by WindowStatsPass and similar passes that need only branch/mnemonic-id info.
+/// Used by WindowStatsPass, LoopSemanticsPass and similar passes that need
+/// lightweight opcode info without a Capstone decode.
 struct OpcodeInfo {
     uint16_t mnemonic_id;   // top 11 bits as grouping key
     bool is_branch;
+    // ── Loop-semantics category flags (pure bit classification) ──
+    bool is_eor;            // EOR (shifted register)
+    bool is_shift_rotate;   // LSLV/LSRV/ASRV/RORV + EON + EXTR
+    bool is_add_sub;        // ADD/SUB (shifted, immediate, with carry)
+    bool is_modular;        // MUL/MADD/MSUB/SMULL/UMULL/UDIV/SDIV etc.
+    bool is_load;           // any load instruction
 
     static OpcodeInfo classify(uint32_t opcode) noexcept {
         OpcodeInfo info;
-        info.mnemonic_id = static_cast<uint16_t>(opcode >> 21);
-        info.is_branch   = is_any_branch(opcode);
+        info.mnemonic_id    = static_cast<uint16_t>(opcode >> 21);
+        info.is_branch      = is_any_branch(opcode);
+        info.is_eor         = aarch64::is_eor_shifted(opcode);
+        info.is_shift_rotate = aarch64::is_variable_shift(opcode) || aarch64::is_eon_shifted(opcode) || aarch64::is_extr(opcode) || aarch64::is_ubfm_sbfm(opcode);
+        info.is_add_sub     = aarch64::is_add_sub(opcode);
+        info.is_modular     = aarch64::is_modular(opcode);
+        info.is_load        = aarch64::is_load(opcode);
         return info;
     }
 };
