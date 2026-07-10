@@ -8,6 +8,7 @@
 #include "core/memory_model.h"
 #include "io/code_table.h"
 #include "io/trace_reader.h"
+#include "infra/checkpoint_manager.h"
 
 #include <fmt/core.h>
 #include <algorithm>
@@ -569,7 +570,7 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
 
     // Create a forward-only cursor for sequential register state access.
     // anchor_inst_ids are sorted ascending, so the cursor only moves forward.
-    RegisterFileCursor cursor(ctx.reader(), ctx.index());
+    RegisterFileCursor cursor = ctx.checkpoint_manager().create_cursor();
 
     // Helper: read VM-PC value from a pre-fetched register state.
     // This replaces the read_vm_pc lambda (which called state_before()

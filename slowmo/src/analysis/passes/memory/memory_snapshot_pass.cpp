@@ -308,28 +308,7 @@ PassResult MemorySnapshotPass::run(PassContext& ctx) {
             LOG_DEBUG("memory_snapshot: fast-path: {} call events, limit={}",
                       events.size(), config_.max_snapshots);
 
-            // ── Opt: pre-cache regfile for all call sites before the loop ──
-            // state_before(inst_id) rebuilds from the nearest anchor and
-            // replays diffs.  When call events are sparse (avg gap >> anchor
-            // interval), warm_range with a fixed stride creates too many
-            // useless checkpoints.  Instead, warm_at each target directly in
-            // ascending order so the I/O traversal is sequential and each
-            // call site gets its result cached before the timing loop starts.
-            {
-                auto t_warm0 = HiResClock::now();
-                size_t warmed = 0;
-                for (const auto& ev : events) {
-                    if (ev.call_inst_id < range.start_inst_id) continue;
-                    if (ev.call_inst_id > end_id) break;
-                    regfile.warm_at(ev.call_inst_id);
-                    ++warmed;
-                    if (warmed >= config_.max_snapshots) break;
-                }
-                auto t_warm1 = HiResClock::now();
-                double warm_ms = std::chrono::duration<double, std::milli>(t_warm1 - t_warm0).count();
-                LOG_DEBUG("memory_snapshot: warm_at {} call sites: {:.1f} ms",
-                          warmed, warm_ms);
-            }
+            // Checkpoints are built eagerly at init_infra() — no per-call-site warm needed.
 
             for (const auto& ev : events) {
                 if (limit_reached() || ctx.cancelled()) break;

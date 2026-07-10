@@ -356,38 +356,7 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
         "TraceFold: {} non-overlapping regions selected, sampling registers...",
         selected.size()));
 
-    // ── Step 3: Pre-warm RegisterFile over all region spans ─────────────────
-    //
-    // Avoids O(regions) cold ANCHOR->INST replays when computing per-region
-    // register/FPR diffs below (same rationale as loop_semantics_pass).
-    if (cfg_.include_reg_summary && !selected.empty()) {
-        constexpr uint64_t ANCHOR_INTERVAL_EST = 1000;
-        constexpr uint64_t COALESCE_GAP = ANCHOR_INTERVAL_EST * 2;
-
-        std::vector<std::pair<uint64_t, uint64_t>> spans;
-        spans.reserve(selected.size());
-        for (const auto& r : selected) {
-            spans.emplace_back(r.first_inst_id, r.last_inst_id + 1);
-        }
-        std::sort(spans.begin(), spans.end());
-
-        uint64_t span_start = spans[0].first;
-        uint64_t span_end   = spans[0].second;
-        auto flush_warm = [&](uint64_t s, uint64_t e) {
-            regfile.warm_range(s, e, 0, nullptr);
-        };
-        for (size_t i = 1; i < spans.size(); ++i) {
-            if (ctx.cancelled()) return PassResult::failed("cancelled by user");
-            if (spans[i].first <= span_end + COALESCE_GAP) {
-                span_end = std::max(span_end, spans[i].second);
-            } else {
-                flush_warm(span_start, span_end);
-                span_start = spans[i].first;
-                span_end   = spans[i].second;
-            }
-        }
-        flush_warm(span_start, span_end);
-    }
+    // Checkpoints are built eagerly at init_infra() — no per-range warm needed.
 
     // ── Step 4: Collect register/FPR diffs + interior change-pattern ───────
     size_t processed = 0;
