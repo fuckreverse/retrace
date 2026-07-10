@@ -401,13 +401,7 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
 
     WindowStatsCollector collector(cfg_, code_table, total_insts, &ctx.decoder());
 
-    // Use shared scan engine if available; otherwise create a local one.
-    // This allows future fusion with other collector-based passes.
-    auto* engine = ctx.scan_engine();
-    if (engine) {
-        engine->add_collector(&collector);
-        engine->run();
-    } else {
+    {
         TraceScanEngine local_engine(reader, total_insts, &index);
         local_engine.set_progress([&](uint64_t processed, uint64_t total) {
             if (total > 0) {

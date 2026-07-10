@@ -22,8 +22,6 @@ class CodeTable;
 class RegisterFile;
 class MemoryModel;
 class InstructionDecoder;
-class TraceScanEngine;
-
 // Infra layer forward declarations
 class ScanOrchestrator;
 class PageStats;
@@ -143,12 +141,6 @@ public:
     /// check in tight inner loops.
     const std::atomic<bool>& global_cancel_flag() const;
 
-    /// Access the shared trace scan engine (for passes that want to run collectors).
-    TraceScanEngine* scan_engine();
-
-    /// Create a new TraceScanEngine pre-configured with exclude ranges from AnalysisRange.
-    /// Passes should prefer this over constructing TraceScanEngine directly.
-    TraceScanEngine make_scan_engine();
 
     /// Whether parallel trace scanning is disabled at runtime.
     bool no_parallel_scan() const;
@@ -188,7 +180,15 @@ public:
     /// Declare scan collector requirements for Scan Fusion (default: none).
     /// Override to participate in unified trace scanning.
     /// Called before run() phase, after all passes are registered.
-    virtual void declare_scan(class ScanOrchestrator& orchestrator) { (void)orchestrator; }
+    virtual void declare_scan(class ScanOrchestrator& orchestrator, PassContext& ctx) {
+        (void)orchestrator; (void)ctx;
+    }
+
+    /// Whether this pass participates in scan fusion.
+    /// Default false. Scanning passes override to return true.
+    /// PassManager uses this to decide whether to orchestrate scanning
+    /// before calling run() in the require() path.
+    virtual bool has_scan() const { return false; }
 
     /// Whether this pass supports incremental update.
     virtual bool supports_incremental() const { return false; }
@@ -232,9 +232,6 @@ public:
     /// Set analysis range.
     void set_range(const AnalysisRange& range) { range_ = range; }
 
-    /// Set the shared trace scan engine.
-    void set_scan_engine(TraceScanEngine* e) { scan_engine_ = e; }
-    TraceScanEngine* scan_engine() { return scan_engine_; }
 
     /// Disable parallel trace scanning within individual passes.
     void set_no_parallel_scan(bool v) { no_parallel_scan_ = v; }
@@ -401,6 +398,7 @@ private:
         // is mutex-protected because string writes aren't atomic.
         std::atomic<float> progress_pct{0.0f};
         std::atomic<bool>  cancelled{false};
+        bool               scan_executed{false};  // prevents re-scan in require() path
         mutable std::mutex progress_mtx;   // protects progress_msg (mutable for const queries)
         std::string        progress_msg;
     };
@@ -442,7 +440,6 @@ private:
     std::unique_ptr<StringResolver>    string_resolver_;
     std::unique_ptr<CheckpointManager> checkpoint_manager_;
 
-    TraceScanEngine* scan_engine_ = nullptr;
     bool no_parallel_scan_ = false;
 
     AnalysisRange range_;

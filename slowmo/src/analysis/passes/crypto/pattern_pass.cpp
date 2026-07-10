@@ -1297,11 +1297,7 @@ PassResult PatternPass::run(PassContext& ctx) {
     PatternCollector collector(code_table, decoder, regfile_ptr, has_yara, constmat_min_parts_,
                                static_cast<uint32_t>(reader.header().target_os));
 
-    auto* engine = ctx.scan_engine();
-    if (engine) {
-        engine->add_collector(&collector);
-        engine->run();
-    } else {
+    {
         TraceScanEngine local_engine(reader, total_insts, &index);
         local_engine.set_progress([&](uint64_t processed, uint64_t total) {
             if (total > 0) {

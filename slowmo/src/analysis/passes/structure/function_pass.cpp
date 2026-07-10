@@ -977,18 +977,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
     collector.set_cancel_fn([&]() { return ctx.cancelled(); });
 
     // Use shared scan engine if available; otherwise create a local one.
-    auto* engine = ctx.scan_engine();
-    if (engine) {
-        // Shared engine: we can't intercept per-instruction progress, but we
-        // can at least mark phase boundaries around run() and end().
-        ctx.progress(0.0f, "Function analysis: scanning trace (shared engine)...");
-        engine->add_collector(&collector);
-        engine->run();
-        // Phase 1 done — engine has already called collector.end() internally,
-        // which drove the phase-2 progress callback above.
-        // Jump to post-processing marker.
-        ctx.progress(kPhase2End, "Function analysis: finalising...");
-    } else {
+    {
         TraceScanEngine local_engine(reader, total_insts, &index);
         if (!ctx.range().exclude_pc_ranges.empty()) {
             local_engine.set_exclude_pc_ranges(ctx.range().exclude_pc_ranges);

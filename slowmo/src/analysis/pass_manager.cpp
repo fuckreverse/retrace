@@ -58,16 +58,6 @@ bool PassContext::cancelled() const {
 }
 void PassContext::cancel() { manager_.cancel_all(); }
 
-TraceScanEngine* PassContext::scan_engine() { return manager_.scan_engine(); }
-
-TraceScanEngine PassContext::make_scan_engine() {
-    TraceScanEngine engine(reader(), index().inst_count(), &index());
-    if (!range_.exclude_pc_ranges.empty()) {
-        engine.set_exclude_pc_ranges(range_.exclude_pc_ranges);
-    }
-    return engine;
-}
-
 bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan(); }
 
 // ─── PassManager ──────────────────────────────────────────────────────────
@@ -305,6 +295,19 @@ void PassManager::execute_pass(PassEntry* entry) {
     ctx.pass_name_       = entry->pass->name();
     ctx.progress_pct_    = &entry->progress_pct;
     ctx.cancelled_flag_  = &entry->cancelled;
+
+    // Scan Fusion: if this pass participates in scan fusion and hasn't been
+    // scanned yet (require() path), orchestrate a single scan before run().
+    // In run_all() path, the scan was already done in Phase 2.
+    if (entry->pass->has_scan() && !entry->scan_executed) {
+        ScanOrchestrator orch(*reader_, index_->inst_count(), index_);
+        entry->pass->declare_scan(orch, ctx);
+        if (orch.has_declarations()) {
+            orch.execute_scan(range_, cancelled_, no_parallel_scan_);
+        }
+        entry->scan_executed = true;
+    }
+
     PassResult result = entry->pass->run(ctx);
 
     double ms   = TENET_TIMER_MS(t0);
@@ -475,8 +478,9 @@ void PassManager::run_all(size_t num_threads) {
 
     // ── Phase 1: Declaration — each pass's declare_scan() registers collectors ──
     if (scan_orchestrator_) {
+        PassContext ctx(*this, range_);
         for (auto& entry : entries_) {
-            entry->pass->declare_scan(*scan_orchestrator_);
+            entry->pass->declare_scan(*scan_orchestrator_, ctx);
         }
 
         // ── Phase 2: Unified scan — one traversal serves all collectors ──

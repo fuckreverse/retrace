@@ -431,11 +431,7 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
     // ─── Phase 1: collect call sites via collector ─────────────────────────
     MemoryStringCollector collector(code_table, config_);
 
-    auto* engine = ctx.scan_engine();
-    if (engine) {
-        engine->add_collector(&collector);
-        engine->run();
-    } else {
+    {
         uint64_t total_insts = index.inst_count();
         TraceScanEngine local_engine(reader, total_insts, &index);
         local_engine.set_progress([&](uint64_t processed, uint64_t total) {

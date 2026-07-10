@@ -1306,11 +1306,7 @@ PassResult SyscallInterceptPass::run(PassContext& ctx) {
     SyscallInterceptCollector collector(config_, code_table, ctx.memory(), objc,
                                        static_cast<uint32_t>(reader.header().target_os));
 
-    auto* engine = ctx.scan_engine();
-    if (engine) {
-        engine->add_collector(&collector);
-        engine->run();
-    } else {
+    {
         auto& index = ctx.index();
         uint64_t total_insts = index.inst_count();
         TraceScanEngine local_engine(reader, total_insts, &index);
