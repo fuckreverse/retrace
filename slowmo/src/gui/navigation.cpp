@@ -92,6 +92,21 @@ void GuiApp::ensure_taint_sorted() {
     taint_sorted_ids_dirty_ = false;
 }
 
+void GuiApp::ensure_backward_taint_sorted() {
+    if (!backward_taint_sorted_ids_dirty_) return;
+    backward_taint_sorted_ids_.clear();
+    if (backward_taint_result_) {
+        backward_taint_sorted_ids_.reserve(
+            backward_taint_result_->contributing_count());
+        for (uint64_t id : backward_taint_result_->contributing_inst_ids) {
+            backward_taint_sorted_ids_.push_back(id);
+        }
+        std::sort(backward_taint_sorted_ids_.begin(),
+                  backward_taint_sorted_ids_.end());
+    }
+    backward_taint_sorted_ids_dirty_ = false;
+}
+
 void GuiApp::jump_taint_next() {
     if (!taint_result_) return;
     ensure_taint_sorted();
@@ -121,17 +136,13 @@ void GuiApp::jump_taint_prev() {
 
 void GuiApp::jump_backward_taint_next() {
     if (!backward_taint_result_) return;
-    // Build sorted list on the fly from backward taint contributing inst_ids
-    std::vector<uint64_t> ids;
-    for (uint64_t id = 0; id < total_inst_; id++) {
-        if (backward_taint_result_->is_contributing(id)) {
-            ids.push_back(id);
-        }
-    }
-    if (ids.empty()) return;
-    auto it = std::upper_bound(ids.begin(), ids.end(), current_inst_);
-    if (it == ids.end()) {
-        navigate_to(ids.front());
+    ensure_backward_taint_sorted();
+    if (backward_taint_sorted_ids_.empty()) return;
+    auto it = std::upper_bound(backward_taint_sorted_ids_.begin(),
+                               backward_taint_sorted_ids_.end(),
+                               current_inst_);
+    if (it == backward_taint_sorted_ids_.end()) {
+        navigate_to(backward_taint_sorted_ids_.front());
     } else {
         navigate_to(*it);
     }
@@ -139,16 +150,13 @@ void GuiApp::jump_backward_taint_next() {
 
 void GuiApp::jump_backward_taint_prev() {
     if (!backward_taint_result_) return;
-    std::vector<uint64_t> ids;
-    for (uint64_t id = 0; id < total_inst_; id++) {
-        if (backward_taint_result_->is_contributing(id)) {
-            ids.push_back(id);
-        }
-    }
-    if (ids.empty()) return;
-    auto it = std::lower_bound(ids.begin(), ids.end(), current_inst_);
-    if (it == ids.begin()) {
-        navigate_to(ids.back());
+    ensure_backward_taint_sorted();
+    if (backward_taint_sorted_ids_.empty()) return;
+    auto it = std::lower_bound(backward_taint_sorted_ids_.begin(),
+                               backward_taint_sorted_ids_.end(),
+                               current_inst_);
+    if (it == backward_taint_sorted_ids_.begin()) {
+        navigate_to(backward_taint_sorted_ids_.back());
     } else {
         --it;
         navigate_to(*it);

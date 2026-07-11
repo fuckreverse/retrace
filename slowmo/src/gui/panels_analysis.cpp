@@ -294,6 +294,7 @@ void GuiApp::apply_pass_result_pointers(std::string_view name) {
     }
     if (name == "backward_taint") {
         backward_taint_result_ = &raw->get<BackwardTaintResult>();
+        backward_taint_sorted_ids_dirty_ = true;
         show_backward_taint_   = true;
         return;
     }
@@ -886,6 +887,7 @@ void GuiApp::clear_analysis() {
 
     taint_result_ = nullptr;
     backward_taint_result_ = nullptr;
+    backward_taint_sorted_ids_dirty_ = true;
     function_result_ = nullptr;
     xref_result_ = nullptr;
     string_result_ = nullptr;
@@ -986,6 +988,8 @@ void GuiApp::clear_analysis() {
     std::memset(function_filter_buf_, 0, sizeof(function_filter_buf_));
     taint_sorted_ids_.clear();
     taint_sorted_ids_dirty_ = true;
+    backward_taint_sorted_ids_.clear();
+    backward_taint_sorted_ids_dirty_ = true;
     goto_candidates_.clear();
     goto_candidates_dirty_ = true;
     goto_selected_candidate_ = -1;

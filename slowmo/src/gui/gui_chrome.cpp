@@ -334,6 +334,7 @@ void GuiApp::render_menu_bar() {
                     taint_result_          = nullptr;
                     backward_taint_result_ = nullptr;
                     taint_sorted_ids_dirty_ = true;
+                    backward_taint_sorted_ids_dirty_ = true;
                 }
                 if (!has_taint) ImGui::EndDisabled();
             }

@@ -27,8 +27,11 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tenet {
@@ -43,6 +46,11 @@ class TuiApp {
 public:
     /// Constructs the TUI from a shared TenetService instance.
     explicit TuiApp(TenetService& service);
+
+    /// Destructor: joins any lingering async analysis thread.
+    ~TuiApp() {
+        if (async_thread_.joinable()) async_thread_.join();
+    }
 
     /// Run the interactive TUI loop. Returns 0 on clean exit.
     int run();
@@ -196,6 +204,18 @@ private:
     void run_default_analysis();
 
     std::string last_pass_status_;
+
+    // ── Async analysis ────────────────────────────────────────────────
+    // Runs passes on a background thread to avoid blocking the TUI event
+    // loop. Completion wakes the loop via screen_.PostEvent(Event::Custom).
+    std::atomic<bool> async_running_{false};
+    std::string async_pass_name_;         // pass being run (for status display)
+    std::shared_ptr<const PassResult> async_result_;  // set by background thread
+    bool async_ok_ = false;               // set by background thread
+    std::thread async_thread_;
+    void finish_async();                  // called on UI thread after completion
+    void launch_async(std::string pass_name,
+                      std::function<void()> run_fn);
 
     // ─── Loop analysis ────────────────────────────────────────────────
     bool show_loops_ = false;

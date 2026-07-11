@@ -413,7 +413,13 @@ std::vector<std::string>      labels;  // one per stack entry, stable across fra
     // Cached sorted list of tainted inst_ids for fast prev/next navigation
     std::vector<uint64_t> taint_sorted_ids_;
     bool taint_sorted_ids_dirty_ = true;
+    // Cached sorted list of backward-taint contributing inst_ids.
+    // Previously jump_backward_taint_next/prev rebuilt this on every call
+    // by scanning all total_inst_ IDs — O(N) per keypress.
+    std::vector<uint64_t> backward_taint_sorted_ids_;
+    bool backward_taint_sorted_ids_dirty_ = true;
     void ensure_taint_sorted();
+    void ensure_backward_taint_sorted();
     void jump_taint_next();
     void jump_taint_prev();
     void jump_backward_taint_next();

@@ -1349,12 +1349,11 @@ void TuiApp::run_taint_analysis() {
     }
 
     pm->register_pass(std::make_unique<TaintPass>(config));
-    auto& result = pm->require("taint");
-    if (result.ok()) {
-        ctx_.taint_result = &result.get<TaintResult>();
-        show_taint_ = true;
-        taint_jump_list_.clear();  // Will be rebuilt lazily
-    }
+    launch_async("taint", [this, pm]() {
+        auto sp = pm->require_shared("taint");
+        async_result_ = sp;
+        async_ok_ = sp && sp->ok();
+    });
 }
 
 void TuiApp::run_backward_taint_analysis() {
@@ -1385,13 +1384,11 @@ void TuiApp::run_backward_taint_analysis() {
     }
 
     pm->register_pass(std::make_unique<BackwardTaintPass>(std::move(config)));
-    auto& result = pm->require("backward_taint");
-    if (result.ok()) {
-        ctx_.backward_taint_result = &result.get<BackwardTaintResult>();
-        show_backward_taint_ = true;
-        show_taint_ = false;
-        taint_jump_list_.clear();
-    }
+    launch_async("backward_taint", [this, pm]() {
+        auto sp = pm->require_shared("backward_taint");
+        async_result_ = sp;
+        async_ok_ = sp && sp->ok();
+    });
 }
 
 void TuiApp::clear_analysis() {
@@ -1563,17 +1560,70 @@ void TuiApp::run_pass_by_name(std::string_view name) {
         return;
     }
 
-    auto& raw = pm->require(name);
+    // Run async on background thread to avoid blocking the TUI event loop.
+    std::string pass_name(name);
+    launch_async(pass_name, [this, pm, pass_name]() {
+        auto sp = pm->require_shared(pass_name);
+        async_result_ = sp;
+        async_ok_ = sp && sp->ok();
+    });
+}
+
+void TuiApp::finish_async() {
+    if (!async_running_.load(std::memory_order_acquire)) return;
+    // Join the background thread
+    if (async_thread_.joinable()) async_thread_.join();
+    async_running_.store(false, std::memory_order_release);
+
+    auto name = std::move(async_pass_name_);
+    auto sp = std::move(async_result_);
+    bool ok = async_ok_;
+    async_ok_ = false;
+
+    // Handle multi-pass default analysis
+    if (name == "default") {
+        auto* pm = service_->pass_manager();
+        for (auto pname : tenet::default_ui_pass_names()) {
+            auto& raw = pm->require(pname);
+            wire_pass_result(pname, raw);
+        }
+        last_pass_status_ = fmt::format("ran {} default passes",
+                                        tenet::default_ui_pass_names().size());
+        return;
+    }
+
+    if (!sp) {
+        last_pass_status_ = fmt::format("{}: failed", name);
+        return;
+    }
+    auto& raw = *sp;
     last_pass_status_ = fmt::format("{}: {}", name,
                                     tenet::summarize_pass_result(name, raw));
     wire_pass_result(name, raw);
 
-    // If the Results panel triggered this run (or the user ran ':pass X'),
-    // jump straight into the detail view instead of leaving them staring at
-    // a one-line status message — mirrors GUI's auto-open-window behavior.
-    if (raw.ok()) {
+    if (ok) {
         results_panel_->focus_pass(name);
     }
+}
+
+void TuiApp::launch_async(std::string pass_name,
+                          std::function<void()> run_fn) {
+    // If a previous async task is still running, wait for it.
+    if (async_running_.load(std::memory_order_acquire)) {
+        if (async_thread_.joinable()) async_thread_.join();
+        async_running_.store(false, std::memory_order_release);
+    }
+    async_pass_name_ = pass_name;
+    async_result_.reset();
+    async_ok_ = false;
+    async_running_.store(true, std::memory_order_release);
+    last_pass_status_ = fmt::format("running {}...", pass_name);
+
+    async_thread_ = std::thread([this, fn = std::move(run_fn)]() {
+        fn();
+        // Wake the TUI event loop to process the result
+        screen_.PostEvent(ftxui::Event::Custom);
+    });
 }
 
 void TuiApp::run_default_analysis() {
@@ -1581,12 +1631,26 @@ void TuiApp::run_default_analysis() {
     auto* pm = service_->pass_manager();
 
     tenet::register_default_passes(*pm);
-    for (auto name : tenet::default_ui_pass_names()) {
-        auto& raw = pm->require(name);
-        wire_pass_result(name, raw);
-    }
-    last_pass_status_ = fmt::format("ran {} default passes",
-                                    tenet::default_ui_pass_names().size());
+    // Run all default passes async. We collect results on the background
+    // thread, then wire them on the UI thread via finish_async().
+    // For multi-pass, we run them all then wire the last one's name.
+    launch_async("default", [this, pm]() {
+        auto names = tenet::default_ui_pass_names();
+        for (auto name : names) {
+            pm->require(name);
+        }
+        // Use the first pass as the "result" for status display
+        if (!names.empty()) {
+            auto sp = pm->require_shared(names[0]);
+            async_result_ = sp;
+            async_ok_ = sp && sp->ok();
+        }
+    });
+    // Wire all results after async completion via a custom finish path
+    // For now, finish_async() handles the single-pass case.  For default
+    // passes, we need to wire all of them.  Override: set a flag so
+    // finish_async knows to wire all default passes.
+    // TODO: extend finish_async to handle multi-pass wiring.
 }
 
 void TuiApp::follow_call() {
@@ -1740,6 +1804,11 @@ int TuiApp::run() {
     });
 
     app |= CatchEvent([&](Event event) {
+        // Async analysis completion: background thread posts Event::Custom
+        if (event == Event::Custom && async_running_.load(std::memory_order_acquire)) {
+            finish_async();
+            return true;
+        }
         // Dialog mode: handle Enter/Escape, let input component handle the rest
         if (show_goto_dialog_) {
             if (event == Event::Return) {

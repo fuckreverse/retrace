@@ -63,7 +63,12 @@ namespace tenet {
 //      record walk to desynchronize and produce non-monotonic keys for
 //      SstFileWriter — resulting in "Keys must be added in strict ascending
 //      order" errors.  Caches built with schema ≤v10 for v7 traces are invalid.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 11;
+// v12: OFFSET CF values expanded from 8 bytes (file_offset only) to 16 bytes
+//      (file_offset + seed_pc).  For v5 traces this eliminates the ANCHOR
+//      walk in offset_of_with_pc() — the seed_pc is read directly from the
+//      sparse index instead of being reconstructed by linear-scanning pc_delta
+//      from the nearest anchor.  Caches built with schema ≤v11 are invalid.
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 12;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1336,6 +1341,11 @@ struct ShardResult {
         };
         std::vector<CodeEntry> code_entries;
 
+        // v5 seed_pc tracking: accumulate pc_delta across INST records,
+        // reset from ANCHOR records.  Stored alongside file_offset in the
+        // OFFSET CF so offset_of_with_pc() can skip the ANCHOR walk.
+        uint64_t running_pc = 0;
+
         uint64_t scan_offset = bounds.file_start;
         const uint64_t scan_end = bounds.file_end;
 
@@ -1362,13 +1372,25 @@ struct ShardResult {
                     + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
                     + ptr[3] * memacc_sz;
                 if (remaining < rec_size) return 0;
+                // v5: accumulate pc_delta so running_pc holds this inst's absolute PC
+                if (is_v5) {
+                    int16_t delta;
+                    std::memcpy(&delta, ptr + 4, 2);
+                    running_pc += static_cast<int64_t>(delta);
+                }
                 // P1.6: Sparse offset with adaptive interval
                 if (inst_id % idx.sparse_interval_ == 0) {
                     char key_buf[8];
                     encode_u64_to(inst_id, key_buf);
+                    // Store 16-byte value: file_offset (8B) + seed_pc (8B).
+                    // For v5 traces seed_pc is the running PC; for others it's 0.
+                    char val_buf[16];
+                    std::memcpy(val_buf, &rec_offset, 8);
+                    uint64_t seed = is_v5 ? running_pc : 0;
+                    std::memcpy(val_buf + 8, &seed, 8);
                     auto s = offset_w.add(
                         rocksdb::Slice(key_buf, 8),
-                        rocksdb::Slice(reinterpret_cast<const char*>(&rec_offset), 8));
+                        rocksdb::Slice(val_buf, 16));
                     if (!s.ok()) { result.error = s.ToString(); return 0; }
                 }
                 // REG_WRITES inverted index (per-register SST writers)
@@ -1399,6 +1421,11 @@ struct ShardResult {
                 size_t anchor_fpr = is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
                 rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + anchor_fpr;
                 if (remaining < rec_size) return 0;
+                // v5: reset running_pc from the anchor's absolute PC
+                if (is_v5) {
+                    const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+                    running_pc = ah->pc;
+                }
                 char anchor_key_buf[8];
                 encode_u64_to(inst_id, anchor_key_buf);
                 auto s = anchor_w.add(
@@ -1862,22 +1889,19 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
     uint64_t offset = 0;
     std::memcpy(&offset, value.data(), 8);
 
-    // Linear scan from base_id to inst_id
-    // The stored offset points to the INST record for base_id.
-    // We need to find the INST record for inst_id.
-    uint64_t current_id = base_id;
-    uint64_t current_offset = offset;
     const uint32_t num_gpr = reader.header().num_gpr;
     const bool is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     const bool is_v7_scan = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
 
-    // For v5 traces we track the running PC so we can return seed_pc to callers
-    // (they need it to correctly call as_inst() on the resulting offset).
-    // We need to find an anchor at/before base_id to seed running_pc.
-    // Use the in-memory anchor table: nearest_anchor_before(base_id) gives us a
-    // file_offset to scan from with a known absolute PC.
+    // v12+: seed_pc is stored alongside the offset (16-byte value).
+    // For v5 traces this eliminates the ANCHOR walk that previously
+    // reconstructed running_pc by linear-scanning pc_delta from the
+    // nearest anchor to base_id.
     uint64_t running_pc = 0;
-    if (is_v5) {
+    if (is_v5 && value.size() >= 16) {
+        std::memcpy(&running_pc, value.data() + 8, 8);
+    } else if (is_v5) {
+        // Legacy 8-byte value (pre-v12 cache) — fall back to ANCHOR walk.
         // Walk from the nearest anchor up to base_id to seed running_pc.
         auto anchor_info = nearest_anchor_before(base_id);
         if (anchor_info.file_offset > 0) {
@@ -1921,6 +1945,12 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
             }
         }
     }
+
+    // Linear scan from base_id to inst_id
+    // The stored offset points to the INST record for base_id.
+    // We need to find the INST record for inst_id.
+    uint64_t current_id = base_id;
+    uint64_t current_offset = offset;
 
     while (current_offset < reader.file_size()) {
         const uint8_t* ptr = reader.data_at(current_offset);

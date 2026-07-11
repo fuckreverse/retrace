@@ -1150,6 +1150,7 @@ show_backward_taint_  = false;
 show_taint_source_annotation_ = false;
 taint_result_         = nullptr;
 backward_taint_result_= nullptr;
+backward_taint_sorted_ids_dirty_ = true;
 // TaintSourceAnnotationResult hard-depends on backward_taint's
 // contributing set — its pointer would dangle once backward_taint
 // is cleared/re-run with a different sink, so clear it alongside.

@@ -6,6 +6,7 @@
 #include "core/register_file.h"
 #include "core/instruction_decoder.h"
 #include "core/memory_model.h"
+#include "analysis/passes/structure/xref_pass.h"
 
 #include <algorithm>
 
@@ -27,6 +28,8 @@ TenetService::TenetService(TraceReader& reader,
 
     // Restore persisted state from RocksDB
     bookmarks_ = index_.load_bookmarks();
+    // Build O(1) lookup mirror
+    for (uint64_t bm : bookmarks_) bookmark_set_.insert(bm);
     uint64_t last = index_.load_last_inst();
     if (last > 0 && last < total_inst_) {
         current_inst_ = last;
@@ -91,15 +94,17 @@ void TenetService::toggle_bookmark(uint64_t inst_id) {
     auto it = std::find(bookmarks_.begin(), bookmarks_.end(), inst_id);
     if (it != bookmarks_.end()) {
         bookmarks_.erase(it);
+        bookmark_set_.erase(inst_id);
     } else {
         bookmarks_.push_back(inst_id);
+        bookmark_set_.insert(inst_id);
     }
     index_.save_bookmarks(bookmarks_);
     notify_bookmark_changed();
 }
 
 bool TenetService::has_bookmark(uint64_t inst_id) const {
-    return std::find(bookmarks_.begin(), bookmarks_.end(), inst_id) != bookmarks_.end();
+    return bookmark_set_.count(inst_id) > 0;
 }
 
 // ─── Instruction row fetching ───────────────────────────────────────────────
@@ -202,19 +207,79 @@ void TenetService::search_forward(const std::string& query, uint64_t from_inst) 
     }
     search_active_ = true;
 
-    // Simple linear search through instruction disassembly
-    for (uint64_t i = from_inst; i < total_inst_ && search_results_.size() < 10000; ++i) {
+    // ── Fast path: XrefResult-accelerated search ──────────────────────
+    // If the xref pass has been run, we can iterate unique PCs (typically
+    // 1000-10000x fewer than total instructions), decode each once, and
+    // expand matching PCs to all their inst_ids.  This avoids calling
+    // fetch_row() for every instruction in the trace.
+    auto* xref = pass_result<XrefResult>("xref");
+    if (xref && xref->unique_pc_count > 0) {
+        std::vector<uint64_t> matched;
+        for (const auto& [pc, exec_count] : xref->pc_exec_count) {
+            // Decode instruction at this PC (same logic as fetch_row)
+            auto opcode = code_table_.opcode_at(pc);
+            if (!opcode) continue;
+            auto decoded = decoder_.decode(pc, *opcode);
+            if (!decoded) continue;
+            std::string_view disasm_sv = decoded->op_str_sv();
+            std::string disasm;
+            if (disasm_sv.empty()) {
+                disasm = std::string(decoded->mnemonic_sv());
+            } else {
+                disasm = std::string(decoded->mnemonic_sv()) + " " +
+                         std::string(disasm_sv);
+            }
+            if (disasm.find(query) == std::string::npos) continue;
+
+            // PC matches — expand to all inst_ids
+            auto ids = xref->inst_ids_at(pc);
+            for (uint64_t id : ids) {
+                matched.push_back(id);
+                if (matched.size() >= 10000) break;
+            }
+            if (matched.size() >= 10000) break;
+        }
+        // Sort and apply from_inst wrap-around
+        std::sort(matched.begin(), matched.end());
+        auto it = std::lower_bound(matched.begin(), matched.end(), from_inst);
+        // [from_inst, end)
+        for (auto i = it; i != matched.end(); ++i)
+            search_results_.push_back(*i);
+        // [0, from_inst)
+        for (auto i = matched.begin(); i != it; ++i)
+            search_results_.push_back(*i);
+        return;
+    }
+
+    // ── Fallback: linear scan with PC dedup ───────────────────────────
+    // When xref hasn't been run, scan all instructions but skip the string
+    // search for PCs we've already checked (loops, repeated calls).
+    ankerl::unordered_dense::set<uint64_t> seen_pcs;
+    ankerl::unordered_dense::set<uint64_t> matching_pcs;
+
+    auto check_inst = [&](uint64_t i) {
         auto row = fetch_row(i);
-        if (row.disasm.find(query) != std::string::npos) {
+        bool matches;
+        if (matching_pcs.count(row.pc)) {
+            matches = true;
+        } else if (seen_pcs.count(row.pc)) {
+            matches = false;
+        } else {
+            seen_pcs.insert(row.pc);
+            matches = row.disasm.find(query) != std::string::npos;
+            if (matches) matching_pcs.insert(row.pc);
+        }
+        if (matches) {
             search_results_.push_back(i);
         }
+    };
+
+    for (uint64_t i = from_inst; i < total_inst_ && search_results_.size() < 10000; ++i) {
+        check_inst(i);
     }
     // Wrap around
     for (uint64_t i = 0; i < from_inst && search_results_.size() < 10000; ++i) {
-        auto row = fetch_row(i);
-        if (row.disasm.find(query) != std::string::npos) {
-            search_results_.push_back(i);
-        }
+        check_inst(i);
     }
 }
 

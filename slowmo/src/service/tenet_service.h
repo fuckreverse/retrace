@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tenet {
@@ -186,6 +187,11 @@ private:
     uint64_t total_inst_ = 0;
     uint64_t current_inst_ = 0;
     std::vector<uint64_t> bookmarks_;
+    // O(1) lookup mirror of bookmarks_ — populated alongside bookmarks_
+    // on every mutation (toggle_bookmark, load). fetch_row() calls
+    // has_bookmark() for every visible row, so O(N) std::find on the
+    // vector was a per-frame hotspot.
+    std::unordered_set<uint64_t> bookmark_set_;
 
     // ── Row cache ───────────────────────────────────────────────────────
     LRUCache<uint64_t, InstructionRow> row_cache_{4096};
