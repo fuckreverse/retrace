@@ -28,6 +28,20 @@ class ImageFallback {
 public:
     ImageFallback() = default;
 
+    /// Destructor: releases the mmap'd image data if still mapped.
+    /// Without this, every load() leaks an mmap region because the
+    /// compiler-generated destructor only destroys the pointer, not the
+    /// underlying mapping.
+    ~ImageFallback();
+
+    // Non-copyable (owns an mmap region).
+    ImageFallback(const ImageFallback&) = delete;
+    ImageFallback& operator=(const ImageFallback&) = delete;
+
+    // Movable: transfers ownership of the mmap region.
+    ImageFallback(ImageFallback&& other) noexcept;
+    ImageFallback& operator=(ImageFallback&& other) noexcept;
+
     /// Load an image file and build the executable-segment map for a module
     /// whose runtime base is `module_base`. Returns false on any parse error
     /// (the fallback simply stays empty and opcode lookups fail gracefully).

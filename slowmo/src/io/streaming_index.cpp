@@ -138,7 +138,19 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
                 // Future: add TraceIndex::append_range(from_offset, to_offset)
                 uint64_t prev_count = inst_count_.load(std::memory_order_relaxed);
 
-                // Count new INST records in the new file segment
+                // Count new INST records in the new file segment.
+                // Use raw_record_size() to correctly advance past each record
+                // based on its kind (INST, ANCHOR, CODE, etc.) and the trace's
+                // format flags (v4/v5/v6/v7). The previous fixed += 6 advance
+                // (v5 minimum INST header) caused record desynchronization:
+                // it would land in the middle of variable-length records,
+                // miscount INST records, and silently corrupt the inst_count.
+                const auto& hdr = reader.header();
+                uint32_t num_gpr = hdr.num_gpr;
+                bool is_v5 = (hdr.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+                bool is_v6 = (hdr.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+                bool is_v7 = (hdr.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+
                 uint64_t scan_start = static_cast<uint64_t>(
                     reader.file_size() - new_bytes);
                 uint64_t new_inst_count = 0;
@@ -147,16 +159,16 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
 
                 reader.pin_all();
                 while (scan_offset < file_end) {
-                    if (scan_offset + 1 > file_end) break;
                     const uint8_t* rec_ptr = reader.data_at(scan_offset);
                     uint8_t kind = rec_ptr[0];
                     if (kind == 0) {  // REC_INST
                         new_inst_count++;
                     }
-                    // Advance by minimum record size to avoid getting stuck
-                    // (proper parsing would use RecordView::byte_size but that
-                    //  requires num_gpr from header)
-                    scan_offset += 6;  // v5 minimum INST header
+                    // Advance by the record's actual byte size.
+                    size_t rec_size = raw_record_size(rec_ptr, num_gpr,
+                                                      is_v5, is_v6, is_v7);
+                    if (rec_size == 0) break;  // safety: avoid infinite loop
+                    scan_offset += rec_size;
                     if (cfg_.max_inst_count > 0 &&
                         prev_count + new_inst_count >= cfg_.max_inst_count) {
                         complete_.store(true, std::memory_order_release);

@@ -73,7 +73,45 @@ struct Elf64Phdr {
 static constexpr uint32_t ELF_PT_LOAD = 1;
 static constexpr uint32_t ELF_PF_X = 1;
 
+// ─── Destructor / move — release mmap on destruction ───────────────────────
+
+ImageFallback::~ImageFallback() {
+    if (data_) {
+        ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+        data_ = nullptr;
+        size_ = 0;
+    }
+}
+
+ImageFallback::ImageFallback(ImageFallback&& other) noexcept
+    : data_(other.data_), size_(other.size_), segments_(std::move(other.segments_)) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+}
+
+ImageFallback& ImageFallback::operator=(ImageFallback&& other) noexcept {
+    if (this != &other) {
+        if (data_) {
+            ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+        }
+        data_ = other.data_;
+        size_ = other.size_;
+        segments_ = std::move(other.segments_);
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+    return *this;
+}
+
 bool ImageFallback::load(const std::string& path, uint64_t module_base) {
+    // Release any previously-loaded mmap before loading a new one.
+    if (data_) {
+        ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+        data_ = nullptr;
+        size_ = 0;
+        segments_.clear();
+    }
+
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     struct stat st{};

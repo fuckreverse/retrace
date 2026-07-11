@@ -37,22 +37,23 @@ uint64_t ScanOrchestrator::execute_scan(const AnalysisRange& range,
         engine.add_collector(decl.collector);
     }
 
-    // Determine if all collectors support parallel scanning
-    bool all_parallel = !no_parallel;
-    if (all_parallel) {
-        for (const auto& decl : declarations_) {
-            if (!decl.wants_parallel) {
-                all_parallel = false;
-                break;
-            }
-        }
-    }
-
-    uint64_t processed = 0;
-    if (all_parallel) {
-        processed = engine.run_parallel(range.start_inst_id, range.end_inst_id);
-    } else {
+    // Always use run_parallel(), which internally separates collectors into
+    // parallel-capable (supports_parallel() + clone()) and sequential groups.
+    // The parallel group is scanned concurrently across shards; the sequential
+    // group is scanned in a single follow-up pass. This avoids the previous
+    // all-or-nothing gate that forced the ENTIRE scan to sequential whenever
+    // a single collector declared wants_parallel=false.
+    //
+    // Fallback to run() happens inside run_parallel() itself when:
+    //   - no collectors support parallel scanning
+    //   - the trace is too small (<50K insts)
+    //   - the index is unavailable
+    //   - v5/v7 format requires sequential PC reconstruction
+    uint64_t processed;
+    if (no_parallel) {
         processed = engine.run(range.start_inst_id, range.end_inst_id);
+    } else {
+        processed = engine.run_parallel(range.start_inst_id, range.end_inst_id);
     }
 
     scanned_ = true;

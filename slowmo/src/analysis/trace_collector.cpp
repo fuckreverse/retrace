@@ -88,6 +88,8 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 }
             }
 
+            uint8_t n_fprdiff = is_v7 ? ptr[fprdiff_offset] : 0;
+
             if (!excluded) {
                 InstView inst;
                 inst.pc = pc;
@@ -96,15 +98,19 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 inst.mem_access_count = n_mem;
                 inst.raw_diffs = raw_diffs;
                 inst.raw_mems = raw_diffs + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
-                              + (is_v7 ? ptr[fprdiff_offset] * fprdiff_sz : 0);
+                              + (is_v7 ? n_fprdiff * fprdiff_sz : 0);
                 inst.is_v5 = false;
+                inst.is_v6 = is_v6;
+                inst.is_v7 = is_v7;
+                inst.fpr_diff_count = n_fprdiff;
+                inst.raw_fprdiffs = is_v7
+                    ? (raw_diffs + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t))
+                    : nullptr;
 
                 for (auto* c : clones) {
                     c->on_inst(inst_id, inst);
                 }
             }
-
-            uint8_t n_fprdiff = is_v7 ? ptr[fprdiff_offset] : 0;
             offset += inst_hdr_sz
                 + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
                 + n_fprdiff * fprdiff_sz
