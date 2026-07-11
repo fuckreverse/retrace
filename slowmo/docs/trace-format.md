@@ -1,4 +1,4 @@
-# Trace Format 接口契约 (v3)
+# Trace Format 接口契约（v4–v7）
 
 ## 概述
 
@@ -78,7 +78,8 @@ tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` t
 | BLOCK_COMPRESSED | bit 8 | 分块压缩格式：多个独立 zstd frame + 尾部索引（见下方"分块压缩"节） |
 | BRANCH_HINT | bit 9 | INST nzcv 字节高 4 位编码分支类别（见下方"Branch Hint"节） |
 
-> **注**：`COMPRESSED` 与 `BLOCK_COMPRESSED` 互斥，不能同时设置。
+> **注**：`COMPRESSED` 与 `BLOCK_COMPRESSED` 互斥。当前 qbditrace writer 默认产生
+> `BLOCK_COMPRESSED`；`COMPRESSED` 单帧流格式仅为历史读取兼容，当前 writer 不产生。
 
 **版本与 Flag 对应关系**：
 
@@ -101,7 +102,9 @@ tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` t
 
 qbditrace 在录制时通过编译期宏自动填写此字段。tenet 读取时会校验值是否在 0-3 范围，超过则回退为 Unknown。
 
-**tenet 要求**：magic == 0x51424454, version >= 4, flags 必须包含 REG_DIFF | HAS_CODE。
+**tenet 打开条件**：magic == `0x51424454` 且 version >= 4。`REG_DIFF`、`HAS_MEM`、
+`HAS_NZCV` 可关闭（sampling trace 即如此）；缺少 `HAS_CODE` 时仍可解析记录流，但依赖
+反汇编的分析需要外部镜像或会降级。
 
 ---
 
@@ -497,6 +500,11 @@ Variable tail: str_count × (4 + str_len + 1 + pad)，最多 ≈ 1 KB
 | bit 1 | `SF_BINARY` | 内容为原始字节（含不可打印字符） |
 | bit 2 | `SF_SAFE_READ_FAIL` | safeRead 失败，str_len=0，捕获为空 |
 
+> **已知格式限制**：进程内配置表的 `api_id` 是 `uint16_t`，但
+> `qbditrace_capicall_head_t.api_id` 的磁盘字段仍为 `uint8_t`。因此所有 `api_id >= 256`
+> 的值都会在写盘时截断；下表中的 JNI、Android/BoringSSL 与其它扩展 ID 不能可靠
+> round-trip。修复需要 widening 字段并同步 tracer、`trace_decode`、tenet 的格式版本。
+
 **api_id 分组速览**（来自 `qbditrace_capi_id_t`）：
 
 | 范围 | 分类 | 平台 |
@@ -724,7 +732,8 @@ size_t record_size(const uint8_t* ptr, const TraceFlags& flags, uint32_t num_gpr
 
 文件头始终不压缩；压缩范围是文件头之后的所有字节，构成一个完整的 zstd frame（包含 content checksum）。
 
-**写入端**：`BackgroundWriter` 使用 `ZSTD_compressStream2` 流式压缩，level=1（最快），预期压缩比 3-4x。
+**写入端**：当前 qbditrace writer 不再产生此格式。本节保留用于解释和读取历史
+`HF_COMPRESSED` trace。
 
 **读取端（tenet）**：`TraceReader::open()` 检测到 `HF_COMPRESSED` 后，自动通过 `ZSTD_decompressStream` 流式解压到临时文件（同目录下 `.tenet-decomp-XXXXXX`，若失败回退 `/tmp`）。临时文件的 header 中 `HF_COMPRESSED` 标志已被清除，之后正常 mmap。`TraceReader::close()` 时自动删除临时文件。
 
@@ -769,7 +778,9 @@ u32  magic          ← 0x51424249 ("QBBI")
 2. 根据 `index_offset` 和 `block_count` 读取 block index table。
 3. 二分搜索找到包含目标逻辑偏移的块，解压该块即可。
 
-**默认参数**：每块解压后大小为 1 MB（`QBDITRACE_BLOCK_SIZE = 1 << 20`）。
+**写入端与默认参数**：这是当前 qbditrace 的默认压缩格式。`BackgroundWriter` 累积
+1 MiB 原始记录（`QBDITRACE_DEFAULT_BLOCK_SIZE`），以 zstd level 1 + frame checksum
+压成独立 frame；`qbditrace_stop()` 刷出最后一块并写索引表与 footer。
 
 **tenet 使用**：`TraceReader` 在检测到 `HF_BLOCK_COMPRESSED` 后，将 index table 加载为 `std::vector<BlockEntry>`，随机访问时通过二分查找定位块，按需解压，无需预先解压整个文件。
 
@@ -815,11 +826,12 @@ if (header.version > 7)
 | E2 | 文件尾部全局索引表 | 避免 tenet 全文件扫描建索引（O(n)→O(1)） | 待实现 |
 | E3 | 浮点/向量寄存器 | 密码学分析需要 NEON | ✅ **已实现**（v7 HF_HAS_FPR） |
 | E4 | 内存映射信息 | mmap 区域感知 | 待实现（REC_MMAP） |
-| E5 | 流式压缩 | 文件体积压缩 3-4x | ✅ **已实现**（HF_COMPRESSED） |
+| E5 | 压缩 | 文件体积压缩 3-4x | ✅ **已实现**（当前 writer 使用 HF_BLOCK_COMPRESSED；HF_COMPRESSED 仅兼容历史读取） |
 | E6 | inst_id 全局编号 | 当前无显式 ID，靠顺序计数 | 待实现 |
 | E7 | 分块压缩 | O(1) 随机访问压缩 trace | ✅ **已实现**（HF_BLOCK_COMPRESSED） |
 | E8 | 分支类别提示 | 零开销函数边界识别 | ✅ **已实现**（HF_BRANCH_HINT） |
+| E9 | CAPICALL api_id 扩宽 | 当前磁盘 `uint8_t` 会截断所有 >=256 的 Android/JNI 扩展 ID | 待实现（需要格式 bump） |
 
-**优先级**（待实现部分）：E2 > E1 > E6 > E4
+**优先级**（待实现部分）：E9 > E2 > E1 > E6 > E4
 
 E2（尾部全局索引表）对 tenet 性能影响最大——可将首次打开从 60s 降到 < 1s。

@@ -337,7 +337,8 @@ def parse_args():
                      help='Enable v7 FPR/NEON register recording '
                           '(128-bit vector regs, essential for AES/SHA analysis)')
     rec.add_argument('--no-compress', action='store_true',
-                     help='Disable zstd stream compression (compression is ON by default)')
+                     help='Disable zstd block compression (1 MiB independent frames + '
+                          'footer index; compression is ON by default)')
     rec.add_argument('--exclude-range', type=str, action='append', default=[],
                      help='Exclude address range from tracing (format: START-END or '
                           'START:SIZE, hex). Can be specified multiple times (max 8). '

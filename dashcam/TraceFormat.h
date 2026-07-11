@@ -154,13 +154,11 @@ typedef enum {
    * header types. Readers that do not support v7 must reject the file.
    * Enabling this flag also bumps the file version to QBDITRACE_VERSION_V7_HAS_FPR. */
   QBDITRACE_HF_HAS_FPR = 1u << 6,
-  /* Zstd stream compression. When set, the file header (536 bytes) is stored
-   * uncompressed (so the reader can always identify the file and check flags),
-   * and all bytes after the header are a single zstd frame produced by
-   * ZSTD_compressStream2. The decompressed payload is identical to the
-   * uncompressed format (same record sequence as if this flag were absent).
-   * Readers that do not support compressed traces should reject the file.
-   * This flag is orthogonal to version — any version (v4–v7) can be compressed. */
+  /* Legacy zstd stream compression. When set, the file header (536 bytes) is
+   * stored uncompressed and all bytes after it are one zstd frame. The current
+   * qbditrace writer emits HF_BLOCK_COMPRESSED instead; this flag remains part
+   * of the format contract so readers can open historical single-frame traces.
+   * This flag is orthogonal to version — any version (v4–v7) may carry it. */
   QBDITRACE_HF_COMPRESSED = 1u << 7,
   /* Block-compressed format. When set, the data after the file header is laid
    * out as:

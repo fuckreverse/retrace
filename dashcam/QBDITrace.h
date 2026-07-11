@@ -180,14 +180,15 @@ typedef struct {
    * Zero (the default) keeps the v4/v5/v6 layout unchanged. */
   uint32_t enable_fpr;
 
-  /* Zstd stream compression (requires library compiled with QBDITRACE_HAVE_ZSTD).
+  /* Zstd block compression (requires QBDITRACE_HAVE_ZSTD at build time).
    * The sense is inverted (0 = compressed, the default): a zero-initialized
-   * config produces compressed output, matching the most common use case (mobile
-   * devices with limited storage).  Set to non-zero to disable compression and
-   * write raw, uncompressed trace data.
-   * When compressed, the 536-byte file header is written uncompressed (so the
-   * reader can always identify the file), followed by a single zstd frame
-   * containing the record stream.  HF_COMPRESSED is set in the header flags. */
+   * config produces compressed output. Set to non-zero to write the raw record
+   * stream instead.
+   * When compressed, the 536-byte file header remains uncompressed. Records are
+   * accumulated into 1 MiB logical blocks; each block is an independent zstd
+   * frame, followed by a block index table and footer. The writer sets
+   * HF_BLOCK_COMPRESSED. HF_COMPRESSED describes the legacy single-frame format
+   * and is retained for reader compatibility; the current writer does not emit it. */
   uint32_t disable_compress;
 
   /* Branch-hint encoding (HF_BRANCH_HINT).
@@ -240,21 +241,16 @@ typedef struct {
    * the target address, the argument registers (x0..x7), and optionally
    * dereferenced string/buffer content from pointer arguments.
    *
-   * The caller (typically the Frida JS loader) populates capi_funcs[] by
-   * resolving each well-known function's runtime address via
-   * Module.findExportByName / Process.getModuleByName(...).findExportByName.
-   * The tracer performs a simple O(n) linear scan; for the expected
-   * n_capi_funcs count (~50-100) this is negligible compared to the
-   * per-instruction overhead.
+   * When n_capi_funcs == 0, the native tracer resolves its standard C/platform
+   * API table with dlsym at configure time. A caller may instead provide an
+   * explicit table; the official Frida agent primarily does this for Android
+   * JNI vtable functions, which are not exported symbols. The tracer builds a
+   * sorted address lookup table and uses binary search on transfer callbacks.
    *
-   * When enable_capi_intercept == 0 (the zero-initialized default), the
-   * tracer does NOT emit REC_CAPICALL records even if QBDITRACE_REC_CAPI
-   * is set. This allows the caller to gate the feature independently of the
-   * record bitmask.
-   *
-   * ABI forward-compatibility: callers that zero-initialize the struct get
-   * n_capi_funcs == 0 (no interception), which is safe and produces no
-   * extra records.
+   * When enable_capi_intercept == 0 (the zero-initialized C ABI default), the
+   * tracer does NOT emit REC_CAPICALL records even if QBDITRACE_REC_CAPI is set.
+   * The official Frida agent sets this field by default; minimal native callers
+   * must opt in explicitly.
    */
   uint32_t enable_capi_intercept; /* non-zero to enable C API interception */
   uint32_t n_capi_funcs;          /* number of entries in capi_funcs[] (0..QBDITRACE_MAX_CAPI_FUNCS) */
@@ -279,7 +275,11 @@ typedef struct {
  * qbditrace_run_* is in progress to force an exact checkpoint at an
  * interesting moment (e.g. just before a critical function call).
  * Thread-safe; the anchor is written to the calling thread's buffer.
- * Returns 0 on success, negative if the tracer is not running.
+ * Sets the calling thread's `need_anchor` flag when a ThreadCtx already exists;
+ * the next PREINST callback emits the snapshot. If the thread has no context
+ * yet, its first context starts with an anchor anyway. This is not a cross-thread
+ * request for another VM thread.
+ * Returns 0 once configured, negative if the tracer is not configured.
  */
 int qbditrace_force_anchor(void);
 

@@ -1,11 +1,11 @@
 # qbditrace — 基于 QBDI 的高性能指令级 trace 工具
 
-面向 iOS AArch64（越狱真机）逆向场景的逐指令 trace 工具。在指定地址区间内，
-记录每条指令执行后的**写入寄存器 diff（改前→改后）、NZCV 标志、内存访问（含
-store value，支持 9-16 字节宽 store）、SVC 系统调用、objc_msgSend 类/方法派发
-（含运行时类名）、以及跨区间调用/返回的目标地址**；区间之外的代码以原生速度
-运行、零 trace 开销。运行期只写裸二进制，反汇编与符号化全部交给离线解码器，
-因此热路径极快。
+面向 iOS / Android AArch64 逆向场景的逐指令 trace 工具。在指定模块内，记录每条
+指令执行后的**写入寄存器 diff（改前→改后）、NZCV 标志、内存访问（含 store
+value，支持 9-16 字节宽 store）、SVC 系统调用、平台 API 调用，以及跨模块调用/
+返回的目标地址**；iOS 还可记录 `objc_msgSend` 类/方法派发（含运行时类名）。模块
+之外的代码以原生速度运行，仅保留 transfer 事件。运行期只写裸二进制，反汇编与
+符号化交给离线分析端，因此热路径开销可控。
 
 针对 iOS/arm64e 真机做了专门处理：VM 开启 `OPT_BYPASS_PAUTH` 绕过指针认证，
 因此 `braa/blraa` 这类带认证的间接跳转（例如 `objc_msgSend` 尾部的 `braa x17`、
@@ -18,11 +18,12 @@ PAC 化的 `br x16`）不会导致崩溃，控制流可以被正确跟踪。
 1. **运行期（注入进目标进程的 dylib）**：逐指令回调里只做最小动作——读 NZCV、
    按 PC 查缓存好的"写哪些寄存器"列表并读新值、按需取内存访问、把一条变长记录
    追加到 thread-local 无锁缓冲区。没有任何反汇编、符号化、加锁或同步 I/O。
-2. **异步落盘**：每个线程独立 ring buffer，单个后台 writer 线程统一刷盘。缓冲区
-   满时采用**全量落盘**（不丢数据）。
-3. **离线后处理（host 工具）**：`trace_decode` 用 Capstone 反汇编，按线程从
-   anchor 快照 + diff 链重建完整寄存器状态，并把运行期地址归一化为 IDA 里的静态
-   地址。反汇编默认直接用 trace **自带的内嵌码表**，无需任何外部镜像。
+2. **异步落盘**：每个线程独立 chunk buffer，单个后台 writer 线程统一刷盘。启用
+   zstd 时默认写成 1 MiB 独立 frame 的**分块压缩格式**，并在文件尾写块索引，兼顾
+   体积和随机访问；`bytes_written` 统计的是提交给 writer 的原始字节数，不是物理文件大小。
+3. **离线后处理**：tenet 是完整分析端，支持默认分块压缩及 v4/v5/v7；轻量
+   `trace_decode` 仅用于未压缩 v4 兼容文件。两者都可利用 trace **自带的内嵌码表**
+   反汇编，并把运行期地址按 slide 归一化为静态地址，无需外部镜像。
 
 此外解码器内置若干逆向增强：调用点的参数/返回值聚合（e1）、adrp/adr 目标与静态
 字符串标注（e2）、调用深度缩进（e3）、以及两条 trace 的指令级 diff（e4，自动归一
@@ -116,24 +117,26 @@ dump 到 `QBDI_LOG_FILE` 环境变量指定的文件（或 stderr），然后 re
 ### 关于 GCD / 多线程的语义边界
 
 QBDI 的 VM 是**单线程**的：`qbditrace_run_call` / `qbditrace_run_at` 只接管发起
-调用的那个线程，并在该线程的栈上用 QBDI 执行目标函数。这带来两点限制：
+调用的线程。默认情况下，`dispatch_async` / `dispatch_after` 派发到其它线程的
+block 不在当前 VM 的接管范围内，只能看到 dispatcher 的跨模块调用。
 
-- **dispatch_async / GCD 派发出去的 block 跟不到**。当目标代码调用
-  `dispatch_async` 把一个 block 丢到其它队列/线程执行时，那段 block 在**另一个
-  原生线程**上运行，并不在当前 VM 的接管范围内，因此不会被 trace。能看到的只是
-  "调用了 dispatch_async"这一跨区间 call 事件本身。
-- **同步派发（dispatch_sync）/ 普通函数调用**只要最终在当前线程、且落在插桩
-  区间内执行，就能正常 trace；落在区间外则原生执行并以 transfer 事件记录目标。
+`--trace-gcd` 是一个显式的侦察模式：Frida agent hook `dispatch_async`、
+`dispatch_after` 和 `dispatch_barrier_async`，在提交点读取 block invoke 指针，并在
+当前线程中额外调用一次 `qbditrace_run_call`，每个 block 生成独立 trace 文件。它并非
+跟踪 GCD 工作线程上的原始那次执行，因此要注意：
 
-本版本**不做多线程并发 trace**。如果需要覆盖多线程，推荐**串行化**（一次只让一个
-线程进入被 trace 的函数），而非真并发。
+- block 会被 agent **同步额外执行一次**，随后仍会被系统正常调度；有副作用、时序依赖、
+  queue-specific data 或必须运行在特定线程上的 block 不适合此模式。
+- 默认只捕获 invoke 指针位于目标模块内的 block；`--gcd-no-filter` 可关闭过滤，
+  `--gcd-max` 可限制额外执行次数。
+- 真正的多线程并发 trace 仍不支持。正式录制应尽量串行化，避免多个线程同时进入 tracer。
 
 ## 文件结构
 
 ```
 tools/qbditrace/
 ├── TraceFormat.h           二进制格式契约（writer 与 decoder 共用）
-├── QBDITrace.h            公共 C ABI（configure / run_call / run_at / stop / output_path / dump_pcring）
+├── QBDITrace.h            公共 C ABI、配置结构与实时统计页契约
 ├── RingBuffer.h           thread-local 缓冲 + 后台 writer 线程
 ├── QBDITrace.cpp          核心 tracer（QBDI 回调、热路径、VM 接管、fault handler、safe ret addr）
 ├── qbditrace_runner.py    ★ Python loader（唯一入口，管理参数/连接/生命周期）
@@ -147,62 +150,58 @@ tools/qbditrace/
 │   └── advanced/          高级 benchmark 套件（22 target，真实加密+OLLVM 混淆）
 │       ├── run_advanced.sh
 │       └── README.md
-└── CMakeLists.txt         两个目标：dylib（iOS）+ decoder（host）
+└── CMakeLists.txt         tracer（iOS dylib / Android so）、decoder 与 host tests
 ```
 
 ## 1. 编译
 
-### 1.1 编译 tracer dylib（iOS arm64）
+### 1.1 编译 tracer（iOS arm64）
 
-依赖已经编译好的 QBDI 静态库（仓库内 `build-ios/libQBDI.a`、`build-ios/libqbdi-llvm.a`）。
-
-最简单、已验证可链接的方式是直接用一条命令（在仓库根目录执行）：
-
-```sh
-xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O2 -dynamiclib \
-    -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static -Itools/qbditrace \
-    tools/qbditrace/QBDITrace.cpp \
-    build-ios/libQBDI.a build-ios/libqbdi-llvm.a \
-    -framework Foundation -framework CoreFoundation \
-    -o libqbditrace.dylib
-```
-
-> 注意头文件分布：`Version.h` 在 `build-ios/include`，而**静态库版本**的
-> `Config.h` 在 `build-ios/include-static`，两个目录都要 `-I`。
-
-或者用 CMake（详见 `CMakeLists.txt` 头部注释）：
+依赖仓库固定目录中的 QBDI 静态库 `build-ios/libQBDI.a` 和
+`build-ios/libqbdi-llvm.a`。从仓库根目录执行：
 
 ```sh
-cmake -S tools/qbditrace -B build-trace-ios \
-    -DCMAKE_TOOLCHAIN_FILE=cmake/config/ios.toolchain.cmake -DPLATFORM=OS64 \
-    -DQBDI_INCLUDE_DIR=$PWD/include \
-    -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-ios/include;$PWD/build-ios/include-static" \
-    -DQBDI_STATIC_LIB=$PWD/build-ios/libQBDI.a \
-    -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF
-cmake --build build-trace-ios
+bash tools/qbditrace/build-qbditrace-ios.sh
 ```
 
-产物 `libqbditrace.dylib` 需要正确签名后推到越狱设备（例如 `/var/jb/usr/lib/`）。
-
-### 1.2 编译离线解码器（host，macOS arm64）
+脚本会复用 `tools/tenet/_deps/zstd-src/`，按需生成 `build-ios/libzstd.a`，并在
+仓库根目录输出带分块 zstd 压缩能力的 `libqbditrace.dylib`。部署到越狱设备：
 
 ```sh
-brew install capstone          # 提供反汇编能力；缺失时仅打印原始 opcode
-
-cmake -S tools/qbditrace -B build-trace-host \
-    -DQBDITRACE_BUILD_DYLIB=OFF -DQBDITRACE_BUILD_DECODER=ON
-cmake --build build-trace-host
-# 产物：build-trace-host/trace_decode
+scp libqbditrace.dylib vphone:/var/jb/usr/lib/libqbditrace.dylib
+ssh vphone 'ldid -S /var/jb/usr/lib/libqbditrace.dylib'
 ```
 
-或直接编译：
+### 1.2 编译 tracer（Android arm64）
+
+先按 `cmake/config/config-android-aarch64.sh` 构建 QBDI，确保
+`build-android/libQBDI.a` 已存在，再设置 NDK 路径并执行：
 
 ```sh
-c++ -std=c++17 -O2 -DQBDITRACE_HAVE_CAPSTONE=1 \
-    tools/qbditrace/decoder/trace_decode.cpp \
-    -I$(brew --prefix capstone)/include -L$(brew --prefix capstone)/lib -lcapstone \
-    -o trace_decode
+export NDK_PATH=/path/to/android-ndk
+bash tools/qbditrace/build-qbditrace-android.sh
+adb push libqbditrace.so /data/local/tmp/libqbditrace.so
 ```
+
+脚本默认使用 Android API 24（可通过 `ANDROID_API_LEVEL` 覆盖），并输出仓库根目录下的
+`libqbditrace.so`。运行 loader 时加 `--android`；默认 dylib 路径会切换为
+`/data/local/tmp/libqbditrace.so`。
+
+### 1.3 编译 host tests 与 v4 离线解码器
+
+固定 host 构建目录为 `tools/qbditrace/build/`，不要另建 build 目录：
+
+```sh
+cd tools/qbditrace/build
+cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF
+ninja
+ctest --output-on-failure
+```
+
+`build/trace_decode` 是轻量兼容工具，**当前只接受未压缩 v4 trace**。默认录制启用了
+分块压缩，`--pc-delta` / `--sampling` 会生成 v5，`--fpr` 会生成 v7；这些 trace
+应使用 tenet 打开。需要给 `trace_decode` 生成兼容输入时，同时使用 `--no-compress`，
+且不要启用 `--pc-delta`、`--sampling` 或 `--fpr`。
 
 ## 2. 用 Frida 注入并 trace
 
@@ -369,6 +368,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 |------|--------|------|
 | `--host` | `127.0.0.1:27042` | Frida remote 设备地址 |
 | `--usb` | off | 使用 USB 连接而非远程 |
+| `--android` | off | 使用 Android 默认路径与平台行为；默认 dylib 切换为 `/data/local/tmp/libqbditrace.so` |
 
 **目标参数：**
 
@@ -392,10 +392,12 @@ python3 tools/qbditrace/qbditrace_runner.py \
 |------|--------|------|
 | `--record` | 127 (全部) | 位掩码：1=NZCV, 2=REGDIFF, 4=MEM, 8=SVC, 16=OBJC, 32=CAPI, 64=SEQEVENTS |
 | `--no-objc` | off | 关闭 ObjC msgSend 解析 |
-| `--capi` | off | 启用 C API 拦截（自动解析常见函数地址并填入 `capi_funcs[]`）。配合 `--record 32` 或默认 `--record 127` 生效 |
 | `--anchor-interval` | 0 (默认1024) | 每 N 条指令打全量快照 |
 | `--ring-bytes` | 0 (默认64MiB) | 每线程 ring buffer 大小 |
-| `--no-embed-code` | off | 关闭内嵌码表 |
+| `--no-embed-code` | off | 关闭内嵌码表；tenet 的 CFG/loop 等依赖反汇编的能力会降级，除非另有外部镜像 |
+| `--pc-delta` | off | 启用 v5 PC-delta，INST 使用 2 字节有符号差值，通常缩小 40%–60% |
+| `--fpr` | off | 启用 v7 FPR/NEON 记录：每条指令写 FPR diff，ANCHOR 增加 512B 快照 |
+| `--no-compress` | off | 关闭默认分块 zstd 压缩，写未压缩记录流 |
 | `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。可多次指定，最多 8 个。该区间内代码以原生速度执行，不产生 trace 记录。适用于排除大循环（如内存校验） |
 | `--sampling` | off | **采样侦察模式**：只记录裸 PC 流（`REC_INST` + `REC_CODE` + `REC_ANCHOR`，不含寄存器/内存/SEQ_ENTRY-EXIT），体积通常缩小 80%+，但仍逐指令执行、循环次数与回边完全精确。用于在做完整 trace 前先摸清执行情况，找出可 `--exclude-range` 排除的大循环。隐含开启 `--pc-delta` 并把 `--anchor-interval` 设为一个较大值（除非显式指定）；此时 `--record` 会被忽略。见下方「采样侦察工作流」 |
 
@@ -439,9 +441,9 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--trace-gcd` | off | 启用 GCD block tracing |
-| `--gcd-no-filter` | off | trace 所有 block（不限模块内） |
-| `--gcd-max` | 0 (无限) | 最大 GCD block 捕获数 |
+| `--trace-gcd` | off | hook GCD dispatcher，并在提交点同步额外执行、单独 trace block invoke；不是跟踪原工作线程 |
+| `--gcd-no-filter` | off | trace 所有 block（不限 invoke 是否位于目标模块） |
+| `--gcd-max` | 0 (无限) | 最大额外执行/捕获的 block 数 |
 
 **运行控制：**
 
@@ -450,7 +452,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--timeout` | 0 (无限) | N 秒后自动退出 |
 | `--wait-for-done` | off (once 模式自动开启) | trace 完成后自动退出 |
 | `--output` / `-o` | (必填) | 设备上 trace 文件输出路径 |
-| `--dylib` | `/var/jb/usr/lib/libqbditrace.dylib` | 设备上 dylib 路径 |
+| `--dylib` | 按平台 | iOS 默认 `/var/jb/usr/lib/libqbditrace.dylib`；Android 默认 `/data/local/tmp/libqbditrace.so` |
 
 ### 2.4 工作原理
 
@@ -527,15 +529,19 @@ nohup python3 tools/qbditrace/qbditrace_runner.py \
 
 ## 3. 离线解码与 IDA 对照
 
+> `trace_decode` 仅用于未压缩 v4 兼容 trace；默认分块压缩 trace 以及 v5/v7 trace
+> 请使用 tenet。录制兼容文件时需加 `--no-compress`，且不要启用 `--pc-delta`、
+> `--sampling` 或 `--fpr`。
+
 ```sh
-# 默认即带反汇编：trace 自带去重码表，无需任何外部输入
-./trace_decode qbditrace.bin
+# v4 兼容 trace 自带去重码表，无需任何外部输入
+./tools/qbditrace/build/trace_decode qbditrace.bin
 
 # 输出 JSONL（每条记录一行 JSON，便于脚本后处理）
-./trace_decode qbditrace.bin --format jsonl
+./tools/qbditrace/build/trace_decode qbditrace.bin --format jsonl
 
 # 两条 trace 做指令级 diff（自动归一化栈/堆地址，只显示真实值差异）
-./trace_decode qbditrace.bin --diff qbditrace_run2.bin
+./tools/qbditrace/build/trace_decode qbditrace.bin --diff qbditrace_run2.bin
 
 # 其他选项
 #   --image <f> --image-base <hex>  [已废弃] 外部裸代码 dump 兜底
@@ -585,8 +591,10 @@ int  qbditrace_run_call(uint64_t *ret_out, uint64_t function,
 int  qbditrace_run_at(uint64_t *ret_out, uint64_t start_pc,
                       const uint64_t *gpr, uint64_t sp, uint64_t lr);
 void qbditrace_stop(void);
+int  qbditrace_force_anchor(void);
 const char *qbditrace_output_path(void);
 int  qbditrace_dump_pcring(const char *path);
+const qbditrace_stats_t *qbditrace_stats_page(void);
 ```
 
 ### qbditrace_configure
@@ -624,6 +632,13 @@ VM dispatch 入口），它们不能在隔离环境下正确执行。
 
 刷盘并关闭 trace 文件。可重复调用。显式调用可保证 trace 完整且立即可读。
 
+### qbditrace_force_anchor
+
+请求在下一条指令前写入全量寄存器 ANCHOR。tracer 未配置时返回负值，已配置时返回
+0。该调用只设置**调用线程**已有 `ThreadCtx` 的 `need_anchor`；若该线程尚无上下文，
+首次创建上下文本来也会先写 ANCHOR。它不是“从任意 Frida 控制线程给另一 VM 线程
+打快照”的跨线程命令。
+
 ### qbditrace_output_path
 
 返回当前正在写入的 trace 文件路径。返回指针由库管理。
@@ -634,6 +649,13 @@ VM dispatch 入口），它们不能在隔离环境下正确执行。
 文件（追加模式），`path` 为 NULL 时写 stderr。供 Frida 端在自己的异常处理中调用
 （Frida 的 exceptor 会在 NativeFunction trampoline 内拦截 fault，此时 native
 signal handler 不会运行）。返回写出的 PC 条目数。
+
+### qbditrace_stats_page
+
+返回进程生命周期内稳定的只读统计页指针。Frida agent 默认每 500 ms 直接读取该页，
+显示指令数、ANCHOR、内存访问、EVENT、SVC、OBJC、CODE、CAPICALL、提交给 writer 的
+原始字节数和运行时间。计数器使用 relaxed atomic，允许轻微滞后；`bytes_written` 不是
+压缩后文件大小。
 
 ### qbditrace_config_t 结构体
 
@@ -655,11 +677,16 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 | `extra_range_start` | `uint64_t` | 第二插桩区间起始（0 = 未用） |
 | `extra_range_end` | `uint64_t` | 第二插桩区间结束 |
 | `disable_embed_code` | `uint32_t` | 非零关闭内嵌码表（默认 0 = 开启，反转语义） |
+| `enable_pc_delta` | `uint32_t` | 非零启用 v5 PC-delta；INST 头由 16B 缩为 6B（与 FPR 同开时为 8B） |
+| `_reserved_old_value` | `uint32_t` | 已弃用的 v6 写前值开关，保留 ABI 布局，writer 忽略该值 |
+| `enable_fpr` | `uint32_t` | 非零启用 v7 FPR/NEON diff 与 ANCHOR 快照 |
+| `disable_compress` | `uint32_t` | 非零关闭压缩；0 默认启用分块 zstd（需构建时包含 zstd） |
+| `disable_branch_hint` | `uint32_t` | 非零关闭 nzcv 高 4 位的 CALL/RET/BRANCH hint；0 默认开启 |
 | `n_exclude_ranges` | `uint32_t` | 排除区间数量（0..8） |
 | `exclude_ranges[8]` | `struct{u64,u64}` | 排除区间数组，每项 {start, end}（运行时地址）。区间内代码以原生速度执行，不产生 trace 记录。最多 8 个 |
-| `enable_capi_intercept` | `uint32_t` | 非零启用 C API 拦截（需同时在 `record` 中设置 `QBDITRACE_REC_CAPI`）。Frida loader 负责将已知函数地址填入 `capi_funcs[]`；拦截命中时发射 REC_CAPICALL 记录 |
-| `n_capi_funcs` | `uint32_t` | `capi_funcs[]` 中有效项数（0..128） |
-| `capi_funcs[128]` | `struct{addr,api_id,n_args,str_args}` | C API 函数表。每项：运行时地址 / api_id / 参数数量 / 字符串参数位掩码（bit i 表示 args[i] 是指针需解引用捕获）。由 Frida loader 在 `qbditrace_configure()` 前通过 `Module.findExportByName` 填充 |
+| `enable_capi_intercept` | `uint32_t` | 非零启用 C API 拦截（仍需 `record` 含 `QBDITRACE_REC_CAPI`）；官方 Frida agent 默认启用 |
+| `n_capi_funcs` | `uint32_t` | `capi_funcs[]` 中有效项数（0..128）。为 0 时 native 在 configure 阶段用 `dlsym` 自动解析标准 C/平台 API |
+| `capi_funcs[128]` | `struct{addr,api_id,n_args,str_args}` | 可选的显式函数表。每项含运行时地址、api_id、参数数量、指针参数捕获位掩码。Frida agent 主要用它传入无法由 `dlsym` 获取的 Android JNI vtable 地址 |
 
 **`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
 `run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。
@@ -752,13 +779,18 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
   - `CAPICALL (7)`：`{api_id, arg_count, str_count, pc, target, args[8]}` +
     str_count 个可变长字符串捕获（88 字节固定头 + 可变尾）。当 `enable_capi_intercept != 0`
     且 XFER_CALL 目标命中 `capi_funcs[]` 时发射；携带调用点的参数寄存器与指针参数的
-    内联字符串内容（最多 4 个，每个最多 255 字节）。`api_id` 来自 `qbditrace_capi_id_t`
-    枚举（134=CCCrypt，135=CCHmac，1=memcpy，22=strcmp 等）
+    内联字符串内容（最多 4 个，每个最多 255 字节）。完整枚举见 `TraceFormat.h` 的
+    `qbditrace_capi_id_t`；当前磁盘字段仍为 `uint8_t`，所以 **api_id >= 256 会截断**，
+    Android 扩展 BoringSSL/JNI ID 暂不能可靠 round-trip。
 - 寄存器索引采用 QBDI GPR 顺序：0..28=x0..x28，29=fp，30=lr，31=sp，
   32=nzcv，33=pc。
 - 内存访问含 `value`（低 8B）+ `value_hi`（高 8B，用于 stp/NEON 9-16B store）。
-- 格式版本当前为 **v4**（v3: 去掉 diff prev_value 改为绝对值 + 新增 value_hi；
-  v4: 新增 CODE 记录 + OBJC cls 字段）。解码器只接受与自身一致的版本。
+- writer 基线为 **v4**；`enable_pc_delta` 生成 v5，`enable_fpr` 生成 v7（可与
+  PC-delta 组合）。v6 OLD_VALUE 只保留读取契约，writer 已移除。
+- zstd 构建下默认设置 `HF_BLOCK_COMPRESSED`，记录按 1 MiB 独立 frame 压缩并带尾部
+  索引；`HF_COMPRESSED` 单流格式仅为历史读取兼容，当前 writer 不产生。
+- 完整字段、结构大小和兼容策略见 `tools/tenet/docs/trace-format.md`；若与本文冲突，
+  以 `TraceFormat.h` 为准。
 
 ## 诊断与环境变量
 
@@ -773,9 +805,11 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
   更宽的向量 store 的 value 保留 unknown 标记。
 - 默认 `--trace-mode once` 只 trace 首次调用。使用 `--trace-mode multi` 或
   `--trace-mode N` 可捕获多次调用。
-- 仅在 iOS AArch64 上验证；x86_64 写入路径未做完整适配。
+- 主路径支持 iOS / Android AArch64；x86_64 写入路径未做完整适配。
+- `trace_decode` 只接受未压缩 v4；默认分块压缩、v5 PC-delta 和 v7 FPR trace 使用 tenet。
 - objc 记录的 cls 字段容量 48 字节；`*Super` 变体跳过类名解析（接收者为 objc_super
   结构体指针）。选择子通常可离线还原为方法名字符串。
 - syscall 名表只覆盖常见子集，未命中的号码按原始数字显示；Mach trap 不在此表内。
-- GCD / 跨线程派发出去的 block 无法被 trace（不在当前 VM 线程内执行）。
+- GCD / 跨线程派发的原始执行不在当前 VM 内；`--trace-gcd` 通过在提交点同步额外执行
+  block 来生成独立 trace，可能重复副作用，不能等同于真实工作线程跟踪。
 - `addInstrumentedModuleFromAddr` 整模块插桩；模块解析失败时退化为固定窗口。
