@@ -6,10 +6,12 @@
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -82,8 +84,8 @@ public:
     const std::string&  trace_path() const { return trace_path_; }
 
     // ── Navigation ──────────────────────────────────────────────────────
-    uint64_t current_inst() const { return current_inst_; }
-    uint64_t total_inst()   const { return total_inst_; }
+    uint64_t current_inst() const { return current_inst_.load(std::memory_order_relaxed); }
+    uint64_t total_inst()   const { return total_inst_.load(std::memory_order_relaxed); }
 
     void navigate_to(uint64_t inst_id);
 
@@ -101,7 +103,10 @@ public:
     InstructionRow fetch_row(uint64_t inst_id);
 
     /// Drop all cached rows (e.g. after external state changes).
-    void clear_row_cache() { row_cache_.clear(); }
+    void clear_row_cache() {
+        std::lock_guard lk(row_cache_mutex_);
+        row_cache_.clear();
+    }
 
     // ── Pass management ─────────────────────────────────────────────────
 
@@ -127,6 +132,7 @@ public:
 
     template<typename T>
     const T* pass_result(std::string_view name) const {
+        std::shared_lock<std::shared_mutex> lk(state_mutex_);
         auto it = pinned_results_.find(std::string(name));
         if (it == pinned_results_.end() || !it->second || !it->second->ok())
             return nullptr;
@@ -140,8 +146,11 @@ public:
         if (!pass_manager_) return nullptr;
         auto sp = pass_manager_->require_shared(name);
         if (!sp || !sp->ok()) return nullptr;
-        pinned_results_[std::string(name)] = sp;
         const T* ptr = &sp->get<T>();
+        {
+            std::unique_lock lk(state_mutex_);
+            pinned_results_[std::string(name)] = sp;
+        }
         notify_pass_completed(name);
         return ptr;
     }
@@ -184,8 +193,8 @@ private:
     std::string trace_path_;
 
     // ── Application state ───────────────────────────────────────────────
-    uint64_t total_inst_ = 0;
-    uint64_t current_inst_ = 0;
+    std::atomic<uint64_t> current_inst_{0};
+    std::atomic<uint64_t> total_inst_{0};
     std::vector<uint64_t> bookmarks_;
     // O(1) lookup mirror of bookmarks_ — populated alongside bookmarks_
     // on every mutation (toggle_bookmark, load). fetch_row() calls
@@ -194,7 +203,11 @@ private:
     std::unordered_set<uint64_t> bookmark_set_;
 
     // ── Row cache ───────────────────────────────────────────────────────
+    // Separate mutex: cache get() mutates LRU order, so it needs exclusive
+    // access, but the critical section is very short (hash + promote).
+    // This avoids blocking state_mutex_ readers during cache operations.
     LRUCache<uint64_t, InstructionRow> row_cache_{4096};
+    mutable std::mutex row_cache_mutex_;
 
     // ── Pass engine ─────────────────────────────────────────────────────
     std::unique_ptr<PassManager> pass_manager_;
@@ -206,6 +219,19 @@ private:
     std::vector<uint64_t> search_results_;
     size_t search_current_ = 0;
     bool search_active_ = false;
+
+    // ── Thread safety ───────────────────────────────────────────────────
+    // Protects: nav_history_, bookmarks_, bookmark_set_, search_results_,
+    //           search_current_, search_active_, pinned_results_.
+    // Shared lock for read-only access (has_bookmark, search_results,
+    //           pass_result, bookmarks).
+    // Unique lock for mutations (navigate_to, toggle_bookmark, search_forward,
+    //           clear_analysis, run_pass, pin_pass_result).
+    //
+    // row_cache_ has its own mutex (row_cache_mutex_) because LRU get()
+    // mutates internal state.
+    // current_inst_ and total_inst_ are atomic (no mutex needed).
+    mutable std::shared_mutex state_mutex_;
 
     // ── Observers ───────────────────────────────────────────────────────
     mutable std::mutex observers_mutex_;

@@ -356,3 +356,182 @@ TEST_CASE("TenetService search_forward with xref acceleration",
         REQUIRE(svc->search_results().empty());
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Concurrent read/write stress tests (#14 — TenetService thread safety)
+//
+// These tests verify that TenetService operations are safe to call from
+// multiple threads simultaneously:
+//   - Writer threads: navigate_to, toggle_bookmark, search_forward
+//   - Reader threads: fetch_row, has_bookmark, current_inst, total_inst,
+//                     bookmarks, search_results
+//
+// The test will hang (timeout) if there's a deadlock, and will crash if
+// there's a data race causing corruption.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+TEST_CASE("TenetService: concurrent navigate + fetch_row (no deadlock)",
+          "[unit][service][concurrent]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        for (int i = 0; i < 100; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::nop(),
+                    {{33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "svc_concurrent_nav");
+
+    REQUIRE(env != nullptr);
+    auto svc = make_service(*env);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+
+    // Writer: navigate to different inst_ids
+    auto writer = [&]() {
+        for (int i = 0; i < 200 && !stop.load(std::memory_order_relaxed); i++) {
+            svc->navigate_to(static_cast<uint64_t>(i % 100));
+        }
+    };
+
+    // Reader: fetch rows and verify no crash
+    auto reader = [&]() {
+        for (int i = 0; i < 200 && !stop.load(std::memory_order_relaxed); i++) {
+            auto row = svc->fetch_row(static_cast<uint64_t>(i % 100));
+            if (row.inst_id != static_cast<uint64_t>(i % 100)) {
+                // fetch_row should return a row with the requested inst_id
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            // current_inst should be valid
+            uint64_t cur = svc->current_inst();
+            if (cur >= 100) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.emplace_back(writer);
+    threads.emplace_back(reader);
+    threads.emplace_back(reader);
+
+    for (auto& t : threads) t.join();
+
+    REQUIRE(errors.load() == 0);
+}
+
+TEST_CASE("TenetService: concurrent toggle_bookmark + has_bookmark (no deadlock)",
+          "[unit][service][concurrent]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        for (int i = 0; i < 20; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::nop(),
+                    {{33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "svc_concurrent_bm");
+
+    REQUIRE(env != nullptr);
+    auto svc = make_service(*env);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+
+    // Writer: toggle bookmarks on inst_ids 0-9
+    auto writer = [&]() {
+        for (int i = 0; i < 100 && !stop.load(std::memory_order_relaxed); i++) {
+            svc->toggle_bookmark(static_cast<uint64_t>(i % 10));
+        }
+    };
+
+    // Reader: has_bookmark and bookmarks() should not crash or corrupt
+    auto reader = [&]() {
+        for (int i = 0; i < 100 && !stop.load(std::memory_order_relaxed); i++) {
+            // has_bookmark should return a consistent true/false (not crash)
+            (void)svc->has_bookmark(static_cast<uint64_t>(i % 10));
+            // bookmarks() vector should be in a valid state
+            auto& bm = svc->bookmarks();
+            if (bm.size() > 10) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.emplace_back(writer);
+    threads.emplace_back(reader);
+    threads.emplace_back(reader);
+
+    for (auto& t : threads) t.join();
+
+    REQUIRE(errors.load() == 0);
+}
+
+TEST_CASE("TenetService: concurrent search + navigation (no deadlock)",
+          "[unit][service][concurrent]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        for (int i = 0; i < 50; i++) {
+            if (i % 2 == 0)
+                tw.emit(ms, 0x1000 + i * 4, enc::nop(),
+                        {{33, tw.rt(0x1004 + i * 4)}}, {});
+            else
+                tw.emit(ms, 0x1000 + i * 4, enc::add_imm(0, 0, 1),
+                        {{0, (uint64_t)i}, {33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "svc_concurrent_search");
+
+    REQUIRE(env != nullptr);
+    auto svc = make_service(*env);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+
+    // Thread 1: search for "nop" repeatedly
+    auto searcher = [&]() {
+        for (int i = 0; i < 20 && !stop.load(std::memory_order_relaxed); i++) {
+            svc->search_forward("nop", 0);
+            auto& results = svc->search_results();
+            // Should find 25 nops (even indices 0,2,4,...,48)
+            if (results.size() != 25 && results.size() != 0) {
+                // 0 is acceptable during concurrent search_clear overlap
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    // Thread 2: navigate while search runs
+    auto navigator = [&]() {
+        for (int i = 0; i < 50 && !stop.load(std::memory_order_relaxed); i++) {
+            svc->navigate_to(static_cast<uint64_t>(i % 50));
+        }
+    };
+
+    // Thread 3: fetch rows while search runs
+    auto fetcher = [&]() {
+        for (int i = 0; i < 50 && !stop.load(std::memory_order_relaxed); i++) {
+            auto row = svc->fetch_row(static_cast<uint64_t>(i % 50));
+            (void)row;
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.emplace_back(searcher);
+    threads.emplace_back(navigator);
+    threads.emplace_back(fetcher);
+
+    for (auto& t : threads) t.join();
+
+    REQUIRE(errors.load() == 0);
+}

@@ -206,7 +206,7 @@ void StringPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
     if (end == 0) end = index.inst_count();
 
     collector_ = std::make_unique<WriteEventCollector>(start, end);
-    orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
+    orch.declare({name(), collector_.get(), /*wants_parallel=*/true});
 }
 
 // ─── StringPass::run ─────────────────────────────────────────────────────

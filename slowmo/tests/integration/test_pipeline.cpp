@@ -204,3 +204,111 @@ TEST_CASE("Pipeline: invalidate forces re-run", "[integration][pipeline]") {
     REQUIRE(r2.ok());
     REQUIRE(pm->state("xref") == PassManager::PassState::Completed);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Parallel DAG scheduling consistency test (#15 — Batch Analysis parallelization)
+//
+// Verifies that pm.run_all(N_threads) produces identical results to sequential
+// pm.require() calls when multiple independent passes are registered.
+// If the DAG scheduler has a race condition, the parallel run will produce
+// different results (missing data, corrupted state, or crash).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "analysis/passes/memory/string_pass.h"
+#include "analysis/passes/crypto/pattern_pass.h"
+
+TEST_CASE("Parallel run_all produces same results as sequential",
+          "[integration][pipeline][parallel]") {
+    // ── Sequential run ──
+    auto env_seq = make_env(gen_realistic_trace, "pipeline_parallel_seq");
+    REQUIRE(env_seq != nullptr);
+    auto pm_seq = make_pm(*env_seq);
+
+    pm_seq->register_pass(std::make_unique<XrefPass>());
+    pm_seq->register_pass(std::make_unique<CFGPass>());
+    pm_seq->register_pass(std::make_unique<LoopPass>());
+    pm_seq->register_pass(std::make_unique<FunctionPass>());
+    pm_seq->register_pass(std::make_unique<CallGraphPass>());
+    pm_seq->register_pass(std::make_unique<StringPass>());
+    pm_seq->register_pass(std::make_unique<PatternPass>());
+
+    // Sequential: require each pass one-by-one
+    auto& seq_xref = pm_seq->require("xref").get<XrefResult>();
+    auto& seq_cfg = pm_seq->require("cfg").get<CFGResult>();
+    auto& seq_loop = pm_seq->require("loop").get<LoopResult>();
+    auto& seq_func = pm_seq->require("function").get<FunctionResult>();
+    auto& seq_cg = pm_seq->require("call_graph").get<CallGraphResult>();
+    auto& seq_str = pm_seq->require("strings").get<StringResult>();
+    auto& seq_pat = pm_seq->require("pattern").get<PatternResult>();
+
+    uint64_t seq_xref_pcs = seq_xref.unique_pc_count;
+    uint64_t seq_cfg_blocks = seq_cfg.block_count();
+    uint64_t seq_cfg_edges = seq_cfg.edge_count();
+    uint64_t seq_loop_count = seq_loop.loops.size();
+    uint64_t seq_func_count = seq_func.functions.size();
+    uint64_t seq_cg_edges = seq_cg.edges.size();
+    uint64_t seq_str_count = seq_str.total();
+    uint64_t seq_pat_hits = seq_pat.matches.size();
+
+    // ── Parallel run (same trace, different env to avoid index cache) ──
+    auto env_par = make_env(gen_realistic_trace, "pipeline_parallel_par");
+    REQUIRE(env_par != nullptr);
+    auto pm_par = make_pm(*env_par);
+
+    pm_par->register_pass(std::make_unique<XrefPass>());
+    pm_par->register_pass(std::make_unique<CFGPass>());
+    pm_par->register_pass(std::make_unique<LoopPass>());
+    pm_par->register_pass(std::make_unique<FunctionPass>());
+    pm_par->register_pass(std::make_unique<CallGraphPass>());
+    pm_par->register_pass(std::make_unique<StringPass>());
+    pm_par->register_pass(std::make_unique<PatternPass>());
+
+    // Run all passes via the parallel DAG scheduler
+    pm_par->run_all(4);
+
+    // After run_all, require() hits the fast path (state == Completed)
+    auto& par_xref = pm_par->require("xref").get<XrefResult>();
+    auto& par_cfg = pm_par->require("cfg").get<CFGResult>();
+    auto& par_loop = pm_par->require("loop").get<LoopResult>();
+    auto& par_func = pm_par->require("function").get<FunctionResult>();
+    auto& par_cg = pm_par->require("call_graph").get<CallGraphResult>();
+    auto& par_str = pm_par->require("strings").get<StringResult>();
+    auto& par_pat = pm_par->require("pattern").get<PatternResult>();
+
+    // ── Verify results match ──
+    REQUIRE(par_xref.unique_pc_count == seq_xref_pcs);
+    REQUIRE(par_cfg.block_count() == seq_cfg_blocks);
+    REQUIRE(par_cfg.edge_count() == seq_cfg_edges);
+    REQUIRE(par_loop.loops.size() == seq_loop_count);
+    REQUIRE(par_func.functions.size() == seq_func_count);
+    REQUIRE(par_cg.edges.size() == seq_cg_edges);
+    REQUIRE(par_str.total() == seq_str_count);
+    REQUIRE(par_pat.matches.size() == seq_pat_hits);
+}
+
+TEST_CASE("Parallel run_all with single thread (degenerates to sequential)",
+          "[integration][pipeline][parallel]") {
+    auto env = make_env(gen_realistic_trace, "pipeline_runall_1thread");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<CFGPass>());
+    pm->register_pass(std::make_unique<LoopPass>());
+
+    // run_all with 1 thread should work identically to sequential
+    pm->run_all(1);
+
+    REQUIRE(pm->state("xref") == PassManager::PassState::Completed);
+    REQUIRE(pm->state("cfg") == PassManager::PassState::Completed);
+    REQUIRE(pm->state("loop") == PassManager::PassState::Completed);
+
+    auto& xr = pm->require("xref").get<XrefResult>();
+    REQUIRE(xr.unique_pc_count > 0);
+
+    auto& cfg = pm->require("cfg").get<CFGResult>();
+    REQUIRE(cfg.block_count() > 0);
+
+    auto& lp = pm->require("loop").get<LoopResult>();
+    REQUIRE(lp.loops.size() >= 1);
+}

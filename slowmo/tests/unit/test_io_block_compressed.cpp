@@ -787,6 +787,99 @@ TEST_CASE("TraceReader: block-compressed with single-byte block size",
     REQUIRE(orig_count == comp_count);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Concurrent stress tests for O(1) LRU cache (#11)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include <atomic>
+#include <thread>
+
+TEST_CASE("BlockCacheReader: concurrent data_at stress (O(1) LRU)",
+          "[unit][io][block_compressed][concurrent]") {
+    TempDir td("bcr_concurrent");
+    // 500 instructions → enough to span multiple 4K blocks
+    auto uncompressed = write_trace_n_insts(td.path, "bcr_concurrent", 500, 256);
+    auto compressed = create_block_compressed_trace(
+        uncompressed, td.path, "block_compressed.trace", 4096);
+
+    auto file_data = read_file_bytes(compressed);
+    constexpr size_t kHdrSize = sizeof(qbditrace::qbditrace_file_header_t);
+
+    auto orig_data = read_file_bytes(uncompressed);
+    const uint8_t* orig_body = orig_data.data() + kHdrSize;
+    uint64_t body_size = orig_data.size() - kHdrSize;
+
+    BlockCacheReader cache;
+    // Small cache (4 blocks) to force frequent eviction under contention
+    bool ok = cache.init(file_data.data(), file_data.size(), kHdrSize, 4);
+    REQUIRE(ok);
+
+    // Spawn N threads, each reading random offsets and verifying correctness
+    constexpr int N_THREADS = 4;
+    constexpr int N_OPS = 500;
+    std::atomic<int> errors{0};
+    std::atomic<bool> stop{false};
+
+    auto worker = [&]() {
+        for (int i = 0; i < N_OPS && !stop.load(std::memory_order_relaxed); i++) {
+            uint64_t off = (uint64_t)(i * 37 + 13) % body_size;
+            const uint8_t* p = cache.data_at(off);
+            if (p == nullptr || *p != orig_body[off]) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N_THREADS; i++) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) t.join();
+
+    REQUIRE(errors.load() == 0);
+}
+
+TEST_CASE("BlockCacheReader: concurrent data_at with pin_all (no eviction deadlock)",
+          "[unit][io][block_compressed][concurrent]") {
+    TempDir td("bcr_concurrent_pin");
+    auto uncompressed = write_trace_n_insts(td.path, "bcr_pin", 200, 256);
+    auto compressed = create_block_compressed_trace(
+        uncompressed, td.path, "block_compressed.trace", 4096);
+
+    auto file_data = read_file_bytes(compressed);
+    constexpr size_t kHdrSize = sizeof(qbditrace::qbditrace_file_header_t);
+
+    auto orig_data = read_file_bytes(uncompressed);
+    const uint8_t* orig_body = orig_data.data() + kHdrSize;
+    uint64_t body_size = orig_data.size() - kHdrSize;
+
+    BlockCacheReader cache;
+    bool ok = cache.init(file_data.data(), file_data.size(), kHdrSize, 2);
+    REQUIRE(ok);
+
+    cache.pin_all();
+
+    std::atomic<int> errors{0};
+
+    auto worker = [&]() {
+        for (uint64_t off = 0; off < body_size; off += 50) {
+            const uint8_t* p = cache.data_at(off);
+            if (p == nullptr || *p != orig_body[off]) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; i++) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) t.join();
+
+    REQUIRE(errors.load() == 0);
+    cache.unpin_all();
+}
+
 #else  // !TENET_HAS_ZSTD
 
 TEST_CASE("TraceReader: block-compressed trace rejected without zstd",

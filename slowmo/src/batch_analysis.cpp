@@ -925,7 +925,32 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<TaintPass>(std::move(taint_cfg)));
     }
 
-    // Execute requested analysis passes
+    // ── Parallel execution: run all registered passes via the DAG scheduler ──
+    //
+    // Instead of executing passes one-by-one via pm.require() in each run_*
+    // function, we call pm.run_all() here to let the PassManager's dynamic
+    // ready-queue scheduler run independent passes in parallel.  This is
+    // especially impactful when multiple independent analyses are requested
+    // (e.g. --strings --pattern --loop-semantics): they scan the trace
+    // concurrently instead of sequentially.
+    //
+    // After run_all() completes, every registered pass is in Completed or
+    // Failed state.  The run_* functions below call pm.require(), which hits
+    // the lock-free fast path (state == Completed) and returns immediately.
+    //
+    // Thread count: use hardware concurrency, capped at 16 (matching the
+    // worker_count() cap in trace_collector.cpp).  --no-parallel-scan only
+    // disables parallel *trace scanning* within individual passes; the
+    // PassManager DAG scheduler still runs independent passes in parallel.
+    {
+        unsigned n_threads = std::thread::hardware_concurrency();
+        if (n_threads == 0) n_threads = 4;
+        n_threads = std::min(n_threads, 16u);
+        pm.run_all(n_threads);
+    }
+
+    // Execute requested analysis passes (results are already computed — these
+    // calls hit the fast path and format the output).
     int rc = 0;
 
     if (!opts.export_cfg_path.empty()) {

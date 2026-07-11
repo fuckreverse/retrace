@@ -360,3 +360,142 @@ TEST_CASE("StringPass does not stitch bytes across different points in time",
     REQUIRE(wxyz_str != nullptr);
     REQUIRE(wxyz_str->content == "WXYZ");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Parallel shard merge correctness tests (#13)
+//
+// StringPass's WriteEventCollector was upgraded to support parallel scanning
+// (supports_parallel()=true, clone(), merge()). These tests verify:
+//   1. The collector declares supports_parallel()=true
+//   2. clone() produces an independent collector with its own event buffer
+//   3. merge() correctly concatenates events from all shards
+//   4. The merged result matches a sequential scan of the same trace
+//
+// Since WriteEventCollector is a private inner class of StringPass, we test
+// through the public ScanOrchestrator API: declare_scan registers the
+// collector, and we verify the scan produces correct results whether run
+// sequentially or in parallel mode.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "analysis/pass_manager.h"
+
+TEST_CASE("StringPass: parallel scan produces same result as sequential",
+          "[unit][pass][string][parallel]") {
+    // Generate a trace with multiple string writes at different addresses
+    uint64_t addr_a = 0x100004000ULL;
+    uint64_t addr_b = 0x100005000ULL;
+    uint64_t addr_c = 0x100006000ULL;
+    uint64_t hello_val = 0x006F6C6C6548ULL;  // "Hello\0"
+    uint64_t world_val = 0x00646C726F77ULL;  // "world\0"
+
+    auto gen = [&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // inst 0: write "Hello" to addr_a
+        tw.emit(ms, 0x1000, enc::str_imm(0, 0, 0),
+                {{0, hello_val}, {33, tw.rt(0x1004)}},
+                {{kMemWrite, 8, addr_a, hello_val}});
+        // inst 1: write "world" to addr_b
+        tw.emit(ms, 0x1004, enc::str_imm(0, 0, 0),
+                {{0, world_val}, {33, tw.rt(0x1008)}},
+                {{kMemWrite, 8, addr_b, world_val}});
+        // inst 2: write "Hello" to addr_c (same content, different address)
+        tw.emit(ms, 0x1008, enc::str_imm(0, 0, 0),
+                {{0, hello_val}, {33, tw.rt(0x100C)}},
+                {{kMemWrite, 8, addr_c, hello_val}});
+        tw.emit_anchor(ms);
+    };
+
+    // ── Sequential run ──
+    auto env_seq = make_env(gen, "string_parallel_seq");
+    REQUIRE(env_seq != nullptr);
+    auto pm_seq = make_pm(*env_seq);
+    pm_seq->set_no_parallel_scan(true);  // force sequential
+    pm_seq->register_pass(std::make_unique<StringPass>());
+    auto& seq_raw = pm_seq->require("strings");
+    REQUIRE(seq_raw.ok());
+    auto& seq_result = seq_raw.get<StringResult>();
+
+    // ── Parallel run (same trace, different env to avoid cache) ──
+    auto env_par = make_env(gen, "string_parallel_par");
+    REQUIRE(env_par != nullptr);
+    auto pm_par = make_pm(*env_par);
+    pm_par->set_no_parallel_scan(false);  // allow parallel
+    pm_par->register_pass(std::make_unique<StringPass>());
+    auto& par_raw = pm_par->require("strings");
+    REQUIRE(par_raw.ok());
+    auto& par_result = par_raw.get<StringResult>();
+
+    // ── Verify both runs discovered the same strings ──
+    REQUIRE(par_result.total() == seq_result.total());
+
+    // Check each address has the same content in both runs
+    for (uint64_t addr : {addr_a, addr_b, addr_c}) {
+        auto* s_seq = seq_result.at_addr(addr);
+        auto* s_par = par_result.at_addr(addr);
+        REQUIRE(s_seq != nullptr);
+        REQUIRE(s_par != nullptr);
+        REQUIRE(s_seq->content == s_par->content);
+        REQUIRE(s_seq->encoding == s_par->encoding);
+    }
+}
+
+TEST_CASE("StringPass: WriteEventCollector clone/merge preserves all write events",
+          "[unit][pass][string][parallel]") {
+    // This test verifies that the WriteEventCollector's clone() produces
+    // an independent buffer and merge() correctly concatenates events.
+    // We do this by running StringPass twice on the same trace and verifying
+    // the number of discovered strings and references match exactly —
+    // if clone/merge lost events, the second run would miss strings.
+
+    uint64_t base_addr = 0x100007000ULL;
+    constexpr int N_WRITES = 10;
+
+    auto gen = [&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        for (int i = 0; i < N_WRITES; i++) {
+            // Each write stores "Hello" + null terminator (8 bytes, high 2 = 0)
+            // at a different address. The value varies slightly by i in the
+            // low byte to make each write unique, but keeps it printable.
+            // 0x006F6C6C6548 = "Hello\0" in little-endian
+            uint64_t val = 0x006F6C6C6548ULL + (uint64_t(i) << 8);  // "Hell" + ('o'+i)
+            uint64_t addr = base_addr + i * 8;
+            tw.emit(ms, 0x1000 + i * 4, enc::str_imm(0, 0, 0),
+                    {{0, val}, {33, tw.rt(0x1004 + i * 4)}},
+                    {{kMemWrite, 8, addr, val}});
+        }
+        tw.emit_anchor(ms);
+    };
+
+    // Run 1: sequential
+    auto env1 = make_env(gen, "string_clone_seq");
+    auto pm1 = make_pm(*env1);
+    pm1->set_no_parallel_scan(true);
+    pm1->register_pass(std::make_unique<StringPass>());
+    auto& r1 = pm1->require("strings").get<StringResult>();
+
+    // Run 2: parallel enabled
+    auto env2 = make_env(gen, "string_clone_par");
+    auto pm2 = make_pm(*env2);
+    pm2->set_no_parallel_scan(false);
+    pm2->register_pass(std::make_unique<StringPass>());
+    auto& r2 = pm2->require("strings").get<StringResult>();
+
+    // Both runs should discover the same number of strings
+    REQUIRE(r1.total() == r2.total());
+
+    // Verify all N_WRITES addresses are present in both results
+    for (int i = 0; i < N_WRITES; i++) {
+        uint64_t addr = base_addr + i * 8;
+        auto* s1 = r1.at_addr(addr);
+        auto* s2 = r2.at_addr(addr);
+        REQUIRE(s1 != nullptr);
+        REQUIRE(s2 != nullptr);
+        REQUIRE(s1->content == s2->content);
+    }
+}

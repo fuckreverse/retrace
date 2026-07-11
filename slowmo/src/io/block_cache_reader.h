@@ -27,6 +27,8 @@
 
 #include "TraceFormat.h"
 
+#include <ankerl/unordered_dense.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -124,8 +126,14 @@ private:
         uint32_t block_id = UINT32_MAX;  // which block index entry
         std::vector<uint8_t> data;       // decompressed bytes
         std::vector<uint8_t> overlap;    // overlap from next block (for cross-block reads)
-        uint32_t access_tick = 0;        // LRU timestamp
         uint32_t pin_count = 0;          // per-block pin (for future use)
+
+        // Intrusive doubly-linked list for O(1) LRU eviction.
+        // lru_prev/lru_next store *slot indices* into cache_ (UINT32_MAX = null).
+        // The list is ordered MRU → LRU: lru_head_ is most-recently-used,
+        // lru_tail_ is least-recently-used (eviction candidate).
+        uint32_t lru_prev = UINT32_MAX;
+        uint32_t lru_next = UINT32_MAX;
     };
 
     /// Decompress block `block_id` and return a reference to its CachedBlock.
@@ -133,7 +141,17 @@ private:
     CachedBlock& ensure_block(uint32_t block_id);
 
     /// Evict the least-recently-used unpinned block. Caller must hold mtx_.
+    /// O(1) via intrusive LRU linked list (was O(N) linear scan).
     void evict_one();
+
+    // ── O(1) LRU linked-list management ────────────────────────────────
+    // All methods require caller to hold mtx_.
+    /// Move slot `idx` to the MRU position (lru_head_).
+    void lru_move_to_front(uint32_t idx);
+    /// Remove slot `idx` from the LRU list.
+    void lru_remove(uint32_t idx);
+    /// Insert slot `idx` at the MRU position.
+    void lru_push_front(uint32_t idx);
 
     /// Maximum contiguous bytes that data_at() guarantees beyond the
     /// requested offset.  Must be >= the largest possible trace record.
@@ -165,12 +183,14 @@ private:
     bool recovered_ = false;  // true if index was rebuilt from scanning
     std::string recovery_msg_;  // human-readable recovery summary
 
-    // LRU cache
+    // LRU cache — O(1) lookup via hash map, O(1) eviction via intrusive list
     std::vector<CachedBlock> cache_;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> block_to_slot_;  // block_id → slot index
     size_t max_cached_ = 256;
-    uint32_t tick_ = 0;
+    uint32_t lru_head_ = UINT32_MAX;  // MRU slot index
+    uint32_t lru_tail_ = UINT32_MAX;  // LRU slot index (eviction candidate)
 
-    // Global pin
+    // Global pin: when > 0, no block can be evicted (preserves old semantics).
     uint32_t global_pin_ = 0;
 
     std::mutex mtx_;
@@ -192,7 +212,10 @@ inline BlockCacheReader::BlockCacheReader(BlockCacheReader&& o) noexcept
     : mapped_(o.mapped_), file_size_(o.file_size_),
       header_size_(o.header_size_), index_(std::move(o.index_)),
       logical_size_(o.logical_size_), cache_(std::move(o.cache_)),
-      max_cached_(o.max_cached_), tick_(o.tick_), global_pin_(o.global_pin_)
+      block_to_slot_(std::move(o.block_to_slot_)),
+      max_cached_(o.max_cached_),
+      lru_head_(o.lru_head_), lru_tail_(o.lru_tail_),
+      global_pin_(o.global_pin_)
 {
     o.mapped_ = nullptr;
     o.file_size_ = 0;
@@ -215,9 +238,11 @@ inline BlockCacheReader& BlockCacheReader::operator=(BlockCacheReader&& o) noexc
         index_ = std::move(o.index_);
         logical_size_ = o.logical_size_;
         cache_ = std::move(o.cache_);
+        block_to_slot_ = std::move(o.block_to_slot_);
         max_cached_ = o.max_cached_;
-        tick_ = o.tick_;
-        global_pin_ = o.global_pin_;
+        lru_head_ = o.lru_head_; o.lru_head_ = UINT32_MAX;
+        lru_tail_ = o.lru_tail_; o.lru_tail_ = UINT32_MAX;
+        global_pin_ = o.global_pin_; o.global_pin_ = 0;
     }
     return *this;
 }
@@ -279,6 +304,9 @@ inline bool BlockCacheReader::init(const uint8_t* mapped, uint64_t file_size,
     // Pre-allocate cache slots
     size_t slots = max_cached_ < index_.size() ? max_cached_ : index_.size();
     cache_.resize(slots);
+    block_to_slot_.reserve(slots * 2);
+    lru_head_ = UINT32_MAX;
+    lru_tail_ = UINT32_MAX;
 
     return true;
 }
@@ -360,81 +388,114 @@ inline uint32_t BlockCacheReader::find_block(uint64_t logical_offset) const {
     return lo > 0 ? lo - 1 : 0;
 }
 
+// ── O(1) LRU linked-list management ─────────────────────────────────────
+
+inline void BlockCacheReader::lru_remove(uint32_t idx) {
+    auto& entry = cache_[idx];
+    uint32_t prev = entry.lru_prev;
+    uint32_t next = entry.lru_next;
+    if (prev != UINT32_MAX) cache_[prev].lru_next = next;
+    else lru_head_ = next;
+    if (next != UINT32_MAX) cache_[next].lru_prev = prev;
+    else lru_tail_ = prev;
+    entry.lru_prev = UINT32_MAX;
+    entry.lru_next = UINT32_MAX;
+}
+
+inline void BlockCacheReader::lru_push_front(uint32_t idx) {
+    auto& entry = cache_[idx];
+    entry.lru_prev = UINT32_MAX;
+    entry.lru_next = lru_head_;
+    if (lru_head_ != UINT32_MAX) cache_[lru_head_].lru_prev = idx;
+    lru_head_ = idx;
+    if (lru_tail_ == UINT32_MAX) lru_tail_ = idx;
+}
+
+inline void BlockCacheReader::lru_move_to_front(uint32_t idx) {
+    lru_remove(idx);
+    lru_push_front(idx);
+}
+
 inline void BlockCacheReader::evict_one() {
-    // Find LRU unpinned slot
-    uint32_t best = UINT32_MAX;
-    uint32_t best_tick = UINT32_MAX;
-    for (uint32_t i = 0; i < cache_.size(); i++) {
-        if (cache_[i].block_id == UINT32_MAX) continue;  // empty slot
-        if (global_pin_ > 0 || cache_[i].pin_count > 0) continue;
-        if (cache_[i].access_tick < best_tick) {
-            best_tick = cache_[i].access_tick;
-            best = i;
+    // O(1) eviction: walk from lru_tail_ to find the first unpinned slot.
+    // In the common case (no pins), this evicts lru_tail_ directly.
+    if (global_pin_ > 0) return;  // global pin prevents all eviction
+    uint32_t idx = lru_tail_;
+    while (idx != UINT32_MAX) {
+        if (cache_[idx].pin_count == 0) {
+            // Found an evictable slot — remove from LRU list and clear.
+            lru_remove(idx);
+            block_to_slot_.erase(cache_[idx].block_id);
+            cache_[idx].block_id = UINT32_MAX;
+            cache_[idx].data.clear();
+            cache_[idx].data.shrink_to_fit();
+            cache_[idx].overlap.clear();
+            cache_[idx].overlap.shrink_to_fit();
+            return;
         }
+        idx = cache_[idx].lru_prev;
     }
-    if (best != UINT32_MAX) {
-        cache_[best].block_id = UINT32_MAX;
-        cache_[best].data.clear();
-        cache_[best].data.shrink_to_fit();
-        cache_[best].overlap.clear();
-        cache_[best].overlap.shrink_to_fit();
-    }
+    // All blocks are pinned — cannot evict (caller handles by growing cache_).
 }
 
 inline BlockCacheReader::CachedBlock&
 BlockCacheReader::ensure_block(uint32_t block_id) {
-    // Check if already cached
-    for (auto& slot : cache_) {
-        if (slot.block_id == block_id) {
-            slot.access_tick = ++tick_;
-            return slot;
-        }
+    // O(1) lookup via hash map
+    auto it = block_to_slot_.find(block_id);
+    if (it != block_to_slot_.end()) {
+        uint32_t slot = it->second;
+        lru_move_to_front(slot);
+        return cache_[slot];
     }
 
     // Find a free slot or evict
-    CachedBlock* target = nullptr;
-    for (auto& slot : cache_) {
-        if (slot.block_id == UINT32_MAX) {
-            target = &slot;
+    uint32_t target_idx = UINT32_MAX;
+    for (uint32_t i = 0; i < cache_.size(); i++) {
+        if (cache_[i].block_id == UINT32_MAX) {
+            target_idx = i;
             break;
         }
     }
-    if (!target) {
+    if (target_idx == UINT32_MAX) {
         evict_one();
-        for (auto& slot : cache_) {
-            if (slot.block_id == UINT32_MAX) {
-                target = &slot;
+        for (uint32_t i = 0; i < cache_.size(); i++) {
+            if (cache_[i].block_id == UINT32_MAX) {
+                target_idx = i;
                 break;
             }
         }
     }
-    if (!target) {
+    if (target_idx == UINT32_MAX) {
         // All pinned — grow cache by one (emergency)
         cache_.emplace_back();
-        target = &cache_.back();
+        target_idx = static_cast<uint32_t>(cache_.size() - 1);
     }
 
     // Decompress
     auto& entry = index_[block_id];
-    target->block_id = block_id;
-    target->data.resize(entry.original_size);
-    target->access_tick = ++tick_;
+    auto& slot = cache_[target_idx];
+    slot.block_id = block_id;
+    slot.data.resize(entry.original_size);
+    slot.overlap.clear();  // reset overlap (will be rebuilt on demand)
 
 #if TENET_HAS_ZSTD
     size_t result = ZSTD_decompressDCtx(
         dctx_,
-        target->data.data(), entry.original_size,
+        slot.data.data(), entry.original_size,
         mapped_ + entry.compressed_offset, entry.compressed_size);
     if (ZSTD_isError(result) || result != entry.original_size) {
         // Decompression error — return a zeroed block rather than crashing
-        std::memset(target->data.data(), 0, entry.original_size);
+        std::memset(slot.data.data(), 0, entry.original_size);
     }
 #else
     // No zstd — should not reach here, but fill with zeros
-    std::memset(target->data.data(), 0, entry.original_size);
+    std::memset(slot.data.data(), 0, entry.original_size);
 #endif
 
-    return *target;
+    block_to_slot_[block_id] = target_idx;
+    lru_push_front(target_idx);
+
+    return slot;
 }
 
 inline size_t BlockCacheReader::decompress_block_raw(
@@ -516,11 +577,9 @@ inline const uint8_t* BlockCacheReader::data_at(uint64_t logical_offset) {
         // Fill head of next block, if any (last block: zero-fill instead).
         CachedBlock* next_cached = nullptr;
         if (block_id + 1 < index_.size()) {
-            for (auto& slot : cache_) {
-                if (slot.block_id == block_id + 1) {
-                    next_cached = &slot;
-                    break;
-                }
+            auto nit = block_to_slot_.find(block_id + 1);
+            if (nit != block_to_slot_.end()) {
+                next_cached = &cache_[nit->second];
             }
         }
         if (block_id + 1 >= index_.size()) {
@@ -570,6 +629,9 @@ inline std::unique_ptr<BlockCacheReader> BlockCacheReader::clone(size_t max_cach
     // Pre-allocate cache slots
     size_t slots = max_cached_blocks < index_.size() ? max_cached_blocks : index_.size();
     c->cache_.resize(slots);
+    c->block_to_slot_.reserve(slots * 2);
+    c->lru_head_ = UINT32_MAX;
+    c->lru_tail_ = UINT32_MAX;
 #if TENET_HAS_ZSTD
     c->dctx_ = ZSTD_createDCtx();
 #endif

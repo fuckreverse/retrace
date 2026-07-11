@@ -147,6 +147,22 @@ private:
 
         std::string_view name() const override { return "WriteEventCollector"; }
 
+        // Parallel scanning support: each shard collects its own write events,
+        // then merge() concatenates them.  The events_ vector is the only
+        // mutable state, and each shard clone has its own — fully thread-safe.
+        bool supports_parallel() const override { return true; }
+        std::unique_ptr<TraceCollector> clone() const override {
+            return std::make_unique<WriteEventCollector>(range_start_, range_end_);
+        }
+        void merge(TraceCollector& shard) override {
+            auto* other = dynamic_cast<WriteEventCollector*>(&shard);
+            if (other) {
+                events_.insert(events_.end(),
+                               std::make_move_iterator(other->events_.begin()),
+                               std::make_move_iterator(other->events_.end()));
+            }
+        }
+
         bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
             events_.clear();
             return true;
