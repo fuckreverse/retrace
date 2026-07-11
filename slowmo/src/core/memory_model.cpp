@@ -25,6 +25,59 @@ namespace tenet {
 // ─── Static thread_local definition ───────────────────────────────────────
 thread_local MemoryModel::IteratorPair MemoryModel::tl_iterators_;
 
+// ─── Global iterator registry ─────────────────────────────────────────────
+//
+// Because tl_iterators_ is static thread_local, each thread (including TBB
+// worker threads) has its own independent copy.  When a MemoryModel is
+// destroyed, invalidate_thread_iterators() must clear not just the calling
+// thread's pair but ALL threads' pairs that reference the about-to-be-closed
+// DB — otherwise the stale unique_ptr<Iterator> in a TBB worker thread will
+// trigger a use-after-free when it is eventually reset or destroyed.
+//
+// The registry is a simple set of raw pointers to live IteratorPair objects.
+// Each thread registers its &tl_iterators_ on first use (inside
+// get_thread_iterators()).  When a thread exits, ~IteratorPair() unregisters.
+// All access is protected by g_iter_registry_mutex.
+//
+// Safety: entries are only added/removed under the mutex.  Cross-thread
+// invalidation (in invalidate_thread_iterators()) also holds the mutex, so
+// there is no race between invalidation and thread-exit cleanup.  After
+// invalidation resets the unique_ptrs to null, the owning thread may safely
+// recreate new iterators for a different DB on its next get_thread_iterators()
+// call.
+#include <unordered_set>
+static std::mutex g_iter_registry_mutex;
+static std::unordered_set<void*> g_iter_registry;
+
+MemoryModel::IteratorPair::~IteratorPair() {
+    MemoryModel::unregister_iterator_pair(this);
+}
+
+void MemoryModel::register_iterator_pair(IteratorPair* p) {
+    std::lock_guard<std::mutex> lk(g_iter_registry_mutex);
+    g_iter_registry.insert(p);
+    p->registered = true;
+}
+
+void MemoryModel::unregister_iterator_pair(IteratorPair* p) {
+    if (!p->registered) return;
+    std::lock_guard<std::mutex> lk(g_iter_registry_mutex);
+    g_iter_registry.erase(p);
+    p->registered = false;
+}
+
+void MemoryModel::invalidate_all_iterators_for_db(rocksdb::DB* db) {
+    std::lock_guard<std::mutex> lk(g_iter_registry_mutex);
+    for (auto* vp : g_iter_registry) {
+        auto* p = static_cast<IteratorPair*>(vp);
+        if (p->owner_db == db) {
+            p->write_iter.reset();
+            p->read_iter.reset();
+            p->owner_db = nullptr;
+        }
+    }
+}
+
 // ─── Thread-local page cache (for read_region fast path) ──────────────────
 // Caches the last PageWriteIndex pointer to skip mutex + hash map lookup when
 // consecutive reads hit the same page (common for try_deref_string chunks).
@@ -101,17 +154,13 @@ MemoryModel::MemoryModel(const TraceReader& reader, const TraceIndex& index)
     : reader_(reader), index_(index) {}
 
 void MemoryModel::invalidate_thread_iterators() {
-// If this thread's cached iterators belong to our DB, invalidate them now.
-// This prevents a use-after-free when the DB is closed (e.g., between tests):
-// the next MemoryModel that happens to get the same DB pointer would otherwise
-// reuse stale iterators that belong to the now-closed DB.
+// Clear ALL threads' cached iterators that belong to our DB, not just the
+// current thread's.  TBB worker threads' static thread_local IteratorPair
+// instances survive after the current thread's MemoryModel is destroyed;
+// if their unique_ptr<Iterator> members are not reset before DB close, the
+// eventual reset/destruction triggers a use-after-free SIGSEGV.
 if (has_rocksdb_ && db_ != nullptr) {
-auto& pair = tl_iterators_;
-if (pair.owner_db == db_) {
-pair.write_iter.reset();
-pair.read_iter.reset();
-pair.owner_db = nullptr;
-}
+    invalidate_all_iterators_for_db(db_);
 }
 }
 
@@ -183,6 +232,12 @@ void MemoryModel::write_persisted_sentinel() {
 
 MemoryModel::IteratorPair& MemoryModel::get_thread_iterators() {
     auto& pair = tl_iterators_;
+    // Register this thread's IteratorPair in the global registry on first use.
+    // This allows invalidate_thread_iterators() to clear it from any thread
+    // before the DB is closed (critical for TBB worker threads).
+    if (!pair.registered) {
+        register_iterator_pair(&pair);
+    }
     // Re-create iterators if they belong to a different DB (or haven't been created yet)
     if (pair.owner_db != db_ && has_rocksdb_) {
         rocksdb::ReadOptions ro;

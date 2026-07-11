@@ -322,13 +322,32 @@ private:
     // Thread-local iterator pool for avoiding repeated NewIterator() calls.
     // Each thread gets its own cached iterator pair (write_iter, read_iter).
     // The pool is tied to a specific DB instance via owner_db pointer.
+    //
+    // CRITICAL: RocksDB iterators must be destroyed BEFORE the DB is closed.
+    // Because tl_iterators_ is static thread_local, a TBB worker thread's
+    // copy survives even after the owning MemoryModel/DB is destroyed.
+    // The destructor unregisters from the global registry (see .cpp) so
+    // that invalidate_thread_iterators() can clear ALL threads' iterators
+    // before DB close — preventing a use-after-free SIGSEGV.
     struct IteratorPair {
         std::unique_ptr<rocksdb::Iterator> write_iter;
         std::unique_ptr<rocksdb::Iterator> read_iter;
         rocksdb::DB* owner_db = nullptr;  // which DB these iterators belong to
+        bool registered = false;          // true once added to global registry
+        ~IteratorPair();
     };
     IteratorPair& get_thread_iterators();
     static thread_local IteratorPair tl_iterators_;
+
+    // ── Global iterator registry (cross-thread cleanup) ──
+    // Registers/unregisters an IteratorPair in the global thread-tracking set.
+    // Called from get_thread_iterators() and ~IteratorPair() respectively.
+    static void register_iterator_pair(IteratorPair* p);
+    static void unregister_iterator_pair(IteratorPair* p);
+    // Clear all threads' iterators that belong to db_ (called by
+    // invalidate_thread_iterators()).  Defined here so it can access
+    // the private IteratorPair type.
+    static void invalidate_all_iterators_for_db(rocksdb::DB* db);
 
     // In-memory cache for recently queried writes (protected by cache_mutex_)
     LRUCache<uint64_t, std::vector<MemWrite>> page_cache_{512};
