@@ -87,11 +87,11 @@ ZSTD_LIB="build-android/libzstd.a"
 if [[ ! -f "${ZSTD_LIB}" ]]; then
     echo "==> Building libzstd.a for Android arm64..."
     TMPDIR=$(mktemp -d)
-    "${CC}" -O2 -DZSTD_MULTITHREAD=0 \
+    "${CC}" -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 \
         -I"${ZSTD_SRC}" -I"${ZSTD_SRC}/common" \
         -c "${ZSTD_SRC}"/common/*.c "${ZSTD_SRC}"/compress/*.c "${ZSTD_SRC}"/decompress/*.c \
         -o "${TMPDIR}/" 2>/dev/null || \
-    (cd "${TMPDIR}" && "${CC}" -O2 -DZSTD_MULTITHREAD=0 \
+    (cd "${TMPDIR}" && "${CC}" -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 \
         -I"${REPO_ROOT}/${ZSTD_SRC}" -I"${REPO_ROOT}/${ZSTD_SRC}/common" \
         -c "${REPO_ROOT}/${ZSTD_SRC}"/common/*.c \
            "${REPO_ROOT}/${ZSTD_SRC}"/compress/*.c \
@@ -113,7 +113,7 @@ if [[ -f build-android/libqbdi-llvm.a ]]; then
     LLVM_LIB="build-android/libqbdi-llvm.a"
 fi
 
-"${CXX}" -std=c++17 -O2 -shared -fPIC \
+"${CXX}" -std=c++17 -O3 -DNDEBUG -shared -fPIC \
     -DQBDITRACE_HAVE_ZSTD=1 \
     -Iinclude -Ibuild-android/include -Ibuild-android/include-static \
     -Itools/qbditrace -I"${ZSTD_SRC}" \
