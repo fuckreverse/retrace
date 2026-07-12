@@ -1,0 +1,353 @@
+---
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { isLocale } from '../../lib/i18n';
+
+export function getStaticPaths() {
+  return [{ params: { locale: 'en' } }, { params: { locale: 'zh-CN' } }];
+}
+
+const { locale } = Astro.params;
+if (!isLocale(locale)) return Astro.redirect('/en/');
+
+const english = {
+  metaTitle: 'Terms of Use',
+  description: 'Terms governing access to the Tenet website and use of Tenet and qbditrace.',
+  eyebrow: 'TERMS OF USE',
+  title: 'Use powerful tools responsibly.',
+  intro: 'These Terms govern your access to this website and your download and use of Tenet, qbditrace, their documentation, updates, and release packages. Please read them before using the Products.',
+  effective: 'Effective',
+  updated: 'Last updated',
+  date: 'July 11, 2026',
+  summaryTitle: 'Terms at a glance',
+  summaries: [
+    ['LICENSE', 'Personal use and internal organizational use are permitted.'],
+    ['RESEARCH', 'You may study, reverse engineer, and modify a lawfully obtained copy for internal use.'],
+    ['OWNERSHIP', 'Your traces, scripts, reports, and research results remain yours.'],
+    ['BOUNDARY', 'No redistribution, resale, third-party hosting, or paid analysis service without permission.'],
+  ],
+  languageNote: 'The Chinese version is the governing version if the Chinese and English versions conflict.',
+  sections: [
+    {
+      number: '01', title: 'Acceptance and scope',
+      paragraphs: [
+        'By accessing the website or downloading, installing, or using a Product, you agree to these Terms. If you do not agree, do not use the website or the Products.',
+        'The current Terms govern website access. A software release remains governed by the Terms made available with, or identified for, that release when you downloaded that version. Later website changes do not retroactively alter that software license.',
+      ],
+    },
+    {
+      number: '02', title: 'Definitions',
+      paragraphs: [
+        '“Products” means the Tenet desktop application, qbditrace recorder, this website, documentation, updates, and official release packages. “Trace Data” means execution data captured by you. “Analysis Results” means reports, scripts, annotations, graphs, and conclusions you create from your analysis.',
+        '“Tenet Developer” means the individual publisher who provides the Products under these Terms.',
+      ],
+    },
+    {
+      number: '03', title: 'Software license',
+      paragraphs: ['Subject to these Terms, Tenet Developer grants you a limited, non-exclusive, non-transferable license to install and use the software personally or within your organization. The software is licensed, not sold; all rights not expressly granted are reserved.'],
+      bullets: [
+        'Use for learning, research, debugging, interoperability, performance work, and authorized security assessment.',
+        'Internal use by businesses, institutions, and their personnel, including analysis supporting commercial products.',
+        'Rights that applicable law does not permit these Terms to restrict remain unaffected.',
+      ],
+    },
+    {
+      number: '04', title: 'Research, modification, and results',
+      paragraphs: ['You may inspect, reverse engineer, disassemble, and modify a copy you lawfully obtained for your own or your organization’s internal use, provided that you comply with applicable law and authorization boundaries.'],
+      bullets: [
+        'You retain ownership of your Trace Data and Analysis Results.',
+        'You may publish or commercially use your own scripts, reports, research conclusions, and other Analysis Results.',
+        'Analysis Results must not include or distribute the Products, modified Product binaries, or protected Product materials unless separately authorized.',
+      ],
+    },
+    {
+      number: '05', title: 'Distribution and commercial restrictions',
+      paragraphs: ['Unless Tenet Developer gives prior written permission, you must not:'],
+      bullets: [
+        'Redistribute, sublicense, sell, rent, lend, or otherwise provide the Products or modified copies to another party.',
+        'Host the Products as a service for third parties or offer a paid analysis service built primarily around the Products.',
+        'Present a modified build as official, remove rights notices, or use Tenet names or marks in a misleading way.',
+      ],
+      note: 'Internal research, development, debugging, and security assessment by an organization do not become a prohibited third-party service merely because they support commercial activity.',
+    },
+    {
+      number: '06', title: 'Responsible use',
+      paragraphs: ['Use the Products only on software, systems, devices, accounts, and data that you own or are expressly authorized to inspect. The capabilities of the Products do not grant authorization to examine any third-party target.'],
+      bullets: [
+        'Do not gain unauthorized access, attack systems, or exceed the scope of an authorization.',
+        'Do not steal credentials, cryptographic material, personal information, confidential information, or trade secrets.',
+        'Do not develop, deploy, or distribute malware, unlawfully bypass safeguards, disrupt services, or abuse website and download infrastructure.',
+        'Do not infringe intellectual property, privacy, data protection, or other rights of any person.',
+      ],
+    },
+    {
+      number: '07', title: 'Trace Data and privacy',
+      paragraphs: [
+        'Tenet is designed to analyze Trace Data locally. The website does not ask you to upload Trace Data and does not inspect it. You are responsible for ensuring that capture, storage, analysis, and disclosure of your data are lawful.',
+        'Website analytics, infrastructure logs, and download records are handled as described in the Privacy Policy.',
+      ],
+      link: { label: 'Read the Privacy Policy', href: '/en/privacy/' },
+    },
+    {
+      number: '08', title: 'Downloads, updates, and third parties',
+      paragraphs: [
+        'Use official download locations and verify published SHA-256 checksums where available. Tenet Developer may change, suspend, or discontinue a Product, feature, release, or download at any time and does not promise that old releases will remain available.',
+        'Third-party components and platforms remain subject to their own terms. References to Apple, Cloudflare, or other providers do not imply their sponsorship, endorsement, or responsibility for the Products.',
+      ],
+    },
+    {
+      number: '09', title: 'Technical risk and warranties',
+      paragraphs: [
+        'Dynamic instrumentation and trace analysis can crash a process, reduce performance, change timing, consume storage, expose sensitive data, or produce incomplete or incorrect results. Back up important data and independently verify material findings.',
+        'To the maximum extent permitted by law, the Products are provided “as is” and “as available,” without express or implied warranties of accuracy, availability, merchantability, fitness for a particular purpose, non-infringement, or error-free operation.',
+      ],
+    },
+    {
+      number: '10', title: 'Limitation of liability',
+      paragraphs: [
+        'To the maximum extent permitted by law, Tenet Developer is not liable for indirect, incidental, special, punitive, or consequential loss, including loss of data, profit, revenue, opportunity, goodwill, or business continuity.',
+        'The aggregate liability arising from the Products or these Terms will not exceed the amount you actually paid for the Products during the 12 months before the claim. If you paid nothing, the aggregate limit is RMB 100.',
+        'Nothing in these Terms excludes liability that cannot lawfully be excluded, including liability that applicable law imposes for intentional misconduct or gross negligence.',
+      ],
+    },
+    {
+      number: '11', title: 'Suspension and termination',
+      paragraphs: [
+        'Your software license terminates if you materially breach these Terms. Tenet Developer may restrict access to website or download infrastructure to address unlawful conduct, security threats, abuse, or material violations. On termination, stop using and delete the software and modified copies in your possession.',
+        'Termination does not transfer or extinguish ownership of Trace Data or Analysis Results you lawfully created before termination, and provisions intended by their nature to survive will continue to apply.',
+      ],
+    },
+    {
+      number: '12', title: 'Compliance and export controls',
+      paragraphs: ['You are responsible for complying with applicable laws, including cybersecurity, data protection, intellectual property, export control, sanctions, and embargo rules. Do not provide or use the Products where doing so is prohibited by law.'],
+    },
+    {
+      number: '13', title: 'Changes to these Terms',
+      paragraphs: [
+        'Tenet Developer may update these Terms and will publish the effective and last-updated dates on this page. Material changes will be highlighted on the website when reasonably practicable.',
+        'Updated Terms govern later website use and newly downloaded releases. A release you already downloaded remains subject to the Terms applicable when it was downloaded, except where an immediate change is required by law or is necessary to address unlawful use or a material security risk.',
+      ],
+    },
+    {
+      number: '14', title: 'Governing law and disputes',
+      paragraphs: ['These Terms are governed by the laws of the People’s Republic of China. The parties should first attempt to resolve a dispute through good-faith consultation. If consultation fails, either party may bring the dispute before a competent people’s court at the location of Tenet Developer. Mandatory rights that cannot lawfully be waived remain unaffected.'],
+    },
+    {
+      number: '15', title: 'Contact and general provisions',
+      paragraphs: [
+        'For terms questions, permission requests, infringement notices, or security reports, contact Tenet Developer at legal@tenet.dev. This address is provisional and must be confirmed as operational before public release.',
+        'If any provision is unenforceable, it will be limited to the minimum extent necessary and the remaining provisions will continue in effect. A failure to enforce a provision is not a waiver. These Terms and any release-specific notice form the entire agreement concerning their subject matter.',
+      ],
+    },
+  ],
+  review: 'Important: this draft is provided for product preparation and should be reviewed by a qualified legal professional before the first public software release.',
+};
+
+const chinese = {
+  metaTitle: '使用条款',
+  description: '关于访问 Tenet 网站以及使用 Tenet 与 qbditrace 的条款。',
+  eyebrow: '使用条款',
+  title: '负责任地使用强大的工具。',
+  intro: '本条款适用于你访问本网站，以及下载和使用 Tenet、qbditrace、相关文档、更新与发布包。使用产品前，请仔细阅读本条款。',
+  effective: '生效日期',
+  updated: '最后更新',
+  date: '2026 年 7 月 11 日',
+  summaryTitle: '条款摘要',
+  summaries: [
+    ['许可', '允许个人使用，也允许企业和组织内部使用。'],
+    ['研究', '你可以研究、反编译并修改合法取得的软件副本，供内部使用。'],
+    ['归属', '你的 Trace、脚本、报告和研究成果仍归你所有。'],
+    ['边界', '未经许可，不得再分发、转售、对外托管或提供收费分析服务。'],
+  ],
+  languageNote: '中英文版本含义不一致时，以中文版本为准。',
+  sections: [
+    {
+      number: '01', title: '接受条款与适用范围',
+      paragraphs: [
+        '访问本网站，或者下载、安装或使用任何产品，即表示你同意本条款。如果你不同意，请勿使用本网站或产品。',
+        '网站访问适用届时公布的最新条款。软件版本适用你下载该版本时随附或明确对应的条款；此后网站条款的修改不会追溯改变该版本的软件许可。',
+      ],
+    },
+    {
+      number: '02', title: '定义',
+      paragraphs: [
+        '“产品”指 Tenet 桌面应用、qbditrace 录制器、本网站、文档、更新及官方发布包。“Trace 数据”指由你捕获的执行数据。“分析成果”指你在分析过程中形成的报告、脚本、标注、图表和结论。',
+        '“Tenet 开发者”指依据本条款提供产品的个人发布者。',
+      ],
+    },
+    {
+      number: '03', title: '软件许可',
+      paragraphs: ['在遵守本条款的前提下，Tenet 开发者授予你有限的、非独占的、不可转让的许可，允许你以个人身份或在所属组织内部安装和使用软件。软件仅供许可使用，并非出售；未明确授予的权利均予保留。'],
+      bullets: [
+        '可用于学习、研究、调试、互操作、性能分析以及经过授权的安全评估。',
+        '允许企业、机构及其人员在内部使用，包括为商业产品提供支持的分析活动。',
+        '适用法律规定不得由本条款限制的权利不受影响。',
+      ],
+    },
+    {
+      number: '04', title: '研究、修改与分析成果',
+      paragraphs: ['你可以为个人或所属组织内部使用之目的，检查、反编译、反汇编并修改你合法取得的软件副本，但必须遵守适用法律和授权边界。'],
+      bullets: [
+        'Trace 数据和分析成果的所有权归你所有。',
+        '你可以发布或商业利用自己创作的脚本、报告、研究结论及其他分析成果。',
+        '除非另获许可，分析成果不得包含或传播产品本身、产品的修改版二进制文件或受保护的产品材料。',
+      ],
+    },
+    {
+      number: '05', title: '分发与商业使用限制',
+      paragraphs: ['未经 Tenet 开发者事先书面许可，你不得：'],
+      bullets: [
+        '向第三方再分发、再许可、销售、出租、出借或以其他方式提供产品或其修改副本。',
+        '将产品作为面向第三方的服务进行托管，或提供以产品为核心的收费分析服务。',
+        '将修改版冒充官方版本，删除权利声明，或者以误导方式使用 Tenet 的名称或标识。',
+      ],
+      note: '企业或组织内部的研究、研发、调试和安全评估，不会仅因其服务于商业活动而成为本条禁止的对外服务。',
+    },
+    {
+      number: '06', title: '负责任使用',
+      paragraphs: ['你只能对自己拥有或获得明确授权的软件、系统、设备、账户和数据使用产品。产品具备的能力并不构成对任何第三方目标进行检查的授权。'],
+      bullets: [
+        '不得未经授权访问、攻击系统或超出授权范围。',
+        '不得窃取凭据、密码材料、个人信息、保密信息或商业秘密。',
+        '不得开发、部署或传播恶意软件，不得为违法目的规避保护措施、干扰服务或滥用网站及下载基础设施。',
+        '不得侵犯任何人的知识产权、隐私权、数据权益或其他合法权利。',
+      ],
+    },
+    {
+      number: '07', title: 'Trace 数据与隐私',
+      paragraphs: [
+        'Tenet 被设计为在本地分析 Trace 数据。本网站不会要求你上传 Trace 数据，也不会对其进行检查。你有责任确保数据的捕获、存储、分析和披露合法合规。',
+        '网站分析、基础设施日志和下载记录依照隐私政策处理。',
+      ],
+      link: { label: '阅读隐私政策', href: '/zh-CN/privacy/' },
+    },
+    {
+      number: '08', title: '下载、更新与第三方',
+      paragraphs: [
+        '请使用官方发布的下载地址，并在提供校验值时验证 SHA-256。Tenet 开发者可以随时变更、暂停或终止产品、功能、版本或下载服务，且不承诺旧版本永久可用。',
+        '第三方组件和平台适用各自的条款。提及 Apple、Cloudflare 或其他服务商，不代表其赞助、认可本产品或对本产品承担责任。',
+      ],
+    },
+    {
+      number: '09', title: '技术风险与免责声明',
+      paragraphs: [
+        '动态插桩和 Trace 分析可能导致进程崩溃、性能下降、时序变化、存储消耗、敏感数据暴露，或产生不完整、不准确的结果。请备份重要数据，并独立复核重要结论。',
+        '在法律允许的最大范围内，产品按“现状”和“可用状态”提供，不附带关于准确性、可用性、适销性、特定用途适用性、不侵权或无错误运行的任何明示或默示保证。',
+      ],
+    },
+    {
+      number: '10', title: '责任限制',
+      paragraphs: [
+        '在法律允许的最大范围内，Tenet 开发者不对任何间接、附带、特殊、惩罚性或后果性损失承担责任，包括数据、利润、收入、机会、商誉损失或业务中断。',
+        '因产品或本条款产生的累计责任，不超过索赔发生前 12 个月内你为产品实际支付的金额；如果你未支付任何费用，累计责任上限为人民币 100 元。',
+        '本条不排除法律规定不得排除的责任，包括因故意或重大过失依法应承担的责任。',
+      ],
+    },
+    {
+      number: '11', title: '暂停与终止',
+      paragraphs: [
+        '如果你严重违反本条款，软件许可即告终止。为处理违法行为、安全威胁、基础设施滥用或严重违约，Tenet 开发者可以限制你访问网站或下载服务。许可终止后，你应停止使用并删除持有的软件及其修改副本。',
+        '终止不会转移或消灭你在终止前合法形成的 Trace 数据和分析成果的所有权；依其性质应持续有效的条款在终止后继续有效。',
+      ],
+    },
+    {
+      number: '12', title: '合规与出口管制',
+      paragraphs: ['你有责任遵守适用法律，包括网络安全、数据保护、知识产权、出口管制、制裁和禁运规定。不得在法律禁止的情形、地区或主体范围内提供或使用产品。'],
+    },
+    {
+      number: '13', title: '条款变更',
+      paragraphs: [
+        'Tenet 开发者可以更新本条款，并在本页公布生效日期与最后更新日期。在合理可行的情况下，重大变更将通过网站醒目提示。',
+        '更新后的条款适用于此后的网站使用和新下载的软件版本。已下载的软件版本继续适用下载时的条款，但法律要求立即变更，或者为处置违法使用或重大安全风险所必需的情况除外。',
+      ],
+    },
+    {
+      number: '14', title: '适用法律与争议解决',
+      paragraphs: ['本条款适用中华人民共和国法律。双方应首先通过友好协商解决争议；协商不成的，任何一方均可向 Tenet 开发者所在地有管辖权的人民法院提起诉讼。依法不得放弃或排除的强制性权利不受影响。'],
+    },
+    {
+      number: '15', title: '联系方式与一般条款',
+      paragraphs: [
+        '如需咨询条款、申请额外授权、提交侵权通知或报告安全问题，请通过 legal@tenet.dev 联系 Tenet 开发者。该地址目前为临时地址，首次公开发布前必须确认能够正常收信。',
+        '如果某项条款无法执行，应仅在必要的最小范围内限制该条款，其余条款继续有效。未行使某项权利不构成放弃。本条款及特定版本随附的通知构成双方就相关事项达成的完整约定。',
+      ],
+    },
+  ],
+  review: '重要提示：本稿用于产品发布准备，首次公开发布软件前应由具备相应资质的法律专业人士审阅。',
+};
+
+const content = locale === 'en' ? english : chinese;
+---
+
+<SiteLayout locale={locale} title={`${content.metaTitle} — Tenet`} description={content.description}>
+  <section class="section page-hero terms-hero">
+    <div class="eyebrow">{content.eyebrow}</div>
+    <h1>{content.title}</h1>
+    <p>{content.intro}</p>
+    <div class="terms-dates mono">
+      <span>{content.effective}: {content.date}</span>
+      <span>{content.updated}: {content.date}</span>
+    </div>
+  </section>
+
+  <main class="section terms-shell">
+    <aside class="terms-summary" aria-labelledby="terms-summary-title">
+      <div class="summary-label mono" id="terms-summary-title">{content.summaryTitle}</div>
+      {content.summaries.map(([label, text]) => (
+        <div class="summary-item">
+          <strong class="mono">{label}</strong>
+          <span>{text}</span>
+        </div>
+      ))}
+      <p class="language-note">{content.languageNote}</p>
+    </aside>
+
+    <article class="terms-document">
+      {content.sections.map((section) => (
+        <section class="terms-section" id={`section-${section.number}`}>
+          <header>
+            <span class="section-number mono">{section.number}</span>
+            <h2>{section.title}</h2>
+          </header>
+          {section.paragraphs.map((paragraph) => <p>{paragraph}</p>)}
+          {'bullets' in section && section.bullets && (
+            <ul>{section.bullets.map((item) => <li>{item}</li>)}</ul>
+          )}
+          {'note' in section && section.note && <div class="terms-callout">{section.note}</div>}
+          {'link' in section && section.link && <a class="terms-link" href={section.link.href}>{section.link.label} →</a>}
+        </section>
+      ))}
+      <div class="notice legal-review">{content.review}</div>
+    </article>
+  </main>
+</SiteLayout>
+
+<style>
+  .terms-hero { padding-bottom: 54px; }
+  .terms-dates { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-top: 28px; color: var(--faint); font-size: 11px; letter-spacing: .04em; }
+  .terms-shell { display: grid; grid-template-columns: 280px minmax(0, 760px); justify-content: space-between; gap: 72px; align-items: start; }
+  .terms-summary { position: sticky; top: 28px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 22px; }
+  .summary-label { margin-bottom: 18px; color: var(--accent); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+  .summary-item { display: grid; gap: 4px; padding: 14px 0; border-top: 1px solid var(--line); }
+  .summary-item strong { color: var(--text); font-size: 10px; letter-spacing: .1em; }
+  .summary-item span, .language-note { color: var(--muted); font-size: 13px; line-height: 1.55; }
+  .language-note { margin: 18px 0 0; padding-top: 16px; border-top: 1px solid var(--line); }
+  .terms-document { min-width: 0; }
+  .terms-section { scroll-margin-top: 24px; padding: 0 0 44px; margin: 0 0 44px; border-bottom: 1px solid var(--line); }
+  .terms-section header { display: grid; grid-template-columns: 42px 1fr; align-items: baseline; gap: 10px; margin-bottom: 20px; }
+  .section-number { color: var(--accent); font-size: 11px; }
+  .terms-section h2 { margin: 0; font-size: clamp(22px, 2.6vw, 30px); letter-spacing: -.025em; }
+  .terms-section p, .terms-section li { color: var(--muted); font-size: 15px; line-height: 1.8; }
+  .terms-section p { margin: 0 0 16px; }
+  .terms-section ul { margin: 8px 0 18px 18px; padding: 0; }
+  .terms-section li { padding-left: 8px; margin: 8px 0; }
+  .terms-section li::marker { color: var(--accent); }
+  .terms-callout { margin-top: 20px; padding: 16px 18px; border-left: 2px solid var(--accent); background: var(--accent-dim); color: var(--text); font-size: 14px; }
+  .terms-link { display: inline-flex; margin-top: 2px; color: var(--accent); border-bottom: 1px solid transparent; font-size: 14px; }
+  .terms-link:hover { border-bottom-color: var(--accent); }
+  .legal-review { margin: 0; }
+  @media (max-width: 850px) {
+    .terms-shell { grid-template-columns: 1fr; gap: 48px; }
+    .terms-summary { position: static; }
+    .terms-section { padding-bottom: 34px; margin-bottom: 34px; }
+  }
+</style>

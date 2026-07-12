@@ -1,0 +1,13 @@
+{
+  "version": "0.1.0-preview.1",
+  "publishedAt": "2026-07-11",
+  "platform": "macos",
+  "arch": "arm64",
+  "minOs": "14.0",
+  "fileName": "Tenet-0.1.0-preview.1-arm64.dmg",
+  "sizeBytes": 104857600,
+  "sha256": "9a28e4f68473ae7b95a1d65f96976f775e66a547cf14a277ab1d7292823d192a",
+  "objectKey": "releases/tenet/0.1.0-preview.1/macos-arm64/Tenet-0.1.0-preview.1-arm64.dmg",
+  "releaseNotesUrl": "/en/releases/",
+  "channel": "preview"
+}

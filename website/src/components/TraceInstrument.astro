@@ -1,0 +1,15 @@
+<div class="instrument" aria-label="Tenet trace analysis preview">
+  <div class="instrument-bar"><span></span><span></span><span></span><code>TRACE / 8,432,109 INST</code></div>
+  <div class="instrument-body">
+    <div class="instruction active"><i>0x10083A274</i><b>bl</b><span>0x100815d20</span></div>
+    <div class="instruction"><i>0x100815D20</i><b>stp</b><span>x29, x30, [sp, #-0x20]!</span></div>
+    <div class="instruction"><i>0x100815D24</i><b>mov</b><span>x29, sp</span></div>
+    <div class="instruction"><i>0x100815D28</i><b>eor</b><span>x8, x0, x1</span></div>
+    <p class="instrument-label">REGISTER DIFF</p>
+    <div class="reg"><b>x8</b><span>0x0000000102a0</span><em>0x9e3779b97f4a</em></div>
+    <div class="reg"><b>sp</b><span>0x000000016f30</span><em>0x000000016f10</em></div>
+    <p class="instrument-label">ANALYSIS SIGNAL</p>
+    <div class="signal"><b>ARX pattern</b><span>detected · confidence 0.94</span></div>
+    <div class="signal"><b>Backward slice</b><span>127 instructions · x0 source</span></div>
+  </div>
+</div>

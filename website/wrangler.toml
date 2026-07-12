@@ -1,0 +1,6 @@
+name = "tenet-website"
+compatibility_date = "2026-07-11"
+pages_build_output_dir = "dist"
+
+[vars]
+PUBLIC_DOWNLOAD_BASE_URL = "https://downloads.tenet.dev"

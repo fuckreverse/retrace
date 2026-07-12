@@ -1,0 +1,18 @@
+---
+import { alternateLocalePath, localizedPath, type Locale } from '../lib/i18n';
+import { t } from '../lib/copy';
+interface Props { locale: Locale; }
+const { locale } = Astro.props;
+const c = t(locale);
+const other = locale === 'en' ? '中文' : 'EN';
+---
+<header class="site-header">
+  <a class="brand" href={localizedPath(locale)} aria-label="Tenet home"><span class="brand-mark">T</span><span>TENET</span></a>
+  <nav aria-label="Main navigation">
+    <a href={`${localizedPath(locale)}#product`}>{c.nav.product}</a>
+    <a href={`${localizedPath(locale)}#workflow`}>{c.nav.workflow}</a>
+    <a href={`${localizedPath(locale)}#use-cases`}>{c.nav.useCases}</a>
+    <a href={localizedPath(locale, '/docs/')}>{c.nav.docs}</a>
+  </nav>
+  <div class="nav-actions"><a class="locale" href={alternateLocalePath(Astro.url.pathname)}>{other}</a><a class="button small" href={localizedPath(locale, '/download/')}>{c.nav.download}</a></div>
+</header>

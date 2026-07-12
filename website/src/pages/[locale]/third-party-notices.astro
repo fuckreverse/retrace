@@ -1,0 +1,108 @@
+---
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { isLocale, localizedPath } from '../../lib/i18n';
+
+export function getStaticPaths() {
+  return [{ params: { locale: 'en' } }, { params: { locale: 'zh-CN' } }];
+}
+
+const { locale } = Astro.params;
+if (!isLocale(locale)) return Astro.redirect('/en/');
+const en = locale === 'en';
+
+const components = [
+  ['QBDI', 'Apache-2.0', en ? 'Dynamic binary instrumentation engine' : '动态二进制插桩引擎'],
+  ['LLVM', 'Apache-2.0 WITH LLVM-exception', en ? 'Instruction and code-generation infrastructure' : '指令与代码生成基础设施'],
+  ['Triton', 'Apache-2.0', en ? 'Symbolic execution and semantic analysis' : '符号执行与语义分析'],
+  ['Z3', 'MIT', en ? 'Satisfiability modulo theories solver' : '可满足性模理论求解器'],
+  ['YARA', 'BSD-3-Clause', en ? 'Rule-based memory pattern matching' : '基于规则的内存模式匹配'],
+  ['RocksDB', 'Apache-2.0', en ? 'Persistent trace indexes' : '持久化 Trace 索引'],
+  ['Capstone', 'BSD-3-Clause', en ? 'Instruction disassembly' : '指令反汇编'],
+  ['oneTBB', 'Apache-2.0', en ? 'Parallel task scheduling' : '并行任务调度'],
+  ['SDL', 'Zlib', en ? 'Desktop window and input integration' : '桌面窗口与输入集成'],
+  ['Dear ImGui', 'MIT', en ? 'Native analysis interface' : '原生分析界面'],
+  ['zstd / LZ4', 'BSD', en ? 'Trace and index compression' : 'Trace 与索引压缩'],
+  ['OpenSSL', 'Apache-2.0', en ? 'Cryptographic support used by packaged dependencies' : '随包依赖使用的密码学支持'],
+];
+---
+
+<SiteLayout
+  locale={locale}
+  title={`${en ? 'Third-Party Software' : '第三方软件声明'} — Tenet`}
+  description={en ? 'Third-party software notices for Tenet and qbditrace.' : 'Tenet 与 qbditrace 的第三方软件声明。'}
+>
+  <section class="section page-hero">
+    <div class="eyebrow">{en ? 'LEGAL / ATTRIBUTION' : '法律信息 / 归属声明'}</div>
+    <h1>{en ? 'Third-Party Software' : '第三方软件声明'}</h1>
+    <p>{en
+      ? 'Tenet and qbditrace are built with carefully selected third-party components. We acknowledge their authors and preserve the license terms that make their use possible.'
+      : 'Tenet 与 qbditrace 使用了经过审慎选择的第三方组件。我们尊重这些组件的作者，并保留使其得以使用的相关许可条款。'}</p>
+  </section>
+
+  <section class="section notices-intro">
+    <div>
+      <div class="eyebrow">{en ? 'LICENSE SCOPE' : '许可范围'}</div>
+      <h2>{en ? 'Component licenses stay with their components.' : '组件许可证仅适用于对应组件。'}</h2>
+    </div>
+    <div>
+      <p class="lead">{en
+        ? 'Tenet includes third-party software made available under permissive licenses such as Apache License 2.0, MIT, BSD, and zlib. These licenses apply only to their respective components and do not grant rights to Tenet’s proprietary code.'
+        : 'Tenet 包含依据 Apache License 2.0、MIT、BSD、zlib 等宽松许可证提供的第三方软件。这些许可证仅适用于对应的第三方组件，不适用于 Tenet 的专有代码。'}</p>
+      <p>{en
+        ? 'Complete notices and license texts are included with every Tenet distribution and remain available without an internet connection.'
+        : '每份 Tenet 发布包均随附完整的第三方声明和许可证文本，无需联网即可查看。'}</p>
+    </div>
+  </section>
+
+  <section class="section component-section">
+    <div class="section-heading">
+      <div><div class="eyebrow">{en ? 'MAJOR COMPONENTS' : '主要组件'}</div><h2>{en ? 'Core technology attributions' : '核心技术归属'}</h2></div>
+      <p>{en ? 'This overview highlights major native components. The distribution contains the authoritative, version-specific inventory, including transitive desktop dependencies.' : '本页仅概览主要原生组件。发布包内包含权威的、与具体版本对应的完整清单，包括桌面端传递依赖。'}</p>
+    </div>
+    <div class="component-list">
+      {components.map(([name, license, purpose], index) => (
+        <article class="component-row">
+          <span class="component-index mono">{String(index + 1).padStart(2, '0')}</span>
+          <div><h3>{name}</h3><p>{purpose}</p></div>
+          <code>{license}</code>
+        </article>
+      ))}
+    </div>
+  </section>
+
+  <section class="section package-notice">
+    <div class="card">
+      <div class="eyebrow">{en ? 'IN EVERY DOWNLOAD' : '随每份下载提供'}</div>
+      <h2>{en ? 'Authoritative notices ship inside the app.' : '权威声明随应用一同交付。'}</h2>
+      <p>{en
+        ? 'On macOS, open About Tenet and choose “Third-Party Software…” to view the bundled notice. The same material is stored under Tenet.app/Contents/Resources/licenses/.'
+        : '在 macOS 上，可打开“关于 Tenet”并选择“第三方软件…”查看随包声明。同一材料也保存在 Tenet.app/Contents/Resources/licenses/ 中。'}</p>
+      <div class="actions">
+        <a class="button" href={localizedPath(locale, '/terms/')}>{en ? 'Terms of Use' : '使用条款'}</a>
+        <a class="button" href={localizedPath(locale, '/download/')}>{en ? 'Download Tenet' : '下载 Tenet'}</a>
+      </div>
+    </div>
+  </section>
+</SiteLayout>
+
+<style>
+  .notices-intro { display: grid; grid-template-columns: .85fr 1.15fr; gap: 72px; align-items: start; border-bottom: 1px solid var(--line); }
+  .notices-intro h2 { max-width: 480px; margin: 14px 0 0; font-size: clamp(28px, 3vw, 42px); line-height: 1.12; letter-spacing: -.04em; }
+  .notices-intro p:not(.lead) { color: var(--muted); }
+  .component-section { padding-top: 78px; }
+  .component-list { border-top: 1px solid var(--line-strong); }
+  .component-row { display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 20px; align-items: center; padding: 22px 10px; border-bottom: 1px solid var(--line); }
+  .component-index { color: var(--faint); font-size: 10px; }
+  .component-row h3 { margin: 0; font-size: 16px; }
+  .component-row p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .component-row code { color: var(--accent); font-size: 11px; text-align: right; }
+  .package-notice { padding-top: 28px; }
+  .package-notice .card { max-width: 820px; padding: 34px; border-color: var(--line-strong); }
+  .package-notice h2 { margin: 12px 0; }
+  .package-notice p { max-width: 680px; color: var(--muted); }
+  @media (max-width: 850px) {
+    .notices-intro { grid-template-columns: 1fr; gap: 30px; }
+    .component-row { grid-template-columns: 34px 1fr; }
+    .component-row code { grid-column: 2; text-align: left; }
+  }
+</style>

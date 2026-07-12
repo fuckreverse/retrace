@@ -1,0 +1,11 @@
+---
+import SiteHeader from '../components/SiteHeader.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+import type { Locale } from '../lib/i18n';
+import '../styles/global.css';
+interface Props { locale: Locale; title: string; description: string; }
+const { locale, title, description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const analyticsToken = import.meta.env.PUBLIC_CF_ANALYTICS_TOKEN;
+---
+<!doctype html><html lang={locale}><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta name="description" content={description}><meta name="theme-color" content="#070b10"><link rel="canonical" href={canonical}><link rel="alternate" hreflang={locale === 'en' ? 'zh-CN' : 'en'} href={new URL(Astro.url.pathname.replace(/^\/(en|zh-CN)/, locale === 'en' ? '/zh-CN/' : '/en/'), Astro.site)}><meta property="og:type" content="website"><meta property="og:title" content={title}><meta property="og:description" content={description}><meta property="og:url" content={canonical}><title>{title}</title>{analyticsToken && <script is:inline defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon={JSON.stringify({ token: analyticsToken })}></script>}</head><body><a class="skip-link" href="#content">Skip to content</a><SiteHeader locale={locale}/><main id="content"><slot /></main><SiteFooter locale={locale}/></body></html>

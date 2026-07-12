@@ -1,0 +1,83 @@
+:root {
+  --sl-font: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sl-font-mono: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+
+  --sl-color-accent-low: #123632;
+  --sl-color-accent: #51dfce;
+  --sl-color-accent-high: #c8fff8;
+  --sl-color-white: #edf3f7;
+  --sl-color-gray-1: #d9e2e9;
+  --sl-color-gray-2: #a8b5c0;
+  --sl-color-gray-3: #748696;
+  --sl-color-gray-4: #435361;
+  --sl-color-gray-5: #26323d;
+  --sl-color-gray-6: #111820;
+  --sl-color-black: #070b10;
+
+  --sl-color-text: var(--sl-color-gray-2);
+  --sl-color-text-accent: var(--sl-color-accent-high);
+  --sl-color-text-invert: var(--sl-color-accent-low);
+  --sl-color-bg: var(--sl-color-black);
+  --sl-color-bg-nav: #090e14;
+  --sl-color-bg-sidebar: var(--sl-color-gray-6);
+  --sl-color-bg-inline-code: #0b1218;
+  --sl-color-bg-accent: var(--sl-color-accent-high);
+  --sl-color-hairline-light: #273640;
+  --sl-color-hairline: #23303b;
+  --sl-color-hairline-shade: var(--sl-color-black);
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #d7f4ef;
+  --sl-color-accent: #087e74;
+  --sl-color-accent-high: #064d47;
+  --sl-color-white: #101b24;
+  --sl-color-gray-1: #1e2d38;
+  --sl-color-gray-2: #344652;
+  --sl-color-gray-3: #526570;
+  --sl-color-gray-4: #7b8b94;
+  --sl-color-gray-5: #b9c3c9;
+  --sl-color-gray-6: #e5eaed;
+  --sl-color-gray-7: #f2f5f6;
+  --sl-color-black: #fbfcfc;
+
+  --sl-color-text: var(--sl-color-gray-2);
+  --sl-color-text-accent: var(--sl-color-accent);
+  --sl-color-text-invert: var(--sl-color-black);
+  --sl-color-bg: var(--sl-color-black);
+  --sl-color-bg-nav: #f7f9f9;
+  --sl-color-bg-sidebar: var(--sl-color-black);
+  --sl-color-bg-inline-code: #edf2f2;
+  --sl-color-bg-accent: var(--sl-color-accent);
+  --sl-color-hairline-light: #dce3e5;
+  --sl-color-hairline: #e5eaec;
+  --sl-color-hairline-shade: #d5dde0;
+}
+
+header.header {
+  border-bottom: 1px solid var(--sl-color-hairline-light);
+  background: var(--sl-color-bg-nav);
+  backdrop-filter: blur(14px);
+}
+
+.site-title {
+  font-family: var(--sl-font-mono);
+  letter-spacing: 0.06em;
+}
+
+.content-panel {
+  border-top-color: var(--sl-color-hairline-light);
+}
+
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--sl-color-accent);
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+  border: 1px solid var(--sl-color-hairline-light);
+  background: var(--sl-color-bg-inline-code);
+}
+
+.sidebar-pane {
+  border-inline-end-color: var(--sl-color-hairline-light);
+}

@@ -1,0 +1,8 @@
+---
+import type { Locale } from '../lib/i18n';
+import { localizedPath } from '../lib/i18n';
+import { t } from '../lib/copy';
+interface Props { locale: Locale; }
+const { locale } = Astro.props;
+---
+<footer class="site-footer"><div><strong>TENET</strong><p>{t(locale).footer}</p></div><div class="footer-links"><a href={localizedPath(locale, '/releases/')}>{locale === 'en' ? 'Release notes' : '版本说明'}</a><a href={localizedPath(locale, '/third-party-notices/')}>{locale === 'en' ? 'Third-party software' : '第三方软件'}</a><a href={localizedPath(locale, '/privacy/')}>{locale === 'en' ? 'Privacy' : '隐私'}</a><a href={localizedPath(locale, '/terms/')}>{locale === 'en' ? 'Terms' : '条款'}</a></div></footer>

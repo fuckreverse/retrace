@@ -1,0 +1,224 @@
+---
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import TraceInstrument from '../../components/TraceInstrument.astro';
+import { isLocale, localizedPath } from '../../lib/i18n';
+import { t } from '../../lib/copy';
+
+export function getStaticPaths() {
+  return [{ params: { locale: 'en' } }, { params: { locale: 'zh-CN' } }];
+}
+
+const { locale } = Astro.params;
+if (!isLocale(locale)) return Astro.redirect('/en/');
+const c = t(locale);
+const en = locale === 'en';
+---
+<SiteLayout locale={locale} title={`Tenet — ${c.home.title} ${c.home.accent}`} description={c.home.intro}>
+  <section class="section hero">
+    <div>
+      <div class="eyebrow">{c.home.eyebrow}</div>
+      <h1>{c.home.title}<span>{c.home.accent}</span></h1>
+      <p class="lead">{c.home.intro}</p>
+      <div class="hero-proof" aria-label={en ? 'Core product properties' : '核心产品属性'}>
+        <span>{en ? 'Random-access state' : '随机访问状态'}</span>
+        <span>{en ? 'Persistent trace index' : '持久化 Trace 索引'}</span>
+        <span>{en ? 'Composable analysis passes' : '可组合分析 Pass'}</span>
+      </div>
+      <div class="actions">
+        <a class="button primary" href={localizedPath(locale, '/docs/getting-started/')}>{c.home.start} →</a>
+        <a class="button" href={localizedPath(locale, '/download/')}>{c.home.download}</a>
+      </div>
+    </div>
+    <TraceInstrument />
+  </section>
+
+  <section id="product" class="workflow-section">
+    <div class="section">
+      <div class="section-heading">
+        <div>
+          <div class="eyebrow">TRACE INDEXING / STATE RECONSTRUCTION</div>
+          <h2>{en ? 'A trace records transitions, not queryable state' : 'Trace 记录状态变化，但不能直接查询状态'}</h2>
+        </div>
+        <p>{en
+          ? 'Text search locates individual records. Register state, overlapping memory writes, executed control flow, and value provenance require reconstruction across the instruction timeline.'
+          : '文本搜索可以定位单条记录。寄存器状态、重叠内存写入、实际控制流和值来源都需要沿指令时间线重建。'}</p>
+      </div>
+
+      <div class="comparison-grid">
+        <article class="comparison-card limitation">
+          <span class="index">01 / RECORD SEARCH</span>
+          <h3>{en ? 'Exact-match record lookup' : '精确匹配记录查询'}</h3>
+          <p>{en
+            ? 'grep can locate a PC, opcode, address, or string. It does not reconstruct the complete register file at an instruction or resolve writes by address range and time.'
+            : 'grep 可以定位 PC、指令、地址或字符串，但不会重建某条指令处的完整寄存器状态，也不能按地址范围和时间解析内存写入。'}</p>
+        </article>
+        <article class="comparison-card limitation">
+          <span class="index">02 / SEQUENTIAL REPLAY</span>
+          <h3>{en ? 'Repeated scans do not scale' : '重复顺序扫描无法扩展'}</h3>
+          <p>{en
+            ? 'Replaying from the beginning for every query makes random navigation expensive. Running each analysis as a separate full scan multiplies IO and decoding cost.'
+            : '每次查询都从头回放会使随机导航成本过高；每项分析各自执行全量扫描，还会成倍增加 IO 和解码开销。'}</p>
+        </article>
+        <article class="comparison-card answer">
+          <span class="index">03 / INDEXED TRACE</span>
+          <h3>{en ? 'Persistent indexes and point-in-time queries' : '持久索引与指定时间点查询'}</h3>
+          <p>{en
+            ? 'Tenet indexes instruction offsets, anchors, register writes, memory history, and code. The same data model supports interactive navigation and deterministic analysis passes.'
+            : 'Tenet 为指令偏移、ANCHOR、寄存器写入、内存历史和代码建立索引。同一数据模型同时支持交互式导航和确定性分析 Pass。'}</p>
+        </article>
+      </div>
+
+      <div class="evidence-statement">
+        <div class="eyebrow">QUERY MODEL / 查询模型</div>
+        <p>{en
+          ? 'Queries return instruction IDs, runtime PCs, register values, time-specific memory contents, write history, and call context. Analysis results retain references to the records that produced them.'
+          : '查询结果包括指令 ID、运行时 PC、寄存器值、指定时间点的内存内容、写入历史和调用上下文。分析结果保留到原始记录的引用。'}</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section product-section">
+    <div class="section-heading">
+      <div>
+        <div class="eyebrow">ANALYSIS CAPABILITIES</div>
+        <h2>{en ? 'Instruction, state, control-flow, and data-flow analysis' : '指令、状态、控制流与数据流分析'}</h2>
+      </div>
+      <p>{en
+        ? 'Analysis passes share the indexed trace, reconstructed state, and common scan infrastructure.'
+        : '各分析 Pass 共用 Trace 索引、重建状态和统一扫描基础设施。'}</p>
+    </div>
+    <div class="feature-grid product-grid">
+      <article class="feature"><span class="feature-code">STATE</span><h3>{en ? 'Point-in-time state reconstruction' : '指定指令点状态重建'}</h3><p>{en ? 'Reconstruct the register file and time-specific memory contents from ANCHOR records, diffs, reads, and writes.' : '通过 ANCHOR、寄存器差值和内存读写，重建指定指令点的寄存器文件与内存内容。'}</p></article>
+      <article class="feature"><span class="feature-code">CONTROL FLOW</span><h3>{en ? 'Executed control-flow recovery' : '实际执行控制流恢复'}</h3><p>{en ? 'Recover functions, XRefs, CFGs, calls, returns, loops, and observed execution counts.' : '恢复函数、XRef、CFG、调用、返回、循环及实际执行次数。'}</p></article>
+      <article class="feature"><span class="feature-code">PROVENANCE</span><h3>{en ? 'Register and memory provenance' : '寄存器与内存来源分析'}</h3><p>{en ? 'Find register definitions, memory write history, forward propagation, backward dependencies, and critical paths.' : '查询寄存器定义、内存写入历史、前向传播、反向依赖和关键路径。'}</p></article>
+      <article class="feature"><span class="feature-code">ALGORITHMS</span><h3>{en ? 'Algorithm and pattern analysis' : '算法与模式分析'}</h3><p>{en ? 'Analyze constants, instruction patterns, loop behavior, call graphs, and data-flow structure.' : '分析常量、指令模式、循环行为、调用图和数据流结构。'}</p></article>
+      <article class="feature"><span class="feature-code">PLATFORM</span><h3>{en ? 'Platform API correlation' : '平台 API 关联分析'}</h3><p>{en ? 'Correlate ObjC messages, C APIs, JNI calls, syscalls, and cryptographic operations with traced instructions.' : '将 ObjC 消息、C API、JNI 调用、系统调用和密码学操作关联到 Trace 指令。'}</p></article>
+      <article class="feature"><span class="feature-code">RESULTS</span><h3>{en ? 'Trace-backed analysis results' : '可回溯到 Trace 的分析结果'}</h3><p>{en ? 'Pass outputs include inst_id, runtime PC, memory access, call-site, and source annotations where applicable.' : 'Pass 输出按需包含 inst_id、运行时 PC、内存访问、调用点和来源标注。'}</p></article>
+    </div>
+  </section>
+
+  <section class="performance-section">
+    <div class="section">
+      <div class="section-heading">
+        <div>
+          <div class="eyebrow">PERFORMANCE / BILLION-INSTRUCTION TRACES</div>
+          <h2>{en ? 'Storage, indexing, and memory behavior at trace scale' : '大规模 Trace 的存储、索引与内存管理'}</h2>
+        </div>
+        <p>{en
+          ? 'Tenet supports traces containing up to billions of executed instructions without loading the complete trace into memory. Persistent indexes move repeated analysis cost out of subsequent sessions.'
+          : 'Tenet 支持十亿级指令 Trace，打开文件时无需将完整 Trace 载入内存。持久索引使后续会话不必重复承担索引构建成本。'}</p>
+      </div>
+
+      <div class="performance-banner">
+        <div><strong>1B</strong><span>{en ? 'BILLION-INSTRUCTION TRACE support' : '十亿级指令 Trace 支持'}</span></div>
+        <div><strong>MMAP</strong><span>{en ? 'memory-mapped trace access without loading the full file' : '内存映射访问，无需全量载入 Trace'}</span></div>
+        <div><strong>FUSED</strong><span>{en ? 'one traversal feeds multiple collectors' : '一次遍历服务多个 Collector'}</span></div>
+        <div><strong>CACHED</strong><span>{en ? 'persistent indexes and pass results' : '持久索引与 Pass 结果缓存'}</span></div>
+      </div>
+
+      <div class="performance-grid">
+        <article class="performance-card">
+          <span class="feature-code">IO / STORAGE</span>
+          <h3>{en ? 'Memory-mapped IO and Block compression' : '内存映射 IO 与分块压缩'}</h3>
+          <p>{en
+            ? 'TraceReader uses mmap for zero-copy access. Indexed zstd blocks keep rich register, memory, and code evidence compact while preserving random block reads.'
+            : 'TraceReader 使用 mmap 零拷贝访问；带索引的 zstd 分块压缩保存完整寄存器、内存和代码证据，同时支持随机读取数据块。'}</p>
+        </article>
+        <article class="performance-card">
+          <span class="feature-code">INDEX / REOPEN</span>
+          <h3>{en ? 'Persistent RocksDB index' : 'RocksDB 持久索引'}</h3>
+          <p>{en
+            ? 'RocksDB separates offsets, anchors, register writes, memory history, and code into dedicated column families. First-open work becomes a durable index; later sessions avoid rebuilding it.'
+            : 'RocksDB 将 offset、ANCHOR、寄存器写入、内存历史与代码分列管理。首次打开的成本沉淀为持久索引，后续会话无需重新构建。'}</p>
+        </article>
+        <article class="performance-card">
+          <span class="feature-code">MEMORY / LATENCY</span>
+          <h3>{en ? 'Adaptive register checkpoints' : '自适应寄存器 checkpoint'}</h3>
+          <p>{en
+            ? 'ANCHOR + diff avoids full snapshots per instruction. Adaptive checkpoints target a practical memory budget while keeping random state queries to a short replay window.'
+            : 'ANCHOR + diff 避免每条指令保存完整快照；自适应 checkpoint 以合理内存预算换取很短的随机状态回放窗口。'}</p>
+        </article>
+        <article class="performance-card">
+          <span class="feature-code">SCAN / CPU</span>
+          <h3>Scan Fusion</h3>
+          <p>{en
+            ? 'Compatible collectors share one sequential trace traversal instead of making every pass rescan billions of records. TBB schedules independent pass dependencies in parallel.'
+            : '兼容 Collector 共享一次顺序 Trace 遍历，避免每个 Pass 重扫数十亿条记录；TBB 并行调度相互独立的 Pass 依赖。'}</p>
+        </article>
+        <article class="performance-card">
+          <span class="feature-code">CACHE / REPEAT</span>
+          <h3>{en ? 'Compact pass-result cache' : '紧凑 Pass 结果缓存'}</h3>
+          <p>{en
+            ? 'Full-scan analyses serialize compact binary results into RocksDB. Repeated GUI, CLI, RPC, or MCP queries can reuse prior work instead of recomputing it.'
+            : '全量扫描分析将紧凑二进制结果写入 RocksDB；GUI、CLI、RPC 与 MCP 的重复查询可以复用已有工作，而不是重新计算。'}</p>
+        </article>
+        <article class="performance-card">
+          <span class="feature-code">SEMANTICS / ON DEMAND</span>
+          <h3>{en ? 'On-demand semantic analysis' : '按需语义分析'}</h3>
+          <p>{en
+            ? 'Fast native indexes handle navigation and structure globally; expensive semantic engines such as Triton are applied to focused ranges where precision justifies the cost.'
+            : '全局导航与结构恢复使用高速原生索引；Triton 等高成本语义引擎只在确有价值的局部范围按需启用。'}</p>
+        </article>
+      </div>
+      <p class="performance-note">{en
+          ? 'Processing time, index size, and peak memory depend on record density, enabled fields, compression ratio, selected passes, and hardware. Tenet does not require the complete trace to reside in RAM.'
+        : '处理时间、索引大小与峰值内存取决于记录密度、启用字段、压缩率、所选 Pass 和硬件。Tenet 不要求完整 Trace 常驻内存。'}</p>
+    </div>
+  </section>
+
+  <section id="workflow" class="workflow-section">
+    <div class="section">
+      <div class="section-heading">
+        <div>
+          <div class="eyebrow">WORKFLOW / CAPTURE → INDEX → ANALYZE → EXPORT</div>
+          <h2>{en ? 'Capture once, reuse the indexed trace' : '一次录制，重复使用 Trace 索引'}</h2>
+        </div>
+        <p>{en
+          ? 'The local index is shared by interactive interfaces, batch commands, and service APIs. Pass results can be cached in the same database.'
+          : '本地索引由交互界面、批处理命令和服务 API 共用，Pass 结果也可以缓存在同一数据库中。'}</p>
+      </div>
+      <div class="flow flow-four">
+        <article class="card"><span class="index">01 / CAPTURE</span><h3>{en ? 'Record instruction execution' : '录制指令执行记录'}</h3><p>{en ? 'Use the official QBDITrace on iOS or Android, or produce the same binary contract with a compatible collector such as Frida Stalker.' : '在 iOS 或 Android 上使用官方 QBDITrace，或用 Frida Stalker 等兼容采集器生成相同二进制契约。'}</p></article>
+        <div class="flow-arrow">→</div>
+        <article class="card"><span class="index">02 / INDEX</span><h3>{en ? 'Reconstruct execution' : '重建执行过程'}</h3><p>{en ? 'Build persistent indexes for instruction offsets, anchors, register writes, memory history, code, functions, and XRefs.' : '为指令偏移、ANCHOR、寄存器写入、内存历史、代码、函数与 XRef 建立持久索引。'}</p></article>
+        <div class="flow-arrow">→</div>
+        <article class="card"><span class="index">03 / ANALYZE</span><h3>{en ? 'Run analysis passes' : '运行分析 Pass'}</h3><p>{en ? 'Run deterministic passes for CFG, taint, memory search, algorithm recognition, platform APIs, Trace Diff, and VM analysis.' : '运行确定性 Pass，完成 CFG、污点、内存搜索、算法识别、平台 API、Trace Diff 与 VM 分析。'}</p></article>
+        <div class="flow-arrow">→</div>
+        <article class="card"><span class="index">04 / EXPORT</span><h3>{en ? 'Inspect or export results' : '查看或导出结果'}</h3><p>{en ? 'Use the GUI or TUI interactively, export reports from the CLI, or retrieve structured results through RPC and MCP.' : '通过 GUI 或 TUI 交互查看，通过 CLI 导出报告，或使用 RPC 和 MCP 获取结构化结果。'}</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="use-cases" class="section use-cases-section">
+    <div class="section-heading">
+      <div>
+        <div class="eyebrow">ANALYSIS TASKS</div>
+        <h2>{en ? 'Common trace-analysis workloads' : '常见 Trace 分析任务'}</h2>
+      </div>
+      <p>{en
+        ? 'These analyses operate on recorded instruction order, reconstructed state, memory history, and observed control flow.'
+        : '这些分析使用已录制的指令顺序、重建状态、内存历史和实际控制流。'}</p>
+    </div>
+    <div class="use-case-grid">
+      <article class="use-case"><span>01</span><div><h3>{en ? 'Signature and encryption routines' : '签名与加密流程分析'}</h3><p>{en ? 'Identify constants, round loops, ARX/SPN/Feistel semantics, and the call context surrounding a signature or encryption routine.' : '识别签名或加密流程中的常量、轮循环、ARX/SPN/Feistel 语义及调用上下文。'}</p></div></article>
+      <article class="use-case"><span>02</span><div><h3>{en ? 'Source-to-sink tracing' : 'Source-to-sink 追踪'}</h3><p>{en ? 'Follow an input through register and memory transformations to an API call, buffer, branch, or return value.' : '沿寄存器与内存变换追踪输入，直到 API 调用、buffer、分支或返回值。'}</p></div></article>
+      <article class="use-case"><span>03</span><div><h3>{en ? 'Backward provenance' : '反向来源分析'}</h3><p>{en ? 'Start from a suspicious output and recover the contributing instructions, last writers, constants, calls, and source annotations.' : '从可疑输出出发，恢复贡献指令、最后写入者、常量、调用及来源标注。'}</p></div></article>
+      <article class="use-case"><span>04</span><div><h3>{en ? 'Platform boundary correlation' : '平台边界关联'}</h3><p>{en ? 'Connect ObjC messages, JNI or C API intercepts, syscalls, and crypto operations back to low-level execution.' : '将 ObjC 消息、JNI/C API 拦截、系统调用和密码学操作关联回底层执行。'}</p></div></article>
+      <article class="use-case"><span>05</span><div><h3>{en ? 'VM protection analysis' : 'VM 保护分析'}</h3><p>{en ? 'Use static hints plus dynamic CFG, loop, taint, and data-flow evidence to study dispatchers, handlers, and virtual state.' : '结合静态 hints 与动态 CFG、循环、污点和数据流证据，研究 dispatcher、handler 与虚拟状态。'}</p></div></article>
+      <article class="use-case"><span>06</span><div><h3>{en ? 'Trace comparison' : 'Trace 对比'}</h3><p>{en ? 'Compare inputs, environments, or patched builds; locate the first control-flow, register, or memory divergence.' : '比较不同输入、环境或补丁版本，定位控制流、寄存器或内存的首次分歧。'}</p></div></article>
+      <article class="use-case wide"><span>07</span><div><h3>{en ? 'Analysis interfaces' : '分析接口'}</h3><p>{en ? 'GUI / TUI provide interactive navigation. CLI / RPC support batch processing and integration. MCP / WebSocket expose indexed trace data and pass results to automation tools, including LLM clients.' : 'GUI / TUI 提供交互式导航；CLI / RPC 用于批处理和系统集成；MCP / WebSocket 向自动化工具（包括 LLM 客户端）提供 Trace 索引数据和 Pass 结果。'}</p></div></article>
+    </div>
+  </section>
+
+  <section class="section final-cta">
+    <div class="eyebrow">GET STARTED</div>
+    <h2>{en ? 'Open a trace and begin analysis' : '打开一个 Trace，开始分析'}</h2>
+    <p class="lead">{en
+      ? 'Follow the quick start to record a trace, build its local index, and inspect the first instruction range.'
+      : '按照快速开始录制 Trace、构建本地索引，并查看第一个指令区间。'}</p>
+    <div class="actions">
+      <a class="button primary" href={localizedPath(locale, '/docs/getting-started/')}>{c.home.start} →</a>
+      <a class="button" href={localizedPath(locale, '/docs/automate/mcp/')}>{en ? 'Explore MCP automation' : '了解 MCP 自动化'}</a>
+    </div>
+  </section>
+</SiteLayout>
