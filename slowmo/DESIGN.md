@@ -50,7 +50,8 @@ tenet 的所有高层能力都建立在 trace 之上：
 ```mermaid
 flowchart LR
     IO[IO\ntrace + index] --> CORE[Core\nstate reconstruction]
-    CORE --> ANA[Analysis\npass pipeline]
+    CORE --> INFRA[Infra\nscan / page / string / checkpoint services]
+    INFRA --> ANA[Analysis\npass pipeline]
     ANA --> UI[UI / Service\nGUI CLI RPC MCP]
 ```
 
@@ -58,6 +59,7 @@ flowchart LR
 
 - IO 层只关心“如何快速读和定位记录”。
 - Core 层只关心“如何重建某时刻状态”。
+- Infra 层提供多个 pass 共用的扫描、页统计、字符串解析和 checkpoint 服务。
 - Analysis 层只关心“如何把状态组织成复用结果”。
 - UI / Service 层只关心“如何把结果暴露给人或程序”。
 
@@ -84,14 +86,14 @@ flowchart LR
 
 - 周期性 `ANCHOR` 存全量寄存器
 - 普通 `INST` 只存变化寄存器 diff
-- `RegisterFile` 查询时从最近 anchor 回放 diff
+- tenet 初始化时从 ANCHOR + diff 建立稠密 checkpoint 数组
+- `RegisterFile` 查询时从最近 checkpoint 最多回放 K-1 条 diff
 
-这是一种典型的“空间换时间折中”：
+这是磁盘空间和查询内存的两级折中：
 
-- anchor 更密：查询更快，trace 更大
-- anchor 更稀：查询更慢，trace 更小
-
-当前系统把这条边界固定在“足够快地重建，又不至于膨胀过头”的区间。
+- ANCHOR 更密：trace 更大，顺序恢复基线更近
+- checkpoint 更密：内存更多，随机查询回放更短
+- checkpoint 间隔由 tenet 按约 80 MiB 目标自适应估算（不是严格上限），不改变 trace 文件
 
 ### 5. 选择 Pass Pipeline，而不是硬编码调用链
 

@@ -12,14 +12,28 @@ Analysis 层把 IO / Core 提供的底层能力组织成可组合的分析 pass�
 | 对象 | 文件 | 职责 |
 |------|------|------|
 | `AnalysisPass` | `pass_manager.h` | 每个分析能力的统一抽象；`declare_scan()` 声明式注册扫描需求 |
-| `PassContext` | `pass_manager.h` | 向 pass 暴露 reader / index / regfile / memory / decoder / range / progress |
+| `PassContext` | `pass_manager.h` | 向 pass 暴露 IO/Core、4 个 Infra 服务、range、progress 与依赖结果 |
 | `PassResult` | `pass_manager.h` | 类型擦除结果容器，承载成功 / 失败 / 跳过状态 |
 | `PassManager` | `pass_manager.{h,cpp}` | 注册、依赖解析、执行、缓存、并发调度 |
 | `TraceCollector` | `trace_collector.h` | 扫描型 pass 的回调接口 |
 | `TraceScanEngine` | `trace_collector.{h,cpp}` | 单遍广播、并行分片、collector 融合扫描 |
 | `ScanOrchestrator` | `infra/scan_orchestrator.{h,cpp}` | 声明式扫描编排：收集 declare_scan 声明 → 单次 trace 遍历服务所有 collector |
+| `PageStats` | `infra/page_stats.{h,cpp}` | lazy 缓存活跃页、读写次数、熵与字符串候选页 |
+| `StringResolver` | `infra/string_resolver.{h,cpp}` | lazy、时间感知的跨 pass 字符串解析与正/负缓存 |
+| `CheckpointManager` | `infra/checkpoint_manager.{h,cpp}` | eager、幂等地构建寄存器 checkpoints，并统一创建 cursor |
 | `ScanDeclaration` | `infra/scan_orchestrator.h` | 扫描声明：pass 名 + collector 指针 + 是否并行 |
 | `pass_catalog()` | `pass_registry.cpp` | pass 名单、分类、默认 UI 集合、工厂入口 |
+
+## Infra 服务生命周期
+
+`PassManager::init_infra()` 必须在设置 reader / index / code table / regfile / memory / decoder 之后、运行任何 pass 之前调用。它拥有并初始化 4 个跨 pass 服务：
+
+- `ScanOrchestrator`：收集扫描声明，仅在一次分析执行期间持有 collector 引用。
+- `PageStats`：首次访问时从 `MemoryModel::active_pages()` 建页级统计。
+- `StringResolver`：首次访问时借助 `PageStats` 筛选候选页，并缓存成功和失败的地址解析。
+- `CheckpointManager`：初始化时立即调用 `RegisterFile::build_checkpoints()`；之后 `state_before()` / `state_after()` 使用不可变 checkpoint 数组。
+
+pass 通过 `PassContext::scan_orchestrator()`、`page_stats()`、`string_resolver()`、`checkpoint_manager()` 获取服务，不应各自重复构建同类缓存。
 
 ## 分析层的工作方式
 
@@ -288,9 +302,9 @@ Collector 可按记录类型覆写回调：
 
 **作用**：**完全由静态分析 hint 驱动**（来自 IDA/Ghidra）。给定 anchor 位置（单 PC / PC 集 / 内存写地址）后，在每个 anchor 命中点快照 VM 上下文（regs/mem），派生 handler 执行次数、解码 opcode（含 ror/bswap/neg/not_ 去混淆）、读取 VM context 和 VM 寄存器文件。依赖 `xref` + `cfg` + `loop`。
 
-> ⚠️ 无 hint 时拒绝注册——pass 不做任何启发式扫描/推断。需通过 `--vm-abstract <hints.json>` 提供 hint 文件。
+> ⚠️ 无 hint 时拒绝注册——pass 不做任何启发式扫描/推断。用 `--vm-hints <file.json>` 提供完整 hints，或组合使用 `--vm-dispatcher`、`--vm-indirect-br`、可重复的 `--vm-handler`。`--vm-abstract` 本身不接文件参数。
 
-**CLI**：`--vm-abstract <hints.json> --vm-hints-slide <slide>`
+**CLI**：`--vm-abstract --vm-hints <file.json>`；或 `--vm-abstract --vm-dispatcher <pc> --vm-indirect-br <pc> --vm-handler <pc>`
 **MCP**：`vm_abstract`
 **GUI 面板**：`"VM Abstract"` / `"VM Workspace"`（`panels_vm_abstract.cpp`）
 - 独立悬浮工作区，三栏布局：
@@ -455,7 +469,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：对指定内存区域做 Shannon 熵分析，判断是明文（<3.5）、压缩数据（3.5-6.5）、加密数据/密钥材料（>6.5）。
 
-**CLI**：`--entropy <addr> <size> [--entropy-inst <inst_id>]`
+**CLI**：当前 parser 兼容性形式为 `--entropy <sample_inst_id> <reserved>`：仅第一个值接到 `at_inst_id`，第二个值尚未参与执行，地址/大小仍使用 pass 默认值。需要精确指定内存区域时应使用 GUI 或 MCP `entropy_analysis`；不要把这两个 CLI 参数理解为指令区间。
 **MCP**：`entropy_analysis`
 **GUI 面板**：`"Entropy"`（`panels_entropy.cpp`）
 - 总体熵值 + 分类（Plaintext/Compressed/Encrypted/KeyMaterial，颜色编码）。
@@ -471,7 +485,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：在内存页上运行 YARA 规则，检测 crypto 常量、反调试字符串、网络/证书/打包载荷签名等。需系统安装 yara。
 
-**CLI**：`--yara-mem-scan [--yara-rules-dir <path>]`
+**CLI**：`--yara-mem-scan [--yara-rules <file_or_dir>] [--yara-min-entropy <n>] [--yara-scan-code]`；`--yara-rules` 可重复
 **MCP**：无独立工具（通过 `pattern_scan` 覆盖部分功能）
 **GUI 面板**：`"YARA Memory Scan"`（`panels_yara_mem_scan.cpp`）
 - 参数表单：YARA rules 目录路径输入框。
@@ -516,7 +530,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：折叠重复循环迭代，保留首尾代表性样本 + GPR/FPR 变化模式（单调/振荡/常量），自动去除嵌套循环重叠。大幅减少浏览时的指令数。依赖 `loop` + `xref`。
 
-**CLI**：`--trace-fold`
+**CLI**：当前 parser 要求 `--trace-fold <reserved_start> <reserved_end>`，但两个范围值尚未接入执行，实际仍处理完整 trace；可配且会生效的参数为 `--trace-fold-min-iter` / `--trace-fold-keep-iter` / `--trace-fold-samples` / `--trace-fold-no-fpr`。
 **MCP**：无独立工具
 **GUI 面板**：`"Trace Fold"`（`panels_trace_fold.cpp`）
 - 顶部摘要：原始指令数 → 折叠后指令数（压缩比 ×N）+ 折叠区域数。
@@ -559,7 +573,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：对 trace 做滑动窗口统计，每个窗口计算指令数、助记符多样性熵、分支比例、内存读写次数等。用于发现热点区域。
 
-**CLI**：`--window-stats [--window-stats-size <n>]`
+**CLI**：当前 parser 要求 `--window-stats <reserved_start> <reserved_end> [--window-stats-size <n>]`，但两个范围值尚未接入执行，实际仍统计完整 trace；只有 `--window-stats-size` 生效。
 **MCP**：`window_stats`
 **GUI 面板**：`"Window Stats"`（`panels_window_stats.cpp`）
 - 统计表：序号 / Range（inst 起止）/ Insts / Entropy（助记符多样性熵，≥3.5 高亮）/ Branch% / Mem R/W（读写次数 + 唯一地址数）/ Top Mnemonic（悬停显示 Top-N 列表）。
@@ -573,7 +587,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：对比同一 trace 中的两个区间（或两个不同 trace 文件），找出执行分叉点。适用于差分分析——用不同输入运行同一算法，找到路径分叉处。支持 resync window 自动重同步。
 
-**CLI**：`--trace-diff <a_start> <a_end> <b_start> <b_end> [--trace-diff-b <trace_b.bin>]`
+**CLI**：`--trace-diff <a_start> <a_end> <b_start> <b_end> [--trace-diff-file <trace_b.bin>]`，可配 `--trace-diff-window` / `--trace-diff-max-diffs`
 **MCP**：`trace_diff`
 **GUI 面板**：`"Trace Diff"`（`panels_trace_diff.cpp`）
 - 参数表单：Region A 起止 inst_id、Region B 起止 inst_id（或 Trace B 文件路径）、Resync Window 大小。
@@ -616,7 +630,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：构建每线程 inst bitmap，用于按线程过滤指令。依赖 `thread`。
 
-**CLI**：`--thread-filter <tid>`
+**CLI**：`--thread-filter [tid1,tid2,...]`；省略列表时仍构建全部线程 bitmap
 **MCP**：无独立工具
 **GUI**：通过线程面板的交互触发。
 **TUI**：Results 面板中 `thread_filter` 条目显示过滤摘要。
@@ -651,6 +665,8 @@ flowchart LR
     xref --> taint
     loop --> trace_fold
     xref --> trace_fold
+    function --> call_context
+    loop --> call_context
     loop --> loop_semantics
     xref --> loop_semantics
     backward_taint --> taint_source_annotation

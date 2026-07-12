@@ -12,7 +12,7 @@
 | RPC | `src/io/rpc_server.cpp` | `--rpc [path]` | 本地工具经 Unix socket 接入 |
 | MCP stdio | `src/io/mcp/` | `--mcp` | AI 客户端通过子进程 stdio 接入 |
 | MCP HTTP | `src/io/mcp/` | `--mcp-http [host:port]` | 远程 / GUI 宿主 / 无 stdio 场景 |
-| MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | 多实例统一入口，自动 failover |
+| MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | 多实例统一入口；Worker 断线自动重连 |
 | WS | `src/ws/` | `--ws-port <port>` | 高性能二进制 WebSocket，面向 Web/Electron 前端 |
 | Streaming | `src/io/streaming_index.*` | `--streaming` | 边录制边索引边分析 |
 
@@ -29,7 +29,7 @@ flowchart TD
     G -- --mcp --> I[TenetMcpService stdio]
     G -- --mcp-http --> J[TenetMcpService HTTP]
     G -- --mcp-hub --> M{Hub election}
-    M -- win --> N[Hub: listen on 10444]
+    M -- win --> N[Hub: listen on configured port\ndefault 10444]
     M -- lose --> O[Worker: reverse-connect to Hub]
     C --> K{--streaming?}
     K -- yes --> L[StreamingIndex]
@@ -204,10 +204,10 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
 - 传输模式：
   - stdio（`--mcp`）
   - Streamable HTTP（`--mcp-http`）
-  - Hub 模式（`--mcp-hub`）：多实例统一入口，固定端口 10444，自动 failover
-- 工具总数：**51 个**（`mcp_tools_core.cpp` 12 + `mcp_tools_ai.cpp` 9 + `mcp_tools_analysis.cpp` 25 + `mcp_server.cpp` 里直接注册的 `set_image_base` 1 + Hub 模式注册的 `list_instances` 1 + session 模式注册的 `select_instance` 1）
+  - Hub 模式（`--mcp-hub [host:port]`）：多实例统一入口，默认端口 10444；Worker 断线后自动重连
+- 工具数量是动态的：基础服务由 `register_all_tools()` 注册；VM query 工具已拆到 `mcp_tools_vm.cpp`；Hub/session 模式还会追加协调工具。不要在文档中依赖固定总数，启动日志会打印当前实例的准确值。
 - 注册入口：`register_all_tools()`，Hub 模式额外注册 `list_instances` / `select_instance`
-- 工具分成 10 组（Hub 模式额外 1-2 个）：
+- 基础工具分成 11 组（Hub 模式额外 1-2 个）：
   - `register_trace_tools()`
   - `register_query_tools()`
   - `register_taint_tools()`
@@ -215,6 +215,7 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
   - `register_analysis_tools()`
   - `register_search_tools()`
   - `register_pass_tools()`
+  - `register_vm_query_tools()`
   - `register_evidence_tools()`
   - `register_batch_tools()`
   - `register_hypothesis_tools()`
@@ -227,6 +228,7 @@ MCP 是 tenet 面向 AI 的核心服务模式，当前实现位于 `src/io/mcp/`
 | taint / graph | `taint_forward`, `taint_backward`, `critical_path`, `cfg_export`, `call_graph`, `dataflow_graph` | 数据流与图恢复 |
 | analysis | `pattern_scan`, `strings_scan`, `constants_scan`, `loop_semantics`, `algorithm_summary`, `objc_messages`, `memory_snapshot` | 高层语义分析 |
 | search / pass | `mem_search`, `reg_timeline`, `call_context`, `window_stats`, `entropy_analysis`, `functions`, `loops`, `xref`, `trace_diff`, `find_function` | 搜索、摘要、按名发现 pass（`literal_search` 已合并进 `mem_search`，`producer_chain` 已被 `backward_taint` 取代，不再作为独立 MCP 工具）|
+| VM query | `vm_steps_query`, `vm_handlers_query` 等 | 查询 VM steps、handler、寄存器、内存和控制流视图 |
 | AI tools | `verify_evidence`, `batch_query`, `hypothesis_*` | 证据校验、批量查询、假设账本 |
 
 ### MCP HTTP 模式补充
@@ -260,7 +262,7 @@ sequenceDiagram
 
 `--mcp-hub [host:port]` 启用 Hub 架构，解决多 tenet 实例端口管理问题。实现位于 `src/io/mcp/mcp_hub.h/.cpp`。
 
-**架构**：第一个启动的 tenet 实例通过 `flock` 选举成为 Hub，在固定端口（默认 10444）监听；后续实例自动成为 Worker，通过反向 TCP 连接到 Hub，不监听任何端口。MCP 客户端只需连接 Hub 的单一端口即可访问所有实例。
+**架构**：第一个启动的 tenet 实例通过 `flock` 选举成为 Hub，在配置端口（默认 10444）监听；后续实例自动成为 Worker，通过反向 TCP 连接到 Hub，不监听任何端口。MCP 客户端只需连接 Hub 的单一端口即可访问所有实例。
 
 **两种工作模式**：
 
@@ -276,7 +278,7 @@ sequenceDiagram
 
 **请求转发**：Hub 收到 `tools/call` 请求后，从参数中提取 `instance`，移除该参数后将剩余 JSON-RPC 转发给目标 Worker。Hub 自身的实例请求在本地处理。
 
-**自动 failover**：Hub 通过 `flock(LOCK_EX | LOCK_NB)` 竿选。进程崩溃时内核自动释放锁，其他实例的选举线程检测到锁可用后重新竞选，新 Hub 在秒级内恢复服务。Worker 通过心跳（10s 间隔，90s 超时）检测 Hub 存活，Hub 崩溃后 Worker 自动重连并触发选举。
+**故障行为**：Hub 通过 `flock(LOCK_EX | LOCK_NB)` 完成启动时选举，进程崩溃后内核会自动释放锁。Worker 会检测连接断开并持续重连，但当前运行主路径不会让存量 Worker 自动重新竞选并接管 Hub；需要新实例启动或外部拉起完成重新选主。因此这里只保证自动重连，不承诺无缝自动 failover。
 
 **协议复用**：Hub 监听单一端口，通过 `MSG_PEEK` 探测首字节区分连接类型——以 `WORKER/1.0\n` 开头的是 Worker 反向连接（newline-delimited JSON-RPC over TCP），否则视为 MCP 客户端的 HTTP 请求。
 

@@ -32,8 +32,8 @@
 
 - 主入口在 `src/main.cpp`：解析参数、打开 trace、构建/加载索引、初始化 Core、再分发到 GUI/TUI/CLI/服务模式。
 - `src/analysis/pass_registry.cpp` 当前注册了 **30 个 pass**，按结构、污点、密码学、内存、ObjC/系统调用、性能、线程等类别组织。
-- `src/io/mcp/` 当前注册了 **47 个 MCP 工具**，覆盖 trace 查询、分析触发、搜索、批量调用、证据验证和假设管理。
-- 常驻对象模型是：`TraceReader` + `TraceIndex` + `CodeTable` + `RegisterFile` + `MemoryModel` + `InstructionDecoder` + `PassManager`。
+- MCP 工具按 core / analysis / AI / VM 四组实现，Hub/session 模式还会动态增加协调工具；启动日志会打印当前实例的准确工具数。
+- 常驻对象模型是：IO/Core 对象 + `PassManager`；`PassManager` 拥有 ScanOrchestrator、PageStats、StringResolver、CheckpointManager 四个共享服务，并由 `init_infra()` 初始化。
 
 ## 固定构建目录
 
@@ -59,8 +59,11 @@ ninja -j$(nproc)
 | `TENET_ENABLE_GUI` | `ON` | 启用 ImGui + SDL3 + Metal GUI |
 | `TENET_BUILD_TESTS` | `ON` | 构建单元测试 |
 | `TENET_ENABLE_RPC` | `ON` | 启用 Unix socket JSON-RPC 服务 |
+| `TENET_ENABLE_WS` | `ON` | 启用 uWebSockets + FlatBuffers 服务 |
 | `TENET_ENABLE_PROFILING` | `ON` | 启用 macOS `os_signpost` 标记 |
+| `TENET_ENABLE_TBB` | `ON` | 并行排序、Pass DAG 调度与 Scan Fusion |
 | `TENET_ENABLE_PYTHON` | `OFF` | 构建 Python 绑定 |
+| `TENET_PGO_MODE` | 空 | `generate` / `use` 两阶段 PGO |
 
 ## 快速开始
 
@@ -151,7 +154,9 @@ tools/tenet/
 │   ├── cli_options.cpp
 │   ├── io/
 │   ├── core/
+│   ├── infra/               # 跨 pass 的扫描、页统计、字符串与 checkpoint 服务
 │   ├── analysis/
+│   ├── service/
 │   ├── gui/
 │   ├── tui/
 │   └── python/
@@ -162,13 +167,13 @@ tools/tenet/
 
 - `qbditrace` 负责录制 trace，`tenet` 负责离线读取和分析。
 - 两者通过 `tools/qbditrace/TraceFormat.h` 约定的二进制格式协作。
-- tenet 当前要求 trace 版本 `>= 4`，并依赖 `REG_DIFF | HAS_CODE` 标志。
+- tenet 接受 trace 版本 `>= 4`（当前完整支持到 v7）；缺少 `REG_DIFF` 的 sampling trace 仍可做 PC 流分析，缺少 `HAS_CODE` 时需 `--image` 回填，否则反汇编相关能力降级。
 - 详细格式见 [`docs/trace-format.md`](docs/trace-format.md)。
 
 ## 进一步阅读
 
 - 想按场景选择能力：看 [`docs/capabilities.md`](docs/capabilities.md)
-- 想理解四层边界：看 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- 想理解分层边界和 Infra 服务：看 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - 想扩展 pass：先看 [`docs/pass-cookbook.md`](docs/pass-cookbook.md)，再看 [`docs/analysis-layer.md`](docs/analysis-layer.md)
 - 想接 AI 或远程服务：看 [`docs/ui-layer.md`](docs/ui-layer.md)
 - 想做性能优化：看 [`docs/profiling.md`](docs/profiling.md)

@@ -13,7 +13,7 @@ Core 层把 IO 层提供的“记录与索引”提升成“某一时刻程序�
 
 | 组件 | 文件 | 作用 |
 |------|------|------|
-| `RegisterFile` | `register_file.{h,cpp}` | 通过 ANCHOR + diff 重建任意时刻寄存器状态 |
+| `RegisterFile` | `register_file.{h,cpp}` | 基于预构建的稠密 checkpoint + diff 重建任意时刻寄存器状态 |
 | `MemoryModel` | `memory_model.{h,cpp}` | 时间感知内存读取与写历史查询 |
 | `InstructionDecoder` | `instruction_decoder.{h,cpp}` | Capstone 解码与缓存 |
 | `TritonBridge` / `TritonPool` | `triton_bridge.{h,cpp}` | 精确语义、污点与可选 Triton 实例池 |
@@ -42,39 +42,36 @@ trace 里不会为每条指令保存完整寄存器快照，而是：
 - 周期性 `ANCHOR` 记录保存全量寄存器
 - 普通 `INST` 只记录改动过的寄存器 diff
 
-于是 `RegisterFile` 的查询流程是：
+正常启动时，`main.cpp` 会先执行一次 O(N) 前向扫描，建立不可变的稠密 checkpoint 数组；`PassManager::init_infra()` 中的 `CheckpointManager` 再幂等确认它已经可用。间隔 K 按约 80 MiB 的目标内存自适应估算。之后 `RegisterFile` 的查询流程是：
 
-1. 用 `TraceIndex::nearest_anchor_before(inst_id)` 找最近 anchor
-2. 从 anchor 读出完整寄存器集
-3. 从 anchor 到目标位置依次 apply diff
-4. 把结果缓存进 LRU
+1. 按 `inst_id / K` 直接定位不晚于目标的 checkpoint
+2. 复制 checkpoint 中的完整 `RegState` 与文件偏移
+3. 用 seeded `RegisterFileCursor` 最多回放 K-1 条 diff
+4. 按目标记录修正 PC，并按值返回状态
+
+checkpoint 建成后不再走 anchor 查找、LRU 或互斥锁；`state_before()` / `state_after()` 是可跨线程共享的 lock-free 查询。若调用方绕过正常装配、在 checkpoint 尚未建立时查询，会得到空 `RegState`。
 
 ### 为什么这样设计
 
 - 全量快照每条都存，trace 会非常大
 - 每次从头 replay 到当前位置，查询又会太慢
 
-所以 ANCHOR + diff 是一个平衡点：
+所以磁盘上的 ANCHOR + diff 与内存中的稠密 checkpoint 分工明确：
 
-- trace 不会膨胀到不可用
-- 任意跳转仍然能在微秒到亚毫秒级完成
+- ANCHOR + diff 控制 trace 体积，并作为顺序重建的事实源
+- checkpoint 用一次 O(N) 初始化换取后续 O(K) 随机查询
+- checkpoint 只存在于当前进程，不改变 trace 格式或持久化索引
 
 ### 关键接口
 
 | 接口 | 作用 |
 |------|------|
-| `state_before(inst_id)` | 最常用，返回执行前状态 |
+| `state_before(inst_id)` | 最常用，基于 checkpoint 返回执行前状态 |
 | `state_after(inst_id)` | 返回执行后状态 |
-| `warm_range(start,end,stride,...)` | 预热一段范围的缓存 |
-| `warm_at(inst_id)` | 预热某个热点点位 |
-| `set_cache_capacity(size_t)` | 调整 LRU 缓存容量（默认 4096 条） |
-| `cache_stats()` | 查看缓存命中情况（`CacheStats` 含 `warm_samples` 字段） |
-
-### 什么时候会受益于预热
-
-- 某个 pass 需要在一小段范围内大量取 `state_before()`
-- GUI / TUI 在附近滚动浏览
-- 需要多次采样循环多轮迭代的寄存器状态
+| `sample_gprs(inst_ids,count)` | 批量采样 x0-x30，供循环语义和 trace fold 复用 |
+| `build_checkpoints(stride,progress)` | O(N) 建立稠密 checkpoint；当前由 `main.cpp` eager 调用，`CheckpointManager` 负责幂等 ensure |
+| `has_checkpoints()` | checkpoint 是否已经可用 |
+| `cache_stats()` | 返回 `ckpt_queries` / `ckpt_fallbacks` 计数 |
 
 ## 2. MemoryModel：时间感知内存模型
 
@@ -264,7 +261,7 @@ flowchart TD
 |------|----------|----------|
 | `TraceReader` | 完全只读安全 | 可以全局共享 |
 | `TraceIndex` | RocksDB 并发安全 | 可以全局共享 |
-| `RegisterFile` | 偏向单线程缓存 | 热路径建议每个 worker 私有或串行用 |
+| `RegisterFile` | checkpoint 建成后不可变，查询 lock-free | 单实例可由 GUI、MCP/RPC 与后台 pass 并发共享 |
 | `MemoryModel` | 并发安全 | 可共享 |
 | `InstructionDecoder` | 每线程独立 Capstone handle（无 mutex）+ opcode 缓存的 `shared_mutex` | 可共享，解码本身无争用，仅缓存读写需要读写锁 |
 | `TritonBridge` | 实例独占 | 通过 `TritonPool` 借用 |
@@ -272,10 +269,11 @@ flowchart TD
 
 ## 8. 这一层最重要的设计取舍
 
-### ANCHOR 周期
+### ANCHOR 与 checkpoint 间隔
 
-- anchor 更密：查询更快，trace 更大
-- anchor 更稀：查询更慢，trace 更小
+- ANCHOR 周期由录制端决定，影响 trace 体积和顺序恢复基线
+- checkpoint 间隔由 tenet 打开 trace 时自适应估算，目标内存约 80 MiB（不是严格上限）
+- 日常随机查询成本主要受 checkpoint 间隔 K 影响，而不是每次重新从 ANCHOR 回放
 
 ### 写粒度索引，而非全量镜像
 

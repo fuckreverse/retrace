@@ -225,7 +225,7 @@ profiling
 
 ### MCP 工具分组
 
-当前实现共 **47 个工具**，分为：
+工具由 `register_all_tools()` 按组注册，VM query 位于独立的 `mcp_tools_vm.cpp`，Hub/session 模式还会增加协调工具；准确数量以启动日志为准。能力分为：
 
 - Core / trace / query / taint / graph：基础 trace 查询与图分析
 - Analysis / search / pass：高层分析与 pass 封装

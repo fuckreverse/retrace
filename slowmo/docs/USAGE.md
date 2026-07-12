@@ -39,8 +39,7 @@ brew install python3
 pip3 install frida frida-tools
 ```
 
-> **重要**：Frida Python 版本必须与目标设备上的 `frida-server` / `frida-gadget` 版本完全一致。  
-> 建议固定安装：`pip3 install frida==16.x.x`
+> **重要**：Frida Python 版本必须与目标设备上的 `frida-server` / `frida-gadget` 版本兼容，推荐客户端与服务端使用完全相同的版本。不要照抄固定的大版本号；先在两端执行版本查询，再安装对应版本。
 
 **tenet 可选依赖：**
 
@@ -114,18 +113,18 @@ adb forward tcp:27042 tcp:27042
 bash tools/qbditrace/build-qbditrace-ios.sh
 ```
 
-产物：`tools/qbditrace/build-ios/libqbditrace.dylib`
+产物：仓库根目录下的 `libqbditrace.dylib`
 
 **推送到设备并签名：**
 
 ```bash
 # 签名（无 entitlement）
-ldid -S tools/qbditrace/build-ios/libqbditrace.dylib
+ldid -S libqbditrace.dylib
 
 # 推送到越狱设备
-scp tools/qbditrace/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
+scp libqbditrace.dylib root@localhost:/var/jb/usr/lib/
 # 或通过 USB
-scp -P 2222 tools/qbditrace/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
+scp -P 2222 libqbditrace.dylib root@localhost:/var/jb/usr/lib/
 ```
 
 ---
@@ -137,12 +136,12 @@ export NDK_PATH=/path/to/android-ndk-rXXX
 bash tools/qbditrace/build-qbditrace-android.sh
 ```
 
-产物：`tools/qbditrace/build-android/libqbditrace.so`
+产物：仓库根目录下的 `libqbditrace.so`
 
 **推送到设备：**
 
 ```bash
-adb push tools/qbditrace/build-android/libqbditrace.so /data/local/tmp/
+adb push libqbditrace.so /data/local/tmp/
 adb shell chmod 644 /data/local/tmp/libqbditrace.so
 ```
 
@@ -155,14 +154,14 @@ adb shell chmod 644 /data/local/tmp/libqbditrace.so
 ```bash
 cd tools/tenet
 mkdir build && cd build
-cmake ..                  # 默认 Debug，适合开发迭代
+cmake ..                  # 默认 RelWithDebInfo，兼顾运行与增量编译速度
 ninja -j$(nproc)
 ```
 
-或构建 RelWithDebInfo 版本（速度约 Debug 的 2-3x，保留调试信息）：
+需要最快编译、可接受较慢运行时，可在同一固定目录显式切到 Debug：
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake .. -DCMAKE_BUILD_TYPE=Debug
 ninja -j$(nproc)
 ```
 
@@ -177,12 +176,17 @@ ninja -j$(nproc)          # 改单个 .cpp 通常 3-4 秒
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `CMAKE_BUILD_TYPE` | `Debug` | `Debug`/`RelWithDebInfo`/`Release` |
+| `CMAKE_BUILD_TYPE` | `RelWithDebInfo` | `Debug`/`RelWithDebInfo`/`Release`；Release 启用 ThinLTO，Apple Silicon host 还启用 `-mcpu=apple-m1` |
 | `TENET_ENABLE_TRITON` | `ON` | Triton 精确语义污点（需预装 libTriton） |
 | `TENET_ENABLE_YARA` | `ON` | YARA 模式匹配（需 `brew install yara`） |
 | `TENET_ENABLE_GUI` | `ON` | ImGui + SDL3 GUI（macOS 默认开） |
 | `TENET_BUILD_TESTS` | `ON` | 单元测试 |
-| `TENET_ENABLE_TBB` | `ON` | Intel TBB 并行加速 |
+| `TENET_ENABLE_TBB` | `ON` | Intel TBB 并行排序、DAG 调度与 Scan Fusion |
+| `TENET_ENABLE_RPC` | `ON` | Unix socket JSON-RPC 服务 |
+| `TENET_ENABLE_WS` | `ON` | uWebSockets + FlatBuffers 服务 |
+| `TENET_ENABLE_PROFILING` | `ON` | macOS `os_signpost` 插桩 |
+| `TENET_ENABLE_PYTHON` | `OFF` | pybind11 Python 绑定 |
+| `TENET_PGO_MODE` | 空 | `generate` / `use` 两阶段 PGO |
 
 不带 Triton 的快速构建：
 
@@ -281,12 +285,15 @@ python3 tools/qbditrace/qbditrace_runner.py \
 ### 3.5 录制参数调优
 
 ```bash
-# 启用 v5 PC-delta 模式（文件体积减少约 60%）
-# 在 qbditrace_runner.py 末尾或通过 Frida 脚本的 config 设置：
-# enable_pc_delta: 1
+# 启用 v5 PC-delta 模式（文件体积通常减少 40%–60%）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --entry 0xABC --pc-delta \
+    --output /var/mobile/Documents/trace.bin
 
-# 启用 v7 FPR 录制（NEON 寄存器，密码学分析时有用）
-# enable_fpr: 1
+# 启用 v7 FPR/NEON 录制（密码学分析时有用）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --entry 0xABC --fpr \
+    --output /var/mobile/Documents/trace.bin
 
 # 调整 ring buffer（默认 64 MiB，大函数可能需要更大）
 python3 tools/qbditrace/qbditrace_runner.py \
@@ -358,7 +365,7 @@ adb pull /data/local/tmp/trace.bin ./trace.bin
 ./tools/qbditrace/build/trace_decode trace.bin 2>&1 | tail -20
 ```
 
-> **注**：`trace_decode` 仅支持 v4 格式。若录制时启用了 `enable_pc_delta`（v5）或 `enable_fpr`（v7），请直接用 tenet 打开。
+> **注**：`trace_decode` 仅支持**未压缩 v4**。默认录制使用分块 zstd，因此通常应直接用 tenet；只有录制时加 `--no-compress` 且未启用 `--pc-delta`、`--sampling`、`--fpr`，才适合用 `trace_decode`。
 
 示例输出：
 
@@ -477,23 +484,21 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 ./tenet trace.bin --objc
 
 # 系统调用分析
-./tenet trace.bin --syscall
+./tenet trace.bin --syscall-intercept
 
 # 全部算法分析一次跑完
 ./tenet trace.bin --pattern --constants --loop-semantics --algorithm-summary
 
-# VMP（虚拟机保护）执行抽象
-./tenet trace.bin --vm-abstract
-
-# 带静态 hint（anchor PC + VM-PC 寄存器 + handler 地址）
-./tenet trace.bin --vm-abstract \
-    --vm-dispatcher-pc 0x100005000 \
-    --vm-indirect-br-pc 0x100005014 \
-    --vm-pc-reg 19 \
-    --vm-handler-pc 0x100006000 --vm-handler-pc 0x100007000
-
-# 用 JSON hints 文件（推荐，支持 anchor_pcs / mem_anchor_addr 等完整字段）
+# VMP（虚拟机保护）执行抽象必须提供静态 hint
 ./tenet trace.bin --vm-abstract --vm-hints vm_hints.json
+
+# 或直接给 dispatcher / indirect branch / handler PC
+./tenet trace.bin --vm-abstract \
+    --vm-dispatcher 0x100005000 \
+    --vm-indirect-br 0x100005014 \
+    --vm-handler 0x100006000 --vm-handler 0x100007000
+
+# JSON hints 文件支持 anchor_pcs / mem_anchor_addr / VM context 等完整字段，推荐优先使用
 ```
 
 **内存与字符串：**
@@ -518,8 +523,9 @@ TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
 # 基本统计（指令数、函数数、循环数等）
 ./tenet trace.bin --stats
 
-# 窗口统计（热点函数、执行频率）
-./tenet trace.bin --window-stats
+# 窗口统计：当前 parser 要求两个保留参数，但执行范围仍是完整 trace
+# 目前只有 --window-stats-size 会改变分析行为
+./tenet trace.bin --window-stats 0 0 --window-stats-size 4096
 ```
 
 **排除噪声区间（分析时过滤）：**
@@ -583,8 +589,8 @@ python3 ... --trace-mode once --output run1.bin
 # 第二次录制（不同输入）
 python3 ... --trace-mode once --output run2.bin
 
-# 用 trace_decode diff（v4 格式，自动归一化栈/堆地址）
-./trace_decode run1.bin --diff run2.bin
+# 用 trace_decode diff（仅未压缩 v4；默认录制请改用 tenet）
+./tools/qbditrace/build/trace_decode run1.bin --diff run2.bin
 
 # 或在 tenet GUI 中打开 trace diff 面板
 ./tenet run1.bin   # File → Compare Trace → run2.bin
@@ -598,7 +604,7 @@ python3 ... --trace-mode once --output run2.bin
 
 ```bash
 ./tenet --mcp trace.bin
-# AI 客户端（如 Claude Desktop）通过 stdio 调用 47 个 MCP 工具
+# AI 客户端通过 stdio 调用工具；实际工具数由构建和 Hub/session 模式决定，启动日志会打印
 ```
 
 **MCP HTTP（远程或 GUI 宿主）：**
@@ -644,9 +650,9 @@ frida-ps -U                   # USB
 
 ### tenet 首次打开很慢（60s+）
 
-这是正常现象——首次打开需要扫描整个 trace 文件建立 RocksDB 索引。索引建完后会持久化到 `.tenet-index/` 目录，后续打开同一 trace 几乎秒开。
+这是正常现象——首次打开需要扫描整个 trace 文件建立 RocksDB 索引。索引会持久化到 trace 同目录下的 `<trace_stem>.tenet/`，后续打开可直接复用。
 
-不要删除 `.tenet-index/` 目录。
+不要随意删除该 `.tenet/` 索引目录；其中还包含 pass blob 缓存与会话状态。
 
 ### trace 文件打不开（version error）
 
@@ -663,11 +669,12 @@ Error: Unsupported trace version 5, need == 4
 ### trace 太大，内存不足
 
 ```bash
-# 减少 ring buffer，录制更短的执行片段
-python3 qbditrace_runner.py --ring-bytes $((32 * 1024 * 1024)) ...
+# ring buffer 只影响内存占用和 chunk 轮转，不会截短 trace；控制体积应缩小追踪范围、
+# 使用 --sampling 侦察后添加 --exclude-range，或缩短触发执行
+python3 qbditrace_runner.py --sampling ...
 
-# 启用 PC-delta 压缩（v5 格式，体积减少 ~60%）
-# 在 qbditrace_runner.py 配置中设置 enable_pc_delta=1
+# 默认已有分块 zstd；还可启用 PC-delta（v5，通常进一步减少 40%–60%）
+python3 qbditrace_runner.py --pc-delta ...
 ```
 
 ### 录制时进程崩溃

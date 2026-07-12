@@ -6,19 +6,21 @@
 
 `tenet` 是 `qbditrace` 的离线分析端：它读取一次真实执行形成的 trace，把它重建成可查询、可导航、可导出、可服务化接入的执行历史。
 
-## 四层结构
+## 分层结构
 
 ```mermaid
 flowchart TB
     UI[Frontend Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP · WS] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
-    SVC --> ANA[Analysis Layer\nPassManager · Pass Registry · TraceScanEngine]
-    ANA --> CORE[Core Layer\nRegisterFile · MemoryModel · InstructionDecoder · TritonBridge]
+    SVC --> ANA[Analysis Layer\nPassManager · Pass Registry · Analysis Passes]
+    ANA --> INFRA[Infra Layer\nScanOrchestrator · PageStats · StringResolver · CheckpointManager]
+    INFRA --> CORE[Core Layer\nRegisterFile · MemoryModel · InstructionDecoder · TritonBridge]
     CORE --> IO[IO Layer\nTraceReader · TraceIndex · CodeTable · StreamingIndex]
 ```
 
 - **IO 层**负责把 trace 暴露成零拷贝记录流，并建立持久化索引。
 - **Core 层**负责把记录流还原成"任意时刻的程序状态"。
-- **Analysis 层**负责把状态和索引组织成可复用的分析 pass。
+- **Infra 层**提供跨 pass 共享的扫描、页统计、字符串解析和寄存器 checkpoint 服务。
+- **Analysis 层**负责把状态、索引和 Infra 服务组织成可复用的分析 pass。
 - **Service 层**管理应用状态（导航、缓存、pass 生命周期），为所有前端提供统一操作入口。
 - **Frontend 层**负责交互、导出和对外服务，不承担核心分析逻辑。
 
@@ -38,7 +40,8 @@ flowchart TD
     E -- no --> G[InstructionDecoder::init]
     F --> G
     G --> H[RegisterFile]
-    H --> I[MemoryModel]
+    H --> CKPT[RegisterFile::build_checkpoints\neager 构建稠密 checkpoints]
+    CKPT --> I[MemoryModel]
     I --> J{has_analysis_option?}
     J -- yes --> K[run_batch_analysis]
     J -- no --> L[TenetService]
@@ -57,7 +60,8 @@ flowchart TD
 | 载入或构建索引 | `TraceIndex` | 建立 offset / anchor / mem / reg / code 等 RocksDB CF |
 | 载入代码字节 | `CodeTable` | 从索引或 trace 提取 opcode，供反汇编和 CFG 使用 |
 | 可选镜像回填 | `ImageFallback` | 处理 trace 内缺失 code bytes 的 PC |
-| 初始化 Core | `InstructionDecoder`, `RegisterFile`, `MemoryModel` | 构造任意时刻寄存器、内存和指令语义 |
+| 初始化 Core | `InstructionDecoder`, `RegisterFile`, `MemoryModel` | 构造寄存器、内存和指令语义对象；`main.cpp` eager 调用 `build_checkpoints()` |
+| 初始化 Infra | `PassManager::init_infra()` | 创建 4 个共享服务；`CheckpointManager` 幂等确认 checkpoint 已建立 |
 | 构建 Service | `TenetService` | 封装导航、缓存、pass 生命周期，供交互入口共享 |
 | 分流到入口 | `run_batch_analysis`, `GuiApp`, `TuiApp` | 批处理、交互或服务化 |
 
@@ -72,10 +76,13 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | `TraceIndex` | 进程级 / 单 trace | RocksDB 并发安全 | 持久化索引与元信息 |
 | `CodeTable` | 进程级 / 单 trace | 读多写少 | 缓存 PC→opcode 映射 |
 | `InstructionDecoder` | 进程级 | 每线程独立 Capstone handle（无锁）+ opcode 缓存读写锁 | 按 opcode（非 PC）缓存反汇编结果 |
-| `RegisterFile` | 进程级或 pass 私有 | 缓存偏向单线程 | ANCHOR+diff 状态重建 |
+| `RegisterFile` | 进程级 | checkpoint 建成后 lock-free | 稠密 checkpoint + diff 状态重建 |
 | `MemoryModel` | 进程级 | 并发安全 | 时间感知内存读取与写历史 |
+| `ScanOrchestrator` | PassManager 级 | 一次执行期内编排 | 汇总 `declare_scan()` 并让多个 collector 共享单次遍历 |
+| `PageStats` / `StringResolver` | PassManager 级 | lazy 构建 | 跨 pass 共享页级统计、熵和字符串解析缓存 |
+| `CheckpointManager` | PassManager 级 | 初始化时 eager、幂等 | 确保 checkpoint 只建一次，并统一创建 cursor |
 | `TenetService` | 入口级 / 会话级 | 单线程（UI 线程调用） | 导航状态、行缓存、pass 生命周期、观察者通知 |
-| `PassManager` | 入口级 / 会话级 | 内部同步 | 调度、缓存、依赖解析 |
+| `PassManager` | 入口级 / 会话级 | 内部同步 | 调度、缓存、依赖解析，并拥有 Infra 服务 |
 
 ## Service Layer
 
@@ -116,7 +123,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 |--------|------|
 | `inst_id` 单调递增 | 所有分析共享同一条时间轴 |
 | 地址是运行时地址 | 默认含 slide；静态地址需自行减 `module_slide` |
-| 寄存器重建基于 ANCHOR | `RegisterFile` 的正确性依赖 trace 中周期性快照 |
+| 寄存器重建基于 checkpoint + diff | 初始化时从 ANCHOR/diff 构建稠密 checkpoint；之后随机查询最多回放 K-1 条 diff |
 | 内存读取是时间感知的 | `MemoryModel` 不读“最终值”，而读某时刻值 |
 | pass 结果可缓存且幂等 | 同一个 pass 在同一上下文里不会重复执行 |
 | 上层只依赖下层 | Frontend 通过 TenetService 间接使用 Analysis，Analysis 不直接改写 IO |
@@ -127,7 +134,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 1. `TraceReader` 通过 `mmap` 让记录可顺序遍历。
 2. `TraceIndex` 用稀疏 offset + anchor 建立快速定位。
-3. `RegisterFile::state_before(inst_id)` 找到最近 anchor 并回放 diff。
+3. `RegisterFile::state_before(inst_id)` 直接定位稠密 checkpoint，并最多回放 K-1 条 diff。
 4. `CodeTable::opcode_at(pc)` 取 opcode，必要时走 `ImageFallback`。
 5. `InstructionDecoder` 把 opcode 反汇编成 mnemonic / operands。
 6. GUI/TUI 通过 `TenetService` 的行缓存获取 `InstructionRow` 并渲染。
@@ -143,7 +150,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 ## 当前实现规模
 
 - `src/analysis/pass_registry.cpp` 当前维护 **30 个 pass**。
-- `src/io/mcp/` 当前维护 **47 个 MCP 工具**。
+- MCP 工具由 `src/io/mcp/mcp_tools_{core,analysis,ai,vm}.cpp` 分组注册；基础服务与 Hub/session 模式的实际数量不同，启动日志会打印本实例的准确值。
 - CLI 参数集中在 `src/cli_options.cpp`，批处理执行集中在 `src/batch_analysis.cpp`。
 
 ## 扩展点
@@ -172,7 +179,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | [`capabilities.md`](capabilities.md) | 按能力看 tenet 能做什么 |
 | [`io-layer.md`](io-layer.md) | trace / index / code / streaming |
 | [`core-layer.md`](core-layer.md) | 寄存器 / 内存 / 解码 / Triton |
-| [`analysis-layer.md`](analysis-layer.md) | pass 分类、依赖、调度、融合 |
+| [`analysis-layer.md`](analysis-layer.md) | Infra 服务、pass 分类、依赖、调度、融合 |
 | [`pass-cookbook.md`](pass-cookbook.md) | 新增 pass 的实操开发指南 |
 | [`ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP |
 | [`trace-format.md`](trace-format.md) | 与 qbditrace 的格式契约 |

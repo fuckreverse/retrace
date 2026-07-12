@@ -181,6 +181,10 @@ ctest -R perf --output-on-failure
 
 基准数据保存在 `bench/baseline_1M.json`，新的测试结果应与之对比。
 
+### PGO 模式
+
+`TENET_PGO_MODE` 支持 `generate` / `use` 两阶段 profile-guided optimization，profile 文件由 `TENET_PGO_PROFILE` 指定。PGO 只用于稳定 workload 的最终优化，不应替代 RelWithDebInfo 下的日常 profiling；生成与使用阶段必须保持编译器、源码和代表性输入一致。
+
 ## 最佳实践
 
 1. **构建类型选择**：性能分析始终用 `RelWithDebInfo`，Debug 版本的 `-O0` 会引入大量虚假热点。
@@ -384,8 +388,8 @@ open objc-opt.trace
 
 | 构建类型 | 用途 | 说明 |
 |---------|------|------|
-| Debug（默认） | 开发迭代、单元测试 | `-O0 -g`，编译快，运行慢（性能数字无参考价值） |
-| RelWithDebInfo | **性能测量标准** | `-O2 -g`，有符号可 profile，性能接近 Release |
+| Debug | 最快编译、调试与单元测试 | `-O0 -g`，运行慢（性能数字无参考价值） |
+| RelWithDebInfo（默认） | 日常开发与**性能测量标准** | `-O2 -g`，无 LTO/PGO/-mcpu；兼顾增量链接与运行速度 |
 | Release | 最终基准 / 发布 | `-O3` + ThinLTO，最快运行，编译最慢 |
 
 ```bash
