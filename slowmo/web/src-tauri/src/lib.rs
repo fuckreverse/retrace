@@ -135,6 +135,24 @@ fn settings_json_path() -> PathBuf {
         .join("settings.json")
 }
 
+fn third_party_notice_path(resource_dir: PathBuf) -> PathBuf {
+    resource_dir.join("licenses").join("THIRD-PARTY-NOTICES.txt")
+}
+
+#[cfg(target_os = "macos")]
+fn open_third_party_notices(app: &tauri::AppHandle) -> Result<(), String> {
+    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    let notice = third_party_notice_path(resource_dir);
+    if !notice.is_file() {
+        return Err(format!("Third-party notice not found: {}", notice.display()));
+    }
+    std::process::Command::new("open")
+        .arg(&notice)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open {}: {e}", notice.display()))
+}
+
 // ── Tauri commands ──────────────────────────────────────────────────────────
 
 /// Return the list of recently opened trace files.
@@ -374,9 +392,10 @@ fn build_and_set_menu(app: &tauri::App) -> tauri::Result<()> {
     }
 
     // ── App menu ────────────────────────────────────────────────────────
-    let app_menu = SubmenuBuilder::new(handle, "Tenet")
-        .text("about", "About Tenet")
-        .separator()
+let app_menu = SubmenuBuilder::new(handle, "Tenet")
+.text("about", "About Tenet")
+.text("third_party_software", "Third-Party Software…")
+.separator()
         .item(&PredefinedMenuItem::hide(handle, Some("Hide Tenet"))?)
         .item(&PredefinedMenuItem::hide_others(handle, Some("Hide Others"))?)
         .item(&PredefinedMenuItem::show_all(handle, Some("Show All"))?)
@@ -581,6 +600,11 @@ fn build_and_set_menu(app: &tauri::App) -> tauri::Result<()> {
         let id = event.id().0.as_str();
         if let Some(path) = id.strip_prefix("file_recent:") {
             let _ = app_handle.emit("menu://file_recent", path);
+        } else if id == "third_party_software" {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = open_third_party_notices(app_handle) {
+                log::error!("{error}");
+            }
         } else {
             let _ = app_handle.emit(&format!("menu://{id}"), ());
         }
@@ -601,6 +625,20 @@ fn truncate_path(path: &str, max_len: usize) -> String {
 }
 
 // ── Entrypoint ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::third_party_notice_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolves_bundled_third_party_notice() {
+        assert_eq!(
+            third_party_notice_path(PathBuf::from("/Tenet.app/Contents/Resources")),
+            PathBuf::from("/Tenet.app/Contents/Resources/licenses/THIRD-PARTY-NOTICES.txt")
+        );
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

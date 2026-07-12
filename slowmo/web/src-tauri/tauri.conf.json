@@ -37,8 +37,13 @@
     ],
     "externalBin": ["binaries/tenet"],
     "resources": {
-      "binaries/lib/*": "lib/"
+      "binaries/lib/*": "lib/",
+      "binaries/licenses": "licenses"
     },
+    "publisher": "Tenet Developer",
+    "copyright": "Copyright © 2026 Tenet Developer",
+    "shortDescription": "Offline instruction-trace analysis for security research and debugging.",
+    "longDescription": "Tenet analyzes qbditrace instruction traces locally to reconstruct registers, memory, control flow, and data flow.",
     "macOS": {
       "signingIdentity": "-"
     },

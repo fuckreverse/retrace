@@ -17,7 +17,9 @@
 #          → rpath "@executable_path/../Resources/lib"
 #      dyld 会按顺序依次尝试每条 rpath，找到第一个存在的文件即可，两个场景
 #      互不影响。
-#   4. 把最终二进制以 Tauri sidecar 命名规则（<name>-<target-triple>）放到
+#   4. 根据实际打包的 dylib、pnpm 锁定依赖和 Cargo.lock 生成第三方许可材料；
+#      未登记的动态库或未批准许可证会直接阻断发布。
+#   5. 把最终二进制以 Tauri sidecar 命名规则（<name>-<target-triple>）放到
 #      src-tauri/binaries/tenet-<triple>，供 tauri.conf.json 的
 #      bundle.externalBin 打包进 .app/Contents/MacOS/。
 #
@@ -42,6 +44,10 @@ TENET_DIR="$(cd "${SRC_TAURI_DIR}/../.." && pwd)"   # tools/tenet
 BUILD_DIR="${TENET_DIR}/build"
 BIN_OUT_DIR="${SRC_TAURI_DIR}/binaries"
 LIB_OUT_DIR="${BIN_OUT_DIR}/lib"
+LICENSE_OUT_DIR="${BIN_OUT_DIR}/licenses"
+LICENSE_MANIFEST="${SRC_TAURI_DIR}/licenses/native-components.json"
+LICENSE_COLLECTOR="${SCRIPT_DIR}/collect_licenses.py"
+WEB_DIR="$(cd "${SRC_TAURI_DIR}/.." && pwd)"
 
 BUILD_TYPE="RelWithDebInfo"
 if [[ "${1:-}" == "--debug" ]]; then
@@ -262,9 +268,21 @@ echo "==> 对 sidecar 二进制与依赖库做 ad-hoc 代码签名 ..."
 find "${LIB_OUT_DIR}" -type f -name '*.dylib' -print0 | xargs -0 -I{} codesign --force --sign - {} 2>/dev/null || true
 codesign --force --sign - "${FINAL_BIN}" 2>/dev/null || true
 
+# ── 6. 生成第三方许可证资源 ─────────────────────────────────────────────────
+# 以实际收集到的 dylib 为准核对原生清单，并从 pnpm/Cargo 锁定依赖生成声明。
+# GraphGridLayout 的许可问题按产品决策单独跟踪，不在本清单中静默处理。
+echo "==> 生成并校验第三方许可证材料 ..."
+python3 "${LICENSE_COLLECTOR}" \
+  --manifest "${LICENSE_MANIFEST}" \
+  --lib-dir "${LIB_OUT_DIR}" \
+  --web-dir "${WEB_DIR}" \
+  --src-tauri-dir "${SRC_TAURI_DIR}" \
+  --output "${LICENSE_OUT_DIR}"
+
 echo "==> 完成。"
 echo "    sidecar 二进制: ${FINAL_BIN}"
 echo "    依赖库目录:     ${LIB_OUT_DIR} ($(find "${LIB_OUT_DIR}" -type f | wc -l | tr -d ' ') 个文件)"
+echo "    许可证目录:     ${LICENSE_OUT_DIR} ($(find "${LICENSE_OUT_DIR}" -type f | wc -l | tr -d ' ') 个文件)"
 echo
 echo "校验（应仅剩系统库 / @executable_path 引用）："
 otool -L "${FINAL_BIN}"
