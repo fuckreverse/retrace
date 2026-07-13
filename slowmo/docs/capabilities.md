@@ -220,7 +220,7 @@ profiling
 - 支持 Basic Auth 和会话 ID。
 
 ```bash
-./tenet trace.bin --mcp-http 127.0.0.1:7080
+./tenet trace.bin --mcp-http 127.0.0.1:10444
 ```
 
 ### MCP 工具分组

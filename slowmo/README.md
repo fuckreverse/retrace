@@ -90,7 +90,7 @@ ninja -j$(nproc)
 # 自动化服务
 ./tenet trace.bin --rpc /tmp/tenet.sock
 ./tenet trace.bin --mcp
-./tenet trace.bin --mcp-http 127.0.0.1:7080
+./tenet trace.bin --mcp-http 127.0.0.1:10444
 ```
 
 ## 常见工作流

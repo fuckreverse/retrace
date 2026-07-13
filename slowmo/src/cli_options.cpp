@@ -137,9 +137,9 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --mcp                             Start MCP server over stdio (JSON-RPC 2.0)\n");
     fmt::print(stderr, "                                    (blocks until stdin closes)\n");
     fmt::print(stderr, "  --mcp-http [host:port]            Start MCP server over Streamable HTTP\n");
-    fmt::print(stderr, "                                    Default: 127.0.0.1:7080 (blocks until SIGINT)\n");
+    fmt::print(stderr, "                                    Default: 127.0.0.1:10444 (blocks until SIGINT)\n");
     fmt::print(stderr, "  --mcp-host <addr>                 Bind address for --mcp-http (e.g. 0.0.0.0)\n");
-    fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 7080)\n");
+    fmt::print(stderr, "  --mcp-port <port>                 Port for --mcp-http (default: 10444)\n");
     fmt::print(stderr, "  --mcp-auth user:pass              Enable Basic Auth for --mcp-http\n");
     fmt::print(stderr, "  --ws-port <port>                  Start WebSocket service on port (binary FlatBuffers protocol)\n");
     fmt::print(stderr, "  --mcp-hub [host:port]             Enable MCP hub mode (multi-instance coordination).\n");
@@ -514,7 +514,7 @@ CliOptions parse_args(int argc, char** argv) {
         }
         if (opts.opt_mcp_http) {
             fmt::print(stderr, "  Hint: --mcp-http requires a trace file, e.g.:\n");
-            fmt::print(stderr, "    tenet --mcp-http 127.0.0.1:7080 trace.bin\n");
+            fmt::print(stderr, "    tenet --mcp-http 127.0.0.1:10444 trace.bin\n");
         }
         if (opts.opt_mcp_hub) {
             fmt::print(stderr, "  Hint: --mcp-hub requires a trace file, e.g.:\n");

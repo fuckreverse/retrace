@@ -28,7 +28,7 @@
 //   - Tool handlers are called under a shared dispatch mutex (same as stdio mode).
 //
 // Usage:
-//   McpHttpTransport transport(message_handler, "127.0.0.1", 7080);
+//   McpHttpTransport transport(message_handler, "127.0.0.1", 10444);
 //   transport.set_auth("admin", "secret");   // optional
 //   transport.start();  // non-blocking, spawns listener thread
 //   // ...
@@ -51,7 +51,7 @@ public:
 
     McpHttpTransport(MessageHandler handler,
                      const std::string& host = "127.0.0.1",
-                     uint16_t port = 7080);
+                     uint16_t port = 10444);
     ~McpHttpTransport();
 
     // Non-copyable

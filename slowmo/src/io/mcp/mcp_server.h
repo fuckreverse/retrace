@@ -42,7 +42,7 @@ enum class McpTransportMode {
 
 struct McpHttpConfig {
     std::string host     = "127.0.0.1";  ///< Bind address ("0.0.0.0" to expose on all interfaces)
-    uint16_t    port     = 7080;
+    uint16_t    port     = 10444;
     std::string username;                ///< Basic Auth username (empty = no auth)
     std::string password;
     bool require_session = false;        ///< Require Mcp-Session-Id header (default: disabled)

@@ -613,7 +613,7 @@ tenet run1.bin --trace-diff-file run2.bin
 **MCP HTTP（远程或 GUI 宿主）：**
 
 ```bash
-./tenet --mcp-http 127.0.0.1:7080 trace.bin
+./tenet --mcp-http 127.0.0.1:10444 trace.bin
 # POST /mcp   Content-Type: application/json
 ```
 
