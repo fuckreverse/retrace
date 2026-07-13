@@ -61,7 +61,7 @@ Every analysis in Tenet is a pass. This page lists all passes in the catalog, gr
 | `reg_timeline` | `--reg-timeline` | No | Timeline of all writes to a register |
 | `call_context` | `--call-context` | No | Call stack + loop position + neighbors at an inst |
 | `window_stats` | `--window-stats` | No | Sliding window statistics (hot regions, entropy…) |
-| `trace_diff` | `--diff-trace` | No | Compare two trace regions for divergence |
+| `trace_diff` | `--trace-diff` | No | Compare two trace regions for divergence |
 | `dataflow_graph` | `--dataflow-graph` | No | Register-level data-flow graph for a region |
 
 ## Misc

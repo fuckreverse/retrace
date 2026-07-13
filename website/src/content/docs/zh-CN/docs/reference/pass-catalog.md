@@ -61,7 +61,7 @@ Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，�
 | `reg_timeline` | `--reg-timeline` | 否 | 寄存器全部写入时间线 |
 | `call_context` | `--call-context` | 否 | 指令处的调用栈+循环位置+邻居 |
 | `window_stats` | `--window-stats` | 否 | 滑动窗口统计（热区、熵…） |
-| `trace_diff` | `--diff-trace` | 否 | 比较两个 Trace 区域的差异 |
+| `trace_diff` | `--trace-diff` | 否 | 比较两个 Trace 区域的差异 |
 | `dataflow_graph` | `--dataflow-graph` | 否 | 区域的寄存器级数据流图 |
 
 ## Misc

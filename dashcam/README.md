@@ -21,11 +21,11 @@ PAC 化的 `br x16`）不会导致崩溃，控制流可以被正确跟踪。
 2. **异步落盘**：每个线程独立 chunk buffer，单个后台 writer 线程统一刷盘。启用
    zstd 时默认写成 1 MiB 独立 frame 的**分块压缩格式**，并在文件尾写块索引，兼顾
    体积和随机访问；`bytes_written` 统计的是提交给 writer 的原始字节数，不是物理文件大小。
-3. **离线后处理**：tenet 是完整分析端，支持默认分块压缩及 v4/v5/v7；轻量
-   `trace_decode` 仅用于未压缩 v4 兼容文件。两者都可利用 trace **自带的内嵌码表**
-   反汇编，并把运行期地址按 slide 归一化为静态地址，无需外部镜像。
+3. **离线后处理**：tenet 是唯一分析端，支持默认分块压缩及 v4/v5/v7 全格式；
+   `tenet --dump` 提供轻量级文本/JSONL 导出（无需构建 RocksDB 索引）。两者都可利用
+   trace **自带的内嵌码表**反汇编，并把运行期地址按 slide 归一化为静态地址，无需外部镜像。
 
-此外解码器内置若干逆向增强：调用点的参数/返回值聚合（e1）、adrp/adr 目标与静态
+此外 tenet 内置若干逆向增强：调用点的参数/返回值聚合（e1）、adrp/adr 目标与静态
 字符串标注（e2）、调用深度缩进（e3）、以及两条 trace 的指令级 diff（e4，自动归一
 栈/堆地址只显示真实差异）。各项均可用 `--no-*` / `--diff` 控制（见第 3 节）。
 
@@ -141,8 +141,6 @@ tools/qbditrace/
 ├── QBDITrace.cpp          核心 tracer（QBDI 回调、热路径、VM 接管、fault handler、safe ret addr）
 ├── qbditrace_runner.py    ★ Python loader（唯一入口，管理参数/连接/生命周期）
 ├── qbditrace.js           Frida agent 引擎（纯逻辑，配置由 Python 注入）
-├── decoder/
-│   └── trace_decode.cpp   离线解码器（Capstone 反汇编 + 状态重建 + diff）
 ├── benchmark/
 │   ├── bench_harness.c    基础 benchmark harness
 │   ├── run_benchmark.sh   一键运行基础 benchmark
@@ -150,7 +148,7 @@ tools/qbditrace/
 │   └── advanced/          高级 benchmark 套件（22 target，真实加密+OLLVM 混淆）
 │       ├── run_advanced.sh
 │       └── README.md
-└── CMakeLists.txt         tracer（iOS dylib / Android so）、decoder 与 host tests
+└── CMakeLists.txt         tracer（iOS dylib / Android so）与 host tests
 ```
 
 ## 1. 编译
@@ -187,9 +185,9 @@ adb push libqbditrace.so /data/local/tmp/libqbditrace.so
 `libqbditrace.so`。运行 loader 时加 `--android`；默认 dylib 路径会切换为
 `/data/local/tmp/libqbditrace.so`。
 
-### 1.3 编译 host tests 与 v4 离线解码器
+### 1.3 编译 host tests
 
-固定 host 构建目录为 `tools/qbditrace/build/`，不要另建 build 目录：
+固定 host 构建目录为 `tools/qbditrace/build/`，不要另建 build目录：
 
 ```sh
 cd tools/qbditrace/build
@@ -198,10 +196,8 @@ ninja
 ctest --output-on-failure
 ```
 
-`build/trace_decode` 是轻量兼容工具，**当前只接受未压缩 v4 trace**。默认录制启用了
-分块压缩，`--pc-delta` / `--sampling` 会生成 v5，`--fpr` 会生成 v7；这些 trace
-应使用 tenet 打开。需要给 `trace_decode` 生成兼容输入时，同时使用 `--no-compress`，
-且不要启用 `--pc-delta`、`--sampling` 或 `--fpr`。
+离线解码功能已集成到 tenet：`tenet --dump text trace.bin` 或 `tenet --dump jsonl trace.bin`。
+tenet 支持所有格式版本（v4/v5/v7，含默认分块压缩），无需额外参数。
 
 ## 2. 用 Frida 注入并 trace
 
@@ -529,37 +525,34 @@ nohup python3 tools/qbditrace/qbditrace_runner.py \
 
 ## 3. 离线解码与 IDA 对照
 
-> `trace_decode` 仅用于未压缩 v4 兼容 trace；默认分块压缩 trace 以及 v5/v7 trace
-> 请使用 tenet。录制兼容文件时需加 `--no-compress`，且不要启用 `--pc-delta`、
-> `--sampling` 或 `--fpr`。
+所有离线解码功能已集成到 tenet，支持 v4/v5/v7 全格式（含默认分块压缩）：
 
 ```sh
-# v4 兼容 trace 自带去重码表，无需任何外部输入
-./tools/qbditrace/build/trace_decode qbditrace.bin
+# 文本格式解码（人可读，自带去重码表，无需任何外部输入）
+tenet --dump text qbditrace.bin
 
-# 输出 JSONL（每条记录一行 JSON，便于脚本后处理）
-./tools/qbditrace/build/trace_decode qbditrace.bin --format jsonl
+# JSONL 格式（每条记录一行 JSON，便于脚本后处理）
+tenet --dump jsonl qbditrace.bin
+
+# 限制解码条数
+tenet --dump text --dump-limit 1000 qbditrace.bin
+
+# 不显示寄存器/内存
+tenet --dump text --no-dump-regs qbditrace.bin
+tenet --dump text --no-dump-mem qbditrace.bin
 
 # 两条 trace 做指令级 diff（自动归一化栈/堆地址，只显示真实值差异）
-./tools/qbditrace/build/trace_decode qbditrace.bin --diff qbditrace_run2.bin
+tenet --diff qbditrace_run2.bin qbditrace.bin
 
-# 其他选项
-#   --image <f> --image-base <hex>  [已废弃] 外部裸代码 dump 兜底
-#   --no-regs            不打印寄存器变化
-#   --no-mem             不打印内存访问
-#   --no-symbols         关闭 adrp/adr 目标 + 静态字符串标注（e2）
-#   --no-call-summary    关闭调用点 参数/返回值 聚合（e1）
-#   --no-depth           关闭调用深度缩进（e3）
-#   --limit N            只解码前 N 条指令
+# 完整 tenet 分析（构建索引后支持 CFG/taint/pattern 等 pass）
+tenet qbditrace.bin
 ```
 
+> `--dump` 模式无需构建 RocksDB 索引，适合快速查看 trace 内容。完整分析请直接
+> `tenet trace.bin`，会自动构建索引。
+
 **内嵌码表（默认开）**：trace 写入时会把每条**执行过的不同指令**的原始字节随流
-落盘（去重，循环/递归稳态零额外开销），解码器据此自带反汇编，**不再需要 `--image`**。
-
-`--image` 现已**废弃（deprecated）**：内嵌码表已让离线反汇编自包含。它目前仅作为
-旧 trace 的兜底保留，**后续版本可能直接移除**。
-
-> 关闭内嵌码表：使用 `--no-embed-code` 参数。
+落盘（去重，循环/递归稳态零额外开销），tenet 据此自带反汇编，**无需外部镜像**。
 
 输出里每条指令的地址都是**静态地址**（已减去 module_slide），可直接和 IDA 里看到
 的地址对照。示例：
@@ -806,7 +799,7 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
 - 默认 `--trace-mode once` 只 trace 首次调用。使用 `--trace-mode multi` 或
   `--trace-mode N` 可捕获多次调用。
 - 主路径支持 iOS / Android AArch64；x86_64 写入路径未做完整适配。
-- `trace_decode` 只接受未压缩 v4；默认分块压缩、v5 PC-delta 和 v7 FPR trace 使用 tenet。
+- 离线解码已统一由 tenet 处理（`tenet --dump`），支持全格式（v4/v5/v7，含默认分块压缩）。独立的 `trace_decode` 已移除。
 - objc 记录的 cls 字段容量 48 字节；`*Super` 变体跳过类名解析（接收者为 objc_super
   结构体指针）。选择子通常可离线还原为方法名字符串。
 - syscall 名表只覆盖常见子集，未命中的号码按原始数字显示；Mach trap 不在此表内。

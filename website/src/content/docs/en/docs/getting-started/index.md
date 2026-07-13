@@ -16,7 +16,7 @@ sidebar:
 
 ## Trace requirements
 
-Tenet accepts format version 4 or newer. The trace should include register diffs and embedded code for the richest analysis. PC-delta (v5) and FPR (v7) recordings require Tenet rather than the legacy `trace_decode` utility.
+Tenet accepts format version 4 or newer. The trace should include register diffs and embedded code for the richest analysis. PC-delta (v5) and FPR (v7) recordings are fully supported by `tenet --dump` and all analysis modes.
 
 ## What success looks like
 

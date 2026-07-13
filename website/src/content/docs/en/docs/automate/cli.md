@@ -41,11 +41,11 @@ The CLI runs analysis, exports data and produces reports without an interactive 
 ./tenet trace.bin --vm-abstract
 ./tenet trace.bin --backward-taint 10000 0 --taint-source-annotation
 
-# Trace tools
-./tenet trace.bin --trace-fold --fold-function 0x100123456
-./tenet trace.bin --diff-trace other.bin
-./tenet trace.bin --window-stats --window-size 10000
-./tenet trace.bin --profile --profile-format json
+# Trace tools (instruction-ID ranges)
+./tenet trace.bin --trace-fold 10000 50000 --trace-fold-min-iter 3
+./tenet trace.bin --trace-diff 10000 20000 30000 40000 --trace-diff-file other.bin
+./tenet trace.bin --window-stats 0 100000 --window-stats-size 10000
+./tenet trace.bin --reg-timeline 0 --reg-timeline-range 10000 50000
 ```
 
 ## Selecting passes explicitly

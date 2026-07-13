@@ -10,7 +10,7 @@ namespace tenet {
 // ─── has_analysis_option ──────────────────────────────────────────────────
 
 bool CliOptions::has_analysis_option() const {
-    return !export_cfg_path.empty() || opt_taint ||
+    return opt_dump || !export_cfg_path.empty() || opt_taint ||
            opt_strings || opt_pattern || opt_constants ||
            !call_graph_path.empty() ||
            opt_backward_taint || opt_critical_path ||
@@ -52,6 +52,10 @@ static void print_usage(const char* prog) {
     fmt::print(stderr, "  -m                     Show memory accesses\n");
     fmt::print(stderr, "  -i                     Show index build statistics\n");
     fmt::print(stderr, "  -h                     Show this help\n");
+    fmt::print(stderr, "  --dump <text|jsonl>    Dump trace records without RocksDB index\n");
+    fmt::print(stderr, "  --limit <N>            Limit dumped INST records (0 = unlimited)\n");
+    fmt::print(stderr, "  --no-regs              Omit GPR/FPR diff output\n");
+    fmt::print(stderr, "  --no-mem               Omit memory access output\n");
     fmt::print(stderr, "\nAnalysis options (batch mode, suppress interactive):\n");
     fmt::print(stderr, "  --run-pass <name>         Run any catalog pass (repeatable). Names: see --list-passes\n");
     fmt::print(stderr, "  --list-passes             List all available pass names and exit\n");
@@ -180,6 +184,24 @@ CliOptions parse_args(int argc, char** argv) {
             opts.show_mem = true;
         } else if (arg == "-i") {
             opts.show_index_stats = true;
+        } else if (arg == "--dump" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            opts.opt_dump = true;
+            if (mode == "text") {
+                opts.dump_options.format = DumpFormat::Text;
+            } else if (mode == "jsonl") {
+                opts.dump_options.format = DumpFormat::Jsonl;
+            } else {
+                fmt::print(stderr, "Error: --dump only supports text|jsonl, got '{}'\n", mode);
+                opts.parse_status = 1;
+                return opts;
+            }
+        } else if (arg == "--limit" && i + 1 < argc) {
+            opts.dump_options.limit = std::stoull(argv[++i]);
+        } else if (arg == "--no-regs") {
+            opts.dump_options.include_regs = false;
+        } else if (arg == "--no-mem") {
+            opts.dump_options.include_mem = false;
         } else if (arg == "--export-cfg" && i + 1 < argc) {
             opts.export_cfg_path = argv[++i];
         } else if (arg == "--taint" && i + 1 < argc) {

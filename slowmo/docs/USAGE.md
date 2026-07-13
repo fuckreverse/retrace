@@ -25,7 +25,7 @@ xcode-select --install
 # Ninja 构建系统（tenet 和 qbditrace 均使用）
 brew install ninja cmake
 
-# Capstone（trace_decode 离线解码器的反汇编引擎）
+# Capstone（tenet 反汇编引擎，若需 --dump 模式）
 brew install capstone
 ```
 
@@ -199,16 +199,19 @@ ninja -j$(nproc)
 
 ---
 
-### 2.4 编译 trace_decode 离线解码器（可选）
+### 2.4 离线解码（tenet --dump）
+
+独立的 `trace_decode` 已移除，其功能由 `tenet --dump` 接替：
 
 ```bash
-cd tools/qbditrace
-mkdir build && cd build
-cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF \
-    -DFETCHCONTENT_BASE_DIR=$(pwd)/../../tenet/_deps  # 复用 tenet 的依赖缓存
-ninja -j$(nproc)
-# 产物：tools/qbditrace/build/trace_decode
+# 人类可读文本格式
+tenet --dump text trace.bin
+
+# 机器可读 JSONL 格式
+tenet --dump jsonl trace.bin
 ```
+
+> `tenet --dump` 支持 v4/v5/v7 全格式（含默认分块压缩），无需单独构建。
 
 ---
 
@@ -352,25 +355,25 @@ adb pull /data/local/tmp/trace.bin ./trace.bin
 
 ## 四、验证 trace（可选）
 
-用 trace_decode 快速确认 trace 文件完整可读：
+用 `tenet --dump` 快速确认 trace 文件完整可读：
 
 ```bash
 # 解码并打印前 100 条指令（含反汇编、寄存器差值、内存访问）
-./tools/qbditrace/build/trace_decode trace.bin --limit 100
+tenet --dump text trace.bin --limit 100
 
 # 以 JSONL 格式输出（便于脚本处理）
-./tools/qbditrace/build/trace_decode trace.bin --format jsonl | head -20
+tenet --dump jsonl trace.bin | head -20
 
 # 查看统计摘要
-./tools/qbditrace/build/trace_decode trace.bin 2>&1 | tail -20
+tenet --stats trace.bin
 ```
 
-> **注**：`trace_decode` 仅支持**未压缩 v4**。默认录制使用分块 zstd，因此通常应直接用 tenet；只有录制时加 `--no-compress` 且未启用 `--pc-delta`、`--sampling`、`--fpr`，才适合用 `trace_decode`。
+> `tenet --dump` 支持 v4/v5/v7 全格式（含默认分块压缩），无需单独构建。
 
 示例输出：
 
 ```
-; qbditrace decode
+; tenet dump
 ; module        : /var/containers/.../TheApp
 ; arch          : aarch64
 ; module_slide  : 0x0000000004a30000
@@ -589,8 +592,8 @@ python3 ... --trace-mode once --output run1.bin
 # 第二次录制（不同输入）
 python3 ... --trace-mode once --output run2.bin
 
-# 用 trace_decode diff（仅未压缩 v4；默认录制请改用 tenet）
-./tools/qbditrace/build/trace_decode run1.bin --diff run2.bin
+# 在 tenet CLI 中对比两次 trace
+tenet run1.bin --trace-diff-file run2.bin
 
 # 或在 tenet GUI 中打开 trace diff 面板
 ./tenet run1.bin   # File → Compare Trace → run2.bin
@@ -660,10 +663,10 @@ frida-ps -U                   # USB
 Error: Unsupported trace version 5, need == 4
 ```
 
-这是 `trace_decode` 的限制——它只支持 v4。改用 tenet 打开：
+如果遇到版本不兼容，请确认使用的 tenet 版本支持该格式。tenet 支持 v4/v5/v7：
 
 ```bash
-./tenet trace.bin   # tenet 支持 v4/v5/v7
+./tenet trace.bin
 ```
 
 ### trace 太大，内存不足

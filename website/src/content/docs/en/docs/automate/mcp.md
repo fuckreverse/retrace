@@ -4,75 +4,243 @@ sidebar:
   order: 4
 ---
 
-The Model Context Protocol (MCP) server allows LLM agents and IDE integrations to query analysis results, navigate the timeline, and trigger passes through a structured tool interface.
+Tenet's Model Context Protocol (MCP) server lets LLM agents and IDEs query traces, reconstruct state, run analyses, and verify conclusions through structured tools. Every entry point reuses the same `TraceReader`, index, pass pipeline, and result cache.
 
-## Start the server
+Tenet has two recommended entry points:
+
+| Mode | Start with | Best for |
+|---|---|---|
+| stdio | `--mcp` | One client launching one Tenet process for one trace |
+| MCP Hub | `--mcp-hub` | GUI auto-connect, multiple open traces, and one stable endpoint |
+
+## stdio: one trace
 
 ```bash
-./tenet trace.bin --mcp-port 13337
+./tenet trace.bin --mcp
 ```
 
-Or start from a GUI session using **File → Start MCP Server**. The server uses the same session and pass results as the running GUI/TUI/CLI.
+Tenet exchanges JSON-RPC messages over stdin/stdout and writes diagnostics to stderr. The process remains active until the client closes stdin.
 
-## Available tools
+Client configuration example:
 
-MCP tools mirror the JSON-RPC methods with additional metadata and structured parameter schemas:
+```json
+{
+  "mcpServers": {
+    "tenet": {
+      "command": "/absolute/path/to/tenet",
+      "args": [
+        "/absolute/path/to/trace.bin",
+        "--mcp"
+      ]
+    }
+  }
+}
+```
 
-### Session and trace
+Use absolute paths because an MCP client's working directory may differ from your terminal. Stdio is bound to one trace and does not require an `instance` argument.
 
-- `trace_info` — Trace metadata, format version, module information
-- `list_passes` — Catalog of available passes with states
-- `run_pass` — Run a named pass with optional parameters
-- `pass_result` — Retrieve cached results for a completed pass
-- `cancel_pass` — Cancel a running pass
+## MCP Hub: stable endpoint and multiple instances
 
-### Navigation
+```bash
+./tenet trace.bin --mcp-hub
+```
 
-- `goto_inst` — Jump to instruction ID
-- `goto_pc` — Jump to runtime PC
-- `set_breakpoint` / `set_watchpoint` — Set PC or memory breakpoints
-- `list_breakpoints` — List active breakpoints
+The default endpoint is:
 
-### State queries
+```text
+http://127.0.0.1:10444/mcp
+```
 
-- `get_registers` — GPR state at an instruction
-- `get_memory` — Memory region at a point in time
-- `get_hex_dump` — Raw byte dump
-- `get_call_stack` — Dynamic call stack
+The bind address and instance name can be explicit:
 
-### Analysis
+```bash
+./tenet trace.bin \
+  --mcp-hub 127.0.0.1:10444 \
+  --mcp-hub-name signing-trace
+```
 
-- `taint_forward` / `taint_backward` — Taint analysis
-- `cfg_export` — Export CFG as DOT
-- `call_graph` — Export call graph
-- `functions` / `find_function` — Function queries
-- `xref` — XRef occurrences for a PC
-- `strings` — Discovered strings
-- `objc_messages` — ObjC message analysis
-- `loops` — Loop information
-- `algorithm_summary` — Algorithm candidates
-- `pattern_results` — Pattern scan results
-- `entropy_analysis` — Entropy measurement
-- `mem_search` — Memory value/pattern search
-- `vm_abstract` — VM handler analysis
+Client configuration example:
 
-### Address rebase
+```json
+{
+  "mcpServers": {
+    "tenet": {
+      "url": "http://127.0.0.1:10444/mcp"
+    }
+  }
+}
+```
 
-- `rebase_addr` — Convert between runtime and static addresses using the trace's `module_slide`. Use this instead of manual arithmetic when carrying addresses to/from IDA or Ghidra.
+:::note[Port convention]
+MCP Hub and the GUI use **10444** by default. You do not need a separate port for every trace.
+:::
 
-## Integration with IDA
+### How the Hub organizes traces
 
-Tenet's MCP server is designed to work alongside IDA's own MCP hub. A typical workflow:
+The first Tenet process to acquire `~/.tenet/mcp-hub.lock` becomes the Hub and listens on `10444`. Later processes become Workers and reverse-connect to it instead of opening public ports. The Hub:
 
-1. Open the trace in Tenet with `--mcp-port`.
-2. Open the same binary in IDA with its MCP server.
-3. Use an MCP client (or IDE integration) that connects to both servers.
-4. Query Tenet for dynamic evidence (taint, values, call stacks) at addresses obtained from IDA.
-5. Use `rebase_addr` to translate between runtime (Tenet) and static (IDA) addresses.
+- serves tools for its own trace;
+- tracks every instance ID, PID, trace path, and module name;
+- routes tool calls to the target instance;
+- relies on `flock` to release election ownership automatically on exit.
 
-## Limitations
+Discover instances first:
 
-- The MCP server requires an active Tenet process with an open trace.
-- It shares the same session lock: only one process can own a trace at a time.
-- Long-running passes return progress notifications; the client must handle these.
-- Not all pass parameters are exposed through MCP; use JSON-RPC or CLI for fine-grained control.
+```text
+list_instances()
+```
+
+The default is **sessionless**, so every ordinary tool call must include `instance`:
+
+```text
+trace_info(instance="signing-trace")
+get_regs(instance="signing-trace", inst_id=1200)
+```
+
+This prevents concurrent agents or sessions sharing the Hub from accidentally switching to another trace.
+
+### Session mode
+
+For clients that benefit from a default instance:
+
+```bash
+./tenet trace.bin --mcp-hub --mcp-hub-session
+```
+
+Select it once:
+
+```text
+select_instance(instance="signing-trace")
+```
+
+Subsequent ordinary calls may omit `instance`. `list_instances` is available in both modes; `select_instance` is registered only in session mode.
+
+### GUI behavior
+
+After opening a trace, the GUI automatically attempts to join MCP Hub. The first GUI session becomes the Hub and later sessions become Workers. The default remains `127.0.0.1:10444`, with sessionless routing. A client normally needs only one connection to `10444`, regardless of how many GUI windows are open.
+
+## Start with three tools
+
+After connecting, establish context in this order:
+
+1. `list_instances` (Hub) — choose the target trace;
+2. `trace_info` — confirm module, format version, instruction count, slide, and address range;
+3. `disasm` / `search_pc` / `get_regs` — ground the question in a concrete execution point and state.
+
+Do not start every expensive analysis immediately. Narrow the PC or `inst_id` range before running taint, graph, or VM queries.
+
+## Tool catalog
+
+Tool schemas are the authoritative parameter reference. Clients should use MCP `tools/list` to discover what the current build actually provides. The current interfaces are grouped below by purpose.
+
+### Trace, instructions, and state
+
+| Tool | Purpose |
+|---|---|
+| `trace_info` | Trace format, module, addresses, flags, and instruction statistics |
+| `disasm` | Page through executed instructions, register diffs, and memory accesses |
+| `get_regs` | Reconstruct all 34 AArch64 GPRs by `inst_id` or PC |
+| `memread` | Time-travel memory read at an instruction |
+| `mem_write_history` | Query historical writes to an address range |
+| `search_pc` | O(1) lookup of execution instances for a PC |
+| `reg_timeline` | Timeline of register value changes |
+| `call_context` | Dynamic call context at an instruction |
+
+### Data flow and graphs
+
+| Tool | Purpose |
+|---|---|
+| `taint_forward` | Forward taint; uses Triton when available and otherwise falls back to heuristics |
+| `taint_backward` | Trace data dependencies backward from a sink |
+| `critical_path` | Intersection of forward and backward taint |
+| `cfg_export` | Export the executed CFG as JSON or DOT |
+| `call_graph` | Export the dynamic call graph as JSON or DOT |
+| `dataflow_graph` | Export data flow for a bounded instruction range |
+
+### Structure, patterns, and platform semantics
+
+| Tool | Purpose |
+|---|---|
+| `functions` / `find_function` | Enumerate or locate execution-backed functions |
+| `loops` / `loop_semantics` | Loop structure and algorithm-semantic classification |
+| `xref` | PC cross-reference and hotness statistics |
+| `pattern_scan` / `constants_scan` | Crypto, anti-analysis, obfuscation patterns and materialized constants |
+| `algorithm_summary` | Summarize algorithm candidates and evidence |
+| `strings_scan` / `memory_strings` | Scan write history or point-in-time memory for strings |
+| `mem_search` / `yara_mem_scan` | Value, byte-pattern, and YARA memory search |
+| `memory_snapshot` / `entropy_analysis` | Memory snapshots and entropy measurement |
+| `objc_messages` / `objc_crypto` | Objective-C messages and crypto context |
+| `syscall_intercept` | CommonCrypto, BoringSSL, JNI, and other boundary calls |
+| `symbol_annotation` | Aggregate function, loop, constant, and pattern labels for PCs |
+| `taint_source_annotation` | Add source semantics to backward-taint leaves |
+| `trace_fold` / `trace_diff` | Fold repeated execution or compare ranges/traces |
+| `window_stats` | Page through instruction-window statistics |
+
+### VM analysis
+
+| Tool | Purpose |
+|---|---|
+| `vm_abstract` | Build a VM abstraction from IDA/Ghidra hints |
+| `vm_summary` | Overview of dispatcher, architecture, and handler hotness; requires an existing `vm_abstract` result |
+| `vm_steps_query` | Filter VM steps by opcode, VM-PC, label, or register change; requires an existing `vm_abstract` result |
+| `vm_reg_timeline` | Timeline of a virtual register's values; requires an existing `vm_abstract` result |
+| `vm_backward_slice` | Step-level backward slice for a virtual register; requires an existing `vm_abstract` result |
+
+`vm_abstract` does not detect a VM without hints. See [Virtual machines and code virtualization](/en/docs/analyze/vmp/) for the input contract.
+
+### Evidence and hypotheses for agents
+
+| Tool | Purpose |
+|---|---|
+| `batch_query` | Run up to 20 independent queries in one round trip |
+| `verify_evidence` | Validate referenced PCs, instructions, registers, or memory evidence |
+| `hypothesis_add` | Create a hypothesis to investigate |
+| `hypothesis_evidence` | Attach supporting/opposing evidence and verification state |
+| `hypothesis_conclude` | Confirm a hypothesis when verified evidence exists |
+| `hypothesis_abandon` | Abandon a disproven hypothesis |
+| `hypothesis_list` / `hypothesis_get` | Enumerate or inspect the hypothesis ledger |
+| `hypothesis_mark_reviewed` | Record human review state |
+
+Prefer the sequence “hypothesis → query → `verify_evidence` → conclusion.” Do not treat an analysis tool's candidate result as a proven fact.
+
+## Address space and IDA integration
+
+By default, MCP converts PCs to the address style commonly displayed by IDA for AArch64 Mach-O:
+
+```text
+displayed_pc = runtime_pc - module_slide + image_base
+image_base = 0x100000000
+```
+
+An IDA address such as `0x10001A2E4` can therefore usually be passed directly to `search_pc`, and Tenet results can be carried back into IDA unchanged.
+
+For another address style, call:
+
+```text
+set_image_base(image_base="0x0")
+```
+
+- `0x100000000`: default IDA displayed addresses;
+- `0x0`: slide-relative static offsets;
+- `module_slide`: raw runtime addresses.
+
+`set_image_base` affects every subsequent PC input and output. Do not continue passing PCs from the previous address space after changing it.
+
+A typical workflow is:
+
+1. locate a static function, dispatcher, or suspicious call site in IDA;
+2. use `search_pc` to confirm that it actually executed;
+3. use the returned `inst_id` with `disasm`, `get_regs`, `memread`, or taint tools;
+4. validate the static hypothesis with Tenet's dynamic evidence;
+5. for VM analysis, place IDA addresses in a hints JSON file and call `vm_abstract`.
+
+## Performance, capability, and security boundaries
+
+- Large results are paginated. Bound the range instead of repeatedly requesting the full trace.
+- `batch_query` combines at most 20 queries; use it for bounded parallel reads, not unbounded expensive analyses.
+- `taint_forward`, `taint_backward`, and `critical_path` use Triton when enabled and fall back to heuristic semantics otherwise.
+- `yara_mem_scan` requires a build with YARA enabled.
+- Tenet currently analyzes traces with single-thread semantics.
+- Hub Worker forwarding has a timeout; reduce the analysis range before retrying a long request.
+- Hub binds only to `127.0.0.1` by default and provides no authentication or TLS. Do not expose `0.0.0.0:10444` to an untrusted network; use a controlled tunnel or access layer for remote use.
+- MCP requires an active Tenet process with an open trace. Rediscover instances after a process exits.

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# gen_and_validate.sh — Build gen_test_traces, generate traces, validate with decoder
+# gen_and_validate.sh — Build gen_test_traces, generate traces, validate with tenet --dump
 #
 # Usage:
 #   ./gen_and_validate.sh                       # Generate unit + 1M perf traces
@@ -14,12 +14,11 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
 TENET_DIR="${ROOT}/tools/tenet"
 BUILD_DIR="${TENET_DIR}/build"
 TRACES_DIR="${HERE}/../traces"
 GENERATOR="${BUILD_DIR}/gen_test_traces"
-DECODER="${HERE}/trace_decode"
+TENET="${BUILD_DIR}/tenet"
 
 # Defaults
 SUITE="all"
@@ -64,7 +63,7 @@ done
 # ─── Step 1: Build ────────────────────────────────────────────────────────────
 
 echo "═══════════════════════════════════════════════════════════════════════"
-echo " Step 1: Building gen_test_traces and trace_decode"
+echo " Step 1: Building gen_test_traces and tenet"
 echo "═══════════════════════════════════════════════════════════════════════"
 
 # Build gen_test_traces via the main CMake build (shared with unit tests)
@@ -76,26 +75,13 @@ else
     echo "  gen_test_traces is up to date."
 fi
 
-# Build decoder (for validation)
+# Build tenet (for --dump validation)
 if [ "${VALIDATE}" -eq 1 ]; then
-    CAPSTONE_PREFIX="$(brew --prefix capstone 2>/dev/null || echo /opt/homebrew/opt/capstone)"
-    if [ -d "${CAPSTONE_PREFIX}" ]; then
-        if [ ! -f "${DECODER}" ] || [ "${TRACE_DIR}/decoder/trace_decode.cpp" -nt "${DECODER}" ]; then
-            echo "  Compiling trace_decode..."
-            clang++ -std=c++17 -O2 -Wall -Wextra \
-                -DQBDITRACE_HAVE_CAPSTONE=1 \
-                -I"${TRACE_DIR}" \
-                -I"${CAPSTONE_PREFIX}/include" \
-                "${TRACE_DIR}/decoder/trace_decode.cpp" \
-                -L"${CAPSTONE_PREFIX}/lib" -lcapstone \
-                -o "${DECODER}"
-            echo "  → ${DECODER}"
-        else
-            echo "  trace_decode is up to date."
-        fi
-    else
-        echo "  ⚠ capstone not found; decoder validation will be skipped."
+    if [ ! -x "${TENET}" ]; then
+        echo "  ⚠ tenet not found at ${TENET}. Build with: cmake --build ${BUILD_DIR}"
         VALIDATE=0
+    else
+        echo "  tenet is available at ${TENET}"
     fi
 fi
 
@@ -125,11 +111,11 @@ if [ "${GENERATE}" -eq 1 ]; then
     echo ""
 fi
 
-# ─── Step 3: Validate with decoder ───────────────────────────────────────────
+# ─── Step 3: Validate with tenet --dump ───────────────────────────────────────
 
 if [ "${VALIDATE}" -eq 1 ]; then
     echo "═══════════════════════════════════════════════════════════════════════"
-    echo " Step 3: Validating traces with decoder"
+    echo " Step 3: Validating traces with tenet --dump"
     echo "═══════════════════════════════════════════════════════════════════════"
 
     PASS=0
@@ -141,15 +127,15 @@ if [ "${VALIDATE}" -eq 1 ]; then
         local name="$(basename "${trace_file}" .trace)"
         TOTAL=$((TOTAL + 1))
 
-        # Run decoder, capture exit code
-        if "${DECODER}" "${trace_file}" 2>/dev/null | head -n "${DECODE_LIMIT}" > /dev/null 2>&1; then
+        # Run tenet --dump text, capture exit code
+        if "${TENET}" --dump text "${trace_file}" 2>/dev/null | head -n "${DECODE_LIMIT}" > /dev/null 2>&1; then
             PASS=$((PASS + 1))
             printf "  ✓ %-30s  (OK)\n" "${name}"
         else
             FAIL=$((FAIL + 1))
             printf "  ✗ %-30s  (DECODE FAILED)\n" "${name}"
             echo "    Error output:"
-            "${DECODER}" "${trace_file}" 2>&1 | head -5 | sed 's/^/      /'
+            "${TENET}" --dump text "${trace_file}" 2>&1 | head -5 | sed 's/^/      /'
         fi
     }
 

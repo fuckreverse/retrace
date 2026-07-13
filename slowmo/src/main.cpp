@@ -151,6 +151,18 @@ if (!trace_lock && lock_holder.pid != 0) {
               hdr.arch == 1 ? "AArch64" : "x86_64",
               hdr.num_gpr, hdr.module_name, hdr.module_slide);
 
+    // ─── Dump mode (no RocksDB index) ───────────────────────────────────
+    if (opts.opt_dump) {
+        auto result = dump_trace(reader, opts.dump_options, std::cout);
+        if (!result) {
+            fmt::print(stderr, "Error: {}\n", result.error().message);
+            return 1;
+        }
+        fmt::print(stderr, "Dumped {} records ({} INST)\n",
+                   result->records, result->inst_records);
+        return 0;
+    }
+
     // ─── Build/load index ───────────────────────────────────────────────
     fmt::print(info_out, "Building index...\n");
     LOG_INFO("building/loading RocksDB index");

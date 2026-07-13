@@ -16,7 +16,7 @@ sidebar:
 
 ## Trace 要求
 
-Tenet 接受格式版本 4 及以上。为获得最丰富分析，Trace 应包含寄存器 diff 和内嵌代码。PC-delta（v5）和 FPR（v7）录制需要 Tenet 而非旧版 `trace_decode`。
+Tenet 接受格式版本 4 及以上。为获得最丰富分析，Trace 应包含寄存器 diff 和内嵌代码。PC-delta（v5）和 FPR（v7）录制由 `tenet --dump` 及所有分析模式完全支持。
 
 ## 成功标志
 

@@ -24,8 +24,8 @@ Choose the narrowest interface that fits the integration. All interfaces use the
 # Start JSON-RPC server
 ./tenet trace.bin --rpc-port 4321
 
-# Start MCP server for LLM integration
-./tenet trace.bin --mcp-port 13337
+# Start MCP Hub for LLM integration (default: 127.0.0.1:10444)
+./tenet trace.bin --mcp-hub
 
 # Start WebSocket streaming
 ./tenet trace.bin --ws-port 9090

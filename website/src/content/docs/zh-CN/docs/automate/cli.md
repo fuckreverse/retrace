@@ -41,11 +41,11 @@ CLI 运行分析、导出数据和生成报告，无需交互会话。所有批�
 ./tenet trace.bin --vm-abstract
 ./tenet trace.bin --backward-taint 10000 0 --taint-source-annotation
 
-# Trace 工具
-./tenet trace.bin --trace-fold --fold-function 0x100123456
-./tenet trace.bin --diff-trace other.bin
-./tenet trace.bin --window-stats --window-size 10000
-./tenet trace.bin --profile --profile-format json
+# Trace 工具（参数为 instruction ID 区间）
+./tenet trace.bin --trace-fold 10000 50000 --trace-fold-min-iter 3
+./tenet trace.bin --trace-diff 10000 20000 30000 40000 --trace-diff-file other.bin
+./tenet trace.bin --window-stats 0 100000 --window-stats-size 10000
+./tenet trace.bin --reg-timeline 0 --reg-timeline-range 10000 50000
 ```
 
 ## 显式选择 Pass

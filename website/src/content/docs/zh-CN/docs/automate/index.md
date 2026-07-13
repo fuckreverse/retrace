@@ -24,8 +24,8 @@ sidebar:
 # 启动 JSON-RPC 服务
 ./tenet trace.bin --rpc-port 4321
 
-# 启动 MCP 服务（LLM 集成）
-./tenet trace.bin --mcp-port 13337
+# 启动 MCP Hub（LLM 集成，默认 127.0.0.1:10444）
+./tenet trace.bin --mcp-hub
 
 # 启动 WebSocket 流式推送
 ./tenet trace.bin --ws-port 9090

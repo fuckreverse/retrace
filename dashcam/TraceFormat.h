@@ -581,7 +581,7 @@ typedef struct {
  * the >=256 Android CAPI ids can currently round-trip through a real trace
  * file. Needs a format bump (widen to uint16_t, or a new record
  * flag/version) to fix properly; deliberately NOT fixed yet because it
- * touches the on-disk format (tracer + trace_decode + tenet all need to
+ * touches the on-disk format (tracer + tenet both need to
  * agree). Tracked via this FIXME; see also the NOTE in
  * tests/unit/test_pass_syscall_intercept.cpp explaining why the Android
  * platform-dispatch tests avoid ids >= 256. */

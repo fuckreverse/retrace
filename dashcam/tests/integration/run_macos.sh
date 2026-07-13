@@ -5,12 +5,12 @@
 # Prerequisites:
 #   - macOS arm64 QBDI static libs built into ../../../build-macos:
 #       sh cmake/config/config-macOS-AARCH64.sh && ninja QBDI_static qbdi-llvm
-#   - capstone (for the decoder disassembly), e.g. `brew install capstone`
+#   - tenet binary at ../../../tools/tenet/build/tenet
 #
 # What it does:
 #   1. builds the tracer + test target + harness into one executable
 #   2. runs it (instruments trace_target, writes /tmp/qbditrace-test.bin)
-#   3. builds the offline decoder and dumps the trace
+#   3. dumps the trace using tenet --dump text
 #
 # Usage: sh run_macos.sh [seed]
 set -e
@@ -19,6 +19,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
 TRACE_DIR="${ROOT}/tools/qbditrace"
 BUILD="${ROOT}/build-macos"
+TENET="${ROOT}/tools/tenet/build/tenet"
 OUT="/tmp/qbditrace-test.bin"
 SEED="${1:-0x1234}"
 
@@ -52,20 +53,15 @@ clang++ -std=c++17 -O2 -g \
 echo "=== [2/3] running (seed=${SEED}) ==="
 /tmp/qbditrace-test "${SEED}" "${OUT}"
 
-echo "=== [3/3] building decoder & decoding trace ==="
-CAPSTONE_PREFIX="$(brew --prefix capstone 2>/dev/null || echo /opt/homebrew/opt/capstone)"
-clang++ -std=c++17 -O2 -Wall -Wextra \
-  -DQBDITRACE_HAVE_CAPSTONE=1 \
-  -I"${CAPSTONE_PREFIX}/include" \
-  "${TRACE_DIR}/decoder/trace_decode.cpp" \
-  -L"${CAPSTONE_PREFIX}/lib" -lcapstone \
-  -o /tmp/trace_decode
-
-echo "--- decoded trace (record structure) ---"
-# No --image needed: the trace embeds a deduplicated code table (REC_CODE), so
-# the decoder disassembles every executed instruction on its own. Each record
-# (insts, mem R/W, reg before->after, xfer site->target, SVC, OBJC) is fully
-# readable from the binary stream alone. Look for "code=1 ... embedded" in the
-# decoded header to confirm the self-contained code table is present.
-/tmp/trace_decode "${OUT}"
+echo "=== [3/3] dumping trace via tenet ==="
+if [ ! -x "${TENET}" ]; then
+  echo "WARNING: tenet not found at ${TENET}; skipping decode"
+  echo "Build it with: cd tools/tenet/build && ninja"
+else
+  echo "--- decoded trace (record structure) ---"
+  # tenet --dump text supports all format versions (v4/v5/v7, compressed or not).
+  # The trace embeds a deduplicated code table (REC_CODE), so tenet can
+  # disassemble every executed instruction without an external --image.
+  "${TENET}" --dump text "${OUT}"
+fi
 echo "=== done ==="

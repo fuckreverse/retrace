@@ -540,6 +540,8 @@ add_library(tenet_lib STATIC
     src/tui/panels/breakpoint_panel.cpp
     src/tui/panels/results_panel.cpp
     src/service/tenet_service.cpp
+    src/cli_options.cpp
+    src/cli/trace_dump.cpp
 )
 
 target_include_directories(tenet_lib BEFORE PUBLIC
@@ -690,7 +692,7 @@ src/gui/popups.cpp
 endif()
 
 # ─── Main executable ────────────────────────────────────────────────────────
-add_executable(tenet src/main.cpp src/cli_options.cpp src/batch_analysis.cpp)
+add_executable(tenet src/main.cpp src/batch_analysis.cpp)
 
 if(TENET_ENABLE_GUI)
     # tenet_gui_lib already PUBLIC-links tenet_lib; no need to add tenet_lib again

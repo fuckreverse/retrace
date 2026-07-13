@@ -6,6 +6,7 @@
 // in main() with a single struct + parse function.
 // ═══════════════════════════════════════════════════════════════════════════
 
+#include "cli/trace_dump.h"
 #include "io/mcp/mcp_server.h"               // McpHttpConfig
 #include "io/mcp/mcp_hub.h"                  // McpHubConfig
 
@@ -27,6 +28,10 @@ struct CliOptions {
     bool show_regs = false;
     bool show_mem = false;
     bool show_index_stats = false;
+
+    // --- Trace dump mode (no RocksDB) ---
+    bool opt_dump = false;
+    DumpOptions dump_options{};
 
     // --- Analysis options ---
     std::string export_cfg_path;

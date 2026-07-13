@@ -5,13 +5,12 @@
 # This script:
 #   1. Builds the advanced benchmark harness (all targets + tracer)
 #   2. Runs instrumented tracing for all targets
-#   3. Decodes trace files (summary or full)
+#   3. Decodes trace files using tenet --dump (summary or full)
 #   4. Optionally runs tenet analysis on each trace
 #
 # Prerequisites:
 #   - macOS arm64 QBDI static libs in build-macos/ (libQBDI.a, libqbdi-llvm.a)
-#   - capstone (brew install capstone)
-#   - tenet binary (optional, for analysis step)
+#   - tenet binary at ../../../tools/tenet/build/tenet
 #
 # Usage:
 #   sh run_advanced.sh [options]
@@ -36,13 +35,13 @@ BENCH_DIR="$(cd "${HERE}/.." && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
 TRACE_DIR="${ROOT}/tools/qbditrace"
 BUILD="${ROOT}/build-macos"
+TENET="${ROOT}/tools/tenet/build/tenet"
 OUTDIR="/tmp/qbditrace-advanced"
 SEED="0x1234567890ABCDEF"
 GROUP=""
 FILTER=""
 CSV=""
 DECODE="summary"
-TENET_BIN=""
 TENET_PASSES="all"
 VERBOSE=""
 
@@ -53,7 +52,7 @@ while [ $# -gt 0 ]; do
     --group)        GROUP="--group $2"; shift 2 ;;
     --filter)       FILTER="--filter $2"; shift 2 ;;
     --output-dir)   OUTDIR="$2"; shift 2 ;;
-    --tenet)        TENET_BIN="$2"; shift 2 ;;
+    --tenet)        TENET="$2"; shift 2 ;;
     --tenet-passes) TENET_PASSES="$2"; shift 2 ;;
     --decode-all)   DECODE="all"; shift ;;
     --no-decode)    DECODE="none"; shift ;;
@@ -76,12 +75,10 @@ if [ ! -f "${BUILD}/libQBDI.a" ]; then
   exit 1
 fi
 
-CAPSTONE_PREFIX="$(brew --prefix capstone 2>/dev/null || echo /opt/homebrew/opt/capstone)"
-if [ ! -d "${CAPSTONE_PREFIX}/include" ]; then
-  echo "WARNING: capstone not found; decoder will skip disassembly"
-  HAVE_CAPSTONE=0
-else
-  HAVE_CAPSTONE=1
+if [ ! -x "${TENET}" ]; then
+  echo "WARNING: tenet not found at ${TENET}; decode step will be skipped"
+  echo "Build it with: cd tools/tenet/build && ninja"
+  DECODE="none"
 fi
 
 echo ""
@@ -161,40 +158,24 @@ echo ""
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Step 3: Decode traces
+# Step 3: Decode traces using tenet --dump
 # ═══════════════════════════════════════════════════════════════════════════
-echo "═══ [3/4] Building decoder and decoding traces ═══"
-
-DECODER="/tmp/trace_decode_advanced"
-if [ "${HAVE_CAPSTONE}" = "1" ]; then
-  clang++ -std=c++17 -O2 -Wall -Wextra \
-    -DQBDITRACE_HAVE_CAPSTONE=1 \
-    -I"${CAPSTONE_PREFIX}/include" \
-    "${TRACE_DIR}/decoder/trace_decode.cpp" \
-    -L"${CAPSTONE_PREFIX}/lib" -lcapstone \
-    -o "${DECODER}"
-else
-  clang++ -std=c++17 -O2 -Wall -Wextra \
-    "${TRACE_DIR}/decoder/trace_decode.cpp" \
-    -o "${DECODER}"
-fi
-echo "  → ${DECODER}"
+echo "═══ [3/4] Decoding traces via tenet ═══"
 echo ""
 
 if [ "${DECODE}" = "none" ]; then
   echo "  (decode skipped by --no-decode)"
 elif [ "${DECODE}" = "summary" ]; then
   echo "─── Trace file summary ───"
-  printf "%-28s %10s %12s %s\n" "FILE" "SIZE" "INSTR_CT" "FIRST_PC"
-  printf "%-28s %10s %12s %s\n" "────" "────" "────────" "────────"
+  printf "%-28s %10s %12s %s\n" "FILE" "SIZE" "FIRST_PC" "NOTE"
+  printf "%-28s %10s %12s %s\n" "────" "────" "─────────" "────"
   for f in "${OUTDIR}"/*.bin; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     sz="$(wc -c < "$f" | tr -d ' ')"
-    # Get instruction count from decoder
-    count=$("${DECODER}" "$f" --format count 2>/dev/null || echo "?")
-    first=$("${DECODER}" "$f" --limit 1 2>/dev/null | grep "^0x" | head -1)
-    printf "%-28s %10s %12s %s\n" "$name" "${sz}" "${count}" "${first}"
+    # Get first instruction PC from tenet --dump
+    first=$("${TENET}" --dump text "$f" --dump-limit 1 2>/dev/null | grep "^0x" | head -1)
+    printf "%-28s %10s %12s %s\n" "$name" "${sz}" "${first}" ""
   done
 elif [ "${DECODE}" = "all" ]; then
   for f in "${OUTDIR}"/*.bin; do
@@ -202,7 +183,7 @@ elif [ "${DECODE}" = "all" ]; then
     name="$(basename "$f" .bin)"
     echo ""
     echo "─── ${name} ───"
-    "${DECODER}" "$f" --limit 100 2>/dev/null | head -80
+    "${TENET}" --dump text "$f" --dump-limit 100 2>/dev/null | head -80
     echo "  ..."
   done
 fi
@@ -212,7 +193,7 @@ echo ""
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 4: Tenet analysis (if available)
 # ═══════════════════════════════════════════════════════════════════════════
-if [ -n "${TENET_BIN}" ] && [ -x "${TENET_BIN}" ]; then
+if [ -x "${TENET}" ]; then
   echo "═══ [4/4] Running tenet analysis ═══"
   echo ""
 
@@ -228,12 +209,12 @@ if [ -n "${TENET_BIN}" ] && [ -x "${TENET_BIN}" ]; then
 
     # Run tenet with specified passes
     if [ "${TENET_PASSES}" = "all" ]; then
-      "${TENET_BIN}" analyze "$f" \
+      "${TENET}" analyze "$f" \
         --output "${REPORT}" \
         --passes pattern,cfg,taint,xref,function,call_graph \
         2>/dev/null || echo "    ⚠ tenet analysis failed for ${name}"
     else
-      "${TENET_BIN}" analyze "$f" \
+      "${TENET}" analyze "$f" \
         --output "${REPORT}" \
         --passes "${TENET_PASSES}" \
         2>/dev/null || echo "    ⚠ tenet analysis failed for ${name}"
@@ -275,11 +256,7 @@ except Exception as e:
   echo "  Reports saved to: ${REPORT_DIR}/"
 else
   echo "═══ [4/4] Tenet analysis ═══"
-  if [ -z "${TENET_BIN}" ]; then
-    echo "  (skipped — use --tenet <path> to enable)"
-  else
-    echo "  (skipped — tenet binary not found at ${TENET_BIN})"
-  fi
+  echo "  (skipped — build tenet first: cd tools/tenet/build && ninja)"
 fi
 
 echo ""
@@ -288,14 +265,9 @@ echo "  Done! Trace files: ${OUTDIR}/"
 echo ""
 echo "  Quick commands:"
 echo "    # Decode a specific trace:"
-echo "    ${DECODER} ${OUTDIR}/<target>.bin"
+echo "    ${TENET} --dump text ${OUTDIR}/<target>.bin"
 echo ""
 echo "    # Decode as JSONL:"
-echo "    ${DECODER} ${OUTDIR}/<target>.bin --format jsonl"
+echo "    ${TENET} --dump jsonl ${OUTDIR}/<target>.bin"
 echo ""
-if [ -n "${TENET_BIN}" ]; then
-  echo "    # Re-run tenet on a single trace:"
-  echo "    ${TENET_BIN} analyze ${OUTDIR}/<target>.bin --passes pattern,cfg,taint"
-  echo ""
-fi
 echo "═══════════════════════════════════════════════════════════════════════"

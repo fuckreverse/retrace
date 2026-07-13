@@ -503,7 +503,7 @@ Variable tail: str_count × (4 + str_len + 1 + pad)，最多 ≈ 1 KB
 > **已知格式限制**：进程内配置表的 `api_id` 是 `uint16_t`，但
 > `qbditrace_capicall_head_t.api_id` 的磁盘字段仍为 `uint8_t`。因此所有 `api_id >= 256`
 > 的值都会在写盘时截断；下表中的 JNI、Android/BoringSSL 与其它扩展 ID 不能可靠
-> round-trip。修复需要 widening 字段并同步 tracer、`trace_decode`、tenet 的格式版本。
+> round-trip。修复需要 widening 字段并同步 tracer 与 tenet 的格式版本。
 
 **api_id 分组速览**（来自 `qbditrace_capi_id_t`）：
 

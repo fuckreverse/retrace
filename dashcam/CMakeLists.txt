@@ -4,7 +4,6 @@
 # Produces three categories of artifacts:
 #
 #   * libqbditrace (SHARED)  — tracer dylib, loaded into the target by Frida
-#   * trace_decode (host)    — offline decoder (optional, -DQBDITRACE_BUILD_DECODER)
 #   * unit / integration tests (host) — lightweight, no QBDI required
 #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -13,7 +12,7 @@
 #
 #   Directory               Purpose                          cmake command
 #   ──────────────────────  ───────────────────────────────── ─────────────
-#   build/                  Host tests + decoder (default)   cmake ..
+#   build/                  Host tests (default)             cmake ..
 #   build-ios/              iOS dylib (cross-compile)        (see below)
 #   build-android/          Android .so (cross-compile)      (see below)
 #
@@ -24,7 +23,7 @@
 #
 #   cd tools/qbditrace/build && ninja -j$(nproc)
 #
-# First-time setup (host tests + decoder):
+# First-time setup (host tests):
 #
 #   cd tools/qbditrace && mkdir build && cd build
 #   cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF
@@ -43,7 +42,7 @@
 #         -DQBDI_INCLUDE_DIR=$PWD/include \
 #         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-ios/include;$PWD/build-ios/include-static" \
 #         -DQBDI_STATIC_LIB=$PWD/build-ios/libQBDI.a \
-#         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF \
+#         -DQBDITRACE_BUILD_DYLIB=ON \
 #         -DQBDITRACE_BUILD_TESTS=OFF
 #   cmake --build tools/qbditrace/build-ios
 #
@@ -59,7 +58,7 @@
 #         -DQBDI_INCLUDE_DIR=$PWD/include \
 #         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-android/include;$PWD/build-android/include-static" \
 #         -DQBDI_STATIC_LIB=$PWD/build-android/libQBDI.a \
-#         -DQBDITRACE_BUILD_DYLIB=ON -DQBDITRACE_BUILD_DECODER=OFF \
+#         -DQBDITRACE_BUILD_DYLIB=ON \
 #         -DQBDITRACE_BUILD_TESTS=OFF
 #   cmake --build tools/qbditrace/build-android
 
@@ -73,7 +72,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(QBDITRACE_BUILD_DYLIB "Build the tracer dylib" ON)
-option(QBDITRACE_BUILD_DECODER "Build the offline decoder (host tool)" ON)
 option(QBDITRACE_BUILD_TESTS "Build unit tests (host)" ON)
 option(QBDITRACE_ENABLE_ZSTD "Enable zstd compression for trace output" ON)
 
@@ -164,26 +162,11 @@ if(QBDITRACE_BUILD_DYLIB)
 endif()
 
 # ---------------------------------------------------------------------------
-# Offline decoder (host build)
+# NOTE: The offline decoder (trace_decode) has been removed.
+# Use tenet --dump text|jsonl instead:
+#   tenet --dump text trace.bin       # human-readable listing
+#   tenet --dump jsonl trace.bin      # machine-readable JSON Lines
 # ---------------------------------------------------------------------------
-if(QBDITRACE_BUILD_DECODER)
-  add_executable(trace_decode decoder/trace_decode.cpp)
-  target_include_directories(trace_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-  # Try to locate Capstone for disassembly; degrade gracefully if absent.
-  find_path(CAPSTONE_INCLUDE_DIR capstone/capstone.h)
-  find_library(CAPSTONE_LIBRARY NAMES capstone)
-  if(CAPSTONE_INCLUDE_DIR AND CAPSTONE_LIBRARY)
-    message(STATUS "qbditrace decoder: Capstone found, disassembly enabled")
-    target_compile_definitions(trace_decode PRIVATE QBDITRACE_HAVE_CAPSTONE=1)
-    target_include_directories(trace_decode PRIVATE ${CAPSTONE_INCLUDE_DIR})
-    target_link_libraries(trace_decode PRIVATE ${CAPSTONE_LIBRARY})
-  else()
-    message(WARNING
-      "qbditrace decoder: Capstone not found; will emit raw opcode words only. "
-      "Install capstone (brew install capstone) for full disassembly.")
-  endif()
-endif()
 
 # ---------------------------------------------------------------------------
 # Unit tests (host build)
@@ -349,6 +332,11 @@ if(QBDITRACE_BUILD_TESTS)
             "${_tenet_src_dir}/_deps/nlohmann_json-src/include"    # nlohmann::json
             "${_tenet_src_dir}/_deps/capstone-src/include"
         )
+
+        # TBB headers (oneTBB fetched by tenet via FetchContent)
+        if(EXISTS "${_tenet_src_dir}/_deps/onetbb-src/include")
+          list(APPEND _tenet_inc_dirs "${_tenet_src_dir}/_deps/onetbb-src/include")
+        endif()
         set_target_properties(tenet_lib PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${_tenet_inc_dirs}")
 
@@ -395,6 +383,26 @@ if(QBDITRACE_BUILD_TESTS)
           list(APPEND _tenet_extra_libs "${_lz4_lib}")
         endif()
         unset(_lz4_lib)
+
+        # TBB (oneTBB — built by tenet via FetchContent; the static lib lands in
+        # a compiler-id subdirectory under the tenet build tree, e.g.
+        #   <build>/appleclang_17.0_cxx17_64_relwithdebinfo/libtbb.a
+        # Use file(GLOB_RECURSE) to find it regardless of the exact subdir name.)
+        file(GLOB_RECURSE _tbb_lib "${TENET_BUILD_DIR}/*/libtbb.a")
+        if(_tbb_lib)
+          list(GET _tbb_lib 0 _tbb_lib)
+          list(APPEND _tenet_extra_libs "${_tbb_lib}")
+          message(STATUS "qbditrace: found TBB at ${_tbb_lib}")
+        else()
+          # Fallback: try system-installed TBB
+          find_library(_tbb_sys_lib NAMES tbb)
+          if(_tbb_sys_lib)
+            list(APPEND _tenet_extra_libs "${_tbb_sys_lib}")
+            message(STATUS "qbditrace: found system TBB at ${_tbb_sys_lib}")
+          endif()
+          unset(_tbb_sys_lib)
+        endif()
+        unset(_tbb_lib)
 
         if(_tenet_extra_libs)
           set_target_properties(tenet_lib PROPERTIES

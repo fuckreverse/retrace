@@ -2006,7 +2006,7 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
          * see QBDITrace.h), but qbditrace_capicall_head_t::api_id on disk is
          * uint8_t (TraceFormat.h) — this narrows and silently truncates any
          * id >= 256 (all Android/BoringSSL + most JNI-extended ids). Needs a
-         * trace format bump to fix properly (tracer + trace_decode + tenet
+         * trace format bump to fix properly (tracer + tenet
          * must agree); not fixed yet, tracked via the FIXME in
          * TraceFormat.h next to qbditrace_capicall_head_t. */
         ch.api_id    = static_cast<uint8_t>(cf->api_id);

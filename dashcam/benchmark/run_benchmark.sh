@@ -5,13 +5,12 @@
 # This script:
 #   1. Builds the benchmark harness (tracer + all targets + harness) → single binary
 #   2. Runs it with configurable seed, producing trace files for each target
-#   3. Builds the offline decoder
-#   4. Decodes all traces and collects statistics
-#   5. Optionally runs the decoder with --format jsonl for machine-parseable output
+#   3. Decodes traces using tenet --dump and collects statistics
+#   4. Optionally runs tenet --dump jsonl for machine-parseable output
 #
 # Prerequisites:
 #   - macOS arm64 QBDI static libs in ../../build-macos/ (libQBDI.a, libqbdi-llvm.a)
-#   - capstone (brew install capstone)
+#   - tenet binary at ../../tools/tenet/build/tenet
 #
 # Usage:
 #   sh run_benchmark.sh [options]
@@ -33,6 +32,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../.." && pwd -P)"
 TRACE_DIR="${ROOT}/tools/qbditrace"
 BUILD="${ROOT}/build-macos"
+TENET="${ROOT}/tools/tenet/build/tenet"
 OUTDIR="/tmp/qbditrace-bench"
 SEED="0x1234567890ABCDEF"
 FILTER=""
@@ -67,12 +67,10 @@ if [ ! -f "${BUILD}/libQBDI.a" ]; then
   exit 1
 fi
 
-CAPSTONE_PREFIX="$(brew --prefix capstone 2>/dev/null || echo /opt/homebrew/opt/capstone)"
-if [ ! -d "${CAPSTONE_PREFIX}/include" ]; then
-  echo "WARNING: capstone not found at ${CAPSTONE_PREFIX}; decoder will skip disassembly"
-  HAVE_CAPSTONE=0
-else
-  HAVE_CAPSTONE=1
+if [ ! -x "${TENET}" ]; then
+  echo "WARNING: tenet not found at ${TENET}; decode step will be skipped"
+  echo "Build it with: cd tools/tenet/build && ninja"
+  DECODE="none"
 fi
 
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -81,7 +79,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # ── Step 1: Build benchmark executable ──
-echo "=== [1/4] Building benchmark executable ==="
+echo "=== [1/3] Building benchmark executable ==="
 clang++ -std=c++17 -O2 -g \
   -Wno-deprecated-declarations \
   -I"${TRACE_DIR}" \
@@ -100,30 +98,13 @@ echo "  → /tmp/qbditrace-bench-exe"
 
 # ── Step 2: Run benchmark ──
 echo ""
-echo "=== [2/4] Running benchmark (seed=${SEED}) ==="
+echo "=== [2/3] Running benchmark (seed=${SEED}) ==="
 echo ""
 /tmp/qbditrace-bench-exe --seed "${SEED}" --output-dir "${OUTDIR}" ${FILTER} ${CSV}
 echo ""
 
-# ── Step 3: Build decoder ──
-echo "=== [3/4] Building decoder ==="
-if [ "${HAVE_CAPSTONE}" = "1" ]; then
-  clang++ -std=c++17 -O2 -Wall -Wextra \
-    -DQBDITRACE_HAVE_CAPSTONE=1 \
-    -I"${CAPSTONE_PREFIX}/include" \
-    "${TRACE_DIR}/decoder/trace_decode.cpp" \
-    -L"${CAPSTONE_PREFIX}/lib" -lcapstone \
-    -o /tmp/trace_decode_bench
-else
-  clang++ -std=c++17 -O2 -Wall -Wextra \
-    "${TRACE_DIR}/decoder/trace_decode.cpp" \
-    -o /tmp/trace_decode_bench
-fi
-echo "  → /tmp/trace_decode_bench"
-
-# ── Step 4: Decode traces ──
-echo ""
-echo "=== [4/4] Decoding traces ==="
+# ── Step 3: Decode traces ──
+echo "=== [3/3] Decoding traces via tenet ==="
 
 if [ "${DECODE}" = "none" ]; then
   echo "  (skipped by --no-decode)"
@@ -137,8 +118,8 @@ elif [ "${DECODE}" = "summary" ]; then
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     sz="$(wc -c < "$f" | tr -d ' ')"
-    # Decode first 3 instructions to show it works
-    first=$(/tmp/trace_decode_bench "$f" --limit 1 2>/dev/null | grep "^0x" | head -1)
+    # Decode first instruction to show it works
+    first=$("${TENET}" --dump text "$f" --dump-limit 1 2>/dev/null | grep "^0x" | head -1)
     printf "%-20s %12s %s\n" "$name" "${sz}B" "$first"
   done
 elif [ "${DECODE}" = "all" ]; then
@@ -149,9 +130,9 @@ elif [ "${DECODE}" = "all" ]; then
     echo "─── ${name} ───"
     LIMIT_ARG=""
     if [ -n "${LIMIT}" ]; then
-      LIMIT_ARG="--limit ${LIMIT}"
+      LIMIT_ARG="--dump-limit ${LIMIT}"
     fi
-    /tmp/trace_decode_bench "$f" ${LIMIT_ARG} 2>/dev/null | head -60
+    "${TENET}" --dump text "$f" ${LIMIT_ARG} 2>/dev/null | head -60
     echo "  ..."
   done
 fi
@@ -159,10 +140,10 @@ fi
 echo ""
 echo "═══ Done ═══"
 echo "Trace files: ${OUTDIR}/"
-echo "Decoder:     /tmp/trace_decode_bench"
+echo "Decoder:     ${TENET} --dump text"
 echo ""
 echo "To decode a specific trace:"
-echo "  /tmp/trace_decode_bench ${OUTDIR}/<target>.bin"
+echo "  ${TENET} --dump text ${OUTDIR}/<target>.bin"
 echo ""
 echo "To decode as JSONL (machine-readable):"
-echo "  /tmp/trace_decode_bench ${OUTDIR}/<target>.bin --format jsonl"
+echo "  ${TENET} --dump jsonl ${OUTDIR}/<target>.bin"
