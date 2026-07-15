@@ -4,6 +4,7 @@
 // Split out of gui_app.mm. Pure C++ (no ObjC/Metal).
 
 #include "gui/gui_app.h"
+#include "common/progress_manager.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/misc/thread_pass.h"
 #include "analysis/passes/memory/string_pass.h"
@@ -1245,29 +1246,19 @@ void GuiApp::render_status_bar() {
     if (show_loops_ && loop_result_) {
         right += fmt::format("  [" ICON_FA_ARROW_ROTATE_LEFT " {}L]", loop_result_->loops.size());
     }
-    if (analysis_running_.load() && pass_manager_) {
-        // Find running passes and show the first one's name + progress.
-        int running_count = 0;
-        std::string_view running_name;
-        float running_pct = 0.0f;
-        for (auto name : pass_manager_->all_passes()) {
-            if (pass_manager_->state(name) == PassManager::PassState::Running) {
-                running_count++;
-                if (running_count == 1) {
-                    running_name = name;
-                    running_pct  = pass_manager_->progress_of(name);
-                }
-            }
+    if (analysis_running_.load()) {
+        auto tasks = ProgressManager::global().snapshot("pass");
+        std::vector<ProgressTask> running;
+        for (const auto& task : tasks) {
+            if (task.state == ProgressState::Running) running.push_back(task);
         }
-        if (running_count == 1) {
-            std::string_view display = running_name;
-            if (auto* cat = tenet::find_pass_catalog_entry(running_name))
-                display = cat->display_name;
-            right += fmt::format("  \xe2\xa3\xbe {} {:d}%", display, (int)(running_pct * 100));
-        } else if (running_count > 1) {
-            right += fmt::format("  \xe2\xa3\xbe {} passes", running_count);
+        if (running.size() == 1) {
+            right += fmt::format("  \xe2\xa3\xbe {} {:d}%", running.front().label,
+                                 static_cast<int>(running.front().progress * 100));
+        } else if (running.size() > 1) {
+            right += fmt::format("  \xe2\xa3\xbe {} passes", running.size());
         } else {
-            right += "  \xe2\xa3\xbe Analyzing...";  // still transitioning
+            right += "  \xe2\xa3\xbe Analyzing...";
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include "analysis/pass_registry.h"
 #include "analysis/pass_manager.h"
+#include "common/progress_manager.h"
 
 #include "analysis/passes/structure/cfg_pass.h"
 #include "analysis/passes/structure/cfg_layout_pass.h"
@@ -391,8 +392,11 @@ Element ResultsPanel::render_catalog() {
         if (st == PassManager::PassState::Completed && ctx_.pass_manager) {
             auto entries = build_result_entries(ctx_, entry.name);
             summary = !entries.empty() ? fmt::format("{} items", entries.size()) : "";
-        } else if (st == PassManager::PassState::Running) {
-            summary = fmt::format("{:.0f}%", ctx_.pass_manager->progress_of(entry.name) * 100.0f);
+    } else if (st == PassManager::PassState::Running) {
+        auto task = ProgressManager::global().get("pass:" + std::string(entry.name));
+        summary = task ? fmt::format("{:.0f}% {}", task->progress * 100.0f,
+                                     task->message)
+                       : "running";
         } else if (st == PassManager::PassState::Failed) {
             summary = "failed";
         }

@@ -158,10 +158,12 @@ export const api = {
     return route(() => ws.wsGetPassCatalog(), () => mock.mockPasses());
   },
 
-  /**
-   * 真正触发后端运行一个 pass（阻塞式：RunPassReq 在事件循环上同步执行，
-   * 响应返回时 pass 已完成或失败）。WS 不可用时在 mock 模式下本地模拟。
-   */
+  async progress(): Promise<ws.ProgressTask[]> {
+    if (wsUnavailable) return [];
+    return ws.wsGetProgress();
+  },
+
+  /** 触发后端异步运行一个 pass；状态与百分比统一由 progress() 查询。 */
   async runPass(name: string): Promise<{ ok: boolean; message: string }> {
     if (wsUnavailable) return mock.mockRunPass(name);
     try {

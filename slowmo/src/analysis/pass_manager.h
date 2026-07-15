@@ -128,7 +128,7 @@ public:
     // Range
     const AnalysisRange& range() const { return range_; }
 
-    // Progress — writes to per-pass atomics so the UI can render live progress.
+    // Progress — publishes to the shared ProgressManager task stream.
     void progress(float pct);
     void progress(float pct, std::string_view msg);
     /// True if the user requested cancellation (global or per-pass).
@@ -149,9 +149,7 @@ private:
     PassManager& manager_;
     AnalysisRange range_;
 
-    // Set by PassManager::execute_pass to point to this pass's progress atomics.
-    // Stored as raw pointers (non-owning) for lock-free hot-path access.
-    std::atomic<float>* progress_pct_ = nullptr;
+    // Set by PassManager::execute_pass for per-pass cancellation checks.
     std::atomic<bool>*  cancelled_flag_ = nullptr;
     std::string_view    pass_name_;  // for progress-message lookup
 
@@ -339,13 +337,6 @@ public:
     /// Returns the number of blobs deleted.
     size_t clear_all_blobs();
 
-    /// Per-pass progress in [0,1].  Returns 0 for unknown / not-yet-run passes.
-    float progress_of(std::string_view pass_name) const;
-
-    /// Per-pass progress message (e.g. "Collecting memory bytes...").
-    /// Returns empty string if pass not found or no message set.
-    std::string progress_msg_of(std::string_view pass_name) const;
-
     /// Per-pass cancellation flag.
     bool is_pass_cancelled(std::string_view pass_name) const;
 
@@ -393,14 +384,8 @@ private:
         std::atomic<size_t> pending_deps{0};   // # of deps not yet completed
         std::vector<size_t> dependents;        // indices of passes that depend on this one
 
-        // Per-pass progress + cancellation (read by UI, written by PassContext).
-        // progress_pct is a lock-free atomic for the hot path; progress_msg
-        // is mutex-protected because string writes aren't atomic.
-        std::atomic<float> progress_pct{0.0f};
-        std::atomic<bool>  cancelled{false};
-        bool               scan_executed{false};  // prevents re-scan in require() path
-        mutable std::mutex progress_mtx;   // protects progress_msg (mutable for const queries)
-        std::string        progress_msg;
+        std::atomic<bool> cancelled{false};
+        bool scan_executed{false};  // prevents re-scan in require() path
     };
 
     PassEntry* find_entry(std::string_view name);
@@ -419,9 +404,6 @@ private:
     /// Build the reverse dependency graph (dependents[] + pending_deps)
     /// on all entries.  Called once at the start of run_all_parallel.
     void build_dependency_graph();
-
-    /// Set the progress message for a pass (called by PassContext::progress).
-    void set_progress_msg(std::string_view pass_name, std::string_view msg);
 
     std::vector<std::unique_ptr<PassEntry>> entries_;
     std::unordered_map<std::string_view, PassEntry*> name_map_;
@@ -457,7 +439,7 @@ private:
 
     static PassResult not_found_result_;
 
-    friend class PassContext;  // PassContext calls set_progress_msg / is_cancelled
+    friend class PassContext;
 };
 
 // ─── Template implementations ─────────────────────────────────────────────

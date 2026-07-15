@@ -24,7 +24,6 @@ enum MessageType : uint16 {
     RunPassReq = 30,
     RunDefaultPassesReq = 31,
     ClearAnalysisReq = 32,
-    GetPassStateReq = 33,
     GetPassResultReq = 34,
     GetPassCatalogReq = 35,
     GetProgressReq = 36,
@@ -53,7 +52,6 @@ enum MessageType : uint16 {
     RunPassResp = 130,
     RunDefaultPassesResp = 131,
     ClearAnalysisResp = 132,
-    GetPassStateResp = 133,
     GetPassResultResp = 134,
     GetPassCatalogResp = 135,
     GetProgressResp = 136,
@@ -66,7 +64,6 @@ enum MessageType : uint16 {
     // Server push (server → client, msg_id=0)
     EvtNavigation = 200,
     EvtPassCompleted = 201,
-    EvtPassProgress = 202,
     EvtBookmarkChanged = 203,
 
     // Error
@@ -209,14 +206,6 @@ table RunDefaultPassesResponse {
 
 table ClearAnalysisResponse { ok: bool; }
 
-table GetPassStateRequest { name: string; }
-table GetPassStateResponse {
-    name: string;
-    state: PassState;
-    progress: float;
-    message: string;
-}
-
 table GetPassResultRequest {
     name: string;
     format: string;
@@ -321,12 +310,6 @@ table EvtPassCompletedMsg {
     name: string;
     ok: bool;
     summary: string;
-}
-
-table EvtPassProgressMsg {
-    name: string;
-    progress: float;
-    message: string;
 }
 
 table EvtBookmarkChangedMsg { bookmarks: [uint64]; }

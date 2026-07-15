@@ -73,6 +73,7 @@ public:
     void fail(std::string_view id, std::string_view error);
     void cancel(std::string_view id, std::string_view message = {});
     void erase(std::string_view id);
+    void erase_kind(std::string_view kind);
 
     std::optional<ProgressTask> get(std::string_view id) const;
     std::vector<ProgressTask> snapshot(std::string_view kind = {}) const;

@@ -64,9 +64,6 @@ void TenetWSService::handle_run_pass(void* ws, uint32_t msg_id,
         return;
     }
 
-    // Ensure PassManager exists
-    service_.ensure_pass_manager();
-
     // Build PassRunCtx from request fields
     PassRunCtx ctx{};
     ctx.current_inst = service_.current_inst();
@@ -78,69 +75,50 @@ void TenetWSService::handle_run_pass(void* ws, uint32_t msg_id,
         ctx.current_reg = static_cast<uint8_t>((*req->taint_regs())[0]);
     }
 
-    // Synchronous: blocks event loop. TenetService is not thread-safe.
-    bool ok = service_.run_pass(name, ctx);
-
     flatbuffers::FlatBufferBuilder fbb(256);
     auto name_off = fbb.CreateString(name);
-    auto msg_off = fbb.CreateString(ok ? "completed" : "failed");
-    auto resp = fbs::CreateRunPassResponse(fbb, name_off, ok, msg_off);
+    auto msg_off = fbb.CreateString("accepted");
+    auto resp = fbs::CreateRunPassResponse(fbb, name_off, true, msg_off);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_RunPassResp, fbb);
+
+    ProgressManager::global().start("pass:" + name, "pass", name, 0, "queued");
+    std::lock_guard<std::mutex> workers_lock(workers_mutex_);
+    for (auto it = analysis_workers_.begin(); it != analysis_workers_.end();) {
+        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            it = analysis_workers_.erase(it);
+        else
+            ++it;
+    }
+    analysis_workers_.push_back(std::async(std::launch::async,
+        [this, name = std::move(name), ctx]() {
+            std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
+            service_.run_pass(name, ctx);
+        }));
 }
 
 void TenetWSService::handle_run_default_passes(void* ws, uint32_t msg_id) {
-    // Synchronous: blocks event loop.
-    service_.run_default_passes();
-
     flatbuffers::FlatBufferBuilder fbb(64);
-    auto msg_off = fbb.CreateString("default passes completed");
+    auto msg_off = fbb.CreateString("accepted");
     auto resp = fbs::CreateRunDefaultPassesResponse(fbb, true, msg_off);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_RunDefaultPassesResp, fbb);
+
+    std::lock_guard<std::mutex> workers_lock(workers_mutex_);
+    analysis_workers_.push_back(std::async(std::launch::async, [this]() {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
+        service_.run_default_passes();
+    }));
 }
 
 void TenetWSService::handle_clear_analysis(void* ws, uint32_t msg_id) {
+    std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
     service_.clear_analysis();
 
     flatbuffers::FlatBufferBuilder fbb(32);
     auto resp = fbs::CreateClearAnalysisResponse(fbb, true);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_ClearAnalysisResp, fbb);
-}
-
-void TenetWSService::handle_get_pass_state(void* ws, uint32_t msg_id,
-                                            const uint8_t* payload, size_t len) {
-    if (!payload || len == 0) {
-        send_error(ws, msg_id, 2, "GetPassState: missing payload");
-        return;
-    }
-    auto* req = flatbuffers::GetRoot<fbs::GetPassStateRequest>(payload);
-    std::string name = req->name() ? req->name()->str() : "";
-
-    auto* pm = service_.pass_manager();
-    fbs::PassState fb_state = fbs::PassState_NotRun;
-    float progress = 0.0f;
-    std::string msg;
-
-    if (pm) {
-        auto pm_state = pm->state(name);
-        switch (pm_state) {
-        case PassManager::PassState::NotRun:    fb_state = fbs::PassState_NotRun; break;
-        case PassManager::PassState::Running:   fb_state = fbs::PassState_Running; break;
-        case PassManager::PassState::Completed: fb_state = fbs::PassState_Completed; break;
-        case PassManager::PassState::Failed:    fb_state = fbs::PassState_Failed; break;
-        }
-        progress = pm->progress_of(name);
-        msg = pm->progress_msg_of(name);
-    }
-
-    flatbuffers::FlatBufferBuilder fbb(256);
-    auto name_off = fbb.CreateString(name);
-    auto msg_off = fbb.CreateString(msg);
-    auto resp = fbs::CreateGetPassStateResponse(fbb, name_off, fb_state, progress, msg_off);
-    fbb.Finish(resp);
-    send_envelope(ws, msg_id, fbs::MessageType_GetPassStateResp, fbb);
 }
 
 void TenetWSService::handle_get_pass_result(void* ws, uint32_t msg_id,
@@ -205,6 +183,7 @@ void TenetWSService::handle_get_pass_catalog(void* ws, uint32_t msg_id) {
     std::vector<flatbuffers::Offset<fbs::PassCatalogEntry>> entries;
 
     if (pm) {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
         auto passes = pm->all_passes();
         entries.reserve(passes.size());
         for (auto pass_name : passes) {
@@ -244,6 +223,7 @@ void TenetWSService::handle_get_call_stack(void* ws, uint32_t msg_id,
     // Need the function pass result
     auto* func_result = service_.pass_result<FunctionResult>("function");
     if (!func_result) {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
         service_.ensure_pass_manager();
         service_.run_pass("function");
         func_result = service_.pass_result<FunctionResult>("function");
@@ -340,6 +320,7 @@ void TenetWSService::handle_get_write_history(void* ws, uint32_t msg_id,
 void TenetWSService::handle_get_functions(void* ws, uint32_t msg_id) {
     auto* func_result = service_.pass_result<FunctionResult>("function");
     if (!func_result) {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
         service_.ensure_pass_manager();
         service_.run_pass("function");
         func_result = service_.pass_result<FunctionResult>("function");

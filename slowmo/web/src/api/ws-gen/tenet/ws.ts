@@ -9,7 +9,6 @@ export { ErrorResponse, ErrorResponseT } from './ws/error-response.js';
 export { EvtBookmarkChangedMsg, EvtBookmarkChangedMsgT } from './ws/evt-bookmark-changed-msg.js';
 export { EvtNavigationMsg, EvtNavigationMsgT } from './ws/evt-navigation-msg.js';
 export { EvtPassCompletedMsg, EvtPassCompletedMsgT } from './ws/evt-pass-completed-msg.js';
-export { EvtPassProgressMsg, EvtPassProgressMsgT } from './ws/evt-pass-progress-msg.js';
 export { FetchRowsRequest, FetchRowsRequestT } from './ws/fetch-rows-request.js';
 export { FetchRowsResponse, FetchRowsResponseT } from './ws/fetch-rows-response.js';
 export { FunctionEntry, FunctionEntryT } from './ws/function-entry.js';
@@ -22,8 +21,6 @@ export { GetLastWriterResponse, GetLastWriterResponseT } from './ws/get-last-wri
 export { GetPassCatalogResponse, GetPassCatalogResponseT } from './ws/get-pass-catalog-response.js';
 export { GetPassResultRequest, GetPassResultRequestT } from './ws/get-pass-result-request.js';
 export { GetPassResultResponse, GetPassResultResponseT } from './ws/get-pass-result-response.js';
-export { GetPassStateRequest, GetPassStateRequestT } from './ws/get-pass-state-request.js';
-export { GetPassStateResponse, GetPassStateResponseT } from './ws/get-pass-state-response.js';
 export { GetProgressResponse, GetProgressResponseT } from './ws/get-progress-response.js';
 export { GetRegsRequest, GetRegsRequestT } from './ws/get-regs-request.js';
 export { GetRegsResponse, GetRegsResponseT } from './ws/get-regs-response.js';

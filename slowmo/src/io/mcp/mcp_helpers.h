@@ -6,6 +6,7 @@
 #include "analysis/pass_manager.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/crypto/pattern_pass.h"
+#include "common/progress_manager.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -77,9 +78,9 @@ inline const ResultT& require_pass(PassManager* pm, std::string_view pass_name,
     }
 
     // Return progress info for the response.
-    float pct = pm->progress_of(pass_name);
-    std::string msg = pm->progress_msg_of(pass_name);
-    throw PassNotReady(std::string(pass_name), pct, std::move(msg));
+    auto task = ProgressManager::global().get("pass:" + std::string(pass_name));
+    throw PassNotReady(std::string(pass_name), task ? task->progress : 0.0f,
+                       task ? task->message : std::string{});
 }
 
 /// Non-blocking require that returns the raw PassResult.
@@ -97,9 +98,9 @@ inline const PassResult& require_pass_nb(PassManager* pm, std::string_view pass_
             pm->require(name);
         }).detach();
     }
-    float pct = pm->progress_of(pass_name);
-    std::string msg = pm->progress_msg_of(pass_name);
-    throw PassNotReady(std::string(pass_name), pct, std::move(msg));
+    auto task = ProgressManager::global().get("pass:" + std::string(pass_name));
+    throw PassNotReady(std::string(pass_name), task ? task->progress : 0.0f,
+                       task ? task->message : std::string{});
 }
 
 // ─── AArch64 register names ──────────────────────────────────────────────

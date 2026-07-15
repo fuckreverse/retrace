@@ -5,6 +5,7 @@
 // translation unit that pulls in every analysis pass header.
 
 #include "gui/gui_app.h"
+#include "common/progress_manager.h"
 #include "analysis/pass_registry.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
@@ -755,7 +756,8 @@ void GuiApp::run_vm_abstract_with_hints() {
         // was wrong, never executed, or matched too few times. The same
         // detail is also always logged at WARN/INFO level (see
         // vm_abstract_pass.cpp) so it's visible in the Log panel too.
-        std::string detail = pass_manager_->progress_msg_of("vm_abstract");
+        auto vm_task = ProgressManager::global().get("pass:vm_abstract");
+std::string detail = vm_task ? vm_task->message : std::string{};
         bool ok = raw.ok();
         post_apply([this, summary, detail, ok]() {
             last_pass_status_ = fmt::format("vm_abstract: {}", summary);
@@ -1133,10 +1135,10 @@ void GuiApp::render_analysis_panel() {
         // Determine pass state
         auto st = PassManager::PassState::NotRun;
         float pct = 0.0f;
-        if (pass_manager_) {
-            st = pass_manager_->state(entry.name);
-            pct = pass_manager_->progress_of(entry.name);
-        }
+    if (pass_manager_) st = pass_manager_->state(entry.name);
+    auto progress_task = ProgressManager::global().get(
+        "pass:" + std::string(entry.name));
+    if (progress_task) pct = progress_task->progress;
 
         // State icon
         const char* icon;
@@ -1198,15 +1200,12 @@ void GuiApp::render_analysis_panel() {
                 ImGui::SetTooltip("Cancel %s", entry.display_name.data());
 
             // Progress message on next line
-            if (pass_manager_) {
-                auto msg = pass_manager_->progress_msg_of(entry.name);
-                if (!msg.empty()) {
-                    ImGui::Indent(16.0f);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.65f, 1.0f));
-                    ImGui::TextWrapped("%s", msg.c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::Unindent(16.0f);
-                }
+            if (progress_task && !progress_task->message.empty()) {
+                ImGui::Indent(16.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.55f, 0.65f, 1.0f));
+                ImGui::TextWrapped("%s", progress_task->message.c_str());
+                ImGui::PopStyleColor();
+                ImGui::Unindent(16.0f);
             }
 
         } else if (st == PassManager::PassState::Completed) {

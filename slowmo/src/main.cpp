@@ -167,6 +167,11 @@ if (!trace_lock && lock_holder.pid != 0) {
     // ─── Build/load index ───────────────────────────────────────────────
     fmt::print(info_out, "Building index...\n");
     LOG_INFO("building/loading RocksDB index");
+    auto cli_progress = ProgressManager::global().subscribe([info_out](const ProgressTask& task) {
+        if (task.kind != "index" || task.state != ProgressState::Running) return;
+        fmt::print(info_out, "\r  {:5.1f}%  {}   ", task.progress * 100.0f, task.message);
+        fflush(info_out);
+    });
     ProgressManager::global().start("index", "index", "Build trace index",
                                     reader.file_size(), "scan");
     auto t_index = TENET_TIMER_START();
@@ -187,8 +192,6 @@ if (!trace_lock && lock_holder.pid != 0) {
                 ProgressManager::global().update_fraction(
                     "index", 0.9f + static_cast<float>(step) / 30.0f,
                     "compact", fmt::format("Compacting index ({}/3)", step));
-                fmt::print(info_out, "\r  Compacting index ({}/3)...   ", step);
-                fflush(info_out);
                 return;
             }
 
@@ -203,22 +206,17 @@ if (!trace_lock && lock_holder.pid != 0) {
                 last_time = now;
             }
             double pct = 100.0 * processed / total;
-            ProgressManager::global().update_fraction(
-                "index", static_cast<float>(processed) / static_cast<float>(total) * 0.9f,
-                "scan", fmt::format("Indexing {:.1f}%", pct));
             // Format speed with appropriate unit
             const char* unit = "B/s";
             double display_speed = cur_speed;
             if (display_speed >= 1e9) { display_speed /= 1e9; unit = "GB/s"; }
             else if (display_speed >= 1e6) { display_speed /= 1e6; unit = "MB/s"; }
             else if (display_speed >= 1e3) { display_speed /= 1e3; unit = "KB/s"; }
-            if (elapsed_total > 0.1 && cur_speed > 0) {
-                fmt::print(info_out, "\r  Progress: {:5.1f}%  [{:.1f} {}]   ",
-                           pct, display_speed, unit);
-            } else {
-                fmt::print(info_out, "\r  Progress: {:5.1f}%", pct);
-            }
-            fflush(info_out);
+            ProgressManager::global().update_fraction(
+                "index", static_cast<float>(processed) / static_cast<float>(total) * 0.9f,
+                "scan", elapsed_total > 0.1 && cur_speed > 0
+                    ? fmt::format("Indexing {:.1f}% [{:.1f} {}]", pct, display_speed, unit)
+                    : fmt::format("Indexing {:.1f}%", pct));
         });
 
     if (!index_result) {

@@ -47,15 +47,10 @@ const PassResult& PassContext::require_raw(std::string_view pass_name) {
 }
 
 void PassContext::progress(float pct) {
-    if (progress_pct_) progress_pct_->store(pct, std::memory_order_relaxed);
     ProgressManager::global().update_fraction(pass_task_id(pass_name_), pct);
     LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}%", pct * 100.0f);
 }
 void PassContext::progress(float pct, std::string_view msg) {
-    if (progress_pct_) progress_pct_->store(pct, std::memory_order_relaxed);
-    if (!msg.empty()) {
-        manager_.set_progress_msg(pass_name_, msg);
-    }
     ProgressManager::global().update_fraction(pass_task_id(pass_name_), pct, "run", msg);
     LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}% — {}", pct * 100.0f, msg);
 }
@@ -313,18 +308,11 @@ void PassManager::execute_pass(PassEntry* entry) {
     auto t0  = TENET_TIMER_START();
     double m0 = ::tenet::log::rss_mb();
 
-    // Reset progress for this run.
-    entry->progress_pct.store(0.0f, std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lk(entry->progress_mtx);
-        entry->progress_msg.clear();
-    }
     entry->cancelled.store(false, std::memory_order_relaxed);
     ProgressManager::global().update_fraction(task_id, 0.0f, "run", "Running analysis pass");
 
     PassContext ctx(*this, range_);
     ctx.pass_name_       = entry->pass->name();
-    ctx.progress_pct_    = &entry->progress_pct;
     ctx.cancelled_flag_  = &entry->cancelled;
 
     // Scan Fusion: if this pass participates in scan fusion and hasn't been
@@ -371,7 +359,9 @@ void PassManager::execute_pass(PassEntry* entry) {
     }
     entry->cv.notify_all();
     if (result_ok) {
-        ProgressManager::global().complete(task_id, "Pass completed");
+        auto task = ProgressManager::global().get(task_id);
+        ProgressManager::global().complete(
+            task_id, task && !task->message.empty() ? task->message : "Pass completed");
     } else if (entry->cancelled.load(std::memory_order_acquire) || is_cancelled()) {
         ProgressManager::global().cancel(task_id, result_error);
     } else {
@@ -572,7 +562,6 @@ void PassManager::invalidate_all() {
         std::atomic_store_explicit(&entry->result_ptr,
             std::make_shared<const PassResult>(PassResult::skipped()),
             std::memory_order_release);
-        entry->progress_pct.store(0.0f, std::memory_order_relaxed);
         entry->cancelled.store(false, std::memory_order_release);
     }
     cancelled_.store(false, std::memory_order_release);
@@ -601,32 +590,10 @@ void PassManager::reset_cancel() {
     }
 }
 
-// ─── Progress query ──────────────────────────────────────────────────────
-
-float PassManager::progress_of(std::string_view pass_name) const {
-    const auto* e = find_entry(pass_name);
-    if (!e) return 0.0f;
-    return e->progress_pct.load(std::memory_order_relaxed);
-}
-
-std::string PassManager::progress_msg_of(std::string_view pass_name) const {
-    const auto* e = find_entry(pass_name);
-    if (!e) return {};
-    std::lock_guard<std::mutex> lk(e->progress_mtx);
-    return e->progress_msg;
-}
-
 bool PassManager::is_pass_cancelled(std::string_view pass_name) const {
     const auto* e = find_entry(pass_name);
     if (!e) return false;
     return e->cancelled.load(std::memory_order_acquire);
-}
-
-void PassManager::set_progress_msg(std::string_view pass_name, std::string_view msg) {
-    auto* e = find_entry(pass_name);
-    if (!e) return;
-    std::lock_guard<std::mutex> lk(e->progress_mtx);
-    e->progress_msg = std::string(msg);
 }
 
 // ─── Query ────────────────────────────────────────────────────────────────

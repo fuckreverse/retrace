@@ -1,4 +1,5 @@
 #include "batch_analysis.h"
+#include "common/progress_manager.h"
 
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
@@ -2306,6 +2307,15 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // ── P3: --streaming ────────────────────────────────────────────────
     // Tail a live / growing trace file, printing progress until complete.
     if (opts.opt_streaming) {
+        constexpr std::string_view kStreamingTask = "streaming:index";
+        auto streaming_progress = ProgressManager::global().subscribe(
+            [](const ProgressTask& task) {
+                if (task.kind != "streaming") return;
+                fmt::print(stderr, "\r[streaming] {}   ", task.message);
+                fflush(stderr);
+            });
+        ProgressManager::global().start(std::string(kStreamingTask), "streaming",
+                                        "Live trace indexing", 0, "tail");
         StreamingIndex streaming;
         StreamingIndex::Config stream_cfg;
         stream_cfg.batch_size       = 5000;
@@ -2314,17 +2324,18 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
 
         bool started = streaming.start(
             opts.trace_path, index,
-            [](uint64_t indexed, uint64_t file_bytes) {
-                fmt::print(stderr, "\r[streaming] {} insts indexed, {:.1f} MB ...",
-                           indexed, file_bytes / (1024.0 * 1024.0));
-                fflush(stderr);
+            [kStreamingTask](uint64_t indexed, uint64_t file_bytes) {
+                ProgressManager::global().update(
+                    kStreamingTask, indexed, "tail",
+                    fmt::format("{} instructions, {:.1f} MiB", indexed,
+                                file_bytes / (1024.0 * 1024.0)));
             },
-            []() {
-                fmt::print(stderr, "\n[streaming] Recording complete.\n");
+            [kStreamingTask]() {
+                ProgressManager::global().complete(kStreamingTask, "Recording complete");
             });
 
         if (!started) {
-            fmt::print(stderr, "[streaming] Failed to start tail thread\n");
+            ProgressManager::global().fail(kStreamingTask, "Failed to start tail thread");
             rc |= 1;
         } else {
             // Wait for completion (idle timeout or SIGINT)

@@ -65,6 +65,18 @@ TEST_CASE("ProgressManager isolates listener failures", "[progress]") {
     CHECK(manager.get("index").has_value());
 }
 
+TEST_CASE("ProgressManager can remove a task family without affecting other tasks", "[progress]") {
+    ProgressManager manager;
+    manager.start("pass:xref", "pass", "xref");
+    manager.start("pass:cfg", "pass", "cfg");
+    manager.start("index", "index", "index");
+
+    manager.erase_kind("pass");
+
+    CHECK(manager.snapshot("pass").empty());
+    CHECK(manager.get("index").has_value());
+}
+
 TEST_CASE("ProgressManager supports concurrent writers and filtered snapshots", "[progress]") {
     ProgressManager manager;
     constexpr int kTaskCount = 16;

@@ -1,5 +1,6 @@
 // tools/tenet/src/service/tenet_service.cpp
 #include "service/tenet_service.h"
+#include "common/progress_manager.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
@@ -238,6 +239,7 @@ void TenetService::clear_analysis() {
         pass_manager_->cancel_all();
         pass_manager_->invalidate_all();
     }
+    ProgressManager::global().erase_kind("pass");
     {
         std::lock_guard lk(row_cache_mutex_);
         row_cache_.clear();

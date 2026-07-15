@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -67,7 +68,6 @@ private:
     void handle_run_pass(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_run_default_passes(void* ws, uint32_t msg_id);
     void handle_clear_analysis(void* ws, uint32_t msg_id);
-    void handle_get_pass_state(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_pass_result(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_pass_catalog(void* ws, uint32_t msg_id);
     void handle_get_progress(void* ws, uint32_t msg_id);
@@ -93,6 +93,11 @@ private:
 
     // Connected clients — accessed ONLY from the event loop thread.
     std::vector<void*> clients_;     // uWS::WebSocket<false>* pointers
+
+    // Analysis runs off the uWS loop so progress requests remain responsive.
+    std::mutex analysis_mutex_;
+    std::mutex workers_mutex_;
+    std::vector<std::future<void>> analysis_workers_;
 };
 
 }  // namespace tenet

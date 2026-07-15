@@ -40,6 +40,7 @@ import {
   GetFunctionsResponse,
   RunAnalysisRequest,
   RunAnalysisResponse,
+  GetProgressResponse,
 } from './ws-gen/tenet/ws';
 import type {
   DisasmResult,
@@ -302,6 +303,41 @@ export async function wsGetPassCatalog(): Promise<PassInfo[]> {
     });
   }
   return out;
+}
+
+export interface ProgressTask {
+  id: string;
+  kind: string;
+  label: string;
+  phase: string;
+  state: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  completed: number;
+  total: number;
+  message: string;
+  error: string;
+  revision: number;
+}
+
+export async function wsGetProgress(): Promise<ProgressTask[]> {
+  const resp = await wsRequest(MessageType.GetProgressReq, (b) => {
+    b.startObject(0);
+    return b.endObject();
+  });
+  const bb = expect(resp, MessageType.GetProgressResp);
+  const r = GetProgressResponse.getRootAsGetProgressResponse(bb);
+  const tasks: ProgressTask[] = [];
+  for (let i = 0; i < r.tasksLength(); i++) {
+    const task = r.tasks(i);
+    if (!task) continue;
+    tasks.push({
+      id: task.id() ?? '', kind: task.kind() ?? '', label: task.label() ?? '',
+      phase: task.phase() ?? '', state: (task.state() ?? 'pending') as ProgressTask['state'],
+      progress: task.progress(), completed: Number(task.completed()), total: Number(task.total()),
+      message: task.message() ?? '', error: task.error() ?? '', revision: Number(task.revision()),
+    });
+  }
+  return tasks;
 }
 
 export async function wsRunPass(

@@ -151,6 +151,14 @@ void ProgressManager::erase(std::string_view id) {
     state_->tasks.erase(std::string(id));
 }
 
+void ProgressManager::erase_kind(std::string_view kind) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    for (auto it = state_->tasks.begin(); it != state_->tasks.end();) {
+        if (it->second.kind == kind) it = state_->tasks.erase(it);
+        else ++it;
+    }
+}
+
 std::optional<ProgressTask> ProgressManager::get(std::string_view id) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
     auto it = state_->tasks.find(std::string(id));

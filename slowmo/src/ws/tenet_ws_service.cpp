@@ -39,6 +39,9 @@ TenetWSService::~TenetWSService() {
 uint16_t TenetWSService::start(uint16_t port) {
     if (running_.load()) return port_.load();
 
+    // Initialize the shared pass engine before any WS worker or event-loop
+    // handler can access it concurrently.
+    service_.ensure_pass_manager();
     loop_thread_ = std::thread([this, port]() {
         event_loop_main(port);
     });
@@ -71,6 +74,11 @@ void TenetWSService::stop() {
         });
     }
 
+    {
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        for (auto& worker : analysis_workers_) worker.wait();
+        analysis_workers_.clear();
+    }
     if (loop_thread_.joinable()) {
         loop_thread_.join();
     }
@@ -185,8 +193,6 @@ void TenetWSService::handle_message(void* ws, const uint8_t* data, size_t len) {
         handle_run_default_passes(ws, msg_id); break;
     case MessageType_ClearAnalysisReq:
         handle_clear_analysis(ws, msg_id); break;
-    case MessageType_GetPassStateReq:
-        handle_get_pass_state(ws, msg_id, payload_data, payload_len); break;
     case MessageType_GetPassResultReq:
         handle_get_pass_result(ws, msg_id, payload_data, payload_len); break;
     case MessageType_GetPassCatalogReq:

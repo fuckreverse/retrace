@@ -18,7 +18,6 @@ export enum MessageType {
   RunPassReq = 30,
   RunDefaultPassesReq = 31,
   ClearAnalysisReq = 32,
-  GetPassStateReq = 33,
   GetPassResultReq = 34,
   GetPassCatalogReq = 35,
   GetProgressReq = 36,
@@ -42,7 +41,6 @@ export enum MessageType {
   RunPassResp = 130,
   RunDefaultPassesResp = 131,
   ClearAnalysisResp = 132,
-  GetPassStateResp = 133,
   GetPassResultResp = 134,
   GetPassCatalogResp = 135,
   GetProgressResp = 136,
@@ -53,7 +51,6 @@ export enum MessageType {
   RunAnalysisResp = 150,
   EvtNavigation = 200,
   EvtPassCompleted = 201,
-  EvtPassProgress = 202,
   EvtBookmarkChanged = 203,
   ErrorResp = 255
 }
