@@ -18,6 +18,7 @@
 #include "batch_analysis.h"
 
 #include "common/logger.h"
+#include "common/progress_manager.h"
 #include "common/Profiling.h"
 
 #include <fmt/core.h>
@@ -166,6 +167,8 @@ if (!trace_lock && lock_holder.pid != 0) {
     // ─── Build/load index ───────────────────────────────────────────────
     fmt::print(info_out, "Building index...\n");
     LOG_INFO("building/loading RocksDB index");
+    ProgressManager::global().start("index", "index", "Build trace index",
+                                    reader.file_size(), "scan");
     auto t_index = TENET_TIMER_START();
 
     auto index_result = TraceIndex::open_or_build(reader,
@@ -179,6 +182,11 @@ if (!trace_lock && lock_holder.pid != 0) {
             // Display "Compacting index (N/3)..." instead of a percentage.
             if (processed > total) {
                 uint64_t step = processed - total;  // 1, 2, or 3
+                // Keep overall progress monotonic: scanning owns [0, 0.9],
+                // compaction owns [0.9, 1.0].
+                ProgressManager::global().update_fraction(
+                    "index", 0.9f + static_cast<float>(step) / 30.0f,
+                    "compact", fmt::format("Compacting index ({}/3)", step));
                 fmt::print(info_out, "\r  Compacting index ({}/3)...   ", step);
                 fflush(info_out);
                 return;
@@ -195,6 +203,9 @@ if (!trace_lock && lock_holder.pid != 0) {
                 last_time = now;
             }
             double pct = 100.0 * processed / total;
+            ProgressManager::global().update_fraction(
+                "index", static_cast<float>(processed) / static_cast<float>(total) * 0.9f,
+                "scan", fmt::format("Indexing {:.1f}%", pct));
             // Format speed with appropriate unit
             const char* unit = "B/s";
             double display_speed = cur_speed;
@@ -211,10 +222,12 @@ if (!trace_lock && lock_holder.pid != 0) {
         });
 
     if (!index_result) {
+        ProgressManager::global().fail("index", index_result.error().message);
         fmt::print(stderr, "\nError building index: {}\n", index_result.error().message);
         return 1;
     }
     auto& index = *index_result;
+    ProgressManager::global().complete("index", "Index ready");
     fmt::print(info_out, "\r  Done. {} instructions, {} anchors, built in {:.2f}s\n",
                index.stats().inst_count, index.stats().anchor_count,
                index.stats().build_seconds);

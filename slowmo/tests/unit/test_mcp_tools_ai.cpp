@@ -18,6 +18,7 @@
 #include "fixtures/trace_fixture.h"
 #include "io/mcp/mcp_server.h"
 #include "io/mcp/mcp_helpers.h"
+#include "common/progress_manager.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -71,6 +72,23 @@ static McpTestEnv make_mcp_env() {
         result.pm.get(),
         &result.env->code_table, &result.env->decoder);
     return result;
+}
+
+TEST_CASE("progress_tasks exposes the shared structured progress snapshot",
+          "[unit][mcp][progress]") {
+    auto ctx = make_mcp_env();
+    ProgressManager::global().start("test:progress", "test", "Test progress", 10);
+    ProgressManager::global().update("test:progress", 4, "run", "Working");
+
+    auto result = ctx.mcp->call_tool("progress_tasks", {{"kind", "test"}});
+
+    REQUIRE(result.at("tasks").size() == 1);
+    const auto& task = result.at("tasks").front();
+    CHECK(task.at("id") == "test:progress");
+    CHECK(task.at("state") == "running");
+    CHECK(task.at("progress").get<float>() == 0.4f);
+    CHECK(task.at("message") == "Working");
+    ProgressManager::global().erase("test:progress");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

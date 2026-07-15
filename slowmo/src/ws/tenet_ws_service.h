@@ -70,6 +70,7 @@ private:
     void handle_get_pass_state(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_pass_result(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_pass_catalog(void* ws, uint32_t msg_id);
+    void handle_get_progress(void* ws, uint32_t msg_id);
     void handle_get_call_stack(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_last_writer(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_write_history(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);

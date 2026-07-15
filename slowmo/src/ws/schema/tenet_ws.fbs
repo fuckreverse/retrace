@@ -27,6 +27,7 @@ enum MessageType : uint16 {
     GetPassStateReq = 33,
     GetPassResultReq = 34,
     GetPassCatalogReq = 35,
+    GetProgressReq = 36,
     GetCallStackReq = 40,
     GetLastWriterReq = 41,
     GetWriteHistoryReq = 42,
@@ -55,6 +56,7 @@ enum MessageType : uint16 {
     GetPassStateResp = 133,
     GetPassResultResp = 134,
     GetPassCatalogResp = 135,
+    GetProgressResp = 136,
     GetCallStackResp = 140,
     GetLastWriterResp = 141,
     GetWriteHistoryResp = 142,
@@ -239,6 +241,24 @@ table PassCatalogEntry {
 
 table GetPassCatalogResponse {
     passes: [PassCatalogEntry];
+}
+
+table ProgressTaskMsg {
+    id: string;
+    kind: string;
+    label: string;
+    phase: string;
+    state: string;
+    progress: float;
+    completed: uint64;
+    total: uint64;
+    message: string;
+    error: string;
+    revision: uint64;
+}
+
+table GetProgressResponse {
+    tasks: [ProgressTaskMsg];
 }
 
 // ─── Call Stack & Memory ────────────────────────────────────────────────────

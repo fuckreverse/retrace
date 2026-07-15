@@ -24,6 +24,7 @@ export { GetPassResultRequest, GetPassResultRequestT } from './ws/get-pass-resul
 export { GetPassResultResponse, GetPassResultResponseT } from './ws/get-pass-result-response.js';
 export { GetPassStateRequest, GetPassStateRequestT } from './ws/get-pass-state-request.js';
 export { GetPassStateResponse, GetPassStateResponseT } from './ws/get-pass-state-response.js';
+export { GetProgressResponse, GetProgressResponseT } from './ws/get-progress-response.js';
 export { GetRegsRequest, GetRegsRequestT } from './ws/get-regs-request.js';
 export { GetRegsResponse, GetRegsResponseT } from './ws/get-regs-response.js';
 export { GetSearchResultsResponse, GetSearchResultsResponseT } from './ws/get-search-results-response.js';
@@ -38,6 +39,7 @@ export { NavigateRequest, NavigateRequestT } from './ws/navigate-request.js';
 export { NavigateResponse, NavigateResponseT } from './ws/navigate-response.js';
 export { PassCatalogEntry, PassCatalogEntryT } from './ws/pass-catalog-entry.js';
 export { PassState } from './ws/pass-state.js';
+export { ProgressTaskMsg, ProgressTaskMsgT } from './ws/progress-task-msg.js';
 export { ReadMemoryRequest, ReadMemoryRequestT } from './ws/read-memory-request.js';
 export { ReadMemoryResponse, ReadMemoryResponseT } from './ws/read-memory-response.js';
 export { RunAnalysisRequest, RunAnalysisRequestT } from './ws/run-analysis-request.js';

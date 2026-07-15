@@ -2,6 +2,7 @@
 #include "analysis/trace_collector.h"
 #include "common/logger.h"
 #include "common/Profiling.h"
+#include "common/progress_manager.h"
 #include "io/index_builder.h"
 #include "infra/scan_orchestrator.h"
 #include "infra/page_stats.h"
@@ -16,6 +17,12 @@
 #include <unordered_set>
 
 namespace tenet {
+
+namespace {
+std::string pass_task_id(std::string_view name) {
+    return "pass:" + std::string(name);
+}
+}  // namespace
 
 // ─── Static ────────────────────────────────────────────────────────────────
 
@@ -41,6 +48,7 @@ const PassResult& PassContext::require_raw(std::string_view pass_name) {
 
 void PassContext::progress(float pct) {
     if (progress_pct_) progress_pct_->store(pct, std::memory_order_relaxed);
+    ProgressManager::global().update_fraction(pass_task_id(pass_name_), pct);
     LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}%", pct * 100.0f);
 }
 void PassContext::progress(float pct, std::string_view msg) {
@@ -48,6 +56,7 @@ void PassContext::progress(float pct, std::string_view msg) {
     if (!msg.empty()) {
         manager_.set_progress_msg(pass_name_, msg);
     }
+    ProgressManager::global().update_fraction(pass_task_id(pass_name_), pct, "run", msg);
     LOG_DEBUG_M(::tenet::log::Module::Analysis, "pass progress: {:.0f}% — {}", pct * 100.0f, msg);
 }
 
@@ -87,7 +96,13 @@ void PassManager::init_infra() {
     }
     {
         auto t0 = std::chrono::steady_clock::now();
-        checkpoint_manager_->ensure_checkpoints();
+        auto& progress = ProgressManager::global();
+        progress.start("checkpoints", "initialization", "Build register checkpoints", 0, "scan");
+        checkpoint_manager_->ensure_checkpoints([&progress](uint64_t done, uint64_t total) {
+            progress.update("checkpoints", done, total,
+                            "scan", "Building register checkpoints");
+        });
+        progress.complete("checkpoints", "Register checkpoints ready");
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         LOG_INFO_M(::tenet::log::Module::Analysis,
@@ -239,6 +254,9 @@ void PassManager::execute_pass(PassEntry* entry) {
     TENET_ZONE;
     TENET_ZONE_TEXT("pass: {}", entry->pass->name());
 
+    const auto task_id = pass_task_id(entry->pass->name());
+    ProgressManager::global().start(task_id, "pass", std::string(entry->pass->name()), 0, "dependencies");
+
     // Fast-path: skip immediately if global cancellation is requested.
     if (is_cancelled()) {
         std::lock_guard<std::mutex> lk(entry->mtx);
@@ -247,6 +265,7 @@ void PassManager::execute_pass(PassEntry* entry) {
             std::memory_order_release);
         entry->state.store(PassState::Failed, std::memory_order_release);
         entry->cv.notify_all();
+        ProgressManager::global().cancel(task_id, "Cancelled before execution");
         return;
     }
 
@@ -266,6 +285,8 @@ void PassManager::execute_pass(PassEntry* entry) {
                 entry->state.store(PassState::Failed, std::memory_order_release);
             }
             entry->cv.notify_all();
+            ProgressManager::global().fail(task_id,
+                std::string("dependency '") + std::string(dep_name) + "' failed");
             return;
         }
     }
@@ -283,6 +304,7 @@ void PassManager::execute_pass(PassEntry* entry) {
             entry->state.store(PassState::Failed, std::memory_order_release);
         }
         entry->cv.notify_all();
+        ProgressManager::global().fail(task_id, "skipped due to memory pressure");
         return;
     }
 
@@ -298,6 +320,7 @@ void PassManager::execute_pass(PassEntry* entry) {
         entry->progress_msg.clear();
     }
     entry->cancelled.store(false, std::memory_order_relaxed);
+    ProgressManager::global().update_fraction(task_id, 0.0f, "run", "Running analysis pass");
 
     PassContext ctx(*this, range_);
     ctx.pass_name_       = entry->pass->name();
@@ -329,9 +352,11 @@ void PassManager::execute_pass(PassEntry* entry) {
                  entry->pass->name(), ms, result.error_message);
     }
 
+    const bool result_ok = result.ok();
+    const std::string result_error = result.error_message;
     {
         std::lock_guard<std::mutex> lk(entry->mtx);
-        bool ok = result.ok();
+        bool ok = result_ok;
         // Build the new, immutable result behind a fresh shared_ptr and swap
         // it in atomically. The *old* shared_ptr (and the PassResult/data it
         // points to) is only decremented here; if some other thread is still
@@ -345,6 +370,13 @@ void PassManager::execute_pass(PassEntry* entry) {
             std::memory_order_release);
     }
     entry->cv.notify_all();
+    if (result_ok) {
+        ProgressManager::global().complete(task_id, "Pass completed");
+    } else if (entry->cancelled.load(std::memory_order_acquire) || is_cancelled()) {
+        ProgressManager::global().cancel(task_id, result_error);
+    } else {
+        ProgressManager::global().fail(task_id, result_error);
+    }
 }
 
 // ─── Parallel run_all using a dynamic ready-queue (LLVM New PM style) ─────

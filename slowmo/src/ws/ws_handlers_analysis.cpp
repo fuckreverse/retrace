@@ -6,6 +6,7 @@
 
 #include "ws/tenet_ws_service.h"
 #include "common/types.h"
+#include "common/progress_manager.h"
 #include "analysis/pass_manager.h"
 #include "analysis/passes/structure/function_pass.h"
 #include "core/memory_model.h"
@@ -177,6 +178,24 @@ void TenetWSService::handle_get_pass_result(void* ws, uint32_t msg_id,
                                                   data_vec, false, 0);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_GetPassResultResp, fbb);
+}
+
+void TenetWSService::handle_get_progress(void* ws, uint32_t msg_id) {
+    flatbuffers::FlatBufferBuilder fbb(2048);
+    std::vector<flatbuffers::Offset<fbs::ProgressTaskMsg>> entries;
+    const auto tasks = ProgressManager::global().snapshot();
+    entries.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        entries.push_back(fbs::CreateProgressTaskMsg(
+            fbb, fbb.CreateString(task.id), fbb.CreateString(task.kind),
+            fbb.CreateString(task.label), fbb.CreateString(task.phase),
+            fbb.CreateString(ProgressManager::state_name(task.state)), task.progress,
+            task.completed, task.total, fbb.CreateString(task.message),
+            fbb.CreateString(task.error), task.revision));
+    }
+    auto resp = fbs::CreateGetProgressResponse(fbb, fbb.CreateVector(entries));
+    fbb.Finish(resp);
+    send_envelope(ws, msg_id, fbs::MessageType_GetProgressResp, fbb);
 }
 
 void TenetWSService::handle_get_pass_catalog(void* ws, uint32_t msg_id) {

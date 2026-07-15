@@ -466,6 +466,7 @@ endif()
 
 # ─── Main library (tenet_lib) ───────────────────────────────────────────────
 add_library(tenet_lib STATIC
+    src/common/progress_manager.cpp
     src/io/trace_reader.cpp
     src/io/code_table.cpp
     src/io/index_builder.cpp

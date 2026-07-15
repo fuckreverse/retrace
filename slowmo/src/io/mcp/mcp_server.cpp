@@ -7,6 +7,7 @@
 #include "io/index_builder.h"
 #include "service/tenet_service.h"
 #include "common/logger.h"
+#include "common/progress_manager.h"
 
 #include <fmt/core.h>
 
@@ -393,6 +394,30 @@ void TenetMcpService::register_all_tools() {
     register_evidence_tools();
     register_batch_tools();
     register_hypothesis_tools();
+
+    register_tool(
+        {"progress_tasks",
+         "Return structured progress snapshots for active and completed backend tasks. "
+         "Use kind to filter (pass, index, initialization).",
+         {{"type", "object"},
+          {"properties", {
+              {"kind", {{"type", "string"}, {"description", "Optional task kind filter"}}}
+          }}}},
+        [](const json& args) -> json {
+            const auto kind = args.value("kind", std::string{});
+            json tasks = json::array();
+            for (const auto& task : ProgressManager::global().snapshot(kind)) {
+                tasks.push_back({
+                    {"id", task.id}, {"kind", task.kind}, {"label", task.label},
+                    {"phase", task.phase},
+                    {"state", ProgressManager::state_name(task.state)},
+                    {"progress", task.progress}, {"completed", task.completed},
+                    {"total", task.total}, {"message", task.message},
+                    {"error", task.error}, {"revision", task.revision}
+                });
+            }
+            return {{"tasks", std::move(tasks)}};
+        });
 
     // ── set_image_base ────────────────────────────────────────────────────
     // Registered here (not in mcp_tools_core.cpp) because it directly mutates

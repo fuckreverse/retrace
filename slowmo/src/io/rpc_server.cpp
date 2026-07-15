@@ -6,6 +6,7 @@
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
 #include "common/types.h"
+#include "common/progress_manager.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "analysis/passes/structure/cfg_layout_pass.h"
 #include "analysis/passes/structure/call_graph_pass.h"
@@ -312,6 +313,25 @@ void TenetRpcService::register_methods() {
     server_->register_method("ping", [](const RpcRequest& req) {
         return make_result(req.id_str, req.id_is_int, req.id_int,
                            R"({"pong":true})");
+    });
+
+    server_->register_method("get_progress", [](const RpcRequest& req) {
+        const json parsed = json::parse(req.params_json);
+        const json params = parsed.is_object() ? parsed : json::object();
+        const auto kind = params.value("kind", std::string{});
+        json tasks = json::array();
+        for (const auto& task : ProgressManager::global().snapshot(kind)) {
+            tasks.push_back({
+                {"id", task.id}, {"kind", task.kind}, {"label", task.label},
+                {"phase", task.phase},
+                {"state", ProgressManager::state_name(task.state)},
+                {"progress", task.progress}, {"completed", task.completed},
+                {"total", task.total}, {"message", task.message},
+                {"error", task.error}, {"revision", task.revision}
+            });
+        }
+        return make_result(req.id_str, req.id_is_int, req.id_int,
+                           json{{"tasks", std::move(tasks)}}.dump());
     });
 
     // ── get_stats ─────────────────────────────────────────────────────────

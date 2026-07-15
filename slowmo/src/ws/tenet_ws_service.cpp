@@ -191,6 +191,8 @@ void TenetWSService::handle_message(void* ws, const uint8_t* data, size_t len) {
         handle_get_pass_result(ws, msg_id, payload_data, payload_len); break;
     case MessageType_GetPassCatalogReq:
         handle_get_pass_catalog(ws, msg_id); break;
+    case MessageType_GetProgressReq:
+        handle_get_progress(ws, msg_id); break;
 
     // Data queries
     case MessageType_GetCallStackReq:
