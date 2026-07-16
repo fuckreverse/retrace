@@ -498,23 +498,15 @@ void TuiApp::handle_resize() {
 
 void TuiApp::search_forward(const std::string& query) {
     search_query_ = query;
-    search_results_.clear();
     search_current_ = 0;
-    search_active_ = false;
 
-    if (query.empty()) return;
+    // Reuse the service's XRef-accelerated, PC-deduplicated, wrap-around
+    // search instead of maintaining a second bounded linear scan in the TUI.
+    search_results_ = service_->search_forward(query, current_inst_);
+    search_active_ = !search_results_.empty();
 
-    // Simple linear search (can be optimized with PC index in M4)
-    for (uint64_t i = 0; i < total_inst_ && i < 1000000; i++) {
-        auto row = fetch_row(i);
-        if (row.disasm.find(query) != std::string::npos) {
-            search_results_.push_back(i);
-        }
-    }
-
-    if (!search_results_.empty()) {
-        search_active_ = true;
-        navigate_to(search_results_[0]);
+    if (search_active_) {
+        navigate_to(search_results_.front());
     }
 }
 
@@ -1257,24 +1249,21 @@ void TuiApp::rebuild_taint_jump_list() {
     taint_jump_list_.clear();
     taint_jump_cursor_ = 0;
 
-    // Collect tainted inst IDs from whichever analysis is active
-    if (show_taint_ && ctx_.taint_result) {
-        for (uint64_t i = 0; i < total_inst_; i++) {
-if (ctx_.taint_result->has_event_at(i)) taint_jump_list_.push_back(i);
-}
-} else if (show_backward_taint_ && ctx_.backward_taint_result) {
-        for (uint64_t i = 0; i < total_inst_; i++) {
-            if (ctx_.backward_taint_result->is_contributing(i)) taint_jump_list_.push_back(i);
-        }
+    // Both result types already maintain ordered Roaring bitmaps. Iterate
+    // those sparse sets directly instead of probing every instruction ID.
+    if (show_backward_taint_ && ctx_.backward_taint_result) {
+        taint_jump_list_ =
+            ctx_.backward_taint_result->ordered_contributing_inst_ids();
+    } else if (show_taint_ && ctx_.taint_result) {
+        taint_jump_list_ = ctx_.taint_result->ordered_event_inst_ids();
     }
 
-    // Position cursor near current instruction
     if (!taint_jump_list_.empty()) {
-        auto it = std::lower_bound(taint_jump_list_.begin(), taint_jump_list_.end(), current_inst_);
-        taint_jump_cursor_ = static_cast<size_t>(it - taint_jump_list_.begin());
-        if (taint_jump_cursor_ >= taint_jump_list_.size()) {
-            taint_jump_cursor_ = taint_jump_list_.size() - 1;
-        }
+        auto it = std::lower_bound(
+            taint_jump_list_.begin(), taint_jump_list_.end(), current_inst_);
+        taint_jump_cursor_ = (it == taint_jump_list_.end())
+            ? taint_jump_list_.size() - 1
+            : static_cast<size_t>(it - taint_jump_list_.begin());
     }
 }
 
@@ -1283,19 +1272,12 @@ void TuiApp::goto_taint_next() {
         rebuild_taint_jump_list();
         if (taint_jump_list_.empty()) return;
     }
-    // Move to next entry strictly after current position
-    for (size_t i = 0; i < taint_jump_list_.size(); i++) {
-        size_t idx = (taint_jump_cursor_ + 1 + i) % taint_jump_list_.size();
-        if (taint_jump_list_[idx] > current_inst_ ||
-            taint_jump_list_.size() == 1) {
-            taint_jump_cursor_ = idx;
-            navigate_to(taint_jump_list_[idx]);
-            return;
-        }
-    }
-    // Wrap around
-    taint_jump_cursor_ = 0;
-    navigate_to(taint_jump_list_[0]);
+
+    auto it = std::upper_bound(
+        taint_jump_list_.begin(), taint_jump_list_.end(), current_inst_);
+    if (it == taint_jump_list_.end()) it = taint_jump_list_.begin();
+    taint_jump_cursor_ = static_cast<size_t>(it - taint_jump_list_.begin());
+    navigate_to(*it);
 }
 
 void TuiApp::goto_taint_prev() {
@@ -1303,24 +1285,13 @@ void TuiApp::goto_taint_prev() {
         rebuild_taint_jump_list();
         if (taint_jump_list_.empty()) return;
     }
-    // Move to previous entry strictly before current position
-    for (size_t i = 0; i < taint_jump_list_.size(); i++) {
-        size_t idx;
-        if (taint_jump_cursor_ == 0) {
-            idx = taint_jump_list_.size() - 1 - i;
-        } else {
-            idx = (taint_jump_cursor_ - 1 + taint_jump_list_.size() - i) % taint_jump_list_.size();
-        }
-        if (taint_jump_list_[idx] < current_inst_ ||
-            taint_jump_list_.size() == 1) {
-            taint_jump_cursor_ = idx;
-            navigate_to(taint_jump_list_[idx]);
-            return;
-        }
-    }
-    // Wrap around
-    taint_jump_cursor_ = taint_jump_list_.size() - 1;
-    navigate_to(taint_jump_list_[taint_jump_cursor_]);
+
+    auto it = std::lower_bound(
+        taint_jump_list_.begin(), taint_jump_list_.end(), current_inst_);
+    if (it == taint_jump_list_.begin()) it = taint_jump_list_.end();
+    --it;
+    taint_jump_cursor_ = static_cast<size_t>(it - taint_jump_list_.begin());
+    navigate_to(*it);
 }
 
 // ─── Analysis passes ────────────────────────────────────────────────────────
@@ -1480,6 +1451,7 @@ void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
     } else if (name == "backward_taint") {
         ctx_.backward_taint_result = &raw.get<BackwardTaintResult>();
         show_backward_taint_ = true;
+        taint_jump_list_.clear();
     } else if (name == "taint_source_annotation") {
         ctx_.taint_source_annotation_result = &raw.get<TaintSourceAnnotationResult>();
     // ── Crypto / Pattern ────────────────────────────────────────────────

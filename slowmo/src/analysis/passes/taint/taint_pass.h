@@ -248,6 +248,18 @@ struct TaintResult {
     uint64_t tainted_inst_count() const {
         return tainted_inst_ids.cardinality();
     }
+
+    /// Return event instruction IDs in ascending order for UI navigation.
+    /// Iterating the Roaring bitmap is O(number of events), avoiding an
+    /// O(total trace instructions) membership scan in frontends.
+    std::vector<uint64_t> ordered_event_inst_ids() const {
+        std::vector<uint64_t> ids;
+        ids.reserve(tainted_inst_ids.cardinality());
+        for (uint64_t id : tainted_inst_ids) {
+            ids.push_back(id);
+        }
+        return ids;
+    }
 };
 
 // ─── Taint analysis pass ───────────────────────────────────────────────────

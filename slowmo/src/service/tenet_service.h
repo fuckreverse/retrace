@@ -163,7 +163,9 @@ public:
     size_t search_current() const { return search_current_; }
     bool search_active() const { return search_active_; }
 
-    void search_forward(const std::string& query, uint64_t from_inst);
+    /// Search from `from_inst` with wrap-around and return an immutable result
+    /// snapshot suitable for direct frontend consumption.
+    std::vector<uint64_t> search_forward(const std::string& query, uint64_t from_inst);
     void search_clear();
 
     // ── Observer management ─────────────────────────────────────────────

@@ -248,7 +248,8 @@ void TenetService::clear_analysis() {
 
 // ─── Search ─────────────────────────────────────────────────────────────────
 
-void TenetService::search_forward(const std::string& query, uint64_t from_inst) {
+std::vector<uint64_t> TenetService::search_forward(
+    const std::string& query, uint64_t from_inst) {
     // ── Phase 1: clear search state and read xref pin (brief lock) ──────
     std::shared_ptr<const PassResult> xref_sp;
     {
@@ -257,7 +258,7 @@ void TenetService::search_forward(const std::string& query, uint64_t from_inst) 
         search_current_ = 0;
         if (query.empty()) {
             search_active_ = false;
-            return;
+            return {};
         }
         search_active_ = true;
         auto it = pinned_results_.find("xref");
@@ -337,8 +338,10 @@ void TenetService::search_forward(const std::string& query, uint64_t from_inst) 
     // ── Phase 2: store results (brief lock) ───────────────────────────
     {
         std::unique_lock lk(state_mutex_);
-        search_results_ = std::move(results);
+        search_results_ = results;
+        search_active_ = !results.empty();
     }
+    return results;
 }
 
 void TenetService::search_clear() {

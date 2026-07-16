@@ -173,11 +173,13 @@ TEST_CASE("TenetService search_forward finds matching instructions",
     REQUIRE(env != nullptr);
     auto svc = make_service(*env);
 
-    SECTION("search for 'nop' finds all nop instructions") {
-        svc->search_forward("nop", 0);
+    SECTION("search returns a result snapshot for direct UI consumption") {
+        const auto results = svc->search_forward("nop", 0);
         REQUIRE(svc->search_active());
-        // Should find inst_ids 0, 2, 4 (the nops)
-        REQUIRE(svc->search_results().size() >= 3);
+        // The TUI consumes the returned snapshot instead of reimplementing
+        // the search or borrowing mutable service state.
+        REQUIRE(results == svc->search_results());
+        REQUIRE(results.size() >= 3);
     }
 
     SECTION("search for 'add' finds add instructions") {
@@ -185,9 +187,11 @@ TEST_CASE("TenetService search_forward finds matching instructions",
         REQUIRE(svc->search_results().size() >= 2);
     }
 
-    SECTION("search for nonexistent string returns empty results") {
-        svc->search_forward("nonexistent_mnemonic", 0);
+    SECTION("search for nonexistent string returns empty inactive results") {
+        const auto results = svc->search_forward("nonexistent_mnemonic", 0);
+        REQUIRE(results.empty());
         REQUIRE(svc->search_results().empty());
+        REQUIRE_FALSE(svc->search_active());
     }
 }
 

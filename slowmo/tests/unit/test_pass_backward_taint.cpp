@@ -24,6 +24,18 @@
 using namespace tenet;
 using namespace tenet::test;
 
+TEST_CASE("BackwardTaintResult exposes ordered contributing IDs without scanning the trace",
+          "[unit][pass][backward_taint][navigation]") {
+    BackwardTaintResult result;
+    result.contributing_inst_ids.add(uint64_t(99));
+    result.contributing_inst_ids.add(uint64_t(5));
+    result.contributing_inst_ids.add(uint64_t(21));
+
+    const auto ids = result.ordered_contributing_inst_ids();
+
+    REQUIRE(ids == std::vector<uint64_t>{5, 21, 99});
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a single-write trace:

@@ -207,6 +207,18 @@ struct BackwardTaintResult {
         return contributing_inst_ids.cardinality();
     }
 
+    /// Return contributing instruction IDs in ascending order for UI navigation.
+    /// Iterating the Roaring bitmap is O(number of contributors), avoiding an
+    /// O(total trace instructions) membership scan in frontends.
+    std::vector<uint64_t> ordered_contributing_inst_ids() const {
+        std::vector<uint64_t> ids;
+        ids.reserve(contributing_inst_ids.cardinality());
+        for (uint64_t id : contributing_inst_ids) {
+            ids.push_back(id);
+        }
+        return ids;
+    }
+
     /// Generate DOT representation of the dataflow graph.
     std::string to_dot() const;
 

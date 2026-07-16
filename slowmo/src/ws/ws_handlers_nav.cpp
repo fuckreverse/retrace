@@ -166,9 +166,7 @@ void TenetWSService::handle_search_forward(void* ws, uint32_t msg_id,
     // TODO: async search requires TenetService-level locking or a
     //       copy-on-write snapshot mechanism before it can be safely
     //       offloaded to a background thread.
-    service_.search_forward(query, from);
-
-    auto& results = service_.search_results();
+    auto results = service_.search_forward(query, from);
     flatbuffers::FlatBufferBuilder fbb(results.size() * 8 + 64);
     auto rv = fbb.CreateVector(results.data(), results.size());
     auto resp = CreateSearchForwardResponse(fbb, rv,

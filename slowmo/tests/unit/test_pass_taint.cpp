@@ -13,6 +13,18 @@
 using namespace tenet;
 using namespace tenet::test;
 
+TEST_CASE("TaintResult exposes ordered event IDs without scanning the trace",
+          "[unit][pass][taint][navigation]") {
+    TaintResult result;
+    result.tainted_inst_ids.add(uint64_t(42));
+    result.tainted_inst_ids.add(uint64_t(3));
+    result.tainted_inst_ids.add(uint64_t(17));
+
+    const auto ids = result.ordered_event_inst_ids();
+
+    REQUIRE(ids == std::vector<uint64_t>{3, 17, 42});
+}
+
 TEST_CASE("TaintPass propagates RegToReg", "[unit][pass][taint]") {
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
