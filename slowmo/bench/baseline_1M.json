@@ -1,8 +1,8 @@
 {
   "benchmark": "tenet_all_passes",
-  "version": "3.1",
+  "version": "3.2",
   "date": "2026-07-16",
-  "note": "Current-code baseline on a real 19.8M-instruction trace. Regression comparisons use pass_cache_cold medians so every pass executes its analysis instead of depending on persisted result compatibility.",
+  "note": "Post cache-short-circuit fix baseline. Cache preflight now skips trace scanning for cached passes. Cold-cache numbers reflect the fix; warm-cache cache_short_circuit_passes show the cache-hit deserialization overhead.",
   "measurement": {
     "runs": 3,
     "statistic": "median",
@@ -40,27 +40,27 @@
     "memory_build_median": 1061.72325
   },
   "pass_cache_cold": {
-    "sum_own_runs_ms": [31104.07271, 30205.948458, 38142.187751],
-    "sum_own_median_ms": 31104.07271,
-    "sum_own_cv_pct": 13.1,
+    "sum_own_runs_ms": [22074.1, 22126.3, 22445.7],
+    "sum_own_median_ms": 22126.3,
+    "sum_own_cv_pct": 0.9,
     "passes": {
-      "xref": {"runs_ms": [669.773375, 603.726375, 726.40275], "median_ms": 669.773375},
-      "function": {"runs_ms": [6132.138042, 5623.725375, 6863.401583], "median_ms": 6132.138042},
-      "loop": {"runs_ms": [23.028125, 17.524875, 33.299958], "median_ms": 23.028125},
-      "pattern": {"runs_ms": [6380.172292, 5698.333875, 7792.551167], "median_ms": 6380.172292},
-      "strings": {"runs_ms": [556.886875, 766.130958, 875.746792], "median_ms": 766.130958},
-      "objc": {"runs_ms": [1888.350042, 1745.57375, 3540.049917], "median_ms": 1888.350042},
-      "thread": {"runs_ms": [4521.580292, 4288.425042, 5423.87375], "median_ms": 4521.580292},
-      "backward_taint": {"runs_ms": [18.117417, 1.988208, 51.107667], "median_ms": 18.117417},
-      "trace_diff": {"runs_ms": [0.868917, 0.599583, 0.688333], "median_ms": 0.688333},
-      "memory_snapshot": {"runs_ms": [2676.164209, 2434.001625, 2158.928917], "median_ms": 2434.001625},
-      "dataflow_graph": {"runs_ms": [0.932375, 1.114542, 4.469292], "median_ms": 1.114542},
-      "cfg": {"runs_ms": [0.000792, 0.000583, 0.001333], "median_ms": 0.000792},
-      "cfg_layout": {"runs_ms": [32.385208, 22.567208, 33.709334], "median_ms": 32.385208},
-      "taint": {"runs_ms": [8034.334875, 8889.570625, 10476.200792], "median_ms": 8889.570625},
-      "call_graph": {"runs_ms": [113.181208, 89.727667, 135.625583], "median_ms": 113.181208},
-      "loop_semantics": {"runs_ms": [54.593041, 22.052084, 25.494916], "median_ms": 25.494916},
-      "algorithm_summary": {"runs_ms": [1.565625, 0.886083, 0.635667], "median_ms": 0.886083}
+      "xref": {"runs_ms": [594.8, 537.9, 538.5], "median_ms": 538.5},
+      "function": {"runs_ms": [3876.1, 3777.9, 3923.9], "median_ms": 3876.1},
+      "loop": {"runs_ms": [13.4, 14.3, 13.2], "median_ms": 13.4},
+      "pattern": {"runs_ms": [4020.9, 4073.0, 4283.7], "median_ms": 4073.0},
+      "strings": {"runs_ms": [358.5, 383.6, 402.6], "median_ms": 383.6},
+      "objc": {"runs_ms": [1623.0, 1625.4, 1730.6], "median_ms": 1625.4},
+      "thread": {"runs_ms": [2680.4, 2704.4, 2700.5], "median_ms": 2700.5},
+      "backward_taint": {"runs_ms": [8.3, 1.8, 1.7], "median_ms": 1.8},
+      "trace_diff": {"runs_ms": [0.5, 0.6, 0.6], "median_ms": 0.6},
+      "memory_snapshot": {"runs_ms": [1939.3, 1918.6, 1988.1], "median_ms": 1939.3},
+      "dataflow_graph": {"runs_ms": [0.8, 0.6, 0.7], "median_ms": 0.7},
+      "cfg": {"runs_ms": [0.0, 0.0, 0.0], "median_ms": 0.0},
+      "cfg_layout": {"runs_ms": [17.6, 18.6, 18.5], "median_ms": 18.5},
+      "taint": {"runs_ms": [6847.1, 6952.6, 6738.0], "median_ms": 6847.1},
+      "call_graph": {"runs_ms": [72.9, 90.1, 80.9], "median_ms": 80.9},
+      "loop_semantics": {"runs_ms": [20.0, 26.2, 23.6], "median_ms": 23.6},
+      "algorithm_summary": {"runs_ms": [0.6, 0.9, 0.6], "median_ms": 0.6}
     }
   },
   "pass_cache_warm": {
@@ -89,7 +89,9 @@
     "memory_snapshot": 1.2
   },
   "legacy": {
+    "v3.1_date": "2026-07-16",
+    "v3.1_note": "Pre-fix baseline: cache preflight was not yet implemented; cold-cache runs still did full trace scanning even for cached passes. sum_own_median was 31104 ms.",
     "v2_date": "2026-06-29",
-    "note": "v2 mixed warm persisted-cache timings with older pass topology (including symbol_annotation and separate constant_materialization), so it is retained only as historical context and is not directly comparable to v3."
+    "v2_note": "v2 mixed warm persisted-cache timings with older pass topology (including symbol_annotation and separate constant_materialization), so it is retained only as historical context and is not directly comparable to v3."
   }
 }
