@@ -2,6 +2,9 @@
 #include "ws/tenet_ws_service.h"
 #include "common/logger.h"
 #include "io/mcp/mcp_server.h"  // TenetMcpService — in-process tool dispatcher
+#include "ws/ws_async_reply_dispatcher.h"
+#include "ws/ws_analysis_task_queue.h"
+#include "ws/ws_protocol.h"
 
 // uWebSockets includes (only in .cpp, not in header)
 #include <App.h>
@@ -25,11 +28,18 @@ TenetWSService::TenetWSService(TenetService& service)
     service_.add_observer(this);
     // Build an in-process MCP dispatcher over the same backend. No transport is
     // started; we only use its call_tool() registry for the generic RunAnalysis
-    // channel. Runs synchronously on the event loop thread like other handlers.
+    // channel. Access stays serialized by analysis_mutex_ even when handlers
+    // run on worker threads.
     mcp_dispatch_ = std::make_unique<TenetMcpService>(service_);
 }
 
 TenetWSService::~TenetWSService() {
+    if (loop_thread_.joinable() &&
+        loop_thread_.get_id() == std::this_thread::get_id()) {
+        LOG_INFO_M(log::Module::Mcp,
+                   "[ws] destructor on loop thread is unsupported; destroy from external thread after join");
+        std::abort();
+    }
     stop();
     service_.remove_observer(this);
 }
@@ -38,6 +48,9 @@ TenetWSService::~TenetWSService() {
 
 uint16_t TenetWSService::start(uint16_t port) {
     if (running_.load()) return port_.load();
+
+    ready_.store(false);
+    stopping_.store(false);
 
     // Initialize the shared pass engine before any WS worker or event-loop
     // handler can access it concurrently.
@@ -54,10 +67,32 @@ uint16_t TenetWSService::start(uint16_t port) {
 }
 
 void TenetWSService::stop() {
-    if (!running_.load()) return;
-    running_.store(false);
+    const bool called_from_loop_thread =
+        loop_thread_.joinable() && loop_thread_.get_id() == std::this_thread::get_id();
 
-    // Close the listen socket and all client connections from the event loop thread
+    if (stopping_.exchange(true)) {
+        if (called_from_loop_thread) {
+            LOG_INFO_M(log::Module::Mcp,
+                       "[ws] stop() re-entered on loop thread; join must be performed by another thread");
+            return;
+        }
+        if (loop_thread_.joinable()) {
+            loop_thread_.join();
+        }
+        return;
+    }
+
+    // 1. Close the intake gate — no new analysis tasks may be enqueued.
+    if (analysis_task_queue_) {
+        analysis_task_queue_->stop();
+    }
+
+    // 2. Drain async reply dispatcher workers.
+    if (async_reply_dispatcher_) {
+        async_reply_dispatcher_->stop();
+    }
+
+    // 3. Close sockets on the event loop.
     auto* loop_ptr = loop_.load();
     if (loop_ptr) {
         auto* loop = static_cast<uWS::Loop*>(loop_ptr);
@@ -66,7 +101,6 @@ void TenetWSService::stop() {
                 us_listen_socket_close(0, listen_socket_);
                 listen_socket_ = nullptr;
             }
-            // Close all active client connections so app.run() can exit
             for (auto* client : clients_) {
                 static_cast<uWS::WebSocket<false, true, PerSocketData>*>(client)->close();
             }
@@ -74,15 +108,21 @@ void TenetWSService::stop() {
         });
     }
 
-    {
-        std::lock_guard<std::mutex> lock(workers_mutex_);
-        for (auto& worker : analysis_workers_) worker.wait();
-        analysis_workers_.clear();
+    if (called_from_loop_thread) {
+        LOG_INFO_M(log::Module::Mcp,
+                   "[ws] stop() called on loop thread; object must stay alive until an external thread joins");
+        return;
     }
+
     if (loop_thread_.joinable()) {
         loop_thread_.join();
     }
+
+    running_.store(false);
+    ready_.store(false);
     loop_.store(nullptr);
+    port_.store(0);
+    listen_socket_ = nullptr;
 }
 
 // ─── Event Loop ─────────────────────────────────────────────────────────────
@@ -90,9 +130,28 @@ void TenetWSService::stop() {
 void TenetWSService::event_loop_main(uint16_t port) {
     uWS::App app;
 
-    // Assign loop_ BEFORE app.listen() so observer callbacks can use it
-    // as soon as running_ becomes true.
+    // Assign loop_ before listen/open so observer callbacks and deferred
+    // response delivery can hop back onto the event loop thread immediately.
+    // stop() blocks new jobs, waits for active workers to finish, then closes
+    // sockets on the loop thread. Replies already queued via defer either send
+    // before close or become harmless stale drops after the close callback
+    // unregisters the connection generation.
+    // Contract: stop() may be called on the loop thread to initiate shutdown,
+    // but ownership/lifetime must remain valid until an external thread (or
+    // destructor off-loop) performs the final join. Loop-thread destruction is
+    // explicitly rejected to avoid detach/UAF hazards.
     loop_.store(uWS::Loop::get());
+    analysis_task_queue_ = std::make_unique<WSAnalysisTaskQueue>();
+    async_reply_dispatcher_ = std::make_unique<WSAsyncReplyDispatcher>(
+        [this](std::function<void()> fn) {
+            auto* loop_ptr = loop_.load();
+            if (!loop_ptr || stopping_.load()) return;
+            static_cast<uWS::Loop*>(loop_ptr)->defer(std::move(fn));
+        },
+        [](void* ws, std::string_view payload) {
+            static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws)->send(
+                payload, uWS::BINARY);
+        });
 
     app.ws<PerSocketData>("/*", {
         .compression = uWS::DISABLED,
@@ -101,6 +160,9 @@ void TenetWSService::event_loop_main(uint16_t port) {
 
         .open = [this](auto* ws) {
             clients_.push_back(ws);
+            if (async_reply_dispatcher_) {
+                async_reply_dispatcher_->register_connection(ws);
+            }
             LOG_INFO_M(log::Module::Mcp, "[ws] client connected (total: {})",
                        clients_.size());
         },
@@ -113,6 +175,9 @@ void TenetWSService::event_loop_main(uint16_t port) {
         },
 
         .close = [this](auto* ws, int /*code*/, std::string_view /*msg*/) {
+            if (async_reply_dispatcher_) {
+                async_reply_dispatcher_->unregister_connection(ws);
+            }
             clients_.erase(
                 std::remove(clients_.begin(), clients_.end(),
                             static_cast<void*>(ws)),
@@ -136,7 +201,9 @@ void TenetWSService::event_loop_main(uint16_t port) {
         ready_.store(true);  // signal start() that setup is done (success or failure)
     });
 
-    app.run();  // blocks until all sockets closed
+    app.run();  // blocks until all sockets close and deferred callbacks drain
+    analysis_task_queue_.reset();
+    async_reply_dispatcher_.reset();
     running_.store(false);
 }
 
@@ -233,18 +300,8 @@ void TenetWSService::broadcast(const uint8_t* buf, size_t len) {
 
 void TenetWSService::send_error(void* ws, uint32_t msg_id, uint32_t code,
                                  const std::string& message) {
-    flatbuffers::FlatBufferBuilder fbb(256);
-    auto err = CreateErrorResponse(fbb, code, fbb.CreateString(message));
-    fbb.Finish(err);
-
-    flatbuffers::FlatBufferBuilder env_fbb(256 + fbb.GetSize());
-    auto payload_vec = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-    auto env = CreateEnvelope(env_fbb, msg_id, MessageType_ErrorResp, payload_vec);
-    env_fbb.Finish(env);
-
-    auto sv = std::string_view(
-        reinterpret_cast<const char*>(env_fbb.GetBufferPointer()),
-        env_fbb.GetSize());
+    auto bytes = build_ws_error_envelope_bytes(msg_id, code, message);
+    auto sv = std::string_view(bytes.data(), bytes.size());
     static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws)->send(sv, uWS::BINARY);
 }
 
@@ -259,11 +316,8 @@ void TenetWSService::on_navigation(uint64_t inst_id) {
         auto evt = CreateEvtNavigationMsg(fbb, inst_id);
         fbb.Finish(evt);
 
-        flatbuffers::FlatBufferBuilder env_fbb(64 + fbb.GetSize());
-        auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-        auto env = CreateEnvelope(env_fbb, 0, MessageType_EvtNavigation, pv);
-        env_fbb.Finish(env);
-        broadcast(env_fbb.GetBufferPointer(), env_fbb.GetSize());
+        auto bytes = build_ws_envelope_bytes(0, MessageType_EvtNavigation, fbb);
+        broadcast(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
     });
 }
 
@@ -278,11 +332,8 @@ void TenetWSService::on_pass_completed(std::string_view name) {
                                               true, 0);
         fbb.Finish(evt);
 
-        flatbuffers::FlatBufferBuilder env_fbb(256 + fbb.GetSize());
-        auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-        auto env = CreateEnvelope(env_fbb, 0, MessageType_EvtPassCompleted, pv);
-        env_fbb.Finish(env);
-        broadcast(env_fbb.GetBufferPointer(), env_fbb.GetSize());
+        auto bytes = build_ws_envelope_bytes(0, MessageType_EvtPassCompleted, fbb);
+        broadcast(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
     });
 }
 
@@ -291,17 +342,14 @@ void TenetWSService::on_bookmark_changed() {
     auto* loop_ptr = loop_.load();
     if (!loop_ptr) return;
     static_cast<uWS::Loop*>(loop_ptr)->defer([this]() {
-        auto& bm = service_.bookmarks();
+        auto bm = service_.bookmarks();
         flatbuffers::FlatBufferBuilder fbb(64 + bm.size() * 8);
         auto bm_vec = fbb.CreateVector(bm.data(), bm.size());
         auto evt = CreateEvtBookmarkChangedMsg(fbb, bm_vec);
         fbb.Finish(evt);
 
-        flatbuffers::FlatBufferBuilder env_fbb(64 + fbb.GetSize());
-        auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-        auto env = CreateEnvelope(env_fbb, 0, MessageType_EvtBookmarkChanged, pv);
-        env_fbb.Finish(env);
-        broadcast(env_fbb.GetBufferPointer(), env_fbb.GetSize());
+        auto bytes = build_ws_envelope_bytes(0, MessageType_EvtBookmarkChanged, fbb);
+        broadcast(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
     });
 }
 

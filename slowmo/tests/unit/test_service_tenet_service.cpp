@@ -17,8 +17,17 @@
 #include "service/tenet_service.h"
 #include "analysis/passes/structure/xref_pass.h"
 
+#include <atomic>
+#include <type_traits>
+#include <utility>
+
 using namespace tenet;
 using namespace tenet::test;
+
+static_assert(!std::is_reference_v<decltype(std::declval<const TenetService&>().bookmarks())>,
+              "bookmarks() must return a thread-safe snapshot value");
+static_assert(!std::is_reference_v<decltype(std::declval<const TenetService&>().search_results())>,
+              "search_results() must return a thread-safe snapshot value");
 
 // ─── Helper: create a service from a trace env ──────────────────────────────
 
@@ -242,6 +251,90 @@ TEST_CASE("TenetService search_forward wrap-around",
     }
 }
 
+TEST_CASE("TenetService ensure_pass_manager publishes one shared instance",
+          "[unit][service][pass_manager]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        for (int i = 0; i < 32; i++) {
+            tw.emit(ms, 0x1000 + i * 4, enc::nop(),
+                    {{33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "svc_pass_manager_once");
+
+    REQUIRE(env != nullptr);
+    auto svc = make_service(*env);
+
+    constexpr int kThreads = 8;
+    std::vector<std::thread> threads;
+    std::vector<PassManager*> managers(kThreads, nullptr);
+    threads.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            managers[i] = &svc->ensure_pass_manager();
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    REQUIRE(managers[0] != nullptr);
+    for (int i = 1; i < kThreads; ++i) {
+        CHECK(managers[i] == managers[0]);
+    }
+    CHECK(svc->pass_manager() == managers[0]);
+}
+
+TEST_CASE("TenetService concurrent snapshot access for bookmark/search state",
+          "[unit][service][snapshot]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        for (int i = 0; i < 64; ++i) {
+            tw.emit(ms, 0x1000 + i * 4, enc::nop(),
+                    {{33, tw.rt(0x1004 + i * 4)}}, {});
+        }
+        tw.emit_anchor(ms);
+    }, "svc_snapshot_concurrency");
+
+    REQUIRE(env != nullptr);
+    auto svc = make_service(*env);
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (uint64_t i = 0; i < 512; ++i) {
+            svc->toggle_bookmark(i % 64);
+            (void)svc->search_forward("nop", i % 64);
+            if ((i % 3) == 0) svc->search_clear();
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            auto bookmarks = svc->bookmarks();
+            auto results = svc->search_results();
+            auto current = svc->search_current();
+            auto active = svc->search_active();
+
+            CHECK(bookmarks.size() <= 64);
+            for (auto id : bookmarks) CHECK(id < 64);
+
+            CHECK(results.size() <= 10000);
+            for (auto id : results) CHECK(id < 64);
+
+            if (!active) {
+                CHECK(current == 0);
+            }
+        }
+    });
+
+    writer.join();
+    reader.join();
+}
+
 TEST_CASE("TenetService search_forward from different start positions",
           "[unit][service][search]") {
     auto env = make_env([](TraceWriter& tw) {
@@ -462,7 +555,7 @@ TEST_CASE("TenetService: concurrent toggle_bookmark + has_bookmark (no deadlock)
             // has_bookmark should return a consistent true/false (not crash)
             (void)svc->has_bookmark(static_cast<uint64_t>(i % 10));
             // bookmarks() vector should be in a valid state
-            auto& bm = svc->bookmarks();
+            auto bm = svc->bookmarks();
             if (bm.size() > 10) {
                 errors.fetch_add(1, std::memory_order_relaxed);
             }
@@ -506,7 +599,7 @@ TEST_CASE("TenetService: concurrent search + navigation (no deadlock)",
     auto searcher = [&]() {
         for (int i = 0; i < 20 && !stop.load(std::memory_order_relaxed); i++) {
             svc->search_forward("nop", 0);
-            auto& results = svc->search_results();
+            auto results = svc->search_results();
             // Should find 25 nops (even indices 0,2,4,...,48)
             if (results.size() != 25 && results.size() != 0) {
                 // 0 is acceptable during concurrent search_clear overlap

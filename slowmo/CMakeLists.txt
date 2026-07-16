@@ -625,10 +625,14 @@ endif()
 if(TENET_ENABLE_WS)
     target_sources(tenet_lib PRIVATE
         src/ws/tenet_ws_service.cpp
+        src/ws/ws_analysis_jobs.cpp
+        src/ws/ws_analysis_task_queue.cpp
+        src/ws/ws_async_reply_dispatcher.cpp
         src/ws/ws_handlers_hotpath.cpp
         src/ws/ws_handlers_nav.cpp
         src/ws/ws_handlers_analysis.cpp
     )
+
     target_link_libraries(tenet_lib PUBLIC uwebsockets flatbuffers)
     target_include_directories(tenet_lib PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/generated)
     add_dependencies(tenet_lib tenet_ws_schema)

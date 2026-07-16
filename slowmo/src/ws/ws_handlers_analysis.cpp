@@ -1,16 +1,19 @@
 // tools/tenet/src/ws/ws_handlers_analysis.cpp
 //
 // Pass management and data query WebSocket handlers.
-// Heavy operations (RunPass, RunDefaultPasses) are synchronous — TenetService
-// is not thread-safe, so we block the event loop rather than race.
+// analysis_mutex_ only serializes heavy analysis jobs (pass execution / MCP
+// tool dispatch). Light handlers rely on TenetService's internal locks
+// (state_mutex_ / row_cache_mutex_) and backend thread safety guarantees.
 
 #include "ws/tenet_ws_service.h"
-#include "common/types.h"
 #include "common/progress_manager.h"
 #include "analysis/pass_manager.h"
-#include "analysis/passes/structure/function_pass.h"
 #include "core/memory_model.h"
 #include "io/mcp/mcp_server.h"  // TenetMcpService::call_tool for generic channel
+#include "ws/ws_analysis_jobs.h"
+#include "ws/ws_analysis_task_queue.h"
+#include "ws/ws_async_reply_dispatcher.h"
+#include "ws/ws_protocol.h"
 
 // uWebSockets
 #include <App.h>
@@ -36,14 +39,8 @@ namespace {
 
 void send_envelope(void* ws_ptr, uint32_t msg_id, fbs::MessageType type,
                     flatbuffers::FlatBufferBuilder& fbb) {
-    flatbuffers::FlatBufferBuilder env_fbb(fbb.GetSize() + 64);
-    auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-    auto env = fbs::CreateEnvelope(env_fbb, msg_id, type, pv);
-    env_fbb.Finish(env);
-
-    auto sv = std::string_view(
-        reinterpret_cast<const char*>(env_fbb.GetBufferPointer()),
-        env_fbb.GetSize());
+    auto bytes = build_ws_envelope_bytes(msg_id, type, fbb);
+    auto sv = std::string_view(bytes.data(), bytes.size());
     static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws_ptr)->send(sv, uWS::BINARY);
 }
 
@@ -75,40 +72,50 @@ void TenetWSService::handle_run_pass(void* ws, uint32_t msg_id,
         ctx.current_reg = static_cast<uint8_t>((*req->taint_regs())[0]);
     }
 
+    // Enqueue the analysis task BEFORE sending "accepted". If the intake
+    // gate is closed (shutdown in progress), reject immediately — no
+    // "accepted but never ran" gap.
+    //
+    // The lambda captures `name` by copy (not move) so that `name` remains
+    // valid for the accepted reply and progress tracking below.  Pass names
+    // are short strings; the extra copy is negligible.
+    bool enqueued = analysis_task_queue_ && analysis_task_queue_->enqueue(
+        [this, name, ctx]() {
+            std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
+            service_.run_pass(name, ctx);
+        });
+
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "RunPass: server is shutting down");
+        return;
+    }
+
+    ProgressManager::global().start("pass:" + name, "pass", name, 0, "queued");
     flatbuffers::FlatBufferBuilder fbb(256);
     auto name_off = fbb.CreateString(name);
     auto msg_off = fbb.CreateString("accepted");
     auto resp = fbs::CreateRunPassResponse(fbb, name_off, true, msg_off);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_RunPassResp, fbb);
-
-    ProgressManager::global().start("pass:" + name, "pass", name, 0, "queued");
-    std::lock_guard<std::mutex> workers_lock(workers_mutex_);
-    for (auto it = analysis_workers_.begin(); it != analysis_workers_.end();) {
-        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
-            it = analysis_workers_.erase(it);
-        else
-            ++it;
-    }
-    analysis_workers_.push_back(std::async(std::launch::async,
-        [this, name = std::move(name), ctx]() {
-            std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
-            service_.run_pass(name, ctx);
-        }));
 }
 
 void TenetWSService::handle_run_default_passes(void* ws, uint32_t msg_id) {
+    // Enqueue BEFORE sending "accepted" — if shutting down, reject immediately.
+    bool enqueued = analysis_task_queue_ && analysis_task_queue_->enqueue([this]() {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
+        service_.run_default_passes();
+    });
+
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "RunDefaultPasses: server is shutting down");
+        return;
+    }
+
     flatbuffers::FlatBufferBuilder fbb(64);
     auto msg_off = fbb.CreateString("accepted");
     auto resp = fbs::CreateRunDefaultPassesResponse(fbb, true, msg_off);
     fbb.Finish(resp);
     send_envelope(ws, msg_id, fbs::MessageType_RunDefaultPassesResp, fbb);
-
-    std::lock_guard<std::mutex> workers_lock(workers_mutex_);
-    analysis_workers_.push_back(std::async(std::launch::async, [this]() {
-        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
-        service_.run_default_passes();
-    }));
 }
 
 void TenetWSService::handle_clear_analysis(void* ws, uint32_t msg_id) {
@@ -220,48 +227,20 @@ void TenetWSService::handle_get_call_stack(void* ws, uint32_t msg_id,
     auto* req = flatbuffers::GetRoot<fbs::GetCallStackRequest>(payload);
     uint64_t inst_id = req->inst_id();
 
-    // Need the function pass result
-    auto* func_result = service_.pass_result<FunctionResult>("function");
-    if (!func_result) {
+    auto token = async_reply_dispatcher_ ? async_reply_dispatcher_->token_for(ws)
+                                         : WSAsyncReplyDispatcher::ConnectionToken{};
+    if (!token.valid()) {
+        send_error(ws, msg_id, 3, "GetCallStack: connection unavailable");
+        return;
+    }
+
+    bool enqueued = async_reply_dispatcher_->dispatch(token, [this, msg_id, inst_id]() {
         std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
-        service_.ensure_pass_manager();
-        service_.run_pass("function");
-        func_result = service_.pass_result<FunctionResult>("function");
+        return build_get_call_stack_reply_bytes(service_, msg_id, inst_id);
+    });
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "GetCallStack: server is shutting down");
     }
-
-    flatbuffers::FlatBufferBuilder fbb(1024);
-    std::vector<flatbuffers::Offset<fbs::CallStackEntry>> stack_entries;
-    std::string current_func_name;
-
-    if (func_result) {
-        auto stack = func_result->call_stack_at(inst_id);
-        stack_entries.reserve(stack.size());
-        for (const auto* evt : stack) {
-            std::string fname;
-            auto it = func_result->functions.find(evt->target_pc);
-            if (it != func_result->functions.end()) {
-                fname = it->second.name;
-            }
-            auto fname_off = fbb.CreateString(fname);
-            stack_entries.push_back(fbs::CreateCallStackEntry(
-                fbb,
-                static_cast<uint32_t>(evt->depth),
-                evt->call_inst_id,
-                evt->return_inst_id,
-                evt->call_site_pc,
-                evt->target_pc,
-                fname_off));
-        }
-
-        const auto* fi = func_result->function_at(inst_id);
-        if (fi) current_func_name = fi->name;
-    }
-
-    auto stack_vec = fbb.CreateVector(stack_entries);
-    auto cfn = fbb.CreateString(current_func_name);
-    auto resp = fbs::CreateGetCallStackResponse(fbb, stack_vec, cfn);
-    fbb.Finish(resp);
-    send_envelope(ws, msg_id, fbs::MessageType_GetCallStackResp, fbb);
 }
 
 void TenetWSService::handle_get_last_writer(void* ws, uint32_t msg_id,
@@ -318,32 +297,20 @@ void TenetWSService::handle_get_write_history(void* ws, uint32_t msg_id,
 }
 
 void TenetWSService::handle_get_functions(void* ws, uint32_t msg_id) {
-    auto* func_result = service_.pass_result<FunctionResult>("function");
-    if (!func_result) {
+    auto token = async_reply_dispatcher_ ? async_reply_dispatcher_->token_for(ws)
+                                         : WSAsyncReplyDispatcher::ConnectionToken{};
+    if (!token.valid()) {
+        send_error(ws, msg_id, 3, "GetFunctions: connection unavailable");
+        return;
+    }
+
+    bool enqueued = async_reply_dispatcher_->dispatch(token, [this, msg_id]() {
         std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
-        service_.ensure_pass_manager();
-        service_.run_pass("function");
-        func_result = service_.pass_result<FunctionResult>("function");
+        return build_get_functions_reply_bytes(service_, msg_id);
+    });
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "GetFunctions: server is shutting down");
     }
-
-    flatbuffers::FlatBufferBuilder fbb(4096);
-    std::vector<flatbuffers::Offset<fbs::FunctionEntry>> func_entries;
-
-    if (func_result) {
-        func_entries.reserve(func_result->functions.size());
-        for (const auto& [pc, info] : func_result->functions) {
-            auto name_off = fbb.CreateString(info.name);
-            func_entries.push_back(fbs::CreateFunctionEntry(
-                fbb, pc, name_off,
-                static_cast<uint32_t>(info.total_calls),
-                info.total_instructions));
-        }
-    }
-
-    auto fv = fbb.CreateVector(func_entries);
-    auto resp = fbs::CreateGetFunctionsResponse(fbb, fv);
-    fbb.Finish(resp);
-    send_envelope(ws, msg_id, fbs::MessageType_GetFunctionsResp, fbb);
 }
 
 // ─── Generic Analysis Channel ───────────────────────────────────────────────
@@ -371,34 +338,23 @@ void TenetWSService::handle_run_analysis(void* ws, uint32_t msg_id,
         return;
     }
 
-    // Parse params (default to empty object) and invoke the tool synchronously.
-    bool ok = true;
-    std::string error;
-    std::string json_out;
-    try {
-        nlohmann::json args = nlohmann::json::object();
-        if (!params_json.empty()) {
-            args = nlohmann::json::parse(params_json);
-            if (!args.is_object()) args = nlohmann::json::object();
-        }
-        nlohmann::json result = mcp_dispatch_->call_tool(tool_name, args);
-        json_out = result.dump();
-    } catch (const std::exception& e) {
-        ok = false;
-        error = e.what();
+    auto token = async_reply_dispatcher_ ? async_reply_dispatcher_->token_for(ws)
+                                         : WSAsyncReplyDispatcher::ConnectionToken{};
+    if (!token.valid()) {
+        send_error(ws, msg_id, 3, "RunAnalysis: connection unavailable");
+        return;
     }
 
-    flatbuffers::FlatBufferBuilder fbb(json_out.size() + 256);
-    auto name_off = fbb.CreateString(tool_name);
-    auto err_off = fbb.CreateString(error);
-    flatbuffers::Offset<flatbuffers::Vector<uint8_t>> data_off = 0;
-    if (ok && !json_out.empty()) {
-        data_off = fbb.CreateVector(
-            reinterpret_cast<const uint8_t*>(json_out.data()), json_out.size());
+    bool enqueued = async_reply_dispatcher_->dispatch(token, [this,
+                                              msg_id,
+                                              tool_name = std::move(tool_name),
+                                              params_json = std::move(params_json)]() mutable {
+        std::lock_guard<std::mutex> analysis_lock(analysis_mutex_);
+        return build_run_analysis_reply_bytes(*mcp_dispatch_, msg_id, tool_name, params_json);
+    });
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "RunAnalysis: server is shutting down");
     }
-    auto resp = fbs::CreateRunAnalysisResponse(fbb, name_off, ok, data_off, err_off);
-    fbb.Finish(resp);
-    send_envelope(ws, msg_id, fbs::MessageType_RunAnalysisResp, fbb);
 }
 
 }  // namespace tenet

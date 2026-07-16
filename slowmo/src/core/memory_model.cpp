@@ -1461,14 +1461,20 @@ MemoryModel::read_batch(const std::vector<ReadRequest>& requests) {
     std::vector<RegionReadResult> results(n);
     if (n == 0) return results;
 
-    // Sort an index array by (page, at_inst_id) for locality.
+    // Sort request indices by (page, at_inst_id) lexicographically.
+    // This keeps same-page requests contiguous even when at_inst_id is huge,
+    // and avoids the overflow/collision behaviour of packed bit arithmetic.
     std::vector<size_t> order(n);
     std::iota(order.begin(), order.end(), 0);
-    auto page_key = [&](size_t i) {
-        return (page_of(requests[i].addr) << 20) ^ requests[i].at_inst_id;
-    };
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return page_key(a) < page_key(b);
+        const uint64_t page_a = page_of(requests[a].addr);
+        const uint64_t page_b = page_of(requests[b].addr);
+        if (page_a != page_b) return page_a < page_b;
+        if (requests[a].at_inst_id != requests[b].at_inst_id) {
+            return requests[a].at_inst_id < requests[b].at_inst_id;
+        }
+        // Stable tie-breaker for deterministic behaviour.
+        return a < b;
     });
 
     // Execute in page-sorted order; store results at original indices.

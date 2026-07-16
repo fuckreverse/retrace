@@ -499,3 +499,321 @@ TEST_CASE("StringPass: WriteEventCollector clone/merge preserves all write event
         REQUIRE(s1->content == s2->content);
     }
 }
+
+TEST_CASE("StringPass uses MemoryModel::read_batch and keeps repeated-write references",
+          "[unit][pass][string][batch]") {
+    constexpr uint64_t str_addr = 0x10000A000ULL;
+    constexpr uint64_t hello = 0x006F6C6C6548ULL;  // "Hello\0"
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        // Repeated identical writes to the same address should keep appending
+        // references without creating duplicate strings.
+        tw.emit(ms, 0x1000, enc::str_imm(0, 0, 0),
+                {{0, hello}, {33, tw.rt(0x1004)}},
+                {{kMemWrite, 8, str_addr, hello}});
+        tw.emit(ms, 0x1004, enc::str_imm(0, 0, 0),
+                {{0, hello}, {33, tw.rt(0x1008)}},
+                {{kMemWrite, 8, str_addr, hello}});
+        tw.emit(ms, 0x1008, enc::str_imm(0, 0, 0),
+                {{0, hello}, {33, tw.rt(0x100C)}},
+                {{kMemWrite, 8, str_addr, hello}});
+        tw.emit_anchor(ms);
+    }, "string_batch_repeated_refs");
+
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    auto* s = sr.at_addr(str_addr);
+    REQUIRE(s != nullptr);
+    REQUIRE(s->content == "Hello");
+    REQUIRE(sr.total() == 1);
+
+    REQUIRE(s->references.size() == 3);
+    REQUIRE(s->references[0].inst_id == 0);
+    REQUIRE(s->references[1].inst_id == 1);
+    REQUIRE(s->references[2].inst_id == 2);
+
+    REQUIRE(sr.at_inst(0).size() == 1);
+    REQUIRE(sr.at_inst(1).size() == 1);
+    REQUIRE(sr.at_inst(2).size() == 1);
+
+}
+
+TEST_CASE("StringPass memory reuse keeps per-epoch references ordered",
+          "[unit][pass][string][batch]") {
+    constexpr uint64_t str_addr = 0x10000B000ULL;
+    constexpr uint64_t first  = 0x00000000324F4C48ULL;  // "HLO2"
+    constexpr uint64_t second = 0x0000005249415042ULL;  // "BPAIR"
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x2000, enc::str_imm(0, 0, 0),
+                {{0, first}, {33, tw.rt(0x2004)}},
+                {{kMemWrite, 8, str_addr, first}});
+        tw.emit(ms, 0x2004, enc::str_imm(0, 0, 0),
+                {{0, first}, {33, tw.rt(0x2008)}},
+                {{kMemWrite, 8, str_addr, first}});
+
+        tw.emit(ms, 0x2008, enc::str_imm(0, 0, 0),
+                {{0, second}, {33, tw.rt(0x200C)}},
+                {{kMemWrite, 8, str_addr, second}});
+        tw.emit(ms, 0x200C, enc::str_imm(0, 0, 0),
+                {{0, second}, {33, tw.rt(0x2010)}},
+                {{kMemWrite, 8, str_addr, second}});
+        tw.emit_anchor(ms);
+    }, "string_batch_reuse_order");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    REQUIRE(sr.total() == 2);
+    REQUIRE(sr.strings[0].content == "HLO2");
+    REQUIRE(sr.strings[1].content == "BPAIR");
+
+    REQUIRE(sr.strings[0].references.size() == 2);
+    REQUIRE(sr.strings[0].references[0].inst_id == 0);
+    REQUIRE(sr.strings[0].references[1].inst_id == 1);
+
+    REQUIRE(sr.strings[1].references.size() == 2);
+    REQUIRE(sr.strings[1].references[0].inst_id == 2);
+    REQUIRE(sr.strings[1].references[1].inst_id == 3);
+
+    auto* latest = sr.at_addr(str_addr);
+    REQUIRE(latest != nullptr);
+    REQUIRE(latest->content == "BPAIR");
+}
+
+TEST_CASE("StringPass keeps time-consistent windows when nearby writes evolve",
+          "[unit][pass][string][batch]") {
+    constexpr uint64_t base = 0x10000C000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        uint64_t early = 0x0000000000004241ULL;  // "AB" + NULs
+        uint32_t wxyz = 0x5A595857u;             // "WXYZ"
+        uint64_t uvwx = 0x0000000058575655ULL;   // "UVWX"
+
+        tw.emit(ms, 0x3000, enc::str_imm(0, 0, 0),
+                {{0, early}, {33, tw.rt(0x3004)}},
+                {{kMemWrite, 8, base, early}});
+        tw.emit(ms, 0x3004, enc::str_imm(1, 0, 0),
+                {{1, wxyz}, {33, tw.rt(0x3008)}},
+                {{kMemWrite, 4, base + 3, wxyz}});
+        tw.emit(ms, 0x3008, enc::str_imm(2, 0, 0),
+                {{2, uvwx}, {33, tw.rt(0x300C)}},
+                {{kMemWrite, 8, base + 8, uvwx}});
+        tw.emit_anchor(ms);
+    }, "string_batch_time_consistent");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    for (const auto& s : sr.strings) {
+        REQUIRE(s.content.find("ABWXYZ") == std::string::npos);
+    }
+
+    auto* wxyz = sr.at_addr(base + 3);
+    REQUIRE(wxyz != nullptr);
+    REQUIRE(wxyz->content == "WXYZ");
+}
+
+TEST_CASE("StringPass repeated non-string writes stay without references",
+          "[unit][pass][string][batch][boundary]") {
+    constexpr uint64_t addr = 0x10000D000ULL;
+    constexpr uint64_t zero = 0ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x4000, enc::str_imm(0, 0, 0),
+                {{0, zero}, {33, tw.rt(0x4004)}},
+                {{kMemWrite, 8, addr, zero}});
+        tw.emit(ms, 0x4004, enc::str_imm(0, 0, 0),
+                {{0, zero}, {33, tw.rt(0x4008)}},
+                {{kMemWrite, 8, addr, zero}});
+        tw.emit(ms, 0x4008, enc::str_imm(0, 0, 0),
+                {{0, zero}, {33, tw.rt(0x400C)}},
+                {{kMemWrite, 8, addr, zero}});
+        tw.emit_anchor(ms);
+    }, "string_batch_non_string_repeat");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    REQUIRE(sr.total() == 0);
+    REQUIRE(sr.at_inst(0).empty());
+    REQUIRE(sr.at_inst(1).empty());
+    REQUIRE(sr.at_inst(2).empty());
+}
+
+TEST_CASE("StringPass alias uses first overlapping hit when one probe matches many",
+          "[unit][pass][string][batch][boundary]") {
+    constexpr uint64_t base = 0x10000E000ULL;
+    constexpr uint64_t abcd = 0x0000000044434241ULL;    // "ABCD"
+    constexpr uint64_t efgh = 0x0000000048474645ULL;    // "EFGH"
+    constexpr uint64_t bridge = 0x0000484746450044ULL;  // "D\0EFGH\0\0"
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x5000, enc::str_imm(0, 0, 0),
+                {{0, abcd}, {33, tw.rt(0x5004)}},
+                {{kMemWrite, 8, base, abcd}});
+        tw.emit(ms, 0x5004, enc::str_imm(0, 0, 0),
+                {{0, efgh}, {33, tw.rt(0x5008)}},
+                {{kMemWrite, 8, base + 5, efgh}});
+        tw.emit(ms, 0x5008, enc::str_imm(0, 0, 0),
+                {{0, bridge}, {33, tw.rt(0x500C)}},
+                {{kMemWrite, 8, base + 3, bridge}});
+        // Repeated identical write aliases to previous probe slot.
+        tw.emit(ms, 0x500C, enc::str_imm(0, 0, 0),
+                {{0, bridge}, {33, tw.rt(0x5010)}},
+                {{kMemWrite, 8, base + 3, bridge}});
+        tw.emit_anchor(ms);
+    }, "string_batch_overlap_alias");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    auto* first = sr.at_addr(base);
+    auto* second = sr.at_addr(base + 5);
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(first->content == "ABCD");
+    REQUIRE(second->content == "EFGH");
+
+    // inst 2 overlaps both strings; inst 3 aliases only the first overlapping hit.
+    REQUIRE(first->references.size() == 3);
+    REQUIRE(first->references[0].inst_id == 0);
+    REQUIRE(first->references[1].inst_id == 2);
+    REQUIRE(first->references[2].inst_id == 3);
+
+    REQUIRE(second->references.size() == 2);
+    REQUIRE(second->references[0].inst_id == 1);
+    REQUIRE(second->references[1].inst_id == 2);
+
+    auto at3 = sr.at_inst(3);
+    REQUIRE(at3.size() == 1);
+    REQUIRE(at3[0]->addr == base);
+}
+
+TEST_CASE("StringPass repeated writes across batch chunk still dedup correctly",
+          "[unit][pass][string][batch][boundary]") {
+    constexpr uint64_t addr = 0x10000F000ULL;
+    constexpr uint64_t hello = 0x006F6C6C6548ULL;  // "Hello\0"
+    constexpr int kWrites = 4300;                  // > previous 4096 chunk size
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 1024;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        for (int i = 0; i < kWrites; ++i) {
+            uint64_t pc = 0x6000 + static_cast<uint64_t>(i) * 4;
+            tw.emit(ms, pc, enc::str_imm(0, 0, 0),
+                    {{0, hello}, {33, tw.rt(pc + 4)}},
+                    {{kMemWrite, 8, addr, hello}});
+        }
+        tw.emit_anchor(ms);
+    }, "string_batch_cross_chunk_repeat");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    auto* s = sr.at_addr(addr);
+    REQUIRE(s != nullptr);
+    REQUIRE(s->content == "Hello");
+    REQUIRE(sr.total() == 1);
+    REQUIRE(s->references.size() == static_cast<size_t>(kWrites));
+
+    REQUIRE(sr.at_inst(0).size() == 1);
+    REQUIRE(sr.at_inst(4095).size() == 1);
+    REQUIRE(sr.at_inst(4096).size() == 1);
+    REQUIRE(sr.at_inst(kWrites - 1).size() == 1);
+}
+
+TEST_CASE("StringPass A-B-A reuse keeps discovery and reference order",
+          "[unit][pass][string][batch][boundary]") {
+    constexpr uint64_t addr = 0x100010000ULL;
+    constexpr uint64_t a = 0x006F6C6C6548ULL;  // "Hello\0"
+    constexpr uint64_t b = 0x00646C726F57ULL;  // "World\0"
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+
+        tw.emit(ms, 0x7000, enc::str_imm(0, 0, 0),
+                {{0, a}, {33, tw.rt(0x7004)}},
+                {{kMemWrite, 8, addr, a}});
+        tw.emit(ms, 0x7004, enc::str_imm(0, 0, 0),
+                {{0, a}, {33, tw.rt(0x7008)}},
+                {{kMemWrite, 8, addr, a}});
+
+        tw.emit(ms, 0x7008, enc::str_imm(0, 0, 0),
+                {{0, b}, {33, tw.rt(0x700C)}},
+                {{kMemWrite, 8, addr, b}});
+        tw.emit(ms, 0x700C, enc::str_imm(0, 0, 0),
+                {{0, b}, {33, tw.rt(0x7010)}},
+                {{kMemWrite, 8, addr, b}});
+
+        tw.emit(ms, 0x7010, enc::str_imm(0, 0, 0),
+                {{0, a}, {33, tw.rt(0x7014)}},
+                {{kMemWrite, 8, addr, a}});
+        tw.emit(ms, 0x7014, enc::str_imm(0, 0, 0),
+                {{0, a}, {33, tw.rt(0x7018)}},
+                {{kMemWrite, 8, addr, a}});
+        tw.emit_anchor(ms);
+    }, "string_batch_a_b_a");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<StringPass>());
+    auto& sr = pm->require("strings").get<StringResult>();
+
+    REQUIRE(sr.total() == 3);
+    REQUIRE(sr.strings[0].content == "Hello");
+    REQUIRE(sr.strings[1].content == "World");
+    REQUIRE(sr.strings[2].content == "Hello");
+
+    REQUIRE(sr.strings[0].discovered_at == 0);
+    REQUIRE(sr.strings[1].discovered_at == 2);
+    REQUIRE(sr.strings[2].discovered_at == 4);
+
+    REQUIRE(sr.strings[0].references.size() == 2);
+    REQUIRE(sr.strings[0].references[0].inst_id == 0);
+    REQUIRE(sr.strings[0].references[1].inst_id == 1);
+
+    REQUIRE(sr.strings[1].references.size() == 2);
+    REQUIRE(sr.strings[1].references[0].inst_id == 2);
+    REQUIRE(sr.strings[1].references[1].inst_id == 3);
+
+    REQUIRE(sr.strings[2].references.size() == 2);
+    REQUIRE(sr.strings[2].references[0].inst_id == 4);
+    REQUIRE(sr.strings[2].references[1].inst_id == 5);
+
+    auto* latest = sr.at_addr(addr);
+    REQUIRE(latest != nullptr);
+    REQUIRE(latest == &sr.strings[2]);
+}

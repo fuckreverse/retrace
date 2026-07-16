@@ -97,6 +97,12 @@ tenet_add_test(test_pass_dataflow_graph    unit/test_pass_dataflow_graph.cpp)
 tenet_add_test(test_dbg_loop               unit/test_dbg_loop.cpp)
 tenet_add_test(test_bugfixes               unit/test_bugfixes.cpp)
 
+# ─── Unit tests: WebSocket layer (requires TENET_ENABLE_WS) ─────────────────
+if(TENET_ENABLE_WS)
+    tenet_add_test(test_ws_async_reply_dispatcher unit/test_ws_async_reply_dispatcher.cpp)
+    tenet_add_test(test_ws_analysis_task_queue  unit/test_ws_analysis_task_queue.cpp)
+endif()
+
 # ─── Unit tests: iOS-specific analysis passes ────────────────────────────────
 tenet_add_test(test_pass_algorithm_summary     unit/test_pass_algorithm_summary.cpp)
 tenet_add_test(test_pass_objc_crypto           unit/test_pass_objc_crypto.cpp)
