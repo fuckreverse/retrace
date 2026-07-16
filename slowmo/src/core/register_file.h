@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 namespace tenet {
 
@@ -134,9 +135,18 @@ public:
     /// This is the shared sampling primitive used by LoopSemanticsPass and
     /// TraceFoldPass to avoid duplicated `state_before()` call loops.
     /// Each `state_before(iid)` returns the full ~800-byte RegState, but
-    /// loop analysis only needs GPR[0..30] (x0-x30).  This method fetches
-    /// only the needed registers and returns them as a compact vector of
-    /// 31-element arrays.
+    /// loop analysis only needs GPR[0..30] (x0-x30). This method groups
+    /// requests by checkpoint bucket, seeds one cursor per visited bucket,
+    /// and replays forward only within that bucket. This preserves exact
+    /// `state_before()` semantics for unordered inputs, duplicates, checkpoint
+    /// hits, and out-of-range ids without degenerating into a global min→max
+    /// sweep on sparse samples.
+    ///
+    /// If checkpoints are not built yet, behavior intentionally matches the
+    /// scalar path's old fast-fail contract: return `count` zero-initialized
+    /// arrays rather than reconstructing from anchors. Batch sampling does not
+    /// increment `CacheStats::ckpt_queries`; that counter remains reserved for
+    /// scalar `state_before()`/`state_after()` checkpoint queries.
     ///
     /// @param inst_ids  pointer to inst_id array
     /// @param count     number of inst_ids
@@ -150,6 +160,10 @@ public:
     ///
     /// Performs one forward sweep over the entire trace, storing a full
     /// RegState snapshot (plus file offset) every `stride` instructions.
+    /// After the first successful call, the checkpoint array becomes immutable:
+    /// later calls are no-ops even if they request a different stride. The
+    /// method is thread-safe; concurrent callers serialize on an internal mutex
+    /// and only the first caller performs the build.
     /// After build, state_before() uses checkpoints (lock-free O(K) replay).
     ///
     /// Memory: (inst_count / stride) * (sizeof(RegState) + 16) bytes.
@@ -168,8 +182,8 @@ public:
     const TraceIndex&  index() const  { return index_; }
 
     struct CacheStats {
-        uint64_t ckpt_queries = 0;     ///< queries served by checkpoint array
-        uint64_t ckpt_fallbacks = 0;   ///< out-of-range → last checkpoint state
+        uint64_t ckpt_queries = 0;     ///< scalar state_before/state_after checkpoint queries
+        uint64_t ckpt_fallbacks = 0;   ///< scalar out-of-range → last checkpoint state
     };
     CacheStats cache_stats() const {
         CacheStats s;
@@ -199,9 +213,10 @@ private:
         uint64_t file_offset;  // file offset of the INST record at this inst_id
     };
 
+    mutable std::mutex build_mutex_;
     std::atomic<bool> checkpoints_built_{false};
     uint64_t ckpt_stride_ = 0;
-    std::vector<Checkpoint> checkpoints_;  // immutable after build
+    std::vector<Checkpoint> checkpoints_;  // immutable after first build
 };
 
 }  // namespace tenet

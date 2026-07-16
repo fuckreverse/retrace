@@ -7,6 +7,7 @@
 #include "common/instruction_row.h"
 #include "core/register_file.h"
 #include "core/memory_model.h"
+#include "ws/ws_protocol.h"
 
 // uWebSockets includes (only in .cpp, not in header)
 #include <App.h>
@@ -27,19 +28,12 @@ struct PerSocketData {};
 
 namespace {
 
-/// Wrap a finished inner FlatBufferBuilder payload in an Envelope and send it
-/// over the WebSocket connection. Mirrors the pattern used by send_error()
-/// and the observer callbacks in tenet_ws_service.cpp.
+/// Wrap a finished payload FlatBuffer in a ws::Envelope and send it over the
+/// WebSocket connection.
 void send_envelope(void* ws, uint32_t msg_id, MessageType type,
                     flatbuffers::FlatBufferBuilder& fbb) {
-    flatbuffers::FlatBufferBuilder env_fbb(fbb.GetSize() + 64);
-    auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-    auto env = CreateEnvelope(env_fbb, msg_id, type, pv);
-    env_fbb.Finish(env);
-
-    auto sv = std::string_view(
-        reinterpret_cast<const char*>(env_fbb.GetBufferPointer()),
-        env_fbb.GetSize());
+    auto bytes = build_ws_envelope_bytes(msg_id, type, fbb);
+    auto sv = std::string_view(bytes.data(), bytes.size());
     static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws)->send(sv, uWS::BINARY);
 }
 

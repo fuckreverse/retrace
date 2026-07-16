@@ -7,12 +7,64 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <vector>
+
 #include "fixtures/trace_fixture.h"
 #include "common/types.h"
 #include "infra/checkpoint_manager.h"
 
 using namespace tenet;
 using namespace tenet::test;
+using namespace std::chrono_literals;
+
+namespace {
+
+std::unique_ptr<TraceEnv> make_env_without_checkpoints(
+        std::function<void(TraceWriter&)> gen,
+        const char* name = "test") {
+    std::string dir_name = std::string("tenet_test_cold_") + name + "_" +
+                           std::to_string(getpid()) + "_" +
+                           std::to_string(reinterpret_cast<uintptr_t>(&gen));
+    auto temp_dir = std::filesystem::temp_directory_path() / dir_name;
+    std::filesystem::remove_all(temp_dir);
+    std::filesystem::create_directories(temp_dir);
+
+    auto trace_path = temp_dir / (std::string(name) + ".trace");
+    {
+        TraceWriter tw;
+        tw.module_name = name;
+        if (!tw.open(trace_path.c_str())) return nullptr;
+        gen(tw);
+        tw.close();
+    }
+
+    auto env = std::make_unique<TraceEnv>();
+    env->temp_dir = temp_dir;
+    env->trace_path = trace_path;
+
+    auto reader_result = TraceReader::open(trace_path);
+    if (!reader_result) {
+        std::filesystem::remove_all(temp_dir);
+        return nullptr;
+    }
+    env->reader = std::make_unique<TraceReader>(std::move(*reader_result));
+
+    auto index_result = TraceIndex::open_or_build(*env->reader, nullptr);
+    if (!index_result) {
+        std::filesystem::remove_all(temp_dir);
+        return nullptr;
+    }
+    env->index = std::make_unique<TraceIndex>(std::move(*index_result));
+    env->regfile = std::make_unique<RegisterFile>(*env->reader, *env->index);
+    return env;
+}
+
+}  // namespace
 
 TEST_CASE("RegisterFile reconstructs state from anchor", "[unit][core][register_file]") {
     auto env = make_env([](TraceWriter& tw) {
@@ -244,11 +296,38 @@ TEST_CASE("RegisterFile empty trace does not crash", "[unit][core][register_file
     }, "regfile_empty");
 
     REQUIRE(env != nullptr);
+    REQUIRE(env->regfile->has_checkpoints());
 
-    // build_checkpoints() is a no-op for an empty trace (total == 0 guard).
-    // state_before(0) on empty checkpoints returns RegState{}.
+    auto stats_before = env->regfile->cache_stats();
     auto state = env->regfile->state_before(0);
     REQUIRE(state.gpr[0] == 0);
+    REQUIRE(env->regfile->cache_stats().ckpt_queries == stats_before.ckpt_queries);
+}
+
+TEST_CASE("RegisterFile empty trace build marks initialized once",
+          "[unit][core][register_file]") {
+    auto env = make_env_without_checkpoints([](TraceWriter& tw) {
+        tw.write_header();
+    }, "regfile_empty_once");
+
+    REQUIRE(env != nullptr);
+    REQUIRE_FALSE(env->regfile->has_checkpoints());
+
+    std::atomic<int> callback_calls{0};
+    env->regfile->build_checkpoints(4, [&](uint64_t, uint64_t) {
+        callback_calls.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    REQUIRE(env->regfile->has_checkpoints());
+    auto stats_before = env->regfile->cache_stats();
+    auto state = env->regfile->state_before(0);
+    REQUIRE(state.gpr[0] == 0);
+    REQUIRE(env->regfile->cache_stats().ckpt_queries == stats_before.ckpt_queries);
+
+    env->regfile->build_checkpoints(1, [&](uint64_t, uint64_t) {
+        callback_calls.fetch_add(1, std::memory_order_relaxed);
+    });
+    REQUIRE(callback_calls.load(std::memory_order_relaxed) == 0);
 }
 
 TEST_CASE("RegisterFile out-of-range returns last checkpoint state", "[unit][core][register_file]") {
@@ -280,6 +359,69 @@ TEST_CASE("RegisterFile out-of-range returns last checkpoint state", "[unit][cor
     REQUIRE(env->regfile->cache_stats().ckpt_fallbacks == fallbacks_before + 1);
     // Returned state is a valid (non-crashing) RegState copy.
     (void)state;
+}
+
+TEST_CASE("RegisterFile build_checkpoints is single-shot even concurrently",
+          "[unit][core][register_file]") {
+    auto env = make_env_without_checkpoints([](TraceWriter& tw) {
+        tw.anchor_interval = 4096;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        for (int i = 0; i < 4100; i++) {
+            const uint64_t pc = 0x1000 + static_cast<uint64_t>(i) * 4;
+            tw.emit(ms, pc, enc::add_imm(0, 0, 1), {
+                {0, static_cast<uint64_t>(i + 1)},
+                {33, tw.rt(pc + 4)},
+            }, {});
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_build_once");
+
+    REQUIRE(env != nullptr);
+    REQUIRE_FALSE(env->regfile->has_checkpoints());
+
+    std::promise<void> first_progress_hit_promise;
+    auto first_progress_hit = first_progress_hit_promise.get_future();
+    std::promise<void> release_first_promise;
+    auto release_first = release_first_promise.get_future().share();
+    std::atomic<bool> first_blocked{false};
+    std::atomic<int> second_progress_calls{0};
+
+    auto build_one = std::async(std::launch::async, [&] {
+        env->regfile->build_checkpoints(4, [&](uint64_t, uint64_t) {
+            if (!first_blocked.exchange(true, std::memory_order_relaxed)) {
+                first_progress_hit_promise.set_value();
+                release_first.wait();
+            }
+        });
+    });
+
+    REQUIRE(first_progress_hit.wait_for(5s) == std::future_status::ready);
+
+    std::promise<void> second_started_promise;
+    auto second_started = second_started_promise.get_future();
+    auto build_two = std::async(std::launch::async, [&] {
+        second_started_promise.set_value();
+        env->regfile->build_checkpoints(64, [&](uint64_t, uint64_t) {
+            second_progress_calls.fetch_add(1, std::memory_order_relaxed);
+        });
+    });
+
+    REQUIRE(second_started.wait_for(5s) == std::future_status::ready);
+    REQUIRE(build_two.wait_for(20ms) == std::future_status::timeout);
+
+    release_first_promise.set_value();
+    build_one.get();
+    build_two.get();
+
+    REQUIRE(env->regfile->has_checkpoints());
+    REQUIRE(second_progress_calls.load(std::memory_order_relaxed) == 0);
+
+    auto state = env->regfile->state_before(8);
+    REQUIRE(state.gpr[0] == 8);
 }
 
 TEST_CASE("RegisterFile ensure_checkpoints is idempotent", "[unit][core][register_file]") {
@@ -322,6 +464,45 @@ TEST_CASE("RegisterFile ensure_checkpoints is idempotent", "[unit][core][registe
     REQUIRE(s1.gpr[0] == s2.gpr[0]);
 }
 
+TEST_CASE("RegisterFileCursor repeated advance restores PC and GPRs in v5",
+          "[unit][core][register_file]") {
+    auto env = make_env_without_checkpoints([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_v5();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        tw.emit_v5(ms, 0x1000, enc::add_imm(0, 0, 1), {{0, 1ULL}}, {});
+        tw.emit_v5(ms, 0x1004, enc::add_imm(0, 0, 1), {{0, 2ULL}}, {});
+        tw.emit_v5(ms, 0x1008, enc::movz(1, 0x1234), {{1, 0x1234ULL}}, {});
+        tw.emit_anchor(ms);
+    }, "regfile_cursor_v5");
+
+    REQUIRE(env != nullptr);
+
+    RegisterFileCursor cursor(*env->reader, *env->index);
+    const RegState& s1 = cursor.advance_to(1);
+    REQUIRE(s1.pc() == rt_pc(0x1004));
+    REQUIRE(s1.gpr[0] == 1);
+    REQUIRE(s1.gpr[1] == 0);
+
+    const RegState& s1_repeat = cursor.advance_to(1);
+    REQUIRE(s1_repeat.pc() == rt_pc(0x1004));
+    REQUIRE(s1_repeat.gpr[0] == 1);
+    REQUIRE(s1_repeat.gpr[1] == 0);
+
+    const RegState& s2 = cursor.advance_to(2);
+    REQUIRE(s2.pc() == rt_pc(0x1008));
+    REQUIRE(s2.gpr[0] == 2);
+    REQUIRE(s2.gpr[1] == 0);
+
+    const RegState& s3 = cursor.advance_to(3);
+    REQUIRE(s3.pc() == rt_pc(0x1008));
+    REQUIRE(s3.gpr[0] == 2);
+    REQUIRE(s3.gpr[1] == 0x1234ULL);
+}
+
 TEST_CASE("RegisterFile create_cursor returns working cursor", "[unit][core][register_file]") {
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
@@ -348,4 +529,96 @@ TEST_CASE("RegisterFile create_cursor returns working cursor", "[unit][core][reg
     auto ref_state = env->regfile->state_before(2);
     REQUIRE(cursor_state.gpr[0] == ref_state.gpr[0]);
     REQUIRE(cursor_state.pc()  == ref_state.pc());
+}
+
+TEST_CASE("RegisterFile sample_gprs matches point queries without per-id ckpt stats",
+          "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 5;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        for (int i = 0; i < 18; i++) {
+            const uint64_t pc = 0x1000 + static_cast<uint64_t>(i) * 4;
+            tw.emit(ms, pc, enc::add_imm(0, 0, 1), {
+                {0, static_cast<uint64_t>(i + 1)},
+                {1, 0x1000ULL + static_cast<uint64_t>(i % 3)},
+                {2, 0x2000ULL + static_cast<uint64_t>(i * 3)},
+                {29, 0x3000ULL + static_cast<uint64_t>(i)},
+                {33, tw.rt(pc + 4)},
+            }, {}, static_cast<uint8_t>(i & 0xF));
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_sample_gprs");
+
+    REQUIRE(env != nullptr);
+
+    const std::vector<uint64_t> inst_ids = {
+        12, 1, 9, 9, 4, 1'000'000, 0, 17, 8, 6
+    };
+
+    std::vector<std::array<uint64_t, 31>> expected;
+    expected.reserve(inst_ids.size());
+    for (uint64_t inst_id : inst_ids) {
+        auto state = env->regfile->state_before(inst_id);
+        std::array<uint64_t, 31> gprs{};
+        std::copy_n(state.gpr, 31, gprs.begin());
+        expected.push_back(gprs);
+    }
+
+    const auto stats_before = env->regfile->cache_stats();
+    auto sampled = env->regfile->sample_gprs(inst_ids.data(), inst_ids.size());
+    const auto stats_after = env->regfile->cache_stats();
+
+    REQUIRE(sampled == expected);
+    // sample_gprs() is a batch API: it must not devolve into one
+    // state_before()/checkpoint query per requested inst_id.
+    REQUIRE(stats_after.ckpt_queries == stats_before.ckpt_queries);
+}
+
+TEST_CASE("RegisterFile sample_gprs handles empty input and no-checkpoint fallback",
+          "[unit][core][register_file]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 4;
+        tw.write_header();
+        MachineState ms;
+        ms.sp() = 0x7F000000ULL;
+        ms.pc() = tw.rt(0x1000);
+        tw.emit_anchor(ms);
+        for (int i = 0; i < 6; i++) {
+            const uint64_t pc = 0x1000 + static_cast<uint64_t>(i) * 4;
+            tw.emit(ms, pc, enc::add_imm(0, 0, 1), {
+                {0, static_cast<uint64_t>(i + 1)},
+                {33, tw.rt(pc + 4)},
+            }, {});
+        }
+        tw.emit_anchor(ms);
+    }, "regfile_sample_gprs_empty");
+
+    REQUIRE(env != nullptr);
+
+    SECTION("empty input returns empty output") {
+        const auto stats_before = env->regfile->cache_stats();
+        auto sampled = env->regfile->sample_gprs(nullptr, 0);
+        const auto stats_after = env->regfile->cache_stats();
+
+        REQUIRE(sampled.empty());
+        REQUIRE(stats_after.ckpt_queries == stats_before.ckpt_queries);
+    }
+
+    SECTION("without checkpoints returns count zero arrays") {
+        RegisterFile cold_regfile(*env->reader, *env->index);
+        const std::vector<uint64_t> inst_ids = {0, 3, 1000};
+
+        auto sampled = cold_regfile.sample_gprs(inst_ids.data(), inst_ids.size());
+        REQUIRE(sampled.size() == inst_ids.size());
+        for (const auto& gprs : sampled) {
+            REQUIRE(std::all_of(gprs.begin(), gprs.end(), [](uint64_t v) {
+                return v == 0;
+            }));
+        }
+        REQUIRE(cold_regfile.cache_stats().ckpt_queries == 0);
+    }
 }

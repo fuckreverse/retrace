@@ -1,10 +1,13 @@
 // tools/tenet/src/ws/ws_handlers_nav.cpp
 //
 // Navigation, bookmark, trace-info, and search WebSocket handlers.
-// All handlers are synchronous (run on the uWS event loop thread).
+// SearchForward computes on a worker thread and only sends on the uWS loop;
+// the other handlers remain synchronous on the event loop thread.
 #include "ws/tenet_ws_service.h"
-#include "common/types.h"
 #include "io/trace_reader.h"
+#include "ws/ws_analysis_jobs.h"
+#include "ws/ws_async_reply_dispatcher.h"
+#include "ws/ws_protocol.h"
 
 // uWebSockets includes (only in .cpp, not in header)
 #include <App.h>
@@ -12,7 +15,6 @@
 // FlatBuffers generated header
 #include "tenet_ws_generated.h"
 
-#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -25,18 +27,12 @@ struct PerSocketData {};
 
 namespace {
 
-/// Wrap a finished inner FlatBufferBuilder payload in an Envelope and send it
-/// over the WebSocket connection.  Same pattern as ws_handlers_hotpath.cpp.
+/// Wrap a finished payload FlatBuffer in a ws::Envelope and send it over the
+/// WebSocket connection.
 void send_envelope(void* ws, uint32_t msg_id, MessageType type,
                     flatbuffers::FlatBufferBuilder& fbb) {
-    flatbuffers::FlatBufferBuilder env_fbb(fbb.GetSize() + 64);
-    auto pv = env_fbb.CreateVector(fbb.GetBufferPointer(), fbb.GetSize());
-    auto env = CreateEnvelope(env_fbb, msg_id, type, pv);
-    env_fbb.Finish(env);
-
-    auto sv = std::string_view(
-        reinterpret_cast<const char*>(env_fbb.GetBufferPointer()),
-        env_fbb.GetSize());
+    auto bytes = build_ws_envelope_bytes(msg_id, type, fbb);
+    auto sv = std::string_view(bytes.data(), bytes.size());
     static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws)->send(sv, uWS::BINARY);
 }
 
@@ -101,7 +97,7 @@ void TenetWSService::handle_toggle_bookmark(void* ws, uint32_t msg_id,
 
     service_.toggle_bookmark(inst_id);
 
-    auto& bm = service_.bookmarks();
+    auto bm = service_.bookmarks();
     flatbuffers::FlatBufferBuilder fbb(64 + bm.size() * 8);
     auto bm_vec = fbb.CreateVector(bm.data(), bm.size());
     auto resp = CreateToggleBookmarkResponse(fbb, bm_vec);
@@ -111,7 +107,7 @@ void TenetWSService::handle_toggle_bookmark(void* ws, uint32_t msg_id,
 }
 
 void TenetWSService::handle_get_bookmarks(void* ws, uint32_t msg_id) {
-    auto& bm = service_.bookmarks();
+    auto bm = service_.bookmarks();
     flatbuffers::FlatBufferBuilder fbb(64 + bm.size() * 8);
     auto bm_vec = fbb.CreateVector(bm.data(), bm.size());
     auto resp = CreateGetBookmarksResponse(fbb, bm_vec);
@@ -159,37 +155,38 @@ void TenetWSService::handle_search_forward(void* ws, uint32_t msg_id,
     std::string query = req->query() ? req->query()->str() : "";
     uint64_t from = req->from_inst();
 
-    // Synchronous: blocks the event loop for the duration of the search.
-    // This is intentional — TenetService is not thread-safe, so dispatching
-    // to a worker thread would race with other handlers touching service_
-    // state (row cache, search results, register file, etc.).
-    // TODO: async search requires TenetService-level locking or a
-    //       copy-on-write snapshot mechanism before it can be safely
-    //       offloaded to a background thread.
-    auto results = service_.search_forward(query, from);
-    flatbuffers::FlatBufferBuilder fbb(results.size() * 8 + 64);
-    auto rv = fbb.CreateVector(results.data(), results.size());
-    auto resp = CreateSearchForwardResponse(fbb, rv,
-                                             static_cast<uint32_t>(results.size()));
-    fbb.Finish(resp);
-    send_envelope(ws, msg_id, MessageType_SearchForwardResp, fbb);
+    auto token = async_reply_dispatcher_ ? async_reply_dispatcher_->token_for(ws)
+                                         : WSAsyncReplyDispatcher::ConnectionToken{};
+    if (!token.valid()) {
+        send_error(ws, msg_id, 3, "SearchForward: connection unavailable");
+        return;
+    }
+    if (async_reply_dispatcher_->is_stopping()) {
+        send_error(ws, msg_id, 4, "SearchForward: server is shutting down");
+        return;
+    }
+
+    bool enqueued = async_reply_dispatcher_->dispatch(
+        token,
+        [this, msg_id, query = std::move(query), from]() mutable {
+            return build_search_forward_reply_bytes(service_, msg_id, query, from);
+        });
+    if (!enqueued) {
+        send_error(ws, msg_id, 4, "SearchForward: server is shutting down");
+    }
 }
 
 void TenetWSService::handle_search_clear(void* ws, uint32_t msg_id) {
     service_.search_clear();
 
-    // No response body defined in the schema — send an empty envelope.
-    flatbuffers::FlatBufferBuilder fbb(32);
-    fbb.Finish(CreateEnvelope(fbb, msg_id, MessageType_SearchClearResp, 0));
-
-    auto sv = std::string_view(
-        reinterpret_cast<const char*>(fbb.GetBufferPointer()),
-        fbb.GetSize());
+    auto bytes = build_ws_envelope_bytes(msg_id, MessageType_SearchClearResp,
+                                         static_cast<const uint8_t*>(nullptr), 0);
+    auto sv = std::string_view(bytes.data(), bytes.size());
     static_cast<uWS::WebSocket<false, true, PerSocketData>*>(ws)->send(sv, uWS::BINARY);
 }
 
 void TenetWSService::handle_get_search_results(void* ws, uint32_t msg_id) {
-    auto& results = service_.search_results();
+    auto results = service_.search_results();
 
     flatbuffers::FlatBufferBuilder fbb(results.size() * 8 + 64);
     auto rv = fbb.CreateVector(results.data(), results.size());

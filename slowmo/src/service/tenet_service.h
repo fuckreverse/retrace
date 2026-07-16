@@ -95,7 +95,8 @@ public:
     bool can_nav_forward() const;
 
     // ── Bookmarks ───────────────────────────────────────────────────────
-    const std::vector<uint64_t>& bookmarks() const { return bookmarks_; }
+    /// Thread-safe snapshot of bookmarks for cross-thread consumers.
+    std::vector<uint64_t> bookmarks() const;
     void toggle_bookmark(uint64_t inst_id);
     bool has_bookmark(uint64_t inst_id) const;
 
@@ -111,7 +112,8 @@ public:
     // ── Pass management ─────────────────────────────────────────────────
 
     /// Ensure PassManager is created and wired to backend objects.
-    /// Idempotent — safe to call multiple times.
+    /// Thread-safe lazy init: all callers see the same fully initialized
+    /// instance before this returns.
     PassManager& ensure_pass_manager();
 
     /// Run the curated default startup passes (async-friendly).
@@ -122,7 +124,8 @@ public:
     bool run_pass(std::string_view name, const PassRunCtx& ctx = {});
 
     /// Access the underlying PassManager (may be nullptr if not yet created).
-    PassManager* pass_manager() { return pass_manager_.get(); }
+    /// Reads are synchronized with ensure_pass_manager() publication.
+    PassManager* pass_manager();
 
     // ── Typed pass result accessors ─────────────────────────────────────
     // Each returns nullptr if the pass has not run or failed.
@@ -143,8 +146,9 @@ public:
     /// a typed pointer to its data.  Returns nullptr on failure.
     template<typename T>
     const T* pin_pass_result(std::string_view name) {
-        if (!pass_manager_) return nullptr;
-        auto sp = pass_manager_->require_shared(name);
+        auto* pm = pass_manager();
+        if (!pm) return nullptr;
+        auto sp = pm->require_shared(name);
         if (!sp || !sp->ok()) return nullptr;
         const T* ptr = &sp->get<T>();
         {
@@ -159,9 +163,10 @@ public:
     void clear_analysis();
 
     // ── Search ──────────────────────────────────────────────────────────
-    const std::vector<uint64_t>& search_results() const { return search_results_; }
-    size_t search_current() const { return search_current_; }
-    bool search_active() const { return search_active_; }
+    /// Thread-safe snapshots/values for cross-thread readers.
+    std::vector<uint64_t> search_results() const;
+    size_t search_current() const;
+    bool search_active() const;
 
     /// Search from `from_inst` with wrap-around and return an immutable result
     /// snapshot suitable for direct frontend consumption.
@@ -212,6 +217,8 @@ private:
     mutable std::mutex row_cache_mutex_;
 
     // ── Pass engine ─────────────────────────────────────────────────────
+    mutable std::mutex pass_manager_mutex_;
+    std::once_flag pass_manager_once_;
     std::unique_ptr<PassManager> pass_manager_;
 
     // Keeps pass results alive (thread-safe shared_ptr ownership).

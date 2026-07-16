@@ -107,8 +107,7 @@ public:
     ///
     /// Requests are internally sorted by page so that all accesses to the
     /// same page share one PageWriteIndex load (RocksDB forward scan) and
-    /// benefit from the thread-local page cache.  Identical (addr, size,
-    /// at_inst_id) requests are deduplicated.
+    /// benefit from the thread-local page cache.
     ///
     /// This is the preferred API for passes that issue many scattered
     /// read_region() calls (e.g. objc args, memory_string, syscall_intercept,

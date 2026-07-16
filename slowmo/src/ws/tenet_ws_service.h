@@ -16,9 +16,11 @@ struct us_listen_socket_t;
 
 namespace tenet {
 
-// Forward declaration — the generic analysis channel reuses the MCP tool
-// registry (TenetMcpService::call_tool) to dispatch any analysis tool by name.
+// Forward declarations for the in-process MCP dispatcher and async WS reply
+// scheduler used by heavy request/response handlers.
 class TenetMcpService;
+class WSAsyncReplyDispatcher;
+class WSAnalysisTaskQueue;
 
 /// High-performance WebSocket service using uWebSockets + FlatBuffers.
 /// Exposes the full TenetService API over binary WebSocket frames.
@@ -34,7 +36,10 @@ public:
     /// Returns the actual listening port (useful when port=0 for OS-assigned).
     uint16_t start(uint16_t port = 9090);
 
-    /// Stop the server and join the event loop thread.
+    /// Stop the server.
+    /// If called from a non-loop thread, this joins the event loop thread.
+    /// If called from the loop thread, shutdown is initiated but join/final
+    /// cleanup must be completed by an external thread (or destructor off-loop).
     void stop();
 
     bool running() const { return running_.load(); }
@@ -52,7 +57,7 @@ private:
     void send_error(void* ws, uint32_t msg_id, uint32_t code,
                     const std::string& message);
 
-    // ── Handler methods (implemented in ws_handlers_stub.cpp) ────────
+    // ── Handler methods (implemented in ws_handlers_*.cpp) ───────────
     void handle_fetch_rows(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_get_regs(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
     void handle_read_memory(void* ws, uint32_t msg_id, const uint8_t* payload, size_t len);
@@ -80,10 +85,14 @@ private:
     TenetService& service_;
     // Owns an MCP service bound to the same TenetService backend, used ONLY as
     // an in-process tool dispatcher for the generic RunAnalysis channel (no
-    // transport started). Accessed only from the event loop thread.
+    // transport started). Access is serialized behind analysis_mutex_.
     std::unique_ptr<TenetMcpService> mcp_dispatch_;
+    // Owns the worker/defer pipeline for handlers that must finish on a
+    // background thread but still deliver the final response on the uWS loop.
+    std::unique_ptr<WSAsyncReplyDispatcher> async_reply_dispatcher_;
     std::thread loop_thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stopping_{false};
     std::atomic<bool> ready_{false};   // set when event_loop_main finishes setup (success or failure)
     std::atomic<uint16_t> port_{0};
 
@@ -94,10 +103,15 @@ private:
     // Connected clients — accessed ONLY from the event loop thread.
     std::vector<void*> clients_;     // uWS::WebSocket<false>* pointers
 
-    // Analysis runs off the uWS loop so progress requests remain responsive.
+    // Serializes heavy analysis jobs (pass execution / MCP tool dispatch).
+    // Event-loop light handlers rely on TenetService's internal locks and
+    // backend thread safety.
     std::mutex analysis_mutex_;
-    std::mutex workers_mutex_;
-    std::vector<std::future<void>> analysis_workers_;
+    // Stop-aware queue for analysis worker tasks. All analysis_workers_
+    // paths (handle_run_pass, handle_run_default_passes, etc.) must go
+    // through this queue so that stop() can atomically reject new work
+    // and drain running tasks before closing the socket.
+    std::unique_ptr<WSAnalysisTaskQueue> analysis_task_queue_;
 };
 
 }  // namespace tenet

@@ -1740,3 +1740,128 @@ TEST_CASE("MemoryModel: active_pages tracks all written pages accurately",
         }
     }
 }
+
+TEST_CASE("MemoryModel: read_batch preserves input order with large inst_id",
+          "[unit][core][memory_model][read_batch]") {
+    constexpr uint64_t kPage0 = 0x204000000ULL;
+    constexpr uint64_t kPage1 = kPage0 + 0x1000ULL;
+    constexpr uint64_t kPage2 = kPage1 + 0x1000ULL;
+    constexpr uint64_t kVal0  = 0x1111111111111111ULL;
+    constexpr uint64_t kVal1  = 0x2222222222222222ULL;
+    constexpr uint64_t kVal2  = 0x3333333333333333ULL;
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x200000000ULL;
+        tw.emit(ms, 0x1000, enc::str_imm(0, 31, 0),
+                {{0, kVal0}, {33, tw.rt(0x1004)}},
+                {{kWrite, 8, kPage0 + 0x10, kVal0}});
+        tw.emit(ms, 0x1004, enc::str_imm(1, 31, 0),
+                {{1, kVal1}, {33, tw.rt(0x1008)}},
+                {{kWrite, 8, kPage1 + 0x20, kVal1}});
+        tw.emit(ms, 0x1008, enc::str_imm(2, 31, 0),
+                {{2, kVal2}, {33, tw.rt(0x100C)}},
+                {{kWrite, 8, kPage2 + 0x30, kVal2}});
+        tw.emit_anchor(ms);
+    }, "mm_read_batch_order_large_id");
+
+    REQUIRE(env != nullptr);
+
+    std::vector<MemoryModel::ReadRequest> reqs = {
+        {kPage2 + 0x30, 8, (1ULL << 36) + 9},
+        {kPage0 + 0x10, 8, (1ULL << 42) + 7},
+        {kPage1 + 0x20, 8, (1ULL << 48) + 5},
+        {kPage0 + 0x10, 8, (1ULL << 52) + 3},
+    };
+
+    auto batch = env->memory->read_batch(reqs);
+    REQUIRE(batch.size() == reqs.size());
+
+    auto read_u64 = [](const MemoryModel::RegionReadResult& rr) {
+        uint64_t v = 0;
+        std::memcpy(&v, rr.data.data(), 8);
+        return v;
+    };
+
+    SECTION("results stay aligned with the original request order") {
+        REQUIRE(batch[0].known_count == 8);
+        REQUIRE(batch[1].known_count == 8);
+        REQUIRE(batch[2].known_count == 8);
+        REQUIRE(batch[3].known_count == 8);
+        REQUIRE(read_u64(batch[0]) == kVal2);
+        REQUIRE(read_u64(batch[1]) == kVal0);
+        REQUIRE(read_u64(batch[2]) == kVal1);
+        REQUIRE(read_u64(batch[3]) == kVal0);
+    }
+
+    SECTION("batch results match per-request read_region for large inst_id") {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            auto single = env->memory->read_region(reqs[i].addr, reqs[i].size, reqs[i].at_inst_id);
+            REQUIRE(batch[i].known_count == single.known_count);
+            REQUIRE(batch[i].data == single.data);
+            REQUIRE(batch[i].known == single.known);
+        }
+    }
+}
+
+TEST_CASE("MemoryModel: read_batch handles huge inst_id without reordering results",
+          "[unit][core][memory_model][read_batch]") {
+    constexpr size_t kOtherPages = 640;
+    constexpr uint64_t kBasePageAddr = 0x400000000ULL;
+    constexpr uint64_t kTargetAddr = kBasePageAddr + kOtherPages * 0x1000ULL;
+
+    auto env = make_mem_env([&](TraceWriter& tw) {
+        tw.anchor_interval = 2048;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x300000000ULL;
+
+        for (size_t i = 0; i < kOtherPages; ++i) {
+            uint64_t addr = kBasePageAddr + i * 0x1000ULL;
+            uint64_t val = 0xA000000000000000ULL | static_cast<uint64_t>(i);
+            tw.emit(ms, 0x4000 + static_cast<uint64_t>(i) * 4, enc::str_imm(0, 31, 0),
+                    {{0, val}, {33, tw.rt(0x4004 + static_cast<uint64_t>(i) * 4)}},
+                    {{kWrite, 8, addr, val}});
+        }
+
+        tw.emit(ms, 0x9000, enc::str_imm(1, 31, 0),
+                {{1, 0xDEADBEEFCAFEBABEULL}, {33, tw.rt(0x9004)}},
+                {{kWrite, 8, kTargetAddr, 0xDEADBEEFCAFEBABEULL}});
+        tw.emit_anchor(ms);
+    }, "mm_read_batch_large_inst_property");
+
+    REQUIRE(env != nullptr);
+
+    const uint64_t target_page = kTargetAddr >> 12;
+    const uint64_t target_sort_const = target_page << 20;
+
+    std::vector<MemoryModel::ReadRequest> reqs;
+    reqs.reserve(kOtherPages + 2);
+
+    reqs.push_back({kTargetAddr, 8, target_sort_const});
+    for (size_t i = 0; i < kOtherPages; ++i) {
+        uint64_t addr = kBasePageAddr + i * 0x1000ULL;
+        reqs.push_back({addr, 8, 1ULL << 60});
+    }
+    reqs.push_back({kTargetAddr, 8, 1ULL << 60});
+
+    auto batch = env->memory->read_batch(reqs);
+    REQUIRE(batch.size() == reqs.size());
+
+    uint64_t target0 = 0;
+    std::memcpy(&target0, batch.front().data.data(), 8);
+    REQUIRE(batch.front().known_count == 8);
+    REQUIRE(target0 == 0xDEADBEEFCAFEBABEULL);
+
+    uint64_t target1 = 0;
+    std::memcpy(&target1, batch.back().data.data(), 8);
+    REQUIRE(batch.back().known_count == 8);
+    REQUIRE(target1 == 0xDEADBEEFCAFEBABEULL);
+
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        auto single = env->memory->read_region(reqs[i].addr, reqs[i].size, reqs[i].at_inst_id);
+        REQUIRE(batch[i].known_count == single.known_count);
+        REQUIRE(batch[i].data == single.data);
+        REQUIRE(batch[i].known == single.known);
+    }
+}

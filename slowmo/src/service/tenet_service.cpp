@@ -114,6 +114,11 @@ bool TenetService::can_nav_forward() const {
     return nav_history_pos_ + 1 < nav_history_.size();
 }
 
+std::vector<uint64_t> TenetService::bookmarks() const {
+    std::shared_lock lk(state_mutex_);
+    return bookmarks_;
+}
+
 // ─── Bookmarks ──────────────────────────────────────────────────────────────
 
 void TenetService::toggle_bookmark(uint64_t inst_id) {
@@ -190,17 +195,27 @@ InstructionRow TenetService::fetch_row(uint64_t inst_id) {
 // ─── Pass management ────────────────────────────────────────────────────────
 
 PassManager& TenetService::ensure_pass_manager() {
-    if (!pass_manager_) {
-        pass_manager_ = std::make_unique<PassManager>();
-        pass_manager_->set_reader(&reader_);
-        pass_manager_->set_index(&index_);
-        pass_manager_->set_code_table(&code_table_);
-        pass_manager_->set_decoder(&decoder_);
-        pass_manager_->set_regfile(&regfile_);
-        pass_manager_->set_memory(&memory_);
-        pass_manager_->init_infra();
-    }
+    std::call_once(pass_manager_once_, [this]() {
+        auto pm = std::make_unique<PassManager>();
+        pm->set_reader(&reader_);
+        pm->set_index(&index_);
+        pm->set_code_table(&code_table_);
+        pm->set_decoder(&decoder_);
+        pm->set_regfile(&regfile_);
+        pm->set_memory(&memory_);
+        pm->init_infra();
+
+        std::lock_guard<std::mutex> lock(pass_manager_mutex_);
+        pass_manager_ = std::move(pm);
+    });
+
+    std::lock_guard<std::mutex> lock(pass_manager_mutex_);
     return *pass_manager_;
+}
+
+PassManager* TenetService::pass_manager() {
+    std::lock_guard<std::mutex> lock(pass_manager_mutex_);
+    return pass_manager_.get();
 }
 
 void TenetService::run_default_passes() {
@@ -235,9 +250,9 @@ void TenetService::clear_analysis() {
         std::unique_lock lk(state_mutex_);
         pinned_results_.clear();
     }
-    if (pass_manager_) {
-        pass_manager_->cancel_all();
-        pass_manager_->invalidate_all();
+    if (auto* pm = pass_manager()) {
+        pm->cancel_all();
+        pm->invalidate_all();
     }
     ProgressManager::global().erase_kind("pass");
     {
@@ -349,6 +364,21 @@ void TenetService::search_clear() {
     search_results_.clear();
     search_current_ = 0;
     search_active_ = false;
+}
+
+std::vector<uint64_t> TenetService::search_results() const {
+    std::shared_lock lk(state_mutex_);
+    return search_results_;
+}
+
+size_t TenetService::search_current() const {
+    std::shared_lock lk(state_mutex_);
+    return search_current_;
+}
+
+bool TenetService::search_active() const {
+    std::shared_lock lk(state_mutex_);
+    return search_active_;
 }
 
 // ─── Observers ──────────────────────────────────────────────────────────────

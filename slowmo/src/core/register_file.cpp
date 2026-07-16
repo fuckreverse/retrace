@@ -2,6 +2,7 @@
 #include "common/Profiling.h"
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace tenet {
 
@@ -228,8 +229,8 @@ RegState RegisterFile::state_before(uint64_t inst_id) {
 
     // Checkpoint array is immutable after build — lock-free read.
     // If not built yet (e.g. GUI thread queries before init_infra() completes),
-    // return empty state.
-    if (!checkpoints_built_.load(std::memory_order_acquire)) {
+    // or the trace is empty, return an empty state without counting a query.
+    if (!checkpoints_built_.load(std::memory_order_acquire) || checkpoints_.empty()) {
         return RegState{};
     }
     counters_.ckpt_queries.fetch_add(1, std::memory_order_relaxed);
@@ -273,16 +274,76 @@ RegState RegisterFile::state_after(uint64_t inst_id) {
 std::vector<std::array<uint64_t, 31>> RegisterFile::sample_gprs(
     const uint64_t* inst_ids, size_t count)
 {
-    std::vector<std::array<uint64_t, 31>> result;
-    result.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        RegState state = state_before(inst_ids[i]);
-        std::array<uint64_t, 31> gprs{};
-        // Copy GPR[0..30] (x0-x30). RegState.gpr has AARCH64_GPR_COUNT (34)
-        // entries; we only need the first 31 for loop analysis.
-        std::copy_n(state.gpr, 31, gprs.begin());
-        result.push_back(gprs);
+    std::vector<std::array<uint64_t, 31>> result(count);
+    if (count == 0) {
+        return result;
     }
+
+    // Match the scalar fast path exactly: before checkpoints exist we do not
+    // reconstruct from anchors for batch queries.
+    if (!checkpoints_built_.load(std::memory_order_acquire)) {
+        return result;
+    }
+    if (checkpoints_.empty()) {
+        return result;
+    }
+
+    struct Request {
+        uint64_t ckpt_idx;
+        uint64_t inst_id;
+        size_t output_index;
+        bool fallback;
+    };
+
+    std::vector<Request> requests;
+    requests.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t inst_id = inst_ids[i];
+        const uint64_t ckpt_idx = inst_id / ckpt_stride_;
+        requests.push_back({
+            ckpt_idx,
+            inst_id,
+            i,
+            ckpt_idx >= checkpoints_.size(),
+        });
+    }
+
+    std::sort(requests.begin(), requests.end(), [](const Request& a,
+                                                   const Request& b) {
+        if (a.ckpt_idx != b.ckpt_idx) return a.ckpt_idx < b.ckpt_idx;
+        if (a.inst_id != b.inst_id) return a.inst_id < b.inst_id;
+        return a.output_index < b.output_index;
+    });
+
+    size_t i = 0;
+    while (i < requests.size()) {
+        if (requests[i].fallback) {
+            const auto& state = checkpoints_.back().state;
+            do {
+                std::copy_n(state.gpr, 31, result[requests[i].output_index].begin());
+                ++i;
+            } while (i < requests.size() && requests[i].fallback);
+            continue;
+        }
+
+        const uint64_t ckpt_idx = requests[i].ckpt_idx;
+        const auto& ckpt = checkpoints_[ckpt_idx];
+        const uint64_t base_id = ckpt_idx * ckpt_stride_;
+        RegisterFileCursor cursor(reader_, index_);
+        cursor.seed(ckpt.state, base_id, ckpt.file_offset);
+
+        do {
+            const RegState* state_ptr = &ckpt.state;
+            if (requests[i].inst_id != base_id) {
+                state_ptr = &cursor.advance_to(requests[i].inst_id);
+            }
+            std::copy_n(state_ptr->gpr, 31, result[requests[i].output_index].begin());
+            ++i;
+        } while (i < requests.size() &&
+                 !requests[i].fallback &&
+                 requests[i].ckpt_idx == ckpt_idx);
+    }
+
     return result;
 }
 
@@ -317,8 +378,22 @@ RegState RegisterFile::state_before_ckpt(uint64_t inst_id) {
 
 void RegisterFile::build_checkpoints(uint64_t stride,
                                      std::function<void(uint64_t, uint64_t)> progress) {
+    if (checkpoints_built_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(build_mutex_);
+    if (checkpoints_built_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     const uint64_t total = index_.inst_count();
-    if (total == 0) return;
+    if (total == 0) {
+        ckpt_stride_ = 0;
+        checkpoints_.clear();
+        checkpoints_built_.store(true, std::memory_order_release);
+        return;
+    }
 
     // Auto-stride: target ~80 MB memory budget
     if (stride == 0) {
