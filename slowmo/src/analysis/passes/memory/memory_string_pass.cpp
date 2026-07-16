@@ -396,17 +396,7 @@ void MemoryStringPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
     orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
 }
 
-PassResult MemoryStringPass::run(PassContext& ctx) {
-    auto& index = ctx.index();
-    auto& memory = ctx.memory();
-    auto& regfile = ctx.regfile();
-
-    const auto& range = ctx.range();
-    uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
-    if (end_id == 0) end_id = index.inst_count();
-
-    // ── Fast path: load from persisted cache ──────────────────────────────
-    // Only cache for default config + full trace to avoid config mismatches.
+std::optional<PassResult> MemoryStringPass::try_load_cached(PassContext& ctx) {
     const bool is_default_cfg =
         config_.scan_size == 256 &&
         config_.min_pointer_value == 0x100000000ULL &&
@@ -417,19 +407,39 @@ PassResult MemoryStringPass::run(PassContext& ctx) {
         config_.deep_probe_max_steps == 50 &&
         config_.min_string_len == 4 &&
         config_.max_string_len == 512;
-    if (is_default_cfg && ctx.range().is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("memory_strings", blob)) {
-            MemoryStringResult cached;
-            if (memory_string_deserialize(blob, cached)) {
-                collector_.reset();
-                ctx.progress(1.0f, fmt::format(
-                    "Done: {} strings ({} unique) (from cache)",
-                    cached.total(), cached.unique_count()));
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
+    if (!is_default_cfg || !ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("memory_strings", blob)) return std::nullopt;
+
+    MemoryStringResult cached;
+    if (!memory_string_deserialize(blob, cached)) return std::nullopt;
+
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "Done: {} strings ({} unique) (from cache)",
+        cached.total(), cached.unique_count()));
+    return PassResult::success(std::move(cached));
+}
+
+PassResult MemoryStringPass::run(PassContext& ctx) {
+    auto& index = ctx.index();
+    auto& memory = ctx.memory();
+    auto& regfile = ctx.regfile();
+
+    const auto& range = ctx.range();
+    uint64_t end_id = std::min(range.end_inst_id, index.inst_count());
+    if (end_id == 0) end_id = index.inst_count();
+    const bool is_default_cfg =
+        config_.scan_size == 256 &&
+        config_.min_pointer_value == 0x100000000ULL &&
+        config_.scan_stack &&
+        config_.stack_scan_size == 512 &&
+        config_.max_call_sites == 0 &&
+        config_.deep_probe &&
+        config_.deep_probe_max_steps == 50 &&
+        config_.min_string_len == 4 &&
+        config_.max_string_len == 512;
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
     if (!collector_) {

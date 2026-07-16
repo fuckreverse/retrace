@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <thread>
 #include <atomic>
+#include <optional>
 
 namespace tenet {
 
@@ -174,6 +175,18 @@ public:
 
     /// Execute the pass.
     virtual PassResult run(PassContext& ctx) = 0;
+
+    /// Try to load a complete persisted result before any trace collector is
+    /// declared or executed. Return std::nullopt on cache miss, incompatible
+    /// configuration, corrupt data, or when this pass is not cacheable.
+    ///
+    /// Implementations must fully validate and deserialize the cached result;
+    /// merely observing that a cache file exists is not sufficient because a
+    /// failed load must fall back to the normal scan + run path.
+    virtual std::optional<PassResult> try_load_cached(PassContext& ctx) {
+        (void)ctx;
+        return std::nullopt;
+    }
 
     /// Declare scan collector requirements for Scan Fusion (default: none).
     /// Override to participate in unified trace scanning.
@@ -397,6 +410,7 @@ private:
 
     /// Internal: execute a pass (assumes we own execution via CAS).
     void execute_pass(PassEntry* entry);
+    bool try_complete_from_cache(PassEntry* entry);
 
     /// Dynamic ready-queue scheduler used by run_all when num_threads > 1.
     void run_all_parallel(size_t num_threads);

@@ -167,19 +167,45 @@ cmake .. -DTENET_ENABLE_PROFILING=OFF
 
 ## 性能基准
 
-项目自带基准测试套件，用于回归检测：
+项目自带基准测试套件，用于回归检测。基准脚本只复用固定的 `tools/tenet/build/`，不会创建额外 build 目录；运行前应按所需特性配置该目录：
 
 ```bash
-# 运行基准测试
-cd tools/tenet/bench
-bash run_benchmark.sh
+# 运行综合基准（增量构建并生成 synthetic perf traces）
+cd tools/tenet
+bash bench/run_benchmark.sh --scale 1M --output /tmp/tenet-bench.json
+
+# 对真实 trace 测量所有 Pass 的增量耗时
+cmake --build build --target bench_all_passes -j$(sysctl -n hw.ncpu)
+./build/bench_all_passes /path/to/trace.bin --output /tmp/all-passes.json
 
 # 运行性能单元测试
-cd tools/tenet/build
+cd build
 ctest -R perf --output-on-failure
 ```
 
-基准数据保存在 `bench/baseline_1M.json`，新的测试结果应与之对比。
+基准数据保存在 `bench/baseline_1M.json`，新的测试结果应与之对比。基线必须记录 build type、Triton/YARA/TBB 开关、硬件、trace 元数据和缓存策略；缺少任一项的数据不能直接横向比较。
+
+### 当前基线（2026-07-15）
+
+当前 v3 基线使用 Apple M2 Pro、16 GiB、macOS 26.5.1、`RelWithDebInfo`，开启 Triton/YARA/TBB，在真实 `test_50m.bin`（19,827,466 条指令、22,279 个 unique PC）上测量。每项运行 3 次并取中位数。
+
+回归判断使用 **RocksDB index warm、Pass result cache cold** 的数据：每次测量前删除 `pass_cache/`，确保测到 Pass 本身，而不是历史 blob 的兼容性或反序列化速度。当前中位数如下：
+
+| 指标 | 中位数 |
+|---|---:|
+| 所有 Pass own time 合计 | 31,104 ms |
+| `taint` | 8,890 ms |
+| `pattern` | 6,380 ms |
+| `function` | 6,132 ms |
+| `thread` | 4,522 ms |
+| `memory_snapshot` | 2,434 ms |
+| `objc` | 1,888 ms |
+| `strings` | 766 ms |
+| `xref` | 670 ms |
+
+完整三次原始数据及回归阈值见 `bench/baseline_1M.json`。
+
+> **Persisted Pass cache（v3.1）**：`PassManager` 现在会在 `declare_scan()` 前调用 Pass 的 `try_load_cached()`；只有缓存缺失、配置不兼容或反序列化失败的 Pass 才注册 collector 并扫描 trace。真实 trace 上三次 warm-cache 的 own time 合计中位数从 v3 的 47,235 ms 降至 10,386 ms；`thread` 中位数为 0.398 ms、`strings` 为 0.586 ms、`pattern` 为 2.2 ms。总值仍包含 `taint`、`memory_snapshot` 等未缓存 Pass，完整数据见 `bench/baseline_1M.json`。
 
 ### PGO 模式
 
@@ -291,12 +317,12 @@ ctest -R perf --output-on-failure
 
 注：`syscall_intercept_pass.h` 中的 `ApiCategory` 是 `enum class`，需在 `namespace tenet` 外补充 `ankerl::unordered_dense::hash<ApiCategory>` 特化（以 `static_cast<uint64_t>` 直接映射枚举值，标记 `is_avalanching`）。
 
-**结果**（test_50m.bin，19.8M 指令，RelWithDebInfo，RocksDB blob cache warm）：
+**历史结果**（2026-06-29，test_50m.bin，19.8M 指令，RelWithDebInfo，当时的 RocksDB/blob cache 与 Pass 拓扑）：
 
 | Pass | 优化前 | 优化后 | 变化 |
 |---|---:|---:|---|
 | `function_pass` | 427.8 ms | 318.0 ms | **-26%** |
-| `symbol_annotation_pass` | 838.0 ms | 484.7 ms | **-42%** |
+| `symbol_annotation_pass`（后续已降级为 `AnnotationView` helper） | 838.0 ms | 484.7 ms | **-42%** |
 | `xref_pass` | 20.3 ms | 18.5 ms | -9% |
 | `taint_pass` | 10382.3 ms | 10156.1 ms | -2% |
 
@@ -336,7 +362,7 @@ time ./tenet --objc --pattern --algorithm-summary /path/to/trace.bin > /dev/null
 time ./tenet --run-pass objc /path/to/trace.bin > /dev/null
 ```
 
-注意：首次跑需要构建 RocksDB 索引（~60s），之后会命中缓存（秒开）。测性能时先跑一次预热索引，再跑第二次取真实 Pass 耗时。
+注意：首次跑需要构建 RocksDB 索引，之后会命中索引缓存。索引缓存与 Pass result cache 是两个独立变量：测 Pass 算法本身时应保留 `.tenet` 索引、仅移走其中的 `pass_cache/`；测交互式重开体验时才保留两者。当前 collector-based 缓存 Pass 会在扫描前完成缓存探测；不支持 persisted cache 的 Pass 仍会正常执行分析。
 
 ```bash
 # 预热索引（结果缓存到 .tenet_cache_* 目录）
@@ -351,23 +377,23 @@ time ./tenet --objc /path/to/trace.bin > /dev/null
 用于测量所有 Pass 的增量耗时，一次运行出全量数据：
 
 ```bash
-ninja bench_all_passes
-./bench/bench_all_passes /path/to/trace.bin --output results.json
+cd tools/tenet
+cmake --build build --target bench_all_passes -j$(sysctl -n hw.ncpu)
 
-# 对比 baseline
-python3 -c "
-import json
-baseline = json.load(open('bench/baseline_1M.json'))
-current  = json.load(open('results.json'))
-for p in current['passes']:
-    name = p['name']
-    b = next((x for x in baseline['passes'] if x['name'] == name), None)
-    if b:
-        ratio = p['own_ms'] / max(b['own_ms'], 0.1)
-        flag = '⚠️' if ratio > 1.2 else '✓'
-        print(f'{flag} {name}: {b[\"own_ms\"]:.1f}ms → {p[\"own_ms\"]:.1f}ms ({ratio:.2f}x)')
-"
+# 保留 index，临时移走 Pass cache；运行结束后恢复原缓存
+CACHE=build/test_50m.tenet/pass_cache
+BACKUP=/tmp/tenet-pass-cache-profile
+mv "$CACHE" "$BACKUP"
+trap 'rm -rf "$CACHE"; mv "$BACKUP" "$CACHE"' EXIT
+
+for i in 1 2 3; do
+    rm -rf "$CACHE"
+    ./build/bench_all_passes build/test_50m.bin \
+        --quiet --output "/tmp/all-passes-$i.json"
+done
 ```
+
+对比时使用三次 `own_ms` 的中位数，并读取 `baseline_1M.json` 的 `pass_cache_cold.passes.<name>.median_ms`。不要拿单次运行与基线直接比较；当前真实 trace 的总 own time CV 约 13%，单次数据容易受温度、后台任务和文件缓存影响。
 
 #### 4. Instruments 精确 profiling（找热点函数）
 

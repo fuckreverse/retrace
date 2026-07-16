@@ -1281,26 +1281,29 @@ void SyscallInterceptPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx
 
 // ─── SyscallInterceptPass::run ────────────────────────────────────────────
 
-PassResult SyscallInterceptPass::run(PassContext& ctx) {
-    // ── Fast path: load from persisted cache ──────────────────────────────
-    // Only cache when default config (no extra_api_names, no intercept_unresolved)
-    // to keep the cache key unambiguous.
+std::optional<PassResult> SyscallInterceptPass::try_load_cached(PassContext& ctx) {
     const bool is_default_cfg =
         config_.extra_api_names.empty() && !config_.intercept_unresolved &&
         config_.capture_bytes == 64;
-    if (is_default_cfg && ctx.range().is_full_trace()) {
-        std::string blob;
-        if (ctx.index().load_pass_blob("syscall_intercept", blob)) {
-            SyscallInterceptResult cached;
-            if (syscall_intercept_deserialize(blob, cached)) {
-                collector_.reset();  // not needed, free memory
-                ctx.progress(1.0f, fmt::format(
-                    "syscall_intercept: {} calls ({} unique callees) (from cache)",
-                    cached.calls.size(), cached.by_callee.size()));
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
+    if (!is_default_cfg || !ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("syscall_intercept", blob)) return std::nullopt;
+
+    SyscallInterceptResult cached;
+    if (!syscall_intercept_deserialize(blob, cached)) return std::nullopt;
+
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "syscall_intercept: {} calls ({} unique callees) (from cache)",
+        cached.calls.size(), cached.by_callee.size()));
+    return PassResult::success(std::move(cached));
+}
+
+PassResult SyscallInterceptPass::run(PassContext& ctx) {
+    const bool is_default_cfg =
+        config_.extra_api_names.empty() && !config_.intercept_unresolved &&
+        config_.capture_bytes == 64;
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
     if (!collector_) {

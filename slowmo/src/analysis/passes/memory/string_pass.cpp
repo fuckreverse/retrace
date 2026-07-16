@@ -211,25 +211,25 @@ void StringPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── StringPass::run ─────────────────────────────────────────────────────
 
+std::optional<PassResult> StringPass::try_load_cached(PassContext& ctx) {
+    if (!ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("strings", blob)) return std::nullopt;
+
+    StringResult cached;
+    if (!string_deserialize(blob, cached)) return std::nullopt;
+
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "Strings: {} discovered (from cache)", cached.total()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult StringPass::run(PassContext& ctx) {
     auto& index  = ctx.index();
     auto& memory = ctx.memory();
     const auto& range = ctx.range();
-
-    // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("strings", blob)) {
-            StringResult cached;
-            if (string_deserialize(blob, cached)) {
-                ctx.progress(1.0f, fmt::format(
-                    "Strings: {} discovered (from cache)",
-                    cached.total()));
-                collector_.reset();
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
     if (!collector_) {

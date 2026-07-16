@@ -1280,6 +1280,22 @@ void PatternPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── PatternPass::run (delegates to PatternCollector) ─────────────────────
 
+std::optional<PassResult> PatternPass::try_load_cached(PassContext& ctx) {
+    if (!ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("pattern", blob)) return std::nullopt;
+
+    PatternResult cached;
+    if (!pattern_deserialize(blob, cached)) return std::nullopt;
+
+    build_category_index(cached);
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "Pattern: {} matches found (from cache)", cached.total()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult PatternPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     const auto& range = ctx.range();
@@ -1287,22 +1303,6 @@ PassResult PatternPass::run(PassContext& ctx) {
     const uint64_t total_insts = index.inst_count();
     if (total_insts == 0) {
         return PassResult::failed("Empty trace");
-    }
-
-    // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("pattern", blob)) {
-            PatternResult cached;
-            if (pattern_deserialize(blob, cached)) {
-                build_category_index(cached);
-                collector_.reset();  // not needed, free memory
-                ctx.progress(1.0f, fmt::format(
-                    "Pattern: {} matches found (from cache)",
-                    cached.total()));
-                return PassResult::success(std::move(cached));
-            }
-        }
     }
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()

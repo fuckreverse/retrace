@@ -266,24 +266,25 @@ void ThreadPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── ThreadPass::run ─────────────────────────────────────────────────────────
 
+std::optional<PassResult> ThreadPass::try_load_cached(PassContext& ctx) {
+    if (!ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("thread", blob)) return std::nullopt;
+
+    ThreadResult cached;
+    if (!thread_deserialize(blob, cached)) return std::nullopt;
+
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "Thread: {} threads, {} switches, {} spans (from cache)",
+        cached.thread_count(), cached.switch_count(), cached.spans.size()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult ThreadPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     const auto& range = ctx.range();
-
-    // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("thread", blob)) {
-            ThreadResult cached;
-            if (thread_deserialize(blob, cached)) {
-                ctx.progress(1.0f, fmt::format(
-                    "Thread: {} threads, {} switches, {} spans (from cache)",
-                    cached.thread_count(), cached.switch_count(), cached.spans.size()));
-                collector_.reset();
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
     if (!collector_) {

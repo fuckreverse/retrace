@@ -940,6 +940,29 @@ void FunctionPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── FunctionPass::run — now delegates to FunctionCollector ───────────────
 
+std::optional<PassResult> FunctionPass::try_load_cached(PassContext& ctx) {
+    if (!ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("function", blob)) return std::nullopt;
+
+    FunctionResult cached;
+    if (!function_deserialize(blob, cached, config_.full_mode)) return std::nullopt;
+
+    cached.build_depth_table();
+    { std::string tmp; tmp.swap(blob); }
+    cached.call_events.shrink_to_fit();
+    cached.depth_table_.shrink_to_fit();
+    cached.sorted_call_indices_.shrink_to_fit();
+    cached.call_site_map_.rehash(0);
+    cached.return_site_map_.rehash(0);
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "Functions: {} unique, {} call events (from cache)",
+        cached.functions.size(), cached.call_events.size()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult FunctionPass::run(PassContext& ctx) {
     auto& index      = ctx.index();
     const auto& range = ctx.range();
@@ -947,33 +970,6 @@ PassResult FunctionPass::run(PassContext& ctx) {
     const uint64_t total_insts = index.inst_count();
     if (total_insts == 0) {
         return PassResult::failed("Empty trace");
-    }
-
-    // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("function", blob)) {
-            FunctionResult cached;
-            if (function_deserialize(blob, cached, config_.full_mode)) {
-                cached.build_depth_table();
-                // Release the blob string now that we have the deserialized data.
-                // On a large trace this blob can be hundreds of MB.
-                { std::string tmp; tmp.swap(blob); }
-                // Compact all containers so the loaded result is as lean as a
-                // freshly-computed one (avoids the 2× over-reservation that
-                // vector::reserve() can leave behind).
-                cached.call_events.shrink_to_fit();
-                cached.depth_table_.shrink_to_fit();
-                cached.sorted_call_indices_.shrink_to_fit();
-                cached.call_site_map_.rehash(0);
-                cached.return_site_map_.rehash(0);
-                collector_.reset();  // not needed, free memory
-                ctx.progress(1.0f, fmt::format(
-                    "Functions: {} unique, {} call events (from cache)",
-                    cached.functions.size(), cached.call_events.size()));
-                return PassResult::success(std::move(cached));
-            }
-        }
     }
 
     // ── Progress budget allocation (based on profiling) ──────────────────

@@ -219,6 +219,39 @@ const PassResult& PassManager::require(std::string_view pass_name) {
     return refresh_and_return();
 }
 
+bool PassManager::try_complete_from_cache(PassEntry* entry) {
+    PassState expected = PassState::NotRun;
+    if (!entry->state.compare_exchange_strong(expected, PassState::Running,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+        return entry->state.load(std::memory_order_acquire) == PassState::Completed;
+    }
+
+    PassContext ctx(*this, range_);
+    ctx.pass_name_ = entry->pass->name();
+    ctx.cancelled_flag_ = &entry->cancelled;
+
+    auto cached = entry->pass->try_load_cached(ctx);
+    if (!cached || !cached->ok()) {
+        entry->state.store(PassState::NotRun, std::memory_order_release);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(entry->mtx);
+        std::atomic_store_explicit(&entry->result_ptr,
+            std::make_shared<const PassResult>(std::move(*cached)),
+            std::memory_order_release);
+        entry->scan_executed = false;
+        entry->state.store(PassState::Completed, std::memory_order_release);
+    }
+    entry->cv.notify_all();
+    LOG_INFO_M(::tenet::log::Module::Analysis,
+               "pass '{}': loaded persisted cache before trace scan",
+               entry->pass->name());
+    return true;
+}
+
 std::shared_ptr<const PassResult> PassManager::require_shared(std::string_view pass_name) {
     auto* entry = find_entry(pass_name);
     if (!entry) return nullptr;
@@ -314,6 +347,26 @@ void PassManager::execute_pass(PassEntry* entry) {
     PassContext ctx(*this, range_);
     ctx.pass_name_       = entry->pass->name();
     ctx.cancelled_flag_  = &entry->cancelled;
+
+    // Persisted-result preflight must happen before declare_scan(). A valid
+    // cache hit is a complete pass result and makes the collector unnecessary.
+    // A miss or corrupt/incompatible blob falls through to the normal scan.
+    if (auto cached = entry->pass->try_load_cached(ctx); cached && cached->ok()) {
+        {
+            std::lock_guard<std::mutex> lk(entry->mtx);
+            std::atomic_store_explicit(&entry->result_ptr,
+                std::make_shared<const PassResult>(std::move(*cached)),
+                std::memory_order_release);
+            entry->scan_executed = false;
+            entry->state.store(PassState::Completed, std::memory_order_release);
+        }
+        entry->cv.notify_all();
+        ProgressManager::global().complete(task_id, "Loaded persisted cache");
+        LOG_INFO_M(::tenet::log::Module::Analysis,
+                   "pass '{}': loaded persisted cache before trace scan",
+                   entry->pass->name());
+        return;
+    }
 
     // Scan Fusion: if this pass participates in scan fusion and hasn't been
     // scanned yet (require() path), orchestrate a single scan before run().
@@ -506,11 +559,25 @@ void PassManager::run_all(size_t num_threads) {
              entries_.size(), num_threads,
              rss_limit_mb_ > 0 ? fmt::format("{:.0f}", rss_limit_mb_) : "none");
 
-    // ── Phase 1: Declaration — each pass's declare_scan() registers collectors ──
+    // Each run_all batch owns a fresh declaration/scan lifecycle. Results in
+    // pass-owned collectors survive reset(); only orchestrator registrations
+    // and the one-shot scanned flag are cleared.
+    if (scan_orchestrator_) scan_orchestrator_->reset();
+
+    // ── Phase 0: persisted-cache preflight ────────────────────────────────
+    // Complete cache hits before collector declaration so they never join the
+    // unified trace scan. Cache misses remain NotRun and follow the normal path.
+    for (auto& entry : entries_) {
+        try_complete_from_cache(entry.get());
+    }
+
+    // ── Phase 1: Declaration — cache misses register collectors ───────────
     if (scan_orchestrator_) {
         PassContext ctx(*this, range_);
         for (auto& entry : entries_) {
-            entry->pass->declare_scan(*scan_orchestrator_, ctx);
+            if (entry->state.load(std::memory_order_acquire) == PassState::NotRun) {
+                entry->pass->declare_scan(*scan_orchestrator_, ctx);
+            }
         }
 
         // ── Phase 2: Unified scan — one traversal serves all collectors ──
@@ -519,6 +586,12 @@ void PassManager::run_all(size_t num_threads) {
                 "PassManager: executing unified scan with {} collector(s)",
                 scan_orchestrator_->has_declarations() ? "multiple" : "0");
             scan_orchestrator_->execute_scan(range_, cancelled_, no_parallel_scan_);
+            for (auto& entry : entries_) {
+                if (entry->state.load(std::memory_order_acquire) == PassState::NotRun &&
+                    scan_orchestrator_->collector_for(entry->pass->name()) != nullptr) {
+                    entry->scan_executed = true;
+                }
+            }
         }
     }
 
@@ -528,12 +601,14 @@ void PassManager::run_all(size_t num_threads) {
         for (auto& entry : entries_) {
             require(entry->pass->name());
         }
+        if (scan_orchestrator_) scan_orchestrator_->reset();
         LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
         return;
     }
 
     run_all_parallel(num_threads);
 
+    if (scan_orchestrator_) scan_orchestrator_->reset();
     LOG_INFO_M(::tenet::log::Module::Analysis, "PassManager::run_all: complete, RSS={:.1f}MB", ::tenet::log::rss_mb());
 }
 
@@ -545,6 +620,7 @@ void PassManager::invalidate(std::string_view pass_name) {
 
     std::lock_guard<std::mutex> lk(entry->mtx);
     entry->state.store(PassState::NotRun, std::memory_order_release);
+    entry->scan_executed = false;
     // Swap in a fresh "skipped" result rather than mutating the existing one
     // in place. Any thread holding a shared_ptr obtained via require_shared()
     // (e.g. the GUI rendering a cached result, or an MCP handler still
@@ -559,6 +635,7 @@ void PassManager::invalidate_all() {
     for (auto& entry : entries_) {
         std::lock_guard<std::mutex> lk(entry->mtx);
         entry->state.store(PassState::NotRun, std::memory_order_release);
+        entry->scan_executed = false;
         std::atomic_store_explicit(&entry->result_ptr,
             std::make_shared<const PassResult>(PassResult::skipped()),
             std::memory_order_release);

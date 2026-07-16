@@ -15,6 +15,8 @@
 #include "analysis/passes/structure/function_pass.h"
 #include "analysis/passes/structure/call_graph_pass.h"
 #include "analysis/passes/taint/taint_pass.h"
+#include "analysis/trace_collector.h"
+#include "infra/scan_orchestrator.h"
 
 using namespace tenet;
 using namespace tenet::test;
@@ -168,6 +170,130 @@ TEST_CASE("Pipeline: pass dependency resolution", "[integration][pipeline]") {
     }
 }
 
+namespace {
+
+struct CacheProbeResult {
+    bool from_cache = false;
+    uint64_t scanned_insts = 0;
+};
+
+class CountingCollector final : public TraceCollector {
+public:
+    explicit CountingCollector(uint64_t& count) : count_(count) {}
+
+    void on_inst(uint64_t, const InstView&) override { ++count_; }
+    std::string_view name() const override { return "CountingCollector"; }
+
+private:
+    uint64_t& count_;
+};
+
+class CacheProbePass final : public AnalysisPass {
+public:
+    explicit CacheProbePass(std::shared_ptr<bool> cache_hit)
+        : cache_hit_(std::move(cache_hit)) {}
+
+    std::string_view name() const override { return "cache_probe"; }
+    std::string_view description() const override { return "cache preflight regression pass"; }
+    bool has_scan() const override { return true; }
+
+    std::optional<PassResult> try_load_cached(PassContext&) override {
+        if (!*cache_hit_) return std::nullopt;
+        return PassResult::success(CacheProbeResult{true, scanned_insts_});
+    }
+
+    void declare_scan(ScanOrchestrator& orch, PassContext&) override {
+        scanned_insts_ = 0;
+        collector_ = std::make_unique<CountingCollector>(scanned_insts_);
+        orch.declare({name(), collector_.get(), false});
+    }
+
+    PassResult run(PassContext&) override {
+        return PassResult::success(CacheProbeResult{false, scanned_insts_});
+    }
+
+private:
+    std::shared_ptr<bool> cache_hit_;
+    uint64_t scanned_insts_ = 0;
+    std::unique_ptr<CountingCollector> collector_;
+};
+
+}  // namespace
+
+TEST_CASE("Pipeline: cache preflight skips scan and cache miss falls back",
+          "[integration][pipeline][cache]") {
+    auto env = make_env(gen_realistic_trace, "pipeline_cache_preflight");
+    REQUIRE(env != nullptr);
+
+    SECTION("require skips collector when cache hits") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(std::make_shared<bool>(true)));
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE(got.from_cache);
+        REQUIRE(got.scanned_insts == 0);
+    }
+
+    SECTION("run_all skips collector when cache hits") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(std::make_shared<bool>(true)));
+
+        pm->run_all(2);
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE(got.from_cache);
+        REQUIRE(got.scanned_insts == 0);
+    }
+
+    SECTION("cache miss executes collector and run") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(std::make_shared<bool>(false)));
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE_FALSE(got.from_cache);
+        REQUIRE(got.scanned_insts == env->index->inst_count());
+    }
+
+    SECTION("run_all cache miss executes collector and run") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(std::make_shared<bool>(false)));
+        pm->run_all(2);
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE_FALSE(got.from_cache);
+        REQUIRE(got.scanned_insts == env->index->inst_count());
+    }
+
+    SECTION("cache hit followed by invalidation can fall back to scan") {
+        auto cache_hit = std::make_shared<bool>(true);
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(cache_hit));
+
+        REQUIRE(pm->require("cache_probe").get<CacheProbeResult>().from_cache);
+        *cache_hit = false;
+        pm->invalidate("cache_probe");
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE_FALSE(got.from_cache);
+        REQUIRE(got.scanned_insts == env->index->inst_count());
+    }
+
+    SECTION("consecutive run_all batches rescan after invalidation") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<CacheProbePass>(std::make_shared<bool>(false)));
+
+        pm->run_all(2);
+        REQUIRE(pm->require("cache_probe").get<CacheProbeResult>().scanned_insts ==
+                env->index->inst_count());
+        pm->invalidate_all();
+        pm->run_all(2);
+
+        const auto& got = pm->require("cache_probe").get<CacheProbeResult>();
+        REQUIRE_FALSE(got.from_cache);
+        REQUIRE(got.scanned_insts == env->index->inst_count());
+    }
+}
+
 TEST_CASE("Pipeline: run_all executes all registered passes", "[integration][pipeline]") {
     auto env = make_env(gen_realistic_trace, "pipeline_runall");
     auto pm = make_pm(*env);
@@ -267,13 +393,34 @@ TEST_CASE("Parallel run_all produces same results as sequential",
     pm_par->run_all(4);
 
     // After run_all, require() hits the fast path (state == Completed)
-    auto& par_xref = pm_par->require("xref").get<XrefResult>();
-    auto& par_cfg = pm_par->require("cfg").get<CFGResult>();
-    auto& par_loop = pm_par->require("loop").get<LoopResult>();
-    auto& par_func = pm_par->require("function").get<FunctionResult>();
-    auto& par_cg = pm_par->require("call_graph").get<CallGraphResult>();
-    auto& par_str = pm_par->require("strings").get<StringResult>();
-    auto& par_pat = pm_par->require("pattern").get<PatternResult>();
+    const auto& par_xref_result = pm_par->require("xref");
+    const auto& par_cfg_result = pm_par->require("cfg");
+    const auto& par_loop_result = pm_par->require("loop");
+    const auto& par_func_result = pm_par->require("function");
+    const auto& par_cg_result = pm_par->require("call_graph");
+    const auto& par_str_result = pm_par->require("strings");
+    const auto& par_pat_result = pm_par->require("pattern");
+    INFO("xref: " << par_xref_result.error_message);
+    REQUIRE(par_xref_result.ok());
+    INFO("cfg: " << par_cfg_result.error_message);
+    REQUIRE(par_cfg_result.ok());
+    INFO("loop: " << par_loop_result.error_message);
+    REQUIRE(par_loop_result.ok());
+    INFO("function: " << par_func_result.error_message);
+    REQUIRE(par_func_result.ok());
+    INFO("call_graph: " << par_cg_result.error_message);
+    REQUIRE(par_cg_result.ok());
+    INFO("strings: " << par_str_result.error_message);
+    REQUIRE(par_str_result.ok());
+    INFO("pattern: " << par_pat_result.error_message);
+    REQUIRE(par_pat_result.ok());
+    auto& par_xref = par_xref_result.get<XrefResult>();
+    auto& par_cfg = par_cfg_result.get<CFGResult>();
+    auto& par_loop = par_loop_result.get<LoopResult>();
+    auto& par_func = par_func_result.get<FunctionResult>();
+    auto& par_cg = par_cg_result.get<CallGraphResult>();
+    auto& par_str = par_str_result.get<StringResult>();
+    auto& par_pat = par_pat_result.get<PatternResult>();
 
     // ── Verify results match ──
     REQUIRE(par_xref.unique_pc_count == seq_xref_pcs);

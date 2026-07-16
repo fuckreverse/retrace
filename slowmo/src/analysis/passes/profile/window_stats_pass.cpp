@@ -398,6 +398,25 @@ void WindowStatsPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── WindowStatsPass::run ─────────────────────────────────────────────────
 
+std::optional<PassResult> WindowStatsPass::try_load_cached(PassContext& ctx) {
+    const bool is_default_cfg =
+        cfg_.window_size == 1000 && cfg_.stride == 0 &&
+        cfg_.top_mnemonics == 10 &&
+        cfg_.track_mem_hotspots && cfg_.track_reg_activity;
+    if (!is_default_cfg || !ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("window_stats", blob)) return std::nullopt;
+
+    WindowStatsResult cached;
+    if (!window_stats_deserialize(blob, cached)) return std::nullopt;
+
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "WindowStats: {} windows (from cache)", cached.windows.size()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult WindowStatsPass::run(PassContext& ctx) {
     auto& index = ctx.index();
 
@@ -405,26 +424,10 @@ PassResult WindowStatsPass::run(PassContext& ctx) {
     if (total_insts == 0) {
         return PassResult::failed("Empty trace");
     }
-
-    // ── Fast path: load from persisted cache ──────────────────────────────
-    // Only cache for full-trace analysis with default window config to keep
-    // the cache key unambiguous.
     const bool is_default_cfg =
         cfg_.window_size == 1000 && cfg_.stride == 0 &&
         cfg_.top_mnemonics == 10 &&
         cfg_.track_mem_hotspots && cfg_.track_reg_activity;
-    if (is_default_cfg && ctx.range().is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("window_stats", blob)) {
-            WindowStatsResult cached;
-            if (window_stats_deserialize(blob, cached)) {
-                collector_.reset();  // no scan needed on cache hit
-                ctx.progress(1.0f, fmt::format(
-                    "WindowStats: {} windows (from cache)", cached.windows.size()));
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
 
     // collector_ was populated by declare_scan() + ScanOrchestrator::execute_scan()
     if (!collector_) {

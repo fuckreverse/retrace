@@ -1,103 +1,95 @@
 {
   "benchmark": "tenet_all_passes",
-  "version": "2.0",
-  "note": "v1.0 used bench_tenet with unique_pcs=1 synthetic traces (not comparable to real traces). v2.0 uses bench_all_passes on real and realistic synthetic traces.",
-  "date": "2026-06-29",
-  "note_opt": "ankerl::unordered_dense replaces std::unordered_map/set in: string_pass, memory_string_pass, memory_snapshot_pass, symbol_annotation_pass, objc_pass, objc_crypto_pass, syscall_intercept_pass, dataflow_graph_pass, algorithm_summary_pass, constant_materialization_pass",
-  "scale": "5M-20M",
-  "system": {
-    "arch": "aarch64",
-    "os": "macOS",
-    "cpu": "Apple M1"
-  },
-  "build_type": "RelWithDebInfo",
-  "traces": [
-    {
-      "trace": "test_50m.bin",
-      "description": "Real iOS app trace (block-compressed, 50MB on disk → 1058MB logical)",
-      "inst_count": 19827466,
-      "unique_pcs": 22279,
-      "anchor_count": 25943,
-      "runs_ms": [360.13, 317.26, 318.04],
-      "median_ms": 318.04,
-      "stdev_ms": 24.8,
-      "cv_pct": 7.8,
-      "throughput_mips": 62.3,
-      "pass": "function"
+  "version": "3.1",
+  "date": "2026-07-16",
+  "note": "Current-code baseline on a real 19.8M-instruction trace. Regression comparisons use pass_cache_cold medians so every pass executes its analysis instead of depending on persisted result compatibility.",
+  "measurement": {
+    "runs": 3,
+    "statistic": "median",
+    "build_directory": "tools/tenet/build",
+    "build_type": "RelWithDebInfo",
+    "features": {
+      "triton": true,
+      "yara": true,
+      "tbb": true
     },
-    {
-      "trace": "perf_deep_calls (5M, 600 PCs)",
-      "description": "Synthetic call-heavy trace: 100-deep recursive calls, 5M instructions",
-      "inst_count": 5000000,
-      "unique_pcs": 600,
-      "runs_ms": [80.21, 76.96, 70.38],
-      "median_ms": 76.96,
-      "stdev_ms": 5.0,
-      "cv_pct": 6.5,
-      "throughput_mips": 65.0,
-      "pass": "function"
+    "cache_policy": {
+      "rocksdb_index": "warm except for the first recovery/open observation",
+      "pass_cache_cold": "remove pass_cache before each measured run",
+      "pass_cache_warm": "seed a cache with the current binary, then run three times"
     }
-  ],
-  "all_passes_median_ms": {
-    "trace": "test_50m.bin",
-    "note": "Cached runs (RocksDB index + blob cache warm). Measured 2026-06-29 after ankerl::unordered_dense migration.",
-    "xref": 18.5,
-    "function": 318.0,
-    "loop": 2.3,
-    "pattern": 0.03,
-    "constant_materialization": 0.7,
-    "strings": 0.2,
-    "objc": 0.16,
-    "thread": 0.01,
-    "backward_taint": 1.9,
-    "trace_diff": 0.3,
-    "memory_snapshot": 1030.6,
-    "dataflow_graph": 0.9,
-    "cfg": 0.0,
-    "cfg_layout": 0.4,
-    "taint": 10156.1,
-    "call_graph": 0.34,
-    "loop_semantics": 0.03,
-    "symbol_annotation": 484.7,
-    "algorithm_summary": 0.18
+  },
+  "system": {
+    "arch": "arm64",
+    "os": "macOS 26.5.1 (25F80)",
+    "cpu": "Apple M2 Pro",
+    "memory_bytes": 17179869184
+  },
+  "trace": {
+    "name": "test_50m.bin",
+    "description": "Real iOS app trace; 50 MB compressed, 1058 MB logical; footer missing and block index recovered on open",
+    "inst_count": 19827466,
+    "unique_pcs": 22279,
+    "anchor_count": 25943,
+    "logical_size_mb": 1058.0005111694336
+  },
+  "infrastructure_ms": {
+    "index_open_runs": [7193.862667, 60.233875, 56.321125],
+    "index_open_median": 60.233875,
+    "memory_build_runs": [1231.340458, 1061.72325, 865.256958],
+    "memory_build_median": 1061.72325
+  },
+  "pass_cache_cold": {
+    "sum_own_runs_ms": [31104.07271, 30205.948458, 38142.187751],
+    "sum_own_median_ms": 31104.07271,
+    "sum_own_cv_pct": 13.1,
+    "passes": {
+      "xref": {"runs_ms": [669.773375, 603.726375, 726.40275], "median_ms": 669.773375},
+      "function": {"runs_ms": [6132.138042, 5623.725375, 6863.401583], "median_ms": 6132.138042},
+      "loop": {"runs_ms": [23.028125, 17.524875, 33.299958], "median_ms": 23.028125},
+      "pattern": {"runs_ms": [6380.172292, 5698.333875, 7792.551167], "median_ms": 6380.172292},
+      "strings": {"runs_ms": [556.886875, 766.130958, 875.746792], "median_ms": 766.130958},
+      "objc": {"runs_ms": [1888.350042, 1745.57375, 3540.049917], "median_ms": 1888.350042},
+      "thread": {"runs_ms": [4521.580292, 4288.425042, 5423.87375], "median_ms": 4521.580292},
+      "backward_taint": {"runs_ms": [18.117417, 1.988208, 51.107667], "median_ms": 18.117417},
+      "trace_diff": {"runs_ms": [0.868917, 0.599583, 0.688333], "median_ms": 0.688333},
+      "memory_snapshot": {"runs_ms": [2676.164209, 2434.001625, 2158.928917], "median_ms": 2434.001625},
+      "dataflow_graph": {"runs_ms": [0.932375, 1.114542, 4.469292], "median_ms": 1.114542},
+      "cfg": {"runs_ms": [0.000792, 0.000583, 0.001333], "median_ms": 0.000792},
+      "cfg_layout": {"runs_ms": [32.385208, 22.567208, 33.709334], "median_ms": 32.385208},
+      "taint": {"runs_ms": [8034.334875, 8889.570625, 10476.200792], "median_ms": 8889.570625},
+      "call_graph": {"runs_ms": [113.181208, 89.727667, 135.625583], "median_ms": 113.181208},
+      "loop_semantics": {"runs_ms": [54.593041, 22.052084, 25.494916], "median_ms": 25.494916},
+      "algorithm_summary": {"runs_ms": [1.565625, 0.886083, 0.635667], "median_ms": 0.886083}
+    }
+  },
+  "pass_cache_warm": {
+    "sum_own_runs_ms": [10233.465207, 10386.273, 13486.143],
+    "sum_own_median_ms": 10386.273,
+    "note": "Measured after moving persisted-cache deserialization before collector declaration and trace scanning. The total still includes uncached passes such as taint and memory_snapshot, so use per-pass values to evaluate cache short-circuiting.",
+    "cache_short_circuit_passes": {
+      "function": {"runs_ms": [477.614833, 472.737, 3325.564], "median_ms": 477.614833},
+      "pattern": {"runs_ms": [29.552291, 1.404, 2.2], "median_ms": 2.2},
+      "strings": {"runs_ms": [20.779, 0.586, 0.408], "median_ms": 0.586},
+      "thread": {"runs_ms": [7.0095, 0.322, 0.398], "median_ms": 0.398},
+      "cfg": {"runs_ms": [0.000625, 0.001, 0.0], "median_ms": 0.001}
+    }
   },
   "regression_thresholds": {
-    "note": "Flag if median_ms increases by more than this factor vs baseline",
+    "note": "Flag when the pass_cache_cold median increases by more than this factor. Re-measure three runs under the same build/features/cache policy.",
+    "sum_own": 1.2,
     "function": 1.2,
     "xref": 1.2,
-    "loop": 1.2,
+    "pattern": 1.2,
+    "strings": 1.25,
+    "objc": 1.25,
+    "thread": 1.2,
     "taint": 1.15,
     "call_graph": 1.3,
-    "memory_snapshot": 1.2,
-    "symbol_annotation": 1.2
+    "memory_snapshot": 1.2
   },
-  "legacy_v1": {
-    "note": "Original bench_tenet results (unique_pcs=1 synthetic traces, NOT comparable to v2)",
-    "results": [
-      {
-        "trace": "perf_cfg_explosion",
-        "inst_count": 2774112,
-        "unique_pcs": 1,
-        "pass_ms": {"function": 12.274167, "xref": 421.957541, "cfg": 46.561542, "taint": 15.01475, "call_graph": 0.004292}
-      },
-      {
-        "trace": "perf_heavy_memory",
-        "inst_count": 3515666,
-        "unique_pcs": 1,
-        "pass_ms": {"function": 18.874792, "xref": 543.387292, "cfg": 55.618708, "taint": 23.977167, "call_graph": 0.003333}
-      },
-      {
-        "trace": "perf_taint_explosion",
-        "inst_count": 3244055,
-        "unique_pcs": 1,
-        "pass_ms": {"function": 17.687125, "xref": 105.1345,   "cfg": 15.573167, "taint": 22.79675,  "call_graph": 0.002375}
-      },
-      {
-        "trace": "perf_linear_scan",
-        "inst_count": 2907037,
-        "unique_pcs": 1,
-        "pass_ms": {"function": 14.862917, "xref": 59.940042,  "cfg": 18.292834, "taint": 23.467917, "call_graph": 0.002458}
-      }
-    ]
+  "legacy": {
+    "v2_date": "2026-06-29",
+    "note": "v2 mixed warm persisted-cache timings with older pass topology (including symbol_annotation and separate constant_materialization), so it is retained only as historical context and is not directly comparable to v3."
   }
 }

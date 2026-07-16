@@ -386,25 +386,26 @@ void CFGPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
 
 // ─── CFGPass::run ───────────────────────────────────────────────────────────
 
+std::optional<PassResult> CFGPass::try_load_cached(PassContext& ctx) {
+    if (!ctx.range().is_full_trace()) return std::nullopt;
+
+    std::string blob;
+    if (!ctx.index().load_pass_blob("cfg", blob)) return std::nullopt;
+
+    CFGResult cached;
+    if (!cfg_deserialize(blob, cached)) return std::nullopt;
+
+    cached.build_adjacency();
+    collector_.reset();
+    ctx.progress(1.0f, fmt::format(
+        "CFG: {} blocks, {} edges (from cache)",
+        cached.block_count(), cached.edge_count()));
+    return PassResult::success(std::move(cached));
+}
+
 PassResult CFGPass::run(PassContext& ctx) {
     auto& index = ctx.index();
     const auto& range = ctx.range();
-
-    // ─── Fast path: load from persisted cache ─────────────────────────────
-    if (range.is_full_trace()) {
-        std::string blob;
-        if (index.load_pass_blob("cfg", blob)) {
-            CFGResult cached;
-            if (cfg_deserialize(blob, cached)) {
-                cached.build_adjacency();
-                ctx.progress(1.0f, fmt::format(
-                    "CFG: {} blocks, {} edges (from cache)",
-                    cached.block_count(), cached.edge_count()));
-                collector_.reset();
-                return PassResult::success(std::move(cached));
-            }
-        }
-    }
 
     // Build blocks if not already done (by declare_scan or previous call)
     build_blocks(ctx);

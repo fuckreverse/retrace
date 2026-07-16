@@ -242,6 +242,7 @@ public:
     }
 
     bool has_scan() const override { return true; }
+    std::optional<PassResult> try_load_cached(PassContext& ctx) override;
     void declare_scan(ScanOrchestrator& orch, PassContext& ctx) override;
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 8.0f; }

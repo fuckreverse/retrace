@@ -5,7 +5,8 @@
 #   ./bench/run_benchmark.sh [--scale 1M|10M|100M] [--output results.json]
 #
 # Steps:
-#   1. Build bench_tenet (and gen_test_traces if needed)
+#   1. Incrementally build bench_tenet and gen_test_traces in the canonical
+#      tools/tenet/build directory
 #   2. Generate perf traces at specified scale
 #   3. Run benchmark harness
 #   4. Output JSON results
@@ -14,7 +15,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TENET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="${TENET_DIR}/build-bench"
+# Reuse the repository's canonical build directory. Creating a dedicated
+# benchmark build would clone/rebuild the same third-party dependencies and can
+# easily drift from the binaries developers actually profile.
+BUILD_DIR="${TENET_DIR}/build"
 TRACES_DIR="${TENET_DIR}/bench/traces"
 TESTS_DIR="${TENET_DIR}/tests"
 
@@ -58,17 +62,17 @@ echo "════════════════════════�
 echo ""
 echo "[1/3] Building bench_tenet..."
 
-# Build tenet's bench_tenet target
-if [[ ! -d "$BUILD_DIR" ]]; then
-    cmake -S "$TENET_DIR" -B "$BUILD_DIR" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DTENET_ENABLE_GUI=OFF \
-        -DTENET_ENABLE_TRITON=OFF \
-        -DTENET_ENABLE_YARA=OFF \
-        2>&1 | tail -5
+# The canonical build must already be configured according to the repository
+# build contract. Reconfigure it explicitly when a different build type or
+# feature set is needed; this script never creates another build tree.
+if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    echo "Error: canonical build directory is not configured: ${BUILD_DIR}" >&2
+    echo "Configure tools/tenet/build first (for profiling, use RelWithDebInfo)." >&2
+    exit 1
 fi
 
-cmake --build "$BUILD_DIR" --target bench_tenet -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) 2>&1 | tail -3
+NPROC=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+cmake --build "$BUILD_DIR" --target bench_tenet gen_test_traces -j"$NPROC" 2>&1 | tail -3
 
 echo "  ✓ bench_tenet built"
 
@@ -77,15 +81,15 @@ echo "  ✓ bench_tenet built"
 echo ""
 echo "[2/3] Generating perf traces (scale=${SCALE})..."
 
-# Build gen_test_traces via the main CMake build (shared with unit tests)
-TESTS_BUILD="${BUILD_DIR}"
-if [[ ! -x "${TESTS_BUILD}/gen_test_traces" ]]; then
-    echo "  Building gen_test_traces..."
-    cmake --build "${TESTS_BUILD}" --target gen_test_traces -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) 2>&1 | tail -3
+# gen_test_traces is emitted under build/tests by the current CMake layout.
+GEN_TEST_TRACES="${BUILD_DIR}/tests/gen_test_traces"
+if [[ ! -x "$GEN_TEST_TRACES" ]]; then
+    echo "Error: gen_test_traces was not produced at ${GEN_TEST_TRACES}" >&2
+    exit 1
 fi
 
 mkdir -p "$TRACES_DIR"
-"${TESTS_BUILD}/gen_test_traces" --suite perf --outdir "$TRACES_DIR" --scale "$SCALE"
+"$GEN_TEST_TRACES" --suite perf --outdir "$TRACES_DIR" --scale "$SCALE"
 echo "  ✓ Perf traces generated in ${TRACES_DIR}/"
 
 # ── Step 3: Run benchmark ─────────────────────────────────────────────────────
