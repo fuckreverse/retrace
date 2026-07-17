@@ -2204,7 +2204,7 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // subprocess-per-call overhead of the Python MCP bridge.
     if (opts.opt_mcp) {
         TenetService service(reader, index, code_table, decoder, regfile, memory,
-                             trace_path.string());
+                             opts.trace_path);
         TenetMcpService mcp_service(service);
         mcp_service.run();  // blocks until stdin EOF
     }
@@ -2217,7 +2217,7 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // Process stays resident and blocks on SIGINT/SIGTERM.
     if (opts.opt_mcp_http) {
         TenetService service(reader, index, code_table, decoder, regfile, memory,
-                             trace_path.string());
+                             opts.trace_path);
         TenetMcpService mcp_service(service);
         if (!mcp_service.start_http(opts.mcp_http_cfg)) {
             fmt::print(stderr, "[mcp-http] Failed to start HTTP server on {}:{}\n",
@@ -2251,7 +2251,7 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // others connect as workers. Only hub listens (port 10444 by default).
     if (opts.opt_mcp_hub) {
         TenetService service(reader, index, code_table, decoder, regfile, memory,
-                             trace_path.string());
+                             opts.trace_path);
         TenetMcpService mcp_service(service);
 
         // Build hub config from CLI options

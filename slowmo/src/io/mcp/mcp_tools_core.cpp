@@ -340,11 +340,23 @@ void TenetMcpService::register_query_tools() {
                                    {"has_more", has_more},
                                    {"next_offset", has_more ? end_i : offset},
                                    {"inst_ids", std::move(page_ids)}};
-                    if (wants_nearest) {
-                        uint64_t nearest = xref.nearest_inst_id_at(runtime_pc, nearest_to_inst_id);
-                        if (nearest != UINT64_MAX) {
-                            result["nearest_inst_id"] = nearest;
+                    if (wants_nearest && !ids.empty()) {
+                        const auto after = std::lower_bound(
+                            ids.begin(), ids.end(), nearest_to_inst_id);
+                        uint64_t nearest = 0;
+                        if (after == ids.begin()) {
+                            nearest = *after;
+                        } else if (after == ids.end()) {
+                            nearest = ids.back();
+                        } else if (*after == nearest_to_inst_id) {
+                            nearest = *after;
+                        } else {
+                            const uint64_t before = *std::prev(after);
+                            const uint64_t dist_before = nearest_to_inst_id - before;
+                            const uint64_t dist_after = *after - nearest_to_inst_id;
+                            nearest = (dist_before <= dist_after) ? before : *after;
                         }
+                        result["nearest_inst_id"] = nearest;
                     }
                     return result;
                 }

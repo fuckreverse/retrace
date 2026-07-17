@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "fixtures/trace_fixture.h"
+#include "analysis/passes/structure/xref_pass.h"
 #include "io/mcp/mcp_server.h"
 #include "service/tenet_service.h"
 
@@ -128,14 +129,31 @@ TEST_CASE("mcp core: search_pc nearest_inst_id uses backend nearest lookup",
 
     REQUIRE(env != nullptr);
     auto pm = make_pm(*env);
+    REQUIRE(pm != nullptr);
 
     TenetMcpService mcp(*env->reader, *env->index, *env->regfile,
                         *env->memory, pm.get(),
                         &env->code_table, &env->decoder);
+    REQUIRE(mcp.tool_count() > 0);
+
+    register_pass_by_name(*pm, "xref");
+    const auto xref_result = pm->require_shared("xref");
+    REQUIRE(xref_result != nullptr);
+    REQUIRE(xref_result->ok());
+    const auto& xref = xref_result->get<XrefResult>();
+    const uint64_t runtime_pc = rt_pc(0x1000);
+    REQUIRE(xref.execution_count(runtime_pc) == 4);
+    REQUIRE(xref.inst_ids_at(runtime_pc) == std::vector<uint64_t>{0, 2, 4, 6});
+    REQUIRE(xref.nearest_inst_id_at(runtime_pc, 0) == 0);
+    REQUIRE(xref.nearest_inst_id_at(runtime_pc, 3) == 2);
+    REQUIRE(xref.nearest_inst_id_at(runtime_pc, 4) == 4);
+    REQUIRE(xref.nearest_inst_id_at(runtime_pc, 99) == 6);
 
     auto before = mcp.call_tool("search_pc", {{"pc", "0x100001000"}, {"nearest_to_inst_id", 0}});
     REQUIRE(before.at("exec_count") == 4);
-    REQUIRE(before.at("nearest_inst_id") == 0);
+    REQUIRE(before.contains("nearest_inst_id"));
+    REQUIRE(before.at("nearest_inst_id").is_number_unsigned());
+    REQUIRE(before.at("nearest_inst_id").get<uint64_t>() == 0);
     REQUIRE(before.at("inst_ids").get<std::vector<uint64_t>>() == std::vector<uint64_t>{0, 2, 4, 6});
 
     auto between = mcp.call_tool("search_pc", {{"pc", "0x100001000"}, {"nearest_to_inst_id", 3}});

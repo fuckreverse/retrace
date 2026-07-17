@@ -439,38 +439,26 @@ uint64_t XrefResult::first_inst_id_at(uint64_t pc) const {
 }
 
 uint64_t XrefResult::nearest_inst_id_at(uint64_t pc, uint64_t target_inst_id) const {
-    roaring::Roaring64Map bitmap = bitmap_at(pc);
-    const uint64_t card = bitmap.cardinality();
-    if (card == 0) {
+    const auto inst_ids = inst_ids_at(pc);
+    if (inst_ids.empty()) {
         return UINT64_MAX;
     }
 
-    const uint64_t rank = bitmap.rank(target_inst_id);
-    uint64_t before = UINT64_MAX;
-    if (rank > 0) {
-        if (!bitmap.select(rank - 1, &before)) {
-            return UINT64_MAX;
-        }
-        if (before == target_inst_id) {
-            return before;
-        }
+    const auto after = std::lower_bound(inst_ids.begin(), inst_ids.end(), target_inst_id);
+    if (after == inst_ids.begin()) {
+        return *after;
+    }
+    if (after == inst_ids.end()) {
+        return inst_ids.back();
+    }
+    if (*after == target_inst_id) {
+        return *after;
     }
 
-    if (rank >= card) {
-        return before;
-    }
-
-    uint64_t after = UINT64_MAX;
-    if (!bitmap.select(rank, &after)) {
-        return before;
-    }
-    if (rank == 0 || before == UINT64_MAX) {
-        return after;
-    }
-
+    const uint64_t before = *std::prev(after);
     const uint64_t dist_before = target_inst_id - before;
-    const uint64_t dist_after = after - target_inst_id;
-    return (dist_before <= dist_after) ? before : after;
+    const uint64_t dist_after = *after - target_inst_id;
+    return (dist_before <= dist_after) ? before : *after;
 }
 
 roaring::Roaring64Map XrefResult::bitmap_at(uint64_t pc) const {
