@@ -48,8 +48,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -114,8 +116,9 @@ struct HubInstance {
     std::string trace_file;
     std::string module_name;
     bool        is_hub       = false;
-    int         sock_fd      = -1;       ///< -1 for hub itself
-    std::chrono::steady_clock::time_point last_heartbeat;
+    int         sock_fd      = -1;       ///< Guarded by socket_mutex_; -1 for hub itself
+    mutable std::mutex socket_mutex_;
+    std::atomic<int64_t> last_heartbeat_ticks{0};
 
     // Pending request tracking (for async request→response matching)
     struct PendingRequest {
@@ -127,9 +130,51 @@ struct HubInstance {
     std::condition_variable pending_cv;
     std::unordered_map<std::string, PendingRequest> pending;
 
-    // Write queue (for sending messages to this worker)
-    std::mutex write_mutex;
-    void send(const nlohmann::json& msg);
+    // Socket lifecycle: send holds this lock across ::send(); close/shutdown
+    // acquires the same lock before invalidating sock_fd to avoid fd reuse races.
+    bool send(const nlohmann::json& msg);
+    bool has_socket() const;
+    bool matches_socket(int fd) const;
+    void attach_socket(int fd);
+    void shutdown_socket();
+    void shutdown_socket_if(int expected_fd);
+    void close_socket();
+    void close_socket_if(int expected_fd);
+};
+
+// Tracks active upgraded WebSocket sessions separately from generic client fds.
+// Worker-bound sessions are keyed by the exact HubInstance identity so an old
+// generation can be torn down without touching a replacement that reused the
+// same string id.
+class BoundWsSessionRegistry {
+public:
+    struct SessionToken {
+        int      fd = -1;
+        uint64_t generation = 0;
+    };
+
+    SessionToken register_session(int fd, const std::shared_ptr<HubInstance>& bound_instance);
+    void unregister_session(SessionToken token);
+    void unregister_session(int fd);
+
+    std::vector<int> sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const;
+    std::vector<int> hub_local_sessions() const;
+    std::vector<int> all_sessions() const;
+    bool has_session(int fd) const;
+
+private:
+    struct Binding {
+        std::weak_ptr<HubInstance> bound_instance;
+        const HubInstance*         identity = nullptr;
+        bool                       hub_local = false;
+        uint64_t                   generation = 0;
+    };
+
+    mutable std::mutex mutex_;
+    uint64_t next_generation_ = 1;
+    std::unordered_map<int, Binding> sessions_by_fd_;
+    std::unordered_map<const HubInstance*, std::unordered_set<int>> sessions_by_instance_;
+    std::unordered_set<int> hub_local_fds_;
 };
 
 // ─── Hub Transport ─────────────────────────────────────────────────────────
@@ -184,9 +229,16 @@ public:
     bool session_mode() const { return session_mode_; }
 
 private:
+    struct HttpRequest;
+
     void listener_loop();
-    void handle_http_client(int fd, const std::string& addr);
+    void handle_http_client(int fd, const std::string& addr, bool peer_is_loopback);
+    void handle_websocket_client(int fd, const std::string& addr, bool peer_is_loopback, const HttpRequest& req);
     void handle_worker_connection(int fd, const std::string& addr);
+
+    nlohmann::json handle_ws_rpc(const std::string& bound_instance,
+                                 const std::shared_ptr<HubInstance>& bound_worker,
+                                 const nlohmann::json& msg);
 
     // HTTP helpers (same protocol as McpHttpTransport)
     struct HttpRequest {
@@ -202,16 +254,23 @@ private:
                                    const std::string& content_type,
                                    const std::string& body,
                                    const std::string& extra_headers = "");
+    static bool send_all(int fd, std::string_view data);
+    static bool has_token_ci(std::string_view header_value, std::string_view token);
 
     // Worker registry
     mutable std::mutex registry_mutex_;
-    std::unordered_map<std::string, std::unique_ptr<HubInstance>> instances_;
+    std::unordered_map<std::string, std::shared_ptr<HubInstance>> instances_;
 
     // Request ID counter
     std::atomic<uint64_t> next_request_id_{1};
 
     // Cleanup
     void reap_stale_workers();
+    void shutdown_ws_sessions_for_instance(const std::shared_ptr<HubInstance>& inst);
+    void shutdown_all_ws_sessions();
+    static void shutdown_fds(const std::vector<int>& fds);
+
+    friend struct McpHubTransportTestAccess;
 
     MessageHandler handler_;
     InstanceInfoProvider instance_info_provider_;
@@ -228,6 +287,8 @@ private:
     // Per-client threads
     std::mutex clients_mutex_;
     std::vector<std::thread> client_threads_;
+    std::unordered_set<int> active_client_fds_;
+    BoundWsSessionRegistry bound_ws_sessions_;
 
     // Heartbeat reaper thread
     std::thread reaper_thread_;
@@ -243,6 +304,7 @@ private:
 class McpWorkerTransport {
 public:
     using MessageHandler = std::function<nlohmann::json(const nlohmann::json& msg)>;
+
 
     McpWorkerTransport(MessageHandler handler,
                        const std::string& hub_host, uint16_t hub_port,
@@ -270,7 +332,12 @@ private:
     void send_heartbeat();
     bool send_json(const nlohmann::json& msg);
     bool recv_line(std::string& line);
+    int current_socket_fd() const;
+    void install_socket(int fd);
+    void shutdown_connection();
     void close_connection();
+
+    friend struct McpWorkerTransportTestAccess;
 
     MessageHandler handler_;
     std::string hub_host_;
@@ -280,7 +347,8 @@ private:
     std::string trace_file_;
     std::string module_name_;
 
-    int sock_fd_ = -1;
+    int sock_fd_ = -1;  // Guarded by socket_mutex_
+    mutable std::mutex socket_mutex_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> running_{true};
 

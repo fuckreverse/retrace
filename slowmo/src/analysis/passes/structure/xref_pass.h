@@ -160,6 +160,10 @@ struct XrefResult {
     /// Returns UINT64_MAX if PC not found.
     uint64_t first_inst_id_at(uint64_t pc) const;
 
+    /// Return the execution closest to `target_inst_id`.
+    /// Ties prefer the earlier inst_id. Returns UINT64_MAX if PC not found.
+    uint64_t nearest_inst_id_at(uint64_t pc, uint64_t target_inst_id) const;
+
     /// Load the full bitmap for a PC (same backing store as inst_ids_at).
     roaring::Roaring64Map bitmap_at(uint64_t pc) const;
 

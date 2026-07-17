@@ -39,6 +39,7 @@
 #include "io/rpc_server.h"
 #include "io/mcp/mcp_server.h"
 #include "io/streaming_index.h"
+#include "service/tenet_service.h"
 
 #include "common/logger.h"
 
@@ -2202,8 +2203,9 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // core objects (reader, index, regfile, memory, pm), eliminating the
     // subprocess-per-call overhead of the Python MCP bridge.
     if (opts.opt_mcp) {
-        TenetMcpService mcp_service(reader, index, regfile, memory,
-                                    &pm, &code_table, &decoder);
+        TenetService service(reader, index, code_table, decoder, regfile, memory,
+                             trace_path.string());
+        TenetMcpService mcp_service(service);
         mcp_service.run();  // blocks until stdin EOF
     }
 
@@ -2214,8 +2216,9 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // stdin/stdout are not available (e.g. when tenet itself is the GUI).
     // Process stays resident and blocks on SIGINT/SIGTERM.
     if (opts.opt_mcp_http) {
-        TenetMcpService mcp_service(reader, index, regfile, memory,
-                                    &pm, &code_table, &decoder);
+        TenetService service(reader, index, code_table, decoder, regfile, memory,
+                             trace_path.string());
+        TenetMcpService mcp_service(service);
         if (!mcp_service.start_http(opts.mcp_http_cfg)) {
             fmt::print(stderr, "[mcp-http] Failed to start HTTP server on {}:{}\n",
                        opts.mcp_http_cfg.host, opts.mcp_http_cfg.port);
@@ -2247,8 +2250,9 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
     // Hub/worker mode: first instance becomes hub (flock election),
     // others connect as workers. Only hub listens (port 10444 by default).
     if (opts.opt_mcp_hub) {
-        TenetMcpService mcp_service(reader, index, regfile, memory,
-                                    &pm, &code_table, &decoder);
+        TenetService service(reader, index, code_table, decoder, regfile, memory,
+                             trace_path.string());
+        TenetMcpService mcp_service(service);
 
         // Build hub config from CLI options
         McpHubConfig hub_cfg = opts.mcp_hub_cfg;

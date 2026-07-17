@@ -112,6 +112,9 @@ tenet_add_test(test_pass_taint_source_annotation unit/test_pass_taint_source_ann
 # ─── Unit tests: MCP layer (hypothesis ledger, evidence verification, batch query)
 tenet_add_test(test_mcp_hypothesis_ledger      unit/test_mcp_hypothesis_ledger.cpp)
 tenet_add_test(test_mcp_tools_ai               unit/test_mcp_tools_ai.cpp)
+tenet_add_test(test_mcp_tools_core             unit/test_mcp_tools_core.cpp)
+tenet_add_test(test_mcp_websocket              unit/test_mcp_websocket.cpp)
+tenet_add_test(test_mcp_hub_socket_lifecycle   unit/test_mcp_hub_socket_lifecycle.cpp)
 
 # ─── Integration tests ──────────────────────────────────────────────────────
 tenet_add_test(test_pipeline               integration/test_pipeline.cpp)
@@ -136,6 +139,18 @@ tenet_add_test(test_perf_io               perf/test_perf_io.cpp)
 tenet_add_test(test_perf_core             perf/test_perf_core.cpp)
 tenet_add_test(test_perf_passes           perf/test_perf_passes.cpp)
 tenet_add_test(test_perf_block_vs_stream  perf/test_perf_block_vs_stream.cpp)
+
+# ─── Python unit tests ───────────────────────────────────────────────────────
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME test_tenet_python_unittests
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/../python/tests -p test_*.py
+    )
+    set_tests_properties(test_tenet_python_unittests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../python
+    )
+endif()
 
 # ─── Test tool: synthetic trace generator ───────────────────────────────────
 add_executable(gen_test_traces tools/gen_test_traces.cpp)

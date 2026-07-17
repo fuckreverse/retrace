@@ -101,7 +101,8 @@ TenetMcpService::TenetMcpService(TraceReader& reader,
                                    PassManager* pm,
                                    CodeTable* code_table,
                                    InstructionDecoder* decoder)
-    : reader_(reader), index_(index), regfile_(regfile), memory_(memory),
+    : service_(nullptr),
+      reader_(reader), index_(index), regfile_(regfile), memory_(memory),
       pm_(pm), code_table_(code_table), decoder_(decoder) {
 
     register_all_tools();
@@ -110,7 +111,8 @@ TenetMcpService::TenetMcpService(TraceReader& reader,
 }
 
 TenetMcpService::TenetMcpService(TenetService& service)
-    : reader_(service.reader()), index_(service.index()),
+    : service_(&service),
+      reader_(service.reader()), index_(service.index()),
       regfile_(service.regfile()), memory_(service.memory()),
       pm_(&service.ensure_pass_manager()),
       code_table_(&service.code_table()),
@@ -206,8 +208,25 @@ void TenetMcpService::stop() {
 }
 
 json TenetMcpService::process_message(const json& msg) {
-    std::string method = msg.value("method", "");
     auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
+
+    if (!msg.is_object()) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg_id},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: expected JSON object"}}}
+        };
+    }
+
+    if (msg.value("jsonrpc", std::string("")) != "2.0") {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg_id},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: jsonrpc must be '2.0'"}}}
+        };
+    }
+
+    std::string method = msg.value("method", "");
 
     // Notifications (no id) — no response
     if (msg_id.is_null() && !msg.contains("id")) {
@@ -652,8 +671,25 @@ void TenetMcpService::register_hub_tools() {
 }
 
 json TenetMcpService::process_message_hub(const json& msg) {
-    std::string method = msg.value("method", "");
     auto msg_id = msg.contains("id") ? msg["id"] : json(nullptr);
+
+    if (!msg.is_object()) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg_id},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: expected JSON object"}}}
+        };
+    }
+
+    if (msg.value("jsonrpc", std::string("")) != "2.0") {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg_id},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: jsonrpc must be '2.0'"}}}
+        };
+    }
+
+    std::string method = msg.value("method", "");
 
     // Notifications — pass through
     if (msg_id.is_null() && !msg.contains("id")) {
@@ -684,6 +720,12 @@ json TenetMcpService::process_message_hub(const json& msg) {
         // Extract instance parameter
         std::string target_instance;
         if (arguments.contains("instance")) {
+            if (!arguments["instance"].is_string()) {
+                json err = {{"error", "Invalid params: 'instance' must be a string."}};
+                return {{"jsonrpc", "2.0"}, {"id", msg_id},
+                        {"result", {{"content", json::array({{{"type", "text"}, {"text", err.dump()}}})},
+                                    {"isError", true}}}};
+            }
             target_instance = arguments["instance"].get<std::string>();
             // Strip instance from arguments before forwarding
             json clean_args = arguments;

@@ -233,6 +233,11 @@ private:
     void register_hypothesis_tools();
 
     // ── Internal state ─────────────────────────────────────────────────
+    // Optional non-owning navigation backend. Only set when constructed from
+    // TenetService; raw backend constructor leaves this null.
+    // Lifetime: the pointed TenetService must outlive this MCP service.
+    TenetService* service_ = nullptr;
+
     TraceReader& reader_;
     TraceIndex& index_;
     RegisterFile& regfile_;

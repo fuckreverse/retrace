@@ -9,7 +9,7 @@
 - 追踪数据流：前向污点、反向污点、关键路径、数据流图。
 - 重建运行时状态：任意指令点寄存器状态、时间感知内存读取、写历史、内存快照、字符串恢复。
 - 识别高层语义：常量物化、模式检测、算法摘要、ObjC 消息分析、系统调用参数提取。
-- 做自动化与 AI 集成：CLI 批处理、JSON-RPC、MCP stdio、MCP Streamable HTTP、实时 streaming index。
+- 做自动化与 AI/IDA 集成：CLI 批处理、JSON-RPC、MCP stdio、MCP Streamable HTTP/Hub、IDAPython 双向导航、实时 streaming index。
 
 ## 文档入口
 
@@ -91,6 +91,9 @@ ninja -j$(nproc)
 ./tenet trace.bin --rpc /tmp/tenet.sock
 ./tenet trace.bin --mcp
 ./tenet trace.bin --mcp-http 127.0.0.1:10444
+./tenet trace.bin --mcp-hub 127.0.0.1:10444
+# Hub JSON WebSocket: ws://127.0.0.1:10444/ws/<instance-id>
+# IDAPython 入口: tools/tenet/python/tenet_ida.py
 ```
 
 ## 常见工作流

@@ -523,6 +523,7 @@ add_library(tenet_lib STATIC
     src/io/mcp/mcp_server.cpp
     src/io/mcp/mcp_http.cpp
     src/io/mcp/mcp_hub.cpp
+    src/io/mcp/mcp_websocket.cpp
     src/io/mcp/mcp_tools_core.cpp
     src/io/mcp/mcp_tools_analysis.cpp
     src/io/mcp/mcp_tools_vm.cpp

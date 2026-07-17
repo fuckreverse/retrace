@@ -1,4 +1,5 @@
 #include "mcp_hub.h"
+#include "mcp_websocket.h"
 #include "common/logger.h"
 
 #include <fmt/core.h>
@@ -19,10 +20,120 @@
 #include <algorithm>
 #include <random>
 #include <chrono>
+#include <cctype>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
 
 using json = nlohmann::json;
 
 namespace tenet {
+namespace {
+
+std::string json_rpc_error(int code, const std::string& message, const json& id = nullptr) {
+    return json{{"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", code}, {"message", message}}}}
+        .dump();
+}
+
+int64_t heartbeat_now_ticks() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::chrono::milliseconds heartbeat_age(const tenet::HubInstance& inst) {
+    const int64_t ticks = inst.last_heartbeat_ticks.load(std::memory_order_relaxed);
+    return std::chrono::milliseconds(heartbeat_now_ticks() - ticks);
+}
+
+bool send_all_fd(int fd, std::string_view data) {
+    size_t off = 0;
+    while (off < data.size()) {
+        ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd{fd, POLLOUT, 0};
+                int pr = ::poll(&pfd, 1, 3000);
+                if (pr > 0) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+void mark_pending_error(tenet::HubInstance::PendingRequest& pending, std::string_view error_message) {
+    pending.completed = true;
+    pending.error = true;
+    pending.response = {{"error", std::string(error_message)}};
+}
+
+void fail_all_pending(const std::shared_ptr<tenet::HubInstance>& inst, std::string_view error_message) {
+    if (!inst) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(inst->pending_mutex);
+        for (auto& [rid, pending] : inst->pending) {
+            (void)rid;
+            mark_pending_error(pending, error_message);
+        }
+    }
+    inst->pending_cv.notify_all();
+}
+
+void ensure_instance_for_ws_call(json& msg, const std::string& bound_instance) {
+    if (!msg.is_object()) {
+        throw std::runtime_error("Invalid JSON-RPC message type");
+    }
+
+    const std::string method = msg.value("method", "");
+    if (method.empty()) {
+        throw std::runtime_error("Missing JSON-RPC method");
+    }
+
+    if (method != "tools/call") {
+        return;
+    }
+
+    if (!msg.contains("params") || !msg["params"].is_object()) {
+        msg["params"] = json::object();
+    }
+    json& params = msg["params"];
+
+    if (!params.contains("arguments") || !params["arguments"].is_object()) {
+        params["arguments"] = json::object();
+    }
+    json& arguments = params["arguments"];
+
+    if (arguments.contains("instance")) {
+        if (!arguments["instance"].is_string()) {
+            throw std::runtime_error("params.arguments.instance must be a string");
+        }
+        const std::string supplied = arguments["instance"].get<std::string>();
+        if (supplied != bound_instance) {
+            throw std::runtime_error(
+                "instance mismatch: websocket is bound to '" + bound_instance +
+                "' but request targets '" + supplied + "'");
+        }
+        return;
+    }
+
+    arguments["instance"] = bound_instance;
+}
+
+}  // namespace
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HubElection — flock-based leader election
@@ -154,13 +265,187 @@ HubElection::HubInfo HubElection::read_current() const {
 // HubInstance — write queue
 // ═══════════════════════════════════════════════════════════════════════════
 
-void HubInstance::send(const json& msg) {
+bool HubInstance::send(const json& msg) {
     std::string data = msg.dump() + "\n";
-    std::lock_guard<std::mutex> lk(write_mutex);
-    if (sock_fd >= 0) {
-        // MSG_NOSIGNAL to avoid SIGPIPE on broken connection
-        ::send(sock_fd, data.data(), data.size(), MSG_NOSIGNAL);
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd < 0) {
+        return false;
     }
+    return send_all_fd(sock_fd, data);
+}
+
+bool HubInstance::has_socket() const {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    return sock_fd >= 0;
+}
+
+bool HubInstance::matches_socket(int fd) const {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    return sock_fd == fd;
+}
+
+void HubInstance::attach_socket(int fd) {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    sock_fd = fd;
+}
+
+void HubInstance::shutdown_socket() {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd >= 0) {
+        ::shutdown(sock_fd, SHUT_RDWR);
+    }
+}
+
+void HubInstance::shutdown_socket_if(int expected_fd) {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd == expected_fd && sock_fd >= 0) {
+        ::shutdown(sock_fd, SHUT_RDWR);
+    }
+}
+
+void HubInstance::close_socket() {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd >= 0) {
+        int fd = sock_fd;
+        sock_fd = -1;
+        ::shutdown(fd, SHUT_RDWR);
+    }
+}
+
+void HubInstance::close_socket_if(int expected_fd) {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd == expected_fd && sock_fd >= 0) {
+        int fd = sock_fd;
+        sock_fd = -1;
+        ::shutdown(fd, SHUT_RDWR);
+    }
+}
+
+BoundWsSessionRegistry::SessionToken BoundWsSessionRegistry::register_session(
+    int fd, const std::shared_ptr<HubInstance>& bound_instance) {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    if (fd < 0) {
+        return {};
+    }
+
+    auto existing = sessions_by_fd_.find(fd);
+    if (existing != sessions_by_fd_.end()) {
+        if (existing->second.hub_local) {
+            hub_local_fds_.erase(fd);
+        } else if (existing->second.identity != nullptr) {
+            auto map_it = sessions_by_instance_.find(existing->second.identity);
+            if (map_it != sessions_by_instance_.end()) {
+                map_it->second.erase(fd);
+                if (map_it->second.empty()) {
+                    sessions_by_instance_.erase(map_it);
+                }
+            }
+        }
+        sessions_by_fd_.erase(existing);
+    }
+
+    Binding binding;
+    binding.generation = next_generation_++;
+    if (bound_instance) {
+        binding.bound_instance = bound_instance;
+        binding.identity = bound_instance.get();
+        binding.hub_local = false;
+        sessions_by_instance_[binding.identity].insert(fd);
+    } else {
+        binding.identity = nullptr;
+        binding.hub_local = true;
+        hub_local_fds_.insert(fd);
+    }
+    sessions_by_fd_[fd] = std::move(binding);
+    return SessionToken{fd, sessions_by_fd_[fd].generation};
+}
+
+void BoundWsSessionRegistry::unregister_session(SessionToken token) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = sessions_by_fd_.find(token.fd);
+    if (it == sessions_by_fd_.end() || it->second.generation != token.generation) {
+        return;
+    }
+
+    if (it->second.hub_local) {
+        hub_local_fds_.erase(token.fd);
+    } else if (it->second.identity != nullptr) {
+        auto map_it = sessions_by_instance_.find(it->second.identity);
+        if (map_it != sessions_by_instance_.end()) {
+            map_it->second.erase(token.fd);
+            if (map_it->second.empty()) {
+                sessions_by_instance_.erase(map_it);
+            }
+        }
+    }
+
+    sessions_by_fd_.erase(it);
+}
+
+void BoundWsSessionRegistry::unregister_session(int fd) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = sessions_by_fd_.find(fd);
+    if (it == sessions_by_fd_.end()) {
+        return;
+    }
+
+    if (it->second.hub_local) {
+        hub_local_fds_.erase(fd);
+    } else if (it->second.identity != nullptr) {
+        auto map_it = sessions_by_instance_.find(it->second.identity);
+        if (map_it != sessions_by_instance_.end()) {
+            map_it->second.erase(fd);
+            if (map_it->second.empty()) {
+                sessions_by_instance_.erase(map_it);
+            }
+        }
+    }
+
+    sessions_by_fd_.erase(it);
+}
+
+std::vector<int> BoundWsSessionRegistry::sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<int> out;
+    if (!bound_instance) {
+        return out;
+    }
+
+    auto it = sessions_by_instance_.find(bound_instance.get());
+    if (it == sessions_by_instance_.end()) {
+        return out;
+    }
+    out.reserve(it->second.size());
+    for (int fd : it->second) {
+        out.push_back(fd);
+    }
+    return out;
+}
+
+std::vector<int> BoundWsSessionRegistry::hub_local_sessions() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<int> out;
+    out.reserve(hub_local_fds_.size());
+    for (int fd : hub_local_fds_) {
+        out.push_back(fd);
+    }
+    return out;
+}
+
+std::vector<int> BoundWsSessionRegistry::all_sessions() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<int> out;
+    out.reserve(sessions_by_fd_.size());
+    for (const auto& [fd, _binding] : sessions_by_fd_) {
+        out.push_back(fd);
+    }
+    return out;
+}
+
+bool BoundWsSessionRegistry::has_session(int fd) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return sessions_by_fd_.count(fd) > 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -168,6 +453,7 @@ void HubInstance::send(const json& msg) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 static constexpr const char* WORKER_PROTOCOL_GREETING = "WORKER/1.0\n";
+static constexpr size_t kWsTextPayloadLimit = mcpws::kMaxTextPayload;
 
 McpHubTransport::McpHubTransport(MessageHandler handler,
                                  const std::string& host, uint16_t port,
@@ -244,44 +530,94 @@ bool McpHubTransport::start() {
 void McpHubTransport::stop() {
     if (!running_.exchange(false)) return;
 
-    // Notify workers
+    // Notify workers so they can reconnect/re-elect quickly.
     notify_shutdown();
+    shutdown_all_ws_sessions();
 
-    // Stop listener
+    // Stop listener accept loop first.
     int sfd = server_fd_;
-    if (sfd >= 0) ::shutdown(sfd, SHUT_RDWR);
-    if (listener_thread_.joinable()) listener_thread_.join();
-    if (sfd >= 0) { ::close(sfd); server_fd_ = -1; }
+    if (sfd >= 0) {
+        ::shutdown(sfd, SHUT_RDWR);
+    }
 
-    // Stop reaper
-    reaper_running_.store(false);
-    if (reaper_thread_.joinable()) reaper_thread_.join();
-
-    // Join client threads
+    // Force all active client sockets out of recv()/poll() before joining.
+    std::vector<int> fds_to_shutdown;
     {
-        std::vector<std::thread> threads_to_join;
-        {
-            std::lock_guard<std::mutex> lk(clients_mutex_);
-            threads_to_join = std::move(client_threads_);
+        std::lock_guard<std::mutex> lk(clients_mutex_);
+        fds_to_shutdown.reserve(active_client_fds_.size());
+        for (int fd : active_client_fds_) {
+            fds_to_shutdown.push_back(fd);
         }
-        for (auto& t : threads_to_join) {
-            if (t.joinable()) t.join();
+    }
+    for (int fd : fds_to_shutdown) {
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
         }
     }
 
-    // Close all worker connections
+    if (listener_thread_.joinable() &&
+        listener_thread_.get_id() != std::this_thread::get_id()) {
+        listener_thread_.join();
+    }
+    if (sfd >= 0) {
+        ::close(sfd);
+        server_fd_ = -1;
+    }
+
+    // Stop reaper.
+    reaper_running_.store(false);
+    if (reaper_thread_.joinable() &&
+        reaper_thread_.get_id() != std::this_thread::get_id()) {
+        reaper_thread_.join();
+    }
+
+    // Join client threads (never self-join).
+    std::vector<std::thread> threads_to_join;
+    {
+        std::lock_guard<std::mutex> lk(clients_mutex_);
+        threads_to_join = std::move(client_threads_);
+    }
+    for (auto& t : threads_to_join) {
+        if (!t.joinable()) continue;
+        if (t.get_id() == std::this_thread::get_id()) {
+            t.detach();
+            continue;
+        }
+        t.join();
+    }
+
+    // Close all worker connections.
+    std::vector<std::shared_ptr<HubInstance>> instances_to_close;
     {
         std::lock_guard<std::mutex> lk(registry_mutex_);
         for (auto& [id, inst] : instances_) {
-            if (inst && inst->sock_fd >= 0) {
-                ::close(inst->sock_fd);
-                inst->sock_fd = -1;
+            (void)id;
+            if (inst) {
+                inst->close_socket();
+                instances_to_close.push_back(inst);
             }
-            // Wake up any pending requests
-            inst->pending_cv.notify_all();
         }
         instances_.clear();
     }
+    for (const auto& inst : instances_to_close) {
+        fail_all_pending(inst, "Hub stopped");
+    }
+}
+
+void McpHubTransport::shutdown_fds(const std::vector<int>& fds) {
+    for (int fd : fds) {
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+}
+
+void McpHubTransport::shutdown_ws_sessions_for_instance(const std::shared_ptr<HubInstance>& inst) {
+    shutdown_fds(bound_ws_sessions_.sessions_for_instance(inst));
+}
+
+void McpHubTransport::shutdown_all_ws_sessions() {
+    shutdown_fds(bound_ws_sessions_.all_sessions());
 }
 
 void McpHubTransport::listener_loop() {
@@ -310,8 +646,14 @@ void McpHubTransport::listener_loop() {
         int ka = 1;
         ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 
+        {
+            std::lock_guard<std::mutex> lk(clients_mutex_);
+            active_client_fds_.insert(client_fd);
+        }
+
+        const bool peer_is_loopback = mcpws::is_loopback_address(client_id);
         std::lock_guard<std::mutex> lk(clients_mutex_);
-        client_threads_.emplace_back([this, client_fd, client_id] {
+        client_threads_.emplace_back([this, client_fd, client_id, peer_is_loopback] {
             // Peek at first bytes to detect protocol
             char peek_buf[16] = {};
             ssize_t peeked = ::recv(client_fd, peek_buf, sizeof(peek_buf) - 1, MSG_PEEK);
@@ -320,23 +662,15 @@ void McpHubTransport::listener_loop() {
                 // Worker connection
                 handle_worker_connection(client_fd, client_id);
             } else {
-                // HTTP connection (MCP client)
-                handle_http_client(client_fd, client_id);
+                // HTTP/WS connection
+                handle_http_client(client_fd, client_id, peer_is_loopback);
+            }
+
+            {
+                std::lock_guard<std::mutex> lk2(clients_mutex_);
+                active_client_fds_.erase(client_fd);
             }
             ::close(client_fd);
-
-            // Self-cleanup: remove finished threads
-            std::lock_guard<std::mutex> lk2(clients_mutex_);
-            client_threads_.erase(
-                std::remove_if(client_threads_.begin(), client_threads_.end(),
-                    [](const std::thread& t) {
-                        // Can't check joinable without joining, but we can
-                        // use a trick: threads that are done will have
-                        // id == this thread. We'll just let them accumulate
-                        // and clean up in stop().
-                        return false;
-                    }),
-                client_threads_.end());
         });
     }
 }
@@ -414,15 +748,50 @@ McpHubTransport::HttpRequest McpHubTransport::parse_http_request(int fd) {
     }
 }
 
+bool McpHubTransport::send_all(int fd, std::string_view data) {
+    return send_all_fd(fd, data);
+}
+
+bool McpHubTransport::has_token_ci(std::string_view header_value, std::string_view token) {
+    auto ieq = [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) ==
+               std::tolower(static_cast<unsigned char>(b));
+    };
+
+    size_t pos = 0;
+    while (pos < header_value.size()) {
+        while (pos < header_value.size() && std::isspace(static_cast<unsigned char>(header_value[pos]))) {
+            ++pos;
+        }
+        size_t end = pos;
+        while (end < header_value.size() && header_value[end] != ',') {
+            ++end;
+        }
+        size_t tok_end = end;
+        while (tok_end > pos && std::isspace(static_cast<unsigned char>(header_value[tok_end - 1]))) {
+            --tok_end;
+        }
+        std::string_view part = header_value.substr(pos, tok_end - pos);
+        if (part.size() == token.size() &&
+            std::equal(part.begin(), part.end(), token.begin(), token.end(), ieq)) {
+            return true;
+        }
+        pos = (end < header_value.size()) ? end + 1 : end;
+    }
+    return false;
+}
+
 void McpHubTransport::send_http_response(int fd, int status,
                                          const std::string& content_type,
                                          const std::string& body,
                                          const std::string& extra_headers) {
-    const char* reason = (status == 200) ? "OK"
+    const char* reason = (status == 101) ? "Switching Protocols"
+                       : (status == 200) ? "OK"
                        : (status == 202) ? "Accepted"
                        : (status == 204) ? "No Content"
                        : (status == 400) ? "Bad Request"
                        : (status == 401) ? "Unauthorized"
+                       : (status == 403) ? "Forbidden"
                        : (status == 404) ? "Not Found"
                        : (status == 405) ? "Method Not Allowed"
                        : (status == 408) ? "Request Timeout"
@@ -443,10 +812,260 @@ void McpHubTransport::send_http_response(int fd, int status,
         status, reason, content_type, body.size(),
         extra_headers.empty() ? "" : extra_headers + "\r\n",
         body);
-    ::send(fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    send_all(fd, resp);
 }
 
-void McpHubTransport::handle_http_client(int fd, const std::string& addr) {
+json McpHubTransport::handle_ws_rpc(const std::string& bound_instance,
+                                   const std::shared_ptr<HubInstance>& bound_worker,
+                                   const json& msg) {
+    if (!msg.is_object()) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", nullptr},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: expected JSON object"}}}
+        };
+    }
+
+    if (msg.value("jsonrpc", std::string("")) != "2.0") {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg.value("id", json(nullptr))},
+            {"error", {{"code", -32600}, {"message", "Invalid Request: jsonrpc must be '2.0'"}}}
+        };
+    }
+
+    if (bound_worker && !bound_worker->has_socket()) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg.value("id", json(nullptr))},
+            {"error", {{"code", -32001}, {"message", "Bound worker disconnected"}}}
+        };
+    }
+
+    json routed = msg;
+    try {
+        ensure_instance_for_ws_call(routed, bound_instance);
+    } catch (const std::exception& e) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg.value("id", json(nullptr))},
+            {"error", {{"code", -32602}, {"message", std::string("Invalid params: ") + e.what()}}}
+        };
+    }
+
+    try {
+        return handler_(routed);
+    } catch (const std::exception& e) {
+        return {
+            {"jsonrpc", "2.0"},
+            {"id", msg.value("id", json(nullptr))},
+            {"error", {{"code", -32603}, {"message", std::string("Internal error: ") + e.what()}}}
+        };
+    }
+}
+
+void McpHubTransport::handle_websocket_client(int fd,
+                                              const std::string& addr,
+                                              bool peer_is_loopback,
+                                              const HttpRequest& req) {
+    std::shared_ptr<HubInstance> bound_worker;
+
+    auto path_result = mcpws::extract_ws_instance_from_path(req.path);
+    if (!path_result.ok) {
+        send_http_response(fd, 404, "application/json", R"({"error":"Unknown instance"})");
+        LOG_WARN_M(log::Module::Mcp, "hub-ws {} {} -> 404 ({})", addr, req.path, path_result.error);
+        return;
+    }
+
+    if (!peer_is_loopback) {
+        send_http_response(fd, 403, "application/json", R"({"error":"WebSocket loopback clients only"})");
+        LOG_WARN_M(log::Module::Mcp, "hub-ws {} {} -> 403 (non-loopback peer)", addr, req.path);
+        return;
+    }
+
+    const std::string& bound_instance = path_result.instance;
+    if (bound_instance != hub_instance_id_) {
+        std::lock_guard<std::mutex> lk(registry_mutex_);
+        auto it = instances_.find(bound_instance);
+        if (it == instances_.end()) {
+            send_http_response(fd, 404, "application/json", R"({"error":"Unknown instance"})");
+            LOG_WARN_M(log::Module::Mcp, "hub-ws {} {} -> 404 (instance='{}' not found)",
+                       addr, req.path, bound_instance);
+            return;
+        }
+        bound_worker = it->second;
+    }
+
+    if (req.method != "GET") {
+        send_http_response(fd, 405, "application/json",
+                           R"({"error":"WebSocket endpoint requires GET"})");
+        LOG_WARN_M(log::Module::Mcp, "hub-ws {} {} -> 405 (method={})", addr, req.path, req.method);
+        return;
+    }
+
+    auto up_it = req.headers.find("upgrade");
+    auto conn_it = req.headers.find("connection");
+    auto ver_it = req.headers.find("sec-websocket-version");
+    auto key_it = req.headers.find("sec-websocket-key");
+
+    if (up_it == req.headers.end() ||
+        !has_token_ci(up_it->second, "websocket") ||
+        conn_it == req.headers.end() ||
+        !has_token_ci(conn_it->second, "upgrade") ||
+        ver_it == req.headers.end() || ver_it->second != "13" ||
+        key_it == req.headers.end() ||
+        !mcpws::is_valid_websocket_key(key_it->second)) {
+        send_http_response(fd, 400, "application/json",
+                           R"({"error":"Invalid WebSocket handshake"})");
+        LOG_WARN_M(log::Module::Mcp, "hub-ws {} {} -> 400 (invalid handshake)", addr, req.path);
+        return;
+    }
+
+    std::string accept = mcpws::websocket_accept_key(key_it->second);
+    std::string response =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: " + accept + "\r\n"
+        "\r\n";
+    if (!send_all(fd, response)) {
+        return;
+    }
+
+    struct WsSessionGuard {
+        BoundWsSessionRegistry* registry = nullptr;
+        BoundWsSessionRegistry::SessionToken token{};
+        bool active = false;
+
+        ~WsSessionGuard() {
+            if (active && registry != nullptr) {
+                registry->unregister_session(token);
+            }
+        }
+    } ws_guard{&bound_ws_sessions_, {}, true};
+    ws_guard.token = bound_ws_sessions_.register_session(fd, bound_worker);
+
+    LOG_INFO_M(log::Module::Mcp, "hub-ws {} connected to instance '{}'", addr, bound_instance);
+
+    json connected = {
+        {"jsonrpc", "2.0"},
+        {"method", "tenet/connected"},
+        {"params", {{"instance", bound_instance}}}
+    };
+    if (!send_all(fd, mcpws::encode_server_text_frame(connected.dump()))) {
+        return;
+    }
+
+    std::string recv_buf = req.body;
+    recv_buf.reserve(std::max<size_t>(recv_buf.size(), 4096));
+    char tmp[4096];
+
+    while (running_.load()) {
+        while (!recv_buf.empty()) {
+            auto dec = mcpws::decode_client_frame(recv_buf, kWsTextPayloadLimit);
+            if (dec.status == mcpws::WsDecodeStatus::NeedMoreData) {
+                break;
+            }
+
+            if (dec.status != mcpws::WsDecodeStatus::Ok) {
+                uint16_t code = 1002;
+                if (dec.status == mcpws::WsDecodeStatus::PayloadTooLarge) {
+                    code = 1009;
+                } else if (dec.status == mcpws::WsDecodeStatus::UnsupportedFrame) {
+                    code = 1003;
+                }
+                std::string reason = dec.error;
+                if (reason.size() > 123) {
+                    reason.resize(123);
+                }
+                auto close_frame = mcpws::encode_server_close_frame(code, reason);
+                send_all(fd, close_frame);
+                return;
+            }
+
+            recv_buf.erase(0, dec.consumed);
+            const auto& frame = dec.frame;
+
+            if (frame.opcode == mcpws::WsOpcode::Ping) {
+                auto pong = mcpws::encode_server_control_frame(mcpws::WsOpcode::Pong, frame.payload);
+                if (!send_all(fd, pong)) return;
+                continue;
+            }
+            if (frame.opcode == mcpws::WsOpcode::Pong) {
+                continue;
+            }
+            if (frame.opcode == mcpws::WsOpcode::Close) {
+                std::string payload = frame.payload.empty()
+                    ? std::string{}
+                    : frame.payload.substr(0, std::min<size_t>(frame.payload.size(), 123));
+                auto close = mcpws::encode_server_control_frame(mcpws::WsOpcode::Close, payload);
+                send_all(fd, close);
+                return;
+            }
+
+            if (frame.opcode != mcpws::WsOpcode::Text) {
+                auto close = mcpws::encode_server_close_frame(1003, "unsupported frame");
+                send_all(fd, close);
+                return;
+            }
+
+            json req_msg;
+            try {
+                req_msg = json::parse(frame.payload);
+            } catch (const json::parse_error& e) {
+                // Parse error must not close WS; return JSON-RPC error response.
+                if (send_all(fd, mcpws::encode_server_text_frame(
+                        json_rpc_error(-32700, std::string("Parse error: ") + e.what())))) {
+                    continue;
+                }
+                return;
+            }
+
+            if (!req_msg.is_object()) {
+                if (!send_all(fd, mcpws::encode_server_text_frame(
+                        json_rpc_error(-32600, "Invalid Request: expected JSON object")))) {
+                    return;
+                }
+                continue;
+            }
+
+            // Notification: no id field -> no response frame.
+            if (!req_msg.contains("id")) {
+                if (req_msg.value("jsonrpc", std::string("")) != "2.0") {
+                    if (!send_all(fd, mcpws::encode_server_text_frame(
+                            json_rpc_error(-32600, "Invalid Request: jsonrpc must be '2.0'")))) {
+                        return;
+                    }
+                    continue;
+                }
+                (void)handle_ws_rpc(bound_instance, bound_worker, req_msg);
+                continue;
+            }
+
+            json rsp = handle_ws_rpc(bound_instance, bound_worker, req_msg);
+            if (rsp.is_null()) {
+                continue;
+            }
+
+            if (!send_all(fd, mcpws::encode_server_text_frame(rsp.dump()))) {
+                return;
+            }
+        }
+
+        ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
+        if (n == 0) break;
+        recv_buf.append(tmp, static_cast<size_t>(n));
+    }
+
+    LOG_INFO_M(log::Module::Mcp, "hub-ws {} disconnected from instance '{}'", addr, bound_instance);
+}
+
+void McpHubTransport::handle_http_client(int fd, const std::string& addr, bool peer_is_loopback) {
     auto req = parse_http_request(fd);
     if (!req.valid) return;
 
@@ -474,6 +1093,11 @@ void McpHubTransport::handle_http_client(int fd, const std::string& addr) {
     if (req.path == "/health") {
         send_http_response(fd, 200, "application/json", R"({"status":"ok"})");
         log_response(200);
+        return;
+    }
+
+    if (req.path.rfind("/ws/", 0) == 0) {
+        handle_websocket_client(fd, addr, peer_is_loopback, req);
         return;
     }
 
@@ -603,26 +1227,31 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
         return;
     }
 
+    std::shared_ptr<HubInstance> inst;
+    std::shared_ptr<HubInstance> replaced_inst;
+
     // Register the worker
     {
         std::lock_guard<std::mutex> lk(registry_mutex_);
-        // Remove existing instance with same ID (reconnection)
-        if (instances_.count(worker_id)) {
-            int old_fd = instances_[worker_id]->sock_fd;
-            if (old_fd >= 0 && old_fd != fd) {
-                ::close(old_fd);
+        auto existing = instances_.find(worker_id);
+        if (existing != instances_.end()) {
+            replaced_inst = existing->second;
+            if (replaced_inst) {
+                replaced_inst->close_socket();
             }
         }
-        auto inst = std::make_unique<HubInstance>();
-        inst->id            = worker_id;
-        inst->pid           = reg_msg.value("pid", 0);
-        inst->trace_file    = reg_msg.value("trace_file", "");
-        inst->module_name   = reg_msg.value("module_name", "");
-        inst->is_hub        = false;
-        inst->sock_fd       = fd;
-        inst->last_heartbeat = std::chrono::steady_clock::now();
-        instances_[worker_id] = std::move(inst);
+        inst = std::make_shared<HubInstance>();
+        inst->id             = worker_id;
+        inst->pid            = reg_msg.value("pid", 0);
+        inst->trace_file     = reg_msg.value("trace_file", "");
+        inst->module_name    = reg_msg.value("module_name", "");
+        inst->is_hub         = false;
+        inst->attach_socket(fd);
+        inst->last_heartbeat_ticks.store(heartbeat_now_ticks(), std::memory_order_relaxed);
+        instances_[worker_id] = inst;
     }
+    shutdown_ws_sessions_for_instance(replaced_inst);
+    fail_all_pending(replaced_inst, "Worker replaced by reconnect");
 
     LOG_INFO_M(log::Module::Mcp, "hub: worker '{}' registered (pid={}, trace={}, addr={})",
                worker_id, reg_msg.value("pid", 0), reg_msg.value("trace_file", ""), addr);
@@ -633,8 +1262,21 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
         {"hub_id", hub_instance_id_},
         {"session_mode", session_mode_}
     };
-    std::string confirm_str = confirm.dump() + "\n";
-    ::send(fd, confirm_str.data(), confirm_str.size(), MSG_NOSIGNAL);
+    if (!inst->send(confirm)) {
+        std::shared_ptr<HubInstance> failed_inst;
+        {
+            std::lock_guard<std::mutex> lk(registry_mutex_);
+            auto it = instances_.find(worker_id);
+            if (it != instances_.end() && it->second == inst) {
+                failed_inst = it->second;
+                failed_inst->close_socket_if(fd);
+                instances_.erase(it);
+            }
+        }
+        shutdown_ws_sessions_for_instance(failed_inst);
+        fail_all_pending(failed_inst, "Worker registration confirmation failed");
+        return;
+    }
 
     // Enter read loop (heartbeat + rpc_response from this worker)
     std::string recv_buf;
@@ -645,13 +1287,18 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
         if (ret <= 0) {
             if (ret == 0) {
                 // Timeout — check if worker is still alive
-                std::lock_guard<std::mutex> lk(registry_mutex_);
-                auto it = instances_.find(worker_id);
-                if (it == instances_.end()) break;  // Removed
-                auto age = std::chrono::steady_clock::now() - it->second->last_heartbeat;
+                std::shared_ptr<HubInstance> live_inst;
+                {
+                    std::lock_guard<std::mutex> lk(registry_mutex_);
+                    auto it = instances_.find(worker_id);
+                    if (it == instances_.end()) break;  // Removed
+                    live_inst = it->second;
+                }
+                auto age = heartbeat_age(*live_inst);
                 if (age > std::chrono::seconds(60)) {
                     LOG_WARN_M(log::Module::Mcp, "hub: worker '{}' heartbeat timeout (60s), disconnecting",
                                worker_id);
+                    live_inst->shutdown_socket_if(fd);
                     break;
                 }
                 continue;
@@ -682,26 +1329,38 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
             std::string msg_type = msg.value("type", "");
 
             if (msg_type == "heartbeat") {
-                std::lock_guard<std::mutex> lk(registry_mutex_);
-                auto it = instances_.find(worker_id);
-                if (it != instances_.end()) {
-                    it->second->last_heartbeat = std::chrono::steady_clock::now();
+                std::shared_ptr<HubInstance> live_inst;
+                {
+                    std::lock_guard<std::mutex> lk(registry_mutex_);
+                    auto it = instances_.find(worker_id);
+                    if (it != instances_.end()) {
+                        live_inst = it->second;
+                    }
+                }
+                if (live_inst) {
+                    live_inst->last_heartbeat_ticks.store(heartbeat_now_ticks(), std::memory_order_relaxed);
                 }
             } else if (msg_type == "rpc_response") {
                 std::string req_id = msg.value("id", "");
                 json response = msg.value("msg", json());
                 bool is_error = msg.value("error", false);
 
-                std::lock_guard<std::mutex> lk(registry_mutex_);
-                auto it = instances_.find(worker_id);
-                if (it != instances_.end()) {
-                    auto& pending = it->second->pending;
-                    auto pit = pending.find(req_id);
-                    if (pit != pending.end()) {
+                std::shared_ptr<HubInstance> response_inst;
+                {
+                    std::lock_guard<std::mutex> lk(registry_mutex_);
+                    auto it = instances_.find(worker_id);
+                    if (it != instances_.end()) {
+                        response_inst = it->second;
+                    }
+                }
+                if (response_inst) {
+                    std::lock_guard<std::mutex> pending_lk(response_inst->pending_mutex);
+                    auto pit = response_inst->pending.find(req_id);
+                    if (pit != response_inst->pending.end()) {
                         pit->second.response  = std::move(response);
                         pit->second.error     = is_error;
                         pit->second.completed = true;
-                        it->second->pending_cv.notify_all();
+                        response_inst->pending_cv.notify_all();
                     }
                 }
             } else if (msg_type == "unregister") {
@@ -712,21 +1371,18 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
     }
 
     // Clean up: remove worker from registry
+    std::shared_ptr<HubInstance> disconnected_inst;
     {
         std::lock_guard<std::mutex> lk(registry_mutex_);
         auto it = instances_.find(worker_id);
-        if (it != instances_.end() && it->second->sock_fd == fd) {
-            it->second->sock_fd = -1;
-            // Wake up any pending requests with error
-            for (auto& [rid, pr] : it->second->pending) {
-                pr.completed = true;
-                pr.error = true;
-                pr.response = {{"error", "Worker disconnected"}};
-            }
-            it->second->pending_cv.notify_all();
+        if (it != instances_.end() && it->second->matches_socket(fd)) {
+            disconnected_inst = it->second;
+            disconnected_inst->close_socket_if(fd);
             instances_.erase(it);
         }
     }
+    shutdown_ws_sessions_for_instance(disconnected_inst);
+    fail_all_pending(disconnected_inst, "Worker disconnected");
 
     LOG_INFO_M(log::Module::Mcp, "hub: worker '{}' disconnected", worker_id);
 }
@@ -771,75 +1427,95 @@ json McpHubTransport::forward_request(const std::string& instance_id,
                                        int timeout_ms) {
     std::string req_id = fmt::format("req-{}", next_request_id_.fetch_add(1));
 
-    // Get the worker instance
-    HubInstance* inst = nullptr;
+    std::shared_ptr<HubInstance> inst;
     {
         std::lock_guard<std::mutex> lk(registry_mutex_);
         auto it = instances_.find(instance_id);
-        if (it == instances_.end() || it->second->sock_fd < 0) {
+        if (it == instances_.end() || !it->second || !it->second->has_socket()) {
             throw std::runtime_error("Instance not connected: " + instance_id);
         }
-        inst = it->second.get();
+        inst = it->second;
+    }
 
-        // Register pending request
+    {
+        std::lock_guard<std::mutex> pending_lk(inst->pending_mutex);
         inst->pending[req_id] = {};
     }
 
-    // Send request to worker
     json fwd = {
         {"type", "rpc"},
         {"id", req_id},
         {"msg", rpc_request}
     };
-    inst->send(fwd);
-
-    // Wait for response
-    {
-        std::unique_lock<std::mutex> lk(inst->pending_mutex);
-        auto it = inst->pending.find(req_id);
-        if (it == inst->pending.end()) {
-            throw std::runtime_error("Pending request vanished");
-        }
-
-        bool ok = inst->pending_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-            [&] { return it->second.completed; });
-
-        if (!ok) {
-            // Timeout
-            std::lock_guard<std::mutex> rlk(registry_mutex_);
-            auto rit = instances_.find(instance_id);
-            if (rit != instances_.end()) {
-                rit->second->pending.erase(req_id);
-            }
-            throw std::runtime_error("Request timeout (" + std::to_string(timeout_ms) + "ms)");
-        }
-
-        json response = std::move(it->second.response);
-        bool is_error = it->second.error;
-
-        // Clean up
+    if (!inst->send(fwd)) {
+        std::shared_ptr<HubInstance> failed_inst;
         {
-            std::lock_guard<std::mutex> rlk(registry_mutex_);
-            auto rit = instances_.find(instance_id);
-            if (rit != instances_.end()) {
-                rit->second->pending.erase(req_id);
+            std::lock_guard<std::mutex> lk(registry_mutex_);
+            auto current = instances_.find(instance_id);
+            if (current != instances_.end() && current->second == inst) {
+                failed_inst = current->second;
+                failed_inst->close_socket();
+                instances_.erase(current);
             }
         }
-
-        if (is_error) {
-            throw std::runtime_error(response.value("error", "Unknown worker error"));
-        }
-
-        return response;
+        shutdown_ws_sessions_for_instance(failed_inst);
+        fail_all_pending(failed_inst, "Failed to send request to worker");
+        throw std::runtime_error("Failed to send request to worker");
     }
+
+    std::unique_lock<std::mutex> lk(inst->pending_mutex);
+    auto it = inst->pending.find(req_id);
+    if (it == inst->pending.end()) {
+        throw std::runtime_error("Pending request vanished");
+    }
+
+    bool ok = inst->pending_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+        [&] { return it->second.completed; });
+
+    if (!ok) {
+        inst->pending.erase(it);
+        throw std::runtime_error("Request timeout (" + std::to_string(timeout_ms) + "ms)");
+    }
+
+    json response = std::move(it->second.response);
+    bool is_error = it->second.error;
+    inst->pending.erase(it);
+    lk.unlock();
+
+    if (is_error) {
+        throw std::runtime_error(response.value("error", "Unknown worker error"));
+    }
+
+    return response;
 }
 
 void McpHubTransport::notify_shutdown() {
     json msg = {{"type", "hub_shutdown"}};
-    std::lock_guard<std::mutex> lk(registry_mutex_);
-    for (auto& [id, inst] : instances_) {
-        if (inst && inst->sock_fd >= 0) {
-            inst->send(msg);
+    std::vector<std::shared_ptr<HubInstance>> instances;
+    {
+        std::lock_guard<std::mutex> lk(registry_mutex_);
+        for (auto& [id, inst] : instances_) {
+            (void)id;
+            if (inst && inst->has_socket()) {
+                instances.push_back(inst);
+            }
+        }
+    }
+
+    for (const auto& inst : instances) {
+        if (!inst->send(msg)) {
+            std::shared_ptr<HubInstance> failed_inst;
+            {
+                std::lock_guard<std::mutex> lk(registry_mutex_);
+                auto current = instances_.find(inst->id);
+                if (current != instances_.end() && current->second == inst) {
+                    failed_inst = current->second;
+                    failed_inst->close_socket();
+                    instances_.erase(current);
+                }
+            }
+            shutdown_ws_sessions_for_instance(inst);
+            fail_all_pending(failed_inst ? failed_inst : inst, "Hub shutdown notification failed");
         }
     }
 }
@@ -848,9 +1524,8 @@ void McpHubTransport::reap_stale_workers() {
     std::vector<std::string> stale;
     {
         std::lock_guard<std::mutex> lk(registry_mutex_);
-        auto now = std::chrono::steady_clock::now();
         for (const auto& [id, inst] : instances_) {
-            auto age = now - inst->last_heartbeat;
+            auto age = heartbeat_age(*inst);
             if (age > std::chrono::seconds(90)) {
                 stale.push_back(id);
             }
@@ -859,21 +1534,19 @@ void McpHubTransport::reap_stale_workers() {
 
     for (const auto& id : stale) {
         LOG_WARN_M(log::Module::Mcp, "hub: reaping stale worker '{}' (no heartbeat 90s)", id);
-        std::lock_guard<std::mutex> lk(registry_mutex_);
-        auto it = instances_.find(id);
-        if (it != instances_.end()) {
-            if (it->second->sock_fd >= 0) {
-                ::close(it->second->sock_fd);
-                it->second->sock_fd = -1;
+        std::shared_ptr<HubInstance> stale_inst;
+        {
+            std::lock_guard<std::mutex> lk(registry_mutex_);
+            auto it = instances_.find(id);
+            if (it == instances_.end()) {
+                continue;
             }
-            for (auto& [rid, pr] : it->second->pending) {
-                pr.completed = true;
-                pr.error = true;
-                pr.response = {{"error", "Worker reaped (stale)"}};
-            }
-            it->second->pending_cv.notify_all();
+            stale_inst = it->second;
+            stale_inst->close_socket();
             instances_.erase(it);
         }
+        shutdown_ws_sessions_for_instance(stale_inst);
+        fail_all_pending(stale_inst, "Worker reaped (stale)");
     }
 }
 
@@ -894,65 +1567,73 @@ McpWorkerTransport::McpWorkerTransport(MessageHandler handler,
 
 McpWorkerTransport::~McpWorkerTransport() {
     stop();
-    close_connection();
 }
 
 bool McpWorkerTransport::connect_to_hub() {
-    sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd_ < 0) return false;
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(hub_port_);
     if (::inet_pton(AF_INET, hub_host_.c_str(), &addr.sin_addr) <= 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
+        ::close(fd);
         return false;
     }
 
     // 5s connect timeout
-    int flags = ::fcntl(sock_fd_, F_GETFL, 0);
-    ::fcntl(sock_fd_, F_SETFL, flags | O_NONBLOCK);
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    int ret = ::connect(sock_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    int ret = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     if (ret < 0 && errno != EINPROGRESS) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
+        ::close(fd);
         return false;
     }
 
     if (ret < 0) {
-        struct pollfd pfd{sock_fd_, POLLOUT, 0};
+        struct pollfd pfd{fd, POLLOUT, 0};
         ret = ::poll(&pfd, 1, 5000);
         if (ret <= 0) {
-            ::close(sock_fd_);
-            sock_fd_ = -1;
+            ::close(fd);
             return false;
         }
         int err = 0;
         socklen_t errlen = sizeof(err);
-        ::getsockopt(sock_fd_, SOL_SOCKET, SO_ERROR, &err, &errlen);
+        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
         if (err != 0) {
-            ::close(sock_fd_);
-            sock_fd_ = -1;
+            ::close(fd);
             return false;
         }
     }
 
     // Restore blocking mode
-    ::fcntl(sock_fd_, F_SETFL, flags);
+    ::fcntl(fd, F_SETFL, flags);
 
     // Keepalive
     int ka = 1;
-    ::setsockopt(sock_fd_, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 
+    install_socket(fd);
     return true;
 }
 
 void McpWorkerTransport::register_with_hub() {
-    // Send greeting
+    // Send greeting without taking the send lock recursively.
+    const int fd = current_socket_fd();
+    if (fd < 0) {
+        connected_.store(false);
+        return;
+    }
+
     std::string greeting = WORKER_PROTOCOL_GREETING;
-    ::send(sock_fd_, greeting.data(), greeting.size(), MSG_NOSIGNAL);
+    {
+        std::lock_guard<std::mutex> lk(socket_mutex_);
+        if (sock_fd_ != fd || sock_fd_ < 0 || !send_all_fd(sock_fd_, greeting)) {
+            connected_.store(false);
+            return;
+        }
+    }
 
     // Send registration
     json reg = {
@@ -962,12 +1643,16 @@ void McpWorkerTransport::register_with_hub() {
         {"trace_file", trace_file_},
         {"module_name", module_name_}
     };
-    send_json(reg);
+    if (!send_json(reg)) {
+        connected_.store(false);
+        return;
+    }
 
     // Wait for confirmation
     std::string line;
     if (!recv_line(line)) {
         LOG_WARN_M(log::Module::Mcp, "worker: no registration confirmation from hub");
+        connected_.store(false);
         return;
     }
 
@@ -977,10 +1662,13 @@ void McpWorkerTransport::register_with_hub() {
             session_mode_ = resp.value("session_mode", false);
             LOG_INFO_M(log::Module::Mcp, "worker: registered with hub '{}' (session_mode={})",
                        resp.value("hub_id", "?"), session_mode_);
+            return;
         }
+        LOG_WARN_M(log::Module::Mcp, "worker: unexpected registration response from hub");
     } catch (...) {
         LOG_WARN_M(log::Module::Mcp, "worker: invalid registration response from hub");
     }
+    connected_.store(false);
 }
 
 void McpWorkerTransport::run() {
@@ -1029,14 +1717,18 @@ void McpWorkerTransport::request_loop() {
     char buf[65536];
 
     while (running_.load() && connected_.load()) {
-        struct pollfd pfd{sock_fd_, POLLIN, 0};
+        const int fd = current_socket_fd();
+        if (fd < 0) {
+            break;
+        }
+        struct pollfd pfd{fd, POLLIN, 0};
         int ret = ::poll(&pfd, 1, 30000);
         if (ret <= 0) {
             if (ret == 0) continue;  // Timeout, loop again
             break;  // Error
         }
 
-        ssize_t n = ::recv(sock_fd_, buf, sizeof(buf), 0);
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;  // Connection closed
 
         recv_buf_.append(buf, n);
@@ -1083,7 +1775,10 @@ void McpWorkerTransport::request_loop() {
                     {"msg", rpc_response}
                 };
                 if (is_error) response_msg["error"] = true;
-                send_json(response_msg);
+                if (!send_json(response_msg)) {
+                    connected_.store(false);
+                    return;
+                }
 
             } else if (msg_type == "hub_shutdown") {
                 LOG_INFO_M(log::Module::Mcp, "worker: hub shutdown notification received");
@@ -1100,19 +1795,26 @@ void McpWorkerTransport::request_loop() {
 
 void McpWorkerTransport::send_heartbeat() {
     json hb = {{"type", "heartbeat"}, {"id", instance_id_}};
-    send_json(hb);
+    if (!send_json(hb)) {
+        connected_.store(false);
+    }
 }
 
 bool McpWorkerTransport::send_json(const json& msg) {
     std::string data = msg.dump() + "\n";
-    ssize_t n = ::send(sock_fd_, data.data(), data.size(), MSG_NOSIGNAL);
-    return n == (ssize_t)data.size();
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd_ < 0) {
+        return false;
+    }
+    return send_all_fd(sock_fd_, data);
 }
 
 bool McpWorkerTransport::recv_line(std::string& line) {
     while (recv_buf_.find('\n') == std::string::npos) {
+        const int fd = current_socket_fd();
+        if (fd < 0) return false;
         char buf[4096];
-        ssize_t n = ::recv(sock_fd_, buf, sizeof(buf), 0);
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return false;
         recv_buf_.append(buf, n);
         if (recv_buf_.size() > 65536) return false;
@@ -1123,10 +1825,29 @@ bool McpWorkerTransport::recv_line(std::string& line) {
     return true;
 }
 
-void McpWorkerTransport::close_connection() {
+int McpWorkerTransport::current_socket_fd() const {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    return sock_fd_;
+}
+
+void McpWorkerTransport::install_socket(int fd) {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    sock_fd_ = fd;
+}
+
+void McpWorkerTransport::shutdown_connection() {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
     if (sock_fd_ >= 0) {
-        ::close(sock_fd_);
+        ::shutdown(sock_fd_, SHUT_RDWR);
+    }
+}
+
+void McpWorkerTransport::close_connection() {
+    std::lock_guard<std::mutex> lk(socket_mutex_);
+    if (sock_fd_ >= 0) {
+        int fd = sock_fd_;
         sock_fd_ = -1;
+        ::close(fd);
     }
     recv_buf_.clear();
 }
@@ -1134,9 +1855,7 @@ void McpWorkerTransport::close_connection() {
 void McpWorkerTransport::stop() {
     running_.store(false);
     connected_.store(false);
-    if (sock_fd_ >= 0) {
-        ::shutdown(sock_fd_, SHUT_RDWR);
-    }
+    shutdown_connection();
 }
 
 }  // namespace tenet

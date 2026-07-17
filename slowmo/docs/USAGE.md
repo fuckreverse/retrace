@@ -610,12 +610,32 @@ tenet run1.bin --trace-diff-file run2.bin
 # AI 客户端通过 stdio 调用工具；实际工具数由构建和 Hub/session 模式决定，启动日志会打印
 ```
 
-**MCP HTTP（远程或 GUI 宿主）：**
+**MCP HTTP / Hub（远程、GUI 与 IDA 宿主）：**
 
 ```bash
+# 单实例 Streamable HTTP
 ./tenet --mcp-http 127.0.0.1:10444 trace.bin
 # POST /mcp   Content-Type: application/json
+
+# 多实例 Hub：首个进程监听 10444，后续进程作为 Worker 接入
+./tenet --mcp-hub trace.bin
+# MCP: POST http://127.0.0.1:10444/mcp
+# JSON WebSocket: ws://127.0.0.1:10444/ws/<instance-id>
 ```
+
+Hub WebSocket 使用 JSON-RPC/MCP 文本帧并按 URL 中的 `instance-id` 固定路由，供 IDAPython 等交互式客户端使用；仅接受本机回环连接。Web/Tauri 前端仍使用 `--ws-port` 提供的独立 FlatBuffers 二进制 WebSocket。
+
+**IDAPython 插件：**
+
+```bash
+# 将入口脚本放入 IDA 用户插件目录；确保同级可导入 tenet Python 包
+cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
+
+# 启动 tenet GUI 或 Hub 后，在 IDA 中执行：
+# Edit → Plugins → Tenet Trace Bridge → Connect
+```
+
+插件会通过 `10444` 自动发现并匹配 trace 实例、同步 IDA image base，并提供双向导航与寄存器查询。完整包部署时需同时让 `tools/tenet/python/tenet/ida/` 位于 IDA 的 Python 搜索路径。
 
 **JSON-RPC（本地脚本接入）：**
 

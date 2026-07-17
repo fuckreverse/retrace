@@ -12,6 +12,7 @@
 #include "core/instruction_decoder.h"
 #include "analysis/pass_manager.h"
 #include "analysis/pass_registry.h"
+#include "service/tenet_service.h"
 
 #include "analysis/passes/structure/xref_pass.h"
 #include "analysis/passes/structure/cfg_pass.h"
@@ -24,6 +25,7 @@
 
 #include <fmt/core.h>
 
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -298,12 +300,15 @@ void TenetMcpService::register_query_tools() {
          "Find all instruction IDs that executed at a given PC address. "
          "Uses the XRef pass index for O(1) lookup when available. "
          "Supports pagination via offset/limit when a PC is executed many times "
-         "(use has_more + next_offset to fetch subsequent pages).",
+         "(use has_more + next_offset to fetch subsequent pages). "
+         "When nearest_to_inst_id is provided, returns nearest_inst_id chosen by backend search "
+         "independent of pagination; ties prefer the earlier execution.",
          {{"type", "object"},
           {"properties", {
               {"pc",     {{"type", "string"}, {"description", "PC address (hex string)"}}},
               {"offset", {{"type", "integer"}, {"description", "Pagination offset (skip first N results)"}, {"default", 0}}},
-              {"limit",  {{"type", "integer"}, {"description", "Max results per page (max 1000)"}, {"default", 100}}}
+              {"limit",  {{"type", "integer"}, {"description", "Max results per page (max 1000)"}, {"default", 100}}},
+              {"nearest_to_inst_id", {{"type", "integer"}, {"description", "Optional instruction id used to choose nearest_inst_id via backend lookup"}}}
           }},
           {"required", json::array({"pc"})}}},
         [this](const json& args) -> json {
@@ -311,6 +316,8 @@ void TenetMcpService::register_query_tools() {
             uint64_t runtime_pc = unrebase(displayed_pc);
             size_t offset = args.value("offset", size_t(0));
             size_t limit = std::min(args.value("limit", size_t(100)), size_t(1000));
+            bool wants_nearest = args.contains("nearest_to_inst_id");
+            uint64_t nearest_to_inst_id = args.value("nearest_to_inst_id", uint64_t(0));
 
             if (pm_) {
                 tenet::register_pass_by_name(*pm_, "xref");
@@ -326,18 +333,97 @@ void TenetMcpService::register_query_tools() {
                         page_ids.push_back(ids[i]);
                     }
                     bool has_more = end_i < ids.size();
-                    return {{"pc", fmt::format("0x{:X}", displayed_pc)},
-                            {"exec_count", exec_count},
-                            {"offset", offset},
-                            {"returned", end_i - start_i},
-                            {"has_more", has_more},
-                            {"next_offset", has_more ? end_i : offset},
-                            {"inst_ids", std::move(page_ids)}};
+                    json result = {{"pc", fmt::format("0x{:X}", displayed_pc)},
+                                   {"exec_count", exec_count},
+                                   {"offset", offset},
+                                   {"returned", end_i - start_i},
+                                   {"has_more", has_more},
+                                   {"next_offset", has_more ? end_i : offset},
+                                   {"inst_ids", std::move(page_ids)}};
+                    if (wants_nearest) {
+                        uint64_t nearest = xref.nearest_inst_id_at(runtime_pc, nearest_to_inst_id);
+                        if (nearest != UINT64_MAX) {
+                            result["nearest_inst_id"] = nearest;
+                        }
+                    }
+                    return result;
                 }
             }
             return {{"pc", fmt::format("0x{:X}", displayed_pc)},
                     {"inst_ids", json::array()},
                     {"warning", "xref pass not available"}};
+        }
+    );
+
+    // -- get_cursor
+    register_tool(
+        {"get_cursor",
+         "Get current tenet navigation cursor. Returns current instruction id "
+         "and rebased PC using the active image-base policy.",
+         {{"type", "object"}, {"properties", json::object()}}},
+        [this](const json&) -> json {
+            if (!service_) {
+                throw std::runtime_error(
+                    "get_cursor unavailable: MCP service was not constructed from TenetService");
+            }
+
+            const uint64_t inst_id = service_->current_inst();
+            if (inst_id >= index_.inst_count()) {
+                throw std::runtime_error("Current cursor is out of trace range");
+            }
+
+            auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
+            auto rv = reader_.record_at(offset, seed_pc);
+            if (rv.kind != RecordKind::Inst) {
+                throw std::runtime_error("Current cursor does not point to an instruction record");
+            }
+
+            auto inst = rv.as_inst();
+            const uint64_t runtime_pc = inst.pc != 0 ? inst.pc : rv.resolved_pc;
+            return {
+                {"inst_id", inst_id},
+                {"pc", fmt::format("0x{:X}", rebase(runtime_pc))}
+            };
+        }
+    );
+
+    // -- navigate
+    register_tool(
+        {"navigate",
+         "Navigate tenet cursor to the requested instruction id. "
+         "The target is clamped through TenetService::navigate_to, then returns "
+         "the actual current instruction id and rebased PC.",
+         {{"type", "object"},
+          {"properties", {
+              {"inst_id", {{"type", "integer"}, {"description", "Target instruction id"}}}
+          }},
+          {"required", json::array({"inst_id"})}}},
+        [this](const json& args) -> json {
+            if (!service_) {
+                throw std::runtime_error(
+                    "navigate unavailable: MCP service was not constructed from TenetService");
+            }
+
+            uint64_t target = args.at("inst_id").get<uint64_t>();
+            service_->navigate_to(target);
+            const uint64_t inst_id = service_->current_inst();
+
+            if (inst_id >= index_.inst_count()) {
+                throw std::runtime_error("Navigation produced out-of-range cursor");
+            }
+
+            auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
+            auto rv = reader_.record_at(offset, seed_pc);
+            if (rv.kind != RecordKind::Inst) {
+                throw std::runtime_error("Navigation target does not point to an instruction record");
+            }
+
+            auto inst = rv.as_inst();
+            const uint64_t runtime_pc = inst.pc != 0 ? inst.pc : rv.resolved_pc;
+            return {
+                {"inst_id", inst_id},
+                {"pc", fmt::format("0x{:X}", rebase(runtime_pc))}
+            };
         }
     );
 }

@@ -113,8 +113,10 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 |------|------|------|
 | RPC | `--rpc` | Unix socket JSON-RPC，适合本地工具接入 |
 | MCP stdio | `--mcp` | AI 客户端拉起 tenet 子进程时使用 |
-| MCP HTTP | `--mcp-http` | 远程或无 stdio 场景，使用 Streamable HTTP |
-| WS | `--ws-port <port>` | 高性能 WebSocket 二进制协议（uWebSockets + FlatBuffers），面向 Web/Electron 前端 |
+| MCP HTTP | `--mcp-http` | 单实例 Streamable HTTP，默认监听 `127.0.0.1:10444` |
+| MCP Hub | `--mcp-hub` / GUI 自动启动 | `10444` 上统一承载 MCP HTTP、Worker TCP 与按实例路由的 JSON WebSocket；首实例为 Hub，其他实例为 Worker |
+| Hub WS | `ws://127.0.0.1:10444/ws/<instance-id>` | 仅回环访问的 JSON-RPC/MCP 长连接，面向 IDAPython 等交互式客户端；Worker 掉线时关闭其绑定会话 |
+| WS | `--ws-port <port>` | 独立高性能 WebSocket 二进制协议（uWebSockets + FlatBuffers），面向 Web/Tauri 前端 |
 | Streaming | `--streaming` | tail 正在增长的 trace，做实时增量索引 |
 
 ## 关键不变量
