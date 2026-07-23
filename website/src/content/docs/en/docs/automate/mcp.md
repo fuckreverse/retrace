@@ -119,6 +119,47 @@ Subsequent ordinary calls may omit `instance`. `list_instances` is available in 
 
 After opening a trace, the GUI automatically attempts to join MCP Hub. The first GUI session becomes the Hub and later sessions become Workers. The default remains `127.0.0.1:10444`, with sessionless routing. A client normally needs only one connection to `10444`, regardless of how many GUI windows are open.
 
+## Connect IDA Pro
+
+Tenet includes an IDAPython bridge that keeps static disassembly and the dynamic trace cursor connected through the Hub.
+
+### Install the plugin
+
+Copy the entry point and its Python package into IDA's user plugin directory:
+
+```bash
+cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
+cp -R tools/tenet/python/tenet ~/.idapro/plugins/
+```
+
+If your IDA user directory differs, use the directory reported by IDA for user plugins. Restart IDA, open the matching binary, then choose **Edit → Plugins → Tenet: Connect** after Tenet has opened the trace or started with `--mcp-hub`.
+
+The plugin exposes four actions:
+
+- **Tenet: Connect** — discover Hub instances, prefer a module-name match for the current IDB, and open the instance WebSocket;
+- **Tenet: Disconnect** — close the session and stop synchronization;
+- **Tenet: Toggle Sync** — enable or pause two-way cursor synchronization;
+- **Tenet: Show Current Registers** — reconstruct and display registers at the active Tenet instruction.
+
+### What is synchronized
+
+The bridge discovers instances over `http://127.0.0.1:10444/mcp`, then connects to:
+
+```text
+ws://127.0.0.1:10444/ws/<instance-id>
+```
+
+This endpoint carries JSON-RPC/MCP text messages and is bound to one trace instance. On connect, the plugin sets Tenet's image base to the current IDB image base.
+
+- Moving the Tenet cursor jumps IDA to the corresponding static address.
+- Moving in IDA calls `search_pc` and navigates Tenet to the execution nearest the current trace cursor. This avoids jumping to an unrelated loop iteration when one PC executed many times.
+- A Worker disconnect closes its bound WebSocket session. The plugin stops synchronization, reports the disconnect, and remains reconnectable.
+- Hub WebSocket access is loopback-only. It is separate from the FlatBuffers service started by `--ws-port`.
+
+:::tip[Multiple traces]
+Open multiple Tenet GUI windows as usual. The plugin compares the current IDB input filename with each instance's module name, then falls back to the trace filename and finally the first available instance.
+:::
+
 ## Start with three tools
 
 After connecting, establish context in this order:
@@ -142,7 +183,7 @@ Tool schemas are the authoritative parameter reference. Clients should use MCP `
 | `get_regs` | Reconstruct all 34 AArch64 GPRs by `inst_id` or PC |
 | `memread` | Time-travel memory read at an instruction |
 | `mem_write_history` | Query historical writes to an address range |
-| `search_pc` | O(1) lookup of execution instances for a PC |
+| `search_pc` | O(1) lookup of executions for a PC; `nearest_to_inst_id` selects the closest occurrence independently of pagination |
 | `reg_timeline` | Timeline of register value changes |
 | `call_context` | Dynamic call context at an instruction |
 

@@ -280,11 +280,12 @@ sequenceDiagram
 
 **故障行为**：Hub 通过 `flock(LOCK_EX | LOCK_NB)` 完成启动时选举，进程崩溃后内核会自动释放锁。Worker 会检测连接断开并持续重连，但当前运行主路径不会让存量 Worker 自动重新竞选并接管 Hub；需要新实例启动或外部拉起完成重新选主。因此这里只保证自动重连，不承诺无缝自动 failover。
 
-**协议复用**：Hub 监听单一端口，通过 `MSG_PEEK` 探测首字节区分连接类型——以 `WORKER/1.0\n` 开头的是 Worker 反向连接（newline-delimited JSON-RPC over TCP），否则视为 MCP 客户端的 HTTP 请求。
+**协议复用**：Hub 在单一端口上承载三类本地连接，通过握手内容区分：以 `WORKER/1.0\n` 开头的是 Worker 反向连接（newline-delimited JSON-RPC over TCP），普通 HTTP 请求进入 `/mcp`，WebSocket Upgrade 请求进入 `/ws/<instance-id>`。Hub WebSocket 使用 JSON 文本帧承载 JSON-RPC/MCP 调用，按 URL 中的实例 ID 固定路由，并仅接受回环地址；它与 `--ws-port` 提供的 FlatBuffers 二进制 WebSocket 是两个不同协议。
 
 ```mermaid
 flowchart TD
-    Client[MCP Client] -->|HTTP :10444| Hub[Hub Instance]
+    Client[MCP Client] -->|HTTP :10444/mcp| Hub[Hub Instance]
+    IDA[IDAPython Bridge] -->|JSON WS :10444/ws/instance| Hub
     Hub -->|local| HubMCP[TenetMcpService]
     Hub -->|TCP reverse| W1[Worker 1]
     Hub -->|TCP reverse| W2[Worker 2]
@@ -309,6 +310,19 @@ flowchart TD
 ```
 
 **GUI 集成**：GUI 的 MCP Server 设置页自动尝试 Hub 模式（端口 10444），失败则降级为 Worker，再降级为独立 HTTP。状态指示器显示 Hub（绿）、Worker（蓝）、Standalone（绿）、Stopped（灰）四种状态。
+
+### IDAPython Bridge
+
+`python/tenet_ida.py` 是 IDA 插件入口，具体实现位于 `python/tenet/ida/`。插件先通过 `http://127.0.0.1:10444/mcp` 调用 `list_instances`，优先按 IDA 输入模块 basename 匹配实例，再连接 `ws://127.0.0.1:10444/ws/<instance-id>`。连接成功后会将 MCP image base 设置为当前 IDB image base。
+
+插件在 `Edit → Plugins` 注册四个动作：Connect、Disconnect、Toggle Sync、Show Current Registers。开启同步后：
+
+- Tenet 光标变化会跳转 IDA；
+- IDA 地址变化会通过 `search_pc(nearest_to_inst_id=...)` 选择距当前 Trace 光标最近的执行实例，再导航 Tenet；
+- generation token 与显式连接状态会丢弃过期异步连接，断线后停止同步并允许重新连接；
+- 所有 IDA UI 操作回到 UI 线程执行，网络请求留在后台线程。
+
+Hub 会把 WebSocket 会话绑定到目标 Worker；Worker 下线时关闭对应会话，避免客户端继续使用失效实例。
 
 ### AI 专用能力
 

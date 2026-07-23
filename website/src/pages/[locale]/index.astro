@@ -206,7 +206,7 @@ const en = locale === 'en';
       <article class="use-case"><span>04</span><div><h3>{en ? 'Platform boundary correlation' : '平台边界关联'}</h3><p>{en ? 'Connect ObjC messages, JNI or C API intercepts, syscalls, and crypto operations back to low-level execution.' : '将 ObjC 消息、JNI/C API 拦截、系统调用和密码学操作关联回底层执行。'}</p></div></article>
       <article class="use-case"><span>05</span><div><h3>{en ? 'VM protection analysis' : 'VM 保护分析'}</h3><p>{en ? 'Use static hints plus dynamic CFG, loop, taint, and data-flow evidence to study dispatchers, handlers, and virtual state.' : '结合静态 hints 与动态 CFG、循环、污点和数据流证据，研究 dispatcher、handler 与虚拟状态。'}</p></div></article>
       <article class="use-case"><span>06</span><div><h3>{en ? 'Trace comparison' : 'Trace 对比'}</h3><p>{en ? 'Compare inputs, environments, or patched builds; locate the first control-flow, register, or memory divergence.' : '比较不同输入、环境或补丁版本，定位控制流、寄存器或内存的首次分歧。'}</p></div></article>
-      <article class="use-case wide"><span>07</span><div><h3>{en ? 'Analysis interfaces' : '分析接口'}</h3><p>{en ? 'GUI / TUI provide interactive navigation. CLI / RPC support batch processing and integration. MCP / WebSocket expose indexed trace data and pass results to automation tools, including LLM clients.' : 'GUI / TUI 提供交互式导航；CLI / RPC 用于批处理和系统集成；MCP / WebSocket 向自动化工具（包括 LLM 客户端）提供 Trace 索引数据和 Pass 结果。'}</p></div></article>
+      <article class="use-case wide"><span>07</span><div><h3>{en ? 'IDA, AI, and automation interfaces' : 'IDA、AI 与自动化接口'}</h3><p>{en ? 'The IDAPython bridge synchronizes static addresses with the dynamic trace cursor. CLI / RPC handle batch integration, while MCP Hub exposes multiple traces through one local endpoint on port 10444.' : 'IDAPython Bridge 在静态地址与动态 Trace 光标间双向同步；CLI / RPC 用于批处理集成，MCP Hub 则通过本机 10444 单一入口提供多份 Trace。'}</p></div></article>
     </div>
   </section>
 
@@ -218,7 +218,7 @@ const en = locale === 'en';
       : '按照快速开始录制 Trace、构建本地索引，并查看第一个指令区间。'}</p>
     <div class="actions">
       <a class="button primary" href={localizedPath(locale, '/docs/getting-started/')}>{c.home.start} →</a>
-      <a class="button" href={localizedPath(locale, '/docs/automate/mcp/')}>{en ? 'Explore MCP automation' : '了解 MCP 自动化'}</a>
+      <a class="button" href={localizedPath(locale, '/docs/automate/mcp/')}>{en ? 'Connect IDA and MCP' : '连接 IDA 与 MCP'}</a>
     </div>
   </section>
 </SiteLayout>

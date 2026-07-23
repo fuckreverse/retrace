@@ -30,7 +30,7 @@ Tenet 将聚焦的设备端捕获与可复现的离线分析连接起来。请�
 
 ## 自动化调查流程
 
-使用 [CLI](./automate/cli/) 批处理、[JSON-RPC](./automate/rpc/) 编程访问、[MCP](./automate/mcp/) 集成 LLM 或 [WebSocket](./automate/websocket/) 实时流式推送。
+使用 [CLI](./automate/cli/) 执行批处理、[JSON-RPC](./automate/rpc/) 编程访问、[MCP Hub 与 IDA Bridge](./automate/mcp/) 完成静态/动态导航和 LLM 集成，或通过独立的 [WebSocket 协议](./automate/websocket/) 提供本地 JSON-RPC 与高吞吐前端访问。
 
 ## 参考
 

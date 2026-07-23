@@ -30,7 +30,7 @@ Tenet connects focused on-device capture with reproducible offline analysis. Cho
 
 ## Automate an investigation
 
-Use the [CLI](./automate/cli/) for batch jobs, [JSON-RPC](./automate/rpc/) for programmatic access, [MCP](./automate/mcp/) for LLM integration, or [WebSocket](./automate/websocket/) for real-time streaming.
+Use the [CLI](./automate/cli/) for batch jobs, [JSON-RPC](./automate/rpc/) for programmatic access, [MCP Hub and the IDA bridge](./automate/mcp/) for static/dynamic navigation and LLM integration, or the separate [WebSocket protocols](./automate/websocket/) for local JSON-RPC and high-throughput frontend access.
 
 ## Reference
 

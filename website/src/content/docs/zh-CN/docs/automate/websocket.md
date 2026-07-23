@@ -4,48 +4,61 @@ sidebar:
   order: 5
 ---
 
-WebSocket 服务使用二进制 FlatBuffers 协议实时流式推送分析结果、Trace 事件和状态变化到远程客户端。
+Tenet 提供两套不同的 WebSocket 协议。请按客户端类型选择端点；两者的线上格式不兼容。
 
-## 启动服务
+| 端点 | 协议 | 适用客户端 |
+|---|---|---|
+| `ws://127.0.0.1:10444/ws/<instance-id>` | JSON-RPC/MCP 文本帧 | IDAPython 与本地交互式集成 |
+| `--ws-port` 提供的 `ws://host:<port>` | FlatBuffers 二进制帧 | Web/Tauri 前端与高吞吐可视化 |
+
+## Hub JSON WebSocket
+
+以 Hub 模式启动 Tenet；也可以直接在 GUI 中打开 Trace，GUI 会自动加入 Hub：
+
+```bash
+./tenet trace.bin --mcp-hub
+```
+
+先通过 `http://127.0.0.1:10444/mcp` 发现实例 ID，再连接：
+
+```text
+ws://127.0.0.1:10444/ws/<instance-id>
+```
+
+URL 将连接固定绑定到一份 Trace。文本帧承载与 `tools/call` 相同的 JSON-RPC/MCP 请求和响应。端点支持 ping/pong 与 close，校验 RFC 6455 帧和 UTF-8，拒绝二进制应用消息，并限制 payload 大小。
+
+Hub JSON 端点刻意限制为**仅回环访问**，用于 [IDA Pro Bridge](./mcp/#连接-ida-pro) 等本地工具，不应直接暴露到网络。目标 Worker 退出时，Hub 会关闭绑定到该实例的会话，避免客户端继续查询失效状态。
+
+## FlatBuffers WebSocket
+
+在显式端口启动独立二进制服务：
 
 ```bash
 ./tenet trace.bin --ws-port 9090
 ```
 
-## 协议
+### 协议
 
-- **传输层：** WebSocket，使用配置端口。
-- **Schema：** FlatBuffers（`.fbs` 定义在 Tenet 源码中）。二进制编码，无 JSON 解析开销。
-- **方向：** 服务端推送事件；客户端订阅主题。
+- **传输层：** 配置端口上的 WebSocket；
+- **Schema：** Tenet 源码中的 FlatBuffers `.fbs` 定义；
+- **编码：** 二进制帧，无 JSON 解析开销；
+- **用途：** 高吞吐前端查询、分析任务与可视化。
 
-## 事件主题
+该服务独立于 MCP Hub。不要让 IDAPython Bridge 或 JSON-RPC 客户端连接 `--ws-port`，也不要向 `10444` 发送 FlatBuffers 消息。
 
-| 主题 | 内容 |
-|---|---|
-| `timeline` | 指令光标移动、导航事件 |
-| `pass_state` | Pass 状态变更（启动、进度、完成、失败） |
-| `analysis_result` | 结构化 Pass 完成结果 |
-| `register_update` | 当前光标处寄存器值变化 |
-| `memory_update` | 内存区域变化 |
-| `breakpoint` | 断点/观察点命中事件 |
+## 流式索引
 
-## 使用模式
+WebSocket 传输也不同于 `--streaming`。Streaming 模式会 tail 正在增长的 Trace，并增量更新索引：
 
-- **实时仪表板：** 构建基于 Web 的 Trace 监控，随分析进展更新。
-- **远程协作：** 多个客户端连接同一 Tenet 实例，看到相同光标和结果。
-- **CI 集成：** CI 任务打开 Trace、运行 Pass、流式传输结果后退出。
-- **自定义可视化：** 使用流式事件在 Web UI 中渲染 CFG、污点图或内存热图。
+```bash
+./tenet trace.bin --streaming
+```
 
-## 连接生命周期
+适合在录制仍进行时提前构建索引；它本身不会创建任何 WebSocket 端点。
 
-1. 客户端连接 `ws://host:port`。
-2. 客户端订阅一个或多个主题。
-3. 服务端推送已订阅主题的事件。
-4. 客户端也可在同一连接上发送 JSON-RPC 请求进行交互查询。
-5. 断开后服务端继续会话；下一个客户端重连到同一状态。
+## 运行边界
 
-## 限制
-
-- WebSocket 流式推送需要活跃的 Tenet 进程，不是离线 API。
-- FlatBuffers schema 跨版本不保证稳定；升级 Tenet 时客户端可能需要更新。
-- 高频事件（如每条指令的光标移动）可能需要客户端节流或防抖。
+- 两套 WebSocket 都依赖活跃 Tenet 进程和已打开 Trace；
+- Hub JSON 会话绑定实例，Worker 消失时会关闭；
+- FlatBuffers schema 跨版本不保证稳定，自定义客户端应随 Tenet 更新；
+- 交互客户端应限制高数据量请求，并对光标更新做防抖。

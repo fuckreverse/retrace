@@ -223,6 +223,10 @@ profiling
 ./tenet trace.bin --mcp-http 127.0.0.1:10444
 ```
 
+### MCP Hub 与 IDA Bridge
+
+`--mcp-hub` 在默认 `127.0.0.1:10444` 上统一提供 `/mcp` Streamable HTTP、多实例 Worker 路由和 `/ws/<instance-id>` JSON WebSocket。IDAPython 插件通过 Hub 自动发现当前 IDB 对应模块，连接目标实例，并在 IDA 与 Tenet 之间双向同步导航；同一 PC 多次执行时，后端会选择距当前 Trace 光标最近的 `inst_id`。Hub JSON WebSocket 仅接受回环连接，与 `--ws-port` 的 FlatBuffers 二进制服务相互独立。
+
 ### MCP 工具分组
 
 工具由 `register_all_tools()` 按组注册，VM query 位于独立的 `mcp_tools_vm.cpp`，Hub/session 模式还会增加协调工具；准确数量以启动日志为准。能力分为：
@@ -270,7 +274,8 @@ profiling
 | 我想知道是不是某个算法 | `pattern`, `constants`, `loop_semantics`, `algorithm_summary` |
 | 我想知道代码是不是被 VM 保护了 | 先用 IDA/Ghidra 静态分析定位 dispatcher，再用 `vm_abstract`（hint 驱动，不做启发式扫描）验证并跑执行统计 |
 | 我想知道某段内存当时的值 | `memread`, `memory_snapshot`, `memory_strings` |
-| 我想让 AI 自动分析 | `--mcp` 或 `--mcp-http` |
+| 我想让 AI 自动分析 | 单实例用 `--mcp`，多 Trace 固定入口用 `--mcp-hub`（默认 `10444`） |
+| 我想在 IDA 与 Trace 间双向跳转 | 启动 GUI/`--mcp-hub`，加载 `python/tenet_ida.py`，通过 Hub JSON WebSocket 同步 |
 | 我想边录边看 | `--streaming` |
 | 我在分析 Android trace | `syscall_intercept`（BoringSSL）, `pattern`, `taint` — ObjC 相关 pass 自动跳过 |
 | 我想排除噪声代码区间 | qbditrace `--exclude-range`（录制时排除），tenet `--exclude-range`（分析时过滤） |

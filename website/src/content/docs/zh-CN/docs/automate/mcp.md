@@ -119,6 +119,47 @@ select_instance(instance="signing-trace")
 
 GUI 打开 Trace 后会自动尝试加入 MCP Hub：首个 GUI 会话成为 Hub，后续会话成为 Worker。默认地址同样是 `127.0.0.1:10444`，默认使用 sessionless 路由。通常只需让客户端连接一次 `10444`，无需为每个 GUI 窗口重复配置。
 
+## 连接 IDA Pro
+
+Tenet 内置 IDAPython Bridge，通过 Hub 将静态反汇编与动态 Trace 光标连接起来。
+
+### 安装插件
+
+将插件入口和 Python package 复制到 IDA 用户插件目录：
+
+```bash
+cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
+cp -R tools/tenet/python/tenet ~/.idapro/plugins/
+```
+
+如果 IDA 用户目录不同，请使用 IDA 显示的用户插件目录。重启 IDA 并打开匹配的二进制；Tenet 打开 Trace 或通过 `--mcp-hub` 启动后，选择 **Edit → Plugins → Tenet: Connect**。
+
+插件注册四个动作：
+
+- **Tenet: Connect** — 发现 Hub 实例，优先匹配当前 IDB 的模块名，并连接实例 WebSocket；
+- **Tenet: Disconnect** — 关闭会话并停止同步；
+- **Tenet: Toggle Sync** — 开启或暂停双向光标同步；
+- **Tenet: Show Current Registers** — 重建并显示当前 Tenet 指令处的寄存器。
+
+### 同步内容
+
+Bridge 先通过 `http://127.0.0.1:10444/mcp` 发现实例，再连接：
+
+```text
+ws://127.0.0.1:10444/ws/<instance-id>
+```
+
+该端点使用 JSON-RPC/MCP 文本消息，并固定绑定一份 Trace。连接后，插件会将 Tenet image base 设置为当前 IDB image base。
+
+- 移动 Tenet 光标会让 IDA 跳到对应静态地址；
+- 在 IDA 中移动时，插件调用 `search_pc`，选择距当前 Trace 光标最近的执行实例后导航 Tenet，避免同一 PC 在循环中执行多次时跳到无关迭代；
+- Worker 断开会关闭绑定的 WebSocket；插件停止同步、提示断线，并允许重新连接；
+- Hub WebSocket 仅允许本机回环访问，与 `--ws-port` 启动的 FlatBuffers 服务是两个独立协议。
+
+:::tip[多份 Trace]
+可以照常打开多个 Tenet GUI 窗口。插件先用当前 IDB 输入文件名匹配各实例的模块名，再回退到 Trace 文件名，最后才选择第一个可用实例。
+:::
+
 ## 从三个工具开始
 
 连接后建议按以下顺序建立上下文：
@@ -142,7 +183,7 @@ GUI 打开 Trace 后会自动尝试加入 MCP Hub：首个 GUI 会话成为 Hub�
 | `get_regs` | 按 `inst_id` 或 PC 重建 34 个 AArch64 GPR |
 | `memread` | 指定时刻的 time-travel 内存读取 |
 | `mem_write_history` | 查询地址范围的历史写入 |
-| `search_pc` | O(1) 查询某 PC 的执行实例 |
+| `search_pc` | O(1) 查询某 PC 的执行实例；`nearest_to_inst_id` 可独立于分页选择最近一次出现 |
 | `reg_timeline` | 寄存器值变化时间线 |
 | `call_context` | 指令处的动态调用上下文 |
 

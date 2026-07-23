@@ -12,8 +12,8 @@ sidebar:
 |---|---|---|
 | [CLI](./cli/) | 批处理、CI、文件导出 | 命令行标志与 stdout |
 | [JSON-RPC](./rpc/) | 脚本编程访问 | TCP 上的 JSON-RPC 2.0 |
-| [MCP](./mcp/) | LLM 与 IDE 集成 | Model Context Protocol |
-| [WebSocket](./websocket/) | 实时仪表板、流式推送 | WebSocket 上的 FlatBuffers |
+| [MCP 与 IDA](./mcp/) | LLM、IDE 与 IDAPython 集成 | MCP HTTP 与实例绑定 JSON WebSocket |
+| [WebSocket](./websocket/) | 本地 IDA Bridge 或高吞吐前端 | 独立端点上的 Hub JSON-RPC 或 FlatBuffers |
 
 ## 快速开始
 
@@ -24,10 +24,11 @@ sidebar:
 # 启动 JSON-RPC 服务
 ./tenet trace.bin --rpc-port 4321
 
-# 启动 MCP Hub（LLM 集成，默认 127.0.0.1:10444）
+# 启动 MCP Hub（LLM 与 IDA 集成，默认 127.0.0.1:10444）
 ./tenet trace.bin --mcp-hub
+# IDA 使用 ws://127.0.0.1:10444/ws/<instance-id>
 
-# 启动 WebSocket 流式推送
+# 启动独立 FlatBuffers WebSocket
 ./tenet trace.bin --ws-port 9090
 ```
 

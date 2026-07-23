@@ -12,8 +12,8 @@ Choose the narrowest interface that fits the integration. All interfaces use the
 |---|---|---|
 | [CLI](./cli/) | Batch jobs, CI, file exports | Command-line flags and stdout |
 | [JSON-RPC](./rpc/) | Programmatic access from scripts | JSON-RPC 2.0 over TCP |
-| [MCP](./mcp/) | LLM and IDE integration | Model Context Protocol |
-| [WebSocket](./websocket/) | Real-time dashboards, streaming | FlatBuffers over WebSocket |
+| [MCP and IDA](./mcp/) | LLM, IDE, and IDAPython integration | MCP HTTP plus instance-bound JSON WebSocket |
+| [WebSocket](./websocket/) | Local IDA bridge or high-throughput frontends | Hub JSON-RPC or FlatBuffers, on separate endpoints |
 
 ## Quick start
 
@@ -24,10 +24,11 @@ Choose the narrowest interface that fits the integration. All interfaces use the
 # Start JSON-RPC server
 ./tenet trace.bin --rpc-port 4321
 
-# Start MCP Hub for LLM integration (default: 127.0.0.1:10444)
+# Start MCP Hub for LLM and IDA integration (default: 127.0.0.1:10444)
 ./tenet trace.bin --mcp-hub
+# IDA uses ws://127.0.0.1:10444/ws/<instance-id>
 
-# Start WebSocket streaming
+# Start the independent FlatBuffers WebSocket
 ./tenet trace.bin --ws-port 9090
 ```
 

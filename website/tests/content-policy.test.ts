@@ -38,12 +38,13 @@ describe('Tenet homepage positioning', () => {
     }
   });
 
-  it('presents automation as an interface rather than the product narrative', () => {
-    expect(home).toContain('GUI / TUI');
+  it('presents integrations as interfaces rather than the product narrative', () => {
+    expect(home).toContain('IDA, AI, and automation interfaces');
+    expect(home).toContain('IDA、AI 与自动化接口');
+    expect(home).toContain('IDAPython bridge');
     expect(home).toContain('CLI / RPC');
-    expect(home).toContain('MCP / WebSocket');
-    expect(home).toContain('LLM clients');
-    expect(home).toContain('LLM 客户端');
+    expect(home).toContain('MCP Hub');
+    expect(home).toContain('10444');
   });
 
   it('does not use the previous slogan-heavy positioning', () => {

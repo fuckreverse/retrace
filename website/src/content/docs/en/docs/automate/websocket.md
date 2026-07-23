@@ -4,48 +4,61 @@ sidebar:
   order: 5
 ---
 
-The WebSocket server streams analysis results, trace events and state changes to remote clients in real time using a binary FlatBuffers protocol.
+Tenet provides two different WebSocket protocols. Choose the endpoint by client type; they are not wire-compatible.
 
-## Start the server
+| Endpoint | Protocol | Intended clients |
+|---|---|---|
+| `ws://127.0.0.1:10444/ws/<instance-id>` | JSON-RPC/MCP text frames | IDAPython and local interactive integrations |
+| `ws://host:<port>` from `--ws-port` | Binary FlatBuffers | Web/Tauri frontends and high-throughput visualization |
+
+## Hub JSON WebSocket
+
+Start Tenet in Hub mode, or open a trace in the GUI, which joins the Hub automatically:
+
+```bash
+./tenet trace.bin --mcp-hub
+```
+
+Discover instance IDs over `http://127.0.0.1:10444/mcp`, then connect to:
+
+```text
+ws://127.0.0.1:10444/ws/<instance-id>
+```
+
+The URL binds the connection to one trace. Text frames carry the same JSON-RPC/MCP requests and responses used by `tools/call`. The endpoint supports ping/pong and close handling, validates RFC 6455 framing and UTF-8, rejects binary application messages, and limits payload size.
+
+The Hub JSON endpoint is deliberately **loopback-only**. It is designed for local tools such as the [IDA Pro bridge](./mcp/#connect-ida-pro), not for direct exposure to a network. If the selected Worker exits, the Hub closes sessions bound to that instance so clients cannot continue querying stale state.
+
+## FlatBuffers WebSocket
+
+Start the independent binary service on an explicit port:
 
 ```bash
 ./tenet trace.bin --ws-port 9090
 ```
 
-## Protocol
+### Protocol
 
 - **Transport:** WebSocket on the configured port.
-- **Schema:** FlatBuffers (`.fbs` definitions in the Tenet source). Binary encoding, no JSON parsing overhead.
-- **Direction:** Server pushes events; clients subscribe to topics.
+- **Schema:** FlatBuffers (`.fbs` definitions in the Tenet source).
+- **Encoding:** binary frames with no JSON parsing overhead.
+- **Use case:** high-throughput frontend queries, analysis jobs, and visualization.
 
-## Event topics
+This service is separate from MCP Hub. Do not connect the IDAPython bridge or a JSON-RPC client to `--ws-port`, and do not send FlatBuffers messages to port `10444`.
 
-| Topic | Content |
-|---|---|
-| `timeline` | Instruction cursor movement, navigation events |
-| `pass_state` | Pass state changes (started, progress, completed, failed) |
-| `analysis_result` | Structured pass results as they complete |
-| `register_update` | Register value changes at the current cursor |
-| `memory_update` | Memory region changes |
-| `breakpoint` | Breakpoint/watchpoint hit events |
+## Streaming index
 
-## Usage patterns
+WebSocket transport is also distinct from `--streaming`. Streaming mode tails a growing trace and incrementally updates its index:
 
-- **Live dashboard:** Build a web-based trace monitor that updates as analysis proceeds.
-- **Remote collaboration:** Multiple clients connect to the same Tenet instance; all see the same cursor and results.
-- **CI integration:** A CI job opens a trace, runs passes, streams results and exits.
-- **Custom visualization:** Render CFG, taint graphs or memory heatmaps in a web UI using the streamed events.
+```bash
+./tenet trace.bin --streaming
+```
 
-## Connection lifecycle
+Use it to pre-build index data while capture is still active. It does not itself create either WebSocket endpoint.
 
-1. Client connects to `ws://host:port`.
-2. Client subscribes to one or more topics.
-3. Server pushes events for subscribed topics.
-4. Client can also send JSON-RPC requests on the same connection for interactive queries.
-5. On disconnect, the server continues the session; the next client reconnects to the same state.
+## Operational boundaries
 
-## Limitations
-
-- WebSocket streaming requires an active Tenet process; it is not an offline API.
-- FlatBuffers schema stability is not guaranteed across versions; clients may need updates when upgrading Tenet.
-- High-frequency events (e.g., timeline cursor at every instruction) may need client-side throttling or debouncing.
+- Both WebSocket services require an active Tenet process with an open trace.
+- Hub JSON sessions are instance-scoped and close when their Worker disappears.
+- FlatBuffers schema stability is not guaranteed across versions; update custom clients with Tenet.
+- Bound high-volume requests and debounce cursor updates in interactive clients.
