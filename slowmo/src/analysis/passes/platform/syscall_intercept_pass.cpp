@@ -417,13 +417,52 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .key_len_arg   = 3,
             .algorithm_arg = 1,
         },
+        // One-shot digests all use (data, len, out). CC_DIGEST (id 136) is
+        // shared by CC_SHA1/MD5/224/256, so retain the tracer-resolved name.
         {
-            .name          = "CCDigest",
+            .name          = "CC_SHA256",
             .category      = ApiCategory::CommonCrypto,
-            .arg_count     = 4,
+            .arg_count     = 3,
+            .data_ptr_arg  = 0,
+            .data_len_arg  = 1,
+        },
+        {
+            .name          = "CC_SHA224",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 3,
+            .data_ptr_arg  = 0,
+            .data_len_arg  = 1,
+        },
+        {
+            .name          = "CC_SHA384",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 3,
+            .data_ptr_arg  = 0,
+            .data_len_arg  = 1,
+        },
+        {
+            .name          = "CC_SHA512",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 3,
+            .data_ptr_arg  = 0,
+            .data_len_arg  = 1,
+        },
+        {
+            .name          = "CC_SHA256_Init",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 1,
+        },
+        {
+            .name          = "CC_SHA256_Update",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 3,
             .data_ptr_arg  = 1,
             .data_len_arg  = 2,
-            .algorithm_arg = 0,
+        },
+        {
+            .name          = "CC_SHA256_Final",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 2,
         },
         {
             .name          = "CCKeyDerivationPBKDF",
@@ -787,8 +826,12 @@ void SyscallInterceptCollector::on_objc(uint64_t /*inst_id*/, const ObjcView& ob
             }
         }
     }
-    if (!cls_name.empty() || !sel_name.empty()) {
+    if (!cls_name.empty() && !sel_name.empty()) {
         last_objc_context_ = '[' + cls_name + ' ' + sel_name + ']';
+    } else if (!cls_name.empty()) {
+        last_objc_context_ = '[' + cls_name + " ?]";
+    } else if (!sel_name.empty()) {
+        last_objc_context_ = "[? " + sel_name + ']';
     }
 }
 
@@ -1436,22 +1479,23 @@ void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView
         call.objc_context = last_objc_context_;
     }
 
-    // Build decoded summary — prefer captured strings.
-    if (!call.captured_strings.empty()) {
-        std::string summary = call.callee_name + ": ";
-        for (const auto& cs : call.captured_strings) {
-            summary += fmt::format("x{}=\"{}\"{}  ",
-                cs.arg_idx,
-                cs.value.substr(0, std::min<size_t>(cs.value.size(), 64)),
-                cs.truncated ? "…" : "");
-        }
-        call.decoded_summary = std::move(summary);
-    } else if (entry.sig) {
+    // Decode known signatures even when the CAPI record has inline captures:
+    // decode_known_api() uses those captures as the preferred byte source.
+    if (entry.sig) {
         decode_known_api(call, *entry.sig);
     } else {
         auto ait = api_by_name_.find(call.callee_name);
         if (ait != api_by_name_.end() && ait->second) {
             decode_known_api(call, *ait->second);
+        } else if (!call.captured_strings.empty()) {
+            std::string summary = call.callee_name + ": ";
+            for (const auto& cs : call.captured_strings) {
+                summary += fmt::format("x{}=\"{}\"{}  ",
+                    cs.arg_idx,
+                    cs.value.substr(0, std::min<size_t>(cs.value.size(), 64)),
+                    cs.truncated ? "…" : "");
+            }
+            call.decoded_summary = std::move(summary);
         } else {
             call.decoded_summary = call.callee_name +
                 fmt::format(": x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x}",
@@ -1529,6 +1573,19 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
     const auto* regs = call.raw_args.data();
     const uint32_t capture = config_.capture_bytes;
 
+    // Inline CAPI captures are produced at the call boundary, so they remain
+    // available even when the trace never touches the source memory page.
+    // Preserve their bytes verbatim (including BINARY/TRUNCATED captures) and
+    // prefer them over reconstructed memory for signature-designated buffers.
+    auto captured_arg = [&](uint8_t arg_idx) -> std::optional<std::vector<uint8_t>> {
+        for (const auto& captured : call.captured_strings) {
+            if (captured.arg_idx == arg_idx) {
+                return std::vector<uint8_t>(captured.value.begin(), captured.value.end());
+            }
+        }
+        return std::nullopt;
+    };
+
     // Helper lambda for reading a pointer arg and returning bytes.
     auto read_ptr_arg = [&](uint8_t ptr_idx, uint8_t len_idx,
                              uint64_t default_len) -> std::vector<uint8_t> {
@@ -1545,8 +1602,10 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
 
     // Extract key material.
     if (sig.key_ptr_arg < 8) {
-        auto kb = read_ptr_arg(sig.key_ptr_arg, sig.key_len_arg, 32);
-        if (!kb.empty()) {
+        if (auto captured = captured_arg(sig.key_ptr_arg)) {
+            call.key_length = (sig.key_len_arg < 8) ? regs[sig.key_len_arg] : captured->size();
+            call.key_bytes = std::move(*captured);
+        } else if (auto kb = read_ptr_arg(sig.key_ptr_arg, sig.key_len_arg, 32); !kb.empty()) {
             call.key_length = (sig.key_len_arg < 8) ? regs[sig.key_len_arg] : kb.size();
             call.key_bytes = std::move(kb);
         }
@@ -1554,27 +1613,36 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
 
     // Extract IV.
     if (sig.iv_ptr_arg < 8) {
-        auto iv = read_ptr_arg(sig.iv_ptr_arg, sig.iv_len_arg, 16);
-        if (!iv.empty()) call.iv_bytes = std::move(iv);
+        if (auto captured = captured_arg(sig.iv_ptr_arg)) {
+            call.iv_bytes = std::move(*captured);
+        } else if (auto iv = read_ptr_arg(sig.iv_ptr_arg, sig.iv_len_arg, 16); !iv.empty()) {
+            call.iv_bytes = std::move(iv);
+        }
     }
 
     // Extract input data (first `capture` bytes).
     if (sig.data_ptr_arg < 8) {
-        auto db = read_ptr_arg(sig.data_ptr_arg, sig.data_len_arg, 64);
-        if (!db.empty()) {
+        if (auto captured = captured_arg(sig.data_ptr_arg)) {
+            call.data_length = (sig.data_len_arg < 8) ? regs[sig.data_len_arg] : captured->size();
+            call.data_bytes = std::move(*captured);
+        } else if (auto db = read_ptr_arg(sig.data_ptr_arg, sig.data_len_arg, 64); !db.empty()) {
             call.data_length = (sig.data_len_arg < 8) ? regs[sig.data_len_arg] : db.size();
             call.data_bytes = std::move(db);
         }
     }
 
     // Build human-readable decoded_summary.
-    std::string summary = sig.name;
+    // CAPI IDs can be shared by a family (for example CC_DIGEST). The call
+    // name is resolved at the writer and must remain the user-facing name.
+    std::string summary = call.callee_name.empty() ? sig.name : call.callee_name;
     summary += ": ";
+    bool has_semantic_content = false;
 
     if (sig.operation_arg < 8) {
         uint32_t op = static_cast<uint32_t>(regs[sig.operation_arg]);
         summary += cc_operation_name(op);
         summary += " ";
+        has_semantic_content = true;
     }
     if (sig.algorithm_arg < 8) {
         uint32_t alg = static_cast<uint32_t>(regs[sig.algorithm_arg]);
@@ -1586,11 +1654,13 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
             summary += cc_algorithm_name(alg);
         }
         summary += " ";
+        has_semantic_content = true;
     }
     if (sig.mode_arg < 8) {
         uint32_t mode = static_cast<uint32_t>(regs[sig.mode_arg]);
         summary += cc_mode_name(mode);
         summary += " ";
+        has_semantic_content = true;
     }
     if (call.key_bytes.has_value()) {
         summary += fmt::format("key[{}]=", call.key_length);
@@ -1599,6 +1669,7 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
         }
         if (call.key_bytes->size() > 8) summary += "...";
         summary += " ";
+        has_semantic_content = true;
     }
     if (call.iv_bytes.has_value()) {
         summary += fmt::format("iv[{}]=", call.iv_bytes->size());
@@ -1607,6 +1678,7 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
         }
         if (call.iv_bytes->size() > 8) summary += "...";
         summary += " ";
+        has_semantic_content = true;
     }
     if (call.data_bytes.has_value()) {
         summary += fmt::format("data[{}]=", call.data_length);
@@ -1614,6 +1686,13 @@ void SyscallInterceptCollector::decode_known_api(InterceptedCall& call,
             summary += fmt::format("{:02x}", (*call.data_bytes)[i]);
         }
         if (call.data_bytes->size() > 8) summary += "...";
+        has_semantic_content = true;
+    }
+    if (!has_semantic_content) {
+        for (uint8_t i = 0; i < std::min<uint8_t>(call.arg_count, 8); ++i) {
+            summary += fmt::format("x{}=0x{:x}{}", i, regs[i],
+                                   i + 1 < std::min<uint8_t>(call.arg_count, 8) ? " " : "");
+        }
     }
 
     call.decoded_summary = std::move(summary);

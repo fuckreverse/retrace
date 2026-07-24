@@ -20,6 +20,7 @@
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/platform/objc_pass.h"
+#include "common/byte_codec.h"
 
 #include <algorithm>
 #include <cstring>
@@ -779,48 +780,107 @@ TEST_CASE("ObjcPass selector name cache resolves repeated selector pointers cons
     }
 }
 
-TEST_CASE("ObjcPass blob serialization round-trip preserves args/return/strings",
+TEST_CASE("ObjcPass v8 return strings fall back to latest observed memory only when incomplete",
+          "[unit][pass][objc][v8]") {
+    constexpr uint64_t kReturnString = 0x70000ULL;
+
+    SECTION("partial return-time string falls back to a complete latest-observed string") {
+        auto env = make_env([&](TraceWriter& tw) {
+            tw.write_header_v8();
+            MachineState ms; ms.sp() = 0x16F000000ULL;
+            tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 0x1, 0x5000,
+                            "Factory", "makeName");
+            tw.emit(ms, 0x1000, enc::str_imm(0, 31, 0),
+                    {{33, tw.rt(0x1004)}}, {{kMemWrite, 1, kReturnString, 't'}});
+            tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                           tw.rt(0x1000), 0, tw.rt(0x1004), kReturnString, 0, 0, 0, 0);
+            plant_string_in_memory(tw, ms, kReturnString, "tenet-e2e");
+        }, "objc_return_string_latest");
+
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<ObjcPass>());
+        const auto& msg = pm->require("objc").get<ObjcResult>().messages.at(0);
+        REQUIRE(msg.return_deref_str == std::optional<std::string>("tenet-e2e"));
+        REQUIRE(msg.return_string_time == ObjcReturnStringTime::LatestObserved);
+        const auto json_return = ObjcResult{{msg}}.to_json()["messages"][0]["return"];
+        REQUIRE(json_return["string_time"] == "latest");
+    }
+
+    SECTION("NUL-terminated return-time string is retained without approximation") {
+        auto env = make_env([&](TraceWriter& tw) {
+            tw.write_header_v8();
+            MachineState ms; ms.sp() = 0x16F000000ULL;
+            plant_string_in_memory(tw, ms, kReturnString, "complete");
+            tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 0x1, 0x5000,
+                            "Factory", "makeName");
+            tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                           tw.rt(0x1000), 0, tw.rt(0x1004), kReturnString, 0, 0, 0, 0);
+            plant_string_in_memory(tw, ms, kReturnString, "later-value");
+        }, "objc_return_string_complete");
+
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<ObjcPass>());
+        const auto& msg = pm->require("objc").get<ObjcResult>().messages.at(0);
+        REQUIRE(msg.return_deref_str == std::optional<std::string>("complete"));
+        REQUIRE(msg.return_string_time == ObjcReturnStringTime::AtReturn);
+    }
+
+    SECTION("unreadable return string at both time points is omitted") {
+        auto env = make_env([&](TraceWriter& tw) {
+            tw.write_header_v8();
+            MachineState ms; ms.sp() = 0x16F000000ULL;
+            tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 0x1, 0x5000,
+                            "Factory", "makeName");
+            tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                           tw.rt(0x1000), 0, tw.rt(0x1004), kReturnString, 0, 0, 0, 0);
+            tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        }, "objc_return_string_unreadable");
+
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<ObjcPass>());
+        const auto& result = pm->require("objc").get<ObjcResult>();
+        REQUIRE_FALSE(result.messages.at(0).return_deref_str.has_value());
+        REQUIRE_FALSE(result.to_json()["messages"][0]["return"].contains("string"));
+    }
+}
+
+TEST_CASE("ObjcPass blob v3 round-trip preserves return string time and v2 misses",
           "[unit][pass][objc]") {
-    // Exercises objc_serialize/objc_deserialize (the persisted-cache path)
-    // indirectly: running the pass twice on the same full-trace range should
-    // produce an identical result the second time (loaded from the RocksDB
-    // blob cache written after the first run).
-    uint64_t sel_addr = 0x50000ULL;
-    uint64_t str_addr = 0x70000ULL;
-
+    constexpr uint64_t kString = 0x70000ULL;
     auto env = make_env([&](TraceWriter& tw) {
-        tw.anchor_interval = 256;
-        tw.write_header();
+        tw.write_header_v8();
         MachineState ms; ms.sp() = 0x16F000000ULL;
-
-        plant_string_in_memory(tw, ms, sel_addr, "setName:");
-        plant_string_in_memory(tw, ms, str_addr, "Alice");
-
-        tw.emit(ms, 0x1000, enc::movz(2, (uint16_t)(str_addr & 0xFFFF)),
-                {{2, str_addr}, {33, tw.rt(0x1004)}}, {});
-        tw.emit_objc(tw.rt(0x1004), 0xABCULL, sel_addr, "Person");
-        tw.emit(ms, 0x1004, enc::movz(0, 1), {{0, 1ULL}, {33, tw.rt(0x1008)}}, {});
-        tw.emit_anchor(ms);
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 0xABC, 0x5000,
+                        "Person", "name");
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                       tw.rt(0x1000), 0, tw.rt(0x1004), kString, 0, 0, 0, 0);
+        plant_string_in_memory(tw, ms, kString, "Alice");
     }, "objc_cache_roundtrip");
+
+    // A v2 blob must miss, then be replaced by a freshly serialized v3 blob.
+    ByteWriter legacy_blob;
+    legacy_blob.u32(0x4F424A43u);  // "OBJC"
+    legacy_blob.u32(2u);
+    legacy_blob.u64(0u);
+    env->index->save_pass_blob("objc", legacy_blob.data().data(), legacy_blob.size());
 
     auto pm1 = make_pm(*env);
     pm1->register_pass(std::make_unique<ObjcPass>());
-    auto& or1 = pm1->require("objc").get<ObjcResult>();
+    const auto& or1 = pm1->require("objc").get<ObjcResult>();
     REQUIRE(or1.total_messages() == 1);
+    REQUIRE(or1.messages[0].return_deref_str == std::optional<std::string>("Alice"));
+    REQUIRE(or1.messages[0].return_string_time == ObjcReturnStringTime::LatestObserved);
 
-    // Second PassManager instance sharing the same TraceIndex (env->index)
-    // will hit the persisted blob cache written by the first run.
+    std::string v3_blob;
+    REQUIRE(env->index->load_pass_blob("objc", v3_blob));
+    ByteReader v3_reader(v3_blob);
+    REQUIRE(v3_reader.u32() == 0x4F424A43u);
+    REQUIRE(v3_reader.u32() == 3u);
+
     auto pm2 = make_pm(*env);
     pm2->register_pass(std::make_unique<ObjcPass>());
-    auto& or2 = pm2->require("objc").get<ObjcResult>();
-
-    SECTION("cached result matches the freshly-computed one") {
-        REQUIRE(or2.total_messages() == or1.total_messages());
-        REQUIRE(or2.messages[0].class_name == or1.messages[0].class_name);
-        REQUIRE(or2.messages[0].selector_name == or1.messages[0].selector_name);
-        REQUIRE(or2.messages[0].args[0].value == or1.messages[0].args[0].value);
-        REQUIRE(or2.messages[0].args[0].deref_str == or1.messages[0].args[0].deref_str);
-        REQUIRE(or2.messages[0].has_return == or1.messages[0].has_return);
-        REQUIRE(or2.messages[0].return_value == or1.messages[0].return_value);
-    }
+    const auto& or2 = pm2->require("objc").get<ObjcResult>();
+    REQUIRE(or2.total_messages() == or1.total_messages());
+    REQUIRE(or2.messages[0].return_deref_str == or1.messages[0].return_deref_str);
+    REQUIRE(or2.messages[0].return_string_time == or1.messages[0].return_string_time);
 }

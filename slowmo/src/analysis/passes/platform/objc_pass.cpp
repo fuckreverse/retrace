@@ -81,13 +81,21 @@ static inline bool is_likely_pointer(uint64_t addr) {
     return true;
 }
 
-/// Try to dereference a pointer value as a C string from memory.
+/// C-string dereference result. Only an unreadable byte is eligible for a
+/// latest-observed fallback; non-printable content and the length cap preserve
+/// the existing best-effort behavior without changing the time point.
+struct DerefStringResult {
+    std::optional<std::string> value;
+    bool nul_terminated = false;
+    bool unreadable = false;
+};
+
+/// Try to dereference a pointer value as a printable C string from memory.
 /// Uses read_region() for bulk reads instead of per-byte byte_at() calls.
-/// Returns nullopt if the address looks like a small integer or can't be read.
-static std::optional<std::string> try_deref_string(
+static DerefStringResult try_deref_string(
     MemoryModel& mem, uint64_t addr, uint64_t at_inst_id)
 {
-    if (!is_likely_pointer(addr)) return std::nullopt;
+    if (!is_likely_pointer(addr)) return {};
 
     static constexpr size_t MAX_LEN = 256;
     static constexpr size_t CHUNK = 64;
@@ -99,21 +107,24 @@ static std::optional<std::string> try_deref_string(
         auto region = mem.read_region(addr + offset, to_read, at_inst_id);
 
         for (size_t i = 0; i < to_read; ++i) {
-            if (!region.known[i]) goto done;
+            if (!region.known[i]) {
+                return {result.size() >= 2 ? std::optional<std::string>(std::move(result))
+                                           : std::nullopt, false, true};
+            }
             uint8_t c = region.data[i];
-            if (c == 0) goto done;  // NUL terminator
+            if (c == 0) {
+                return {result.size() >= 2 ? std::optional<std::string>(std::move(result))
+                                           : std::nullopt, true, false};
+            }
             if (c < 0x20 || c > 0x7E) {
-                // Non-printable — this probably isn't a string
-                if (offset + i == 0) return std::nullopt;
-                goto done;
+                return {result.size() >= 2 ? std::optional<std::string>(std::move(result))
+                                           : std::nullopt, false, false};
             }
             result.push_back(static_cast<char>(c));
         }
     }
-done:
-    // Require at least 2 chars to consider it a meaningful string
-    if (result.size() < 2) return std::nullopt;
-    return result;
+    return {result.size() >= 2 ? std::optional<std::string>(std::move(result))
+                               : std::nullopt, false, false};
 }
 
 /// Try to decode a 64-bit register value as a little-endian ASCII string.
@@ -167,6 +178,14 @@ static const char* return_kind_name(ObjcReturnKind kind) {
     return "none";
 }
 
+static const char* return_string_time_name(ObjcReturnStringTime time) {
+    switch (time) {
+    case ObjcReturnStringTime::AtReturn:       return "at_return";
+    case ObjcReturnStringTime::LatestObserved: return "latest";
+    }
+    return "at_return";
+}
+
 // ─── ObjcResult::to_json ─────────────────────────────────────────────────
 
 nlohmann::json ObjcResult::to_json() const {
@@ -216,6 +235,7 @@ nlohmann::json ObjcResult::to_json() const {
             ret["inst_id"] = msg.return_inst_id;
             if (msg.return_deref_str.has_value()) {
                 ret["string"] = *msg.return_deref_str;
+                ret["string_time"] = return_string_time_name(msg.return_string_time);
             }
             m["return"] = std::move(ret);
         }
@@ -262,7 +282,7 @@ nlohmann::json ObjcResult::to_json() const {
 namespace {
 
 static constexpr uint32_t OBJC_BLOB_MAGIC   = 0x4F424A43u;  // "OBJC"
-static constexpr uint32_t OBJC_BLOB_VERSION  = 2u;
+static constexpr uint32_t OBJC_BLOB_VERSION  = 3u;
 
 std::string objc_serialize(const ObjcResult& res) {
     ByteWriter w;
@@ -297,6 +317,7 @@ std::string objc_serialize(const ObjcResult& res) {
             w.u64(msg.return_value);
             w.u64(msg.return_inst_id);
             w.opt_str(msg.return_deref_str);
+            w.u8(static_cast<uint8_t>(msg.return_string_time));
         }
     }
 
@@ -340,6 +361,7 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
             msg.return_value = r.u64();
             msg.return_inst_id = r.u64();
             r.opt_str(msg.return_deref_str);
+            msg.return_string_time = static_cast<ObjcReturnStringTime>(r.u8());
         }
 
         // Rebuild class info
@@ -655,7 +677,16 @@ PassResult ObjcPass::run(PassContext& ctx) {
                         msg.return_kind = msg.is_stret
                             ? ObjcReturnKind::StretRaw
                             : ObjcReturnKind::X0;
-                        msg.return_deref_str = cached_deref(rv->x0, inst_id);
+                        const auto return_string = try_deref_string(memory, rv->x0, inst_id);
+                        msg.return_deref_str = return_string.value;
+                        if (return_string.unreadable) {
+                            const auto latest_string = try_deref_string(
+                                memory, rv->x0, index.inst_count());
+                            if (latest_string.value.has_value() && latest_string.nul_terminated) {
+                                msg.return_deref_str = std::move(latest_string.value);
+                                msg.return_string_time = ObjcReturnStringTime::LatestObserved;
+                            }
+                        }
                         if (!msg.return_deref_str.has_value()) {
                             msg.return_deref_str = try_decode_reg_ascii(rv->x0);
                         }

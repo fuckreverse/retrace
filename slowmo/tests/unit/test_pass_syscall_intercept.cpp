@@ -164,6 +164,18 @@ static std::unique_ptr<TraceEnv> make_with_svc_android() {
     }, "si_svc_android");
 }
 
+static void plant_bytes(TraceWriter& tw, MachineState& ms, uint64_t addr,
+                        const std::vector<uint8_t>& bytes) {
+    for (size_t off = 0; off < bytes.size(); off += sizeof(uint64_t)) {
+        uint64_t word = 0;
+        const size_t chunk = std::min(sizeof(word), bytes.size() - off);
+        std::memcpy(&word, bytes.data() + off, chunk);
+        const uint64_t pc = 0x1000 + off * 4;
+        tw.emit(ms, pc, enc::str_imm(0, 31, 0),
+                {{0, word}, {33, tw.rt(pc + 4)}}, {{2, static_cast<uint8_t>(chunk), addr + off, word}});
+    }
+}
+
 static void plant_mach_msg_header(TraceWriter& tw, MachineState& ms,
                                   uint64_t addr, uint32_t msgh_id) {
     // mach_msg_header_t is 24 bytes; only msgh_id @ +20 is relevant here.
@@ -984,7 +996,173 @@ TEST_CASE("SyscallInterceptPass: repeated CAPICALL target remains distinct",
     }
 }
 
-// ─── B7. v8 wide IDs, SVC metadata, and precise RETVAL association ──────────
+// ─── B7. CommonCrypto CAPI semantic decoding ────────────────────────────────
+
+TEST_CASE("SyscallInterceptPass: CommonCrypto CAPI digest and PBKDF signatures decode",
+          "[unit][pass][syscall_intercept][capicall][commoncrypto]") {
+    struct TestCase {
+        const char* label;
+        uint16_t api_id;
+        const char* want_name;
+        std::vector<uint64_t> args;
+        const char* want_summary;
+        bool expect_key;
+    };
+    const TestCase tests[] = {
+        {"shared digest id", 136, "CC_SHA256", {0x160100000ULL, 4, 0x160200000ULL},
+         "CC_SHA256: data[4]=01020304", false},
+        {"SHA-384", 471, "CC_SHA384", {0x160100000ULL, 4, 0x160200000ULL},
+         "CC_SHA384: data[4]=01020304", false},
+        {"SHA-256 update", 474, "CC_SHA256_Update", {0x160300000ULL, 0x160100000ULL, 4},
+         "CC_SHA256_Update: data[4]=01020304", false},
+        {"PBKDF", 137, "CCKeyDerivationPBKDF",
+         {2, 0x160400000ULL, 3, 0x160100000ULL, 4, 3, 1000, 0x160500000ULL},
+         "CCKeyDerivationPBKDF: 3DES key[3]=706173 data[4]=01020304", true},
+    };
+
+    for (const auto& tc : tests) {
+        DYNAMIC_SECTION(tc.label) {
+            auto env = make_env([&](TraceWriter& tw) {
+                tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+                MachineState ms; ms.sp() = 0x16F000000ULL;
+                plant_bytes(tw, ms, 0x160100000ULL, {1, 2, 3, 4});
+                plant_bytes(tw, ms, 0x160400000ULL, {'p', 'a', 's'});
+                tw.emit_capicall_v8(tc.api_id, tw.rt(0x1100), 0xDEAD000ULL, tc.args);
+                tw.emit(ms, 0x1100, enc::nop(), {{33, tw.rt(0x1104)}}, {});
+                tw.emit_anchor(ms);
+            }, tc.label);
+            auto pm = make_pm(*env);
+            pm->register_pass(std::make_unique<SyscallInterceptPass>());
+            const auto& call = pm->require("syscall_intercept").get<SyscallInterceptResult>().calls.at(0);
+
+            CHECK(call.callee_name == tc.want_name);
+            CHECK(call.category == ApiCategory::CommonCrypto);
+            CHECK(call.decoded_summary.find(tc.want_summary) != std::string::npos);
+            REQUIRE(call.data_bytes.has_value());
+            CHECK(*call.data_bytes == std::vector<uint8_t>{1, 2, 3, 4});
+            CHECK(call.data_length == 4);
+            if (tc.expect_key) {
+                REQUIRE(call.key_bytes.has_value());
+                CHECK(*call.key_bytes == std::vector<uint8_t>{'p', 'a', 's'});
+                CHECK(call.key_length == 3);
+            }
+
+            const auto json = nlohmann::json::parse(
+                pm->require("syscall_intercept").get<SyscallInterceptResult>().to_json());
+            CHECK(json["calls"][0]["data_hex_first64"] == "01020304");
+        }
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: known CAPI signatures fall back and prefer inline buffer captures",
+          "[unit][pass][syscall_intercept][capicall][commoncrypto]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        constexpr uint64_t kData = 0x160100000ULL;
+        constexpr uint64_t kKey = 0x160200000ULL;
+        plant_bytes(tw, ms, kData, {1, 2, 3, 4});
+        plant_bytes(tw, ms, kKey, {'m', 'e', 'm'});
+
+        // No capture and no reconstructed memory at this address: the summary
+        // must retain the generic x-register fallback after the signature name.
+        tw.emit_capicall_v8(136, tw.rt(0x1100), 0xDEAD000ULL,
+                             {0x170000000ULL, 4, 0x180000000ULL});
+
+        // The captured binary content wins over the concurrently available
+        // memory bytes, and its declared data-length remains the ABI argument.
+        TraceWriter::CapiStr digest_data;
+        digest_data.arg_idx = 0;
+        digest_data.flags = QBDITRACE_SF_BINARY | QBDITRACE_SF_TRUNCATED;
+        digest_data.value = std::string("\xaa\xbb\xcc\xdd", 4);
+        tw.emit_capicall_v8(136, tw.rt(0x1110), 0xDEAD010ULL,
+                             {kData, 4, 0x180000010ULL}, {digest_data});
+
+        // CCHmac and CCCrypt retain their semantic decoding while their key
+        // and data fields are sourced from the authoritative inline payload.
+        TraceWriter::CapiStr hmac_key;
+        hmac_key.arg_idx = 1;
+        hmac_key.value = "cap";
+        TraceWriter::CapiStr hmac_data;
+        hmac_data.arg_idx = 3;
+        hmac_data.flags = QBDITRACE_SF_BINARY;
+        hmac_data.value = std::string("\x10\x11", 2);
+        tw.emit_capicall_v8(135, tw.rt(0x1120), 0xDEAD020ULL,
+                             {2, kKey, 3, kData, 2, 0x180000020ULL},
+                             {hmac_key, hmac_data});
+
+        TraceWriter::CapiStr crypt_key;
+        crypt_key.arg_idx = 3;
+        crypt_key.value = "key";
+        TraceWriter::CapiStr crypt_data;
+        crypt_data.arg_idx = 6;
+        crypt_data.flags = QBDITRACE_SF_BINARY;
+        crypt_data.value = std::string("\xfe\xed", 2);
+        tw.emit_capicall_v8(134, tw.rt(0x1130), 0xDEAD030ULL,
+                             {0, 0, 2, kKey, 3, 0, kData, 2},
+                             {crypt_key, crypt_data});
+        tw.emit(ms, 0x1200, enc::nop(), {{33, tw.rt(0x1204)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_signature_inline_capture");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& result = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+    REQUIRE(result.calls.size() == 4);
+
+    const auto& unreadable_digest = result.calls[0];
+    CHECK(unreadable_digest.callee_name == "CC_SHA256");
+    CHECK_FALSE(unreadable_digest.data_bytes.has_value());
+    CHECK(unreadable_digest.decoded_summary ==
+          "CC_SHA256: x0=0x170000000 x1=0x4 x2=0x180000000");
+
+    const auto& captured_digest = result.calls[1];
+    REQUIRE(captured_digest.data_bytes.has_value());
+    CHECK(*captured_digest.data_bytes == std::vector<uint8_t>{0xaa, 0xbb, 0xcc, 0xdd});
+    CHECK(captured_digest.data_length == 4);
+    CHECK(captured_digest.decoded_summary.find("data[4]=aabbccdd") != std::string::npos);
+    const auto json = nlohmann::json::parse(result.to_json());
+    CHECK(json["calls"][1]["data_hex_first64"] == "aabbccdd");
+
+    const auto& hmac = result.calls[2];
+    REQUIRE(hmac.key_bytes.has_value());
+    REQUIRE(hmac.data_bytes.has_value());
+    CHECK(*hmac.key_bytes == std::vector<uint8_t>{'c', 'a', 'p'});
+    CHECK(*hmac.data_bytes == std::vector<uint8_t>{0x10, 0x11});
+    CHECK(hmac.decoded_summary.find("SHA256 key[3]=636170 data[2]=1011") != std::string::npos);
+
+    const auto& crypt = result.calls[3];
+    REQUIRE(crypt.key_bytes.has_value());
+    REQUIRE(crypt.data_bytes.has_value());
+    CHECK(*crypt.key_bytes == std::vector<uint8_t>{'k', 'e', 'y'});
+    CHECK(*crypt.data_bytes == std::vector<uint8_t>{0xfe, 0xed});
+    CHECK(crypt.decoded_summary.find("Encrypt AES128 CBC key[3]=6b6579 data[2]=feed") !=
+          std::string::npos);
+}
+
+TEST_CASE("SyscallInterceptPass: ObjC context with empty selector has no dangling space",
+          "[unit][pass][syscall_intercept][objc]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 0x1234, 0,
+                        "NSTaggedPointerString", "");
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_capicall_v8(136, tw.rt(0x1010), 0xDEAD000ULL,
+                             {0x160100000ULL, 0, 0x160200000ULL});
+        tw.emit(ms, 0x1010, enc::nop(), {{33, tw.rt(0x1014)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_objc_empty_selector");
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& call = pm->require("syscall_intercept").get<SyscallInterceptResult>().calls.at(0);
+
+    REQUIRE(call.objc_context.has_value());
+    CHECK(*call.objc_context == "[NSTaggedPointerString ?]");
+    CHECK(call.objc_context->find(" ]") == std::string::npos);
+}
+
+// ─── B8. v8 wide IDs, SVC metadata, and precise RETVAL association ──────────
 
 TEST_CASE("SyscallInterceptPass: v8 wide CAPI IDs resolve BoringSSL and JNI",
           "[unit][pass][syscall_intercept][capicall][v8]") {

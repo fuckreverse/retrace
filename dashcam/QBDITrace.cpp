@@ -454,14 +454,14 @@ static void resolveCApiAddrsIntoConfig(Config &cfg) {
   CAPI_("CCCryptorRelease",       QBDITRACE_CAPI_CC_CRYPTOR_RELEASE,  1, 0x00);
   CAPI_("CCRandomGenerateBytes",  QBDITRACE_CAPI_CC_RANDOM_GENERATE,  2, 0x00);
   CAPI_("CCKeyDerivationPBKDF",   QBDITRACE_CAPI_CC_KEY_DERIVE_PBKDF, 8, 0x02);
-  CAPI_("CC_SHA1",                QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
-  CAPI_("CC_SHA224",              QBDITRACE_CAPI_CC_SHA224,           3, 0x00);
-  CAPI_("CC_SHA256",              QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
-  CAPI_("CC_SHA384",              QBDITRACE_CAPI_CC_SHA384,           3, 0x00);
-  CAPI_("CC_SHA512",              QBDITRACE_CAPI_CC_SHA512,           3, 0x00);
-  CAPI_("CC_MD5",                 QBDITRACE_CAPI_CC_DIGEST,           3, 0x00);
+  CAPI_("CC_SHA1",                QBDITRACE_CAPI_CC_DIGEST,           3, 0x01);
+  CAPI_("CC_SHA224",              QBDITRACE_CAPI_CC_SHA224,           3, 0x01);
+  CAPI_("CC_SHA256",              QBDITRACE_CAPI_CC_DIGEST,           3, 0x01);
+  CAPI_("CC_SHA384",              QBDITRACE_CAPI_CC_SHA384,           3, 0x01);
+  CAPI_("CC_SHA512",              QBDITRACE_CAPI_CC_SHA512,           3, 0x01);
+  CAPI_("CC_MD5",                 QBDITRACE_CAPI_CC_DIGEST,           3, 0x01);
   CAPI_("CC_SHA256_Init",         QBDITRACE_CAPI_CC_SHA256_INIT,      1, 0x00);
-  CAPI_("CC_SHA256_Update",       QBDITRACE_CAPI_CC_SHA256_UPDATE,    3, 0x00);
+  CAPI_("CC_SHA256_Update",       QBDITRACE_CAPI_CC_SHA256_UPDATE,    3, 0x02);
   CAPI_("CC_SHA256_Final",        QBDITRACE_CAPI_CC_SHA256_FINAL,     2, 0x00);
 
   /* ── iOS/macOS: CoreFoundation ──────────────────────────────────── */

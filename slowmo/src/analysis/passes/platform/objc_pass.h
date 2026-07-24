@@ -48,6 +48,13 @@ enum class ObjcReturnKind : uint8_t {
     StretRaw,
 };
 
+/// Time point used to resolve a v8 REC_RETVAL string.
+/// LatestObserved is an approximation because it may include later writes.
+enum class ObjcReturnStringTime : uint8_t {
+    AtReturn,
+    LatestObserved,
+};
+
 /// A single Objective-C message send captured from the trace.
 struct ObjcMessage {
     uint64_t inst_id;           // inst_id of the surrounding instruction
@@ -71,6 +78,7 @@ struct ObjcMessage {
     uint64_t return_value = 0;
     uint64_t return_inst_id = 0;
     std::optional<std::string> return_deref_str;
+    ObjcReturnStringTime return_string_time = ObjcReturnStringTime::AtReturn;
     ObjcReturnKind return_kind = ObjcReturnKind::None;
     bool has_return = false;
     bool is_stret = false;

@@ -133,8 +133,13 @@ uint64_t trace_target(uint64_t seed) {
           s, sel_registerName("UTF8String"));
       /* NB: use the string CONTENT, not the pointer: -UTF8String on a
        * tagged NSString materializes a decode buffer whose address varies
-       * between the native reference call and the instrumented call. */
-      branchy ^= (len << 24) ^ (uint64_t)(uint8_t)utf8[0];
+       * between the native reference call and the instrumented call. Read
+       * every byte so the trace captures the whole returned C string. */
+      uint64_t utf8_checksum = 0;
+      for (const char *p = utf8; *p; ++p) {
+        utf8_checksum ^= (uint64_t)(uint8_t)*p << ((p - utf8) % 8);
+      }
+      branchy ^= (len << 24) ^ utf8_checksum;
     }
   }
 #endif
