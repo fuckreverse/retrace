@@ -186,14 +186,17 @@ RegChangePattern classify_pattern(const std::vector<uint64_t>& samples) {
 
 PassResult TraceFoldPass::run(PassContext& ctx) {
     // The persisted blob only stores results, not the config that produced
-    // them. Every knob in TraceFoldConfig (min_iterations_to_fold,
-    // keep_iterations, pattern_sample_points, include_fpr_summary) changes
+    // them. Every knob in TraceFoldConfig (instruction range,
+    // min_iterations_to_fold, keep_iterations, pattern_sample_points,
+    // include_fpr_summary) changes
     // what gets computed, so — like other parameter-aware-cached passes
     // (e.g. window_stats) — we only read/write the cache when the pass is
     // running with its default configuration. A
     // custom config (e.g. `--trace-fold-min-iter 10`) always recomputes,
     // avoiding silently returning results from a *different* configuration.
-    const bool is_default_cfg = (cfg_.min_iterations_to_fold == TraceFoldConfig{}.min_iterations_to_fold &&
+    const bool is_default_cfg = (cfg_.start_inst_id          == TraceFoldConfig{}.start_inst_id &&
+                                  cfg_.end_inst_id            == TraceFoldConfig{}.end_inst_id &&
+                                  cfg_.min_iterations_to_fold == TraceFoldConfig{}.min_iterations_to_fold &&
                                   cfg_.keep_iterations        == TraceFoldConfig{}.keep_iterations &&
                                   cfg_.include_reg_summary    == TraceFoldConfig{}.include_reg_summary &&
                                   cfg_.include_fpr_summary    == TraceFoldConfig{}.include_fpr_summary &&
@@ -291,6 +294,12 @@ PassResult TraceFoldPass::run(PassContext& ctx) {
         uint64_t fold_start = iteration_starts[keep];
         uint64_t fold_end = iteration_starts[n_iters - keep] - 1;
         if (fold_end < fold_start) continue;  // degenerate — nothing to fold
+
+        // The configured interval is half-open. Keep folding at whole-region
+        // granularity so representative iterations, register summaries, and
+        // iteration counts remain internally consistent rather than clipping
+        // a loop body at arbitrary instruction IDs.
+        if (fold_start < cfg_.start_inst_id || fold_end >= cfg_.end_inst_id) continue;
 
         region.first_inst_id = fold_start;
         region.last_inst_id = fold_end;

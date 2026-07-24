@@ -9,6 +9,10 @@ namespace tenet {
 // ─── Configuration ─────────────────────────────────────────────────────────
 
 struct TraceFoldConfig {
+    /// Only fold regions whose complete removed instruction span is contained
+    /// in the half-open instruction-ID range [start_inst_id, end_inst_id).
+    uint64_t start_inst_id = 0;
+    uint64_t end_inst_id = UINT64_MAX;
     /// Minimum consecutive iterations of a loop to fold (default: 3).
     uint32_t min_iterations_to_fold = 3;
     /// Maximum representative iterations to keep (first N + last N).

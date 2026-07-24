@@ -1775,6 +1775,8 @@ pm.register_pass(std::make_unique<XrefPass>());
 pm.register_pass(std::make_unique<CFGPass>());
 pm.register_pass(std::make_unique<LoopPass>());
         TraceFoldConfig tf_cfg;
+        tf_cfg.start_inst_id = opts.trace_fold_start;
+        tf_cfg.end_inst_id = opts.trace_fold_end;
         tf_cfg.min_iterations_to_fold = opts.trace_fold_min_iter;
         tf_cfg.keep_iterations = opts.trace_fold_keep_iter;
         tf_cfg.pattern_sample_points = opts.trace_fold_samples;
@@ -1964,14 +1966,43 @@ pm.register_pass(std::make_unique<LoopPass>());
             size_t limit = std::min(ws_result.windows.size(), size_t(500));
             for (size_t i = 0; i < limit; i++) {
                 const auto& w = ws_result.windows[i];
+                json top_mnemonics_arr = json::array();
+                for (const auto& mnemonic : w.top_mnemonics) {
+                    top_mnemonics_arr.push_back({
+                        {"mnemonic_id", mnemonic.mnemonic_id},
+                        {"count", mnemonic.count},
+                        {"mnemonic", mnemonic.mnemonic}
+                    });
+                }
+                json reg_write_counts_arr = json::array();
+                for (const auto count : w.reg_write_counts) {
+                    reg_write_counts_arr.push_back(count);
+                }
                 windows_arr.push_back({
                     {"start_inst_id", w.start_inst_id},
                     {"end_inst_id", w.end_inst_id},
-                    {"instruction_count", w.instruction_count}
+                    {"instruction_count", w.instruction_count},
+                    {"top_mnemonics", std::move(top_mnemonics_arr)},
+                    {"reg_write_counts", std::move(reg_write_counts_arr)},
+                    {"mem_read_count", w.mem_read_count},
+                    {"mem_write_count", w.mem_write_count},
+                    {"unique_mem_addrs", w.unique_mem_addrs},
+                    {"unique_pcs", w.unique_pcs},
+                    {"mnemonic_entropy", w.mnemonic_entropy},
+                    {"branch_density", w.branch_density}
                 });
             }
             ws_json["windows"] = std::move(windows_arr);
             ws_json["total_windows"] = ws_result.windows.size();
+            if (ws_result.windows.empty()) {
+                ws_json["hottest_mem_window"] = nullptr;
+                ws_json["most_diverse_window"] = nullptr;
+                ws_json["densest_branch_window"] = nullptr;
+            } else {
+                ws_json["hottest_mem_window"] = ws_result.hottest_mem_window;
+                ws_json["most_diverse_window"] = ws_result.most_diverse_window;
+                ws_json["densest_branch_window"] = ws_result.densest_branch_window;
+            }
             if (ws_result.windows.size() > 500) ws_json["truncated"] = true;
             fmt::print("{}\n", ws_json.dump(2));
         }

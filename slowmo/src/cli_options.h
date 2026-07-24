@@ -96,7 +96,7 @@ struct CliOptions {
 
     // --- Additional pass options ---
     bool opt_trace_fold = false;
-    uint64_t trace_fold_start = 0, trace_fold_end = 0;
+    uint64_t trace_fold_start = 0, trace_fold_end = UINT64_MAX;
     uint32_t trace_fold_min_iter = 3;
     uint32_t trace_fold_keep_iter = 2;        // TraceFoldConfig::keep_iterations
     uint32_t trace_fold_samples = 6;          // TraceFoldConfig::pattern_sample_points

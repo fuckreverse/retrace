@@ -8,13 +8,22 @@ log "Recording profile scenario for trace_fold..."
 run_scenario profile "${PROFILE_TRACE}"
 assert_semantic_ok "profile/fold"
 
-log "Running trace_fold pass via its high-level CLI flag..."
-# The two positional args are required by the parser (cli_options.cpp) but
-# not currently wired into TraceFoldConfig (which has no start/end fields) --
-# any values are accepted; the pass always scans the whole trace.
-run_tenet "${PROFILE_TRACE}" --trace-fold 0 0
+log "Running trace_fold pass via its high-level CLI flag (full range)..."
+# [start,end) is a real half-open instruction-ID filter (TraceFoldConfig::
+# start_inst_id/end_inst_id): only folded regions fully contained in the
+# range are reported. Use a huge end bound here for "whole trace".
+run_tenet "${PROFILE_TRACE}" --trace-fold 0 999999999
 assert_tenet_ok "profile/trace_fold"
 assert_in "profile/trace_fold folded regions" /tmp/e2e_out.log '\[trace-fold\] [1-9][0-9]* foldable regions, [1-9][0-9]* total folded instructions'
+
+log "Running trace_fold pass with a narrow range that excludes all loop bodies..."
+# A [0,1) range cannot fully contain any real folded region, so this must
+# report zero foldable regions -- proving the range filter actually narrows
+# what gets folded instead of silently scanning the whole trace regardless
+# of the CLI arguments (the bug this test now guards against).
+run_tenet "${PROFILE_TRACE}" --trace-fold 0 1
+assert_tenet_ok "profile/trace_fold narrow range"
+assert_in "profile/trace_fold narrow range yields zero regions" /tmp/e2e_out.log '\[trace-fold\] 0 foldable regions, 0 total folded instructions'
 
 log "Recording core scenario for timeline, context, statistics, diff, and dataflow..."
 run_scenario core "${PROFILE_CORE_TRACE}"

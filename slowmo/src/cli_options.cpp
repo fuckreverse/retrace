@@ -93,6 +93,7 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --memory-strings-max-sites <N> Max call sites to scan (default: unlimited)\n");
     fmt::print(stderr, "  --memory-strings-scan-size <N> Bytes to scan per pointer (default: 256)\n");
     fmt::print(stderr, "  --dataflow-graph <start> <end> Build dataflow graph for instruction range\n");
+    fmt::print(stderr, "  --trace-fold <start_inst_id> <end_inst_id>  Fold complete repetitive-loop regions within [start,end)\n");
     fmt::print(stderr, "  --dataflow-graph-output <file> Export dataflow graph (.dot or .json)\n");
     fmt::print(stderr, "  --algorithm-summary           Generate algorithm summary report\n");
     fmt::print(stderr, "  --objc                        Analyze Objective-C message sends\n");
