@@ -126,8 +126,12 @@ int main(int argc, char **argv) {
   cfg.module_slide = 0;          /* keep static == runtime for easy reading */
   cfg.module_name = "test_target";
   cfg.output_path = out;
-  cfg.record = QBDITRACE_REC_DEFAULT;
-  cfg.anchor_interval = 0;
+cfg.record = QBDITRACE_REC_DEFAULT;
+/* Opt in to C API interception; n_capi_funcs stays 0 so the native tracer
+ * auto-resolves its standard table (CC_SHA256, memcpy, strcmp, ...) via
+ * dlsym at configure time. */
+cfg.enable_capi_intercept = 1;
+cfg.anchor_interval = 0;
   cfg.ring_bytes = 0; /* default */
   /* The standalone harness compiles QBDITrace.cpp directly without linking
    * zstd. Keep this trace uncompressed; Tenet still exercises the complete

@@ -32,6 +32,14 @@
 #include <objc/runtime.h>
 #endif
 
+/* CommonCrypto lives in libSystem on macOS; no extra link flag needed.
+ * Exercised so the E2E trace contains a REC_CAPICALL with a real return.
+ * This file is compiled as C++ by run_macos.sh, hence the extern "C". */
+#ifdef __cplusplus
+extern "C"
+#endif
+unsigned char *CC_SHA256(const void *data, uint32_t len, unsigned char *md);
+
 /* ---- 3. cross-function call target -------------------------------------- */
 
 __attribute__((noinline)) static uint64_t helper_sum(const uint64_t *p,
@@ -102,7 +110,9 @@ uint64_t trace_target(uint64_t seed) {
 #endif
 
 #if defined(QBDITRACE_TEST_OBJC)
-  /* 4. objc_msgSend: [NSObject description] */
+  /* 4. objc_msgSend: [NSObject description], then an NSString class factory
+   *    and two instance messages so the trace shows multiple classes,
+   *    selectors and distinct return shapes (object ptr, NSUInteger, char*). */
   Class cls = objc_getClass("NSObject");
   if (cls) {
     SEL selDesc = sel_registerName("description");
@@ -111,10 +121,51 @@ uint64_t trace_target(uint64_t seed) {
       branchy ^= (uint64_t)(uintptr_t)desc;
     }
   }
+  Class nsStr = objc_getClass("NSString");
+  if (nsStr) {
+    id s = ((id (*)(id, SEL, const char *))objc_msgSend)(
+        (id)nsStr, sel_registerName("stringWithUTF8String:"),
+        "tenet-e2e");
+    if (s) {
+      uint64_t len = ((uint64_t (*)(id, SEL))objc_msgSend)(
+          s, sel_registerName("length"));
+      const char *utf8 = ((const char *(*)(id, SEL))objc_msgSend)(
+          s, sel_registerName("UTF8String"));
+      /* NB: use the string CONTENT, not the pointer: -UTF8String on a
+       * tagged NSString materializes a decode buffer whose address varies
+       * between the native reference call and the instrumented call. */
+      branchy ^= (len << 24) ^ (uint64_t)(uint8_t)utf8[0];
+    }
+  }
 #endif
+
+  /* 6. C API: CC_SHA256 is auto-resolved by the tracer's dlsym table, so it
+   *    should surface as a REC_CAPICALL with input buffer + real return. */
+  {
+    static const char kMsg[] = "tenet-e2e";
+    unsigned char md[32];
+    unsigned char *m = CC_SHA256(kMsg, (uint32_t)(sizeof(kMsg) - 1), md);
+    if (m) {
+      branchy ^= ((uint64_t)md[0] << 32) ^ ((uint64_t)md[31] << 40);
+    }
+  }
+
+  /* 5c. inline Mach trap: thread_self (x16 = -27). Same anti-debug style
+   *     pattern as 5b, but exercises the negative Mach trap numbering. */
+  uint64_t self_port = 0;
+#if defined(__aarch64__) || defined(__arm64__)
+  {
+    register uint64_t x16m __asm__("x16") = (uint64_t)(int64_t)-27;
+    register uint64_t x0m __asm__("x0") = 0;
+    __asm__ volatile("svc #0x80" : "=r"(x0m) : "r"(x16m) : "cc", "memory");
+    self_port = x0m;
+  }
+#endif
+  branchy ^= (self_port << 40);
 
   return branchy ^ s ^ (f << 1) ^ (pid << 8) ^ (inline_pid << 16);
 }
+
 
 /*
  * Sentinel symbol immediately following trace_target in the source so the
