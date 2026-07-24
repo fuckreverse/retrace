@@ -4,16 +4,27 @@
  * test_harness.c
  *
  * Drives the tracer entirely in-process (no Frida): it computes the runtime
- * address range of trace_target(), configures the tracer, then asks it to take
- * over a call to trace_target() via qbditrace_run_call(). Finally it compares
- * the instrumented result against a reference value computed by calling
- * trace_target() natively, and prints the trace path so it can be fed to the
- * offline decoder.
+ * address range of a target function, configures the tracer, then asks it to
+ * take over a call to that function via qbditrace_run_call(). Finally it
+ * compares the instrumented result against a reference value computed by
+ * calling the target natively, and prints the trace path so it can be fed to
+ * the offline decoder.
  *
  * This lets us validate the full pipeline (instrumentation -> ring buffer ->
  * trace.bin -> decoder) on Apple Silicon macOS before touching a real device.
  *
- * Build/run: see tools/qbditrace/test/run_macos.sh
+ * Scenario selection (argv[3], optional, defaults to "core"):
+ *   core     - test_target.c:trace_target()      (control flow, mem, ObjC, SVC, CAPI)
+ *   crypto   - target_crypto.c:crypto_target()   (AES-const idiom, XOR/ARX loops)
+ *   profile  - target_profile.c:profile_target() (long loop, sentinel value, high-entropy buffer)
+ *
+ * Each scenario target is compiled into the harness binary unconditionally
+ * (see run_pass_e2e.sh / e2e/lib.sh); only the ONE selected by argv[3] is
+ * executed and traced per run, keeping every produced trace small and
+ * focused on the pass(es) under test.
+ *
+ * Build/run: see tools/qbditrace/tests/integration/run_macos.sh (core scenario)
+ *            tools/qbditrace/tests/integration/e2e/run_pass_e2e.sh (all scenarios)
  */
 
 #include <dlfcn.h>
@@ -55,21 +66,76 @@ static int find_section(const char *seg, const char *sect, uint64_t *start,
   return 1;
 }
 
-/* Provided by test_target.c */
+/* Provided by test_target.c (always linked in). */
 extern uint64_t trace_target(uint64_t seed);
 extern void trace_target_end(void);
 
 /*
- * The instrumented range is [trace_target, trace_target_end). The linker is
- * free to reorder, so trace_target_end may land *before* trace_target. We
- * therefore normalise: if end <= start, fall back to a conservative fixed span
- * that comfortably covers a function of this size.
+ * Provided by target_crypto.c / target_profile.c when linked in. These are
+ * declared as weak symbols so the "core"-only build (run_macos.sh, which does
+ * not compile the extra scenario files) still links; scenario_lookup() will
+ * simply refuse to select a scenario whose function pointer resolved to NULL.
  */
-static void compute_range(uint64_t *start, uint64_t *end) {
-  uint64_t s = (uint64_t)(uintptr_t)&trace_target;
-  uint64_t e = (uint64_t)(uintptr_t)&trace_target_end;
-  if (e <= s || (e - s) > 0x4000) {
-    e = s + 0x1000; /* 4 KiB is plenty for this target */
+#if defined(__has_attribute) && __has_attribute(weak)
+__attribute__((weak)) uint64_t crypto_target(uint64_t seed);
+__attribute__((weak)) void crypto_target_end(void);
+__attribute__((weak)) uint64_t profile_target(uint64_t seed);
+__attribute__((weak)) void profile_target_end(void);
+#else
+extern uint64_t crypto_target(uint64_t seed);
+extern void crypto_target_end(void);
+extern uint64_t profile_target(uint64_t seed);
+extern void profile_target_end(void);
+#endif
+
+typedef uint64_t (*target_fn_t)(uint64_t);
+typedef void (*target_end_fn_t)(void);
+
+typedef struct {
+  const char *name;
+  target_fn_t fn;
+  target_end_fn_t end_fn;
+  const char *module_name;
+} scenario_t;
+
+static const scenario_t kScenarios[] = {
+    {"core", trace_target, trace_target_end, "test_target"},
+    {"crypto", crypto_target, crypto_target_end, "target_crypto"},
+    {"profile", profile_target, profile_target_end, "target_profile"},
+};
+#define N_SCENARIOS (sizeof(kScenarios) / sizeof(kScenarios[0]))
+
+/* Look up a scenario by name; NULL/unknown falls back to "core". Returns NULL
+ * only if the resolved scenario's weak symbol was never linked in (fn==0). */
+static const scenario_t *scenario_lookup(const char *name) {
+  const scenario_t *fallback = &kScenarios[0];
+  for (size_t i = 0; i < N_SCENARIOS; ++i) {
+    if (name && strcmp(kScenarios[i].name, name) == 0) {
+      if (!kScenarios[i].fn) {
+        fprintf(stderr,
+                "[harness] scenario '%s' requested but not linked in "
+                "(missing target_%s.c in build)\n",
+                name, name);
+        return NULL;
+      }
+      return &kScenarios[i];
+    }
+  }
+  return fallback;
+}
+
+/*
+ * The instrumented range is [entry, entry_end). The linker is free to
+ * reorder, so entry_end may land *before* entry. We therefore normalise: if
+ * end <= start, fall back to a conservative fixed span that comfortably
+ * covers a function of this size.
+ */
+static void compute_range(target_fn_t fn, target_end_fn_t end_fn,
+                           uint64_t *start, uint64_t *end) {
+  uint64_t s = (uint64_t)(uintptr_t)fn;
+  uint64_t e = (uint64_t)(uintptr_t)end_fn;
+  if (e <= s || (e - s) > 0x8000) {
+    e = s + 0x2000; /* 8 KiB is plenty for these targets */
   }
   *start = s;
   *end = e;
@@ -78,19 +144,26 @@ static void compute_range(uint64_t *start, uint64_t *end) {
 int main(int argc, char **argv) {
   const uint64_t seed = (argc > 1) ? strtoull(argv[1], NULL, 0) : 0x1234;
   const char *out = (argc > 2) ? argv[2] : "/tmp/qbditrace-test.bin";
+  const char *scenario_name = (argc > 3) ? argv[3] : "core";
+
+  const scenario_t *scenario = scenario_lookup(scenario_name);
+  if (!scenario) {
+    return 5;
+  }
+  printf("[harness] scenario          = %s\n", scenario->name);
 
   uint64_t start = 0, end = 0;
-  compute_range(&start, &end);
+  compute_range(scenario->fn, scenario->end_fn, &start, &end);
 
-  printf("[harness] trace_target      = 0x%016" PRIx64 "\n", start);
-  printf("[harness] trace_target_end  = 0x%016" PRIx64
+  printf("[harness] target entry      = 0x%016" PRIx64 "\n", start);
+  printf("[harness] target entry_end  = 0x%016" PRIx64
          " (range end = 0x%016" PRIx64 ")\n",
-         (uint64_t)(uintptr_t)&trace_target_end, end);
+         (uint64_t)(uintptr_t)scenario->end_fn, end);
   printf("[harness] seed              = 0x%" PRIx64 "\n", seed);
   printf("[harness] output            = %s\n", out);
 
   /* Reference result (native, no instrumentation). */
-  uint64_t ref = trace_target(seed);
+  uint64_t ref = scenario->fn(seed);
   printf("[harness] native result     = 0x%016" PRIx64 "\n", ref);
 
   /* Resolve the objc_msgSend family if present in this process. On macOS this
@@ -124,7 +197,7 @@ int main(int argc, char **argv) {
   cfg.trace_end = end;
   cfg.module_base = start;       /* single-module test: normalise against start */
   cfg.module_slide = 0;          /* keep static == runtime for easy reading */
-  cfg.module_name = "test_target";
+  cfg.module_name = scenario->module_name;
   cfg.output_path = out;
 cfg.record = QBDITRACE_REC_DEFAULT;
 /* Opt in to C API interception; n_capi_funcs stays 0 so the native tracer
@@ -187,7 +260,7 @@ cfg.anchor_interval = 0;
 
   uint64_t ret = 0;
   uint64_t args[1] = {seed};
-  int rc = qbditrace_run_call(&ret, (uint64_t)(uintptr_t)&trace_target, 1, args);
+  int rc = qbditrace_run_call(&ret, start, 1, args);
   qbditrace_stop();
 
   printf("[harness] run_call rc       = %d\n", rc);

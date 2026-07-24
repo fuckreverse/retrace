@@ -46,6 +46,16 @@ fail_() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); printf '\033[1;31m  ✗ FAIL\033
 
 # Build a test harness variant.
 # build_harness <output_binary> [extra_cflags...]
+#
+# Always links target_crypto.c + target_profile.c alongside test_target.c:
+# test_harness.c's scenario table (see test_harness.c) unconditionally takes
+# the address of crypto_target()/profile_target(), and while those
+# declarations are marked __attribute__((weak)) so a *reference* tolerates a
+# missing definition, this toolchain still requires the *definition* to exist
+# at final link time (weak only relaxes multiple-definition conflicts, not
+# missing ones). Every scenario built by this script only ever runs "core"
+# (the default), but omitting either file reproduces an "Undefined symbols
+# ... crypto_target/profile_target" link error.
 build_harness() {
   local out="$1"; shift
   clang++ -std=c++17 -O2 -g \
@@ -57,6 +67,8 @@ build_harness() {
     -I"${BUILD}/include-static" \
     "${TRACE_DIR}/QBDITrace.cpp" \
     "${TRACE_DIR}/tests/integration/test_target.c" \
+    "${TRACE_DIR}/tests/integration/target_crypto.c" \
+    "${TRACE_DIR}/tests/integration/target_profile.c" \
     "${TRACE_DIR}/tests/integration/test_harness.c" \
     "$@" \
     "${BUILD}/libQBDI.a" \

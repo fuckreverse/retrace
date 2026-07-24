@@ -40,6 +40,8 @@ clang++ -std=c++17 -O2 -g \
   -I"${BUILD}/include-static" \
   "${TRACE_DIR}/QBDITrace.cpp" \
   "${TRACE_DIR}/tests/integration/test_target.c" \
+  "${TRACE_DIR}/tests/integration/target_crypto.c" \
+  "${TRACE_DIR}/tests/integration/target_profile.c" \
   "${TRACE_DIR}/tests/integration/test_harness.c" \
   ${OBJC_DEF} \
   "${BUILD}/libQBDI.a" \
@@ -49,6 +51,16 @@ clang++ -std=c++17 -O2 -g \
   -o /tmp/qbditrace-test
 # Note: test_target.c is compiled here at -O2; the noinline attributes keep the
 # cross-function call and recursion intact so the transfer events still appear.
+# target_crypto.c / target_profile.c must always be linked in alongside
+# test_target.c: test_harness.c's scenario table (see test_harness.c) takes
+# the address of crypto_target()/profile_target() unconditionally, and while
+# those declarations are marked __attribute__((weak)) to make the *reference*
+# tolerant of a missing definition, this toolchain still requires the
+# *definition* to be present at final link time (weak only relaxes multiple-
+# definition conflicts, not missing ones) -- omitting either file reproduces
+# an "Undefined symbols ... crypto_target/profile_target" link error. This
+# script only ever runs the default "core" scenario, but must still link all
+# three target_*.c files for that reason.
 
 echo "=== [2/3] running (seed=${SEED}) ==="
 /tmp/qbditrace-test "${SEED}" "${OUT}"
