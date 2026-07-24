@@ -31,6 +31,7 @@
 #include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "common/byte_codec.h"
 #include <nlohmann/json.hpp>
+#include <cstring>
 
 using namespace tenet;
 using namespace tenet::test;
@@ -161,6 +162,79 @@ static std::unique_ptr<TraceEnv> make_with_svc_android() {
         tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
         tw.emit_anchor(ms);
     }, "si_svc_android");
+}
+
+static void plant_mach_msg_header(TraceWriter& tw, MachineState& ms,
+                                  uint64_t addr, uint32_t msgh_id) {
+    // mach_msg_header_t is 24 bytes; only msgh_id @ +20 is relevant here.
+    uint8_t bytes[24] = {};
+    const uint32_t bits = 0x13;
+    const uint32_t size = sizeof(bytes);
+    std::memcpy(bytes, &bits, sizeof(bits));
+    std::memcpy(bytes + 4, &size, sizeof(size));
+    std::memcpy(bytes + 20, &msgh_id, sizeof(msgh_id));
+    for (uint64_t off = 0; off < sizeof(bytes); off += 8) {
+        uint64_t word = 0;
+        std::memcpy(&word, bytes + off, sizeof(word));
+        const uint64_t pc = 0xF000 + off * 4;
+        tw.emit(ms, pc, enc::str_imm(0, 31, 0),
+                {{0, word}, {33, tw.rt(pc + 4)}}, {{2, 8, addr + off, word}});
+    }
+}
+
+static std::unique_ptr<TraceEnv> make_with_mach_msg(uint64_t trap,
+                                                     uint64_t options,
+                                                     std::optional<uint32_t> msgh_id,
+                                                     const char* name) {
+    return make_env([=](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        constexpr uint64_t kHeader = 0x16F100000ULL;
+        if (msgh_id) plant_mach_msg_header(tw, ms, kHeader, *msgh_id);
+        const uint64_t site = tw.rt(0x1100);
+        tw.emit_svc(site, trap, kHeader, options);
+        tw.emit_retval(QBDITRACE_REC_SVC, trap, site, 0, tw.rt(0x1104),
+                       0, 0, 0, 0, 0, trap);
+        tw.emit(ms, 0x1200, enc::nop(), {{33, tw.rt(0x1204)}}, {});
+        tw.emit_anchor(ms);
+    }, name);
+}
+
+static std::unique_ptr<TraceEnv> make_with_mach_msg2(uint64_t option64,
+                                                      uint64_t voucher_and_id,
+                                                      const char* name) {
+    return make_env([=](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        const uint64_t site = tw.rt(0x1100);
+        qbditrace::qbditrace_svc_head_t svc = {};
+        svc.kind = QBDITRACE_REC_SVC;
+        svc.pc = site;
+        svc.syscall_no = static_cast<uint64_t>(-47);
+        svc.args[0] = 0xDEAD0000ULL; // data; intentionally not backed by trace memory
+        svc.args[1] = option64;
+        svc.args[4] = voucher_and_id;
+        fwrite(&svc, sizeof(svc), 1, tw.fp);
+        tw.emit_retval(QBDITRACE_REC_SVC, static_cast<uint16_t>(-47), site, 0,
+                       tw.rt(0x1104), 0, 0, 0, 0, 0,
+                       static_cast<uint64_t>(-47));
+        tw.emit(ms, 0x1200, enc::nop(), {{33, tw.rt(0x1204)}}, {});
+        tw.emit_anchor(ms);
+    }, name);
+}
+
+static std::unique_ptr<TraceEnv> make_with_platform_svc(uint32_t target_os,
+                                                         uint64_t syscall_no,
+                                                         const char* name) {
+    return make_env([=](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_target_os(target_os);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_svc(tw.rt(0x1004), syscall_no);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, name);
 }
 
 /// Trace with REC_CAPICALL that carries 2 inline captured strings.
@@ -373,6 +447,164 @@ TEST_CASE("SyscallInterceptPass: SVC record produces Syscall-category call",
     SECTION("decoded_summary mentions syscall number") {
         const auto& s = res.calls[0].decoded_summary;
         REQUIRE(s.find("1") != std::string::npos);
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: Darwin Mach traps retain signed selectors",
+          "[unit][pass][syscall_intercept][svc][mach]") {
+    // In-Got-Want: Darwin SVC records encode Mach trap numbers as sign-extended
+    // uint64_t values. They must resolve before BSD class-prefix normalization.
+    struct TestCase {
+        const char* label;
+        uint64_t raw_syscall_no;
+        const char* want_name;
+    };
+    const TestCase tests[] = {
+        {"thread self", static_cast<uint64_t>(-27), "thread_self_trap"},
+        {"mach message", static_cast<uint64_t>(-31), "mach_msg_trap"},
+        {"vm protect", static_cast<uint64_t>(-14), "mach_vm_protect"},
+        {"task for pid", static_cast<uint64_t>(-45), "task_for_pid"},
+        {"iokit user client", static_cast<uint64_t>(-100), "iokit_user_client_trap"},
+        {"uncovered trap", static_cast<uint64_t>(-120), "mach_trap_-120"},
+        {"BSD syscall", 20, "getpid"},
+        {"BSD class prefix", 0x02000004ULL, "write"},
+    };
+
+    for (const auto& tc : tests) {
+        DYNAMIC_SECTION(tc.label) {
+            auto env = make_with_platform_svc(QBDITRACE_OS_IOS, tc.raw_syscall_no,
+                                              tc.label);
+            auto pm = make_pm(*env);
+            pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+            const auto& res = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+            REQUIRE(res.calls.size() == 1);
+            const auto& got = res.calls.front();
+            REQUIRE(got.category == ApiCategory::Syscall);
+            REQUIRE(got.callee_name == tc.want_name);
+            REQUIRE(got.decoded_summary.find("raw=" + std::to_string(
+                    static_cast<int64_t>(tc.raw_syscall_no))) != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: Darwin mach_msg decodes sent MIG requests",
+          "[unit][pass][syscall_intercept][svc][mach][mig]") {
+    struct TestCase {
+        const char* label;
+        uint64_t trap;
+        uint64_t options;
+        std::optional<uint32_t> msgh_id;
+        const char* want_name;
+        const char* want_summary;
+        bool decoded;
+    };
+    const TestCase tests[] = {
+        {"known send", static_cast<uint64_t>(-31), 0x1, 4802,
+         "mach_vm_protect", "mach_vm_protect via mach_msg_trap(msgh_id=0x12c2)", true},
+        {"known overwrite", static_cast<uint64_t>(-32), 0, 3205,
+         "mach_port_allocate", "mach_port_allocate via mach_msg_overwrite_trap(msgh_id=0xc85)", true},
+        {"unknown id", static_cast<uint64_t>(-31), 0x1, 0xFEED,
+         "mach_msg_trap", "(msgh_id=0xfeed)", false},
+        {"receive only", static_cast<uint64_t>(-31), 0x2, 4802,
+         "mach_msg_trap", "mach_msg_trap(", false},
+        {"unreadable", static_cast<uint64_t>(-31), 0x1, std::nullopt,
+         "mach_msg_trap", "(msgh unreadable)", false},
+    };
+
+    for (const auto& tc : tests) {
+        DYNAMIC_SECTION(tc.label) {
+            auto env = make_with_mach_msg(tc.trap, tc.options, tc.msgh_id, tc.label);
+            auto pm = make_pm(*env);
+            pm->register_pass(std::make_unique<SyscallInterceptPass>());
+            const auto& result = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+            REQUIRE(result.calls.size() == 1);
+            const auto& call = result.calls.front();
+            CHECK(call.callee_name == tc.want_name);
+            CHECK(call.decoded_summary.find(tc.want_summary) != std::string::npos);
+            CHECK(call.has_return);
+            if (tc.decoded) {
+                REQUIRE(call.mach_msgh_id.has_value());
+                CHECK(*call.mach_msgh_id == *tc.msgh_id);
+                REQUIRE(call.mach_msg_via.has_value());
+                CHECK(*call.mach_msg_via ==
+                      (tc.trap == static_cast<uint64_t>(-31) ? "mach_msg_trap" :
+                       tc.trap == static_cast<uint64_t>(-32) ? "mach_msg_overwrite_trap" :
+                                                                  "mach_msg2_trap"));
+                const auto json = nlohmann::json::parse(result.to_json());
+                CHECK(json["calls"][0]["mach_msgh_id"] == *tc.msgh_id);
+                CHECK(json["calls"][0]["mach_msg_via"] == *call.mach_msg_via);
+            } else {
+                CHECK_FALSE(call.mach_msgh_id.has_value());
+                CHECK_FALSE(call.mach_msg_via.has_value());
+                const auto json = nlohmann::json::parse(result.to_json());
+                CHECK_FALSE(json["calls"][0].contains("mach_msgh_id"));
+                CHECK_FALSE(json["calls"][0].contains("mach_msg_via"));
+            }
+        }
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: Darwin mach_msg2 decodes register-packed MIG requests",
+          "[unit][pass][syscall_intercept][svc][mach][mig]") {
+    struct TestCase {
+        const char* label;
+        uint64_t option64;
+        uint64_t voucher_and_id;
+        const char* want_name;
+        bool decoded;
+    };
+    const TestCase tests[] = {
+        {"known send", 0x1, 0xA5A5000000000E13ULL, "thread_get_state", true},
+        {"receive only", 0x2, 0xA5A5000000000E13ULL, "mach_msg2_trap", false},
+        {"unknown id", 0x1, 0xA5A500000000FEEDULL, "mach_msg2_trap", false},
+    };
+
+    for (const auto& tc : tests) {
+        DYNAMIC_SECTION(tc.label) {
+            auto env = make_with_mach_msg2(tc.option64, tc.voucher_and_id, tc.label);
+            auto pm = make_pm(*env);
+            pm->register_pass(std::make_unique<SyscallInterceptPass>());
+            const auto& result = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+            REQUIRE(result.calls.size() == 1);
+            const auto& call = result.calls.front();
+            CHECK(call.callee_name == tc.want_name);
+            CHECK(call.raw_args[4] == tc.voucher_and_id);
+            if (tc.decoded) {
+                REQUIRE(call.mach_msgh_id.has_value());
+                CHECK(*call.mach_msgh_id == 3603);
+                REQUIRE(call.mach_msg_via.has_value());
+                CHECK(*call.mach_msg_via == "mach_msg2_trap");
+                CHECK(call.decoded_summary.find("thread_get_state via mach_msg2_trap(msgh_id=0xe13)") !=
+                      std::string::npos);
+            } else {
+                CHECK_FALSE(call.mach_msgh_id.has_value());
+                CHECK_FALSE(call.mach_msg_via.has_value());
+                if ((tc.option64 & 0x1) != 0) {
+                    CHECK(call.decoded_summary.find("(msgh_id=0xfeed)") != std::string::npos);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: Linux and Android negative SVCs are not Mach traps",
+          "[unit][pass][syscall_intercept][svc][mach]") {
+    // In-Got-Want: negative raw selectors on non-Darwin targets retain their
+    // generic syscall fallback rather than being decoded through the Mach table.
+    const uint32_t targets[] = {QBDITRACE_OS_ANDROID, QBDITRACE_OS_LINUX};
+    for (uint32_t target : targets) {
+        DYNAMIC_SECTION("target_os=" << target) {
+            auto env = make_with_platform_svc(target, static_cast<uint64_t>(-27),
+                                              "si_non_darwin_negative_svc");
+            auto pm = make_pm(*env);
+            pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+            const auto& res = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+            REQUIRE(res.calls.size() == 1);
+            REQUIRE(res.calls.front().callee_name != "thread_self_trap");
+            REQUIRE(res.calls.front().callee_name.find("mach_trap_") == std::string::npos);
+        }
     }
 }
 
@@ -615,14 +847,37 @@ TEST_CASE("SyscallInterceptPass: blob cache round-trip preserves captured string
     CHECK(cached_binary.value == std::string({'\x01', '\x02', '\x03'}));
 }
 
-TEST_CASE("SyscallInterceptPass: v2 blob cache is treated as a miss",
+TEST_CASE("SyscallInterceptPass: v4 blob cache round-trip preserves MIG metadata",
+          "[unit][pass][syscall_intercept][cache][mig]") {
+    auto env = make_with_mach_msg(static_cast<uint64_t>(-31), 0x1, 4802,
+                                  "si_mach_msg_cache");
+    auto pm1 = make_pm(*env);
+    pm1->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& fresh = pm1->require("syscall_intercept").get<SyscallInterceptResult>();
+    REQUIRE(fresh.calls.size() == 1);
+    REQUIRE(fresh.calls[0].mach_msgh_id.has_value());
+    CHECK(*fresh.calls[0].mach_msgh_id == 4802);
+    REQUIRE(fresh.calls[0].mach_msg_via.has_value());
+    CHECK(*fresh.calls[0].mach_msg_via == "mach_msg_trap");
+
+    auto pm2 = make_pm(*env);
+    pm2->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& cached = pm2->require("syscall_intercept").get<SyscallInterceptResult>();
+    REQUIRE(cached.calls.size() == 1);
+    REQUIRE(cached.calls[0].mach_msgh_id.has_value());
+    CHECK(*cached.calls[0].mach_msgh_id == 4802);
+    REQUIRE(cached.calls[0].mach_msg_via.has_value());
+    CHECK(*cached.calls[0].mach_msg_via == "mach_msg_trap");
+}
+
+TEST_CASE("SyscallInterceptPass: v3 blob cache is treated as a miss",
           "[unit][pass][syscall_intercept][cache]") {
     auto env = make_with_capicall_strings();
     REQUIRE(env != nullptr);
 
     ByteWriter legacy_blob;
     legacy_blob.u32(0x53494341u);  // "SICA"
-    legacy_blob.u32(2u);
+    legacy_blob.u32(3u);
     legacy_blob.u64(0u);
     env->index->save_pass_blob(
         "syscall_intercept", legacy_blob.data().data(), legacy_blob.size());
@@ -640,7 +895,7 @@ TEST_CASE("SyscallInterceptPass: v2 blob cache is treated as a miss",
     REQUIRE(env->index->load_pass_blob("syscall_intercept", refreshed_blob));
     ByteReader reader(refreshed_blob);
     CHECK(reader.u32() == 0x53494341u);
-    CHECK(reader.u32() == 3u);
+    CHECK(reader.u32() == 4u);
 }
 
 // ─── B4. REC_CAPICALL — truncated string flag ────────────────────────────────

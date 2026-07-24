@@ -60,7 +60,7 @@ Tenet 可打开 version ≥ 4 的任何 Trace。
 | 证据 | 是否必需 | 缺失时降级 |
 |---|---|---|
 | `REC_CAPICALL` 记录 | 最佳质量 | 启发式回退 |
-| `REC_SVC` 记录 | 系统调用拦截需要 | 无系统调用数据 |
+| `REC_SVC` 记录 | 系统调用拦截需要；可分类 Darwin BSD syscall、负号 Mach trap 与可读的发送 Mach 消息头 | 无系统调用数据；消息头缺失或不可读时保留 trap 级结果 |
 | `REC_OBJC` 记录 | ObjC 消息需要 | 无 ObjC 分析 |
 | `REC_RETVAL` 记录 | 真实返回值需要 | 返回值显示为未知；旧版 v4-v7 Trace 不含此记录 |
 | Darwin 目标 | ObjC / CryptoKit 需要 | Android/Linux 跳过 |

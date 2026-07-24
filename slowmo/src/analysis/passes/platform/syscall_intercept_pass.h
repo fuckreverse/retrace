@@ -150,6 +150,10 @@ struct InterceptedCall {
     int32_t errno_before = 0;
     int32_t errno_after = 0;
     std::optional<int64_t> raw_error;
+    /// Present only when a sent Mach message header was decoded as a MIG request.
+    std::optional<uint32_t> mach_msgh_id;
+    /// The Mach message trap that carried mach_msgh_id (for example mach_msg_trap).
+    std::optional<std::string> mach_msg_via;
     std::optional<std::string> objc_context;
 
     /// Inline string captures directly from the CapiCall record (tracer-side).
@@ -235,6 +239,7 @@ private:
     void decode_known_api(InterceptedCall& call, const ApiSignature& sig);
     void finalize_call(InterceptedCall call);
     void refresh_summary_with_return(InterceptedCall& call) const;
+    void decode_mach_message(InterceptedCall& call, uint64_t raw_syscall_no);
     std::string syscall_name(uint64_t raw_syscall_no) const;
 
     static const std::vector<ApiSignature>& known_apis();

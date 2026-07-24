@@ -60,7 +60,7 @@ Tenet opens any trace with version ≥ 4.
 | Evidence | Required | Degradation when missing |
 |---|---|---|
 | `REC_CAPICALL` records | Best quality | Heuristic fallback |
-| `REC_SVC` records | For syscall intercept | No syscall data |
+| `REC_SVC` records | For syscall intercept; Darwin BSD syscalls, negative Mach traps, and readable sent Mach-message headers can be classified | No syscall data; unavailable or unreadable message headers remain trap-level results |
 | `REC_OBJC` records | For ObjC messages | No ObjC analysis |
 | `REC_RETVAL` records | For true return values | Returns reported as unknown; legacy v4-v7 traces have no such records |
 | Darwin target | For ObjC / CryptoKit | Skipped on Android/Linux |

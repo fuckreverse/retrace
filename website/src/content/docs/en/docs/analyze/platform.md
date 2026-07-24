@@ -76,6 +76,12 @@ This is the gold standard: symbol name, typed arguments, and dereferenced string
 
 **`REC_SVC`** (syscall records) capture supervisor-call events and v8 flags. On Darwin these include `mach_msg`, `mach_vm_map`, `read`, `write`, etc.; on Linux/Android `ioctl`, `mmap`, `mprotect` and so on. Tenet selects the table by `target_os`; Darwin class prefixes are normalized for naming while the raw number remains available.
 
+#### Darwin Mach traps
+
+For Darwin SVCs with a negative `x16`, `syscall_intercept` uses the Mach-trap table rather than the BSD syscall table (for example, `thread_self_trap`, `task_for_pid`, `iokit_user_client_trap`, and `mach_vm_protect`). Unmapped traps remain visible as `mach_trap_N`; positive BSD syscall and class-prefix handling is unchanged.
+
+For sent `mach_msg_trap`, `mach_msg_overwrite_trap`, and `mach_msg2_trap` requests, Tenet reads `msgh_id` from offset 20 of a readable Mach message header and resolves common MIG routines (Mach VM, task, thread, host, port, VM map, and clock families). A resolved call is summarized as `mach_vm_protect via mach_msg_trap(msgh_id=0x12c2)` and JSON additionally exposes `mach_msgh_id` and `mach_msg_via`. Unknown routine IDs, receive-only messages, and unreadable headers gracefully fall back to the trap-level result.
+
 For `REC_CAPICALL`, `REC_SVC`, and ObjC, v8 `REC_RETVAL` supplies the actual x0/x1/NZCV at return time and links it precisely by site/target/source ID. A syscall failure is derived from Darwin NZCV carry (bit 29) or Linux x0 in `[-4095,-1]`; native SVC does not treat environment TLS `errno` as valid. Opaque objects such as `SecKeyRef` remain opaque rather than being decoded as key bytes.
 
 **`XFER_CALL` heuristic** works on `REC_EVENT` records marking cross-module exits and re-entries. When the traced code transfers execution outside the instrumented range and comes back, tenet reconstructs a synthetic call. No symbol resolution is available, so calls are labeled by the target PC.

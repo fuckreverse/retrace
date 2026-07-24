@@ -296,6 +296,155 @@ scan_done_retval:
     return result;
 }
 
+// ─── Mach trap target and raw-scan helper ─────────────────────────────────────
+
+static constexpr uint64_t kThreadSelfTrap =
+    static_cast<uint64_t>(static_cast<int64_t>(-27));
+
+// thread_self_trap has no arguments. Darwin selects it via x16 and returns the
+// current thread's Mach port name in x0.
+__attribute__((noinline)) static uint64_t mach_thread_self_trap_target(void) {
+    register uint64_t x16 asm("x16") = kThreadSelfTrap;
+    register uint64_t x0 asm("x0");
+    asm volatile("svc #0x80" : "=r"(x0) : "r"(x16) : "cc", "memory");
+    return x0;
+}
+
+void mach_thread_self_trap_target_end(void) {}  // sentinel
+
+struct MachTrapPair {
+    bool found = false;
+    uint64_t native_port = 0;
+    qbditrace::qbditrace_svc_head_t svc{};
+    qbditrace::qbditrace_retval_t retval{};
+};
+
+static MachTrapPair run_mach_thread_self_trap(const char* output_path) {
+    const uint64_t start = (uint64_t)(uintptr_t)&mach_thread_self_trap_target;
+    uint64_t end = (uint64_t)(uintptr_t)&mach_thread_self_trap_target_end;
+    if (end <= start || (end - start) > 0x1000) end = start + 0x400;
+
+    MachTrapPair result;
+    result.native_port = mach_thread_self_trap_target();
+    if (result.native_port == 0) return result;
+
+    qbditrace_config_t cfg{};
+    cfg.struct_size = sizeof(cfg);
+    cfg.trace_start = start;
+    cfg.trace_end = end;
+    cfg.module_base = start;
+    cfg.module_name = "mach_thread_self_trap_target";
+    cfg.output_path = output_path;
+    cfg.record = QBDITRACE_REC_DEFAULT;
+    cfg.anchor_interval = 64;
+    cfg.disable_compress = 1;
+
+    if (qbditrace_configure(&cfg) != 0) return result;
+    uint64_t traced_port = 0;
+    const int rc = qbditrace_run_call(&traced_port, start, 0, nullptr);
+    qbditrace_stop();
+    if (rc != 0 || traced_port != result.native_port) return result;
+
+    FILE* f = fopen(output_path, "rb");
+    if (f == nullptr) return result;
+    qbditrace::qbditrace_file_header_t hdr{};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        !(hdr.flags & QBDITRACE_HF_CALL_META)) {
+        fclose(f);
+        return result;
+    }
+
+    qbditrace::qbditrace_svc_head_t matching_svc{};
+    bool have_svc = false;
+    for (int iter = 0; iter < 10000; ++iter) {
+        uint8_t kind = 0;
+        if (fread(&kind, 1, 1, f) != 1) break;
+        fseek(f, -1, SEEK_CUR);
+
+        if (kind == QBDITRACE_REC_INST) {
+            const bool has_fpr = (hdr.flags & QBDITRACE_HF_HAS_FPR) != 0;
+            const bool is_v5 = hdr.version >= 5 && (hdr.flags & QBDITRACE_HF_PC_DELTA) != 0;
+            uint8_t n_regdiff = 0, n_mem = 0, n_fprdiff = 0;
+            if (has_fpr && is_v5) {
+                qbditrace::qbditrace_inst_head_v7_v5_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (has_fpr) {
+                qbditrace::qbditrace_inst_head_v7_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (is_v5) {
+                qbditrace::qbditrace_inst_head_v5_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            } else {
+                qbditrace::qbditrace_inst_head_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            }
+            const size_t mem_size = (hdr.flags & QBDITRACE_HF_OLD_VALUE)
+                ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+                : sizeof(qbditrace::qbditrace_memacc_t);
+            fseek(f, (long)(n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t) +
+                            n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t) +
+                            n_mem * mem_size), SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_ANCHOR) {
+            qbditrace::qbditrace_anchor_head_t ah{};
+            if (fread(&ah, sizeof(ah), 1, f) != 1) break;
+            const size_t fpr_bytes = (hdr.flags & QBDITRACE_HF_HAS_FPR)
+                ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+            fseek(f, (long)(hdr.num_gpr * 8 + fpr_bytes), SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_CODE) {
+            qbditrace::qbditrace_code_head_t ch{};
+            if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            fseek(f, ch.size, SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_THREAD) {
+            qbditrace::qbditrace_thread_head_t th{};
+            if (fread(&th, sizeof(th), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_EVENT) {
+            qbditrace::qbditrace_event_head_t eh{};
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_SVC) {
+            qbditrace::qbditrace_svc_head_t sh{};
+            if (fread(&sh, sizeof(sh), 1, f) != 1) break;
+            if (sh.syscall_no == kThreadSelfTrap) {
+                matching_svc = sh;
+                have_svc = true;
+            }
+        } else if (kind == QBDITRACE_REC_RETVAL) {
+            qbditrace::qbditrace_retval_t rv{};
+            if (fread(&rv, sizeof(rv), 1, f) != 1) break;
+            if (rv.record_size > sizeof(rv))
+                fseek(f, (long)(rv.record_size - sizeof(rv)), SEEK_CUR);
+            if (have_svc && rv.source_kind == QBDITRACE_REC_SVC &&
+                rv.source_id == kThreadSelfTrap && rv.site == matching_svc.pc) {
+                result.found = true;
+                result.svc = matching_svc;
+                result.retval = rv;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+TEST_CASE("qbditrace: Mach thread_self_trap records return value (raw scan)",
+          "[integration][qbditrace][svc][mach]") {
+    const auto pair = run_mach_thread_self_trap("/tmp/qbditrace_test_mach_trap.bin");
+
+    REQUIRE(pair.native_port != 0);
+    REQUIRE(pair.found);
+    CHECK(pair.svc.syscall_no == kThreadSelfTrap);
+    CHECK(pair.retval.source_kind == QBDITRACE_REC_SVC);
+    CHECK(pair.retval.source_id == kThreadSelfTrap);
+    CHECK(pair.retval.site == pair.svc.pc);
+    CHECK(pair.retval.x0 != 0);
+    CHECK(pair.retval.x0 == pair.native_port);
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 TEST_CASE("qbditrace: real CAPI transfer records its return value",

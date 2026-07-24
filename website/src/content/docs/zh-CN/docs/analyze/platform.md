@@ -76,6 +76,12 @@ Tenet 从 Trace 头读取 `target_os`（`TraceFormat.h`，偏移 `0x138`，4 字
 
 **`REC_SVC`**（系统调用记录）捕获 supervisor-call 事件及 v8 flags。Darwin 上包括 `mach_msg`、`mach_vm_map`、`read`、`write` 等；Linux/Android 上包括 `ioctl`、`mmap`、`mprotect` 等。Tenet 按 `target_os` 选 syscall 表；Darwin 名称会归一化 class prefix，但保留原始编号。
 
+#### Darwin Mach trap
+
+Darwin SVC 的 `x16` 为负数时，`syscall_intercept` 使用 Mach trap 表而非 BSD syscall 表（例如 `thread_self_trap`、`task_for_pid`、`iokit_user_client_trap`、`mach_vm_protect`）。未映射的 trap 仍显示为 `mach_trap_N`；正数 BSD syscall 与 class prefix 的既有处理不变。
+
+对于携带发送消息的 `mach_msg_trap`、`mach_msg_overwrite_trap` 与 `mach_msg2_trap`，Tenet 会从可读 Mach 消息头的偏移 20 读取 `msgh_id`，并解析常用 MIG routine（Mach VM、task、thread、host、port、VM map、clock 系列）。解析成功的摘要形如 `mach_vm_protect via mach_msg_trap(msgh_id=0x12c2)`，JSON 额外给出 `mach_msgh_id` 与 `mach_msg_via`。未知 routine ID、纯接收消息或消息头不可读时会优雅降级为 trap 级结果。
+
 对 `REC_CAPICALL`、`REC_SVC` 与 ObjC，v8 `REC_RETVAL` 提供返回时刻真实 x0/x1/NZCV，按 site/target/source ID 精确关联。syscall 失败：Darwin 看 NZCV carry（bit 29），Linux 看 x0 是否在 `[-4095,-1]`；原生 SVC 不把环境 TLS `errno` 当作有效值。`SecKeyRef` 等 opaque 对象保持 opaque，不会误解为 key bytes。
 
 **`XFER_CALL` 启发式** 基于 `REC_EVENT` 记录中标记跨模块离开与返回的事件工作。当被追踪代码转移到录制范围外再返回时，tenet 重建一次合成调用。无符号解析，按目标 PC 标记。

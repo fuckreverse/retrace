@@ -20,7 +20,7 @@ using json = nlohmann::json;
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x53494341 ("SICA")
-//   u32  version = 3
+//   u32  version = 4
 //   u64  num_calls
 //   for each InterceptedCall:
 //     u64  inst_id
@@ -38,6 +38,7 @@ using json = nlohmann::json;
 //     u64  data_length
 //     u64  return_value
 //     u8   has_return
+//     u8   has_mach_msgh_id; if 1: u32 mach_msgh_id; u32 mach_msg_via_len; u8[] mach_msg_via
 //     u8   has_objc_ctx; if 1: u32 objc_len, u8[] objc_ctx
 //     u32  captured_string_count
 //     for each CapturedString:
@@ -49,7 +50,129 @@ using json = nlohmann::json;
 namespace {
 
 static constexpr uint32_t SICA_BLOB_MAGIC   = 0x53494341u;  // "SICA"
-static constexpr uint32_t SICA_BLOB_VERSION = 3u;
+static constexpr uint32_t SICA_BLOB_VERSION = 4u;
+
+const char* mig_routine_name(uint32_t msgh_id) {
+    // XNU MIG definitions, verified against apple-oss-distributions/xnu main:
+    // osfmk/mach/{mach_vm,task,thread_act,mach_port,vm_map,clock}.defs.
+    // The host subsystem's public definitions moved out of osfmk/mach upstream;
+    // retain only long-stable, high-confidence host message IDs here.
+    struct MigRoutineEntry { uint32_t id; const char* name; };
+    static constexpr MigRoutineEntry kMigRoutines[] = {
+        // host.defs (base 200)
+        {200, "host_info"}, {201, "host_kernel_version"},
+        {202, "host_get_io_master"}, {203, "host_page_size"},
+        {206, "host_processors"}, {209, "host_get_clock_service"},
+        {210, "host_get_clock_control"}, {211, "host_request_notification"},
+        {212, "host_statistics"}, {213, "host_statistics64"},
+        // mach_port.defs (base 3200)
+        {3200, "mach_port_names"}, {3201, "mach_port_type"},
+        {3203, "mach_port_rename"}, {3204, "mach_port_allocate_name"},
+        {3205, "mach_port_allocate"}, {3206, "mach_port_destroy"},
+        {3207, "mach_port_deallocate"}, {3208, "mach_port_get_refs"},
+        {3209, "mach_port_mod_refs"}, {3210, "mach_port_peek"},
+        {3211, "mach_port_set_mscount"}, {3213, "mach_port_move_member"},
+        {3214, "mach_port_request_notification"}, {3215, "mach_port_insert_right"},
+        {3216, "mach_port_extract_right"}, {3217, "mach_port_set_seqno"},
+        {3220, "mach_port_set_attributes"}, {3221, "mach_port_allocate_qos"},
+        {3222, "mach_port_allocate_full"}, {3223, "task_set_port_space"},
+        {3224, "mach_port_get_srights"}, {3226, "mach_port_dnrequest_info"},
+        {3228, "mach_port_kernel_object"}, {3229, "mach_port_insert_member"},
+        {3230, "mach_port_extract_member"}, {3232, "mach_port_set_context"},
+        {3234, "mach_port_construct"}, {3235, "mach_port_destruct"},
+        {3236, "mach_port_guard"}, {3237, "mach_port_unguard"},
+        // task.defs (base 3400)
+        {3400, "task_create"}, {3401, "task_terminate"}, {3402, "task_threads"},
+        {3403, "mach_ports_register"}, {3404, "mach_ports_lookup"},
+        {3405, "task_info"}, {3406, "task_set_info"}, {3407, "task_suspend"},
+        {3408, "task_resume"}, {3409, "task_get_special_port"},
+        {3410, "task_set_special_port"}, {3411, "thread_create"},
+        {3412, "thread_create_running"}, {3413, "task_set_exception_ports"},
+        {3414, "task_get_exception_ports"}, {3415, "task_swap_exception_ports"},
+        {3418, "lock_set_create"}, {3419, "lock_set_destroy"},
+        {3420, "semaphore_create"}, {3421, "semaphore_destroy"},
+        {3422, "task_policy_set"}, {3423, "task_policy_get"},
+        {3448, "task_get_state"}, {3449, "task_set_state"},
+        {3450, "task_set_phys_footprint_limit"},
+        // thread_act.defs (base 3600)
+        {3600, "thread_terminate"}, {3601, "act_get_state"},
+        {3602, "act_set_state"}, {3603, "thread_get_state"},
+        {3604, "thread_set_state"}, {3605, "thread_suspend"},
+        {3606, "thread_resume"}, {3607, "thread_abort"},
+        {3608, "thread_abort_safely"}, {3609, "thread_depress_abort"},
+        {3610, "thread_get_special_port"}, {3611, "thread_set_special_port"},
+        {3612, "thread_info"}, {3613, "thread_set_exception_ports"},
+        {3614, "thread_get_exception_ports"}, {3615, "thread_swap_exception_ports"},
+        // vm_map.defs (base 3800)
+        {3800, "vm_region"}, {3802, "vm_allocate"}, {3804, "vm_deallocate"},
+        {3806, "vm_protect"}, {3807, "vm_inherit"}, {3808, "vm_read"},
+        {3809, "vm_read_list"}, {3810, "vm_write"}, {3811, "vm_copy"},
+        {3812, "vm_read_overwrite"}, {3813, "vm_msync"},
+        {3814, "vm_behavior_set"}, {3815, "vm_map"},
+        // mach_vm.defs (base 4800)
+        {4800, "mach_vm_allocate"}, {4801, "mach_vm_deallocate"},
+        {4802, "mach_vm_protect"}, {4803, "mach_vm_inherit"},
+        {4804, "mach_vm_read"}, {4805, "mach_vm_read_list"},
+        {4806, "mach_vm_write"}, {4807, "mach_vm_copy"},
+        {4808, "mach_vm_read_overwrite"}, {4809, "mach_vm_msync"},
+        {4810, "mach_vm_behavior_set"}, {4811, "mach_vm_map"},
+        {4812, "mach_vm_machine_attribute"}, {4813, "mach_vm_remap"},
+        {4814, "mach_vm_page_query"}, {4815, "mach_vm_region_recurse"},
+        {4816, "mach_vm_region"},
+        // clock.defs (base 1000)
+        {1000, "clock_get_time"}, {1001, "clock_get_attributes"},
+        {1002, "clock_alarm"},
+    };
+    for (const auto& entry : kMigRoutines) {
+        if (entry.id == msgh_id) return entry.name;
+    }
+    return nullptr;
+}
+
+const char* mach_trap_name(int32_t trap_no) {
+    // XNU bsd/kern/syscalls.master and osfmk/kern/syscall_sw.c. KernelRPC
+    // prefixes are intentionally omitted to match the user-facing trap name.
+    struct MachTrapEntry {
+        int32_t number;
+        const char* name;
+    };
+    static constexpr MachTrapEntry kMachTraps[] = {
+        {-10, "mach_vm_allocate"}, {-11, "mach_vm_purgable_control"},
+        {-12, "mach_vm_deallocate"}, {-13, "task_dyld_process_info_notify_get"},
+        {-14, "mach_vm_protect"}, {-15, "mach_vm_map"}, {-16, "mach_port_allocate"},
+        {-18, "mach_port_deallocate"}, {-19, "mach_port_mod_refs"},
+        {-20, "mach_port_move_member"}, {-21, "mach_port_insert_right"},
+        {-22, "mach_port_insert_member"}, {-23, "mach_port_extract_member"},
+        {-24, "mach_port_construct"}, {-25, "mach_port_destruct"},
+        {-26, "mach_reply_port"}, {-27, "thread_self_trap"},
+        {-28, "task_self_trap"}, {-29, "host_self_trap"}, {-31, "mach_msg_trap"},
+        {-32, "mach_msg_overwrite_trap"}, {-33, "semaphore_signal_trap"},
+        {-34, "semaphore_signal_all_trap"}, {-35, "semaphore_signal_thread_trap"},
+        {-36, "semaphore_wait_trap"}, {-37, "semaphore_wait_signal_trap"},
+        {-38, "semaphore_timedwait_trap"}, {-39, "semaphore_timedwait_signal_trap"},
+        {-40, "mach_port_get_attributes"}, {-41, "mach_port_guard"},
+        {-42, "mach_port_unguard"}, {-43, "mach_generate_activity_id"},
+        {-44, "task_name_for_pid"}, {-45, "task_for_pid"}, {-46, "pid_for_task"},
+        {-47, "mach_msg2_trap"}, {-48, "macx_swapon"}, {-49, "macx_swapoff"},
+        {-50, "thread_get_special_reply_port"}, {-51, "macx_triggers"},
+        {-52, "macx_backing_store_suspend"}, {-53, "macx_backing_store_recovery"},
+        {-58, "pfz_exit"}, {-59, "swtch_pri"}, {-60, "swtch"},
+        {-61, "thread_switch"}, {-62, "clock_sleep_trap"},
+        {-63, "mach_vm_reclaim_update_kernel_accounting"},
+        {-70, "host_create_mach_voucher"}, {-72, "mach_voucher_extract_attr_recipe"},
+        {-76, "mach_port_type"}, {-77, "mach_port_request_notification"},
+        {-88, "exclaves_ctl"}, {-89, "mach_timebase_info_trap"},
+        {-90, "mach_wait_until_trap"}, {-91, "mk_timer_create_trap"},
+        {-92, "mk_timer_destroy_trap"}, {-93, "mk_timer_arm_trap"},
+        {-94, "mk_timer_cancel_trap"}, {-95, "mk_timer_arm_leeway_trap"},
+        {-96, "debug_control_port_for_pid"}, {-100, "iokit_user_client_trap"},
+    };
+
+    for (const auto& entry : kMachTraps) {
+        if (entry.number == trap_no) return entry.name;
+    }
+    return nullptr;
+}
 
 std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
     ByteWriter w;
@@ -83,6 +206,11 @@ std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
         if (c.raw_error) w.u64(static_cast<uint64_t>(*c.raw_error));
         w.u8(c.svc_flags);
         w.u8(c.from_capicall_record ? 1u : 0u);
+        w.u8(c.mach_msgh_id.has_value() ? 1u : 0u);
+        if (c.mach_msgh_id) {
+            w.u32(*c.mach_msgh_id);
+            w.str(c.mach_msg_via.value_or(""));
+        }
         w.opt_str(c.objc_context);
         w.u32(static_cast<uint32_t>(c.captured_strings.size()));
         for (const auto& captured : c.captured_strings) {
@@ -130,6 +258,12 @@ bool syscall_intercept_deserialize(const std::string& blob, SyscallInterceptResu
         if (r.u8() != 0) c.raw_error = static_cast<int64_t>(r.u64());
         c.svc_flags = r.u8();
         c.from_capicall_record = r.u8() != 0;
+        if (r.u8() != 0) {
+            c.mach_msgh_id = r.u32();
+            std::string via;
+            if (!r.str(via)) return false;
+            c.mach_msg_via = std::move(via);
+        }
         if (!r.opt_str(c.objc_context)) return false;
         uint32_t captured_string_count = r.u32();
         c.captured_strings.reserve(captured_string_count);
@@ -1080,9 +1214,16 @@ SyscallInterceptCollector::capi_entry(uint16_t api_id) {
 std::string SyscallInterceptCollector::syscall_name(uint64_t raw_syscall_no) const {
     uint64_t syscall_no = raw_syscall_no;
     if (target_os_ == qbditrace::QBDITRACE_OS_IOS) {
-        // Darwin selectors carry the syscall class in the high byte
-        // (for example 0x02000004 is BSD write). Preserve the raw selector on
-        // InterceptedCall, but use the normalized low 24 bits for lookup.
+        const auto signed_syscall_no = static_cast<int64_t>(raw_syscall_no);
+        if (signed_syscall_no < 0) {
+            const auto trap_no = static_cast<int32_t>(signed_syscall_no);
+            if (const char* name = mach_trap_name(trap_no)) return name;
+            return fmt::format("mach_trap_{}", signed_syscall_no);
+        }
+
+        // Darwin BSD selectors carry the syscall class in the high byte
+        // (for example 0x02000004 is BSD write). Mach traps are signed and
+        // must have returned above before this normalization.
         syscall_no &= 0x00ffffffULL;
         switch (syscall_no) {
         case 3: return "read";
@@ -1136,12 +1277,60 @@ void SyscallInterceptCollector::on_svc(uint64_t inst_id, const SvcView& svc) {
     call.decoded_summary = fmt::format(
         "{}(x0=0x{:x}, x1=0x{:x}, x2=0x{:x}, x3=0x{:x}) [raw={}]",
         call.callee_name, svc.args[0], svc.args[1], svc.args[2], svc.args[3],
-        svc.syscall_no);
+        static_cast<int64_t>(svc.syscall_no));
+    decode_mach_message(call, svc.syscall_no);
 
     const size_t idx = result_.calls.size();
     finalize_call(std::move(call));
     pending_returns_.push_back(
         {qbditrace::QBDITRACE_REC_SVC, svc.syscall_no, svc.pc, idx});
+}
+
+void SyscallInterceptCollector::decode_mach_message(InterceptedCall& call,
+                                                     uint64_t raw_syscall_no) {
+    if (target_os_ != qbditrace::QBDITRACE_OS_IOS) return;
+    const int64_t signed_syscall_no = static_cast<int64_t>(raw_syscall_no);
+    if (signed_syscall_no != -31 && signed_syscall_no != -32 && signed_syscall_no != -47) return;
+
+    // x1 is mach_msg option only for mach_msg_trap. A pure receive buffer does
+    // not contain an outbound MIG request, so never interpret it as one.
+    constexpr uint64_t kMachSendMsg = 0x1;
+    const std::string trap_name = call.callee_name;
+    uint32_t msgh_id = 0;
+
+    if (signed_syscall_no == -47) {
+        // XNU libsyscall/mach/mach_msg.c: mach_msg2_internal() forwards
+        // (data, option64, bits_and_send_size, remote_and_local_port,
+        // voucher_and_id, ...) directly to mach_msg2_trap(). Therefore the
+        // mach_msg2 ABI carries option64 in x1 and msgh_id in x4[31:0], not
+        // in a mach_msg_header_t addressed by x0.
+        if ((call.raw_args[1] & kMachSendMsg) == 0) return;
+        msgh_id = static_cast<uint32_t>(call.raw_args[4]);
+    } else {
+        if (signed_syscall_no == -31 && (call.raw_args[1] & kMachSendMsg) == 0) return;
+
+        const auto header = read_memory_at(call.raw_args[0], 24, call.inst_id);
+        if (header.size() < 24) {
+            call.decoded_summary += " (msgh unreadable)";
+            return;
+        }
+
+        msgh_id = static_cast<uint32_t>(header[20]) |
+            (static_cast<uint32_t>(header[21]) << 8) |
+            (static_cast<uint32_t>(header[22]) << 16) |
+            (static_cast<uint32_t>(header[23]) << 24);
+    }
+    if (const char* routine = mig_routine_name(msgh_id)) {
+        call.mach_msgh_id = msgh_id;
+        call.mach_msg_via = trap_name;
+        call.callee_name = routine;
+        call.decoded_summary = fmt::format(
+            "{} via {}(msgh_id=0x{:x})(x0=0x{:x}, x1=0x{:x}, x2=0x{:x}, x3=0x{:x}) [raw={}]",
+            routine, trap_name, msgh_id, call.raw_args[0], call.raw_args[1],
+            call.raw_args[2], call.raw_args[3], signed_syscall_no);
+    } else {
+        call.decoded_summary += fmt::format(" (msgh_id=0x{:x})", msgh_id);
+    }
 }
 
 void SyscallInterceptCollector::on_retval(uint64_t /*inst_id*/, const RetvalView& retval) {
@@ -1561,6 +1750,10 @@ std::string SyscallInterceptResult::to_json() const {
         cj["category"]    = api_category_str(c.category);
         cj["summary"]     = c.decoded_summary;
         cj["svc_flags"]   = c.svc_flags;
+        if (c.mach_msgh_id) {
+            cj["mach_msgh_id"] = *c.mach_msgh_id;
+            cj["mach_msg_via"] = c.mach_msg_via.value_or("");
+        }
         cj["has_return"]  = c.has_return;
         if (c.has_return) {
             cj["return_x0"] = fmt::format("0x{:X}", c.return_value);
