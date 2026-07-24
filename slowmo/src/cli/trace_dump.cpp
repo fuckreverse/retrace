@@ -54,6 +54,64 @@ static const char* mem_type_str(uint8_t type) {
     return "?";
 }
 
+static const char* retval_source_name(uint8_t source_kind) {
+    switch (source_kind) {
+    case qbditrace::QBDITRACE_REC_SVC:      return "svc";
+    case qbditrace::QBDITRACE_REC_OBJC:     return "objc";
+    case qbditrace::QBDITRACE_REC_CAPICALL: return "capi";
+    default:                                return "unknown";
+    }
+}
+
+static const char* unknown_return_label(bool has_call_metadata) {
+    return has_call_metadata ? "unknown" : "unknown (legacy)";
+}
+
+static std::string capi_name(uint16_t api_id) {
+    switch (api_id) {
+    case qbditrace::QBDITRACE_CAPI_MEMCPY: return "memcpy";
+    case 600: return "EVP_EncryptInit_ex";
+    case 601: return "EVP_EncryptUpdate";
+    case 602: return "EVP_EncryptFinal_ex";
+    case 603: return "EVP_DecryptInit_ex";
+    case 604: return "EVP_DecryptUpdate";
+    case 605: return "EVP_DecryptFinal_ex";
+    default:  return fmt::format("unknown_api_{}", api_id);
+    }
+}
+
+static const char* syscall_name(uint64_t raw_syscall_no, TargetOS target_os) {
+    if (target_os == TargetOS::iOS) {
+        switch (raw_syscall_no & 0x00ffffffULL) {
+        case 3:   return "read";
+        case 4:   return "write";
+        case 5:   return "open";
+        case 6:   return "close";
+        case 20:  return "getpid";
+        case 26:  return "ptrace";
+        case 29:  return "recv";
+        case 74:  return "mprotect";
+        case 97:  return "socket";
+        case 98:  return "connect";
+        case 133: return "send";
+        case 197: return "mmap";
+        case 463: return "openat";
+        default:  return "unknown";
+        }
+    }
+
+    switch (raw_syscall_no) {
+    case 56:  return "openat";
+    case 57:  return "close";
+    case 63:  return "read";
+    case 64:  return "write";
+    case 117: return "ptrace";
+    case 172: return "getpid";
+    case 198: return "socket";
+    default:  return "unknown";
+    }
+}
+
 // ─── JSON helpers ──────────────────────────────────────────────────────────
 
 static std::string json_escape(std::string_view s) {
@@ -351,13 +409,15 @@ Result<DumpStats> dump_trace(TraceReader& reader,
         case RecordKind::Svc: {
             auto sv = rec.as_svc();
             if (options.format == DumpFormat::Text) {
-                out << fmt::format("SVC pc=0x{:016X} no={}", sv.pc, sv.syscall_no);
+                out << fmt::format("SVC name={} raw_syscall_no={} pc=0x{:016X} return={}",
+                                   syscall_name(sv.syscall_no, hdr.target_os), sv.syscall_no, sv.pc,
+                                   unknown_return_label(rec.is_v8));
                 for (int a = 0; a < 6; a++) {
                     out << fmt::format(" arg{}=0x{:016X}", a, sv.args[a]);
                 }
                 out << "\n";
             } else {
-                out << fmt::format("{{\"type\":\"svc\",\"pc\":\"0x{:X}\",\"no\":{}", sv.pc, sv.syscall_no);
+                out << fmt::format("{{\"type\":\"svc\",\"name\":\"{}\",\"pc\":\"0x{:X}\",\"raw_syscall_no\":{},\"return\":null", syscall_name(sv.syscall_no, hdr.target_os), sv.pc, sv.syscall_no);
                 out << ",\"args\":[";
                 for (int a = 0; a < 6; a++) {
                     if (a > 0) out << ",";
@@ -370,23 +430,44 @@ Result<DumpStats> dump_trace(TraceReader& reader,
 
         case RecordKind::Objc: {
             auto ov = rec.as_objc();
+            const bool class_known = ov.cls[0] != '\0';
+            const char* selector_source = ov.is_v8 ? "inline" : "hex";
+            const char* selector_resolution = !ov.is_v8 ? "unresolved"
+                : (ov.flags & QBDITRACE_OBJC_FL_SEL_READ_FAIL) ? "read_failed"
+                : (ov.flags & QBDITRACE_OBJC_FL_SEL_TRUNCATED) ? "truncated"
+                : "resolved";
+            const bool is_stret = ov.variant == qbditrace::QBDITRACE_OBJC_MSGSEND_STRET;
             if (options.format == DumpFormat::Text) {
-                out << fmt::format("OBJC pc=0x{:016X} recv=0x{:016X} sel=0x{:016X} cls={}\n",
-                                   ov.pc, ov.recv, ov.sel, ov.cls);
+                out << fmt::format("OBJC pc=0x{:016X} recv=0x{:016X} sel=0x{:016X} class={} class_resolution={} selector={} selector_source={} selector_resolution={} return={}\n",
+                                   ov.pc, ov.recv, ov.sel,
+                                   class_known ? ov.cls : "unknown",
+                                   class_known ? "resolved" : "unknown",
+                                   ov.selector_name[0] != '\0' ? ov.selector_name : "unknown",
+                                   selector_source, selector_resolution,
+                                   is_stret ? "stret_raw" : unknown_return_label(ov.is_v8));
             } else {
                 out << fmt::format("{{\"type\":\"objc\",\"pc\":\"0x{:X}\","
                                    "\"recv\":\"0x{:X}\",\"sel\":\"0x{:X}\","
-                                   "\"cls\":\"{}\"}}\n",
-                                   ov.pc, ov.recv, ov.sel, json_escape(ov.cls));
+                                   "\"class\":{},\"class_resolution\":\"{}\","
+                                   "\"selector\":{},\"selector_source\":\"{}\","
+                                   "\"selector_resolution\":\"{}\",\"return_kind\":\"{}\",\"return\":null}}\n",
+                                   ov.pc, ov.recv, ov.sel,
+                                   class_known ? fmt::format("\"{}\"", json_escape(ov.cls)) : "null",
+                                   class_known ? "resolved" : "unknown",
+                                   ov.selector_name[0] != '\0' ? fmt::format("\"{}\"", json_escape(ov.selector_name)) : "null",
+                                   selector_source, selector_resolution,
+                                   is_stret ? "stret_raw" : unknown_return_label(ov.is_v8));
             }
             break;
         }
 
         case RecordKind::CapiCall: {
             auto cc = rec.as_capicall();
+            const auto api_name = capi_name(cc.api_id);
             if (options.format == DumpFormat::Text) {
-                out << fmt::format("CAPICALL api={} pc=0x{:016X} target=0x{:016X}\n",
-                                   static_cast<int>(cc.api_id), cc.pc, cc.target);
+                out << fmt::format("CAPICALL name={} api_id={} pc=0x{:016X} target=0x{:016X} return={}\n",
+                                   api_name, cc.api_id, cc.pc, cc.target,
+                                   unknown_return_label(cc.is_v8));
                 for (uint8_t a = 0; a < cc.arg_count && a < 8; a++) {
                     out << fmt::format("    arg{}=0x{:016X}\n", a, cc.args[a]);
                 }
@@ -398,9 +479,9 @@ Result<DumpStats> dump_trace(TraceReader& reader,
                                        json_escape(sv.data));
                 }
             } else {
-                out << fmt::format("{{\"type\":\"capicall\",\"api_id\":{},"
-                                   "\"pc\":\"0x{:X}\",\"target\":\"0x{:X}\"",
-                                   static_cast<int>(cc.api_id), cc.pc, cc.target);
+                out << fmt::format("{{\"type\":\"capicall\",\"name\":\"{}\",\"api_id\":{},"
+                                   "\"pc\":\"0x{:X}\",\"target\":\"0x{:X}\",\"return\":null",
+                                   api_name, cc.api_id, cc.pc, cc.target);
                 out << ",\"args\":[";
                 for (uint8_t a = 0; a < cc.arg_count && a < 8; a++) {
                     if (a > 0) out << ",";
@@ -417,6 +498,54 @@ Result<DumpStats> dump_trace(TraceReader& reader,
                                            json_escape(sv.data));
                     }
                     out << "]";
+                }
+                out << "}\n";
+            }
+            break;
+        }
+
+        case RecordKind::Retval: {
+            auto rv = rec.as_retval();
+const bool errno_valid = (rv.flags & QBDITRACE_RET_FL_ERRNO_VALID) != 0;
+// raw_error is only meaningful when the syscall actually failed:
+// Darwin sets the carry flag (nzcv bit 29) and returns errno in x0;
+// Linux returns -errno in x0 (range [-4095, -1]). Mirroring the pass
+// semantics avoids showing a successful return value as a fake error.
+const int64_t signed_x0 = static_cast<int64_t>(rv.x0);
+bool has_raw_error = false;
+int64_t raw_error = 0;
+if (rv.source_kind == qbditrace::QBDITRACE_REC_SVC) {
+    if (hdr.target_os == TargetOS::iOS && (rv.nzcv & (1u << 29)) != 0) {
+        has_raw_error = true;
+        raw_error = static_cast<int64_t>(rv.x0);
+    } else if (hdr.target_os != TargetOS::iOS &&
+               signed_x0 < 0 && signed_x0 >= -4095) {
+        has_raw_error = true;
+        raw_error = signed_x0;
+    }
+}
+            if (options.format == DumpFormat::Text) {
+                out << fmt::format("RETVAL source_kind={} source_id={} site=0x{:016X} target=0x{:016X} x0=0x{:016X}",
+                                   retval_source_name(rv.source_kind), rv.source_id,
+                                   rv.site, rv.target, rv.x0);
+                out << fmt::format(" errno_valid={}", errno_valid ? "true" : "false");
+                if (errno_valid) {
+                    out << fmt::format(" errno={}->{}", rv.errno_before, rv.errno_after);
+                }
+                if (has_raw_error) {
+                    out << fmt::format(" raw_error={}", raw_error);
+                }
+                out << "\n";
+            } else {
+                out << fmt::format("{{\"type\":\"retval\",\"source_kind\":\"{}\",\"source_id\":{},\"site\":\"0x{:X}\",\"target\":\"0x{:X}\",\"x0\":\"0x{:X}\",\"errno_valid\":{}",
+                                   retval_source_name(rv.source_kind), rv.source_id,
+                                   rv.site, rv.target, rv.x0,
+                                   errno_valid ? "true" : "false");
+                if (errno_valid) {
+                    out << fmt::format(",\"errno_before\":{},\"errno_after\":{}", rv.errno_before, rv.errno_after);
+                }
+                if (has_raw_error) {
+                    out << fmt::format(",\"raw_error\":{}", raw_error);
                 }
                 out << "}\n";
             }

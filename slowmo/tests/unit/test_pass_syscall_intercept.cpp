@@ -29,6 +29,7 @@
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/platform/syscall_intercept_pass.h"
+#include "common/byte_codec.h"
 #include <nlohmann/json.hpp>
 
 using namespace tenet;
@@ -220,8 +221,8 @@ static std::unique_ptr<TraceEnv> make_with_capicall_jni() {
     }, "si_capicall_jni_findclass");
 }
 
-/// Trace with two CAPICALL records to the *same* target: dedup must suppress
-/// the second one within the dedup window.
+/// Trace with two authoritative CAPICALL records to the same target. Both are
+/// real invocations and must remain independently matchable to RETVAL records.
 static std::unique_ptr<TraceEnv> make_with_capicall_dedup() {
     return make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
@@ -232,7 +233,7 @@ static std::unique_ptr<TraceEnv> make_with_capicall_dedup() {
         tw.emit_capicall(22, tw.rt(0x1004), 0xDEAD500ULL,
                          {0xA000ULL, 0xB000ULL}, {});
         tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
-        // Second call: same target 0xDEAD500 within dedup window → should be suppressed
+        // Second call: same target but a distinct call site and invocation.
         tw.emit_capicall(22, tw.rt(0x1008), 0xDEAD500ULL,
                          {0xC000ULL, 0xD000ULL}, {});
         tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
@@ -567,6 +568,81 @@ TEST_CASE("SyscallInterceptPass: CAPICALL with inline strings (strcmp)",
     }
 }
 
+TEST_CASE("SyscallInterceptPass: blob cache round-trip preserves captured strings",
+          "[unit][pass][syscall_intercept][capicall][cache]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+
+        TraceWriter::CapiStr text;
+        text.arg_idx = 0;
+        text.value = "complete";
+        TraceWriter::CapiStr binary;
+        binary.arg_idx = 2;
+        binary.flags = QBDITRACE_SF_TRUNCATED | QBDITRACE_SF_BINARY;
+        binary.value = std::string("\x01\x02\x03", 3);
+        tw.emit_capicall(22, tw.rt(0x1004), 0xDEAD600ULL,
+                         {0xA000ULL, 0xB000ULL, 0xC000ULL}, {text, binary});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_captured_strings_cache");
+    REQUIRE(env != nullptr);
+
+    auto pm1 = make_pm(*env);
+    pm1->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& fresh = pm1->require("syscall_intercept").get<SyscallInterceptResult>();
+    REQUIRE(fresh.calls.size() == 1);
+    REQUIRE(fresh.calls[0].captured_strings.size() == 2);
+
+    auto pm2 = make_pm(*env);
+    pm2->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& cached = pm2->require("syscall_intercept").get<SyscallInterceptResult>();
+    REQUIRE(cached.calls.size() == 1);
+    REQUIRE(cached.calls[0].captured_strings.size() == 2);
+
+    const auto& cached_text = cached.calls[0].captured_strings[0];
+    CHECK(cached_text.arg_idx == 0);
+    CHECK_FALSE(cached_text.truncated);
+    CHECK_FALSE(cached_text.binary);
+    CHECK(cached_text.value == "complete");
+
+    const auto& cached_binary = cached.calls[0].captured_strings[1];
+    CHECK(cached_binary.arg_idx == 2);
+    CHECK(cached_binary.truncated);
+    CHECK(cached_binary.binary);
+    CHECK(cached_binary.value == std::string({'\x01', '\x02', '\x03'}));
+}
+
+TEST_CASE("SyscallInterceptPass: v2 blob cache is treated as a miss",
+          "[unit][pass][syscall_intercept][cache]") {
+    auto env = make_with_capicall_strings();
+    REQUIRE(env != nullptr);
+
+    ByteWriter legacy_blob;
+    legacy_blob.u32(0x53494341u);  // "SICA"
+    legacy_blob.u32(2u);
+    legacy_blob.u64(0u);
+    env->index->save_pass_blob(
+        "syscall_intercept", legacy_blob.data().data(), legacy_blob.size());
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& result = pm->require("syscall_intercept").get<SyscallInterceptResult>();
+
+    REQUIRE(result.calls.size() == 1);
+    REQUIRE(result.calls[0].captured_strings.size() == 2);
+    CHECK(result.calls[0].captured_strings[0].value == "hello");
+    CHECK(result.calls[0].captured_strings[1].value == "world");
+
+    std::string refreshed_blob;
+    REQUIRE(env->index->load_pass_blob("syscall_intercept", refreshed_blob));
+    ByteReader reader(refreshed_blob);
+    CHECK(reader.u32() == 0x53494341u);
+    CHECK(reader.u32() == 3u);
+}
+
 // ─── B4. REC_CAPICALL — truncated string flag ────────────────────────────────
 
 TEST_CASE("SyscallInterceptPass: CAPICALL fopen with truncated path string",
@@ -631,10 +707,10 @@ TEST_CASE("SyscallInterceptPass: CAPICALL JNI FindClass name resolved",
     }
 }
 
-// ─── B6. CAPICALL dedup: same target within window → one record ──────────────
+// ─── B6. Repeated CAPICALL target remains distinct ──────────────────────────
 
-TEST_CASE("SyscallInterceptPass: CAPICALL dedup suppresses same target",
-          "[unit][pass][syscall_intercept][capicall][dedup]") {
+TEST_CASE("SyscallInterceptPass: repeated CAPICALL target remains distinct",
+          "[unit][pass][syscall_intercept][capicall]") {
     auto env = make_with_capicall_dedup();
     REQUIRE(env != nullptr);
 
@@ -646,9 +722,132 @@ TEST_CASE("SyscallInterceptPass: CAPICALL dedup suppresses same target",
 
     const auto& res = raw.get<SyscallInterceptResult>();
 
-    SECTION("only one call recorded (second deduplicated)") {
-        REQUIRE(res.total() == 1);
+    SECTION("both authoritative calls are recorded") {
+        REQUIRE(res.total() == 2);
+        REQUIRE(res.calls[0].raw_args[0] == 0xA000ULL);
+        REQUIRE(res.calls[1].raw_args[0] == 0xC000ULL);
     }
+}
+
+// ─── B7. v8 wide IDs, SVC metadata, and precise RETVAL association ──────────
+
+TEST_CASE("SyscallInterceptPass: v8 wide CAPI IDs resolve BoringSSL and JNI",
+          "[unit][pass][syscall_intercept][capicall][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_capicall_v8(600, tw.rt(0x1010), 0xA600, {1, 2, 3, 4, 5});
+        tw.emit_capicall_v8(700, tw.rt(0x1020), 0xA700, {6, 7, 8});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_wide_ids");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+    const auto& res = raw.get<SyscallInterceptResult>();
+    REQUIRE(res.total() == 2);
+    CHECK(res.calls[0].callee_name == "EVP_EncryptInit_ex");
+    CHECK(res.calls[0].category == ApiCategory::BoringSSL);
+    CHECK(res.calls[1].callee_name == "GetIntField");
+    CHECK(res.calls[1].category == ApiCategory::JNI);
+}
+
+TEST_CASE("SyscallInterceptPass: SVC exposes flags name return and errno semantics",
+          "[unit][pass][syscall_intercept][svc][retval][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_LINUX);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        const uint64_t site = tw.rt(0x1010);
+        tw.emit_svc(site, 64, 7, 0xBEEF,
+                    QBDITRACE_SVC_FL_MEM_OP | QBDITRACE_SVC_FL_FILE_OP);
+        tw.emit_retval(QBDITRACE_REC_SVC, 64, site, 0, tw.rt(0x1014),
+                       static_cast<uint64_t>(-5LL), 0x1234, 0xA0000000,
+                       11, 5, 64, true);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_svc_retval");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+    const auto& call = raw.get<SyscallInterceptResult>().calls.at(0);
+    CHECK(call.callee_name == "write");
+    CHECK(call.raw_args[0] == 7);              // receiver/input remains pre-call
+    CHECK(call.return_value == static_cast<uint64_t>(-5LL));
+    CHECK(call.return_x1 == 0x1234);
+    CHECK(call.return_nzcv == 0xA0000000);
+    CHECK(call.svc_flags == (QBDITRACE_SVC_FL_MEM_OP | QBDITRACE_SVC_FL_FILE_OP));
+    CHECK(call.has_return);
+    CHECK(call.errno_valid);
+    CHECK(call.errno_before == 11);
+    CHECK(call.errno_after == 5);
+    REQUIRE(call.raw_error.has_value());
+    CHECK(*call.raw_error == -5);
+    CHECK(call.decoded_summary.find("write(") != std::string::npos);
+    CHECK(call.decoded_summary.find("error=-5") != std::string::npos);
+}
+
+TEST_CASE("SyscallInterceptPass: Darwin class prefix is normalized but raw number retained",
+          "[unit][pass][syscall_intercept][svc][darwin]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_IOS);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_svc(tw.rt(0x1010), 0x02000004ULL, 3, 0xCAFE,
+                    QBDITRACE_SVC_FL_FILE_OP);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_darwin_syscall_name");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    const auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+    const auto& call = raw.get<SyscallInterceptResult>().calls.at(0);
+    CHECK(call.callee_name == "write");
+    CHECK(call.decoded_summary.find("raw=33554436") != std::string::npos);
+    CHECK_FALSE(call.has_return); // legacy/no matching RETVAL remains unknown
+}
+
+TEST_CASE("SyscallInterceptPass: interleaved returns match source kind site and source id",
+          "[unit][pass][syscall_intercept][retval][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        const uint64_t capi_site = tw.rt(0x1010);
+        const uint64_t svc_site = tw.rt(0x1020);
+        tw.emit_capicall_v8(700, capi_site, 0xA700, {0x1111, 2, 3});
+        tw.emit_svc(svc_site, 63, 9, 0x2222, QBDITRACE_SVC_FL_MEM_OP);
+        // Deliberately return in reverse/interleaved order.
+        tw.emit_retval(QBDITRACE_REC_SVC, 63, svc_site, 0, tw.rt(0x1024),
+                       0x3333, 0x44, 0, 0, 0, 63);
+        tw.emit_retval(QBDITRACE_REC_CAPICALL, 700, capi_site, 0xA700,
+                       tw.rt(0x1014), 0x7777, 0x88, 0x60000000,
+                       0, 0, 700);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_interleaved_returns");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+    const auto& calls = raw.get<SyscallInterceptResult>().calls;
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[0].callee_name == "GetIntField");
+    CHECK(calls[0].raw_args[0] == 0x1111);
+    CHECK(calls[0].return_value == 0x7777);
+    CHECK_FALSE(calls[0].errno_valid);
+    CHECK_FALSE(calls[0].raw_error.has_value());
+    CHECK(calls[1].callee_name == "read");
+    CHECK(calls[1].raw_args[0] == 9);
+    CHECK(calls[1].return_value == 0x3333);
 }
 
 // ─── C. Data structure integrity ─────────────────────────────────────────────

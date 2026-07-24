@@ -13,6 +13,7 @@ Tenet degrades gracefully when trace evidence is incomplete. This page documents
 | v4 | Baseline | All features |
 | v5 | `HF_PC_DELTA` | Reduced file size (pc_delta mode); Tenet auto-detects |
 | v7 | `HF_HAS_FPR` | FPR (NEON v0-v31) reconstruction |
+| v8 | `HF_CALL_META` (required; may combine with `HF_PC_DELTA` / `HF_HAS_FPR`) | Call metadata: true return values (`REC_RETVAL`), inline selectors, and wider API IDs |
 | v6 | `HF_OLD_VALUE` | Pre-write memory values (writer removed; no current trace produces this) |
 
 Tenet opens any trace with version ≥ 4.
@@ -61,6 +62,7 @@ Tenet opens any trace with version ≥ 4.
 | `REC_CAPICALL` records | Best quality | Heuristic fallback |
 | `REC_SVC` records | For syscall intercept | No syscall data |
 | `REC_OBJC` records | For ObjC messages | No ObjC analysis |
+| `REC_RETVAL` records | For true return values | Returns reported as unknown; legacy v4-v7 traces have no such records |
 | Darwin target | For ObjC / CryptoKit | Skipped on Android/Linux |
 
 ### Algorithm and pattern

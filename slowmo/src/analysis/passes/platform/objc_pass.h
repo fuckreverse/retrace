@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <ankerl/unordered_dense.h>
@@ -24,25 +23,57 @@ struct ObjcArg {
     std::optional<std::string> deref_str;   // dereferenced C-string if pointer
 };
 
+enum class ObjcSelectorSource : uint8_t {
+    Inline,
+    Image,
+    Memory,
+    Hex,
+};
+
+enum class ObjcSelectorResolution : uint8_t {
+    Resolved,
+    Truncated,
+    ReadFailed,
+    Unresolved,
+};
+
+enum class ObjcClassResolution : uint8_t {
+    Resolved,
+    Unknown,
+};
+
+enum class ObjcReturnKind : uint8_t {
+    None,
+    X0,
+    StretRaw,
+};
+
 /// A single Objective-C message send captured from the trace.
 struct ObjcMessage {
     uint64_t inst_id;           // inst_id of the surrounding instruction
     uint64_t pc;                // PC of the objc_msgSend call
     uint64_t receiver;          // receiver object address
     uint64_t selector;          // selector pointer
-    std::string class_name;     // resolved class name (from trace data)
-    std::string selector_name;  // selector name (from memory or hex fallback)
-    uint8_t variant;            // 0=msgSend, 1=stret, 2=super, etc.
+    std::string class_name;     // resolved class name (empty when unavailable)
+    std::string selector_name;  // selector name (or hex fallback)
+    ObjcClassResolution class_resolution = ObjcClassResolution::Unknown;
+    ObjcSelectorSource selector_source = ObjcSelectorSource::Hex;
+    ObjcSelectorResolution selector_resolution = ObjcSelectorResolution::Unresolved;
+    uint8_t variant;            // qbditrace_objc_variant_t
 
     /// Method arguments (x2-x7). Only populated when register state is available.
     std::array<ObjcArg, OBJC_MAX_ARGS> args{};
     uint8_t arg_count = 0;      // number of args based on selector colon count
 
-    /// Return value (x0 after the method returns).
-    /// Populated by looking at the register state at the next OBJC call or end of trace.
+    /// Return fact recorded by v8 REC_RETVAL. Legacy traces never synthesize one
+    /// from the pre-call receiver in x0. Stret keeps the raw architectural x0
+    /// but labels it separately from an ordinary scalar/object return.
     uint64_t return_value = 0;
-    std::optional<std::string> return_deref_str;  // dereferenced if pointer
+    uint64_t return_inst_id = 0;
+    std::optional<std::string> return_deref_str;
+    ObjcReturnKind return_kind = ObjcReturnKind::None;
     bool has_return = false;
+    bool is_stret = false;
 };
 
 // ─── ObjC class info ──────────────────────────────────────────────────────

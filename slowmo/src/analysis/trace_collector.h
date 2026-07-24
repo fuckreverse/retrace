@@ -52,6 +52,11 @@ public:
         (void)inst_id; (void)objc;
     }
 
+    /// Called for return facts emitted for ObjC/CAPI/SVC.
+    virtual void on_retval(uint64_t inst_id, const RetvalView& retval) {
+        (void)inst_id; (void)retval;
+    }
+
     /// Called for Thread records (thread context switch).
     virtual void on_thread(uint64_t inst_id, const ThreadView& thread) {
         (void)inst_id; (void)thread;

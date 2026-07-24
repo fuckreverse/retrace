@@ -116,29 +116,54 @@ SvcView RecordView::as_svc() const {
     v.pc = hdr->pc;
     v.syscall_no = hdr->syscall_no;
     v.args = hdr->args;
+    v.flags = hdr->reserved[0];
     return v;
 }
 
 ObjcView RecordView::as_objc() const {
-    const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_objc_head_t*>(raw_ptr);
     ObjcView v;
-    v.variant = hdr->variant;
-    v.pc = hdr->pc;
-    v.recv = hdr->recv;
-    v.sel = hdr->sel;
-    v.cls = hdr->cls;
+    v.is_v8 = is_v8;
+    if (is_v8) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_objc_head_v8_t*>(raw_ptr);
+        v.variant = hdr->variant;
+        v.sel_len = hdr->sel_len;
+        v.flags = hdr->flags;
+        v.pc = hdr->pc;
+        v.recv = hdr->recv;
+        v.sel = hdr->sel;
+        v.cls = hdr->cls;
+        v.selector_name = reinterpret_cast<const char*>(raw_ptr + sizeof(*hdr));
+    } else {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_objc_head_t*>(raw_ptr);
+        v.variant = hdr->variant;
+        v.pc = hdr->pc;
+        v.recv = hdr->recv;
+        v.sel = hdr->sel;
+        v.cls = hdr->cls;
+    }
     return v;
 }
 
 CapiCallView RecordView::as_capicall() const {
-    const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(raw_ptr);
     CapiCallView v;
-    v.api_id    = hdr->api_id;
-    v.arg_count = hdr->arg_count;
-    v.str_count = hdr->str_count;
-    v.pc        = hdr->pc;
-    v.target    = hdr->target;
-    v.args      = hdr->args;
+    v.is_v8 = is_v8;
+    if (is_v8) {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(raw_ptr);
+        v.api_id    = hdr->api_id;
+        v.arg_count = hdr->arg_count;
+        v.str_count = hdr->str_count;
+        v.pc        = hdr->pc;
+        v.target    = hdr->target;
+        v.args      = hdr->args;
+    } else {
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(raw_ptr);
+        v.api_id    = hdr->api_id;  // uint8_t -> uint16_t, zero-extended
+        v.arg_count = hdr->arg_count;
+        v.str_count = hdr->str_count;
+        v.pc        = hdr->pc;
+        v.target    = hdr->target;
+        v.args      = hdr->args;
+    }
     return v;
 }
 
@@ -147,6 +172,24 @@ ThreadView RecordView::as_thread() const {
     ThreadView v;
     v.thread_id = hdr->thread_id;
     return v;
+}
+
+RetvalView RecordView::as_retval() const {
+    qbditrace::qbditrace_retval_t hdr{};
+    std::memcpy(&hdr, raw_ptr, std::min(available_size, sizeof(hdr)));
+    int32_t errno_before = 0;
+    int32_t errno_after = 0;
+    constexpr size_t errno_extension_size = sizeof(int32_t) * 2;
+    if ((hdr.flags & QBDITRACE_RET_FL_ERRNO_VALID) != 0 &&
+        hdr.record_size >= sizeof(hdr) + errno_extension_size &&
+        available_size >= sizeof(hdr) + errno_extension_size) {
+        std::memcpy(&errno_before, raw_ptr + sizeof(hdr), sizeof(errno_before));
+        std::memcpy(&errno_after, raw_ptr + sizeof(hdr) + sizeof(errno_before),
+                    sizeof(errno_after));
+    }
+    return {hdr.source_kind, hdr.flags, hdr.aux_id, hdr.record_size,
+            hdr.source_id, hdr.site, hdr.target, hdr.resume, hdr.x0,
+            hdr.x1, hdr.nzcv, errno_before, errno_after, available_size};
 }
 
 size_t RecordView::byte_size(uint32_t num_gpr) const {
@@ -192,7 +235,7 @@ size_t RecordView::byte_size(uint32_t num_gpr) const {
     case RecordKind::Svc:
         return sizeof(qbditrace::qbditrace_svc_head_t);
     case RecordKind::Objc:
-        return sizeof(qbditrace::qbditrace_objc_head_t);
+        return as_objc().byte_size();
     case RecordKind::CapiCall: {
         auto cc = as_capicall();
         return cc.byte_size();
@@ -201,6 +244,8 @@ size_t RecordView::byte_size(uint32_t num_gpr) const {
         auto code = as_code();
         return code.byte_size();
     }
+    case RecordKind::Retval:
+        return as_retval().byte_size();
     }
     return 1;  // unknown kind, skip 1 byte (shouldn't happen)
 }
@@ -289,18 +334,34 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
         return Error::invalid_magic();
     }
 
-    // Accept v4, v5 (PC-delta), v6 (old-value), and v7 (FPR) trace files.
+    // Version tags describe the newest layout contract in use. CALL_META is
+    // strictly v8-only; v8 requires it and may compose with earlier layouts.
     const uint32_t ver = raw_hdr->version;
     const uint64_t flg = raw_hdr->flags;
+    const bool pc_delta = (flg & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+    const bool old_value = (flg & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+    const bool has_fpr = (flg & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+    const bool call_meta = (flg & qbditrace::QBDITRACE_HF_CALL_META) != 0;
     bool version_ok = false;
-    if (ver == TRACE_VERSION)
-        version_ok = true;  // v4 baseline
-    if (ver == QBDITRACE_VERSION_V5_PC_DELTA && (flg & qbditrace::QBDITRACE_HF_PC_DELTA))
-        version_ok = true;
-    if (ver == QBDITRACE_VERSION_V6_OLD_VALUE && (flg & qbditrace::QBDITRACE_HF_OLD_VALUE))
-        version_ok = true;
-    if (ver == QBDITRACE_VERSION_V7_HAS_FPR  && (flg & qbditrace::QBDITRACE_HF_HAS_FPR))
-        version_ok = true;
+    switch (ver) {
+    case TRACE_VERSION:
+        version_ok = !pc_delta && !old_value && !has_fpr && !call_meta;
+        break;
+    case QBDITRACE_VERSION_V5_PC_DELTA:
+        version_ok = pc_delta && !old_value && !has_fpr && !call_meta;
+        break;
+    case QBDITRACE_VERSION_V6_OLD_VALUE:
+        version_ok = old_value && !has_fpr && !call_meta;
+        break;
+    case QBDITRACE_VERSION_V7_HAS_FPR:
+        version_ok = has_fpr && !call_meta;
+        break;
+    case QBDITRACE_VERSION_V8_CALL_META:
+        version_ok = call_meta;
+        break;
+    default:
+        break;
+    }
     if (!version_ok) {
         uint32_t bad_version = raw_hdr->version;  // read before munmap
         reader.close();
@@ -619,11 +680,14 @@ RecordView TraceReader::record_at(uint64_t offset) const {
     rv.kind = static_cast<RecordKind>(ptr[0]);
     rv.file_offset = offset;
     rv.raw_ptr = ptr;
+    rv.available_size = offset < logical_size_
+        ? static_cast<size_t>(logical_size_ - offset) : 0;
     // Set format flags from header so byte_size() computes correct sizes
     // (e.g. v7 ANCHOR records include a 512-byte FPR snapshot).
     rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+    rv.is_v8 = (header_.flags & qbditrace::QBDITRACE_HF_WIDE_API_ID) != 0;
     return rv;
 }
 
@@ -633,17 +697,21 @@ RecordView TraceReader::Iterator::operator*() const {
     rv.kind = static_cast<RecordKind>(ptr[0]);
     rv.file_offset = offset_;
     rv.raw_ptr = ptr;
+    rv.available_size = offset_ < reader_->logical_size_
+        ? static_cast<size_t>(reader_->logical_size_ - offset_) : 0;
 
     const uint64_t flags = reader_->header_.flags;
     const bool use_pc_delta  = (flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool use_old_value = (flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     const bool use_fpr       = (flags & qbditrace::QBDITRACE_HF_HAS_FPR)   != 0;
+    const bool use_wide_api  = (flags & qbditrace::QBDITRACE_HF_WIDE_API_ID) != 0;
 
-    // Propagate is_v5 / is_v6 / is_v7 so as_inst() and mem_access() use
-    // the right struct layout.
+    // Propagate is_v5 / is_v6 / is_v7 / is_v8 so as_inst(), as_capicall()
+    // and mem_access() use the right struct layout.
     rv.is_v5 = use_pc_delta;
     rv.is_v6 = use_old_value;
     rv.is_v7 = use_fpr;
+    rv.is_v8 = use_wide_api;
 
     if (rv.kind == RecordKind::Inst && use_pc_delta) {
         // v5/v6+v5/v7+v5: reconstruct absolute PC from pc_delta.
@@ -668,6 +736,8 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
     // advance past it.  Uses thread-local reader when available to avoid
     // mutex contention on the shared BlockCacheReader.
 
+    if (offset_ >= reader_->logical_size_) return *this;
+    const size_t remaining = static_cast<size_t>(reader_->logical_size_ - offset_);
     const uint8_t* ptr = read_at(offset_);
     auto kind = static_cast<RecordKind>(ptr[0]);
     size_t rec_size = 0;
@@ -724,21 +794,55 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
         rec_size = sizeof(qbditrace::qbditrace_svc_head_t);
         break;
     case RecordKind::Objc:
-        rec_size = sizeof(qbditrace::qbditrace_objc_head_t);
+        if (remaining < (reader_->header_.has_call_meta()
+                ? sizeof(qbditrace::qbditrace_objc_head_v8_t)
+                : sizeof(qbditrace::qbditrace_objc_head_t))) {
+            rec_size = remaining;
+        } else {
+            rec_size = raw_record_size(ptr, reader_->header_, remaining);
+        }
         break;
     case RecordKind::CapiCall: {
         // Fixed header + variable-length string captures.
-        // capicall_head_t is 88 bytes; after it, str_count variable-length
-        // captures follow, each: capicall_str_t (4B) + padded content.
-        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
-        rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
-        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
-        for (uint8_t s = 0; s < cc->str_count; ++s) {
-            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
-            uint16_t data_bytes = sh->str_len + 1; // content + NUL
-            uint16_t padded = (data_bytes + 3u) & ~3u; // 4-byte alignment
-            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
-            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        // v8 and legacy fixed headers are both 88 bytes; field order differs.
+        const bool use_wide_api = (reader_->header_.flags & qbditrace::QBDITRACE_HF_WIDE_API_ID) != 0;
+        const size_t fixed_size = use_wide_api
+            ? sizeof(qbditrace::qbditrace_capicall_head_v8_t)
+            : sizeof(qbditrace::qbditrace_capicall_head_t);
+        if (remaining < fixed_size) {
+            rec_size = remaining;
+            break;
+        }
+        if (use_wide_api) {
+            const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(ptr);
+            rec_size = sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+            const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+            for (uint8_t s = 0; s < cc->str_count; ++s) {
+                if (rec_size + sizeof(qbditrace::qbditrace_capicall_str_t) > remaining) {
+                    rec_size = remaining;
+                    break;
+                }
+                const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                uint16_t data_bytes = sh->str_len + 1;
+                uint16_t padded = (data_bytes + 3u) & ~3u;
+                rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            }
+        } else {
+            const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+            rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
+            const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+            for (uint8_t s = 0; s < cc->str_count; ++s) {
+                if (rec_size + sizeof(qbditrace::qbditrace_capicall_str_t) > remaining) {
+                    rec_size = remaining;
+                    break;
+                }
+                const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                uint16_t data_bytes = sh->str_len + 1;
+                uint16_t padded = (data_bytes + 3u) & ~3u;
+                rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            }
         }
         break;
     }
@@ -746,15 +850,29 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
         rec_size = sizeof(qbditrace::qbditrace_code_head_t)
             + ptr[1]; // code_size is the 2nd byte
         break;
+    case RecordKind::Retval:
+        if (remaining < offsetof(qbditrace::qbditrace_retval_t, source_id)) {
+            rec_size = remaining;
+        } else {
+            const auto* rv = reinterpret_cast<const qbditrace::qbditrace_retval_t*>(ptr);
+            rec_size = std::max<size_t>(rv->record_size,
+                                        sizeof(qbditrace::qbditrace_retval_t));
+        }
+        break;
     default:
         // Fallback: parse via RecordView (shouldn't happen in valid traces)
         rec_size = reader_->record_at(offset_).byte_size(reader_->header_.num_gpr);
         break;
     }
 
+    // A malformed/truncated variable record must never advance or prefetch
+    // beyond the logical stream. Consume the remainder as one terminal record.
+    rec_size = std::min(rec_size, remaining);
+    if (rec_size == 0) rec_size = remaining;
+
     // Prefetch hint — only useful in mmap mode; harmless in block mode
     // (the address may be in a different decompressed block anyway).
-    if (!reader_->is_block_mode()) {
+    if (!reader_->is_block_mode() && rec_size < remaining) {
         __builtin_prefetch(ptr + rec_size, 0, 1);
     }
 

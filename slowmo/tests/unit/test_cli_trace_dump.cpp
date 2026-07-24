@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "analysis/passes/platform/objc_pass.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "cli/trace_dump.h"
 #include "cli_options.h"
 #include "fixtures/trace_fixture.h"
@@ -42,6 +44,7 @@ TEST_CASE("dump_trace text includes core sections", "[unit][cli][dump]") {
         tw.emit_event(QBDITRACE_EV_XFER_CALL, tw.rt(0x2000), tw.rt(0x1000));
         tw.emit_svc(tw.rt(0x1000), 0x80, 0x11, 0x22);
         tw.emit_objc(tw.rt(0x1000), 0x1234, 0x5678, "DemoCls");
+        tw.emit_objc(tw.rt(0x1004), 0x4321, 0x8765, "");
         tw.emit_capicall(QBDITRACE_CAPI_MEMCPY, tw.rt(0x1000), tw.rt(0x3000),
                          {0x1, 0x2, 0x3}, {{0, 0, "abc"}});
 
@@ -68,9 +71,148 @@ TEST_CASE("dump_trace text includes core sections", "[unit][cli][dump]") {
     REQUIRE(s.find("mem") != std::string::npos);
     REQUIRE(s.find("THREAD") != std::string::npos);
     REQUIRE(s.find("EVENT") != std::string::npos);
-    REQUIRE(s.find("SVC") != std::string::npos);
-    REQUIRE(s.find("OBJC") != std::string::npos);
-    REQUIRE(s.find("CAPICALL") != std::string::npos);
+    REQUIRE(s.find("SVC name=unknown raw_syscall_no=128") != std::string::npos);
+    REQUIRE(s.find("return=unknown (legacy)") != std::string::npos);
+    REQUIRE(s.find("class=unknown class_resolution=unknown") != std::string::npos);
+    REQUIRE(s.find("selector_source=hex selector_resolution=unresolved return=unknown (legacy)") != std::string::npos);
+    REQUIRE(s.find("CAPICALL name=memcpy api_id=1") != std::string::npos);
+    REQUIRE(s.find("CAPICALL name=memcpy api_id=1 pc=") != std::string::npos);
+    REQUIRE(s.find("RETVAL") == std::string::npos);
+}
+
+TEST_CASE("dump_trace labels ObjC stret return as raw", "[unit][cli][dump][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8();
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND_STRET, tw.rt(0x2200),
+                        0x1234, 0x5678, "", "buildValue");
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND_STRET,
+                       tw.rt(0x2200), 0x9000, tw.rt(0x2204),
+                       0xDEADBEEF, 0, 0, 0, 0,
+                       QBDITRACE_OBJC_MSGSEND_STRET);
+    }, "dump_v8_objc_stret");
+    REQUIRE(env != nullptr);
+
+    std::ostringstream os;
+    DumpOptions options;
+    options.format = DumpFormat::Text;
+    REQUIRE(dump_trace(*env->reader, options, os).has_value());
+
+    const auto output = os.str();
+    CHECK(output.find("class=unknown class_resolution=unknown") != std::string::npos);
+    CHECK(output.find("selector=buildValue selector_source=inline selector_resolution=resolved return=stret_raw") != std::string::npos);
+    CHECK(output.find("return=unknown (legacy)") == std::string::npos);
+    CHECK(output.find("RETVAL source_kind=objc source_id=3") != std::string::npos);
+    CHECK(output.find("x0=0x00000000DEADBEEF") != std::string::npos);
+}
+
+TEST_CASE("v8 call metadata crosses reader passes and trace dump",
+          "[unit][cli][dump][v8]") {
+    constexpr uint64_t objc_return = 0xA0B0C0D0E0F00123ULL;
+    constexpr uint64_t capi_return = 0x1122334455667788ULL;
+    constexpr uint64_t svc_return = static_cast<uint64_t>(-5LL);
+    constexpr uint64_t objc_site = 0x5000;
+    constexpr uint64_t capi_site = 0x5004;
+    constexpr uint64_t svc_site = 0x5008;
+
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8();
+        MachineState ms;
+        ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x0FF0, enc::nop(), {{33, tw.rt(0x0FF4)}}, {});
+
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(objc_site),
+                        0x1234, 0x5678, "DemoCls", "computeValue:");
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                       tw.rt(objc_site), 0x9000, tw.rt(objc_site + 4),
+                       objc_return, 0, 0, 0, 0,
+                       QBDITRACE_OBJC_MSGSEND);
+
+        tw.emit_capicall_v8(600, tw.rt(capi_site), tw.rt(0x3000),
+                            {1, 2, 3, 4, 5}, {{1, 0, "payload"}});
+        tw.emit_retval(QBDITRACE_REC_CAPICALL, 600, tw.rt(capi_site),
+                       tw.rt(0x3000), tw.rt(capi_site + 4),
+                       capi_return, 0x99, 0x40000000, 0, 0, 600);
+
+        tw.emit_svc(tw.rt(svc_site), 64, 7, 0xBEEF,
+                    QBDITRACE_SVC_FL_MEM_OP | QBDITRACE_SVC_FL_FILE_OP);
+        tw.emit_retval(QBDITRACE_REC_SVC, 64, tw.rt(svc_site), 0,
+                       tw.rt(svc_site + 4), svc_return, 0x55, 0,
+                       11, 5, 64, true);
+        tw.emit(ms, 0x0FF4, enc::nop(), {{33, tw.rt(0x0FF8)}}, {});
+    }, "dump_v8_complete_calls");
+    REQUIRE(env != nullptr);
+
+    SECTION("TraceReader preserves every source identity and real return") {
+        bool saw_objc = false;
+        bool saw_capi = false;
+        bool saw_svc = false;
+        for (auto it = env->reader->begin(); it != env->reader->end(); ++it) {
+            const auto rec = *it;
+            if (rec.kind != RecordKind::Retval) continue;
+            const auto rv = rec.as_retval();
+            if (rv.source_kind == QBDITRACE_REC_OBJC) {
+                saw_objc = true;
+                CHECK(rv.source_id == QBDITRACE_OBJC_MSGSEND);
+                CHECK(rv.x0 == objc_return);
+            } else if (rv.source_kind == QBDITRACE_REC_CAPICALL) {
+                saw_capi = true;
+                CHECK(rv.source_id == 600);
+                CHECK(rv.x0 == capi_return);
+            } else if (rv.source_kind == QBDITRACE_REC_SVC) {
+                saw_svc = true;
+                CHECK(rv.source_id == 64);
+                CHECK(rv.x0 == svc_return);
+            }
+        }
+        CHECK(saw_objc);
+        CHECK(saw_capi);
+        CHECK(saw_svc);
+    }
+
+    SECTION("platform passes expose selector names and recorded returns") {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<ObjcPass>());
+        pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+        const auto& objc = pm->require("objc").get<ObjcResult>();
+        REQUIRE(objc.messages.size() == 1);
+        CHECK(objc.messages[0].selector_name == "computeValue:");
+        CHECK(objc.messages[0].has_return);
+        CHECK(objc.messages[0].return_value == objc_return);
+
+        const auto& calls = pm->require("syscall_intercept")
+                                .get<SyscallInterceptResult>().calls;
+        REQUIRE(calls.size() == 2);
+        CHECK(calls[0].callee_name == "EVP_EncryptInit_ex");
+        CHECK(calls[0].has_return);
+        CHECK(calls[0].return_value == capi_return);
+        CHECK(calls[1].callee_name == "syscall_64");
+        CHECK(calls[1].has_return);
+        CHECK(calls[1].return_value == svc_return);
+        CHECK(calls[1].errno_valid);
+        CHECK(calls[1].errno_after == 5);
+    }
+
+    SECTION("trace dump emits selector names and real return values") {
+        std::ostringstream os;
+        DumpOptions options;
+        options.format = DumpFormat::Text;
+        REQUIRE(dump_trace(*env->reader, options, os).has_value());
+        const auto output = os.str();
+        CHECK(output.find("selector=computeValue: selector_source=inline selector_resolution=resolved") != std::string::npos);
+        CHECK(output.find("CAPICALL name=EVP_EncryptInit_ex api_id=600") != std::string::npos);
+        CHECK(output.find("SVC name=write raw_syscall_no=64") != std::string::npos);
+        CHECK(output.find("return=unknown (legacy)") == std::string::npos);
+        CHECK(output.find("return=unknown\n") != std::string::npos);
+        CHECK(output.find("RETVAL source_kind=objc source_id=0") != std::string::npos);
+        CHECK(output.find("site=0x") != std::string::npos);
+        CHECK(output.find("target=0x0000000000009000 x0=0xA0B0C0D0E0F00123") != std::string::npos);
+        CHECK(output.find("RETVAL source_kind=capi source_id=600") != std::string::npos);
+        CHECK(output.find("x0=0x1122334455667788") != std::string::npos);
+        CHECK(output.find("RETVAL source_kind=svc source_id=64") != std::string::npos);
+        CHECK(output.find("target=0x0000000000000000 x0=0xFFFFFFFFFFFFFFFB") != std::string::npos);
+        CHECK(output.find("errno_valid=true errno=11->5 raw_error=-5") != std::string::npos);
+    }
 }
 
 TEST_CASE("dump_trace jsonl limit and no-regs/no-mem", "[unit][cli][dump]") {

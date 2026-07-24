@@ -134,6 +134,39 @@ static std::optional<std::string> try_decode_reg_ascii(uint64_t value) {
     return str;
 }
 
+static const char* selector_source_name(ObjcSelectorSource source) {
+    switch (source) {
+    case ObjcSelectorSource::Inline: return "inline";
+    case ObjcSelectorSource::Image:  return "image";
+    case ObjcSelectorSource::Memory: return "memory";
+    case ObjcSelectorSource::Hex:    return "hex";
+    }
+    return "hex";
+}
+
+static const char* selector_resolution_name(ObjcSelectorResolution resolution) {
+    switch (resolution) {
+    case ObjcSelectorResolution::Resolved:   return "resolved";
+    case ObjcSelectorResolution::Truncated:  return "truncated";
+    case ObjcSelectorResolution::ReadFailed: return "read_failed";
+    case ObjcSelectorResolution::Unresolved: return "unresolved";
+    }
+    return "unresolved";
+}
+
+static const char* class_resolution_name(ObjcClassResolution resolution) {
+    return resolution == ObjcClassResolution::Resolved ? "resolved" : "unknown";
+}
+
+static const char* return_kind_name(ObjcReturnKind kind) {
+    switch (kind) {
+    case ObjcReturnKind::None:     return "none";
+    case ObjcReturnKind::X0:       return "x0";
+    case ObjcReturnKind::StretRaw: return "stret_raw";
+    }
+    return "none";
+}
+
 // ─── ObjcResult::to_json ─────────────────────────────────────────────────
 
 nlohmann::json ObjcResult::to_json() const {
@@ -152,8 +185,13 @@ nlohmann::json ObjcResult::to_json() const {
         m["receiver"] = fmt::format("0x{:x}", msg.receiver);
         m["selector"] = fmt::format("0x{:x}", msg.selector);
         m["class_name"] = msg.class_name;
+        m["class_resolution"] = class_resolution_name(msg.class_resolution);
         m["selector_name"] = msg.selector_name;
+        m["selector_source"] = selector_source_name(msg.selector_source);
+        m["selector_resolution"] = selector_resolution_name(msg.selector_resolution);
         m["variant"] = msg.variant;
+        m["is_stret"] = msg.is_stret;
+        m["return_kind"] = return_kind_name(msg.return_kind);
 
         // Arguments
         if (msg.arg_count > 0) {
@@ -175,6 +213,7 @@ nlohmann::json ObjcResult::to_json() const {
         if (msg.has_return) {
             json ret;
             ret["value"] = fmt::format("0x{:x}", msg.return_value);
+            ret["inst_id"] = msg.return_inst_id;
             if (msg.return_deref_str.has_value()) {
                 ret["string"] = *msg.return_deref_str;
             }
@@ -223,7 +262,7 @@ nlohmann::json ObjcResult::to_json() const {
 namespace {
 
 static constexpr uint32_t OBJC_BLOB_MAGIC   = 0x4F424A43u;  // "OBJC"
-static constexpr uint32_t OBJC_BLOB_VERSION  = 1u;
+static constexpr uint32_t OBJC_BLOB_VERSION  = 2u;
 
 std::string objc_serialize(const ObjcResult& res) {
     ByteWriter w;
@@ -239,8 +278,12 @@ std::string objc_serialize(const ObjcResult& res) {
         w.u64(msg.selector);
         w.str(msg.class_name);
         w.str(msg.selector_name);
+        w.u8(static_cast<uint8_t>(msg.class_resolution));
+        w.u8(static_cast<uint8_t>(msg.selector_source));
+        w.u8(static_cast<uint8_t>(msg.selector_resolution));
         w.u8(msg.variant);
         w.u8(msg.arg_count);
+        w.u8(msg.is_stret ? 1 : 0);
 
         uint8_t n = std::min(msg.arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
         for (uint8_t k = 0; k < n; ++k) {
@@ -249,8 +292,10 @@ std::string objc_serialize(const ObjcResult& res) {
         }
 
         w.u8(msg.has_return ? 1 : 0);
+        w.u8(static_cast<uint8_t>(msg.return_kind));
         if (msg.has_return) {
             w.u64(msg.return_value);
+            w.u64(msg.return_inst_id);
             w.opt_str(msg.return_deref_str);
         }
     }
@@ -275,8 +320,12 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
         msg.selector      = r.u64();
         r.str(msg.class_name);
         r.str(msg.selector_name);
+        msg.class_resolution = static_cast<ObjcClassResolution>(r.u8());
+        msg.selector_source = static_cast<ObjcSelectorSource>(r.u8());
+        msg.selector_resolution = static_cast<ObjcSelectorResolution>(r.u8());
         msg.variant       = r.u8();
         msg.arg_count     = r.u8();
+        msg.is_stret      = r.u8() != 0;
 
         uint8_t n = std::min(msg.arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
         for (uint8_t k = 0; k < n; ++k) {
@@ -286,8 +335,10 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
 
         uint8_t has_ret = r.u8();
         msg.has_return = (has_ret != 0);
+        msg.return_kind = static_cast<ObjcReturnKind>(r.u8());
         if (msg.has_return) {
             msg.return_value = r.u64();
+            msg.return_inst_id = r.u64();
             r.opt_str(msg.return_deref_str);
         }
 
@@ -310,8 +361,8 @@ bool objc_deserialize(const std::string& blob, ObjcResult& out) {
 /// ::tenet::raw_record_size from trace_reader.h (handles all 8 record types
 /// and all 4 INST header formats: v4, v5, v7, v7+v5).
 inline size_t objc_raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
-                                   bool is_v5, bool is_v6, bool is_v7) {
-    return raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7);
+                                   bool is_v5, bool is_v6, bool is_v7, bool is_v8) {
+    return raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
 }
 
 }  // anonymous namespace
@@ -366,6 +417,7 @@ PassResult ObjcPass::run(PassContext& ctx) {
     const bool is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     const bool is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     const bool is_v7 = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+    const bool is_v8 = (reader.header().flags & qbditrace::QBDITRACE_HF_CALL_META) != 0;
     const size_t inst_hdr_sz = inst_header_size(is_v5, is_v7);
     const size_t fprdiff_sz = is_v7
         ? sizeof(qbditrace::qbditrace_fprdiff_t)          // 24 bytes
@@ -381,13 +433,24 @@ PassResult ObjcPass::run(PassContext& ctx) {
     uint64_t offset = header_size;
     uint64_t inst_id = 0;
 
-    // Selector name cache (still per-pass: selector refs are image addresses
-    // that StringResolver's PageStats may not cover).
-    ankerl::unordered_dense::map<uint64_t, std::string> sel_name_cache;
+    struct SelectorInfo {
+        std::string name;
+        ObjcSelectorSource source = ObjcSelectorSource::Hex;
+        ObjcSelectorResolution resolution = ObjcSelectorResolution::Unresolved;
+    };
+    // Legacy selector resolution is cached by selector pointer. v8 inline
+    // metadata is authoritative per record and deliberately bypasses it.
+    ankerl::unordered_dense::map<uint64_t, SelectorInfo> legacy_sel_cache;
     // String deref cache is now delegated to StringResolver (cross-pass
     // positive + negative caching), eliminating the per-pass deref_cache.
 
     ObjcResult result;
+    struct PendingObjc {
+        uint64_t site;
+        uint16_t variant;
+        std::optional<size_t> message_index;
+    };
+    std::vector<PendingObjc> pending_objc;
 
     auto cached_deref = [&](uint64_t addr, uint64_t at_inst_id) -> std::optional<std::string> {
         if (!is_likely_pointer(addr)) return std::nullopt;
@@ -432,20 +495,31 @@ PassResult ObjcPass::run(PassContext& ctx) {
         } else if (kind == 5) { // OBJC — the record we actually care about
             if (inst_id >= start && inst_id < end) {
                 const auto* oh = reinterpret_cast<const qbditrace::qbditrace_objc_head_t*>(ptr);
+                const auto* oh8 = is_v8
+                    ? reinterpret_cast<const qbditrace::qbditrace_objc_head_v8_t*>(ptr)
+                    : nullptr;
 
                 // Extract class name early for filtering
                 std::string cls_name = extract_class_name(oh->cls);
+                const bool class_matches = class_filter_.empty() || cls_name == class_filter_;
+                bool message_recorded = false;
 
-                if (class_filter_.empty() || cls_name == class_filter_) {
+                if (class_matches) {
                     ObjcMessage msg;
                     msg.inst_id   = inst_id;
                     msg.pc        = oh->pc;
                     msg.receiver  = oh->recv;
                     msg.selector  = oh->sel;
                     msg.variant   = oh->variant;
+                    msg.is_stret  = oh->variant == qbditrace::QBDITRACE_OBJC_MSGSEND_STRET;
                     msg.class_name = std::move(cls_name);
+                    msg.class_resolution = msg.class_name.empty()
+                        ? ObjcClassResolution::Unknown
+                        : ObjcClassResolution::Resolved;
 
-                    // Resolve selector name — cached by address.
+                    // Resolve selector name. v8's online payload is
+                    // authoritative; only legacy records use offline image /
+                    // memory fallback.
                     //
                     // `inst_id` here is the raw scan counter: the number of INST
                     // records already processed when this OBJC record was
@@ -462,16 +536,47 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     // `inst_id - 1` here (as a prior version of this code did)
                     // under-counts by one instruction and silently drops the
                     // most recently-written argument/selector-string byte.
-                    auto [sel_it, sel_inserted] = sel_name_cache.emplace(oh->sel, std::string{});
-                    if (sel_inserted) {
-                        auto img_str = code_table.image_read_cstring(oh->sel);
-                        if (img_str.has_value()) {
-                            sel_it->second = std::move(*img_str);
+                    if (oh8) {
+                        if (oh8->sel_len > 0) {
+                            msg.selector_name.assign(
+                                reinterpret_cast<const char*>(ptr + sizeof(*oh8)),
+                                oh8->sel_len);
+                            msg.selector_source = ObjcSelectorSource::Inline;
+                            msg.selector_resolution =
+                                (oh8->flags & QBDITRACE_OBJC_FL_SEL_TRUNCATED)
+                                    ? ObjcSelectorResolution::Truncated
+                                    : ObjcSelectorResolution::Resolved;
                         } else {
-                            sel_it->second = read_cstring_from_memory(memory, oh->sel, inst_id);
+                            msg.selector_name = fmt::format("0x{:x}", oh->sel);
+                            msg.selector_source = ObjcSelectorSource::Hex;
+                            msg.selector_resolution =
+                                (oh8->flags & QBDITRACE_OBJC_FL_SEL_READ_FAIL)
+                                    ? ObjcSelectorResolution::ReadFailed
+                                    : ObjcSelectorResolution::Unresolved;
                         }
+                    } else {
+                        auto [sel_it, inserted] = legacy_sel_cache.emplace(oh->sel, SelectorInfo{});
+                        if (inserted) {
+                            auto img_str = code_table.image_read_cstring(oh->sel);
+                            if (img_str.has_value()) {
+                                sel_it->second.name = std::move(*img_str);
+                                sel_it->second.source = ObjcSelectorSource::Image;
+                                sel_it->second.resolution = ObjcSelectorResolution::Resolved;
+                            } else {
+                                sel_it->second.name = read_cstring_from_memory(memory, oh->sel, inst_id);
+                                if (sel_it->second.name.rfind("0x", 0) == 0) {
+                                    sel_it->second.source = ObjcSelectorSource::Hex;
+                                    sel_it->second.resolution = ObjcSelectorResolution::Unresolved;
+                                } else {
+                                    sel_it->second.source = ObjcSelectorSource::Memory;
+                                    sel_it->second.resolution = ObjcSelectorResolution::Resolved;
+                                }
+                            }
+                        }
+                        msg.selector_name = sel_it->second.name;
+                        msg.selector_source = sel_it->second.source;
+                        msg.selector_resolution = sel_it->second.resolution;
                     }
-                    msg.selector_name = sel_it->second;
 
                     // Apply selector filter if set (substring match)
                     if (!selector_filter_.empty() &&
@@ -487,10 +592,6 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     }
                     msg.arg_count = std::min(sel_arg_count, static_cast<uint8_t>(OBJC_MAX_ARGS));
 
-                    // Fetch register state once — reused for both argument
-                    // extraction (x2-x7) and return-value capture (x0).
-                    // Previously this was two separate state_before() calls
-                    // for the same inst_id, doubling the checkpoint replay cost.
                     RegState pre_regs = regfile.state_before(inst_id);
 
                     for (uint8_t k = 0; k < msg.arg_count; ++k) {
@@ -502,16 +603,8 @@ PassResult ObjcPass::run(PassContext& ctx) {
                         }
                     }
 
-                    // Extract return value (x0 at the call site)
-                    {
-                        msg.return_value = pre_regs.gpr[0];
-                        msg.return_deref_str = cached_deref(pre_regs.gpr[0], inst_id);
-                        auto reg_str = try_decode_reg_ascii(pre_regs.gpr[0]);
-                        if (reg_str.has_value() && !msg.return_deref_str.has_value()) {
-                            msg.return_deref_str = std::move(reg_str);
-                        }
-                        msg.has_return = true;
-                    }
+                    // Return values are attached only from v8 REC_RETVAL below.
+                    // In particular, pre-call x0 is the receiver, not a return.
 
                     // Update class info
                     size_t msg_idx = result.messages.size();
@@ -524,16 +617,55 @@ PassResult ObjcPass::run(PassContext& ctx) {
                     // Index by PC
                     result.by_pc[msg.pc].push_back(msg_idx);
 
-                    // Store message
+                    // Store message and retain its LIFO return association.
                     result.messages.push_back(std::move(msg));
+                    message_recorded = true;
+                    if (is_v8) {
+                        pending_objc.push_back({oh->pc, oh->variant, msg_idx});
+                    }
                     }  // end argument extraction scope
-                skip_objc:;
+                skip_objc:
+                    if (is_v8 && !message_recorded) {
+                        // A selector filter may exclude this call. Keep a
+                        // placeholder so its nested return cannot be attached
+                        // to an older visible message.
+                        pending_objc.push_back({oh->pc, oh->variant, std::nullopt});
+                    }
                 }
             }
-            offset += sizeof(qbditrace::qbditrace_objc_head_t);
+            offset += objc_raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
+        } else if (kind == qbditrace::QBDITRACE_REC_RETVAL && is_v8) {
+            const auto* rv = reinterpret_cast<const qbditrace::qbditrace_retval_t*>(ptr);
+            if (rv->source_kind == qbditrace::QBDITRACE_REC_OBJC) {
+                auto match = pending_objc.rend();
+                for (auto it = pending_objc.rbegin(); it != pending_objc.rend(); ++it) {
+                    if (it->site == rv->site && it->variant == rv->aux_id) {
+                        match = it;
+                        break;
+                    }
+                }
+                if (match != pending_objc.rend()) {
+                    const auto message_index = match->message_index;
+                    pending_objc.erase(std::next(match).base());
+                    if (message_index.has_value() && *message_index < result.messages.size()) {
+                        auto& msg = result.messages[*message_index];
+                        msg.has_return = true;
+                        msg.return_value = rv->x0;
+                        msg.return_inst_id = inst_id;
+                        msg.return_kind = msg.is_stret
+                            ? ObjcReturnKind::StretRaw
+                            : ObjcReturnKind::X0;
+                        msg.return_deref_str = cached_deref(rv->x0, inst_id);
+                        if (!msg.return_deref_str.has_value()) {
+                            msg.return_deref_str = try_decode_reg_ascii(rv->x0);
+                        }
+                    }
+                }
+            }
+            offset += objc_raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
         } else {
             // Other record types: skip quickly
-            offset += objc_raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7);
+            offset += objc_raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
         }
     }
 

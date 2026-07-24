@@ -13,6 +13,7 @@ Tenet 在 Trace 证据不完整时优雅降级。本页记录每项能力所需�
 | v4 | 基线 | 所有功能 |
 | v5 | `HF_PC_DELTA` | 减小文件体积（pc_delta 模式）；Tenet 自动检测 |
 | v7 | `HF_HAS_FPR` | FPR（NEON v0-v31）重建 |
+| v8 | `HF_CALL_META`（必需；可与 `HF_PC_DELTA` / `HF_HAS_FPR` 组合） | 调用元数据：真实返回值（`REC_RETVAL`）、在线 selector 与更宽的 API ID |
 | v6 | `HF_OLD_VALUE` | 写前内存值（writer 已移除；当前无 Trace 生成此格式） |
 
 Tenet 可打开 version ≥ 4 的任何 Trace。
@@ -61,6 +62,7 @@ Tenet 可打开 version ≥ 4 的任何 Trace。
 | `REC_CAPICALL` 记录 | 最佳质量 | 启发式回退 |
 | `REC_SVC` 记录 | 系统调用拦截需要 | 无系统调用数据 |
 | `REC_OBJC` 记录 | ObjC 消息需要 | 无 ObjC 分析 |
+| `REC_RETVAL` 记录 | 真实返回值需要 | 返回值显示为未知；旧版 v4-v7 Trace 不含此记录 |
 | Darwin 目标 | ObjC / CryptoKit 需要 | Android/Linux 跳过 |
 
 ### 算法与模式

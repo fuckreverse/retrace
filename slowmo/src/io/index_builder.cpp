@@ -826,6 +826,7 @@ Result<TraceIndex> TraceIndex::build(
     const bool     is_v5       = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool     is_v6       = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     const bool     is_v7       = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR)  != 0;
+const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WIDE_API_ID) != 0;
 
     // P1.7: correct memacc struct size depending on format version
     const size_t memacc_sz = is_v6
@@ -928,17 +929,30 @@ Result<TraceIndex> TraceIndex::build(
                 case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
                 case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
                 case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
-                case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
+                case RecordKind::Objc:   rec_size = raw_record_size(ptr, reader.header()); break;
                 case RecordKind::CapiCall: {
-                    const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
-                    rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
-                    const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
-                    for (uint8_t s = 0; s < cc->str_count; ++s) {
-                        const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
-                        uint16_t data_bytes = sh->str_len + 1;
-                        uint16_t padded = (data_bytes + 3u) & ~3u;
-                        rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
-                        sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                    if (is_v8) {
+                        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(ptr);
+                        rec_size = sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                        for (uint8_t s = 0; s < cc->str_count; ++s) {
+                            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                            uint16_t data_bytes = sh->str_len + 1;
+                            uint16_t padded = (data_bytes + 3u) & ~3u;
+                            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        }
+                    } else {
+                        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+                        rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
+                        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+                        for (uint8_t s = 0; s < cc->str_count; ++s) {
+                            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                            uint16_t data_bytes = sh->str_len + 1;
+                            uint16_t padded = (data_bytes + 3u) & ~3u;
+                            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        }
                     }
                     break;
                 }
@@ -946,6 +960,9 @@ Result<TraceIndex> TraceIndex::build(
                     rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];
                     break;
                 }
+                case RecordKind::Retval:
+                    rec_size = raw_record_size(ptr, reader.header());
+                    break;
                 default: rec_size = 1; break;
                 }
                 if (rec_size == 0) return pos;  // corrupt record guard
@@ -1046,22 +1063,36 @@ Result<TraceIndex> TraceIndex::build(
                 case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
                 case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
                 case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
-                case RecordKind::Objc:   rec_size = sizeof(qbditrace::qbditrace_objc_head_t);   break;
+                case RecordKind::Objc:   rec_size = raw_record_size(ptr, reader.header()); break;
                 case RecordKind::CapiCall: {
-                    const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
-                    rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
-                    const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
-                    for (uint8_t s = 0; s < cc->str_count; ++s) {
-                        const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
-                        uint16_t data_bytes = sh->str_len + 1;
-                        uint16_t padded = (data_bytes + 3u) & ~3u;
-                        rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
-                        sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                    if (is_v8) {
+                        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(ptr);
+                        rec_size = sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                        for (uint8_t s = 0; s < cc->str_count; ++s) {
+                            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                            uint16_t data_bytes = sh->str_len + 1;
+                            uint16_t padded = (data_bytes + 3u) & ~3u;
+                            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        }
+                    } else {
+                        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+                        rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
+                        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+                        for (uint8_t s = 0; s < cc->str_count; ++s) {
+                            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                            uint16_t data_bytes = sh->str_len + 1;
+                            uint16_t padded = (data_bytes + 3u) & ~3u;
+                            rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        }
                     }
                     break;
                 }
-                case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
-                default: rec_size = 1; break;
+case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
+case RecordKind::Retval: rec_size = raw_record_size(ptr, reader.header()); break;
+default: rec_size = 1; break;
                 }
                 if (rec_size == 0) break;
                 scan_offset += rec_size;
@@ -1463,26 +1494,45 @@ struct ShardResult {
                 if (remaining < rec_size) return 0;
                 break;
             case RecordKind::Objc:
-                rec_size = sizeof(qbditrace::qbditrace_objc_head_t);
+                rec_size = raw_record_size(ptr, reader.header());
                 if (remaining < rec_size) return 0;
                 break;
             case RecordKind::CapiCall: {
-                if (remaining < sizeof(qbditrace::qbditrace_capicall_head_t)) return 0;
-                const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
-                rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
-                const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
-                for (uint8_t s = 0; s < cc->str_count; ++s) {
-                    if (remaining < rec_size + sizeof(qbditrace::qbditrace_capicall_str_t)) return 0;
-                    const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
-                    uint16_t data_bytes = sh->str_len + 1;
-                    uint16_t padded = (data_bytes + 3u) & ~3u;
-                    rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
-                    sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                if (is_v8) {
+                    if (remaining < sizeof(qbditrace::qbditrace_capicall_head_v8_t)) return 0;
+                    const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(ptr);
+                    rec_size = sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                    const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+                    for (uint8_t s = 0; s < cc->str_count; ++s) {
+                        if (remaining < rec_size + sizeof(qbditrace::qbditrace_capicall_str_t)) return 0;
+                        const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                        uint16_t data_bytes = sh->str_len + 1;
+                        uint16_t padded = (data_bytes + 3u) & ~3u;
+                        rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                    }
+                } else {
+                    if (remaining < sizeof(qbditrace::qbditrace_capicall_head_t)) return 0;
+                    const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+                    rec_size = sizeof(qbditrace::qbditrace_capicall_head_t);
+                    const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+                    for (uint8_t s = 0; s < cc->str_count; ++s) {
+                        if (remaining < rec_size + sizeof(qbditrace::qbditrace_capicall_str_t)) return 0;
+                        const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                        uint16_t data_bytes = sh->str_len + 1;
+                        uint16_t padded = (data_bytes + 3u) & ~3u;
+                        rec_size += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                        sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                    }
                 }
                 if (remaining < rec_size) return 0;
                 result.capicall_count++;
                 break;
             }
+            case RecordKind::Retval:
+                rec_size = raw_record_size(ptr, reader.header());
+                if (remaining < rec_size) return 0;
+                break;
             default:
                 rec_size = 1;
                 break;

@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "TraceFormat.h"
@@ -61,6 +62,16 @@ _Static_assert(sizeof(qbditrace_svc_head_t) == 72,
 /* ObjC header: 4B + 4B pad + 8B pc + 8B recv + 8B sel + 48B cls = 80 */
 _Static_assert(sizeof(qbditrace_objc_head_t) == 80,
     "objc_head must be 80 bytes");
+_Static_assert(sizeof(qbditrace_objc_head_v8_t) == 80,
+    "objc_head_v8 must be 80 bytes");
+_Static_assert(sizeof(qbditrace_capicall_head_v8_t) == 88,
+    "capicall_head_v8 must be 88 bytes");
+_Static_assert(sizeof(qbditrace_retval_t) == 64,
+    "retval must be 64 bytes");
+_Static_assert(offsetof(qbditrace_retval_t, source_id) == 8,
+    "retval source_id must start at byte 8");
+_Static_assert(offsetof(qbditrace_retval_t, nzcv) == 56,
+    "retval nzcv must start at byte 56");
 
 /* Code header: 4B fields + 4B pad + 8B pc = 16 */
 _Static_assert(sizeof(qbditrace_code_head_t) == 16,
@@ -80,6 +91,8 @@ _Static_assert(QBDITRACE_REC_EVENT == 3, "EVENT = 3");
 _Static_assert(QBDITRACE_REC_SVC == 4, "SVC = 4");
 _Static_assert(QBDITRACE_REC_OBJC == 5, "OBJC = 5");
 _Static_assert(QBDITRACE_REC_CODE == 6, "CODE = 6");
+_Static_assert(QBDITRACE_REC_CAPICALL == 7, "CAPICALL = 7");
+_Static_assert(QBDITRACE_REC_RETVAL == 8, "RETVAL = 8");
 
 /* Header flag bits */
 _Static_assert(QBDITRACE_HF_HAS_MEM == 1u, "HAS_MEM = bit 0");

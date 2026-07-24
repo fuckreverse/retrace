@@ -160,7 +160,9 @@ function buildConfigStruct(opts) {
    * offset 152  exclude_ranges[0..7] 8×{u64 start, u64 end} = 128 bytes
    * offset 280  enable_capi_intercept u32
    * offset 284  n_capi_funcs          u32
-   * offset 288  capi_funcs[0..127]   128×{u64 addr, u8 api_id, u8 n_args, u8 str_args, u8 _reserved} = 128×16 = 2048 bytes
+   * offset 288  capi_funcs[0..127]   128×{u64 addr, u16 api_id, u8 n_args, u8 str_args, u8 pad[4]}
+   *                                  = 128×16 = 2048 bytes (C natural alignment: the struct's
+   *                                  8-byte alignment pads each 12-byte entry up to 16)
    *
    * Total: 280 + 4 + 4 + 2048 = 2336 bytes
    */
@@ -210,21 +212,20 @@ function buildConfigStruct(opts) {
   const capiFuncs = opts.capiFuncs || [];
   cfg.add(280).writeU32(opts.enableCapiIntercept ? 1 : 0);
   cfg.add(284).writeU32(capiFuncs.length);
-  /* Each capi_funcs entry is 16 bytes:
+  /* Each capi_funcs entry is 16 bytes (12 bytes of fields + 4 bytes of
+   * trailing alignment padding, matching the native struct's 8-byte alignment):
    *   u64 addr      (offset 0)
-   *   u8  api_id    (offset 8)
-   *   u8  n_args    (offset 9)
-   *   u8  str_args  (offset 10)
-   *   u8  _reserved (offset 11)
-   *   u32 padding   (offset 12)
+   *   u16 api_id    (offset 8)
+   *   u8  n_args    (offset 10)
+   *   u8  str_args  (offset 11)
+   *   u8  _pad[4]   (offset 12, already zeroed)
    */
   for (let i = 0; i < capiFuncs.length && i < 128; i++) {
-    const base = 288 + i * 16;
-    cfg.add(base).writePointer(capiFuncs[i].addr || NULL);
-    cfg.add(base + 8).writeU8(capiFuncs[i].apiId || 0);
-    cfg.add(base + 9).writeU8(capiFuncs[i].nArgs || 0);
-    cfg.add(base + 10).writeU8(capiFuncs[i].strArgs || 0);
-    cfg.add(base + 11).writeU8(0); /* _reserved */
+   const base = 288 + i * 16;
+   cfg.add(base).writePointer(capiFuncs[i].addr || NULL);
+   cfg.add(base + 8).writeU16(capiFuncs[i].apiId || 0);
+   cfg.add(base + 10).writeU8(capiFuncs[i].nArgs || 0);
+   cfg.add(base + 11).writeU8(capiFuncs[i].strArgs || 0);
   }
   return cfg;
 }
@@ -233,41 +234,127 @@ function isAndroid() {
   return Process.platform === 'linux';
 }
 
+const QBDITRACE_REC_MSGSEND = 1 << 4;
+const OBJC_DISPATCHERS = [
+  { key: 'objcMsgSend', configKey: 'objc_msgSend', symbol: 'objc_msgSend' },
+  { key: 'objcMsgSendSuper', configKey: 'objc_msgSendSuper', symbol: 'objc_msgSendSuper' },
+  { key: 'objcMsgSendSuper2', configKey: 'objc_msgSendSuper2', symbol: 'objc_msgSendSuper2' },
+  { key: 'objcMsgSendStret', configKey: 'objc_msgSend_stret', symbol: 'objc_msgSend_stret' },
+];
+
+/* Pure policy helper. `lookup` is injected so precedence and disabled-platform
+ * behavior can be tested without a Frida runtime. */
+function planObjcDispatchers(config, platform, lookup) {
+  const enabled = config.resolveObjc !== false &&
+      ((config.record >>> 0) & QBDITRACE_REC_MSGSEND) !== 0;
+  const result = { enabled: enabled, platform: platform, entries: [], missing: [] };
+
+  for (const descriptor of OBJC_DISPATCHERS) {
+    let address = null;
+    let source = 'missing';
+    const explicit = config[descriptor.key] !== undefined
+        ? config[descriptor.key] : config[descriptor.configKey];
+
+    if (enabled && platform !== 'linux') {
+      if (explicit !== undefined && explicit !== null && explicit !== 0 && explicit !== '0' &&
+          explicit !== '0x0') {
+        address = lookup.explicit(explicit);
+        if (address !== null) source = 'explicit';
+      }
+      if (address === null) {
+        address = lookup.global(descriptor.symbol);
+        if (address !== null) source = 'global';
+      }
+      if (address === null) {
+        address = lookup.module(descriptor.symbol);
+        if (address !== null) source = 'module';
+      }
+    }
+
+    result.entries.push({
+      key: descriptor.key,
+      symbol: descriptor.symbol,
+      address: address,
+      source: source,
+    });
+    if (address === null) result.missing.push(descriptor.symbol);
+  }
+  return result;
+}
+
 function resolveObjcDispatchers() {
+  let objcModule;
+
+  function validPointer(value) {
+    return value && !value.isNull() ? value : null;
+  }
+
+  const plan = planObjcDispatchers(CONFIG, Process.platform, {
+    explicit(value) {
+      try { return validPointer(ptr(value)); } catch (e) { return null; }
+    },
+    global(symbol) {
+      try { return validPointer(Module.findGlobalExportByName(symbol)); }
+      catch (e) { return null; }
+    },
+    module(symbol) {
+      if (objcModule === undefined) {
+        objcModule = Process.findModuleByName('libobjc.A.dylib');
+      }
+      if (!objcModule) return null;
+      try { return validPointer(objcModule.findExportByName(symbol)); }
+      catch (e) { return null; }
+    },
+  });
+
   const out = {
     objcMsgSend: NULL,
     objcMsgSendSuper: NULL,
     objcMsgSendSuper2: NULL,
     objcMsgSendStret: NULL,
   };
-  /* ObjC runtime is only available on iOS/macOS. On Android/Linux there is no
-   * libobjc and no ObjC dispatchers to resolve — all pointers stay NULL, which
-   * causes the native tracer to skip OBJC record emission automatically. */
-  if (isAndroid()) {
-    log('Android target — skipping ObjC dispatcher resolution');
-    return out;
+
+  if (!plan.enabled) {
+    log('ObjC capture: disabled (record does not include MSGSEND or resolution was disabled)');
+  } else if (isAndroid()) {
+    /* Do not touch an ObjC bridge or runtime module on Android. */
+    log('ObjC capture: unsupported on Android; dispatcher resolution skipped');
+  } else {
+    for (const entry of plan.entries) {
+      if (entry.address !== null) out[entry.key] = entry.address;
+    }
   }
-  const map = {
-    objcMsgSend: 'objc_msgSend',
-    objcMsgSendSuper: 'objc_msgSendSuper',
-    objcMsgSendSuper2: 'objc_msgSendSuper2',
-    objcMsgSendStret: 'objc_msgSend_stret',
+
+  const addresses = plan.entries.map(function(entry) {
+    return entry.symbol + '=' + (entry.address === null ? '0 (missing)' :
+        entry.address + ' [' + entry.source + ']');
+  }).join(', ');
+  const selectorInlineCaptureAvailable = plan.enabled && !isAndroid() &&
+      plan.entries.some(function(entry) { return entry.address !== null; });
+  log('ObjC dispatchers: ' + addresses);
+  log('ObjC coverage: direct symbol configured=' +
+      (plan.entries[0].address !== null ? 'yes' : 'no') +
+      '; selector inline capture available=' +
+      (selectorInlineCaptureAvailable ? 'yes' : 'no') +
+      '; objc_msgSend$selector stubs=' +
+      (plan.enabled && !isAndroid() && plan.entries[0].address !== null
+        ? 'resolve via transfer target (individual stubs are not configured)'
+        : 'unsupported (objc_msgSend transfer target unavailable)'));
+  if (plan.missing.length > 0) log('ObjC missing: ' + plan.missing.join(', '));
+
+  out.diagnostic = {
+    enabled: plan.enabled,
+    platform: plan.platform,
+    addresses: plan.entries.reduce(function(acc, entry) {
+      acc[entry.symbol] = entry.address === null ? '0' : entry.address.toString();
+      return acc;
+    }, {}),
+    missing: plan.missing,
+    directSymbolConfigured: plan.entries[0].address !== null,
+    selectorInlineCaptureAvailable: selectorInlineCaptureAvailable,
+    selectorStubs: plan.enabled && !isAndroid() && plan.entries[0].address !== null
+        ? 'transfer-target' : 'unsupported',
   };
-  for (const key in map) {
-    let p = null;
-    try {
-      p = Process.getModuleByName('libobjc.A.dylib').findExportByName(map[key]);
-    } catch (e) {
-      p = null;
-    }
-    if (!p) {
-      try { p = Module.getGlobalExportByName(map[key]); } catch (e) { p = null; }
-    }
-    if (p && !p.isNull()) {
-      out[key] = p;
-      log('resolved ' + map[key] + ' @ ' + p);
-    }
-  }
   return out;
 }
 
@@ -1092,10 +1179,9 @@ function mainImpl() {
     });
   }
 
-  const objc = CONFIG.resolveObjc ? resolveObjcDispatchers() : {
-    objcMsgSend: NULL, objcMsgSendSuper: NULL,
-    objcMsgSendSuper2: NULL, objcMsgSendStret: NULL,
-  };
+  /* Always run the planner so disabled MSGSEND capture is diagnosed explicitly.
+   * It performs no ObjC runtime/module access on Android or when disabled. */
+  const objc = resolveObjcDispatchers();
 
   // --- Resolve C API function addresses ---
   const capiIntercept = CONFIG.enableCapiIntercept !== false;  // on by default
@@ -1168,6 +1254,9 @@ function mainImpl() {
     }
     log('configured trace #' + traceIndex +
         '. output = ' + fn.outputPath().readUtf8String());
+    if (traceIndex === 1) {
+      status('objc_configuration', objc.diagnostic);
+    }
     return cfg;
   }
 

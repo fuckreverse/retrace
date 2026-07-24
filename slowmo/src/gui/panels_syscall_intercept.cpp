@@ -123,6 +123,21 @@ static std::string truncate(const std::string& s, size_t max_chars) {
     return s.substr(0, max_chars) + "\xe2\x80\xa6";   // U+2026 HORIZONTAL ELLIPSIS
 }
 
+static const char* source_label(const InterceptedCall& call) {
+    if (call.from_capicall_record) return "CAPICALL (tracer-resolved)";
+    if (call.category == ApiCategory::Syscall) return "SVC record";
+    return "event fallback";
+}
+
+static std::string raw_syscall_label(const InterceptedCall& call) {
+    constexpr std::string_view marker = "[raw=";
+    const size_t begin = call.decoded_summary.find(marker);
+    if (begin == std::string::npos) return "unavailable";
+    const size_t value_begin = begin + marker.size();
+    const size_t end = call.decoded_summary.find(']', value_begin);
+    return call.decoded_summary.substr(value_begin, end - value_begin);
+}
+
 /// True if `call` is a crypto-category call.
 static bool is_crypto(const InterceptedCall& call) {
     return call.category == ApiCategory::CommonCrypto ||
@@ -286,6 +301,12 @@ void GuiApp::render_syscall_intercept_panel() {
                         category_label(call.category),
                         (int)call.category);
 
+                    tip += fmt::format("\nSource: {}", source_label(call));
+                    if (call.category == ApiCategory::Syscall) {
+                        tip += fmt::format("\nSVC flags: 0x{:02x}\nRaw syscall: {}",
+                            call.svc_flags, raw_syscall_label(call));
+                    }
+
                     tip += fmt::format("\n\nSummary:\n  {}", call.decoded_summary);
 
                     if (call.key_bytes.has_value() && !call.key_bytes->empty()) {
@@ -304,7 +325,19 @@ void GuiApp::render_syscall_intercept_panel() {
                             hex_dump(*call.data_bytes, 16));
                     }
                     if (call.has_return) {
-                        tip += fmt::format("\n\nReturn: 0x{:x}", call.return_value);
+                        tip += fmt::format("\n\nReturn: x0=0x{:x}, x1=0x{:x}, nzcv=0x{:x}",
+                            call.return_value, call.return_x1, call.return_nzcv);
+                    } else {
+                        tip += "\n\nReturn: <unknown/not recorded>";
+                    }
+                    if (call.raw_error.has_value()) {
+                        tip += fmt::format("\nRaw error: {}", *call.raw_error);
+                    }
+                    if (call.errno_valid) {
+                        tip += fmt::format("\nerrno: {} -> {}",
+                            call.errno_before, call.errno_after);
+                    } else {
+                        tip += "\nerrno: unavailable";
                     }
                     if (!call.captured_strings.empty()) {
                         tip += "\n\nCaptured Strings (tracer-side):";
@@ -320,10 +353,6 @@ void GuiApp::render_syscall_intercept_panel() {
                     if (call.objc_context.has_value()) {
                         tip += fmt::format("\n\nObjC: {}", *call.objc_context);
                     }
-                    if (call.from_capicall_record) {
-                        tip += "\n\n[CAPICALL record — tracer-resolved]";
-                    }
-
                     tip += "\n\nRight-click for more options";
                     ImGui::SetTooltip("%s", tip.c_str());
                     if (ImGui::IsMouseDoubleClicked(0))

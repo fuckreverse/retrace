@@ -21,6 +21,36 @@
 
 namespace tenet {
 
+namespace {
+
+const char* selector_source_label(ObjcSelectorSource source) {
+    switch (source) {
+        case ObjcSelectorSource::Inline: return "inline";
+        case ObjcSelectorSource::Image:  return "image";
+        case ObjcSelectorSource::Memory: return "memory";
+        case ObjcSelectorSource::Hex:    return "hex fallback";
+    }
+    return "unknown";
+}
+
+const char* selector_status_label(ObjcSelectorResolution resolution) {
+    switch (resolution) {
+        case ObjcSelectorResolution::Resolved:   return "resolved";
+        case ObjcSelectorResolution::Truncated:  return "truncated";
+        case ObjcSelectorResolution::ReadFailed: return "read failed";
+        case ObjcSelectorResolution::Unresolved: return "unresolved";
+    }
+    return "unknown";
+}
+
+const char* class_display_name(const ObjcMessage& msg) {
+    return msg.class_resolution == ObjcClassResolution::Resolved && !msg.class_name.empty()
+        ? msg.class_name.c_str()
+        : "<unknown class>";
+}
+
+}  // namespace
+
 void GuiApp::render_objc_panel() {
     if (!ImGui::Begin("ObjC Messages", &show_objc_)) {
         ImGui::End();
@@ -166,8 +196,13 @@ void GuiApp::render_objc_panel() {
                         std::string tip = fmt::format(
                             "[{}] -[{} {}]\nPC: 0x{:x}\nReceiver: 0x{:x}\nVariant: {}",
                             msg.inst_id,
-                            msg.class_name, msg.selector_name,
+                            class_display_name(msg), msg.selector_name,
                             msg.pc, msg.receiver, (int)msg.variant);
+                        tip += fmt::format("\nClass status: {}\nSelector: {} ({})",
+                            msg.class_resolution == ObjcClassResolution::Resolved
+                                ? "resolved" : "unknown",
+                            selector_source_label(msg.selector_source),
+                            selector_status_label(msg.selector_resolution));
                         if (msg.arg_count > 0) {
                             tip += "\nArgs:";
                             for (uint8_t k = 0; k < msg.arg_count; ++k) {
@@ -179,9 +214,14 @@ void GuiApp::render_objc_panel() {
                             }
                         }
                         if (msg.has_return) {
-                            tip += fmt::format("\nReturn: 0x{:x}", msg.return_value);
+                            tip += fmt::format(msg.return_kind == ObjcReturnKind::StretRaw
+                                ? "\nReturn: stret raw x0=0x{:x}"
+                                : "\nReturn: x0=0x{:x}", msg.return_value);
                             if (msg.return_deref_str.has_value())
                                 tip += fmt::format(" \"{}\"", *msg.return_deref_str);
+                            tip += fmt::format(" @inst {}", msg.return_inst_id);
+                        } else {
+                            tip += "\nReturn: <unknown/not recorded>";
                         }
                         tip += "\n\nRight-click for more options";
                         ImGui::SetTooltip("%s", tip.c_str());
@@ -192,7 +232,7 @@ void GuiApp::render_objc_panel() {
                     // ── Right-click context menu ───────────────────────
                     if (ImGui::BeginPopupContextItem(nullptr)) {
                         ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f),
-                                           "%s", msg.class_name.c_str());
+                                           "%s", class_display_name(msg));
                         ImGui::TextColored(ImVec4(0.75f, 0.92f, 0.6f, 1.0f),
                                            "%s", msg.selector_name.c_str());
                         ImGui::TextDisabled("inst #%llu", (unsigned long long)msg.inst_id);
@@ -249,14 +289,17 @@ void GuiApp::render_objc_panel() {
                     // Return column
                     ImGui::TableSetColumnIndex(4);
                     if (msg.has_return) {
-                        if (msg.return_deref_str.has_value()) {
+                        if (msg.return_kind == ObjcReturnKind::StretRaw) {
+                            ImGui::TextDisabled("stret raw 0x%llx",
+                                (unsigned long long)msg.return_value);
+                        } else if (msg.return_deref_str.has_value()) {
                             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
                                 "\"%s\"", msg.return_deref_str->c_str());
                         } else {
                             ImGui::TextDisabled("0x%llx", (unsigned long long)msg.return_value);
                         }
                     } else {
-                        ImGui::TextDisabled("—");
+                        ImGui::TextDisabled("unknown");
                     }
 
                     // PC column

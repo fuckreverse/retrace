@@ -1,9 +1,9 @@
-# Trace Format 接口契约（v4–v7）
+# Trace Format 接口契约（v4–v8）
 
 ## 概述
 
 本文档是 **tenet 分析器**与 **qbditrace 记录器**之间的接口契约。
-tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` trace 文件。
+tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8）定义的格式读取 `.bin` trace 文件。
 
 **权威来源**：`tools/qbditrace/TraceFormat.h`。本文档是该头文件的人类可读解释，
 并标注 tenet 特有的处理策略和未来增强方向。如有冲突，以 `.h` 文件为准。
@@ -51,7 +51,7 @@ tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` t
 | 偏移 | 大小 | 字段 | 值/说明 |
 |------|------|------|---------|
 | 0x00 | 4 | magic | `0x51424454` ("QBDT") |
-| 0x04 | 4 | version | 4（基线）/ 5（+PC_DELTA）/ 7（+HAS_FPR） |
+| 0x04 | 4 | version | 4（基线）/ 5（+PC_DELTA）/ 6（+OLD_VALUE）/ 7（+HAS_FPR）/ 8（+CALL_META） |
 | 0x08 | 4 | arch | `QBDITRACE_ARCH_AARCH64 = 1` |
 | 0x0C | 4 | num_gpr | 34 (AArch64) |
 | 0x10 | 8 | module_base | 被追踪模块的运行时基址 |
@@ -77,6 +77,7 @@ tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` t
 | COMPRESSED | bit 7 | Header 后所有数据为单个 zstd 压缩流（见下方"流式压缩"节） |
 | BLOCK_COMPRESSED | bit 8 | 分块压缩格式：多个独立 zstd frame + 尾部索引（见下方"分块压缩"节） |
 | BRANCH_HINT | bit 9 | INST nzcv 字节高 4 位编码分支类别（见下方"Branch Hint"节） |
+| CALL_META | bit 10 | v8：OBJC/CAPICALL 使用 v8 布局，且允许 REC_RETVAL |
 
 > **注**：`COMPRESSED` 与 `BLOCK_COMPRESSED` 互斥。当前 qbditrace writer 默认产生
 > `BLOCK_COMPRESSED`；`COMPRESSED` 单帧流格式仅为历史读取兼容，当前 writer 不产生。
@@ -88,6 +89,7 @@ tenet 依赖 `TraceFormat.h` (支持 v4/v5/v6/v7) 定义的格式读取 `.bin` t
 | 4 | — | 基线格式 |
 | 5 | PC_DELTA | INST 头缩小为 6B |
 | 7 | HAS_FPR | ANCHOR + INST 携带 FPR 快照/差值 |
+| 8 | CALL_META | OBJC/CAPICALL v8 布局，并增加 RETVAL 返回事实记录 |
 
 > v6 (`OLD_VALUE`) 已从 writer 移除（`config_t._reserved_old_value` 被忽略），但格式定义保留以支持旧 trace 读取。
 
@@ -104,7 +106,8 @@ qbditrace 在录制时通过编译期宏自动填写此字段。tenet 读取时�
 
 **tenet 打开条件**：magic == `0x51424454` 且 version >= 4。`REG_DIFF`、`HAS_MEM`、
 `HAS_NZCV` 可关闭（sampling trace 即如此）；缺少 `HAS_CODE` 时仍可解析记录流，但依赖
-反汇编的分析需要外部镜像或会降级。
+反汇编的分析需要外部镜像或会降级。`HF_CALL_META` 仅允许 version=8，且 version=8 必须设置
+`HF_CALL_META`；v8 可与 `PC_DELTA`、`HAS_FPR`、`OLD_VALUE` 组合。
 
 ---
 
@@ -172,7 +175,8 @@ struct RegState {
 | SVC | 4 | `qbditrace_svc_head_t` | 系统调用 |
 | OBJC | 5 | `qbditrace_objc_head_t` | ObjC 消息发送 |
 | CODE | 6 | `qbditrace_code_head_t` + bytes[] | 指令原始字节 |
-| CAPICALL | 7 | `qbditrace_capicall_head_t` + str_caps[] | C/平台 API 调用（含参数快照） |
+| CAPICALL | 7 | `qbditrace_capicall_head_t`/`_v8_t` + str_caps[] | C/平台 API 调用（含参数快照） |
+| RETVAL | 8 | `qbditrace_retval_t` | OBJC/CAPICALL/SVC 的返回事实 |
 
 > **磁盘布局说明**：所有记录以 C struct 自然对齐方式存储（writer 用 `memcpy(p, &struct, sizeof)`），
 > 磁盘大小 = `sizeof(struct)`，**含对齐 padding**。下方各记录的 "Total" 均为 sizeof 口径，
@@ -405,7 +409,8 @@ Total: 24 字节 (`sizeof(qbditrace_event_head_t)`，含对齐 padding)
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ u8  kind (=4)                                                  │
-│ u8  reserved[3]                                                │
+│ u8  flags           ← `reserved[0]`；QBDITRACE_SVC_FL_*         │
+│ u8  reserved[2]                                                │
 │ u64 pc              ← svc 指令地址                             │
 │ u64 syscall_no      ← x16 (Darwin) 或 x8 (Linux/Android)       │
 │ u64 args[6]         ← x0-x5                                   │
@@ -413,30 +418,33 @@ Total: 24 字节 (`sizeof(qbditrace_event_head_t)`，含对齐 padding)
 Total: 72 字节 (`sizeof(qbditrace_svc_head_t)`，含对齐 padding)
 ```
 
+`flags` 复用旧 `reserved[0]`，不改变 72B 布局：`SVC_FL_MACH_TRAP`、`SVC_FL_BINDER_IOC`、
+`SVC_FL_MEM_OP`、`SVC_FL_FILE_OP`、`SVC_FL_NET_OP`、`SVC_FL_CRYPTO_OP` 分别标识 Mach trap、Binder ioctl
+及内存/文件/网络/密码学相关系统调用。
+
 ---
 
 ## REC_OBJC — Objective-C 消息发送
 
+v4–v7 使用 `qbditrace_objc_head_t`：80B 固定头，字段为 `kind/variant/reserved/pc/recv/sel/cls[48]`；
+`cls` 是在线捕获的 NUL 终止接收者类名。
+
+v8（`HF_CALL_META`）改用同为 **80B** 的 `qbditrace_objc_head_v8_t`：
+
 ```
-┌────────────────────────────────────────────────────────────────┐
-│ u8  kind (=5)                                                  │
-│ u8  variant         ← qbditrace_objc_variant_t                │
-│ u8  reserved[2]                                                │
-│ u64 pc              ← 调用点 PC                                │
-│ u64 recv            ← x0 (receiver)                           │
-│ u64 sel             ← x1 (selector ptr)                       │
-│ char cls[48]        ← 运行时类名（NUL 终止）                   │
-└────────────────────────────────────────────────────────────────┘
-Total: 80 字节 (`sizeof(qbditrace_objc_head_t)`，含对齐 padding)
+kind | variant | sel_len | flags | reserved | pc | recv | sel | cls[48]
+[selector_name: sel_len 字节内容 + NUL，随后补齐到 4B]
 ```
 
-ObjC Variant：MSGSEND(0), MSGSEND_SUPER(1), MSGSEND_SUPER2(2), MSGSEND_STRET(3)
+`selector_name` 由 tracer 在线调用 `sel_getName` 捕获；`sel_len` 不含末尾 NUL。`flags` 的 bit 0 为
+`OBJC_FL_SEL_TRUNCATED`，bit 1 为 `OBJC_FL_SEL_READ_FAIL`；最长 255 字节。尾部仅在 v8 存在，
+记录大小为 `80 + align4(sel_len + 1)`。
 
-对于 MSGSEND_STRET：x0 为隐藏返回指针，x1 为 receiver，x2 为 selector；`recv` 存 x1，`sel` 存 x2。
+ObjC Variant：MSGSEND(0), MSGSEND_SUPER(1), MSGSEND_SUPER2(2), MSGSEND_STRET(3)。对于
+MSGSEND_STRET：x0 为隐藏返回指针，x1 为 receiver，x2 为 selector；`recv` 存 x1，`sel` 存 x2。
 
-**tenet 使用**：
-- 字符串来源：cls 字段直接提供类名
-- CallStack 增强：识别 ObjC 方法边界
+**tenet 使用**：`cls` 直接提供类名，v8 selector payload 提供无需离线解引用的 selector 名；两者均可增强
+CallStack 方法边界识别。
 
 ---
 
@@ -474,7 +482,7 @@ Total: 16 + size 字节 (`sizeof(qbditrace_code_head_t)` + size，含对齐 padd
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ u8  kind (=7)                                                  │
-│ u8  api_id        ← qbditrace_capi_id_t（0=unknown）          │
+│ u8  api_id        ← v4–v7：`qbditrace_capi_id_t` 的低 8 位    │
 │ u8  arg_count     ← args[] 中有效项数（0..8）                  │
 │ u8  str_count     ← 紧随其后的字符串捕获条数（0..4）           │
 │ u64 pc            ← 调用点 PC（位于被追踪范围内）              │
@@ -492,6 +500,10 @@ Fixed header: sizeof(qbditrace_capicall_head_t) = 88 字节
 Variable tail: str_count × (4 + str_len + 1 + pad)，最多 ≈ 1 KB
 ```
 
+v8（`HF_CALL_META`）固定头改为 `qbditrace_capicall_head_v8_t`，仍为 **88B**：字段顺序为
+`kind/arg_count/str_count/flags/api_id(uint16_t)/reserved/pc/target/args[8]`。可变字符串尾部与旧布局相同；
+`api_id` 因此可完整保存 16 位 API ID，文件内不得混用两种布局。
+
 **str_flags 位定义**：
 
 | 位 | 宏 | 含义 |
@@ -500,10 +512,8 @@ Variable tail: str_count × (4 + str_len + 1 + pad)，最多 ≈ 1 KB
 | bit 1 | `SF_BINARY` | 内容为原始字节（含不可打印字符） |
 | bit 2 | `SF_SAFE_READ_FAIL` | safeRead 失败，str_len=0，捕获为空 |
 
-> **已知格式限制**：进程内配置表的 `api_id` 是 `uint16_t`，但
-> `qbditrace_capicall_head_t.api_id` 的磁盘字段仍为 `uint8_t`。因此所有 `api_id >= 256`
-> 的值都会在写盘时截断；下表中的 JNI、Android/BoringSSL 与其它扩展 ID 不能可靠
-> round-trip。修复需要 widening 字段并同步 tracer 与 tenet 的格式版本。
+> **版本差异**：v4–v7 的磁盘 `api_id` 为 `uint8_t`，所有 `api_id >= 256` 会截断；v8 的
+> `qbditrace_capicall_head_v8_t.api_id` 为 `uint16_t`，可完整 round-trip。
 
 **api_id 分组速览**（来自 `qbditrace_capi_id_t`）：
 
@@ -561,6 +571,27 @@ size_t capicall_record_size(const uint8_t* ptr) {
 - `SyscallInterceptCollector::on_capicall()` 处理此记录，优先级高于 Event XFER_CALL 启发式检测
 - `from_capicall_record = true` 的 `InterceptedCall` 含有 `captured_strings` 内联字符串向量
 - 已处理的 callee PC 被记录进 `capicall_seen_`，阻止后续重复的 Event 路径生成冗余记录
+
+---
+
+## REC_RETVAL — 返回事实（v8）
+
+`HF_CALL_META` 下允许 `REC_RETVAL`（`qbditrace_retval_t`，固定 **64B**），用于自描述地关联
+OBJC、CAPICALL 或 SVC 的实际返回状态：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `kind/source_kind/flags/reserved8` | 4 × u8 | `kind=8`；来源为 SVC/OBJC/CAPICALL |
+| `aux_id/record_size` | 2 × u16 | 紧凑 variant/API 提示；记录总大小（v8 为 64B） |
+| `source_id/site/target/resume/x0/x1` | 6 × u64 | 完整来源标识、调用点、目标、恢复地址及返回 x0/x1 |
+| `nzcv/reserved32` | 2 × u32 | 返回时 NZCV 与保留字段 |
+
+- `source_id` 保存完整来源标识，Darwin syscall selector 不截断为 32 位；`aux_id` 为紧凑的 variant/API 提示。
+- `site` 是原调用点，`target` 是调用目标，`resume` 是恢复执行地址；`x0/x1/nzcv` 是返回时原始架构状态。
+- `record_size` 支持将来扩展：v8 reader 应按该值跳过完整记录。`flags` 的 bit 0
+  `QBDITRACE_RET_FL_ERRNO_VALID` 表示 producer 可证明 errno 属于此调用。
+- 记录器对待返回的调用按 **LIFO** 栈管理：每个 call-site 先压入 pending call，返回时弹出栈顶并发射
+  RETVAL；嵌套调用因此与最近、尚未完成的来源记录关联。
 
 ---
 
@@ -634,7 +665,7 @@ REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B
 | # | 假设 | 违反时处理 |
 |---|------|-----------|
 | 1 | Header 为 536 字节，magic = "QBDT" | 拒绝打开 |
-| 2 | version >= 4 | < 4 拒绝；> 7 警告并尝试继续 |
+| 2 | version >= 4 | < 4 拒绝；> 8 警告并尝试继续 |
 | 3 | flags 包含 REG_DIFF（常规完整 trace） | 不强制：REG_DIFF/NZCV/MEM 均可关闭（见 `QBDITRACE_REC_SAMPLING`），此时 RegisterFile/MemoryModel 相关能力降级，但 `xref`/`cfg`/`loop`/`window_stats` 等只需 PC 流 + REC_CODE 的 pass 正常工作 |
 | 4 | flags 包含 HAS_CODE | 不含则需要外部 image |
 | 5 | 记录按写入顺序排列（时间单调递增） | 索引依赖此假设 |
@@ -642,6 +673,7 @@ REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B
 | 7 | 每条记录大小可从头部字段确定 | 向前兼容跳过未知记录 |
 | 8 | num_gpr = 34 (AArch64) | 其他值按 header 声明处理 |
 | 9 | CAPICALL 记录（若存在）紧随对应 XFER_CALL Event 之前 | SyscallInterceptCollector 用 capicall_seen_ 去重 |
+| 10 | `HF_CALL_META` 仅随 v8 出现，且 v8 必带该 flag | 其他组合拒绝；v8 可组合 PC_DELTA/HAS_FPR/OLD_VALUE |
 
 ---
 
@@ -692,15 +724,24 @@ size_t record_size(const uint8_t* ptr, const TraceFlags& flags, uint32_t num_gpr
     case QBDITRACE_REC_SVC:
         return sizeof(qbditrace_svc_head_t);
     case QBDITRACE_REC_OBJC:
-        return sizeof(qbditrace_objc_head_t);
+        // v8: 80B 固定头 + align4(sel_len + NUL)；旧版固定 80B。
+        return flags.call_meta
+            ? sizeof(qbditrace_objc_head_v8_t)
+              + align4(((const qbditrace_objc_head_v8_t*)ptr)->sel_len + 1)
+            : sizeof(qbditrace_objc_head_t);
     case QBDITRACE_REC_CODE:
         return sizeof(qbditrace_code_head_t) + ptr[1]; // ptr[1] = size
     case QBDITRACE_REC_CAPICALL: {
-        // Fixed header + variable-length string captures
-        const auto* h = (const qbditrace_capicall_head_t*)ptr;
-        size_t sz = sizeof(qbditrace_capicall_head_t);
-        const uint8_t* sp = ptr + sz;
-        for (uint8_t i = 0; i < h->str_count; ++i) {
+        // v8 仍为 88B 固定头，但 api_id 位宽和字段顺序不同。
+        const size_t head_size = flags.call_meta
+            ? sizeof(qbditrace_capicall_head_v8_t)
+            : sizeof(qbditrace_capicall_head_t);
+        const uint8_t str_count = flags.call_meta
+            ? ((const qbditrace_capicall_head_v8_t*)ptr)->str_count
+            : ((const qbditrace_capicall_head_t*)ptr)->str_count;
+        size_t sz = head_size;
+        const uint8_t* sp = ptr + head_size;
+        for (uint8_t i = 0; i < str_count; ++i) {
             const auto* s = (const qbditrace_capicall_str_t*)sp;
             size_t entry = 4 + s->str_len + 1;
             entry = (entry + 3) & ~3u;  // 4-byte aligned
@@ -709,6 +750,8 @@ size_t record_size(const uint8_t* ptr, const TraceFlags& flags, uint32_t num_gpr
         }
         return sz;
     }
+    case QBDITRACE_REC_RETVAL:
+        return ((const qbditrace_retval_t*)ptr)->record_size;
     default:
         return 0; // 未知记录，无法跳过
     }
@@ -800,7 +843,10 @@ bool old_value_mode = (header.flags & HF_OLD_VALUE) != 0;
 // v7: FPR 记录
 bool has_fpr = (header.flags & HF_HAS_FPR) != 0;
 
-if (header.version > 7)
+bool call_meta_mode = (header.flags & HF_CALL_META) != 0;
+if ((header.version == 8) != call_meta_mode)
+    return Error("HF_CALL_META is required exactly for v8 traces");
+if (header.version > 8)
     warn("Unknown trace version {}, attempting to continue", header.version);
 ```
 
@@ -810,6 +856,7 @@ if (header.version > 7)
 | v5 | PC_DELTA | **6B** | 288B | 约减少 60% 文件体积 |
 | v6 | OLD_VALUE | 16B | 288B | memacc 扩展为 48B；writer 已移除 |
 | v7 | HAS_FPR | 24B (或 8B 含 PC_DELTA) | **800B** | 新增 FPR diff 和快照 |
+| v8 | CALL_META | 同 v4–v7 组合 | 同 v4–v7 组合 | OBJC 在线 selector、CAPICALL `api_id:uint16_t`、RETVAL |
 
 对于未知 kind 的记录，tenet 的处理规则：
 
@@ -830,8 +877,8 @@ if (header.version > 7)
 | E6 | inst_id 全局编号 | 当前无显式 ID，靠顺序计数 | 待实现 |
 | E7 | 分块压缩 | O(1) 随机访问压缩 trace | ✅ **已实现**（HF_BLOCK_COMPRESSED） |
 | E8 | 分支类别提示 | 零开销函数边界识别 | ✅ **已实现**（HF_BRANCH_HINT） |
-| E9 | CAPICALL api_id 扩宽 | 当前磁盘 `uint8_t` 会截断所有 >=256 的 Android/JNI 扩展 ID | 待实现（需要格式 bump） |
+| E9 | CAPICALL api_id 扩宽 | v8 已升级为 `uint16_t`，支持 Android/JNI 扩展 ID | ✅ **已实现**（v8 HF_CALL_META） |
 
-**优先级**（待实现部分）：E9 > E2 > E1 > E6 > E4
+**优先级**（待实现部分）：E2 > E1 > E6 > E4
 
 E2（尾部全局索引表）对 tenet 性能影响最大——可将首次打开从 60s 降到 < 1s。

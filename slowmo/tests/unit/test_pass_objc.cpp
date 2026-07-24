@@ -575,17 +575,19 @@ TEST_CASE("ObjcPass falls back to inline-ASCII decoding for short register value
     }
 }
 
-TEST_CASE("ObjcPass extracts the return value (x0) after the message send",
+TEST_CASE("ObjcPass legacy trace does not invent a return from pre-call x0",
           "[unit][pass][objc]") {
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
         tw.write_header();
         MachineState ms; ms.sp() = 0x16F000000ULL;
 
-        tw.emit_objc(tw.rt(0x1000), 0xAAULL, 0xBBULL, "NSNumber");
-        // x0 is set to the "return value" right after the objc_msgSend call.
-        tw.emit(ms, 0x1000, enc::movz(0, 0x7777),
-                {{0, 0x7777ULL}, {33, tw.rt(0x1004)}}, {});
+        // Legacy OBJC has no matching return fact. x0 before the call is the
+        // receiver and must never be reported as a return value.
+        tw.emit(ms, 0x0FFC, enc::movz(0, 0xAAAA),
+                {{0, 0xAAAAULL}, {33, tw.rt(0x1000)}}, {});
+        tw.emit_objc(tw.rt(0x1000), 0xAAAAULL, 0xBBULL, "NSNumber");
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
         tw.emit_anchor(ms);
     }, "objc_retval");
 
@@ -596,13 +598,95 @@ TEST_CASE("ObjcPass extracts the return value (x0) after the message send",
     REQUIRE(or_.total_messages() == 1);
     const auto& msg = or_.messages[0];
 
-    SECTION("has_return is true") {
-        REQUIRE(msg.has_return);
-    }
+    REQUIRE_FALSE(msg.has_return);
+    REQUIRE(msg.return_kind == ObjcReturnKind::None);
+    REQUIRE(msg.return_value == 0);
+}
 
-    SECTION("return_value matches x0 after the message send") {
-        REQUIRE(msg.return_value == 0x7777ULL);
+TEST_CASE("ObjcPass v8 associates nested ObjC returns by LIFO identity",
+          "[unit][pass][objc][v8]") {
+    constexpr uint64_t outer_receiver = 0x11110000ULL;
+    constexpr uint64_t inner_receiver = 0x22220000ULL;
+    constexpr uint64_t inner_return = 0xAAAA0000ULL;
+    constexpr uint64_t outer_return = 0xBBBB0000ULL;
+
+    auto env = make_env([&](TraceWriter& tw) {
+        tw.write_header_v8();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), outer_receiver,
+                        0x5000, "Outer", "outerCall");
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x2000), inner_receiver,
+                        0x6000, "Inner", "innerCall");
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                       tw.rt(0x2000), 0x9000, tw.rt(0x2004), inner_return, 0, 0, 0, 0);
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND,
+                       tw.rt(0x1000), 0x8000, tw.rt(0x1004), outer_return, 0, 0, 0, 0);
+        tw.emit(ms, 0x3000, enc::nop(), {{33, tw.rt(0x3004)}}, {});
+    }, "objc_v8_nested_retval");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    const auto& messages = pm->require("objc").get<ObjcResult>().messages;
+
+    REQUIRE(messages.size() == 2);
+    REQUIRE(messages[0].receiver == outer_receiver);
+    REQUIRE(messages[0].return_value == outer_return);
+    REQUIRE(messages[1].receiver == inner_receiver);
+    REQUIRE(messages[1].return_value == inner_return);
+    for (const auto& msg : messages) {
+        REQUIRE(msg.has_return);
+        REQUIRE(msg.return_kind == ObjcReturnKind::X0);
+        REQUIRE(msg.return_value != msg.receiver);
     }
+}
+
+TEST_CASE("ObjcPass v8 prefers inline selector and reports hex fallback status",
+          "[unit][pass][objc][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x1000), 1, 0x5000,
+                        "", "inlineSelector:");
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND, tw.rt(0x2000), 2, 0x6000,
+                        "KnownClass", "");
+        tw.emit(ms, 0x3000, enc::nop(), {{33, tw.rt(0x3004)}}, {});
+    }, "objc_v8_selector_status");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    const auto& messages = pm->require("objc").get<ObjcResult>().messages;
+
+    REQUIRE(messages.size() == 2);
+    REQUIRE(messages[0].selector_name == "inlineSelector:");
+    REQUIRE(messages[0].selector_source == ObjcSelectorSource::Inline);
+    REQUIRE(messages[0].selector_resolution == ObjcSelectorResolution::Resolved);
+    REQUIRE(messages[0].class_name.empty());
+    REQUIRE(messages[0].class_resolution == ObjcClassResolution::Unknown);
+    REQUIRE(messages[1].selector_name == "0x6000");
+    REQUIRE(messages[1].selector_source == ObjcSelectorSource::Hex);
+    REQUIRE(messages[1].selector_resolution == ObjcSelectorResolution::Unresolved);
+}
+
+TEST_CASE("ObjcPass labels stret x0 as raw return state",
+          "[unit][pass][objc][v8]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v8();
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit_objc_v8(QBDITRACE_OBJC_MSGSEND_STRET, tw.rt(0x1000), 0x1111,
+                        0x5000, "StructFactory", "makeRect");
+        tw.emit_retval(QBDITRACE_REC_OBJC, QBDITRACE_OBJC_MSGSEND_STRET,
+                       tw.rt(0x1000), 0x9000, tw.rt(0x1004), 0xDEAD, 0, 0, 0, 0);
+        tw.emit(ms, 0x3000, enc::nop(), {{33, tw.rt(0x3004)}}, {});
+    }, "objc_v8_stret");
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ObjcPass>());
+    const auto& msg = pm->require("objc").get<ObjcResult>().messages.at(0);
+
+    REQUIRE(msg.is_stret);
+    REQUIRE(msg.has_return);
+    REQUIRE(msg.return_kind == ObjcReturnKind::StretRaw);
+    REQUIRE(msg.return_value == 0xDEAD);
 }
 
 TEST_CASE("ObjcPass zero-colon selector with hex fallback uses full arg window",

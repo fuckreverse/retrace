@@ -126,7 +126,7 @@ struct ShardResult {
 /// For v5 (HF_PC_DELTA) traces, shard.seed_pc seeds the running PC accumulator;
 /// ANCHOR records resync it from their absolute PC field.
 void scan_shard(const Shard& shard, uint32_t num_gpr,
-                bool is_v5, bool is_v6, bool is_v7, ShardResult& out,
+                bool is_v5, bool is_v6, bool is_v7, bool is_v8, ShardResult& out,
                 const TraceReader::ThreadReader& thread_reader,
                 const std::atomic<bool>& cancelled,
                 const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges = {}) {
@@ -228,7 +228,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 const auto* a_hdr = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
                 running_pc = a_hdr->pc;
             }
-            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7);
+            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
         }
     }
 }
@@ -800,6 +800,7 @@ PassResult XrefPass::run(PassContext& ctx) {
     const bool xref_is_v5 = (reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA)  != 0;
     const bool xref_is_v6 = (reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     const bool xref_is_v7 = (reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR)    != 0;
+const bool xref_is_v8 = (reader.header().flags & qbditrace::QBDITRACE_HF_CALL_META)  != 0;
 
     // Create per-shard ThreadReaders to eliminate mutex contention.
     std::vector<TraceReader::ThreadReader> thread_readers;
@@ -813,13 +814,17 @@ PassResult XrefPass::run(PassContext& ctx) {
     const auto& excludes = range.exclude_pc_ranges;
 
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_results, &thread_readers, &cancel_flag, &excludes, num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, i]() {
-            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, shard_results[i], thread_readers[i], cancel_flag, excludes);
+        threads.emplace_back([&shards, &shard_results, &thread_readers,
+                              &cancel_flag, &excludes, num_gpr,
+                              xref_is_v5, xref_is_v6, xref_is_v7, xref_is_v8, i]() {
+            scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6,
+                       xref_is_v7, xref_is_v8, shard_results[i],
+                       thread_readers[i], cancel_flag, excludes);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, shard_results[0], thread_readers[0], cancel_flag, excludes);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, xref_is_v8, shard_results[0], thread_readers[0], cancel_flag, excludes);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 

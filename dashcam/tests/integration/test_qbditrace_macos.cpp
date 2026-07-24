@@ -135,7 +135,189 @@ static std::string run_tracer(const char* output_path, uint64_t seed,
     return output_path;
 }
 
+// ─── Real transfer target for CAPI return-value correlation ───────────────────
+
+static constexpr uint16_t kRetvalCapiId = 0x345;
+static constexpr uint64_t kRetvalArg = 0x1122334455667788ULL;
+
+extern "C" __attribute__((noinline, used)) uint64_t
+capi_retval_external(uint64_t value) {
+    return (value ^ 0xD6E8FEB86659FD93ULL) + 0x1020304050607080ULL;
+}
+
+extern "C" __attribute__((used)) void capi_retval_external_end(void) {}
+
+__attribute__((noinline)) static uint64_t capi_retval_transfer_target(uint64_t value) {
+    // Load through a volatile function pointer so Clang emits a real BLR transfer
+    // instead of folding the known local function into a direct/inlined call.
+    using ExternalFn = uint64_t (*)(uint64_t);
+    volatile ExternalFn external = &capi_retval_external;
+    volatile uint64_t result = external(value);
+    return result;
+}
+
+void capi_retval_transfer_target_end(void) {}
+
+struct CapiRetvalPair {
+    bool found = false;
+    qbditrace::qbditrace_capicall_head_v8_t call{};
+    qbditrace::qbditrace_retval_t retval{};
+};
+
+static CapiRetvalPair run_capi_retval_transfer(const char* output_path) {
+    const uint64_t start = (uint64_t)(uintptr_t)&capi_retval_transfer_target;
+    uint64_t end = (uint64_t)(uintptr_t)&capi_retval_transfer_target_end;
+    if (end <= start || (end - start) > 0x1000) end = start + 0x400;
+
+    const uint64_t external = (uint64_t)(uintptr_t)&capi_retval_external;
+    if (external >= start && external < end) return {};
+
+    qbditrace_config_t cfg{};
+    cfg.struct_size = sizeof(cfg);
+    cfg.trace_start = start;
+    cfg.trace_end = end;
+    cfg.module_base = start;
+    cfg.module_name = "capi_retval_transfer_target";
+    cfg.output_path = output_path;
+    cfg.record = QBDITRACE_REC_DEFAULT;
+    cfg.anchor_interval = 64;
+    cfg.disable_compress = 1;
+    cfg.enable_capi_intercept = 1;
+    cfg.n_capi_funcs = 1;
+    cfg.capi_funcs[0].addr = external;
+    cfg.capi_funcs[0].api_id = kRetvalCapiId;
+    cfg.capi_funcs[0].n_args = 1;
+    // The tracer instruments the whole containing Mach-O module. Explicitly
+    // remove this small leaf so BLR crosses through QBDI's ExecBroker.
+    cfg.n_exclude_ranges = 1;
+    cfg.exclude_ranges[0].start = external;
+    cfg.exclude_ranges[0].end = (uint64_t)(uintptr_t)&capi_retval_external_end;
+
+    if (qbditrace_configure(&cfg) != 0) return {};
+    uint64_t traced_ret = 0;
+    const uint64_t args[] = {kRetvalArg};
+    const int rc = qbditrace_run_call(&traced_ret, start, 1, args);
+    qbditrace_stop();
+    const uint64_t expected_ret = capi_retval_external(kRetvalArg);
+    if (rc != 0 || traced_ret != expected_ret || traced_ret == kRetvalArg) return {};
+
+    FILE* f = fopen(output_path, "rb");
+    if (f == nullptr) return {};
+    qbditrace::qbditrace_file_header_t hdr{};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        !(hdr.flags & QBDITRACE_HF_CALL_META)) {
+        fclose(f);
+        return {};
+    }
+
+    CapiRetvalPair result;
+    qbditrace::qbditrace_capicall_head_v8_t matching_call{};
+    bool have_call = false;
+    for (int iter = 0; iter < 10000; ++iter) {
+        uint8_t kind = 0;
+        if (fread(&kind, 1, 1, f) != 1) break;
+        fseek(f, -1, SEEK_CUR);
+
+        if (kind == QBDITRACE_REC_INST) {
+            const bool has_fpr = (hdr.flags & QBDITRACE_HF_HAS_FPR) != 0;
+            const bool is_v5 = hdr.version >= 5 && (hdr.flags & QBDITRACE_HF_PC_DELTA) != 0;
+            uint8_t n_regdiff = 0, n_mem = 0, n_fprdiff = 0;
+            if (has_fpr && is_v5) {
+                qbditrace::qbditrace_inst_head_v7_v5_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (has_fpr) {
+                qbditrace::qbditrace_inst_head_v7_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (is_v5) {
+                qbditrace::qbditrace_inst_head_v5_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            } else {
+                qbditrace::qbditrace_inst_head_t ih{};
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            }
+            const size_t mem_size = (hdr.flags & QBDITRACE_HF_OLD_VALUE)
+                ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+                : sizeof(qbditrace::qbditrace_memacc_t);
+            fseek(f, (long)(n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t) +
+                            n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t) +
+                            n_mem * mem_size), SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_ANCHOR) {
+            qbditrace::qbditrace_anchor_head_t ah{};
+            if (fread(&ah, sizeof(ah), 1, f) != 1) break;
+            const size_t fpr_bytes = (hdr.flags & QBDITRACE_HF_HAS_FPR)
+                ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+            fseek(f, (long)(hdr.num_gpr * 8 + fpr_bytes), SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_CODE) {
+            qbditrace::qbditrace_code_head_t ch{};
+            if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            fseek(f, ch.size, SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_THREAD) {
+            qbditrace::qbditrace_thread_head_t th{};
+            if (fread(&th, sizeof(th), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_EVENT) {
+            qbditrace::qbditrace_event_head_t eh{};
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_CAPICALL) {
+            qbditrace::qbditrace_capicall_head_v8_t ch{};
+            if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            for (uint8_t i = 0; i < ch.str_count; ++i) {
+                qbditrace::qbditrace_capicall_str_t sh{};
+                if (fread(&sh, sizeof(sh), 1, f) != 1) goto scan_done_retval;
+                const uint32_t padded = ((uint32_t)(sh.str_len + 1u) + 3u) & ~3u;
+                fseek(f, (long)padded, SEEK_CUR);
+            }
+            if (ch.api_id == kRetvalCapiId && ch.target == external) {
+                matching_call = ch;
+                have_call = true;
+            }
+        } else if (kind == QBDITRACE_REC_RETVAL) {
+            qbditrace::qbditrace_retval_t rv{};
+            if (fread(&rv, sizeof(rv), 1, f) != 1) break;
+            if (rv.record_size > sizeof(rv))
+                fseek(f, (long)(rv.record_size - sizeof(rv)), SEEK_CUR);
+            if (have_call && rv.source_kind == QBDITRACE_REC_CAPICALL &&
+                rv.source_id == kRetvalCapiId && rv.site == matching_call.pc &&
+                rv.target == matching_call.target) {
+                result.found = true;
+                result.call = matching_call;
+                result.retval = rv;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+scan_done_retval:
+    fclose(f);
+    return result;
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("qbditrace: real CAPI transfer records its return value",
+          "[integration][qbditrace][capi][retval]") {
+    const char* out = "/tmp/qbditrace_test_capi_retval.bin";
+    const auto pair = run_capi_retval_transfer(out);
+
+    REQUIRE(pair.found);
+    CHECK(pair.call.api_id == kRetvalCapiId);
+    CHECK(pair.call.arg_count == 1);
+    CHECK(pair.call.args[0] == kRetvalArg);
+    CHECK(pair.call.pc >= (uint64_t)(uintptr_t)&capi_retval_transfer_target);
+    CHECK(pair.call.pc < (uint64_t)(uintptr_t)&capi_retval_transfer_target + 0x400);
+    CHECK(pair.call.target == (uint64_t)(uintptr_t)&capi_retval_external);
+    CHECK(pair.retval.source_kind == QBDITRACE_REC_CAPICALL);
+    CHECK(pair.retval.source_id == kRetvalCapiId);
+    CHECK(pair.retval.site == pair.call.pc);
+    CHECK(pair.retval.target == pair.call.target);
+    CHECK(pair.retval.resume == pair.call.pc + 4);
+    CHECK(pair.retval.x0 == capi_retval_external(kRetvalArg));
+    CHECK(pair.retval.x0 != pair.call.args[0]);
+}
 
 TEST_CASE("qbditrace: in-process trace is semantically correct",
           "[integration][qbditrace]") {
@@ -269,12 +451,24 @@ TEST_CASE("qbditrace: trace file contains expected record types",
             qbditrace::qbditrace_svc_head_t sh;
             if (fread(&sh, sizeof(sh), 1, f) != 1) break;
         } else if (kind == QBDITRACE_REC_OBJC) {
-            // OBJC record has a fixed-size header (including 48-byte cls name buffer)
-            qbditrace::qbditrace_objc_head_t oh;
-            if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+            if (hdr.flags & QBDITRACE_HF_CALL_META) {
+                qbditrace::qbditrace_objc_head_v8_t oh;
+                if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+                uint32_t padded = ((uint32_t)(oh.sel_len + 1u) + 3u) & ~3u;
+                fseek(f, (long)padded, SEEK_CUR);
+            } else {
+                qbditrace::qbditrace_objc_head_t oh;
+                if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+            }
         } else if (kind == QBDITRACE_REC_CAPICALL) {
-            qbditrace::qbditrace_capicall_head_t ch;
-            if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            qbditrace::qbditrace_capicall_head_v8_t ch;
+            if (hdr.flags & QBDITRACE_HF_CALL_META) {
+                if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            } else {
+                qbditrace::qbditrace_capicall_head_t old;
+                if (fread(&old, sizeof(old), 1, f) != 1) break;
+                ch.str_count = old.str_count;
+            }
             for (uint8_t si = 0;
                  si < ch.str_count && si < QBDITRACE_CAPICALL_MAX_STR_CAPS; ++si) {
                 qbditrace::qbditrace_capicall_str_t sh;
@@ -282,6 +476,11 @@ TEST_CASE("qbditrace: trace file contains expected record types",
                 uint32_t padded = ((uint32_t)(sh.str_len + 1u) + 3u) & ~3u;
                 fseek(f, (long)padded, SEEK_CUR);
             }
+        } else if (kind == QBDITRACE_REC_RETVAL) {
+            qbditrace::qbditrace_retval_t rv;
+            if (fread(&rv, sizeof(rv), 1, f) != 1) break;
+            if (rv.record_size > sizeof(rv))
+                fseek(f, (long)(rv.record_size - sizeof(rv)), SEEK_CUR);
         } else {
             // Unknown record kind: stop scanning
             break;
@@ -689,6 +888,11 @@ TEST_CASE("qbditrace: CAPICALL records appear in trace file (raw scan)",
         } else if (kind == QBDITRACE_REC_OBJC) {
             qbditrace::qbditrace_objc_head_t oh;
             if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_RETVAL) {
+            qbditrace::qbditrace_retval_t rv;
+            if (fread(&rv, sizeof(rv), 1, f) != 1) break;
+            if (rv.record_size > sizeof(rv))
+                fseek(f, (long)(rv.record_size - sizeof(rv)), SEEK_CUR);
         } else {
             break;  // unknown record — stop scan
         }

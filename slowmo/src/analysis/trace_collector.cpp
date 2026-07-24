@@ -35,7 +35,7 @@ struct ScanShard {
 /// Only on_inst() is called; non-INST records are skipped.
 /// Uses a per-thread ThreadReader to avoid mutex contention on the shared cache.
 void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
-                           bool is_v5, bool is_v6, bool is_v7,
+                           bool is_v5, bool is_v6, bool is_v7, bool is_v8,
                            const std::vector<TraceCollector*>& clones,
                            std::atomic<uint64_t>& progress_counter,
                            const TraceReader::ThreadReader& thread_reader,
@@ -128,7 +128,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
             }
         } else {
             // Non-INST record: skip using shared raw_record_size
-            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7);
+            offset += raw_record_size(ptr, num_gpr, is_v5, is_v6, is_v7, is_v8);
         }
     }
 
@@ -236,6 +236,13 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
             }
             break;
         }
+        case RecordKind::Retval: {
+            if (inst_id >= start_inst_id) {
+                auto retval = rec.as_retval();
+                for (auto* c : active) c->on_retval(inst_id, retval);
+            }
+            break;
+        }
         case RecordKind::Thread: {
             auto thread = rec.as_thread();
             for (auto* c : active) {
@@ -286,6 +293,7 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     bool is_v5 = (reader_.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
     bool is_v6 = (reader_.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
     bool is_v7 = (reader_.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+    bool is_v8 = (reader_.header().flags & qbditrace::QBDITRACE_HF_CALL_META) != 0;
 
     // Fallback to sequential if: no parallel collectors, no index, small trace, or v5/v7 format
     if (par_collectors.empty() || index_ == nullptr ||
@@ -377,13 +385,13 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     const std::atomic<bool>* cancel_tok = cancel_token_;
     const auto& excludes = exclude_pc_ranges_;
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, num_gpr, is_v5, is_v6, is_v7, cancel_tok, i]() {
-            scan_shard_collectors(shards[i], num_gpr, is_v5, is_v6, is_v7, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, num_gpr, is_v5, is_v6, is_v7, is_v8, cancel_tok, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, is_v5, is_v6, is_v7, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes);
+    scan_shard_collectors(shards[0], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes);
 
     // Report progress while waiting
     if (progress_fn_) {

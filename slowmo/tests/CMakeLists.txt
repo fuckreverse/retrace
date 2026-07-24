@@ -49,6 +49,7 @@ tenet_add_test(test_common_progress_manager unit/test_common_progress_manager.cp
 tenet_add_test(test_io_trace_reader        unit/test_io_trace_reader.cpp)
 tenet_add_test(test_io_trace_reader_v5     unit/test_io_trace_reader_v5.cpp)
 tenet_add_test(test_io_trace_reader_v6     unit/test_io_trace_reader_v6.cpp)
+tenet_add_test(test_io_trace_reader_v8     unit/test_io_trace_reader_v8.cpp)
 tenet_add_test(test_io_trace_reader_special unit/test_io_trace_reader_special.cpp)
 tenet_add_test(test_io_trace_reader_compressed unit/test_io_trace_reader_compressed.cpp)
 tenet_add_test(test_io_block_compressed    unit/test_io_block_compressed.cpp)

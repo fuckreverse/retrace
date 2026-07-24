@@ -17,6 +17,8 @@
 #include "infra/scan_orchestrator.h"
 
 #include <filesystem>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 
@@ -543,6 +545,72 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
     }
 
     // Cleanup
+    index_result->close();
+    std::filesystem::remove_all(temp_dir);
+}
+
+TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
+          "[bugfix][streaming_index][v8]") {
+    const auto temp_dir = std::filesystem::temp_directory_path() /
+        ("tenet_test_streaming_v8_" + std::to_string(getpid()));
+    std::filesystem::remove_all(temp_dir);
+    std::filesystem::create_directories(temp_dir);
+    const auto trace_path = temp_dir / "streaming_v8.trace";
+
+    {
+        TraceWriter tw;
+        REQUIRE(tw.open(trace_path.c_str()));
+        tw.write_header_v8();
+        tw.close();
+    }
+
+    auto reader_result = TraceReader::open(trace_path);
+    REQUIRE(reader_result.has_value());
+    auto index_result = TraceIndex::open_or_build(*reader_result, nullptr);
+    REQUIRE(index_result.has_value());
+    REQUIRE(index_result->inst_count() == 0);
+
+    StreamingIndex si(StreamingIndex::Config{
+        .batch_size = 1,
+        .poll_interval_ms = 20,
+        .idle_timeout_ms = 1000,
+        .max_inst_count = 0,
+    });
+    REQUIRE(si.start(trace_path, *index_result));
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    qbditrace::qbditrace_capicall_head_v8_t call{};
+    call.kind = qbditrace::QBDITRACE_REC_CAPICALL;
+    call.str_count = 1;
+    {
+        FILE* fp = std::fopen(trace_path.c_str(), "ab");
+        REQUIRE(fp != nullptr);
+        REQUIRE(std::fwrite(&call, sizeof(call), 1, fp) == 1);
+        std::fclose(fp);
+    }
+
+    // The first poll sees an incomplete C API record and must retain its offset.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    REQUIRE(si.inst_count() == 0);
+
+    {
+        FILE* fp = std::fopen(trace_path.c_str(), "ab");
+        REQUIRE(fp != nullptr);
+        qbditrace::qbditrace_capicall_str_t string_header{};
+        string_header.str_len = 3;
+        const char string_payload[] = "abc";
+        qbditrace::qbditrace_inst_head_t inst{};
+        inst.kind = qbditrace::QBDITRACE_REC_INST;
+        REQUIRE(std::fwrite(&string_header, sizeof(string_header), 1, fp) == 1);
+        REQUIRE(std::fwrite(string_payload, sizeof(string_payload), 1, fp) == 1);
+        REQUIRE(std::fwrite(&inst, sizeof(inst), 1, fp) == 1);
+        std::fclose(fp);
+    }
+
+    REQUIRE(si.wait_for_inst(1, 3000));
+    si.stop();
+    REQUIRE(si.inst_count() == 1);
+
     index_result->close();
     std::filesystem::remove_all(temp_dir);
 }

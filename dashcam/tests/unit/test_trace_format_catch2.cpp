@@ -10,6 +10,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstring>
 #include "TraceFormat.h"
 
@@ -39,6 +40,16 @@ static_assert(sizeof(qbditrace_objc_head_t) == 80,
     "objc_head must be 80 bytes");
 static_assert(sizeof(qbditrace_code_head_t) == 16,
     "code_head must be 16 bytes");
+static_assert(sizeof(qbditrace_capicall_head_v8_t) == 88,
+    "v8 capicall head must remain 88 bytes");
+static_assert(sizeof(qbditrace_objc_head_v8_t) == 80,
+    "v8 objc head must remain 80 bytes");
+static_assert(sizeof(qbditrace_retval_t) == 64,
+    "retval must be 64 bytes");
+static_assert(offsetof(qbditrace_retval_t, source_id) == 8,
+    "retval source_id must start at byte 8");
+static_assert(offsetof(qbditrace_retval_t, nzcv) == 56,
+    "retval nzcv must start at byte 56");
 
 // ─── Magic + version constants ───────────────────────────────────────────────
 
@@ -64,6 +75,8 @@ TEST_CASE("TraceFormat: record kind enum values", "[unit][qbditrace][trace_forma
     CHECK(QBDITRACE_REC_SVC    == 4);
     CHECK(QBDITRACE_REC_OBJC   == 5);
     CHECK(QBDITRACE_REC_CODE   == 6);
+    CHECK(QBDITRACE_REC_CAPICALL == 7);
+    CHECK(QBDITRACE_REC_RETVAL == 8);
 }
 
 // ─── Header flag bits ─────────────────────────────────────────────────────────
@@ -74,6 +87,8 @@ TEST_CASE("TraceFormat: header flag bit values", "[unit][qbditrace][trace_format
     CHECK(QBDITRACE_HF_REG_DIFF == 4u);
     CHECK(QBDITRACE_HF_HAS_CODE == 8u);
     CHECK(QBDITRACE_HF_PC_DELTA == 16u);
+    CHECK(QBDITRACE_HF_CALL_META == (1u << 10));
+    CHECK(QBDITRACE_HF_WIDE_API_ID == QBDITRACE_HF_CALL_META);
 }
 
 // ─── File header initialization ──────────────────────────────────────────────

@@ -363,9 +363,11 @@ struct TraceWriter {
         fwrite(&h, sizeof(h), 1, fp);
     }
 
-    void emit_svc(uint64_t pc, uint64_t no, uint64_t a0 = 0, uint64_t a1 = 0) {
+    void emit_svc(uint64_t pc, uint64_t no, uint64_t a0 = 0, uint64_t a1 = 0,
+                  uint8_t flags = 0) {
         qbditrace::qbditrace_svc_head_t h = {};
         h.kind = QBDITRACE_REC_SVC; h.pc = pc; h.syscall_no = no;
+        h.reserved[0] = flags;
         h.args[0] = a0; h.args[1] = a1;
         fwrite(&h, sizeof(h), 1, fp);
     }
@@ -766,6 +768,127 @@ struct TraceWriter {
             fwrite(&ma, sizeof(ma), 1, fp);
         }
         inst_count++;
+    }
+
+    /// Write a v8 file-wide call metadata header.
+    void write_header_v8(uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V8_WIDE_API_ID;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_CALL_META;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
+    /// Same as write_header_v8(), but also stamps `target_os`
+    /// (see qbditrace_target_os_t: 0=Unknown, 1=iOS, 2=Android, 3=Linux).
+    /// Used by tests that need v8 format AND platform-specific API dispatch
+    /// (e.g. BoringSSL on Android).
+    void write_header_v8_target_os(uint32_t target_os, uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V8_WIDE_API_ID;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE |
+                    QBDITRACE_HF_CALL_META;
+        hdr.target_os = target_os;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
+    /// Emit a REC_CAPICALL record using the v8 88-byte header.
+    /// Must be called after write_header_v8().
+    void emit_capicall_v8(uint16_t api_id, uint64_t pc, uint64_t target,
+                          const std::vector<uint64_t>& args,
+                          const std::vector<CapiStr>& strs = {}) {
+        uint8_t arg_count = static_cast<uint8_t>(std::min<size_t>(args.size(), 8));
+        uint8_t str_count = static_cast<uint8_t>(
+            std::min<size_t>(strs.size(), QBDITRACE_CAPICALL_MAX_STR_CAPS));
+
+        qbditrace::qbditrace_capicall_head_v8_t h = {};
+        h.kind      = QBDITRACE_REC_CAPICALL;
+        h.arg_count = arg_count;
+        h.str_count = str_count;
+        h.api_id    = api_id;
+        h.pc        = pc;
+        h.target    = target;
+        for (uint8_t i = 0; i < arg_count; ++i) h.args[i] = args[i];
+        fwrite(&h, sizeof(h), 1, fp);
+
+        for (uint8_t si = 0; si < str_count; ++si) {
+            const auto& s = strs[si];
+            uint8_t slen = static_cast<uint8_t>(
+                std::min<size_t>(s.value.size(), QBDITRACE_CAPICALL_MAX_STR_BYTES));
+
+            qbditrace::qbditrace_capicall_str_t sh = {};
+            sh.str_arg_idx = s.arg_idx;
+            sh.str_len     = slen;
+            sh.str_flags   = s.flags;
+            sh._reserved   = 0;
+            fwrite(&sh, sizeof(sh), 1, fp);
+
+            uint16_t data_bytes = static_cast<uint16_t>(slen + 1);
+            uint16_t padded = (data_bytes + 3u) & ~3u;
+            fwrite(s.value.data(), 1, slen, fp);
+            char nul = '\0';
+            fwrite(&nul, 1, 1, fp);
+            uint16_t pad = padded - data_bytes;
+            for (uint16_t p = 0; p < pad; ++p) fwrite(&nul, 1, 1, fp);
+        }
+    }
+
+    void emit_objc_v8(uint8_t variant, uint64_t pc, uint64_t recv,
+                      uint64_t sel, const std::string& cls,
+                      const std::string& selector) {
+        qbditrace::qbditrace_objc_head_v8_t h{};
+        h.kind = QBDITRACE_REC_OBJC;
+        h.variant = variant;
+        h.sel_len = static_cast<uint8_t>(std::min<size_t>(selector.size(), 255));
+        h.pc = pc; h.recv = recv; h.sel = sel;
+        std::strncpy(h.cls, cls.c_str(), sizeof(h.cls) - 1);
+        fwrite(&h, sizeof(h), 1, fp);
+        fwrite(selector.data(), 1, h.sel_len, fp);
+        const char nul = 0; fwrite(&nul, 1, 1, fp);
+        size_t pad = ((static_cast<size_t>(h.sel_len) + 1u + 3u) & ~size_t{3})
+                   - (static_cast<size_t>(h.sel_len) + 1u);
+        for (size_t i = 0; i < pad; ++i) fwrite(&nul, 1, 1, fp);
+    }
+
+    void emit_retval(uint8_t source_kind, uint16_t aux_id,
+                     uint64_t site, uint64_t target, uint64_t resume,
+                     uint64_t x0, uint64_t x1, uint32_t nzcv,
+                     int32_t errno_before, int32_t errno_after,
+                     uint64_t source_id = UINT64_MAX,
+                     bool errno_valid = false) {
+        qbditrace::qbditrace_retval_t h{};
+        h.kind = QBDITRACE_REC_RETVAL;
+        h.source_kind = source_kind;
+        h.flags = errno_valid ? QBDITRACE_RET_FL_ERRNO_VALID : 0;
+        h.aux_id = aux_id;
+        h.record_size = static_cast<uint16_t>(sizeof(h) +
+            (errno_valid ? sizeof(int32_t) * 2 : 0));
+        h.source_id = source_id == UINT64_MAX ? aux_id : source_id;
+        h.site = site; h.target = target; h.resume = resume;
+        h.x0 = x0; h.x1 = x1; h.nzcv = nzcv;
+        fwrite(&h, sizeof(h), 1, fp);
+        if (errno_valid) {
+            fwrite(&errno_before, sizeof(errno_before), 1, fp);
+            fwrite(&errno_after, sizeof(errno_after), 1, fp);
+        }
     }
 
     /// Emit a v5+v6 INST record: 6-byte pc_delta inst head + 48-byte memacc_v6_t.

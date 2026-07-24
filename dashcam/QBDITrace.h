@@ -126,7 +126,8 @@ typedef struct {
   uint64_t ring_bytes;      /* per-thread ring buffer size in bytes
                              * (0 => default 64 MiB). */
   /* Runtime addresses of the objc_msgSend family, resolved by the loader (e.g.
-   * Module.findExportByName("libobjc.A.dylib", "objc_msgSend")). Any may be 0
+   * Module.findGlobalExportByName("objc_msgSend") or
+   * Process.getModuleByName("libobjc.A.dylib").findExportByName("objc_msgSend")). Any may be 0
    * if unavailable / not wanted. When an EXEC_TRANSFER_CALL targets one of
    * these, the tracer emits an OBJC record carrying x0 (receiver) and the
    * selector register so the decoder can resolve class/selector offline. */
@@ -265,7 +266,10 @@ typedef struct {
     uint8_t  str_args; /* bitmask: bit i set => args[i] is a pointer to capture */
                        /* e.g. memcpy: str_args = 0x06 (args[1]=src, args[2] size-hint) */
                        /*      strcmp:  str_args = 0x03 (args[0]=a, args[1]=b) */
-    /* Total: 8+2+1+1 = 12 bytes; no explicit pad needed for natural alignment. */
+    /* Fields total 8+2+1+1 = 12 bytes, but the struct's 8-byte alignment (from
+ * addr) pads sizeof(entry) to 16 with 4 bytes of trailing padding. Array
+ * stride is therefore 16 bytes; external writers (e.g. the Frida agent)
+ * must use the 16-byte stride and zero the padding. */
   } capi_funcs[QBDITRACE_MAX_CAPI_FUNCS];
 } qbditrace_config_t;
 

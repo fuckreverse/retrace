@@ -28,10 +28,10 @@ Older qbditrace recordings write `target_os = 0`. `objc` and `objc_crypto` skip 
 `objc` parses ObjC record kinds from `REC_OBJC` (=5). It extracts, per message send:
 
 - **receiver** (x0 at the `objc_msgSend` call site) — the object the message is sent to;
-- **selector** (x1) — the SEL pointer; resolved to a selector string from the binary's selector references or the trace memory;
-- **class name** — derived from the receiver's isa pointer (ObjC runtime class lookup via trace memory);
+- **selector** (x1) — v8 captures the `sel_getName` result inline (`selector_source=inline`); older traces fall back through image and trace-memory resolution, then show hex. `selector_resolution` reports `resolved`, `truncated`, `read_failed`, or `unresolved`;
+- **class name** — derived from the receiver's isa pointer (ObjC runtime class lookup via trace memory); `class_resolution` reports the same status, and unavailable classes are explicitly `unknown`;
 - **arguments** (x2–x7, up to 6) — each arg value is recorded, and when it looks like a userspace pointer, `objc` attempts to dereference it as a C string;
-- **return value** (x0 at the next OBJC record or trace end) — also dereferenced as a string when applicable.
+- **return value** — v8 `REC_RETVAL` captures the actual return-time x0/x1/NZCV and associates it with the call by site/target/source ID. v4–v7 have no return fact, so show `return=unknown` rather than inferring a later x0. `objc_msgSend_stret` is marked `stret raw`: x0 is the hidden result buffer, not an ordinary scalar return.
 
 Only the four msgSend variants are parsed (`objc_msgSend`, `objc_msgSendSuper`, `objc_msgSendSuper2`, `objc_msgSend_stret`), matching whatever addresses were passed in `qbditrace_config_t` at record time. The `variant` field on `ObjcMessage` distinguishes which variant fired (0 = msgSend, 1 = stret, 2 = super/super2).
 
@@ -68,13 +68,15 @@ The pass also highlights cases where a crypto call happens *without* an enclosin
 
 **`REC_CAPICALL`** is emitted when `qbditrace_config_t::enable_capi_intercept` is set and explicit `capi_funcs[]` entries (or auto-resolved dlsym entries for native, Frida-supplied entries for JNI) are matched. Each record carries:
 - runtime target address;
-- `api_id` (index into the known-API table);
+- `api_id` (index into the known-API table; `uint16_t` in v8, so BoringSSL 600+ and JNI 700+ IDs are preserved);
 - argument values (up to 8);
 - `str_args` bitmask indicating which arguments are known string pointers — the tracer captures those inline so tenet does not need to reconstruct memory for them.
 
 This is the gold standard: symbol name, typed arguments, and dereferenced strings all arrive pre-packaged.
 
-**`REC_SVC`** (syscall records) capture supervisor-call events. On Darwin these include `mach_msg`, `mach_vm_map`, `read`, `write`, etc.; on Linux/Android `ioctl`, `mmap`, `mprotect` and so on. Tenet classifies each syscall using the `target_os`-selected table.
+**`REC_SVC`** (syscall records) capture supervisor-call events and v8 flags. On Darwin these include `mach_msg`, `mach_vm_map`, `read`, `write`, etc.; on Linux/Android `ioctl`, `mmap`, `mprotect` and so on. Tenet selects the table by `target_os`; Darwin class prefixes are normalized for naming while the raw number remains available.
+
+For `REC_CAPICALL`, `REC_SVC`, and ObjC, v8 `REC_RETVAL` supplies the actual x0/x1/NZCV at return time and links it precisely by site/target/source ID. A syscall failure is derived from Darwin NZCV carry (bit 29) or Linux x0 in `[-4095,-1]`; native SVC does not treat environment TLS `errno` as valid. Opaque objects such as `SecKeyRef` remain opaque rather than being decoded as key bytes.
 
 **`XFER_CALL` heuristic** works on `REC_EVENT` records marking cross-module exits and re-entries. When the traced code transfers execution outside the instrumented range and comes back, tenet reconstructs a synthetic call. No symbol resolution is available, so calls are labeled by the target PC.
 
@@ -100,7 +102,7 @@ Each intercepted call reports:
 - the API name and category;
 - all argument values, with pointer arguments dereferenced to strings (where feasible);
 - the call site PC and inst_id;
-- the return value;
+- the return value — the return-time `REC_RETVAL` fact on v8; `unknown` on v4–v7, which contain no return fact;
 - the source (`REC_CAPICALL` / `REC_SVC` / `XFER_CALL`) used to resolve it.
 
 When multiple sources cover the same underlying call, only the highest-priority source produces output — tenet does not duplicate across sources.
@@ -144,11 +146,13 @@ MCP exposes `objc_messages`, `syscall_intercept`, and `objc_crypto`. `objc_messa
 | CommonCrypto / Security / CryptoKit | Classification only (needs `REC_CAPICALL`) | N/A | N/A | Heuristic |
 | Encryption primitive detection | Pattern-based (`pattern` pass) | Pattern-based | Pattern-based | Pattern-based |
 | Cross-source correlation (`objc_crypto`) | Works | N/A | N/A | N/A |
+| Exact platform-call returns | v8 `REC_RETVAL`; older traces `unknown` | v8 `REC_RETVAL`; older traces `unknown` | v8 `REC_RETVAL`; older traces `unknown` | Depends on trace version |
 
 **Recording prerequisites:**
 - ObjC: the trace must contain `REC_OBJC` records (set `record |= QBDITRACE_REC_MSGSEND` at record time; configure `objc_msgSend` addresses in `qbditrace_config_t`);
 - `REC_CAPICALL`: set `enable_capi_intercept = 1` with `n_capi_funcs > 0` (or rely on native dlsym auto-resolve); without it, only `REC_SVC` and `XFER_CALL` are available;
-- `REC_SVC`: default enabled in `QBDITRACE_REC_DEFAULT` (127); explicitly disable via `record &= ~QBDITRACE_REC_SYSCALL` to reduce trace size.
+- `REC_SVC`: default enabled in `QBDITRACE_REC_DEFAULT` (127); explicitly disable via `record &= ~QBDITRACE_REC_SYSCALL` to reduce trace size;
+- Exact ObjC/C API/SVC returns, inline ObjC selectors, and 16-bit C API IDs require a v8 trace with `HF_CALL_META` and `REC_RETVAL`; v4–v7 remain readable but have no return facts.
 
 ## Recommended workflow
 
@@ -170,6 +174,10 @@ MCP exposes `objc_messages`, `syscall_intercept`, and `objc_crypto`. `objc_messa
 - The trace may lack `REC_CAPICALL` and `REC_SVC`. Check `record` in the trace header.
 - `enable_capi_intercept` may not have been enabled at record time; without it, only syscall-level interception works.
 - On Unknown-target traces, the API table may not match — re-record with correct `target_os`.
+
+### Return value is `unknown`
+
+- The trace is v4–v7 or otherwise lacks v8 `REC_RETVAL`; it contains no trustworthy return-time fact. Re-record with a v8 `HF_CALL_META` trace. Tenet deliberately does not infer a return from a later record's x0.
 
 ### Results differ between CLI and GUI
 

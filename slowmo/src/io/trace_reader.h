@@ -181,6 +181,7 @@ struct SvcView {
     uint64_t pc;
     uint64_t syscall_no;
     const uint64_t* args;  // 6 args
+    uint8_t flags = 0;     // qbditrace QBDITRACE_SVC_FL_* bits
 
     size_t byte_size() const {
         return sizeof(qbditrace::qbditrace_svc_head_t);
@@ -189,13 +190,41 @@ struct SvcView {
 
 struct ObjcView {
     uint8_t variant;
+    uint8_t sel_len = 0;
+    uint8_t flags = 0;
     uint64_t pc;
     uint64_t recv;
     uint64_t sel;
-    const char* cls;  // 48-byte class name
+    const char* cls;
+    const char* selector_name = "";
+    bool is_v8 = false;
 
     size_t byte_size() const {
-        return sizeof(qbditrace::qbditrace_objc_head_t);
+        if (!is_v8) return sizeof(qbditrace::qbditrace_objc_head_t);
+        size_t payload = (static_cast<size_t>(sel_len) + 1u + 3u) & ~size_t{3};
+        return sizeof(qbditrace::qbditrace_objc_head_v8_t) + payload;
+    }
+};
+
+struct RetvalView {
+    uint8_t source_kind;
+    uint8_t flags;
+    uint16_t aux_id;
+    uint16_t record_size;
+    uint64_t source_id;
+    uint64_t site;
+    uint64_t target;
+    uint64_t resume;
+    uint64_t x0;
+    uint64_t x1;
+    uint32_t nzcv;
+    int32_t errno_before = 0; // compatibility view; not asserted valid by v8 writer
+    int32_t errno_after = 0;
+    size_t available_size = SIZE_MAX;
+    size_t byte_size() const {
+        return std::min(std::max<size_t>(record_size,
+                                         sizeof(qbditrace::qbditrace_retval_t)),
+                        available_size);
     }
 };
 
@@ -211,15 +240,18 @@ struct CapiCallStrView {
 };
 
 struct CapiCallView {
-    uint8_t  api_id;     // qbditrace_capi_id_t
+    uint16_t api_id;     // qbditrace_capi_id_t (uint16_t for v8, was uint8_t for v4-v7)
     uint8_t  arg_count;  // number of valid entries in args[]
     uint8_t  str_count;  // number of inline string captures
     uint64_t pc;         // call-site PC
     uint64_t target;     // runtime address of called function
     const uint64_t* args; // pointer to args[8] in mmap/cache
+    bool is_v8 = false;   // true when file-wide HF_CALL_META is set
 
     size_t byte_size() const {
-        size_t total = sizeof(qbditrace::qbditrace_capicall_head_t);
+        size_t total = is_v8
+            ? sizeof(qbditrace::qbditrace_capicall_head_v8_t)
+            : sizeof(qbditrace::qbditrace_capicall_head_t);
         // Variable-length string captures follow the fixed header.
         // Parse them to compute total record size.
         const uint8_t* p = reinterpret_cast<const uint8_t*>(args) + 8 * 8;
@@ -280,6 +312,12 @@ struct RecordView {
     // is_v7: true when INST records carry FPR diffs and ANCHOR records carry FPR
     //        snapshots (HF_HAS_FPR). Set by Iterator and record_at().
     bool is_v7 = false;
+    // is_v8: true when the file-wide call metadata layouts are enabled.
+    //        Set by Iterator and record_at().
+    bool is_v8 = false;
+    // Bytes remaining in the logical stream from raw_ptr. Iterator/record_at
+    // populate this so self-describing sizes cannot escape a truncated file.
+    size_t available_size = SIZE_MAX;
 
     // Parse helpers (caller checks kind first)
     InstView as_inst() const;
@@ -290,6 +328,7 @@ struct RecordView {
     ObjcView as_objc() const;
     CapiCallView as_capicall() const;
     ThreadView as_thread() const;
+    RetvalView as_retval() const;
 
     /// Compute the byte size of this record (needed to advance to next)
     size_t byte_size(uint32_t num_gpr) const;
@@ -348,6 +387,9 @@ struct FileHeader {
     ///   0 = not a branch, 1 = CALL (BL/BLR), 2 = RET, 4 = BRANCH (B/BR).
     /// The low nibble retains the normal N/Z/C/V flags.
     bool has_branch_hint() const  { return flags & qbditrace::QBDITRACE_HF_BRANCH_HINT; }
+    /// Compatibility spelling for v8 call metadata.
+    bool has_call_meta() const      { return flags & qbditrace::QBDITRACE_HF_CALL_META; }
+    bool has_wide_api_id() const    { return has_call_meta(); }
 };
 
 // ─── Shared raw record size calculation ───────────────────────────────────
@@ -368,7 +410,7 @@ struct FileHeader {
 //   is_v7   — HF_HAS_FPR: INST head includes n_fprdiff, ANCHOR includes 512B FPR
 inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
                                bool is_v5 = false, bool is_v6 = false,
-                               bool is_v7 = false) {
+                               bool is_v7 = false, bool is_v8 = false) {
     switch (ptr[0]) {
     case 0: { // INST
         uint8_t n_regdiff = ptr[2];
@@ -408,22 +450,44 @@ inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
         return sizeof(qbditrace::qbditrace_event_head_t);   // 24
     case 4: // SVC
         return sizeof(qbditrace::qbditrace_svc_head_t);     // 72
-    case 5: // OBJC
-        return sizeof(qbditrace::qbditrace_objc_head_t);    // 80
+    case 5: { // OBJC
+        if (!is_v8) return sizeof(qbditrace::qbditrace_objc_head_t);
+        const auto* oh = reinterpret_cast<const qbditrace::qbditrace_objc_head_v8_t*>(ptr);
+        size_t payload = (static_cast<size_t>(oh->sel_len) + 1u + 3u) & ~size_t{3};
+        return sizeof(qbditrace::qbditrace_objc_head_v8_t) + payload;
+    }
     case 6: // CODE
         return sizeof(qbditrace::qbditrace_code_head_t) + ptr[1];  // 16 + size
     case 7: { // CapiCall — variable length (fixed header + string captures)
-        const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
-        size_t sz = sizeof(qbditrace::qbditrace_capicall_head_t);  // 88 bytes
-        const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
-        for (uint8_t s = 0; s < cc->str_count; ++s) {
-            const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
-            uint16_t data_bytes = sh->str_len + 1;
-            uint16_t padded = (data_bytes + 3u) & ~3u;
-            sz += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
-            sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+        if (is_v8) {
+            const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_v8_t*>(ptr);
+            size_t sz = sizeof(qbditrace::qbditrace_capicall_head_v8_t);  // 88 bytes
+            const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_v8_t);
+            for (uint8_t s = 0; s < cc->str_count; ++s) {
+                const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                uint16_t data_bytes = sh->str_len + 1;
+                uint16_t padded = (data_bytes + 3u) & ~3u;
+                sz += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            }
+            return sz;
+        } else {
+            const auto* cc = reinterpret_cast<const qbditrace::qbditrace_capicall_head_t*>(ptr);
+            size_t sz = sizeof(qbditrace::qbditrace_capicall_head_t);  // 88 bytes
+            const uint8_t* sp = ptr + sizeof(qbditrace::qbditrace_capicall_head_t);
+            for (uint8_t s = 0; s < cc->str_count; ++s) {
+                const auto* sh = reinterpret_cast<const qbditrace::qbditrace_capicall_str_t*>(sp);
+                uint16_t data_bytes = sh->str_len + 1;
+                uint16_t padded = (data_bytes + 3u) & ~3u;
+                sz += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+                sp += sizeof(qbditrace::qbditrace_capicall_str_t) + padded;
+            }
+            return sz;
         }
-        return sz;
+    }
+    case 8: { // RETVAL — self describing
+        const auto* rv = reinterpret_cast<const qbditrace::qbditrace_retval_t*>(ptr);
+        return std::max<size_t>(rv->record_size, sizeof(qbditrace::qbditrace_retval_t));
     }
     default:
         return 1; // shouldn't happen
@@ -431,12 +495,15 @@ inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
 }
 
 /// Convenience overload: extract format flags from a FileHeader.
-inline size_t raw_record_size(const uint8_t* ptr, const FileHeader& hdr) {
-    return raw_record_size(
+inline size_t raw_record_size(const uint8_t* ptr, const FileHeader& hdr,
+                              size_t remaining = SIZE_MAX) {
+    size_t size = raw_record_size(
         ptr, hdr.num_gpr,
         (hdr.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0,
         (hdr.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0,
-        (hdr.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0);
+        (hdr.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0,
+        (hdr.flags & qbditrace::QBDITRACE_HF_CALL_META) != 0);
+    return std::min(size, remaining);
 }
 
 /// Compute the byte offset of n_fprdiff within an INST header.
@@ -588,14 +655,15 @@ public:
     /// obtained via random access (not Iterator). `seed_pc` is the absolute PC of
     /// the instruction at `offset`, as computed by offset_of_with_pc().
     /// Sets is_v5 and is_v6 from the file header so as_inst() uses the correct layout.
-    RecordView record_at(uint64_t offset, uint64_t seed_pc) const {
-        RecordView rv = record_at(offset);
-        rv.resolved_pc = seed_pc;
-        rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
-        rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
-        rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
-        return rv;
-    }
+RecordView record_at(uint64_t offset, uint64_t seed_pc) const {
+RecordView rv = record_at(offset);
+rv.resolved_pc = seed_pc;
+rv.is_v5 = (header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
+rv.is_v6 = (header_.flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0;
+rv.is_v7 = (header_.flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0;
+rv.is_v8 = (header_.flags & qbditrace::QBDITRACE_HF_WIDE_API_ID) != 0;
+return rv;
+}
 
     // ─── Pin / unpin (block-compressed mode) ─────────────────────────────
     /// Prevent all cached blocks from being evicted. Must be balanced by

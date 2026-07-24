@@ -129,6 +129,10 @@ int main(int argc, char **argv) {
   cfg.record = QBDITRACE_REC_DEFAULT;
   cfg.anchor_interval = 0;
   cfg.ring_bytes = 0; /* default */
+  /* The standalone harness compiles QBDITrace.cpp directly without linking
+   * zstd. Keep this trace uncompressed; Tenet still exercises the complete
+   * record/decode/analysis path without a misleading compression warning. */
+  cfg.disable_compress = 1;
   cfg.objc_msgSend = msgSend;
   cfg.objc_msgSendSuper = msgSendSuper;
   cfg.objc_msgSendSuper2 = msgSendSuper2;

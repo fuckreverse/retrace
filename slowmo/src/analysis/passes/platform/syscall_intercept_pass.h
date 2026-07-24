@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <optional>
 #include <array>
 #include <memory>
@@ -144,7 +143,13 @@ struct InterceptedCall {
     uint64_t key_length  = 0;
     uint64_t data_length = 0;
     uint64_t return_value = 0;
+    uint64_t return_x1 = 0;
+    uint32_t return_nzcv = 0;
     bool has_return = false;
+    bool errno_valid = false;
+    int32_t errno_before = 0;
+    int32_t errno_after = 0;
+    std::optional<int64_t> raw_error;
     std::optional<std::string> objc_context;
 
     /// Inline string captures directly from the CapiCall record (tracer-side).
@@ -218,6 +223,7 @@ public:
     void on_inst(uint64_t inst_id, const InstView& inst) override;
     void on_capicall(uint64_t inst_id, const CapiCallView& capi) override;
     void on_svc(uint64_t inst_id, const SvcView& svc) override;
+    void on_retval(uint64_t inst_id, const RetvalView& retval) override;
     void on_objc(uint64_t inst_id, const ObjcView& objc) override;
     void on_event(const EventView& ev) override;
     void end() override;
@@ -228,6 +234,8 @@ private:
     std::vector<uint8_t> read_memory_at(uint64_t addr, uint32_t max_bytes, uint64_t at_inst_id);
     void decode_known_api(InterceptedCall& call, const ApiSignature& sig);
     void finalize_call(InterceptedCall call);
+    void refresh_summary_with_return(InterceptedCall& call) const;
+    std::string syscall_name(uint64_t raw_syscall_no) const;
 
     static const std::vector<ApiSignature>& known_apis();
     static const std::vector<ApiSignature>& known_android_apis();
@@ -236,7 +244,7 @@ private:
         const char* name = nullptr;
         const ApiSignature* sig = nullptr;
     };
-    static const CapiEntry& capi_entry(uint8_t api_id);
+    static const CapiEntry& capi_entry(uint16_t api_id);
 
     // ── Configuration ──
     const SyscallInterceptConfig& config_;
@@ -248,7 +256,15 @@ private:
     // ── Known API lookup ──
     ankerl::unordered_dense::map<std::string, const ApiSignature*> api_by_name_;
 
-    /// Set of callee PCs handled by on_capicall() to suppress duplicate Event matches.
+    struct PendingReturn {
+        uint8_t source_kind = 0;
+        uint64_t source_id = 0;
+        uint64_t site = 0;
+        size_t call_index = 0;
+    };
+    std::vector<PendingReturn> pending_returns_;
+
+    /// Call sites handled by REC_CAPICALL, used only to suppress Event fallback duplicates.
     ankerl::unordered_dense::map<uint64_t, uint64_t> capicall_seen_;
 
     // ── Rolling register state ──

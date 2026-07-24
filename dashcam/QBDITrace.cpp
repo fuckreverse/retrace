@@ -79,6 +79,7 @@
 #include <sys/syscall.h>   /* __NR_gettid */
 #include <dlfcn.h>
 #endif
+#include <cerrno>
 
 /* Weak reference to the Objective-C runtime so the tracer can resolve a
  * message-send receiver's class name live, without hard-linking libobjc (the
@@ -87,7 +88,9 @@
  * <objc/runtime.h>. */
 extern "C" {
 typedef struct objc_object *id;
+typedef const void *SEL;
 const char *object_getClassName(id obj) __attribute__((weak_import));
+const char *sel_getName(SEL sel) __attribute__((weak_import));
 }
 
 /* Internal types (Config, classifySyscall, classifyObjcTarget, lookupCApiFunc)
@@ -757,9 +760,13 @@ private:
     qbditrace_file_header_t h;
     std::memset(&h, 0, sizeof(h));
     h.magic = QBDITRACE_MAGIC;
-    // Version selection: v7 > v6 > v5 > v4. Each bumps a version number so
-    // older readers can gracefully reject traces they cannot parse correctly.
-    if (cfg_.fpr_mode)
+    const bool call_meta = (cfg_.record & (QBDITRACE_REC_SYSCALL |
+                                           QBDITRACE_REC_MSGSEND |
+                                           QBDITRACE_REC_CAPI)) != 0;
+    // v8 is a file-wide call metadata contract and composes with PC delta/FPR.
+    if (call_meta)
+      h.version = QBDITRACE_VERSION_V8_CALL_META;
+    else if (cfg_.fpr_mode)
       h.version = QBDITRACE_VERSION_V7_HAS_FPR;
     else if (cfg_.pc_delta_mode)
       h.version = QBDITRACE_VERSION_V5_PC_DELTA;
@@ -793,6 +800,8 @@ private:
       h.flags |= QBDITRACE_HF_BLOCK_COMPRESSED;
     if (cfg_.branch_hint_mode)
       h.flags |= QBDITRACE_HF_BRANCH_HINT;
+    if (call_meta)
+      h.flags |= QBDITRACE_HF_CALL_META;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
 #if defined(__APPLE__)
@@ -915,6 +924,52 @@ struct ThreadCtx {
    * Used to compute pc_delta = exec_pc - last_emitted_pc.
    * Reset to 0 after emitting an ANCHOR (which re-anchors the running PC). */
   uint64_t last_emitted_pc = 0;
+
+  struct PendingCall {
+    uint8_t source_kind = 0;
+    uint16_t aux_id = 0;
+    uint64_t source_id = 0;
+    uint64_t site = 0;
+    uint64_t target = 0;
+  };
+  struct PendingTransfer {
+    PendingCall facts[2]{}; /* one target may be both ObjC and configured C API */
+    uint8_t fact_count = 0;
+  };
+  static constexpr uint8_t kPendingTransferDepth = 8;
+  PendingTransfer pending_calls[kPendingTransferDepth]{};
+  uint8_t pending_call_depth = 0;
+  uint8_t pending_call_overflow = 0;
+
+  void beginPendingTransfer() {
+    if (pending_call_depth < kPendingTransferDepth) {
+      pending_calls[pending_call_depth++] = {};
+    } else if (pending_call_overflow != UINT8_MAX) {
+      ++pending_call_overflow;
+    }
+  }
+
+  void addPendingCall(const PendingCall &call) {
+    if (pending_call_overflow != 0 || pending_call_depth == 0) return;
+    PendingTransfer &transfer = pending_calls[pending_call_depth - 1];
+    if (transfer.fact_count < 2) transfer.facts[transfer.fact_count++] = call;
+  }
+
+  bool popPendingTransfer(PendingTransfer &out) {
+    if (pending_call_overflow != 0) {
+      --pending_call_overflow;
+      return false;
+    }
+    if (pending_call_depth == 0) return false;
+    out = pending_calls[--pending_call_depth];
+    return true;
+  }
+
+  struct PendingSvc {
+    bool valid = false;
+    uint64_t site = 0;
+    uint64_t syscall_no = 0;
+  } pending_svc;
 
   /* LDXR/STXR exclusive monitor protection.
    *
@@ -1870,10 +1925,37 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
  * selector is in x16; on Linux/Android arm64 the syscall number is in x8.
  * Arguments are x0..x5 on both platforms. We snapshot them before the trap
  * executes so the decoder can name the syscall and show its arguments. */
-QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
-                     QBDI::FPRState * /*fpr*/, void * /*data*/) {
+inline void emitRetval(ThreadCtx *c, uint8_t source_kind, uint16_t aux_id,
+                       uint64_t source_id, uint64_t site, uint64_t target,
+                       uint64_t resume, QBDI::GPRState *gpr) {
+#if defined(__aarch64__) || defined(__arm64__)
+  qbditrace_retval_t rv{};
+  rv.kind = QBDITRACE_REC_RETVAL;
+  rv.source_kind = source_kind;
+  rv.aux_id = aux_id;
+  rv.record_size = sizeof(rv);
+  rv.source_id = source_id;
+  rv.site = site;
+  rv.target = target;
+  rv.resume = resume;
+  rv.x0 = QBDI_GPR_GET(gpr, 0);
+  rv.x1 = QBDI_GPR_GET(gpr, 1);
+  rv.nzcv = static_cast<uint32_t>(QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_NZCV));
+  prepareRecord(c->buf, sizeof(rv));
+  std::memcpy(c->buf->reserve(sizeof(rv)), &rv, sizeof(rv));
+#else
+  /* The v8 return-state layout is currently defined only for AArch64.
+   * Do not index an architecture-specific GPR array on secondary targets. */
+  (void)c; (void)source_kind; (void)aux_id; (void)source_id;
+  (void)site; (void)target; (void)resume; (void)gpr;
+#endif
+}
+
+QBDI::VMAction svcPreCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
+                        QBDI::FPRState * /*fpr*/, void * /*data*/) {
   ThreadCtx *c = ensureThreadCtx();
   ThreadBuffer *buf = c->buf;
+  const int saved_errno = errno;
 
   qbditrace_svc_head_t sh;
   sh.kind = QBDITRACE_REC_SVC;
@@ -1896,6 +1978,25 @@ QBDI::VMAction svcCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
   uint8_t *p = buf->reserve(sizeof(sh));
   std::memcpy(p, &sh, sizeof(sh));
   statsIncSvc();
+  c->pending_svc.valid = true;
+  c->pending_svc.site = sh.pc;
+  c->pending_svc.syscall_no = sh.syscall_no;
+  errno = saved_errno;
+  return QBDI::CONTINUE;
+}
+
+QBDI::VMAction svcPostCB(QBDI::VMInstanceRef /*vm*/, QBDI::GPRState *gpr,
+                         QBDI::FPRState * /*fpr*/, void * /*data*/) {
+  ThreadCtx *c = ensureThreadCtx();
+  const int target_errno = errno;
+  if (c->pending_svc.valid) {
+    emitRetval(c, QBDITRACE_REC_SVC,
+               static_cast<uint16_t>(c->pending_svc.syscall_no),
+               c->pending_svc.syscall_no, c->pending_svc.site, 0,
+               QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_PC), gpr);
+    c->pending_svc.valid = false;
+  }
+  errno = target_errno;
   return QBDI::CONTINUE;
 }
 
@@ -1920,16 +2021,13 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     statsIncEvents();
   };
 
-  /* Emit an OBJC dispatch record (receiver + selector) captured at the call
-   * site, before the dispatcher runs. */
-  auto emitObjc = [&](int variant, uint64_t site) {
-    qbditrace_objc_head_t oh;
-    std::memset(&oh, 0, sizeof(oh));
+  /* Emit the file-wide v8 OBJC layout with an online selector-name payload. */
+  auto emitObjc = [&](int variant, uint64_t site, uint64_t target) {
+    const int saved_errno = errno;
+    qbditrace_objc_head_v8_t oh{};
     oh.kind = QBDITRACE_REC_OBJC;
-    oh.variant = (uint8_t)variant;
+    oh.variant = static_cast<uint8_t>(variant);
     oh.pc = site;
-    /* For the *_stret variant x0 is the hidden struct-return pointer, so the
-     * receiver is in x1 and the selector in x2; otherwise x0/x1. */
     if (variant == QBDITRACE_OBJC_MSGSEND_STRET) {
       oh.recv = QBDI_GPR_GET(gpr, 1);
       oh.sel = QBDI_GPR_GET(gpr, 2);
@@ -1937,23 +2035,47 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
       oh.recv = QBDI_GPR_GET(gpr, 0);
       oh.sel = QBDI_GPR_GET(gpr, 1);
     }
-    /* Resolve the receiver's class name *live* (it cannot be recovered from the
-     * static image). object_getClassName handles tagged pointers and the arm64e
-     * isa packing safely. For the *Super variants the "receiver" is an
-     * objc_super struct pointer, not an object, so we skip class resolution. */
-    if (object_getClassName != nullptr && oh.recv != 0 &&
-        variant != QBDITRACE_OBJC_MSGSEND_SUPER &&
-        variant != QBDITRACE_OBJC_MSGSEND_SUPER2 &&
-        looksLikeObjcObject(oh.recv)) {
-      const char *cn = object_getClassName(reinterpret_cast<id>(oh.recv));
-      if (cn != nullptr) {
-        std::strncpy(oh.cls, cn, sizeof(oh.cls) - 1);
-      }
+
+    uint64_t class_receiver = oh.recv;
+    if (variant == QBDITRACE_OBJC_MSGSEND_SUPER ||
+        variant == QBDITRACE_OBJC_MSGSEND_SUPER2) {
+      struct ObjcSuperPrefix { uint64_t receiver; uint64_t super_class; } sup{};
+      if (safeRead(oh.recv, &sup, sizeof(sup))) class_receiver = sup.receiver;
+      else class_receiver = 0;
     }
-    prepareRecord(buf, sizeof(oh));
-    uint8_t *p = buf->reserve(sizeof(oh));
+    if (object_getClassName != nullptr && looksLikeObjcObject(class_receiver)) {
+      const char *cn = object_getClassName(reinterpret_cast<id>(class_receiver));
+      if (cn != nullptr) std::strncpy(oh.cls, cn, sizeof(oh.cls) - 1);
+    }
+
+    char selector[QBDITRACE_OBJC_MAX_SEL_BYTES + 1] = {};
+    if (sel_getName != nullptr && oh.sel != 0) {
+      const char *name = sel_getName(reinterpret_cast<SEL>(oh.sel));
+      if (name != nullptr) {
+        size_t n = ::strnlen(name, QBDITRACE_OBJC_MAX_SEL_BYTES + 1);
+        if (n > QBDITRACE_OBJC_MAX_SEL_BYTES) {
+          n = QBDITRACE_OBJC_MAX_SEL_BYTES;
+          oh.flags |= QBDITRACE_OBJC_FL_SEL_TRUNCATED;
+        }
+        oh.sel_len = static_cast<uint8_t>(n);
+        std::memcpy(selector, name, n);
+      } else {
+        oh.flags |= QBDITRACE_OBJC_FL_SEL_READ_FAIL;
+      }
+    } else {
+      oh.flags |= QBDITRACE_OBJC_FL_SEL_READ_FAIL;
+    }
+    const size_t payload = (static_cast<size_t>(oh.sel_len) + 1u + 3u) & ~3u;
+    prepareRecord(buf, sizeof(oh) + payload);
+    uint8_t *p = buf->reserve(sizeof(oh) + payload);
     std::memcpy(p, &oh, sizeof(oh));
+    p += sizeof(oh);
+    std::memcpy(p, selector, oh.sel_len);
+    std::memset(p + oh.sel_len, 0, payload - oh.sel_len);
     statsIncObjc();
+    c->addPendingCall({QBDITRACE_REC_OBJC, static_cast<uint16_t>(variant),
+                       static_cast<uint64_t>(variant), site, target});
+    errno = saved_errno;
   };
 
   /* NOTE: register diffs store ABSOLUTE post-values, so the diff chain does not
@@ -1985,10 +2107,11 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
      * (the call site inside the traced range). */
     const uint64_t target = st->basicBlockStart;
     const uint64_t site = c->cur_pc;
+    c->beginPendingTransfer();
     if (cfg.record & QBDITRACE_REC_MSGSEND) {
       int variant = classifyObjcTarget(cfg, target);
       if (variant >= 0) {
-        emitObjc(variant, site);
+        emitObjc(variant, site, target);
       }
     }
     /* C API interception: if enabled and the target matches a known library
@@ -1998,18 +2121,11 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
     if (cfg.capi_intercept && (cfg.record & QBDITRACE_REC_CAPI)) {
       const Config::CApiFunc *cf = lookupCApiFunc(cfg, target);
       if (cf != nullptr) {
-        /* --- Emit fixed header --- */
-        qbditrace_capicall_head_t ch;
-        std::memset(&ch, 0, sizeof(ch));
+        const int saved_errno = errno;
+        /* v8 fixed header remains 88 bytes while carrying the full API id. */
+        qbditrace_capicall_head_v8_t ch{};
         ch.kind      = QBDITRACE_REC_CAPICALL;
-        /* FIXME(api_id-width): cf->api_id is uint16_t (holds ids up to ~726,
-         * see QBDITrace.h), but qbditrace_capicall_head_t::api_id on disk is
-         * uint8_t (TraceFormat.h) — this narrows and silently truncates any
-         * id >= 256 (all Android/BoringSSL + most JNI-extended ids). Needs a
-         * trace format bump to fix properly (tracer + tenet
-         * must agree); not fixed yet, tracked via the FIXME in
-         * TraceFormat.h next to qbditrace_capicall_head_t. */
-        ch.api_id    = static_cast<uint8_t>(cf->api_id);
+        ch.api_id    = cf->api_id;
         ch.arg_count = cf->n_args;
         ch.pc        = site;
         ch.target    = target;
@@ -2121,16 +2237,24 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
           sh.str_len     = d.str_len;
           sh.str_flags   = d.str_flags;
           sh._reserved   = 0;
-          std::memcpy(p, &sh, sizeof(sh));
-          p += sizeof(sh);
-
           if (d.str_len > 0 && !(d.str_flags & QBDITRACE_SF_SAFE_READ_FAIL)) {
             char tmp[QBDITRACE_CAPICALL_MAX_STR_BYTES + 1];
             bool rd = safeRead(ch.args[d.arg_idx], tmp, d.str_len);
             if (rd) {
-              std::memcpy(p, tmp, d.str_len);
-              p += d.str_len;
+              std::memcpy(p + sizeof(sh), tmp, d.str_len);
+            } else {
+              /* The source may become unreadable between the sizing and write
+               * passes. Preserve the declared variable payload size so the
+               * following record remains aligned. */
+              sh.str_flags |= QBDITRACE_SF_SAFE_READ_FAIL;
+              std::memset(p + sizeof(sh), 0, d.str_len);
             }
+          }
+          std::memcpy(p, &sh, sizeof(sh));
+          p += sizeof(sh);
+
+          if (d.str_len > 0 && !(d.str_flags & QBDITRACE_SF_SAFE_READ_FAIL)) {
+            p += d.str_len;
             /* NUL terminator. */
             *p++ = '\0';
             /* Padding to 4-byte alignment. */
@@ -2147,13 +2271,27 @@ QBDI::VMAction vmEventCB(QBDI::VMInstanceRef vm, const QBDI::VMState *st,
           }
         }
         statsIncCapi();
+        c->addPendingCall({QBDITRACE_REC_CAPICALL, cf->api_id,
+                           cf->api_id, site, target});
+        errno = saved_errno;
       }
     }
     emitEvent(QBDITRACE_EV_XFER_CALL, target, site);
     c->need_anchor = true; /* checkpoint after returning into the range */
   }
   if (st->event & QBDI::EXEC_TRANSFER_RETURN) {
-    emitEvent(QBDITRACE_EV_XFER_RETURN, st->basicBlockStart, 0);
+    const int target_errno = errno;
+    const uint64_t resume = QBDI_GPR_GET(gpr, QBDITRACE_AARCH64_IDX_PC);
+    emitEvent(QBDITRACE_EV_XFER_RETURN, resume, 0);
+    ThreadCtx::PendingTransfer transfer;
+    if (c->popPendingTransfer(transfer)) {
+      for (uint8_t i = 0; i < transfer.fact_count; ++i) {
+        const ThreadCtx::PendingCall &call = transfer.facts[i];
+        emitRetval(c, call.source_kind, call.aux_id, call.source_id,
+                   call.site, call.target, resume, gpr);
+      }
+    }
+    errno = target_errno;
     c->need_anchor = true;
   }
 
@@ -2263,7 +2401,8 @@ static bool setupVM(QBDI::VM &vm) {
    * so it adds no cost to ordinary instructions. */
 #if !defined(__x86_64__)
   if (cfg.record & QBDITRACE_REC_SYSCALL) {
-    vm.addMnemonicCB("SVC", QBDI::PREINST, svcCB, nullptr, QBDI::PRIORITY_DEFAULT);
+    vm.addMnemonicCB("SVC", QBDI::PREINST, svcPreCB, nullptr, QBDI::PRIORITY_DEFAULT);
+    vm.addMnemonicCB("SVC", QBDI::POSTINST, svcPostCB, nullptr, QBDI::PRIORITY_DEFAULT);
   }
 #endif
   return true;

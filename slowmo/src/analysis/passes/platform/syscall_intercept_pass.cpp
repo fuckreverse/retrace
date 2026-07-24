@@ -20,7 +20,7 @@ using json = nlohmann::json;
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x53494341 ("SICA")
-//   u32  version = 1
+//   u32  version = 3
 //   u64  num_calls
 //   for each InterceptedCall:
 //     u64  inst_id
@@ -39,11 +39,17 @@ using json = nlohmann::json;
 //     u64  return_value
 //     u8   has_return
 //     u8   has_objc_ctx; if 1: u32 objc_len, u8[] objc_ctx
+//     u32  captured_string_count
+//     for each CapturedString:
+//       u8   arg_idx
+//       u8   truncated
+//       u8   binary
+//       u32  value_len; u8[] value
 
 namespace {
 
 static constexpr uint32_t SICA_BLOB_MAGIC   = 0x53494341u;  // "SICA"
-static constexpr uint32_t SICA_BLOB_VERSION = 1u;
+static constexpr uint32_t SICA_BLOB_VERSION = 3u;
 
 std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
     ByteWriter w;
@@ -67,8 +73,24 @@ std::string syscall_intercept_serialize(const SyscallInterceptResult& res) {
         w.u64(c.key_length);
         w.u64(c.data_length);
         w.u64(c.return_value);
+        w.u64(c.return_x1);
+        w.u32(c.return_nzcv);
         w.u8(c.has_return ? 1u : 0u);
+        w.u8(c.errno_valid ? 1u : 0u);
+        w.u32(static_cast<uint32_t>(c.errno_before));
+        w.u32(static_cast<uint32_t>(c.errno_after));
+        w.u8(c.raw_error.has_value() ? 1u : 0u);
+        if (c.raw_error) w.u64(static_cast<uint64_t>(*c.raw_error));
+        w.u8(c.svc_flags);
+        w.u8(c.from_capicall_record ? 1u : 0u);
         w.opt_str(c.objc_context);
+        w.u32(static_cast<uint32_t>(c.captured_strings.size()));
+        for (const auto& captured : c.captured_strings) {
+            w.u8(captured.arg_idx);
+            w.u8(captured.truncated ? 1u : 0u);
+            w.u8(captured.binary ? 1u : 0u);
+            w.str(captured.value);
+        }
     }
 
     return std::move(w).take();
@@ -99,8 +121,26 @@ bool syscall_intercept_deserialize(const std::string& blob, SyscallInterceptResu
         c.key_length   = r.u64();
         c.data_length  = r.u64();
         c.return_value = r.u64();
+        c.return_x1    = r.u64();
+        c.return_nzcv  = r.u32();
         c.has_return   = r.u8() != 0;
+        c.errno_valid  = r.u8() != 0;
+        c.errno_before = static_cast<int32_t>(r.u32());
+        c.errno_after  = static_cast<int32_t>(r.u32());
+        if (r.u8() != 0) c.raw_error = static_cast<int64_t>(r.u64());
+        c.svc_flags = r.u8();
+        c.from_capicall_record = r.u8() != 0;
         if (!r.opt_str(c.objc_context)) return false;
+        uint32_t captured_string_count = r.u32();
+        c.captured_strings.reserve(captured_string_count);
+        for (uint32_t j = 0; j < captured_string_count; ++j) {
+            CapturedString captured;
+            captured.arg_idx = r.u8();
+            captured.truncated = r.u8() != 0;
+            captured.binary = r.u8() != 0;
+            if (!r.str(captured.value)) return false;
+            c.captured_strings.push_back(std::move(captured));
+        }
 
         size_t idx = out.calls.size();
         out.by_callee[c.callee_name].push_back(idx);
@@ -207,6 +247,25 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .mode_arg      = 2,
         },
         {
+            .name          = "CCCryptorUpdate",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 7,
+            // x0 is an opaque CCCryptorRef; x1/x2 are the input buffer/length.
+            .data_ptr_arg  = 1,
+            .data_len_arg  = 2,
+        },
+        {
+            .name          = "CCCryptorFinal",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 4,
+            // x0 is an opaque CCCryptorRef and must never be dereferenced.
+        },
+        {
+            .name          = "CCCryptorRelease",
+            .category      = ApiCategory::CommonCrypto,
+            .arg_count     = 1,
+        },
+        {
             .name          = "CCHmac",
             .category      = ApiCategory::CommonCrypto,
             .arg_count     = 6,
@@ -247,14 +306,14 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .name          = "SecKeyCreateSignature",
             .category      = ApiCategory::SecurityFramework,
             .arg_count     = 4,
-            .key_ptr_arg   = 0,   // x0 = SecKeyRef
-            .data_ptr_arg  = 2,   // x2 = CFDataRef to sign
+            // x0 is an opaque SecKeyRef and x2 is an opaque CFDataRef.
+            // Neither is a raw byte buffer.
         },
         {
             .name          = "SecKeyRawSign",
             .category      = ApiCategory::SecurityFramework,
             .arg_count     = 5,
-            .key_ptr_arg   = 0,   // x0 = SecKeyRef
+            // x0 is an opaque SecKeyRef; only x2/x3 are raw bytes.
             .data_ptr_arg  = 2,   // x2 = data to sign
             .data_len_arg  = 3,
         },
@@ -262,7 +321,7 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .name          = "SecKeyRawVerify",
             .category      = ApiCategory::SecurityFramework,
             .arg_count     = 6,
-            .key_ptr_arg   = 0,
+            // x0 is an opaque SecKeyRef.
             .data_ptr_arg  = 2,
             .data_len_arg  = 3,
         },
@@ -270,7 +329,7 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .name          = "SecKeyEncrypt",
             .category      = ApiCategory::SecurityFramework,
             .arg_count     = 5,
-            .key_ptr_arg   = 0,
+            // x0 is an opaque SecKeyRef.
             .data_ptr_arg  = 2,
             .data_len_arg  = 3,
         },
@@ -278,7 +337,7 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_apis() {
             .name          = "SecKeyDecrypt",
             .category      = ApiCategory::SecurityFramework,
             .arg_count     = 5,
-            .key_ptr_arg   = 0,
+            // x0 is an opaque SecKeyRef.
             .data_ptr_arg  = 2,
             .data_len_arg  = 3,
         },
@@ -511,6 +570,7 @@ SyscallInterceptCollector::SyscallInterceptCollector(
     , code_table_(code_table)
     , memory_(memory)
     , objc_result_(objc)
+    , target_os_(target_os)
 {
     // Select the API signature table based on target platform.
     // Darwin → CommonCrypto/Security.framework table.
@@ -552,6 +612,8 @@ bool SyscallInterceptCollector::begin(uint64_t /*start_inst_id*/,
     last_objc_inst_id_ = 0;
     last_objc_context_.clear();
     result_ = {};
+    pending_returns_.clear();
+    capicall_seen_.clear();
     return true;
 }
 
@@ -597,6 +659,10 @@ void SyscallInterceptCollector::on_objc(uint64_t /*inst_id*/, const ObjcView& ob
 }
 
 void SyscallInterceptCollector::on_event(const EventView& ev) {
+    // The authoritative CAPICALL record is emitted immediately before its
+    // XFER_CALL event. Suppress only that fallback event at the same site.
+    if (capicall_seen_.find(ev.site) != capicall_seen_.end()) return;
+
     // XFER_CALL events: callee PC is outside the traced module.
     // event type: XFER_CALL = EventKind value (check TraceFormat.h)
     // qbditrace defines: QBDITRACE_EV_SEQ_ENTRY=0, XFER_CALL=2, XFER_RETURN=3
@@ -680,7 +746,7 @@ void SyscallInterceptCollector::on_event(const EventView& ev) {
 // typically turn this into a jump table.
 
 const SyscallInterceptCollector::CapiEntry&
-SyscallInterceptCollector::capi_entry(uint8_t api_id) {
+SyscallInterceptCollector::capi_entry(uint16_t api_id) {
     using namespace qbditrace;
 
     // Each entry is { name, nullptr } — we set sig pointers lazily from the
@@ -791,7 +857,7 @@ SyscallInterceptCollector::capi_entry(uint8_t api_id) {
     };
 
     // kEntries covers indices 0..142 (143 entries).
-    static constexpr uint8_t kTableSize = 143;
+    static constexpr uint16_t kTableSize = 143;
 
     if (api_id < kTableSize) {
         return kEntries[api_id];
@@ -1011,29 +1077,109 @@ SyscallInterceptCollector::capi_entry(uint8_t api_id) {
     return kFallback;
 }
 
+std::string SyscallInterceptCollector::syscall_name(uint64_t raw_syscall_no) const {
+    uint64_t syscall_no = raw_syscall_no;
+    if (target_os_ == qbditrace::QBDITRACE_OS_IOS) {
+        // Darwin selectors carry the syscall class in the high byte
+        // (for example 0x02000004 is BSD write). Preserve the raw selector on
+        // InterceptedCall, but use the normalized low 24 bits for lookup.
+        syscall_no &= 0x00ffffffULL;
+        switch (syscall_no) {
+        case 3: return "read";
+        case 4: return "write";
+        case 5: return "open";
+        case 6: return "close";
+        case 20: return "getpid";
+        case 26: return "ptrace";
+        case 29: return "recv";
+        case 74: return "mprotect";
+        case 97: return "socket";
+        case 98: return "connect";
+        case 133: return "send";
+        case 197: return "mmap";
+        case 463: return "openat";
+        case 500: return "getentropy";
+        default: break;
+        }
+    } else if (target_os_ == qbditrace::QBDITRACE_OS_ANDROID || target_os_ == qbditrace::QBDITRACE_OS_LINUX) {
+        switch (syscall_no) {
+        case 56: return "openat";
+        case 57: return "close";
+        case 63: return "read";
+        case 64: return "write";
+        case 117: return "ptrace";
+        case 172: return "getpid";
+        case 198: return "socket";
+        case 203: return "connect";
+        case 206: return "send";   // sendto on the raw arm64 ABI
+        case 207: return "recv";   // recvfrom on the raw arm64 ABI
+        case 222: return "mmap";
+        case 226: return "mprotect";
+        case 278: return "getentropy"; // libc getentropy is backed by getrandom
+        case 1024: return "open";  // asm-generic compatibility number
+        default: break;
+        }
+    }
+    return fmt::format("syscall_{}", raw_syscall_no);
+}
+
 void SyscallInterceptCollector::on_svc(uint64_t inst_id, const SvcView& svc) {
-    // Build an InterceptedCall for a raw syscall record.
     InterceptedCall call;
     call.inst_id      = inst_id;
     call.call_site_pc = svc.pc;
-    call.callee_pc    = 0;  // no callee address for syscalls
-    call.callee_name  = fmt::format("syscall_{}", svc.syscall_no);
+    call.callee_pc    = 0;
+    call.callee_name  = syscall_name(svc.syscall_no);
     call.category     = ApiCategory::Syscall;
-    call.svc_flags    = 0;
+    call.svc_flags    = svc.flags;
+    call.arg_count    = 6;
+    for (uint8_t i = 0; i < 6; ++i) call.raw_args[i] = svc.args[i];
+    call.decoded_summary = fmt::format(
+        "{}(x0=0x{:x}, x1=0x{:x}, x2=0x{:x}, x3=0x{:x}) [raw={}]",
+        call.callee_name, svc.args[0], svc.args[1], svc.args[2], svc.args[3],
+        svc.syscall_no);
 
-    // Copy up to 6 syscall arguments.
-    call.arg_count = 6;
-    for (uint8_t i = 0; i < 6 && i < static_cast<uint8_t>(call.raw_args.size()); ++i) {
-        call.raw_args[i] = svc.args[i];
+    const size_t idx = result_.calls.size();
+    finalize_call(std::move(call));
+    pending_returns_.push_back(
+        {qbditrace::QBDITRACE_REC_SVC, svc.syscall_no, svc.pc, idx});
+}
+
+void SyscallInterceptCollector::on_retval(uint64_t /*inst_id*/, const RetvalView& retval) {
+    auto match = pending_returns_.rend();
+    for (auto it = pending_returns_.rbegin(); it != pending_returns_.rend(); ++it) {
+        if (it->source_kind == retval.source_kind &&
+            it->site == retval.site && it->source_id == retval.source_id) {
+            match = it;
+            break;
+        }
+    }
+    if (match == pending_returns_.rend()) return;
+
+    const size_t call_index = match->call_index;
+    pending_returns_.erase(std::next(match).base());
+    if (call_index >= result_.calls.size()) return;
+
+    auto& call = result_.calls[call_index];
+    call.has_return = true;
+    call.return_value = retval.x0;
+    call.return_x1 = retval.x1;
+    call.return_nzcv = retval.nzcv;
+    call.errno_valid = (retval.flags & QBDITRACE_RET_FL_ERRNO_VALID) != 0;
+    if (call.errno_valid) {
+        call.errno_before = retval.errno_before;
+        call.errno_after = retval.errno_after;
     }
 
-    call.decoded_summary = fmt::format("syscall #{}: x0=0x{:x} x1=0x{:x} x2=0x{:x}",
-        svc.syscall_no, svc.args[0], svc.args[1], svc.args[2]);
-
-    size_t idx = result_.calls.size();
-    result_.by_callee[call.callee_name].push_back(idx);
-    result_.by_category[call.category].push_back(idx);
-    result_.calls.push_back(std::move(call));
+    if (call.category == ApiCategory::Syscall) {
+        const auto signed_x0 = static_cast<int64_t>(retval.x0);
+        const bool linux_error = target_os_ != qbditrace::QBDITRACE_OS_IOS &&
+            signed_x0 < 0 && signed_x0 >= -4095;
+        const bool darwin_error = target_os_ == qbditrace::QBDITRACE_OS_IOS &&
+            (retval.nzcv & (1u << 29)) != 0;
+        if (linux_error) call.raw_error = signed_x0;
+        else if (darwin_error) call.raw_error = static_cast<int64_t>(retval.x0);
+    }
+    refresh_summary_with_return(call);
 }
 
 void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView& capi) {
@@ -1041,16 +1187,10 @@ void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView
     const CapiEntry& entry = capi_entry(capi.api_id);
     const char* api_name = entry.name ? entry.name : nullptr;
 
-    // Suppress duplicate: if this callee was already handled, skip it.
-    // (The event-based on_event may also fire for the same call site.)
-    auto seen_it = capicall_seen_.find(capi.target);
-    if (seen_it != capicall_seen_.end()) {
-        // Already seen at a different inst_id — update dedup window.
-        if (seen_it->second + 4096 > inst_id) {
-            return;  // Duplicate within window.
-        }
-    }
-    capicall_seen_[capi.target] = inst_id;
+    // REC_CAPICALL records represent distinct invocations even when they call
+    // the same target. Keep only a marker for suppressing heuristic Event
+    // fallback; never deduplicate authoritative records by callee address.
+    capicall_seen_[capi.pc] = inst_id;
 
     InterceptedCall call;
     call.inst_id           = inst_id;
@@ -1074,6 +1214,11 @@ void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView
         auto ait = api_by_name_.find(call.callee_name);
         if (ait != api_by_name_.end() && ait->second) {
             call.category = ait->second->category;
+        } else if (capi.api_id >= 600 && capi.api_id <= 629) {
+            call.category = ApiCategory::BoringSSL;
+        } else if ((capi.api_id >= 280 && capi.api_id <= 300) ||
+                   (capi.api_id >= 700 && capi.api_id <= 726)) {
+            call.category = ApiCategory::JNI;
         }
     }
 
@@ -1126,10 +1271,33 @@ void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView
         }
     }
 
-    size_t idx = result_.calls.size();
+    const size_t idx = result_.calls.size();
+    const uint64_t source_id = capi.api_id;
+    const uint64_t site = capi.pc;
+    finalize_call(std::move(call));
+    pending_returns_.push_back(
+        {qbditrace::QBDITRACE_REC_CAPICALL, source_id, site, idx});
+}
+
+void SyscallInterceptCollector::finalize_call(InterceptedCall call) {
+    const size_t idx = result_.calls.size();
     result_.by_callee[call.callee_name].push_back(idx);
     result_.by_category[call.category].push_back(idx);
     result_.calls.push_back(std::move(call));
+}
+
+void SyscallInterceptCollector::refresh_summary_with_return(InterceptedCall& call) const {
+    if (!call.has_return) return;
+    call.decoded_summary += fmt::format(" => x0=0x{:x}, x1=0x{:x}, nzcv=0x{:x}",
+                                       call.return_value, call.return_x1,
+                                       call.return_nzcv);
+    if (call.raw_error) {
+        call.decoded_summary += fmt::format(" error={}", *call.raw_error);
+    }
+    if (call.errno_valid) {
+        call.decoded_summary += fmt::format(" errno={}->{}",
+                                           call.errno_before, call.errno_after);
+    }
 }
 
 void SyscallInterceptCollector::end() {
@@ -1392,6 +1560,19 @@ std::string SyscallInterceptResult::to_json() const {
         cj["callee_pc"]   = fmt::format("0x{:X}", c.callee_pc);
         cj["category"]    = api_category_str(c.category);
         cj["summary"]     = c.decoded_summary;
+        cj["svc_flags"]   = c.svc_flags;
+        cj["has_return"]  = c.has_return;
+        if (c.has_return) {
+            cj["return_x0"] = fmt::format("0x{:X}", c.return_value);
+            cj["return_x1"] = fmt::format("0x{:X}", c.return_x1);
+            cj["return_nzcv"] = c.return_nzcv;
+            cj["errno_valid"] = c.errno_valid;
+            if (c.errno_valid) {
+                cj["errno_before"] = c.errno_before;
+                cj["errno_after"] = c.errno_after;
+            }
+            if (c.raw_error) cj["raw_error"] = *c.raw_error;
+        }
 
         if (c.objc_context.has_value()) {
             cj["objc_context"] = *c.objc_context;

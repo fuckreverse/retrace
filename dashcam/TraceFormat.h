@@ -85,6 +85,9 @@ namespace qbditrace {
 #define QBDITRACE_VERSION_V5_PC_DELTA 5u  /* version tag written when HF_PC_DELTA is used */
 #define QBDITRACE_VERSION_V6_OLD_VALUE 6u /* version tag written when HF_OLD_VALUE is used */
 #define QBDITRACE_VERSION_V7_HAS_FPR   7u /* version tag written when HF_HAS_FPR is used */
+#define QBDITRACE_VERSION_V8_CALL_META 8u /* v8 call metadata: CAPI/OBJC/RETVAL */
+/* Source compatibility for the short-lived wide-id name. */
+#define QBDITRACE_VERSION_V8_WIDE_API_ID QBDITRACE_VERSION_V8_CALL_META
 
 /* Architecture tags (kept independent of QBDI enums for decoder portability). */
 typedef enum {
@@ -207,6 +210,12 @@ typedef enum {
    * the table for instructions whose high nibble is 0 (which includes all
    * instructions on older traces). */
   QBDITRACE_HF_BRANCH_HINT = 1u << 9,
+  /* v8 call metadata. When set, every OBJC/CAPICALL record in the file uses
+   * its v8 layout, and REC_RETVAL records may be present. This flag is a
+   * file-wide layout contract; writers must not select layouts per record. */
+  QBDITRACE_HF_CALL_META = 1u << 10,
+  /* Source compatibility alias for the initial v8 prototype. */
+  QBDITRACE_HF_WIDE_API_ID = QBDITRACE_HF_CALL_META,
 } qbditrace_header_flags;
 
 /* Branch-hint nibble values (bits[7:4] of the nzcv byte in REC_INST). */
@@ -246,6 +255,7 @@ typedef enum {
   QBDITRACE_REC_OBJC = 5,     /* objc_msgSend-family dispatch site */
   QBDITRACE_REC_CODE = 6,     /* raw instruction bytes for one distinct PC */
   QBDITRACE_REC_CAPICALL = 7, /* C/platform API call site with semantic args */
+  QBDITRACE_REC_RETVAL = 8,   /* return fact for OBJC/CAPI/SVC */
 } qbditrace_record_kind_t;
 
 /* ---- QBDITRACE_REC_INST ----
@@ -497,6 +507,24 @@ typedef struct {
   char cls[48]; /* runtime class name of recv, NUL-terminated; "" if unknown */
 } qbditrace_objc_head_t;
 
+/* v8 fixed OBJC header. The fixed portion remains 80 bytes; selector_name is
+ * appended as sel_len content bytes plus a NUL, padded to 4-byte alignment. */
+typedef struct {
+  uint8_t kind;
+  uint8_t variant;
+  uint8_t sel_len;
+  uint8_t flags;
+  uint32_t reserved;
+  uint64_t pc;
+  uint64_t recv;
+  uint64_t sel;
+  char cls[48];
+} qbditrace_objc_head_v8_t;
+
+#define QBDITRACE_OBJC_FL_SEL_TRUNCATED (1u << 0)
+#define QBDITRACE_OBJC_FL_SEL_READ_FAIL (1u << 1)
+#define QBDITRACE_OBJC_MAX_SEL_BYTES 255u
+
 /* ---- QBDITRACE_REC_CODE ----
  * Raw bytes of one distinct executed instruction, emitted exactly once the
  * first time that PC is seen (deduplicated by the tracer). Lets the offline
@@ -572,30 +600,63 @@ typedef struct {
 #define QBDITRACE_SF_BINARY         (1u << 1) /* raw bytes, not a C string */
 #define QBDITRACE_SF_SAFE_READ_FAIL (1u << 2) /* safeRead failed; capture is empty */
 
-/* FIXME(api_id-width): qbditrace_capi_id_t now defines Android/BoringSSL and
- * JNI-extended entries up to 726 (see below), but api_id here is a single
- * uint8_t (max 255). Any id >= 256 (e.g. QBDITRACE_CAPI_EVP_ENCRYPT_UPDATE=601,
- * QBDITRACE_CAPI_HMAC_INIT_EX=610, ...) silently truncates when written to
- * disk — see QBDITrace.cpp's `ch.api_id = cf->api_id;` (cf->api_id is
- * uint16_t in the in-process config, see QBDITrace.h). Net effect: none of
- * the >=256 Android CAPI ids can currently round-trip through a real trace
- * file. Needs a format bump (widen to uint16_t, or a new record
- * flag/version) to fix properly; deliberately NOT fixed yet because it
- * touches the on-disk format (tracer + tenet both need to
- * agree). Tracked via this FIXME; see also the NOTE in
- * tests/unit/test_pass_syscall_intercept.cpp explaining why the Android
- * platform-dispatch tests avoid ids >= 256. */
+/* The legacy v4-v7 layout stores api_id in uint8_t. Under the file-wide v8
+ * HF_CALL_META contract every CAPICALL uses qbditrace_capicall_head_v8_t,
+ * regardless of the actual id, so a file never mixes legacy and v8 layouts. */
 
-/* Fixed header for REC_CAPICALL. Variable-length string captures follow. */
+/* Fixed header for REC_CAPICALL (v4-v7, HF_WIDE_API_ID not set).
+ * Variable-length string captures follow.
+ * NOTE: api_id is uint8_t here, which truncates ids >= 256.
+ * Use qbditrace_capicall_head_v8_t (with HF_WIDE_API_ID) for full range. */
 typedef struct {
   uint8_t  kind;       /* == QBDITRACE_REC_CAPICALL */
-  uint8_t  api_id;     /* qbditrace_capi_id_t — FIXME: too narrow for ids >= 256, see above */
+  uint8_t  api_id;     /* qbditrace_capi_id_t — truncated to 0..255; use v8 for full range */
   uint8_t  arg_count;  /* number of valid entries in args[] (0..8) */
   uint8_t  str_count;  /* number of inline string captures that follow (0..4) */
   uint64_t pc;         /* call-site PC (inside the traced range) */
   uint64_t target;     /* runtime address of the called function */
   uint64_t args[8];    /* x0..x7 at call time */
 } qbditrace_capicall_head_t;
+
+/* Fixed header for REC_CAPICALL (v8, HF_CALL_META set). The field order keeps
+ * the fixed header at 88 bytes while widening api_id to uint16_t. */
+typedef struct {
+  uint8_t  kind;
+  uint8_t  arg_count;
+  uint8_t  str_count;
+  uint8_t  flags;
+  uint16_t api_id;
+  uint16_t reserved;
+  uint64_t pc;
+  uint64_t target;
+  uint64_t args[8];
+} qbditrace_capicall_head_v8_t;
+
+/* Self-describing return fact. record_size permits future extension while old
+ * v8 readers can skip the complete record. source_kind is one of SVC/OBJC/
+ * CAPICALL. source_id preserves the complete source identity (notably the
+ * full 64-bit Darwin syscall selector); aux_id is a compact variant/API hint.
+ * x0/x1/nzcv are the raw architectural return state. */
+typedef struct {
+  uint8_t  kind;
+  uint8_t  source_kind;
+  uint8_t  flags;
+  uint8_t  reserved8;
+  uint16_t aux_id;
+  uint16_t record_size;
+  uint64_t source_id;
+  uint64_t site;
+  uint64_t target;
+  uint64_t resume;
+  uint64_t x0;
+  uint64_t x1;
+  uint32_t nzcv;
+  uint32_t reserved32;
+} qbditrace_retval_t;
+
+/* Reserved for producers that can prove an errno value belongs to the call.
+ * The native SVC producer intentionally does not set this from ambient TLS. */
+#define QBDITRACE_RET_FL_ERRNO_VALID (1u << 0)
 
 /* Per-string capture header (precedes the str_data bytes). */
 typedef struct {
@@ -1019,6 +1080,12 @@ static_assert(sizeof(qbditrace_code_head_t) == 16,
               "code head must be 16 bytes (4B kind+size+reserved + 4B pad + 8B pc)");
 static_assert(sizeof(qbditrace_capicall_head_t) == 88,
               "capicall head must be 88 bytes (4B header + 4B pad + 8B pc + 8B target + 8*8B args)");
+static_assert(sizeof(qbditrace_capicall_head_v8_t) == 88,
+              "capicall head v8 must remain 88 bytes");
+static_assert(sizeof(qbditrace_objc_head_v8_t) == 80,
+              "objc head v8 must remain 80 bytes");
+static_assert(sizeof(qbditrace_retval_t) == 64,
+              "retval record must be 64 bytes");
 static_assert(sizeof(qbditrace_capicall_str_t) == 4,
               "capicall str must be 4 bytes (4 × u8)");
 #endif

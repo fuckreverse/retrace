@@ -38,6 +38,54 @@ namespace tenet {
 
 using namespace ftxui;
 
+namespace {
+
+const char* objc_selector_source(ObjcSelectorSource source) {
+    switch (source) {
+        case ObjcSelectorSource::Inline: return "inline";
+        case ObjcSelectorSource::Image:  return "image";
+        case ObjcSelectorSource::Memory: return "memory";
+        case ObjcSelectorSource::Hex:    return "hex";
+    }
+    return "unknown";
+}
+
+const char* objc_selector_status(ObjcSelectorResolution resolution) {
+    switch (resolution) {
+        case ObjcSelectorResolution::Resolved:   return "resolved";
+        case ObjcSelectorResolution::Truncated:  return "truncated";
+        case ObjcSelectorResolution::ReadFailed: return "read-failed";
+        case ObjcSelectorResolution::Unresolved: return "unresolved";
+    }
+    return "unknown";
+}
+
+std::string objc_return_text(const ObjcMessage& msg) {
+    if (!msg.has_return) return "return=unknown";
+    return msg.return_kind == ObjcReturnKind::StretRaw
+        ? fmt::format("return=stret-raw:0x{:x}", msg.return_value)
+        : fmt::format("return=x0:0x{:x}", msg.return_value);
+}
+
+const char* intercept_source(const InterceptedCall& call) {
+    if (call.from_capicall_record) return "capicall";
+    if (call.category == ApiCategory::Syscall) return "svc";
+    return "event";
+}
+
+std::string intercept_status(const InterceptedCall& call) {
+    std::string status = call.has_return
+        ? fmt::format("ret=0x{:x}", call.return_value)
+        : "ret=unknown";
+    if (call.raw_error) status += fmt::format(" raw-error={}", *call.raw_error);
+    status += call.errno_valid
+        ? fmt::format(" errno={}->{}", call.errno_before, call.errno_after)
+        : " errno=unavailable";
+    return status;
+}
+
+}  // namespace
+
 // ─── build_result_entries() ────────────────────────────────────────────────
 //
 // One branch per pass that has a structured, per-item breakdown worth
@@ -114,11 +162,14 @@ std::vector<ResultEntry> build_result_entries(const TuiContext& ctx, std::string
         if (auto* r = ctx.objc_result) {
             for (const auto& m : r->messages) {
                 out.push_back({
-                    fmt::format("[{}] {} {}  @inst {}",
-                                m.class_name.empty() ? "?" : m.class_name,
+                    fmt::format("[{}] {}  selector={}/{}  {}  @inst {}",
+                                m.class_resolution == ObjcClassResolution::Resolved &&
+                                        !m.class_name.empty()
+                                    ? m.class_name : "<unknown class>",
                                 m.selector_name.empty() ? "?" : m.selector_name,
-                                m.has_return ? fmt::format("-> 0x{:x}", m.return_value) : "",
-                                m.inst_id),
+                                objc_selector_source(m.selector_source),
+                                objc_selector_status(m.selector_resolution),
+                                objc_return_text(m), m.inst_id),
                     m.inst_id, true});
             }
         }
@@ -134,9 +185,10 @@ std::vector<ResultEntry> build_result_entries(const TuiContext& ctx, std::string
         if (auto* r = ctx.syscall_intercept_result) {
             for (const auto& c : r->calls) {
                 out.push_back({
-                    fmt::format("{:<24} cat={:<2} @inst {}  {}",
-                                c.callee_name, static_cast<int>(c.category), c.inst_id,
-                                c.decoded_summary),
+                    fmt::format("{:<24} src={} cat={:<2} flags=0x{:02x} @inst {}  {}  {}",
+                                c.callee_name, intercept_source(c),
+                                static_cast<int>(c.category), c.svc_flags, c.inst_id,
+                                intercept_status(c), c.decoded_summary),
                     c.inst_id, true});
             }
         }
