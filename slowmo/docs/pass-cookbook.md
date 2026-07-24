@@ -229,8 +229,14 @@ CLI 入口通常要改三处：
 #### 5.1 `CliOptions`
 
 ```cpp
+// 字段名直接对应 EntropyConfig 的字段（addr/size/at_inst_id），而不是
+// 泛化的 start/end —— 每个 pass 的 CLI 字段应该和它自己的 Config 字段
+// 一一对应，避免出现"字段名叫 start/end 但实际塞进了别的语义"的歧义。
 bool opt_entropy = false;
-uint64_t entropy_start = 0, entropy_end = 0;  // 复用为 addr/at_inst_id 等参数
+uint64_t entropy_addr = 0;
+uint32_t entropy_size = 256;
+uint64_t entropy_at_inst_id = 0;  // 0 = end of trace
+bool entropy_timeline = false;
 ```
 
 #### 5.2 参数解析
@@ -238,8 +244,10 @@ uint64_t entropy_start = 0, entropy_end = 0;  // 复用为 addr/at_inst_id 等�
 ```cpp
 } else if (arg == "--entropy" && i + 2 < argc) {
     opts.opt_entropy = true;
-    opts.entropy_start = std::stoull(argv[++i]);
-    opts.entropy_end = std::stoull(argv[++i]);
+    opts.entropy_addr = std::stoull(argv[++i], nullptr, 16);  // hex address
+    opts.entropy_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+} else if (arg == "--entropy-at" && i + 1 < argc) {
+    opts.entropy_at_inst_id = std::stoull(argv[++i]);
 }
 ```
 
@@ -248,12 +256,21 @@ uint64_t entropy_start = 0, entropy_end = 0;  // 复用为 addr/at_inst_id 等�
 ```cpp
 if (opts.opt_entropy) {
     EntropyConfig ent_cfg;
-    ent_cfg.at_inst_id = opts.entropy_start;  // use start as sample point
+    ent_cfg.addr = opts.entropy_addr;
+    ent_cfg.size = opts.entropy_size;
+    ent_cfg.at_inst_id = opts.entropy_at_inst_id;
+    ent_cfg.compute_timeline = opts.entropy_timeline;
     pm.register_pass(std::make_unique<EntropyPass>(std::move(ent_cfg)));
     const auto& raw = pm.require("entropy");
     // ... 序列化输出 ...
 }
 ```
+
+> 提醒：给 pass 加 CLI 入口时，如果这个 pass 有 `start_inst_id`/`end_inst_id`
+> 这类"区间"字段，检查它的 Config 默认值——很多 pass（`MemSearchConfig`、
+> `RegTimelineConfig`、`DataflowGraphConfig`）用 `end_inst_id = UINT64_MAX`
+> 表示"扫描到 trace 末尾"，如果 CLI 侧对应字段默认成 `0`，未显式传 range
+> 参数时就会静默变成空区间 `[0,0)`，产出"成功但 0 条结果"的误导性输出。
 
 > 注意：旧版本文档曾以独立的 `literal_search` pass 为例——该 pass 现在已合并进 `mem_search`（作为精确数值搜索模式），不再是独立可注册的 pass。如果你需要参考“多个搜索条件合并为一个 pass”的设计，可以看 `src/analysis/passes/memory/mem_search_pass.h`。
 

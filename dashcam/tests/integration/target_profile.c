@@ -19,10 +19,18 @@
  *                     buffer, exact-value searchable via
  *                     `--mem-search-value <hex>`.
  *   3. entropy /
- *      yara_mem_scan - a high-entropy buffer produced by an xorshift64
- *                     PRNG (approximates ciphertext/packed-payload entropy;
+ *      yara_mem_scan - a high-entropy buffer produced by an xorshift64 PRNG
+ *                     (approximates ciphertext/packed-payload entropy;
  *                     avoids the low-entropy, highly-repetitive patterns a
- *                     naive counter or memset would produce).
+ *                     naive counter or memset would produce). buf[0] is
+ *                     overwritten with a fixed marker constant
+ *                     (ENTROPY_BUF_MARKER, below) right after filling, so
+ *                     e2e/pass_memory.sh can locate the buffer's runtime
+ *                     address via `--mem-search-value <hex>` (an exact
+ *                     8-byte match) and pass it straight to `--entropy
+ *                     <addr> <size>` -- no need to reproduce xorshift64's
+ *                     output or depend on stack layout. Overwriting only
+ *                     buf[0] keeps the other 15 words' entropy intact.
  *
  * Every other profile pass exercisable via `--reg-timeline` / `--call-context`
  * / `--window-stats` / `--dataflow-graph` / `--trace-diff` does not need
@@ -126,6 +134,25 @@ xor_reduce_buffer(const uint64_t *buf, int n) {
 
 /* ---- the single entry point the tracer takes over ------------------------ */
 
+/*
+ * Fixed marker overwritten into hi_entropy[0] (see profile_target() below)
+ * right after fill_high_entropy_buffer() populates the buffer. Distinct from
+ * PROFILE_SENTINEL_VALUE so `--mem-search-value` can target either
+ * independently. e2e/pass_memory.sh locates this exact 8-byte value via
+ * `--mem-search-value <hex>` to get hi_entropy's runtime *address* directly
+ * from the match's "addr" field, then passes that address straight to
+ * `--entropy <addr> <size>` -- no need to reproduce xorshift64's output or
+ * depend on stack layout/compiler reordering. Overwriting only word 0 (of
+ * 16) leaves the buffer's overall entropy high enough to still classify as
+ * Compressed/Encrypted rather than Plaintext.
+ */
+#define ENTROPY_BUF_MARKER 0xE47A0DDE55A2D2C1ULL
+
+__attribute__((noinline)) static void
+stash_entropy_marker(volatile uint64_t *buf0) {
+  *buf0 = ENTROPY_BUF_MARKER;
+}
+
 uint64_t profile_target(uint64_t seed) {
   uint64_t branchy = 0;
 
@@ -142,6 +169,8 @@ uint64_t profile_target(uint64_t seed) {
   uint64_t hi_entropy[16];
   fill_high_entropy_buffer(hi_entropy, 16, seed ^ folded);
   branchy ^= xor_reduce_buffer(hi_entropy, 16);
+  stash_entropy_marker(&hi_entropy[0]);
+  branchy ^= hi_entropy[0];
 
   return branchy;
 }

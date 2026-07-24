@@ -102,13 +102,19 @@ struct CliOptions {
     uint32_t trace_fold_samples = 6;          // TraceFoldConfig::pattern_sample_points
     bool trace_fold_no_fpr = false;           // disables TraceFoldConfig::include_fpr_summary
 
-    bool opt_reg_timeline = false;
-    uint8_t reg_timeline_reg = 0;
-    uint64_t reg_timeline_start = 0, reg_timeline_end = 0;
+bool opt_reg_timeline = false;
+uint8_t reg_timeline_reg = 0;
+// Default to the full trace ([0, UINT64_MAX)) so `--reg-timeline <reg>`
+// without `--reg-timeline-range` scans the whole trace instead of an empty
+// [0,0) range — matches RegTimelineConfig's own defaults.
+uint64_t reg_timeline_start = 0, reg_timeline_end = UINT64_MAX;
 
-    bool opt_mem_search = false;
-    std::string mem_search_pattern;               // --mem-search <hex>: byte pattern
-    uint64_t mem_search_start = 0, mem_search_end = 0;
+bool opt_mem_search = false;
+std::string mem_search_pattern;               // --mem-search <hex>: byte pattern
+// Default to the full trace ([0, UINT64_MAX)) so `--mem-search`/
+// `--mem-search-value` without `--mem-search-range` scans the whole trace
+// instead of an empty [0,0) range — matches MemSearchConfig's own defaults.
+uint64_t mem_search_start = 0, mem_search_end = UINT64_MAX;
     // Exact-value search (formerly the standalone --literal-search).
     std::vector<uint64_t> mem_search_exact_values; // --mem-search-value <hex> (repeatable)
     bool mem_search_immediates = false;            // --mem-search-immediates: also scan MOVZ/MOVK
@@ -120,8 +126,15 @@ struct CliOptions {
     uint64_t window_stats_start = 0, window_stats_end = 0;
     uint32_t window_stats_size = 1024;
 
-    bool opt_entropy = false;
-    uint64_t entropy_start = 0, entropy_end = 0;
+// --entropy <addr_hex> <size>: memory region to analyze (matches
+// EntropyConfig::addr/size, same convention as the GUI's Entropy panel).
+bool opt_entropy = false;
+uint64_t entropy_addr = 0;
+uint32_t entropy_size = 256;
+// --entropy-at <inst_id>: optional sample point (0 = end of trace, matches
+// EntropyConfig::at_inst_id's own default).
+uint64_t entropy_at_inst_id = 0;
+bool entropy_timeline = false;  // --entropy-timeline
 
     bool opt_no_parallel_scan = false;
 

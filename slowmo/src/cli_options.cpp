@@ -368,9 +368,16 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--window-stats-size" && i + 1 < argc) {
             opts.window_stats_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--entropy" && i + 2 < argc) {
+            // <addr_hex> <size> — matches EntropyConfig::addr/size (same
+            // convention as the GUI's Entropy panel address+size inputs).
             opts.opt_entropy = true;
-            opts.entropy_start = std::stoull(argv[++i]);
-            opts.entropy_end = std::stoull(argv[++i]);
+            opts.entropy_addr = std::stoull(argv[++i], nullptr, 16);
+            opts.entropy_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--entropy-at" && i + 1 < argc) {
+            opts.entropy_at_inst_id = std::stoull(argv[++i]);
+        } else if (arg == "--entropy-timeline") {
+            opts.opt_entropy = true;
+            opts.entropy_timeline = true;
         } else if (arg == "--literal-search-range" && i + 2 < argc) {
             // Deprecated alias for --mem-search-range (shares the same
             // inst_id range field since exact-value search now runs inside

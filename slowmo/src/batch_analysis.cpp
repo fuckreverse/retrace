@@ -766,11 +766,14 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         pm.register_pass(std::make_unique<TraceDiffPass>(std::move(td_cfg)));
     }
 
-    // --loop-semantics needs loop pass
-    if (opts.opt_loop_semantics) {
-        pm.register_pass(std::make_unique<LoopPass>());
-        pm.register_pass(std::make_unique<LoopSemanticsPass>());
-    }
+// --loop-semantics needs xref -> cfg -> loop, plus xref for
+// LoopSemanticsPass itself (PC→inst_id acceleration index).
+if (opts.opt_loop_semantics) {
+pm.register_pass(std::make_unique<XrefPass>());
+pm.register_pass(std::make_unique<CFGPass>());
+pm.register_pass(std::make_unique<LoopPass>());
+pm.register_pass(std::make_unique<LoopSemanticsPass>());
+}
 
     // --symbol-annotation needs function, loop, pattern (constant materialization
     // was merged into "pattern" — see PatternResult::constants)
@@ -806,9 +809,12 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     // --algorithm-summary needs pattern (includes constant materialization —
-    // see PatternResult::constants), loop_semantics, function, call_graph
+    // see PatternResult::constants), loop_semantics (which needs xref),
+    // loop (which needs cfg), function, call_graph (which needs function)
     if (opts.opt_algorithm_summary) {
         pm.register_pass(std::make_unique<PatternPass>());
+        pm.register_pass(std::make_unique<XrefPass>());
+        pm.register_pass(std::make_unique<CFGPass>());
         pm.register_pass(std::make_unique<LoopPass>());
         pm.register_pass(std::make_unique<LoopSemanticsPass>());
         pm.register_pass(std::make_unique<FunctionPass>());
@@ -1761,10 +1767,13 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
         fmt::print("{}\n", output.dump(2));
     }
 
-    // --trace-fold: fold repetitive loop iterations
-    if (opts.opt_trace_fold) {
-        pm.register_pass(std::make_unique<LoopPass>());
-        pm.register_pass(std::make_unique<XrefPass>());
+// --trace-fold: fold repetitive loop iterations. TraceFoldPass depends on
+// {loop, xref}, and LoopPass itself depends on cfg, so cfg must be
+// registered too or pm.require("loop") fails with "dependency 'cfg' failed".
+if (opts.opt_trace_fold) {
+pm.register_pass(std::make_unique<XrefPass>());
+pm.register_pass(std::make_unique<CFGPass>());
+pm.register_pass(std::make_unique<LoopPass>());
         TraceFoldConfig tf_cfg;
         tf_cfg.min_iterations_to_fold = opts.trace_fold_min_iter;
         tf_cfg.keep_iterations = opts.trace_fold_keep_iter;
@@ -1968,10 +1977,14 @@ pat_raw.ok()   ? &pat_raw.get<PatternResult>()    : nullptr);
         }
     }
 
-    // --entropy: Shannon entropy analysis on memory writes
+    // --entropy: Shannon entropy analysis of a memory region (addr+size,
+    // matching EntropyConfig — see cli_options.cpp's --entropy parsing).
     if (opts.opt_entropy) {
         EntropyConfig ent_cfg;
-        ent_cfg.at_inst_id = opts.entropy_start;  // use start as sample point
+        ent_cfg.addr = opts.entropy_addr;
+        ent_cfg.size = opts.entropy_size;
+        ent_cfg.at_inst_id = opts.entropy_at_inst_id;
+        ent_cfg.compute_timeline = opts.entropy_timeline;
         pm.register_pass(std::make_unique<EntropyPass>(std::move(ent_cfg)));
         const auto& ent_raw = pm.require("entropy");
         if (!ent_raw.ok()) {

@@ -1,7 +1,12 @@
 # Validate tenet's pattern, loop semantics, algorithm summary, and ObjC crypto
-# correlation passes against a real crypto trace. Use --run-pass for
-# loop_semantics and algorithm_summary because their high-level CLI flags omit
-# the xref/cfg dependencies required by LoopPass.
+# correlation passes against a real crypto trace.
+#
+# --loop-semantics / --algorithm-summary used to fail here because
+# batch_analysis.cpp manually registered LoopPass/LoopSemanticsPass without
+# their transitive xref/cfg dependencies (fixed: both flags now register the
+# full xref -> cfg -> loop -> loop_semantics chain, matching what
+# `--run-pass <name>` already did via pass_registry.cpp's automatic
+# dependency resolution).
 
 CRYPTO_TRACE=/tmp/e2e_pass_crypto_trace.bin
 
@@ -14,15 +19,15 @@ run_tenet "${CRYPTO_TRACE}" --pattern
 assert_tenet_ok "crypto/pattern"
 assert_in "crypto/pattern TEA known constant" /tmp/e2e_out.log '(TEA_DELTA|TEA)'
 
-log "Running loop_semantics pass with automatic dependency resolution..."
-run_tenet "${CRYPTO_TRACE}" --run-pass loop_semantics
+log "Running loop_semantics pass via its high-level CLI flag..."
+run_tenet "${CRYPTO_TRACE}" --loop-semantics
 assert_tenet_ok "crypto/loop_semantics"
-assert_in "crypto/loop_semantics classified both loops" /tmp/e2e_out.log '\[run-pass\] loop_semantics: loops: 2 \(2 crypto\)'
+assert_in "crypto/loop_semantics classified both loops" /tmp/e2e_out.log '\[loop-semantics\] 2 loops analyzed, 2 Feistel, 2 crypto'
 
-log "Running algorithm_summary pass with automatic dependency resolution..."
-run_tenet "${CRYPTO_TRACE}" --run-pass algorithm_summary
+log "Running algorithm_summary pass via its high-level CLI flag..."
+run_tenet "${CRYPTO_TRACE}" --algorithm-summary
 assert_tenet_ok "crypto/algorithm_summary"
-assert_in "crypto/algorithm_summary identified algorithm" /tmp/e2e_out.log '\[run-pass\] algorithm_summary: algorithms: [1-9][0-9]*'
+assert_in "crypto/algorithm_summary identified algorithm" /tmp/e2e_out.log '"name": "TEA"'
 
 log "Running objc_crypto pass..."
 run_tenet "${CRYPTO_TRACE}" --objc-crypto

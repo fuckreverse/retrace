@@ -1,6 +1,4 @@
 # Validate tenet's profile analysis passes against real profile/core traces.
-# trace_fold uses --run-pass because the high-level --trace-fold path omits
-# CFGPass even though LoopPass depends on cfg.
 
 PROFILE_TRACE=/tmp/e2e_pass_profile_fold.bin
 PROFILE_CORE_TRACE=/tmp/e2e_pass_profile_core.bin
@@ -10,10 +8,13 @@ log "Recording profile scenario for trace_fold..."
 run_scenario profile "${PROFILE_TRACE}"
 assert_semantic_ok "profile/fold"
 
-log "Running trace_fold pass with automatic dependency resolution..."
-run_tenet "${PROFILE_TRACE}" --run-pass trace_fold
+log "Running trace_fold pass via its high-level CLI flag..."
+# The two positional args are required by the parser (cli_options.cpp) but
+# not currently wired into TraceFoldConfig (which has no start/end fields) --
+# any values are accepted; the pass always scans the whole trace.
+run_tenet "${PROFILE_TRACE}" --trace-fold 0 0
 assert_tenet_ok "profile/trace_fold"
-assert_in "profile/trace_fold folded regions" /tmp/e2e_out.log '\[run-pass\] trace_fold: folded regions: [1-9][0-9]*, removed [1-9][0-9]* insts'
+assert_in "profile/trace_fold folded regions" /tmp/e2e_out.log '\[trace-fold\] [1-9][0-9]* foldable regions, [1-9][0-9]* total folded instructions'
 
 log "Recording core scenario for timeline, context, statistics, diff, and dataflow..."
 run_scenario core "${PROFILE_CORE_TRACE}"

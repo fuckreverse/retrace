@@ -469,7 +469,7 @@ Collector 可按记录类型覆写回调：
 
 **作用**：对指定内存区域做 Shannon 熵分析，判断是明文（<3.5）、压缩数据（3.5-6.5）、加密数据/密钥材料（>6.5）。
 
-**CLI**：当前 parser 兼容性形式为 `--entropy <sample_inst_id> <reserved>`：仅第一个值接到 `at_inst_id`，第二个值尚未参与执行，地址/大小仍使用 pass 默认值。需要精确指定内存区域时应使用 GUI 或 MCP `entropy_analysis`；不要把这两个 CLI 参数理解为指令区间。
+**CLI**：`--entropy <addr_hex> <size>`（地址为十六进制，大小为字节数，语义对齐 `EntropyConfig::addr`/`size`，与 GUI Entropy 面板的地址/大小输入一致）。可选 `--entropy-at <inst_id>` 指定采样点（默认 0 = trace 末尾）；`--entropy-timeline` 额外计算熵值时间线。
 **MCP**：`entropy_analysis`
 **GUI 面板**：`"Entropy"`（`panels_entropy.cpp`）
 - 总体熵值 + 分类（Plaintext/Compressed/Encrypted/KeyMaterial，颜色编码）。
