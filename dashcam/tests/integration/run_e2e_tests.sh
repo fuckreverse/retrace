@@ -156,12 +156,21 @@ rc=$?
 
 assert_harness_exit_ok "s1" "$rc"
 assert_semantic_ok "s1"
-assert_header_field "s1" "arch" "aarch64"
-assert_header_field "s1" "code" "embedded"
-assert_in_decode "s1 INST records" "\[.*\] 0x"
-assert_in_decode "s1 ANCHOR" "seq_entry"
-assert_in_decode "s1 memory read" "mem\[r\]"
-assert_in_decode "s1 memory write" "mem\[w\]"
+# tenet's `--dump text` header prints "  Arch:      AArch64" / "  Flags: ...
+# code=true" (src/main.cpp) -- not the lowercase "aarch64"/"embedded" this
+# assertion originally looked for (those values never existed in the actual
+# output; see run_e2e_tests.sh's E2E-mismatch fix commit for the full audit).
+assert_header_field "s1" "Arch" "AArch64"
+assert_header_field "s1" "Flags" "code=true"
+# Instruction lines are "INST #<id>      <disasm>  nzcv=..." (trace_dump.cpp),
+# never the older "[<id>] 0x..." bracket form.
+assert_in_decode "s1 INST records" "^INST #[0-9]"
+# EVENT SEQ_ENTRY marks the trace's instrumented-range entry point.
+assert_in_decode "s1 SEQ_ENTRY event" "EVENT SEQ_ENTRY"
+# Memory accesses are "    mem R size=N: addr=... val=..." / "mem W size=..."
+# (trace_dump.cpp:mem_type_str()+dump_inst_text()), never "mem[r]"/"mem[w]".
+assert_in_decode "s1 memory read" "mem R size="
+assert_in_decode "s1 memory write" "mem W size="
 assert_in_decode "s1 inline SVC getpid" "svc.*#20\|#0x14\|getpid"
 assert_in_decode "s1 cross-func call" "CALL.*\|call\|transfer"
 assert_in_decode "s1 ObjC record" "objc\|msgSend"
@@ -185,9 +194,9 @@ assert_semantic_ok "s2/odd"
 
 # Both must produce INST records
 "${TENET}" --dump text "${S2_EVEN}" >/tmp/e2e_decode.log 2>&1
-EVEN_CNT=$(grep -c "^\[" /tmp/e2e_decode.log 2>/dev/null || echo 0)
+EVEN_CNT=$(grep -c "^INST #" /tmp/e2e_decode.log 2>/dev/null || echo 0)
 "${TENET}" --dump text "${S2_ODD}" >/tmp/e2e_decode.log 2>&1
-ODD_CNT=$(grep -c "^\[" /tmp/e2e_decode.log 2>/dev/null || echo 0)
+ODD_CNT=$(grep -c "^INST #" /tmp/e2e_decode.log 2>/dev/null || echo 0)
 
 if [ "$EVEN_CNT" -gt 50 ] && [ "$ODD_CNT" -gt 50 ]; then
   pass_ "s2: both seeds produce >50 INST records (even=${EVEN_CNT} odd=${ODD_CNT})"
@@ -218,19 +227,28 @@ else
 fi
 
 # ─── Scenario 4: Anchor interval – verify ANCHOR records appear ──────────────
+# NOTE: `--dump text`/`--dump jsonl` intentionally skip ANCHOR records
+# entirely (trace_dump.cpp: "case RecordKind::Anchor: ... skip in dump
+# output" — they're an internal register-snapshot mechanism, not something a
+# human/JSON consumer needs to see per-instruction). So ANCHOR presence can
+# only be verified via `--stats`, which builds the RocksDB index and reports
+# a precise "anchor_count" field from IndexBuilder's own tally.
 log ""
 log "=== Scenario 4: ANCHOR records ==="
 S4=/tmp/e2e_s4.bin
 /tmp/e2e_harness_base 0x5555 "${S4}" >/tmp/e2e_harness.log 2>&1
 assert_semantic_ok "s4"
 "${TENET}" --dump text "${S4}" >/tmp/e2e_decode.log 2>&1
-assert_in_decode "s4 ANCHOR seq_entry" "seq_entry"
-ANCHOR_CNT=$(grep -c "seq_entry\|anchor" /tmp/e2e_decode.log 2>/dev/null || echo 0)
-if [ "$ANCHOR_CNT" -ge 1 ]; then
-  pass_ "s4: ${ANCHOR_CNT} ANCHOR markers found"
+assert_in_decode "s4 SEQ_ENTRY event" "EVENT SEQ_ENTRY"
+"${TENET}" --stats "${S4}" >/tmp/e2e_s4_stats.log 2>&1
+ANCHOR_CNT=$(grep -o '"anchor_count": *[0-9]*' /tmp/e2e_s4_stats.log | grep -o '[0-9]*$' || echo 0)
+if [ "${ANCHOR_CNT:-0}" -ge 1 ]; then
+  pass_ "s4: ${ANCHOR_CNT} ANCHOR markers found (via --stats anchor_count)"
 else
-  fail_ "s4: no ANCHOR markers"
+  fail_ "s4: no ANCHOR markers (--stats anchor_count=${ANCHOR_CNT:-0})"
+  tail -15 /tmp/e2e_s4_stats.log | sed 's/^/    /'
 fi
+rm -rf /tmp/e2e_s4.tenet
 
 # ─── Scenario 5: No-ObjC build → no OBJC records ────────────────────────────
 log ""
@@ -305,8 +323,8 @@ log "=== Scenario 9: REC_CODE table (embedded instruction bytes) ==="
 S9=/tmp/e2e_s9.bin
 /tmp/e2e_harness_base 0x1234 "${S9}" >/tmp/e2e_harness.log 2>&1
 "${TENET}" --dump text "${S9}" >/tmp/e2e_decode.log 2>&1
-assert_header_field "s9" "code" "embedded"
-CODE_CNT=$(grep -c "^\[.*\].*0x" /tmp/e2e_decode.log 2>/dev/null || echo 0)
+assert_header_field "s9" "Flags" "code=true"
+CODE_CNT=$(grep -c "^INST #.*0x" /tmp/e2e_decode.log 2>/dev/null || echo 0)
 if [ "$CODE_CNT" -gt 20 ]; then
   pass_ "s9: ${CODE_CNT} disassembled instructions (code table works)"
 else
@@ -319,8 +337,8 @@ log "=== Scenario 10: Memory read/write records ==="
 S10=/tmp/e2e_s10.bin
 /tmp/e2e_harness_base 0x1234 "${S10}" >/tmp/e2e_harness.log 2>&1
 "${TENET}" --dump text "${S10}" >/tmp/e2e_decode.log 2>&1
-MEM_R=$(grep -c "mem\[r\]" /tmp/e2e_decode.log 2>/dev/null | tr -d ' \n' || echo 0)
-MEM_W=$(grep -c "mem\[w\]" /tmp/e2e_decode.log 2>/dev/null | tr -d ' \n' || echo 0)
+MEM_R=$(grep -c "mem R size=" /tmp/e2e_decode.log 2>/dev/null | tr -d ' \n' || echo 0)
+MEM_W=$(grep -c "mem W size=" /tmp/e2e_decode.log 2>/dev/null | tr -d ' \n' || echo 0)
 if [ "$MEM_R" -gt 0 ] && [ "$MEM_W" -gt 0 ]; then
   pass_ "s10: mem reads=${MEM_R} writes=${MEM_W}"
 else
@@ -348,9 +366,12 @@ S12=/tmp/e2e_s12.bin
 /tmp/e2e_harness_base 0x1234 "${S12}" >/tmp/e2e_harness.log 2>&1
 "${TENET}" --dump text "${S12}" >/tmp/e2e_decode.log 2>&1
 
-# Extract start/end from decode header
-TSTART=$(grep "trace range" /tmp/e2e_decode.log | grep -o "0x[0-9a-f]*" | head -1)
-TEND=$(grep "trace range" /tmp/e2e_decode.log | grep -o "0x[0-9a-f]*" | tail -1)
+# Extract start/end from decode header. The header line is
+# "  Range:     0x<HEX> - 0x<HEX>" (src/main.cpp), with uppercase hex digits
+# -- not the lowercase "trace range"/"[0-9a-f]" this originally looked for
+# (neither the label text nor the hex case ever matched the real output).
+TSTART=$(grep "Range:" /tmp/e2e_decode.log | grep -o "0x[0-9A-Fa-f]*" | head -1)
+TEND=$(grep "Range:" /tmp/e2e_decode.log | grep -o "0x[0-9A-Fa-f]*" | tail -1)
 
 if [ -n "${TSTART}" ] && [ -n "${TEND}" ]; then
   pass_ "s12: trace range ${TSTART} - ${TEND} found in header"
@@ -365,7 +386,7 @@ S13=/tmp/e2e_s13.bin
 /tmp/e2e_harness_base 0x0 "${S13}" >/tmp/e2e_harness.log 2>&1
 assert_semantic_ok "s13"
 "${TENET}" --dump text "${S13}" >/tmp/e2e_decode.log 2>&1
-assert_in_decode "s13 zero seed" "\[.*\] 0x"
+assert_in_decode "s13 zero seed" "^INST #[0-9]"
 
 # ─── Scenario 14: Max seed (all-ones) ───────────────────────────────────────
 log ""
@@ -374,7 +395,7 @@ S14=/tmp/e2e_s14.bin
 /tmp/e2e_harness_base 0xFFFFFFFFFFFFFFFF "${S14}" >/tmp/e2e_harness.log 2>&1
 assert_semantic_ok "s14"
 "${TENET}" --dump text "${S14}" >/tmp/e2e_decode.log 2>&1
-assert_in_decode "s14 max seed" "\[.*\] 0x"
+assert_in_decode "s14 max seed" "^INST #[0-9]"
 
 # ─── Scenario 15: Large recursion depth (fib produces > 100 INST records) ───
 log ""
@@ -383,7 +404,7 @@ S15=/tmp/e2e_s15.bin
 /tmp/e2e_harness_base 0x42 "${S15}" >/tmp/e2e_harness.log 2>&1
 assert_semantic_ok "s15"
 "${TENET}" --dump text "${S15}" >/tmp/e2e_decode.log 2>&1
-INST_CNT=$(grep -c "^\[" /tmp/e2e_decode.log 2>/dev/null || echo 0)
+INST_CNT=$(grep -c "^INST #" /tmp/e2e_decode.log 2>/dev/null || echo 0)
 if [ "$INST_CNT" -gt 100 ]; then
   pass_ "s15: ${INST_CNT} INST records (> 100 as expected for fib+loops)"
 else
