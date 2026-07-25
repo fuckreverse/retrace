@@ -220,12 +220,27 @@ static PassResult run_backward_taint_common(
         }
 
         if (contributes) {
-            // Add all READ registers as new needed (source operands)
+            // Add all READ registers as new needed (source operands).
+            //
+            // NOTE: a register that is BOTH written and read by this same
+            // instruction (read-modify-write / accumulator pattern, e.g.
+            // `eor x9, x9, x21` — reads the old x9, writes a new x9) must
+            // still be re-added as a dependency: the new value provably
+            // depends on the OLD value of that register, which was defined
+            // by an *earlier* instruction and has to keep propagating
+            // backward. We used to `continue` here whenever
+            // `event.has_dst_reg(sr_reg)` was true, which conflated this
+            // RMW case with instructions that overwrite a register without
+            // reading it (e.g. `mov x1, #imm`, which never lists x1 as a
+            // read in the first place and so never hits this branch at
+            // all). That conflation silently truncated backward slices at
+            // every self-referencing accumulator (common in checksum/mixing
+            // code), which is why real traces stopped short of memory
+            // load/store chains that a step-by-step trace clearly crosses.
             for (uint8_t i = 0; i < info.n_read; i++) {
                 uint8_t sr_reg = info.read_regs[i];
                 if (should_exclude_reg(sr_reg, config)) continue;
                 if (info.is_bl_site && sr_reg == kTaintRegLR) continue;
-                if (event.has_dst_reg(sr_reg)) continue;
 
                 event.add_src_reg(sr_reg);
                 state.add_reg(sr_reg, resolved_tags_mask);
