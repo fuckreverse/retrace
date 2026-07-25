@@ -7,6 +7,7 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { MENU_BAR, type MenuNode } from '@/lib/menu';
 import { runMenuAction } from '@/hooks/useNativeMenu';
+import { displayShortcut } from '@/lib/env';
 import './menubar.css';
 
 function renderNodes(nodes: MenuNode[]) {
@@ -38,7 +39,9 @@ function renderNodes(nodes: MenuNode[]) {
         onSelect={() => runMenuAction(node.id)}
       >
         <span className="menu-item-label">{node.label}</span>
-        {node.shortcut && <span className="menu-item-shortcut">{node.shortcut}</span>}
+        {node.shortcut && (
+          <span className="menu-item-shortcut">{displayShortcut(node.shortcut)}</span>
+        )}
       </DropdownMenu.Item>
     );
   });

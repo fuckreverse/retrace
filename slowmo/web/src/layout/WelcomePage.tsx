@@ -32,20 +32,35 @@ function fmtTime(epoch: number): string {
   return new Date(epoch).toLocaleDateString();
 }
 
-/** Truncate a file path from the left to keep the filename visible */
+/**
+ * Truncate a file path from the left to keep the filename visible.
+ * Splits on both `/` (macOS/Linux) and `\` (Windows) since these paths
+ * come straight from the backend's canonicalized trace path (Tauri's
+ * `std::fs::canonicalize` on Windows returns backslash-separated,
+ * sometimes `\\?\`-prefixed paths) — splitting on `/` alone would treat
+ * the entire Windows path as a single "filename" and defeat truncation.
+ */
 function truncatePath(path: string, maxLen = 40): string {
-  if (path.length <= maxLen) return path;
-  const parts = path.split('/');
-  // Keep filename and walk backwards
-  let result = parts[parts.length - 1];
-  for (let i = parts.length - 2; i >= 0; i--) {
-    const candidate = parts[i] + '/' + result;
-    if (candidate.length > maxLen - 4) {
-      return '\u2026/' + result;
-    }
-    result = candidate;
-  }
-  return result;
+if (path.length <= maxLen) return path;
+const sep = path.includes('\\') && !path.includes('/') ? '\\' : '/';
+const parts = path.split(/[/\\]/);
+// Keep filename and walk backwards
+let result = parts[parts.length - 1];
+// The filename itself may exceed maxLen (no separators to trim, or an
+// unusually long leaf name) — truncate its middle so the result always
+// respects maxLen while keeping both the start and the extension visible.
+if (result.length > maxLen) {
+const keep = Math.max(1, Math.floor((maxLen - 1) / 2));
+return result.slice(0, keep) + '\u2026' + result.slice(result.length - keep);
+}
+for (let i = parts.length - 2; i >= 0; i--) {
+const candidate = parts[i] + sep + result;
+if (candidate.length > maxLen - 4) {
+return '\u2026' + sep + result;
+}
+result = candidate;
+}
+return result;
 }
 
 /* ------------------------------------------------------------------ */

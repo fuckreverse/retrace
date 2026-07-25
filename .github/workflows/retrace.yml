@@ -1,0 +1,232 @@
+name: Tenet Cross-Platform Build
+
+# Builds and tests the `tenet` trace analyzer (tools/tenet) on Linux, macOS,
+# and Windows. This is independent of the top-level QBDI engine CI
+# (linux.yml/macos.yml/windows.yml), which only covers the QBDI core library
+# and its AArch64/X86 execution engine — tenet is a separate CMake project
+# that consumes qbditrace's TraceFormat.h header-only contract and does not
+# link against QBDI itself.
+#
+# Coverage matrix:
+#   - ubuntu-latest   (x86_64)  — YARA + WS enabled; Triton disabled (no Triton/
+#                                 Z3 package available on the runner image)
+#   - macos-14        (arm64)   — YARA + WS enabled; Triton disabled (same reason)
+#   - windows-latest  (x86_64)  — core build only (Triton/YARA/WS default OFF;
+#                                 see CMakeLists.txt comments for why)
+#
+# Third-party sources are cached via actions/cache keyed on CMakeLists.txt
+# hashes so FetchContent (~10+ deps: capstone, rocksdb, roaring, ftxui, fmt,
+# nlohmann_json, flatbuffers, zstd, mimalloc, Catch2, ...) doesn't re-clone
+# on every run.
+
+on:
+  push:
+    branches:
+      - master
+      - dev-next
+    paths:
+      - 'tools/tenet/**'
+      - 'tools/qbditrace/**'
+      - '.github/workflows/tenet.yml'
+  pull_request:
+    paths:
+      - 'tools/tenet/**'
+      - 'tools/qbditrace/**'
+      - '.github/workflows/tenet.yml'
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config libyara-dev libz-dev
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        id: cache-ccache
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-tenet-linux-${{ github.run_number }}
+          restore-keys: |
+            ccache-tenet-linux-
+
+      - name: Cache tenet third-party (_deps)
+        uses: actions/cache@v4
+        with:
+          path: tools/tenet/_deps
+          key: tenet-deps-v2-linux-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: tools/tenet
+        run: |
+          mkdir -p build
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DTENET_ENABLE_TRITON=OFF \
+            -DTENET_ENABLE_YARA=ON \
+            -DTENET_ENABLE_WS=ON \
+            -DTENET_BUILD_TESTS=ON
+
+      - name: Build
+        working-directory: tools/tenet
+        run: ninja -C build -j$(nproc)
+
+      - name: Test
+        working-directory: tools/tenet/build
+        run: ctest --output-on-failure -j$(nproc)
+
+  macos:
+    runs-on: macos-14
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew install ninja ccache yara
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        id: cache-ccache
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-tenet-macos-${{ github.run_number }}
+          restore-keys: |
+            ccache-tenet-macos-
+
+      - name: Cache tenet third-party (_deps)
+        uses: actions/cache@v4
+        with:
+          path: tools/tenet/_deps
+          key: tenet-deps-v2-macos-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: tools/tenet
+        run: |
+          mkdir -p build
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DTENET_ENABLE_TRITON=OFF \
+            -DTENET_ENABLE_YARA=ON \
+            -DTENET_ENABLE_WS=ON \
+            -DTENET_BUILD_TESTS=ON
+
+      - name: Build
+        working-directory: tools/tenet
+        run: ninja -C build -j$(sysctl -n hw.ncpu)
+
+      - name: Test
+        working-directory: tools/tenet/build
+        run: ctest --output-on-failure -j$(sysctl -n hw.ncpu)
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        id: cache-sccache
+        with:
+          path: C:\Users\runneradmin\AppData\Local\Mozilla\sccache
+          key: sccache-tenet-win-${{ github.run_number }}
+          restore-keys: |
+            sccache-tenet-win-
+
+      - name: Install sccache
+        run: choco install sccache --no-progress -y
+
+      - name: Cache tenet third-party (_deps)
+        uses: actions/cache@v4
+        with:
+          path: tools/tenet/_deps
+          key: tenet-deps-v2-win-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: tools/tenet
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DTENET_ENABLE_TRITON=OFF `
+            -DTENET_ENABLE_YARA=OFF `
+            -DTENET_ENABLE_WS=OFF `
+            -DTENET_BUILD_TESTS=ON
+
+      - name: Build
+        working-directory: tools/tenet
+        run: ninja -C build
+
+      - name: Test
+        working-directory: tools/tenet/build
+        run: ctest --output-on-failure -C RelWithDebInfo
+
+  qbditrace-host:
+    # qbditrace's host-test build (QBDITRACE_BUILD_DYLIB=OFF) is the desktop
+    # cross-platform surface — the tracer dylib/.so itself only ever targets
+    # iOS/Android (see ios.yml/android.yml) and is out of scope here.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja ccache
+
+      - name: Cache qbditrace third-party (_deps)
+        uses: actions/cache@v4
+        with:
+          path: tools/qbditrace/_deps
+          key: qbditrace-deps-v2-${{ runner.os }}-${{ hashFiles('tools/qbditrace/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: tools/qbditrace
+        run: |
+          mkdir -p build
+          cmake -S . -B build -G Ninja \
+            -DQBDITRACE_BUILD_DYLIB=OFF \
+            -DQBDITRACE_BUILD_TESTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: tools/qbditrace
+        run: ninja -C build
+
+      - name: Test
+        working-directory: tools/qbditrace/build
+        run: ctest --output-on-failure

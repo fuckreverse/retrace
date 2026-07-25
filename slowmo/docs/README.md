@@ -3,7 +3,7 @@
 这组文档按两个维度组织：
 
 - **按模块**：IO / Core / Infra + Analysis / UI / Trace Format
-- **按能力**：交互浏览 / 批处理分析 / AI 自动化 / 流式索引 / 性能优化
+- **按能力**：Tauri 图形化浏览 / TUI / 批处理分析 / AI 自动化 / 流式索引 / 性能优化
 
 ```mermaid
 flowchart TD
@@ -44,7 +44,7 @@ flowchart TD
 | [`io-layer.md`](io-layer.md) | trace 读取、索引、代码字节、流式索引 | `TraceReader`, `TraceIndex`, `CodeTable`, `StreamingIndex` |
 | [`core-layer.md`](core-layer.md) | 寄存器、内存、解码、语义桥接、断点 | `RegisterFile`, `MemoryModel`, `InstructionDecoder`, `TritonBridge`, `BreakpointEngine` |
 | [`analysis-layer.md`](analysis-layer.md) | Infra 服务、PassManager、TraceScanEngine、30 个 pass | `ScanOrchestrator`, `CheckpointManager`, `PassManager`, `pass_registry.cpp` |
-| [`ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP / HTTP | `GuiApp`, `TuiApp`, `TenetRpcService`, `TenetMcpService` |
+| [`ui-layer.md`](ui-layer.md) | Tauri Web 前端 / TUI / CLI / RPC / MCP / HTTP / WS | `tools/tenet/web/`, `TuiApp`, `TenetRpcService`, `TenetMcpService` |
 | [`trace-format.md`](trace-format.md) | tenet 与 qbditrace 的接口契约 | `TraceFormat.h`, `InstView`, `AnchorView` |
 | [`pass-cookbook.md`](pass-cookbook.md) | pass 开发实操 | `AnalysisPass`, `pass_registry.cpp`, `batch_analysis.cpp`, `mcp_tools_*` |
 
@@ -52,14 +52,22 @@ flowchart TD
 
 | 能力 | 入口文档 | 说明 |
 |------|----------|------|
-| 打开 trace 与时间轴导航 | [`capabilities.md`](capabilities.md) | GUI / TUI / CLI 的典型工作流 |
+| 打开 trace 与时间轴导航 | [`capabilities.md`](capabilities.md) | Tauri Web 前端 / TUI / CLI 的典型工作流 |
 | 结构恢复（函数 / XRef / CFG / 调用图） | [`capabilities.md`](capabilities.md), [`analysis-layer.md`](analysis-layer.md) | 结构类 pass 与导出方式 |
 | 数据流与污点 | [`capabilities.md`](capabilities.md), [`analysis-layer.md`](analysis-layer.md) | 正反向污点、切片、critical path |
 | 内存与字符串 | [`capabilities.md`](capabilities.md), [`core-layer.md`](core-layer.md) | 时间感知内存、快照、字符串恢复 |
-| AI / 自动化接入 | [`ui-layer.md`](ui-layer.md) | `--rpc`, `--mcp`, `--mcp-http`, `--mcp-hub`；工具按 core / analysis / AI / VM 分组，实际数量以启动日志为准 |
+| 图形化与自动化接入 | [`ui-layer.md`](ui-layer.md) | Tauri sidecar 同时启动 `--ws-port` 与 `--mcp-hub`；浏览器端 Web UI 仅使用 FlatBuffers WS，MCP Hub 供 AI/IDA 等外部客户端使用 |
 | 新增分析能力 | [`pass-cookbook.md`](pass-cookbook.md), [`analysis-layer.md`](analysis-layer.md) | 从 pass 实现到 CLI / MCP 暴露 |
 | 边录边分析 | [`capabilities.md`](capabilities.md), [`io-layer.md`](io-layer.md) | `StreamingIndex` 与 `--streaming` |
 | 性能分析 | [`profiling.md`](profiling.md) | Instruments、bench、优化方法论 |
+
+## 平台与前端边界
+
+- `tenet` 可执行文件是纯后端，提供 CLI / TUI / TCP JSON-RPC / MCP / WS 服务；RPC 默认绑定 `127.0.0.1`（loopback），也可通过 `--rpc [[host:]port]` 指定其他 host，端口 `0` 由 OS 自动分配。原生 ImGui + Metal + SDL3 GUI 已移除。
+- 图形化体验由 `tools/tenet/web/` 中独立的 Tauri（Rust shell + React/TypeScript）桌面应用提供。Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动 `tenet`；浏览器端 Web UI 仅连接 `ws://127.0.0.1:<port>` 并使用 FlatBuffers 二进制协议。
+- sidecar 并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
+- 后端与 Tauri 前端以 Windows（x86_64/arm64）、Linux（x86_64/arm64）、macOS（x86_64/arm64）为构建运行目标。三平台 CI 已建立，但尚未在真实 Windows/Linux 物理机上完成完整人工验收。
+- Windows 默认关闭 `TENET_ENABLE_WS`，因此 Windows Web UI 暂时无法连接后端获取实时数据；这是待补齐 WS 支持的已知限制，不存在 MCP HTTP 过渡方案。
 
 ## 推荐阅读路径
 

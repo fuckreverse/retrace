@@ -8,13 +8,13 @@
 #include "service/tenet_service.h"
 #include "common/logger.h"
 #include "common/progress_manager.h"
+#include "common/platform_compat.h"
 
 #include <fmt/core.h>
 
 #include <cmath>
 #include <iostream>
 #include <string>
-#include <unistd.h>
 #include <random>
 #include <chrono>
 
@@ -492,7 +492,7 @@ bool TenetMcpService::is_write_tool(const std::string& tool_name) const {
 json TenetMcpService::instance_info_json() const {
     return {
         {"id",          instance_id_},
-        {"pid",         static_cast<int>(getpid())},
+        {"pid",         static_cast<int>(platform::current_pid())},
         {"trace_file",  trace_file_},
         {"module_name", module_name_},
         {"is_hub",      true}
@@ -511,7 +511,7 @@ bool TenetMcpService::start_hub(const McpHubConfig& cfg) {
     // Generate instance ID if not set
     if (instance_id_.empty()) {
         instance_id_ = cfg.instance_name.empty()
-            ? fmt::format("tenet-{}", getpid())
+            ? fmt::format("tenet-{}", platform::current_pid())
             : cfg.instance_name;
     }
 
@@ -521,7 +521,7 @@ bool TenetMcpService::start_hub(const McpHubConfig& cfg) {
 
     // Attempt flock election
     hub_election_ = std::make_unique<HubElection>(
-        cfg.lock_dir, getpid(), cfg.port, trace_file_, instance_id_);
+        cfg.lock_dir, platform::current_pid(), cfg.port, trace_file_, instance_id_);
 
     if (!hub_election_->try_acquire()) {
         LOG_INFO_M(log::Module::Mcp, "hub: election failed, another instance is hub");
@@ -547,6 +547,17 @@ bool TenetMcpService::start_hub(const McpHubConfig& cfg) {
         return false;
     }
 
+    const uint16_t listening_port = hub_transport_->listening_port();
+    if (!hub_election_->update_port(listening_port)) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: failed to publish actual listener port {}", listening_port);
+        hub_transport_->stop();
+        hub_election_->release();
+        hub_election_.reset();
+        hub_transport_.reset();
+        return false;
+    }
+    hub_cfg_.port = listening_port;
+
     // Inject instance parameter into all tool schemas
     inject_instance_param(!cfg.session_mode);  // required in sessionless mode
 
@@ -554,7 +565,7 @@ bool TenetMcpService::start_hub(const McpHubConfig& cfg) {
     register_hub_tools();
 
     LOG_INFO_M(log::Module::Mcp, "hub: started on {}:{} (id={}, session_mode={})",
-               cfg.host, cfg.port, instance_id_, cfg.session_mode);
+               cfg.host, listening_port, instance_id_, cfg.session_mode);
     return true;
 }
 
@@ -564,7 +575,7 @@ bool TenetMcpService::start_worker(const McpHubConfig& cfg) {
     // Generate instance ID if not set
     if (instance_id_.empty()) {
         instance_id_ = cfg.instance_name.empty()
-            ? fmt::format("tenet-{}", getpid())
+            ? fmt::format("tenet-{}", platform::current_pid())
             : cfg.instance_name;
     }
 
@@ -574,7 +585,7 @@ bool TenetMcpService::start_worker(const McpHubConfig& cfg) {
     // Try to read hub info from lock file
     HubElection::HubInfo hub_info;
     {
-        HubElection probe(cfg.lock_dir, getpid(), cfg.port, trace_file_, instance_id_);
+        HubElection probe(cfg.lock_dir, platform::current_pid(), cfg.port, trace_file_, instance_id_);
         hub_info = probe.read_current();
     }
 
@@ -589,7 +600,7 @@ bool TenetMcpService::start_worker(const McpHubConfig& cfg) {
     worker_transport_ = std::make_unique<McpWorkerTransport>(
         [this](const json& msg) -> json { return process_message(msg); },
         cfg.host, hub_info.port,
-        instance_id_, getpid(),
+        instance_id_, platform::current_pid(),
         trace_file_, module_name_);
 
     // Run worker in background thread

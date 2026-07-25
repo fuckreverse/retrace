@@ -7,8 +7,6 @@
 #include <algorithm>
 #include <cstring>
 
-#include <sys/mman.h>
-
 #include "common/byte_codec.h"
 
 // Pull CRoaring C API types into our namespace

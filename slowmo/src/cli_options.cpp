@@ -4,6 +4,7 @@
 #include <fmt/core.h>
 #include <string>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace tenet {
 
@@ -42,9 +43,6 @@ bool CliOptions::has_analysis_option() const {
 static void print_usage(const char* prog) {
     fmt::print(stderr, "Usage: {} <trace.bin> [options]\n", prog);
     fmt::print(stderr, "\nOptions:\n");
-#if TENET_HAS_GUI
-    fmt::print(stderr, "  --tui                  Use terminal UI instead of GUI (default: GUI)\n");
-#endif
     fmt::print(stderr, "  -c                     Batch mode (non-interactive)\n");
     fmt::print(stderr, "  -n <count>             Number of instructions to display (default: 100)\n");
     fmt::print(stderr, "  -s <inst_id>           Start from instruction ID (default: 0)\n");
@@ -133,8 +131,8 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --yara-scan-code                  Also scan code bytes buffer\n");
     fmt::print(stderr, "  --thread-filter [tid1,tid2,...]   Build per-thread instruction bitmaps\n");
     fmt::print(stderr, "  --exclude-range <start> <end>     Exclude PC range [start,end) from analysis (hex, repeatable)\n");
-    fmt::print(stderr, "  --rpc [socket_path]               Start JSON-RPC server over Unix socket\n");
-    fmt::print(stderr, "                                    (blocks until client disconnects)\n");
+    fmt::print(stderr, "  --rpc [[host:]port]               Start JSON-RPC server over TCP loopback\n");
+    fmt::print(stderr, "                                    Default: 127.0.0.1:0 (auto port; blocks until SIGINT)\n");
     fmt::print(stderr, "  --mcp                             Start MCP server over stdio (JSON-RPC 2.0)\n");
     fmt::print(stderr, "                                    (blocks until stdin closes)\n");
     fmt::print(stderr, "  --mcp-http [host:port]            Start MCP server over Streamable HTTP\n");
@@ -173,8 +171,6 @@ CliOptions parse_args(int argc, char** argv) {
             return opts;
         } else if (arg == "-c") {
             opts.batch_mode = true;
-        } else if (arg == "--tui") {
-            opts.force_tui = true;
         } else if (arg == "-n" && i + 1 < argc) {
             opts.display_count = std::stoull(argv[++i]);
         } else if (arg == "-s" && i + 1 < argc) {
@@ -459,7 +455,34 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--rpc") {
             opts.opt_rpc = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                opts.rpc_socket_path = argv[++i];
+                std::string endpoint = argv[++i];
+                size_t colon = endpoint.rfind(':');
+                try {
+                    std::string port_text;
+                    if (colon != std::string::npos) {
+                        opts.rpc_host = endpoint.substr(0, colon);
+                        port_text = endpoint.substr(colon + 1);
+                        if (opts.rpc_host.empty()) {
+                            fmt::print(stderr, "Invalid --rpc endpoint '{}': host is empty\n", endpoint);
+                            opts.parse_status = 1;
+                            return opts;
+                        }
+                    } else {
+                        port_text = endpoint;
+                    }
+                    size_t consumed = 0;
+                    unsigned long parsed = std::stoul(port_text, &consumed, 10);
+                    if (consumed != port_text.size() || parsed > 65535) {
+                        throw std::out_of_range("RPC port");
+                    }
+                    opts.rpc_port = static_cast<uint16_t>(parsed);
+                } catch (const std::exception&) {
+                    fmt::print(stderr,
+                               "Invalid --rpc endpoint '{}': expected [host:]port\n",
+                               endpoint);
+                    opts.parse_status = 1;
+                    return opts;
+                }
             }
         } else if (arg == "--mcp") {
             opts.opt_mcp = true;

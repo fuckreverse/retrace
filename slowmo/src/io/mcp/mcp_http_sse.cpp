@@ -1,15 +1,8 @@
 #include "mcp_http_sse.h"
 #include "common/logger.h"
+#include "common/platform_compat.h"
 
 #include <fmt/core.h>
-
-#include <sys/socket.h>
-#include <poll.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
 
 #include <cstring>
 #include <sstream>
@@ -37,14 +30,8 @@ void SseSession::send_raw(const std::string& data) {
     if (!alive.load()) return;
     std::lock_guard<std::mutex> lk(write_mutex);
     if (!alive.load()) return;
-    ssize_t total = 0;
-    const char* ptr = data.data();
-    ssize_t remaining = static_cast<ssize_t>(data.size());
-    while (remaining > 0) {
-        ssize_t n = ::send(fd, ptr + total, static_cast<size_t>(remaining), MSG_NOSIGNAL);
-        if (n <= 0) { alive.store(false); return; }
-        total += n;
-        remaining -= n;
+    if (!platform::send_all(fd, data.data(), data.size())) {
+        alive.store(false);
     }
 }
 
@@ -80,7 +67,7 @@ std::string McpHttpSseTransport::base64_encode(const std::string& s) {
 
 // ─── HTTP request parser ──────────────────────────────────────────────────
 
-McpHttpSseTransport::HttpRequest McpHttpSseTransport::parse_http_request(int fd) {
+McpHttpSseTransport::HttpRequest McpHttpSseTransport::parse_http_request(platform::socket_t fd) {
     HttpRequest req;
 
     // Read headers (up to 16KB)
@@ -169,7 +156,7 @@ McpHttpSseTransport::HttpRequest McpHttpSseTransport::parse_http_request(int fd)
 
 // ─── HTTP response helpers ────────────────────────────────────────────────
 
-void McpHttpSseTransport::send_http_response(int fd, int status,
+void McpHttpSseTransport::send_http_response(platform::socket_t fd, int status,
                                               const std::string& content_type,
                                               const std::string& body,
                                               const std::string& extra_headers) {
@@ -195,10 +182,10 @@ void McpHttpSseTransport::send_http_response(int fd, int status,
         status, reason, content_type, body.size(),
         extra_headers.empty() ? "" : extra_headers + "\r\n",
         body);
-    ::send(fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    platform::send_all(fd, resp.data(), resp.size());
 }
 
-void McpHttpSseTransport::send_sse_headers(int fd) {
+void McpHttpSseTransport::send_sse_headers(platform::socket_t fd) {
     static const char* hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -208,7 +195,7 @@ void McpHttpSseTransport::send_sse_headers(int fd) {
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
         "\r\n";
-    ::send(fd, hdr, strlen(hdr), MSG_NOSIGNAL);
+    platform::send_all(fd, hdr, strlen(hdr));
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
@@ -225,7 +212,7 @@ bool McpHttpSseTransport::check_auth(const HttpRequest& req) const {
 
 // ─── Session management ───────────────────────────────────────────────────
 
-std::shared_ptr<SseSession> McpHttpSseTransport::create_session(int fd) {
+std::shared_ptr<SseSession> McpHttpSseTransport::create_session(platform::socket_t fd) {
     auto sess = std::make_shared<SseSession>();
     sess->fd = fd;
     sess->id = generate_uuid();
@@ -276,39 +263,47 @@ void McpHttpSseTransport::set_auth(const std::string& username,
 // ─── Start / Stop ─────────────────────────────────────────────────────────
 
 bool McpHttpSseTransport::start() {
+    platform::ensure_sockets_initialized();
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd_ < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "sse: socket() failed: {}", strerror(errno));
+    if (!platform::socket_valid(server_fd_)) {
+        LOG_ERROR_M(log::Module::Mcp, "sse: socket() failed: {}", platform::last_socket_error_string());
         return false;
     }
 
-    int optval = 1;
-    ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    platform::set_reuseaddr(server_fd_);
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port_);
-    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) <= 0) {
-        addr.sin_addr.s_addr = INADDR_ANY;
+    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+        LOG_ERROR_M(log::Module::Mcp, "sse: invalid listen address: {}", host_);
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
+        return false;
     }
 
     if (::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "sse: bind({}:{}) failed: {}", host_, port_, strerror(errno));
-        ::close(server_fd_);
-        server_fd_ = -1;
+        LOG_ERROR_M(log::Module::Mcp, "sse: bind({}:{}) failed: {}", host_, port_, platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
         return false;
     }
 
     if (::listen(server_fd_, 16) < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "sse: listen() failed: {}", strerror(errno));
-        ::close(server_fd_);
-        server_fd_ = -1;
+        LOG_ERROR_M(log::Module::Mcp, "sse: listen() failed: {}", platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
         return false;
     }
 
-    // Non-blocking for select-based accept loop
-    int flags = ::fcntl(server_fd_, F_GETFL, 0);
-    ::fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK);
+    // Non-blocking for poll-based accept loop
+    if (!platform::set_nonblocking(server_fd_)) {
+        LOG_ERROR_M(log::Module::Mcp, "sse: failed to set listener non-blocking: {}",
+                    platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
+        return false;
+    }
 
     running_.store(true);
     listener_thread_ = std::thread([this] { listener_loop(); });
@@ -321,9 +316,9 @@ void McpHttpSseTransport::stop() {
 
     // Shutdown server socket to unblock select()/accept() in listener thread.
     // We shutdown but DON'T close yet — listener thread still references server_fd_.
-    int sfd = server_fd_;
-    if (sfd >= 0) {
-        ::shutdown(sfd, SHUT_RDWR);
+    platform::socket_t sfd = server_fd_;
+    if (platform::socket_valid(sfd)) {
+        platform::shutdown_both(sfd);
     }
 
     // Mark all sessions as dead and shutdown their fds to unblock I/O
@@ -331,7 +326,7 @@ void McpHttpSseTransport::stop() {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
         for (auto& [sid, sess] : sessions_) {
             sess->alive.store(false);
-            if (sess->fd >= 0) ::shutdown(sess->fd, SHUT_RDWR);
+            if (platform::socket_valid(sess->fd)) platform::shutdown_both(sess->fd);
         }
         // Don't clear yet — client threads may still reference sessions
     }
@@ -340,9 +335,9 @@ void McpHttpSseTransport::stop() {
     if (listener_thread_.joinable()) listener_thread_.join();
 
     // Now close the server socket — listener is done
-    if (sfd >= 0) {
-        ::close(sfd);
-        server_fd_ = -1;
+    if (platform::socket_valid(sfd)) {
+        platform::close_socket(sfd);
+        server_fd_ = platform::kInvalidSocket;
     }
 
     // Join all client threads (they should exit quickly since sessions are dead
@@ -369,20 +364,19 @@ void McpHttpSseTransport::stop() {
 
 void McpHttpSseTransport::listener_loop() {
     while (running_.load()) {
-        int sfd = server_fd_;  // snapshot — may become -1 during stop()
-        if (sfd < 0) break;
+        platform::socket_t sfd = server_fd_;  // snapshot — may become invalid during stop()
+        if (!platform::socket_valid(sfd)) break;
 
-        struct pollfd pfd{sfd, POLLIN, 0};
-        int ret = ::poll(&pfd, 1, 200);  // 200ms
+        int ret = platform::poll_one(sfd, platform::kPollIn, 200);  // 200ms
         if (ret <= 0) continue;
         if (!running_.load()) break;
 
         struct sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = ::accept(sfd,
+        platform::socklen_compat_t client_len = sizeof(client_addr);
+        platform::socket_t client_fd = ::accept(sfd,
                                  reinterpret_cast<struct sockaddr*>(&client_addr),
                                  &client_len);
-        if (client_fd < 0) continue;
+        if (!platform::socket_valid(client_fd)) continue;
 
         // Set a receive timeout on client fd so handler threads don't block forever
         struct timeval recv_tv{5, 0};  // 5 second timeout
@@ -392,7 +386,7 @@ void McpHttpSseTransport::listener_loop() {
         std::lock_guard<std::mutex> lk(clients_mutex_);
         client_threads_.emplace_back([this, client_fd] {
             handle_client(client_fd);
-            ::close(client_fd);
+            platform::close_socket(client_fd);
         });
 
         // Reap finished threads periodically
@@ -422,7 +416,7 @@ static std::unordered_map<std::string, std::string> parse_query(const std::strin
     return out;
 }
 
-void McpHttpSseTransport::handle_client(int client_fd) {
+void McpHttpSseTransport::handle_client(platform::socket_t client_fd) {
     auto req = parse_http_request(client_fd);
     if (!req.valid) return;
 

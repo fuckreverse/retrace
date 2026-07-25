@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,9 +14,48 @@ from typing import Any
 
 LICENSE_CANDIDATES = ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "COPYING.txt")
 
+# Shared-library filename globs per platform, used to discover the bundled
+# native dependencies in --lib-dir. native-components.json's per-component
+# "libraries" patterns are historically written in macOS .dylib form (e.g.
+# "libtriton.dylib") since that's the only platform this manifest/script
+# originally shipped for; _pattern_variants() below derives the Linux
+# (.so / .so.N) and Windows (.dll, no "lib" prefix) equivalents from each
+# macOS-form pattern at match time instead of requiring every entry in the
+# manifest to be triplicated by hand.
+LIBRARY_GLOBS = ("*.dylib", "*.so", "*.so.*", "*.dll")
+
+
+def _pattern_variants(pattern: str) -> list[str]:
+    """Derive the Linux/.so and Windows/.dll equivalents of a macOS-form
+    fnmatch pattern (e.g. "libtriton.dylib" or "libz3.*.dylib").
+
+    Naming conventions differ in *where* the version glob sits:
+    - macOS:   libNAME[.VERSION].dylib   (version, if any, before ".dylib")
+    - Linux:   libNAME.so[.VERSION]      (soname suffix: version AFTER ".so")
+    - Windows: NAME.dll or libNAME.dll   (no versioned-suffix convention;
+      "lib" prefix isn't standard either, so both forms are accepted since
+      MSVC/MinGW builds differ)
+    """
+    variants = [pattern]
+    if pattern.endswith(".dylib"):
+        stem = pattern[: -len(".dylib")]  # e.g. "libtriton" or "libz3.*"
+        base = re.sub(r"\.\*$", "", stem)  # drop a trailing version glob -> "libz3"
+        variants.append(f"{stem}.so")       # unversioned: libz3.*.so (rare)
+        variants.append(f"{base}.so")       # unversioned: libz3.so
+        variants.append(f"{base}.so.*")     # versioned soname: libz3.so.4
+        variants.append(f"{base}.dll")
+        if base.startswith("lib"):
+            variants.append(f"{base[3:]}.dll")
+    return variants
+
 
 def validate_bundled_libraries(libraries: list[str], components: list[dict[str, Any]]) -> None:
-    patterns = [pattern for component in components for pattern in component.get("libraries", [])]
+    patterns = [
+        variant
+        for component in components
+        for pattern in component.get("libraries", [])
+        for variant in _pattern_variants(pattern)
+    ]
     unknown = sorted(name for name in libraries if not any(fnmatch.fnmatch(name, pattern) for pattern in patterns))
     if unknown:
         raise ValueError("Bundled libraries missing from native-components.json: " + ", ".join(unknown))
@@ -34,7 +74,29 @@ def _resolve_license(path: str, manifest_dir: Path) -> Path:
     return candidate
 
 
-def build_native_notices(components: list[dict[str, Any]], manifest_dir: Path, output: Path) -> None:
+def _component_is_bundled(component: dict[str, Any], libraries: list[str]) -> bool:
+    """Whether `component` should be included in this platform's notices.
+
+    Components without a "libraries" glob (QBDI, LLVM, fmt, nlohmann/json,
+    ...) are statically linked or always present, so they're always bundled.
+    Components *with* a "libraries" glob (Triton, YARA, Z3, OpenSSL, ...) are
+    optional runtime dependencies that only ship on some platforms/build
+    configs; skip them here unless the current --lib-dir actually contains a
+    matching file. This matters because several such entries' license_files
+    are hardcoded Homebrew absolute paths (e.g. /opt/homebrew/opt/z3/...)
+    that only exist on the macOS machine that authored the manifest — trying
+    to resolve them unconditionally would break license generation on Linux/
+    Windows (or on a mac without those Homebrew formulae installed) even
+    when the library in question isn't part of this bundle at all.
+    """
+    patterns = component.get("libraries")
+    if not patterns:
+        return True
+    variants = [variant for pattern in patterns for variant in _pattern_variants(pattern)]
+    return any(fnmatch.fnmatch(name, variant) for name in libraries for variant in variants)
+
+
+def build_native_notices(components: list[dict[str, Any]], manifest_dir: Path, output: Path, libraries: list[str]) -> None:
     native_dir = output / "native"
     native_dir.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -46,6 +108,8 @@ def build_native_notices(components: list[dict[str, Any]], manifest_dir: Path, o
         "",
     ]
     for component in components:
+        if not _component_is_bundled(component, libraries):
+            continue
         name = component["name"]
         lines.append(f"{name} {component['version']} — {component['license']}")
         if attribution := component.get("attribution"):
@@ -175,13 +239,17 @@ def main() -> None:
     manifest_path = args.manifest.resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     components = manifest["components"]
-    libraries = sorted(path.name for path in args.lib_dir.glob("*.dylib"))
+    # --lib-dir holds macOS .dylib, Linux .so[.N], or Windows .dll files
+    # depending on which prepare-sidecar-*.{sh,ps1} produced it.
+    libraries = sorted(
+        {path.name for glob_pattern in LIBRARY_GLOBS for path in args.lib_dir.glob(glob_pattern)}
+    )
     validate_bundled_libraries(libraries, components)
 
     if args.output.exists():
         shutil.rmtree(args.output)
     args.output.mkdir(parents=True)
-    build_native_notices(components, manifest_path.parent, args.output)
+    build_native_notices(components, manifest_path.parent, args.output, libraries)
 
     allowed = set(manifest["policy"]["allowed_licenses"])
     collect_npm_notices(args.web_dir, args.output, allowed)

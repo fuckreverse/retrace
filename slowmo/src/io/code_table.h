@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/platform_mmap.h"
 #include "common/types.h"
 #include <ankerl/unordered_dense.h>
 #include <algorithm>
@@ -28,11 +29,7 @@ class ImageFallback {
 public:
     ImageFallback() = default;
 
-    /// Destructor: releases the mmap'd image data if still mapped.
-    /// Without this, every load() leaks an mmap region because the
-    /// compiler-generated destructor only destroys the pointer, not the
-    /// underlying mapping.
-    ~ImageFallback();
+    ~ImageFallback() = default;
 
     // Non-copyable (owns an mmap region).
     ImageFallback(const ImageFallback&) = delete;
@@ -73,8 +70,7 @@ private:
         uint64_t file_offset;    // file offset of runtime_start
     };
 
-    const uint8_t* data_ = nullptr;
-    uint64_t size_ = 0;
+    platform::MappedFile mapped_file_;
     std::vector<Segment> segments_;  // sorted by runtime_start
 };
 

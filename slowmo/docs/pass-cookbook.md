@@ -15,7 +15,7 @@
 优先把下面这类能力做成 pass：
 
 - 会产出可复用分析结果
-- 结果可能被多个入口消费（GUI / CLI / MCP）
+- 结果可能被多个入口消费（TUI / CLI / MCP / WS）
 - 逻辑依赖 `TraceReader` / `TraceIndex` / `RegisterFile` / `MemoryModel`
 - 可能依赖其他分析的中间结果
 
@@ -141,7 +141,7 @@ PassResult MyPass::run(PassContext& ctx) {
 - `ctx.progress(pct, "...")`
 - `ctx.cancelled()`
 
-这样 GUI 里的后台分析和退出流程才不会体验很差。
+这样交互式入口和服务端任务才能及时反馈进度，并在取消或退出时可靠停止。
 
 ## Step 3：声明依赖
 
@@ -202,7 +202,7 @@ if (name == "my_pass") {
 这一步的意义是：
 
 - `--list-passes` 能看到它
-- GUI / TUI 能知道它属于哪个类别
+- TUI 与服务端目录接口能知道它属于哪个类别
 - 默认 UI 启动时能决定是否预热它
 
 ### 4.3 可选：加入摘要函数
@@ -335,11 +335,12 @@ register_tool(
 
 你需要做：
 
-- 自定义 `TraceCollector`
-- pass 实现 `prepare_scan()` 返回 collector
-- pass 实现 `finish_scan()` 把 collector 状态转成 `PassResult`
+- 自定义 `TraceCollector`，并由 pass 持有 `collector_`
+- pass 覆写 `has_scan()` 返回 `true`
+- pass 覆写 `declare_scan(ScanOrchestrator&, PassContext&)`，构造 collector 并向 orchestrator 声明扫描需求
+- 在 `run()` 中读取 collector 已完成的扫描结果并转换成 `PassResult`
 
-这能让 `run_all()` 场景下多个 pass 共用一次扫描。
+这能让 `run_all()` 场景下多个 pass 共用一次扫描；按需 `require()` 场景也会由框架在 `run()` 前完成声明与扫描。
 
 ## Step 8：文档同步
 
@@ -376,7 +377,7 @@ register_tool(
 
 结果：
 
-- GUI 退出时后台线程很难停
+- 交互入口退出或服务请求取消时，后台线程很难停
 - 长 pass 用户体验差
 
 ### 5. CLI 和 MCP 重复写了两套分析逻辑

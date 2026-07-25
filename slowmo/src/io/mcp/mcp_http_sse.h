@@ -31,6 +31,8 @@
 //   // ...
 //   transport.stop();
 
+#include "common/platform_compat.h"
+
 #include <functional>
 #include <string>
 #include <thread>
@@ -47,7 +49,7 @@ namespace tenet {
 // ─── SSE client session ────────────────────────────────────────────────────
 
 struct SseSession {
-    int         fd = -1;                ///< connected client socket
+    platform::socket_t fd = platform::kInvalidSocket;  ///< connected client socket
     std::string id;                     ///< session UUID
     std::mutex  write_mutex;            ///< guards writes to fd
     std::atomic<bool> alive{true};
@@ -94,7 +96,7 @@ public:
 
 private:
     void listener_loop();
-    void handle_client(int client_fd);
+    void handle_client(platform::socket_t client_fd);
 
     // HTTP parsing / response helpers
     struct HttpRequest {
@@ -105,12 +107,12 @@ private:
         std::string body;
         bool valid = false;
     };
-    static HttpRequest parse_http_request(int fd);
-    static void send_http_response(int fd, int status,
+    static HttpRequest parse_http_request(platform::socket_t fd);
+    static void send_http_response(platform::socket_t fd, int status,
                                    const std::string& content_type,
                                    const std::string& body,
                                    const std::string& extra_headers = "");
-    static void send_sse_headers(int fd);
+    static void send_sse_headers(platform::socket_t fd);
 
     // Auth
     bool check_auth(const HttpRequest& req) const;
@@ -118,13 +120,13 @@ private:
 
     // Session management
     std::shared_ptr<SseSession> get_session(const std::string& sid);
-    std::shared_ptr<SseSession> create_session(int fd);
+    std::shared_ptr<SseSession> create_session(platform::socket_t fd);
     void remove_session(const std::string& sid);
 
     MessageHandler handler_;
     std::string host_;
     uint16_t    port_;
-    int         server_fd_ = -1;
+    platform::socket_t server_fd_ = platform::kInvalidSocket;
 
     std::atomic<bool> running_{false};
     std::thread       listener_thread_;

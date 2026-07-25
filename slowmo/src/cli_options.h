@@ -22,7 +22,6 @@ struct CliOptions {
     // --- Basic options ---
     std::string trace_path;
     bool batch_mode = false;
-    bool force_tui = false;
     uint64_t display_count = 100;
     uint64_t start_id = 0;
     bool show_regs = false;
@@ -197,7 +196,8 @@ bool entropy_timeline = false;  // --entropy-timeline
 
     // --- P3: RPC server ---
     bool opt_rpc = false;
-    std::string rpc_socket_path;
+    std::string rpc_host = "127.0.0.1";
+    uint16_t rpc_port = 0;  ///< 0 = automatically select a free port
 
     // --- P3: MCP server ---
     bool opt_mcp = false;

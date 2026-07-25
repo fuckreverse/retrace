@@ -150,7 +150,7 @@ checkpoint 建成后不再走 anchor 查找、LRU 或互斥锁；`state_before()
 
 ### 典型用途
 
-- GUI / TUI 渲染指令行
+- TUI 与 Tauri 前端渲染指令行
 - CLI / RPC / MCP 输出反汇编文本
 - 各类 pass 判断 mnemonic、操作数字符串或读写集合
 
@@ -216,7 +216,7 @@ Triton 实例不是零成本对象，而且并发访问时需要隔离上下文�
 ### 关键价值
 
 - 可以做 forward / reverse continue
-- 支撑 GUI / TUI 里的时间导航体验
+- 支撑 TUI 与 Tauri 前端的时间导航体验
 - 不需要重新执行程序，也不依赖在线环境
 
 ### 接口
@@ -261,11 +261,11 @@ flowchart TD
 |------|----------|----------|
 | `TraceReader` | 完全只读安全 | 可以全局共享 |
 | `TraceIndex` | RocksDB 并发安全 | 可以全局共享 |
-| `RegisterFile` | checkpoint 建成后不可变，查询 lock-free | 单实例可由 GUI、MCP/RPC 与后台 pass 并发共享 |
+| `RegisterFile` | checkpoint 建成后不可变，查询 lock-free | 单实例可由 TUI、MCP/RPC、WS 与后台 pass 并发共享 |
 | `MemoryModel` | 并发安全 | 可共享 |
 | `InstructionDecoder` | 每线程独立 Capstone handle（无 mutex）+ opcode 缓存的 `shared_mutex` | 可共享，解码本身无争用，仅缓存读写需要读写锁 |
 | `TritonBridge` | 实例独占 | 通过 `TritonPool` 借用 |
-| `BreakpointEngine` | 偏向单线程交互 | 主要供 GUI / TUI 主线程使用 |
+| `BreakpointEngine` | 偏向单线程交互 | 主要供 TUI 交互线程或服务入口调用 |
 
 ## 8. 这一层最重要的设计取舍
 
@@ -287,7 +287,7 @@ flowchart TD
 
 ### Core 与 UI 解耦
 
-- GUI/TUI 直接消费 Core，但不在 Core 中写界面逻辑
+- TUI 直接消费 Core；Tauri 前端通过 MCP / WS 等服务接口间接消费，Core 中不写界面逻辑
 - Core 的任务只是不偏不倚地回答“当时状态是什么”
 
 ## 9. 改这一层代码时优先检查什么
@@ -302,5 +302,5 @@ flowchart TD
 
 - 想看这些状态如何被组织成可组合分析：看 [`analysis-layer.md`](analysis-layer.md)
 - 想看它们的底层数据来源：看 [`io-layer.md`](io-layer.md)
-- 想看 GUI / CLI / MCP 如何消费这些对象：看 [`ui-layer.md`](ui-layer.md)
+- 想看 TUI / CLI / RPC / MCP / WS 如何消费这些对象：看 [`ui-layer.md`](ui-layer.md)
 - 想写一个依赖这些对象的新 pass：看 [`pass-cookbook.md`](pass-cookbook.md)

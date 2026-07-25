@@ -1,12 +1,10 @@
 #include "io/trace_reader.h"
 #include "common/Profiling.h"
 #include "common/logger.h"
+#include "common/platform_mmap.h"
 
 #include <fmt/format.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
@@ -258,17 +256,12 @@ TraceReader::~TraceReader() {
 
 TraceReader::TraceReader(TraceReader&& other) noexcept
     : path_(std::move(other.path_)),
-      fd_(other.fd_),
-      mapped_(other.mapped_),
-      raw_file_size_(other.raw_file_size_),
+      mapped_file_(std::move(other.mapped_file_)),
       logical_size_(other.logical_size_),
       header_size_(other.header_size_),
       header_(std::move(other.header_)),
       temp_path_(std::move(other.temp_path_)),
       block_cache_(std::move(other.block_cache_)) {
-    other.fd_ = -1;
-    other.mapped_ = nullptr;
-    other.raw_file_size_ = 0;
     other.logical_size_ = 0;
 }
 
@@ -276,17 +269,12 @@ TraceReader& TraceReader::operator=(TraceReader&& other) noexcept {
     if (this != &other) {
         close();
         path_ = std::move(other.path_);
-        fd_ = other.fd_;
-        mapped_ = other.mapped_;
-        raw_file_size_ = other.raw_file_size_;
+        mapped_file_ = std::move(other.mapped_file_);
         logical_size_ = other.logical_size_;
         header_size_ = other.header_size_;
         header_ = std::move(other.header_);
         temp_path_ = std::move(other.temp_path_);
         block_cache_ = std::move(other.block_cache_);
-        other.fd_ = -1;
-        other.mapped_ = nullptr;
-        other.raw_file_size_ = 0;
         other.logical_size_ = 0;
     }
     return *this;
@@ -298,36 +286,26 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     reader.path_ = path;
     reader.header_size_ = sizeof(qbditrace::qbditrace_file_header_t);
 
-    // Open file
-    reader.fd_ = ::open(path.c_str(), O_RDONLY);
-    if (reader.fd_ < 0) {
-        return Error::file_not_found(path.string());
+    // Open and map the entire file read-only.
+    std::string map_error;
+    reader.mapped_file_ = platform::MappedFile::open(path.string(), &map_error);
+    if (!reader.mapped_file_.valid()) {
+        // std::string::starts_with() is C++20-only; project targets C++17.
+        if (map_error.rfind("open() failed", 0) == 0 ||
+            map_error.rfind("CreateFileW failed", 0) == 0) {
+            return Error::file_not_found(path.string());
+        }
+        return Error::mmap_failed(map_error);
     }
 
-    // Get file size
-    struct stat st{};
-    if (fstat(reader.fd_, &st) < 0) {
-        ::close(reader.fd_);
-        return Error::mmap_failed("fstat failed");
-    }
-    reader.raw_file_size_ = static_cast<uint64_t>(st.st_size);
-
-    // Validate minimum size (at least file header)
-    if (reader.raw_file_size_ < sizeof(qbditrace::qbditrace_file_header_t)) {
-        ::close(reader.fd_);
+    // Validate minimum size (at least file header).
+    if (reader.mapped_file_.size() < sizeof(qbditrace::qbditrace_file_header_t)) {
         return Error::invalid_magic();
     }
 
-    // mmap the entire file read-only
-    reader.mapped_ = ::mmap(nullptr, reader.raw_file_size_, PROT_READ,
-                            MAP_PRIVATE | MAP_NORESERVE, reader.fd_, 0);
-    if (reader.mapped_ == MAP_FAILED) {
-        ::close(reader.fd_);
-        return Error::mmap_failed(strerror(errno));
-    }
-
-    // Parse file header
-    const auto* raw_hdr = static_cast<const qbditrace::qbditrace_file_header_t*>(reader.mapped_);
+    // Parse file header.
+    const auto* raw_hdr = reinterpret_cast<const qbditrace::qbditrace_file_header_t*>(
+        reader.mapped_file_.data());
 
     if (raw_hdr->magic != TRACE_MAGIC) {
         reader.close();
@@ -418,15 +396,10 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     // ── Handle legacy stream-compressed traces ────────────────────────────
     if (reader.header_.is_compressed()) {
 #if TENET_HAS_ZSTD
-        // Transfer ownership of the raw mmap/fd to decompress_to_temp,
-        // which will release them and replace with the decompressed file.
-        int raw_fd = reader.fd_;
-        void* raw_mapped = reader.mapped_;
-        uint64_t raw_size = reader.raw_file_size_;
-        reader.fd_ = -1;
-        reader.mapped_ = nullptr;
-        reader.raw_file_size_ = 0;
-        return decompress_to_temp(std::move(reader), raw_fd, raw_mapped, raw_size);
+        // Transfer ownership of the raw mapping to decompress_to_temp, which
+        // releases it and replaces it with the decompressed file mapping.
+        auto raw_mapping = std::move(reader.mapped_file_);
+        return decompress_to_temp(std::move(reader), std::move(raw_mapping));
 #else
         reader.close();
         return Error(ErrorCode::MmapFailed,
@@ -436,7 +409,7 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
     }
 
     // ── Uncompressed trace: logical size == file size on disk ──────────────
-    reader.logical_size_ = reader.raw_file_size_;
+    reader.logical_size_ = reader.mapped_file_.size();
 
     return reader;
 }
@@ -445,15 +418,7 @@ void TraceReader::close() {
     // Release block cache first (it references the mmap'd region).
     block_cache_.reset();
 
-    if (mapped_ && mapped_ != MAP_FAILED) {
-        ::munmap(mapped_, raw_file_size_);
-        mapped_ = nullptr;
-    }
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
-    raw_file_size_ = 0;
+    mapped_file_.reset();
     logical_size_ = 0;
     // Clean up the temp file created for decompressed traces.
     if (!temp_path_.empty()) {
@@ -471,8 +436,8 @@ Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
 
     auto cache = std::make_unique<BlockCacheReader>();
     bool ok = cache->init(
-        static_cast<const uint8_t*>(reader.mapped_),
-        reader.raw_file_size_,
+        reader.mapped_file_.data(),
+        reader.mapped_file_.size(),
         kHeaderSize);
     if (!ok) {
         reader.close();
@@ -498,7 +463,7 @@ Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
     reader.header_.flags &= ~static_cast<uint64_t>(qbditrace::QBDITRACE_HF_BLOCK_COMPRESSED);
 
     fmt::print(stderr, "Block-compressed trace: {:.1f} MB on disk → {:.1f} MB logical\n",
-               reader.raw_file_size_ / (1024.0 * 1024.0),
+               reader.mapped_file_.size() / (1024.0 * 1024.0),
                reader.logical_size_ / (1024.0 * 1024.0));
 
     return std::move(reader);
@@ -520,10 +485,11 @@ Result<TraceReader> TraceReader::init_block_compressed(TraceReader&& reader) {
 #if TENET_HAS_ZSTD
 
 Result<TraceReader> TraceReader::decompress_to_temp(
-    TraceReader&& reader, int raw_fd, void* raw_mapped, uint64_t raw_size)
+    TraceReader&& reader, platform::MappedFile raw_mapping)
 {
     constexpr size_t kHeaderSize = sizeof(qbditrace::qbditrace_file_header_t);
-    const auto* src = static_cast<const uint8_t*>(raw_mapped);
+    const uint8_t* src = raw_mapping.data();
+    const uint64_t raw_size = raw_mapping.size();
     const uint8_t* compressed_start = src + kHeaderSize;
     size_t compressed_size = raw_size - kHeaderSize;
 
@@ -538,8 +504,6 @@ Result<TraceReader> TraceReader::decompress_to_temp(
         tmp_fd = ::mkstemp(temp_str.data());
     }
     if (tmp_fd < 0) {
-        ::munmap(raw_mapped, raw_size);
-        ::close(raw_fd);
         return Error(ErrorCode::MmapFailed,
                      std::string("Failed to create temp file for decompression: ") +
                      strerror(errno));
@@ -557,8 +521,6 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     if (::write(tmp_fd, &hdr, kHeaderSize) != static_cast<ssize_t>(kHeaderSize)) {
         ::close(tmp_fd);
         std::filesystem::remove(temp_path);
-        ::munmap(raw_mapped, raw_size);
-        ::close(raw_fd);
         return Error(ErrorCode::MmapFailed, "Failed to write header to temp file");
     }
 
@@ -567,8 +529,6 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     if (!dctx) {
         ::close(tmp_fd);
         std::filesystem::remove(temp_path);
-        ::munmap(raw_mapped, raw_size);
-        ::close(raw_fd);
         return Error(ErrorCode::MmapFailed, "ZSTD_createDCtx failed");
     }
 
@@ -611,9 +571,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
 
     ZSTD_freeDCtx(dctx);
 
-    // Release the original compressed file resources.
-    ::munmap(raw_mapped, raw_size);
-    ::close(raw_fd);
+    // Release the original compressed file mapping.
+    raw_mapping.reset();
 
     if (!ok) {
         fmt::print(stderr, "\n  Decompression failed: {}\n", err_msg);
@@ -625,33 +584,19 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     fmt::print(stderr, "\r  Decompressed: {:.1f} MB  \n", total_written / (1024.0 * 1024.0));
     LOG_INFO_M(::tenet::log::Module::Io, "decompression complete: {:.2f} MB", total_written / (1024.0 * 1024.0));
 
-    // Get the decompressed file size.
-    struct stat st{};
-    if (fstat(tmp_fd, &st) < 0) {
-        ::close(tmp_fd);
+    // Close the writer, then map the completed decompressed file read-only.
+    ::close(tmp_fd);
+    std::string map_error;
+    auto decompressed_mapping = platform::MappedFile::open(temp_str, &map_error);
+    if (!decompressed_mapping.valid()) {
         std::filesystem::remove(temp_path);
         return Error(ErrorCode::MmapFailed,
-                     std::string("fstat on decompressed temp file failed: ") +
-                     strerror(errno));
-    }
-    uint64_t decompressed_size = static_cast<uint64_t>(st.st_size);
-
-    // mmap the decompressed file.
-    void* mapped = ::mmap(nullptr, decompressed_size, PROT_READ,
-                          MAP_PRIVATE | MAP_NORESERVE, tmp_fd, 0);
-    if (mapped == MAP_FAILED) {
-        ::close(tmp_fd);
-        std::filesystem::remove(temp_path);
-        return Error(ErrorCode::MmapFailed,
-                     std::string("mmap decompressed temp file failed: ") +
-                     strerror(errno));
+                     "Failed to map decompressed temp file: " + map_error);
     }
 
     // Update the reader to point at the decompressed data.
-    reader.fd_ = tmp_fd;
-    reader.mapped_ = mapped;
-    reader.raw_file_size_ = decompressed_size;
-    reader.logical_size_ = decompressed_size;
+    reader.logical_size_ = decompressed_mapping.size();
+    reader.mapped_file_ = std::move(decompressed_mapping);
     reader.temp_path_ = temp_path;
     // Clear the compressed flag in the in-memory header so downstream code
     // does not attempt to decompress again.
@@ -663,10 +608,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
 #else  // !TENET_HAS_ZSTD
 
 Result<TraceReader> TraceReader::decompress_to_temp(
-    TraceReader&& /*reader*/, int raw_fd, void* raw_mapped, uint64_t raw_size)
+    TraceReader&& /*reader*/, platform::MappedFile /*raw_mapping*/)
 {
-    ::munmap(raw_mapped, raw_size);
-    ::close(raw_fd);
     return Error(ErrorCode::MmapFailed,
                  "Compressed trace requires zstd support, but tenet was "
                  "built without TENET_HAS_ZSTD");
@@ -898,15 +841,11 @@ TraceReader::Iterator TraceReader::end(const ThreadReader& tr) const {
 }
 
 void TraceReader::advise_sequential() const {
-    if (mapped_) {
-        ::madvise(mapped_, raw_file_size_, MADV_SEQUENTIAL);
-    }
+    mapped_file_.advise(platform::AccessHint::Sequential);
 }
 
 void TraceReader::advise_random() const {
-    if (mapped_) {
-        ::madvise(mapped_, raw_file_size_, MADV_RANDOM);
-    }
+    mapped_file_.advise(platform::AccessHint::Random);
 }
 
 }  // namespace tenet

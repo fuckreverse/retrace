@@ -1,12 +1,13 @@
 #include "io/recent_files.h"
 
+#include "common/platform_paths.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
+#include <filesystem>
 #include <fstream>
-#include <sys/stat.h>
 
 namespace tenet {
 
@@ -15,13 +16,7 @@ using json = nlohmann::json;
 // ─── Default path ────────────────────────────────────────────────────────────
 
 std::string RecentFiles::default_path() {
-    std::string home;
-    if (const char* h = std::getenv("HOME")) {
-        home = h;
-    } else {
-        home = "/tmp";
-    }
-    return home + "/.config/tenet/recent.json";
+    return (platform::user_config_dir() / "recent.json").string();
 }
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
@@ -62,16 +57,8 @@ RecentFiles RecentFiles::load() {
 // ─── Save ─────────────────────────────────────────────────────────────────────
 
 void RecentFiles::save() const {
-    std::string path = default_path();
-
-    // Ensure directory exists
-    auto sep = path.rfind('/');
-    if (sep != std::string::npos) {
-        std::string dir = path.substr(0, sep);
-        if (!dir.empty()) {
-            mkdir(dir.c_str(), 0755);
-        }
-    }
+    const std::filesystem::path path = default_path();
+    platform::ensure_directory(path.parent_path());
 
     json j = json::array();
     for (const auto& e : entries_) {

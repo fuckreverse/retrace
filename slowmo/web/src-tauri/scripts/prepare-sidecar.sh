@@ -33,7 +33,11 @@
 #
 # 幂等：可重复运行；每次都会覆盖 binaries/ 下的产物。
 #
-# 仅支持 macOS（arm64/x86_64）。Windows/Linux sidecar 需要另行适配（见脚本末尾说明）。
+# 仅支持 macOS（arm64/x86_64）。Windows 用 prepare-sidecar-windows.ps1，
+# Linux 用 prepare-sidecar-linux.sh —— 三者各自适配平台的动态库发现/改写机制
+# （macOS: install_name_tool + @rpath；Linux: patchelf + $ORIGIN；
+#  Windows: DLL 与 sidecar exe 同目录，见 tauri.conf.json 的
+#  bundle.resources["binaries/*.dll"]）。
 
 set -euo pipefail
 

@@ -26,8 +26,8 @@ Quickstart
     taint = t.pass_taint(source_reg=0)
     print(f"Taint steps: {len(taint.steps)}")
 
-    # Pipe into a custom analysis via the RPC interface
-    t.start_rpc()          # starts /tmp/tenet-<pid>.sock
+    # Pipe into a custom analysis via the loopback RPC interface
+    t.start_rpc()          # starts a TCP listener on 127.0.0.1
     t.stop_rpc()
 """
 
@@ -175,25 +175,26 @@ class TaintResult:
 
 class RpcClient:
     """
-    Thin JSON-RPC 2.0 client over Unix Domain Socket.
+    Thin JSON-RPC 2.0 client over TCP.
 
     Used by Trace.start_rpc() but can also be used standalone::
 
-        client = RpcClient("/tmp/tenet-12345.sock")
+        client = RpcClient("127.0.0.1", 10445)
         result = client.call("get_regs", {"inst_id": 100})
         print(result)
     """
 
-    def __init__(self, socket_path: str):
-        self._path = socket_path
+    def __init__(self, host: str, port: int):
+        self._host = host
+        self._port = port
         self._seq  = 0
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
 
     def connect(self, timeout: float = 5.0):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
-        sock.connect(self._path)
+        sock.connect((self._host, self._port))
         self._sock = sock
 
     def close(self):
@@ -297,37 +298,52 @@ class Trace:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
-    def start_rpc(self, socket_path: Optional[str] = None) -> RpcClient:
+    def start_rpc(self, host: str = "127.0.0.1", port: int = 0) -> RpcClient:
         """
         Start a tenet process in RPC server mode and return a connected client.
 
-        The tenet process runs in the background and listens on a Unix socket.
+        The tenet process runs in the background and listens on the requested
+        TCP loopback endpoint. Port 0 selects an available local port.
         Call stop_rpc() or use the Trace as a context manager to clean up.
         """
         if self._rpc is not None:
             return self._rpc
 
-        sock_path = socket_path or f"/tmp/tenet-py-{os.getpid()}.sock"
-        # Launch tenet in RPC server mode
-        cmd = [self._bin, "--rpc", sock_path, self._path]
+        if not 0 <= port <= 65535:
+            raise ValueError("RPC port must be in range 0..65535")
+        if port == 0:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind((host, 0))
+                port = probe.getsockname()[1]
+            finally:
+                probe.close()
+
+        endpoint = f"{host}:{port}"
+        cmd = [self._bin, "--rpc", endpoint, self._path]
         self._rpc_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Wait for socket to appear (up to 10s)
+
         import time
         deadline = time.time() + 10.0
-        while not os.path.exists(sock_path) and time.time() < deadline:
-            time.sleep(0.05)
+        client = RpcClient(host, port)
+        while time.time() < deadline:
             if self._rpc_proc.poll() is not None:
                 raise TraceError(
                     f"tenet RPC server exited early (rc={self._rpc_proc.returncode})")
+            try:
+                client.connect(timeout=0.2)
+                self._rpc = client
+                return client
+            except OSError:
+                client.close()
+                time.sleep(0.05)
 
-        client = RpcClient(sock_path)
-        client.connect(timeout=5.0)
-        self._rpc = client
-        return client
+        self.stop_rpc()
+        raise TraceError(f"timed out connecting to tenet RPC server at {endpoint}")
 
     def stop_rpc(self):
         """Stop the RPC server and disconnect the client."""

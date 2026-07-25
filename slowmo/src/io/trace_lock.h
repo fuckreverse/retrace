@@ -8,17 +8,16 @@
 // level LOCK-file error), and interactive mode assumes exclusive ownership
 // of navigation/bookmark state persisted in the index's META column family.
 //
-// Design: advisory flock(2) on a small lock file kept inside the trace's
-// index directory (`<trace>.tenet/session.lock`), i.e. "the trace's database
-// directory" — so the lock always lives next to the data it protects and
-// never touches the (possibly read-only) trace file itself.
+// Design: a cross-platform advisory lock on a small lock file kept inside
+// the trace's index directory (`<trace>.tenet/session.lock`), i.e. "the
+// trace's database directory" — so the lock always lives next to the data it
+// protects and never touches the (possibly read-only) trace file itself.
 //
-// Why flock and not "PID in a file + kill(pid, 0)":
-//   - flock's lock lives on the struct file* held by the kernel. It is
-//     released automatically when every fd referencing it is closed —
-//     which the kernel guarantees happens on process exit, *including*
-//     crashes, SIGKILL, and OOM-killer termination. There is no window
-//     where a dead process leaves a "locked" file behind.
+// Why an OS advisory lock and not "PID in a file + process liveness check":
+//   - The lock is tied to an OS-level open-file object and released
+//     automatically when every handle referencing it is closed — including
+//     on crashes and forced process termination. There is no window where a
+//     dead process leaves a "locked" file behind.
 //   - PID-based liveness checks are unreliable: PIDs are recycled by the
 //     OS, so `kill(old_pid, 0)` can return "alive" for a completely
 //     unrelated process that reused the PID after a crash, causing a false
@@ -27,10 +26,12 @@
 // The lock file's *contents* (pid, host, mode, timestamp) are therefore
 // purely informational — used only to print a friendly diagnostic when
 // try_acquire() fails. They are never used to decide whether the trace is
-// actually in use; that decision is made solely by the flock() syscall
-// result.
+// actually in use; that decision is made solely by the platform lock result.
 
-#include <sys/types.h>
+#include "common/platform_file_lock.h"
+#include "common/platform_paths.h"
+#include "common/platform_compat.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -42,7 +43,7 @@ namespace tenet {
 /// from the lock file for display purposes only (see header comment on
 /// why this is never used to make the acquire/deny decision).
 struct TraceLockHolderInfo {
-    pid_t       pid = 0;
+    platform::pid_t_compat pid = 0;
     std::string host;
     std::string mode;        ///< e.g. "gui", "tui", "batch", "rpc", "mcp"
     std::string opened_at;   ///< human-readable local time
@@ -51,7 +52,7 @@ struct TraceLockHolderInfo {
 
 /// RAII holder for an acquired exclusive trace lock. Destroying this object
 /// (or letting it go out of scope, including via unwind on any return path,
-/// or the kernel closing the fd on process termination) releases the lock.
+/// or the OS closing its file handle on process termination) releases the lock.
 class TraceFileLock {
 public:
     TraceFileLock() = default;
@@ -85,11 +86,11 @@ public:
     /// Explicitly release the lock early (also called by the destructor).
     void release();
 
-    bool valid() const { return fd_ >= 0; }
+    bool valid() const { return lock_.valid(); }
 
 private:
     std::string lock_path_;
-    int fd_ = -1;
+    platform::FileLock lock_;
 };
 
 }  // namespace tenet

@@ -11,8 +11,8 @@
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx",
     "tauri": "tauri",
-    "sidecar": "bash src-tauri/scripts/prepare-sidecar.sh",
-    "sidecar:debug": "bash src-tauri/scripts/prepare-sidecar.sh --debug",
+    "sidecar": "node scripts/run-sidecar.mjs",
+    "sidecar:debug": "node scripts/run-sidecar.mjs --debug",
     "tauri:dev": "pnpm sidecar:debug && tauri dev",
     "tauri:build": "pnpm sidecar && tauri build"
   },

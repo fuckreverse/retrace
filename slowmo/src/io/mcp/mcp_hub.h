@@ -8,7 +8,7 @@
 //       │
 //       ▼ HTTP (port 10444)
 //   ┌──────────────────────────┐
-//   │  Hub Instance            │  ← flock-elected, auto-failover
+//   │  Hub Instance            │  ← platform-lock elected, auto-failover
 //   │  (also serves its own    │
 //   │   trace via MCP tools)   │
 //   │                          │
@@ -31,15 +31,19 @@
 //     {"type":"hub_shutdown"}
 //
 // Election:
-//   flock(LOCK_EX | LOCK_NB) on ~/.tenet/mcp-hub.lock
-//   Process crash → flock auto-released → workers detect TCP disconnect
-//   → attempt flock → winner becomes new hub
+//   Cross-platform advisory exclusive lock on the per-user mcp-hub.lock file.
+//   Process crash → OS lock auto-released → workers detect TCP disconnect
+//   → attempt lock acquisition → winner becomes new hub
 //
 // Modes:
 //   sessionless (default): every tool call must specify instance parameter.
 //     select_instance tool is NOT available.
 //   session: select_instance sets session-level default instance.
 //     instance parameter is optional.
+
+#include "common/platform_compat.h"
+#include "common/platform_file_lock.h"
+#include "common/platform_paths.h"
 
 #include <atomic>
 #include <chrono>
@@ -68,27 +72,30 @@ struct McpHubConfig {
     std::string instance_name;         ///< Optional custom instance name
 };
 
-// ─── Hub Election (flock-based) ────────────────────────────────────────────
+// ─── Hub Election (cross-platform advisory lock) ───────────────────────────
 
 class HubElection {
 public:
     HubElection(const std::string& lock_dir,
-                pid_t pid, uint16_t hub_port,
+                platform::pid_t_compat pid, uint16_t hub_port,
                 const std::string& trace_file,
                 const std::string& instance_id);
     ~HubElection();
 
-    /// Try to acquire hub role via flock(LOCK_EX | LOCK_NB).
+    /// Try to acquire the hub role via a non-blocking advisory lock.
     /// Returns true if this instance is now the hub.
     bool try_acquire();
 
-    /// Release hub role (graceful shutdown). Unlocks flock and closes fd.
+    /// Publish the actual listener port after the hub transport has started.
+    bool update_port(uint16_t hub_port);
+
+    /// Release the hub role (graceful shutdown) and its platform lock.
     void release();
 
     /// Read current hub info from the lock file (if another instance is hub).
     struct HubInfo {
         bool        valid       = false;
-        pid_t       pid         = 0;
+        platform::pid_t_compat pid = 0;
         uint16_t    port        = 0;
         std::string trace_file;
         std::string instance_id;
@@ -96,14 +103,15 @@ public:
     HubInfo read_current() const;
 
     bool is_hub() const { return is_hub_; }
-    int  fd()     const { return fd_; }
+    bool has_lock() const { return lock_.valid(); }
 
 private:
     std::string lock_path_;
-    int  fd_          = -1;
-    bool is_hub_      = false;
-    pid_t pid_;
+    platform::FileLock lock_;
+    bool is_hub_ = false;
+    platform::pid_t_compat pid_;
     uint16_t hub_port_;
+    uint64_t start_time_ = 0;
     std::string trace_file_;
     std::string instance_id_;
 };
@@ -112,11 +120,11 @@ private:
 
 struct HubInstance {
     std::string id;
-    pid_t       pid          = 0;
+    platform::pid_t_compat pid = 0;
     std::string trace_file;
     std::string module_name;
     bool        is_hub       = false;
-    int         sock_fd      = -1;       ///< Guarded by socket_mutex_; -1 for hub itself
+    platform::socket_t sock_fd = platform::kInvalidSocket;  ///< Guarded by socket_mutex_; invalid for hub itself
     mutable std::mutex socket_mutex_;
     std::atomic<int64_t> last_heartbeat_ticks{0};
 
@@ -134,12 +142,12 @@ struct HubInstance {
     // acquires the same lock before invalidating sock_fd to avoid fd reuse races.
     bool send(const nlohmann::json& msg);
     bool has_socket() const;
-    bool matches_socket(int fd) const;
-    void attach_socket(int fd);
+    bool matches_socket(platform::socket_t fd) const;
+    void attach_socket(platform::socket_t fd);
     void shutdown_socket();
-    void shutdown_socket_if(int expected_fd);
+    void shutdown_socket_if(platform::socket_t expected_fd);
     void close_socket();
-    void close_socket_if(int expected_fd);
+    void close_socket_if(platform::socket_t expected_fd);
 };
 
 // Tracks active upgraded WebSocket sessions separately from generic client fds.
@@ -149,18 +157,18 @@ struct HubInstance {
 class BoundWsSessionRegistry {
 public:
     struct SessionToken {
-        int      fd = -1;
+        platform::socket_t fd = platform::kInvalidSocket;
         uint64_t generation = 0;
     };
 
-    SessionToken register_session(int fd, const std::shared_ptr<HubInstance>& bound_instance);
+    SessionToken register_session(platform::socket_t fd, const std::shared_ptr<HubInstance>& bound_instance);
     void unregister_session(SessionToken token);
-    void unregister_session(int fd);
+    void unregister_session(platform::socket_t fd);
 
-    std::vector<int> sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const;
-    std::vector<int> hub_local_sessions() const;
-    std::vector<int> all_sessions() const;
-    bool has_session(int fd) const;
+    std::vector<platform::socket_t> sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const;
+    std::vector<platform::socket_t> hub_local_sessions() const;
+    std::vector<platform::socket_t> all_sessions() const;
+    bool has_session(platform::socket_t fd) const;
 
 private:
     struct Binding {
@@ -172,9 +180,9 @@ private:
 
     mutable std::mutex mutex_;
     uint64_t next_generation_ = 1;
-    std::unordered_map<int, Binding> sessions_by_fd_;
-    std::unordered_map<const HubInstance*, std::unordered_set<int>> sessions_by_instance_;
-    std::unordered_set<int> hub_local_fds_;
+    std::unordered_map<platform::socket_t, Binding> sessions_by_fd_;
+    std::unordered_map<const HubInstance*, std::unordered_set<platform::socket_t>> sessions_by_instance_;
+    std::unordered_set<platform::socket_t> hub_local_fds_;
 };
 
 // ─── Hub Transport ─────────────────────────────────────────────────────────
@@ -232,9 +240,9 @@ private:
     struct HttpRequest;
 
     void listener_loop();
-    void handle_http_client(int fd, const std::string& addr, bool peer_is_loopback);
-    void handle_websocket_client(int fd, const std::string& addr, bool peer_is_loopback, const HttpRequest& req);
-    void handle_worker_connection(int fd, const std::string& addr);
+    void handle_http_client(platform::socket_t fd, const std::string& addr, bool peer_is_loopback);
+    void handle_websocket_client(platform::socket_t fd, const std::string& addr, bool peer_is_loopback, const HttpRequest& req);
+    void handle_worker_connection(platform::socket_t fd, const std::string& addr);
 
     nlohmann::json handle_ws_rpc(const std::string& bound_instance,
                                  const std::shared_ptr<HubInstance>& bound_worker,
@@ -249,12 +257,12 @@ private:
         std::string body;
         bool valid = false;
     };
-    static HttpRequest parse_http_request(int fd);
-    static void send_http_response(int fd, int status,
+    static HttpRequest parse_http_request(platform::socket_t fd);
+    static void send_http_response(platform::socket_t fd, int status,
                                    const std::string& content_type,
                                    const std::string& body,
                                    const std::string& extra_headers = "");
-    static bool send_all(int fd, std::string_view data);
+    static bool send_all(platform::socket_t fd, std::string_view data);
     static bool has_token_ci(std::string_view header_value, std::string_view token);
 
     // Worker registry
@@ -268,7 +276,7 @@ private:
     void reap_stale_workers();
     void shutdown_ws_sessions_for_instance(const std::shared_ptr<HubInstance>& inst);
     void shutdown_all_ws_sessions();
-    static void shutdown_fds(const std::vector<int>& fds);
+    static void shutdown_fds(const std::vector<platform::socket_t>& fds);
 
     friend struct McpHubTransportTestAccess;
 
@@ -277,7 +285,7 @@ private:
     std::string host_;
     uint16_t port_;
     uint16_t listening_port_ = 0;
-    int server_fd_ = -1;
+    platform::socket_t server_fd_ = platform::kInvalidSocket;
     bool session_mode_;
     std::string hub_instance_id_;
 
@@ -287,7 +295,7 @@ private:
     // Per-client threads
     std::mutex clients_mutex_;
     std::vector<std::thread> client_threads_;
-    std::unordered_set<int> active_client_fds_;
+    std::unordered_set<platform::socket_t> active_client_fds_;
     BoundWsSessionRegistry bound_ws_sessions_;
 
     // Heartbeat reaper thread
@@ -309,7 +317,7 @@ public:
     McpWorkerTransport(MessageHandler handler,
                        const std::string& hub_host, uint16_t hub_port,
                        const std::string& instance_id,
-                       pid_t pid,
+                       platform::pid_t_compat pid,
                        const std::string& trace_file,
                        const std::string& module_name);
     ~McpWorkerTransport();
@@ -332,8 +340,8 @@ private:
     void send_heartbeat();
     bool send_json(const nlohmann::json& msg);
     bool recv_line(std::string& line);
-    int current_socket_fd() const;
-    void install_socket(int fd);
+    platform::socket_t current_socket_fd() const;
+    void install_socket(platform::socket_t fd);
     void shutdown_connection();
     void close_connection();
 
@@ -343,11 +351,11 @@ private:
     std::string hub_host_;
     uint16_t hub_port_;
     std::string instance_id_;
-    pid_t pid_;
+    platform::pid_t_compat pid_;
     std::string trace_file_;
     std::string module_name_;
 
-    int sock_fd_ = -1;  // Guarded by socket_mutex_
+    platform::socket_t sock_fd_ = platform::kInvalidSocket;  // Guarded by socket_mutex_
     mutable std::mutex socket_mutex_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> running_{true};

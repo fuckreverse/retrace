@@ -6,7 +6,7 @@
 mindmap
   root((tenet capabilities))
     交互浏览
-      GUI
+      Tauri Web 前端
       TUI
       导航历史
       书签与搜索
@@ -41,28 +41,26 @@ mindmap
       MCP HTTP
       batch_query
     流式与性能
-streaming
-stats
-window_stats
-profiling
+      streaming
+      stats
+      window_stats
+      profiling
 ```
 
 ## 1. 交互浏览
 
-### GUI
+### Tauri Web 前端
 
-- 默认入口，适合大 trace 的可视化浏览。
-- 主要能力：指令列表、寄存器、内存、调用栈、函数列表、Hex Dump、CFG、分析结果面板。
-- 典型命令：
-
-```bash
-./tenet trace.bin
-```
+- 图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供；`tenet` 可执行文件本身是纯后端，不再创建原生窗口。
+- Tauri 的 Rust shell 以 `--ws-port <port> <trace_path> --mcp-hub` 启动和管理 `tenet` 子进程，同时开启 WS 服务与 MCP Hub；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。
+- MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径并行且相互独立，不是 Web UI 的 fallback。
+- 主要能力包括指令列表、寄存器、内存、调用栈、函数列表、Hex Dump、CFG 和分析结果视图。
+- 后端与 Tauri 前端以 Windows（x86_64/arm64）、Linux（x86_64/arm64）、macOS（x86_64/arm64）为构建运行目标。Windows 默认关闭 WebSocket 服务，因此 Web UI 暂时无法连接后端获取实时数据；这是待补齐 WS 支持的已知限制，不存在 MCP HTTP 过渡方案。三平台 CI 已建立，但尚未在真实 Windows/Linux 物理机上完成完整人工验收。
 
 ### TUI
 
 - 适合远程终端、SSH、无图形环境。
-- 与 GUI 共用同一套 Core 和 Analysis，对等支持导航、断点、Goto、搜索、分析触发。
+- 与 Tauri Web 前端共用同一套后端 Core 和 Analysis，支持导航、断点、Goto、搜索、分析触发。
 - 典型命令：
 
 ```bash
@@ -126,7 +124,7 @@ profiling
 
 对应 pass：`taint`, `backward_taint`, `dataflow_graph`, `taint_source_annotation`
 
-> `slice`、`producer_chain` 已被 `backward_taint` 取代（不再是独立 pass/CLI 选项/MCP 工具）；GUI 里的 “Producer Chain” 快捷入口现在内部调用的是 `BackwardTaintPass` 的一个小步数预览模式。
+> `slice`、`producer_chain` 已被 `backward_taint` 取代（不再是独立 pass/CLI 选项/MCP 工具）；Tauri Web 前端的 “Producer Chain” 快捷入口内部调用 `BackwardTaintPass` 的小步数预览模式。
 
 参考：[`analysis-layer.md`](analysis-layer.md), [`core-layer.md`](core-layer.md)
 
@@ -156,7 +154,7 @@ profiling
 
 对应 pass：`strings`, `memory_strings`, `memory_snapshot`, `mem_search`, `entropy`, `yara_mem_scan`
 
-> `literal_search` 已不是独立 pass：精确数值搜索现在是 `MemSearchPass` 的一个模式。`--literal-search`/`--literal-search-range` 仍保留为 `--mem-search-value`/`--mem-search-range` 的弃用别名（仅 CLI 层面，不影响 MCP/GUI）。
+> `literal_search` 已不是独立 pass：精确数值搜索现在是 `MemSearchPass` 的一个模式。`--literal-search`/`--literal-search-range` 仍保留为 `--mem-search-value`/`--mem-search-range` 的弃用别名（仅 CLI 层面，不影响 MCP/Tauri Web 前端）。
 
 参考：[`core-layer.md`](core-layer.md), [`analysis-layer.md`](analysis-layer.md)
 
@@ -197,11 +195,12 @@ profiling
 
 ### RPC
 
-- Unix socket JSON-RPC。
-- 适合本地脚本或工具接入，不适合直接暴露到远程网络。
+- JSON-RPC over TCP；默认绑定 `127.0.0.1`（loopback），适合本地脚本或工具接入，也可显式绑定其他 host。
+- 参数格式为 `--rpc [[host:]port]`；省略端点时默认为 `127.0.0.1:0`，端口 `0` 表示自动分配空闲端口。
 
 ```bash
-./tenet trace.bin --rpc /tmp/tenet.sock
+./tenet trace.bin --rpc 127.0.0.1:10445
+./tenet trace.bin --rpc                  # 127.0.0.1:0，自动分配端口
 ```
 
 ### MCP stdio
@@ -215,7 +214,7 @@ profiling
 
 ### MCP Streamable HTTP
 
-- 适合 GUI 宿主、远程接入、没有 stdio 的运行环境。
+- 适合 AI 客户端远程接入或没有 stdio 的运行环境；不用于浏览器端 Web UI 渲染。
 - 单入口 `POST /mcp`，附带 `GET /health`。
 - 支持 Basic Auth 和会话 ID。
 
@@ -268,14 +267,14 @@ profiling
 
 | 你遇到的问题 | 优先使用 |
 |--------------|----------|
-| 我想知道某个输出是怎么来的 | `backward_taint`（含 GUI 内快速预览 “Producer Chain” 步数受限模式）, `mem_write_history` |
+| 我想知道某个输出是怎么来的 | `backward_taint`（含 Tauri Web 前端的 “Producer Chain” 步数受限预览模式）, `mem_write_history` |
 | 我想知道输入往哪流了 | `taint`, `critical_path`, `dataflow_graph` |
 | 我想知道代码结构 | `function`, `xref`, `cfg`, `call_graph`, `loops` |
 | 我想知道是不是某个算法 | `pattern`, `constants`, `loop_semantics`, `algorithm_summary` |
 | 我想知道代码是不是被 VM 保护了 | 先用 IDA/Ghidra 静态分析定位 dispatcher，再用 `vm_abstract`（hint 驱动，不做启发式扫描）验证并跑执行统计 |
 | 我想知道某段内存当时的值 | `memread`, `memory_snapshot`, `memory_strings` |
 | 我想让 AI 自动分析 | 单实例用 `--mcp`，多 Trace 固定入口用 `--mcp-hub`（默认 `10444`） |
-| 我想在 IDA 与 Trace 间双向跳转 | 启动 GUI/`--mcp-hub`，加载 `python/tenet_ida.py`，通过 Hub JSON WebSocket 同步 |
+| 我想在 IDA 与 Trace 间双向跳转 | 启动 Tauri 前端或 `--mcp-hub`，加载 `python/tenet_ida.py`，通过 Hub JSON WebSocket 同步 |
 | 我想边录边看 | `--streaming` |
 | 我在分析 Android trace | `syscall_intercept`（BoringSSL）, `pattern`, `taint` — ObjC 相关 pass 自动跳过 |
 | 我想排除噪声代码区间 | qbditrace `--exclude-range`（录制时排除），tenet `--exclude-range`（分析时过滤） |

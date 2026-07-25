@@ -1,19 +1,17 @@
 #include "mcp_hub.h"
 #include "mcp_websocket.h"
 #include "common/logger.h"
+#include "common/platform_compat.h"
+#include "common/platform_file_lock.h"
+#include "common/platform_paths.h"
 
 #include <fmt/core.h>
 
-#include <sys/socket.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <poll.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
+// platform_compat.h already pulls in the right socket headers per platform
+// (winsock2.h/ws2tcpip.h on Windows, sys/socket.h/netinet/in.h/arpa/inet.h
+// on POSIX) as well as poll()/errno/signal() equivalents (platform::poll_one,
+// platform::last_socket_error, SIGPIPE handling in ensure_sockets_initialized)
+// -- don't duplicate POSIX-only includes here, they'd break the Windows build.
 
 #include <cstring>
 #include <sstream>
@@ -47,29 +45,8 @@ std::chrono::milliseconds heartbeat_age(const tenet::HubInstance& inst) {
     return std::chrono::milliseconds(heartbeat_now_ticks() - ticks);
 }
 
-bool send_all_fd(int fd, std::string_view data) {
-    size_t off = 0;
-    while (off < data.size()) {
-        ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd{fd, POLLOUT, 0};
-                int pr = ::poll(&pfd, 1, 3000);
-                if (pr > 0) {
-                    continue;
-                }
-            }
-            return false;
-        }
-        if (n == 0) {
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    return true;
+bool send_all_fd(platform::socket_t fd, std::string_view data) {
+    return platform::send_all(fd, data.data(), data.size());
 }
 
 void mark_pending_error(tenet::HubInstance::PendingRequest& pending, std::string_view error_message) {
@@ -136,20 +113,18 @@ void ensure_instance_for_ws_call(json& msg, const std::string& bound_instance) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// HubElection — flock-based leader election
+// HubElection — cross-platform advisory-lock leader election
 // ═══════════════════════════════════════════════════════════════════════════
 
 static std::string get_default_lock_dir() {
-    const char* home = getenv("HOME");
-    if (!home) home = "/tmp";
-    return std::string(home) + "/.tenet";
+    return platform::user_config_dir().string();
 }
 
 static constexpr uint32_t HUB_LOCK_MAGIC = 0x54485542;  // "THUB"
 
 struct HubLockFileData {
     uint32_t magic;           // HUB_LOCK_MAGIC
-    pid_t    hub_pid;
+    platform::pid_t_compat hub_pid;
     uint16_t hub_port;
     uint64_t start_time;      // epoch seconds
     char     trace_file[256];
@@ -157,7 +132,7 @@ struct HubLockFileData {
 };
 
 HubElection::HubElection(const std::string& lock_dir,
-                         pid_t pid, uint16_t hub_port,
+                         platform::pid_t_compat pid, uint16_t hub_port,
                          const std::string& trace_file,
                          const std::string& instance_id)
     : pid_(pid), hub_port_(hub_port),
@@ -165,8 +140,7 @@ HubElection::HubElection(const std::string& lock_dir,
     std::string dir = lock_dir.empty() ? get_default_lock_dir() : lock_dir;
     lock_path_ = dir + "/mcp-hub.lock";
 
-    // Ensure directory exists
-    ::mkdir(dir.c_str(), 0755);
+    platform::ensure_directory(dir);
 }
 
 HubElection::~HubElection() {
@@ -176,80 +150,77 @@ HubElection::~HubElection() {
 bool HubElection::try_acquire() {
     if (is_hub_) return true;
 
-    fd_ = ::open(lock_path_.c_str(), O_CREAT | O_RDWR, 0644);
-    if (fd_ < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "hub-election: open({}) failed: {}",
-                    lock_path_, strerror(errno));
+    auto [file_lock, result] = platform::FileLock::try_acquire(lock_path_);
+    if (result == platform::FileLock::Result::HeldElsewhere) {
+        return false;
+    }
+    if (result == platform::FileLock::Result::IoError) {
+        LOG_ERROR_M(log::Module::Mcp, "hub-election: acquiring {} failed", lock_path_);
         return false;
     }
 
-    // Non-blocking exclusive lock
-    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-        if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            // Someone else holds the lock
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        LOG_ERROR_M(log::Module::Mcp, "hub-election: flock failed: {}", strerror(errno));
-        ::close(fd_);
-        fd_ = -1;
-        return false;
-    }
-
-    // We got the lock — write our info
+    // We got the lock — write our info.
     HubLockFileData data{};
     data.magic      = HUB_LOCK_MAGIC;
     data.hub_pid    = pid_;
     data.hub_port   = hub_port_;
-    data.start_time = static_cast<uint64_t>(time(nullptr));
+    start_time_     = static_cast<uint64_t>(time(nullptr));
+    data.start_time = start_time_;
     std::strncpy(data.trace_file, trace_file_.c_str(), sizeof(data.trace_file) - 1);
     std::strncpy(data.instance_id, instance_id_.c_str(), sizeof(data.instance_id) - 1);
+    if (!file_lock.write_at_start(&data, sizeof(data))) {
+        LOG_ERROR_M(log::Module::Mcp, "hub-election: failed to write {}", lock_path_);
+        return false;
+    }
 
-    // Truncate and write
-    ::ftruncate(fd_, 0);
-    ::pwrite(fd_, &data, sizeof(data), 0);
-    ::fsync(fd_);
-
+    lock_ = std::move(file_lock);
     is_hub_ = true;
     LOG_INFO_M(log::Module::Mcp, "hub-election: acquired hub role (pid={}, port={}, lock={})",
                pid_, hub_port_, lock_path_);
     return true;
 }
 
+bool HubElection::update_port(uint16_t hub_port) {
+    if (!is_hub_ || !lock_.valid()) return false;
+
+    HubLockFileData data{};
+    data.magic      = HUB_LOCK_MAGIC;
+    data.hub_pid    = pid_;
+    data.hub_port   = hub_port;
+    data.start_time = start_time_;
+    std::strncpy(data.trace_file, trace_file_.c_str(), sizeof(data.trace_file) - 1);
+    std::strncpy(data.instance_id, instance_id_.c_str(), sizeof(data.instance_id) - 1);
+    if (!lock_.write_at_start(&data, sizeof(data))) {
+        LOG_ERROR_M(log::Module::Mcp, "hub-election: failed to publish listener port {}", hub_port);
+        return false;
+    }
+
+    hub_port_ = hub_port;
+    LOG_INFO_M(log::Module::Mcp, "hub-election: published listener port {}", hub_port_);
+    return true;
+}
+
 void HubElection::release() {
     if (!is_hub_) return;
 
-    if (fd_ >= 0) {
-        // Truncate the lock file content before unlocking
-        ::ftruncate(fd_, 0);
-        ::flock(fd_, LOCK_UN);
-        ::close(fd_);
-        fd_ = -1;
-    }
+    lock_.release();
     is_hub_ = false;
     LOG_INFO_M(log::Module::Mcp, "hub-election: released hub role");
 }
 
 HubElection::HubInfo HubElection::read_current() const {
     HubInfo info;
-    int fd = ::open(lock_path_.c_str(), O_RDONLY);
-    if (fd < 0) return info;
+    auto [file_lock, result] = platform::FileLock::try_acquire(lock_path_);
+    if (result == platform::FileLock::Result::IoError) return info;
 
-    // Try shared lock (non-blocking) — if it fails, someone holds EX lock
-    // and is actively the hub. If it succeeds, we can read safely.
-    // Actually, we don't need to lock to read — flock ensures writer
-    // consistency. Just read.
     HubLockFileData data{};
-    ssize_t n = ::pread(fd, &data, sizeof(data), 0);
-    ::close(fd);
-
-    if (n < (ssize_t)sizeof(data)) return info;
+    size_t n = file_lock.read_at_start(&data, sizeof(data));
+    if (n != sizeof(data)) return info;
     if (data.magic != HUB_LOCK_MAGIC) return info;
 
-    // Verify the hub process is still alive
-    if (data.hub_pid > 0 && ::kill(data.hub_pid, 0) != 0) {
-        // Process is dead — lock file is stale
+    // Verify the hub process is still alive.
+    if (data.hub_pid > 0 && !platform::process_alive(data.hub_pid)) {
+        // Process is dead — lock file is stale.
         return info;
     }
 
@@ -268,7 +239,7 @@ HubElection::HubInfo HubElection::read_current() const {
 bool HubInstance::send(const json& msg) {
     std::string data = msg.dump() + "\n";
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd < 0) {
+    if (!platform::socket_valid(sock_fd)) {
         return false;
     }
     return send_all_fd(sock_fd, data);
@@ -276,56 +247,56 @@ bool HubInstance::send(const json& msg) {
 
 bool HubInstance::has_socket() const {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    return sock_fd >= 0;
+    return platform::socket_valid(sock_fd);
 }
 
-bool HubInstance::matches_socket(int fd) const {
+bool HubInstance::matches_socket(platform::socket_t fd) const {
     std::lock_guard<std::mutex> lk(socket_mutex_);
     return sock_fd == fd;
 }
 
-void HubInstance::attach_socket(int fd) {
+void HubInstance::attach_socket(platform::socket_t fd) {
     std::lock_guard<std::mutex> lk(socket_mutex_);
     sock_fd = fd;
 }
 
 void HubInstance::shutdown_socket() {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd >= 0) {
-        ::shutdown(sock_fd, SHUT_RDWR);
+    if (platform::socket_valid(sock_fd)) {
+        platform::shutdown_both(sock_fd);
     }
 }
 
-void HubInstance::shutdown_socket_if(int expected_fd) {
+void HubInstance::shutdown_socket_if(platform::socket_t expected_fd) {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd == expected_fd && sock_fd >= 0) {
-        ::shutdown(sock_fd, SHUT_RDWR);
+    if (sock_fd == expected_fd && platform::socket_valid(sock_fd)) {
+        platform::shutdown_both(sock_fd);
     }
 }
 
 void HubInstance::close_socket() {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd >= 0) {
-        int fd = sock_fd;
-        sock_fd = -1;
-        ::shutdown(fd, SHUT_RDWR);
+    if (platform::socket_valid(sock_fd)) {
+        platform::socket_t fd = sock_fd;
+        sock_fd = platform::kInvalidSocket;
+        platform::shutdown_both(fd);
     }
 }
 
-void HubInstance::close_socket_if(int expected_fd) {
+void HubInstance::close_socket_if(platform::socket_t expected_fd) {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd == expected_fd && sock_fd >= 0) {
-        int fd = sock_fd;
-        sock_fd = -1;
-        ::shutdown(fd, SHUT_RDWR);
+    if (sock_fd == expected_fd && platform::socket_valid(sock_fd)) {
+        platform::socket_t fd = sock_fd;
+        sock_fd = platform::kInvalidSocket;
+        platform::shutdown_both(fd);
     }
 }
 
 BoundWsSessionRegistry::SessionToken BoundWsSessionRegistry::register_session(
-    int fd, const std::shared_ptr<HubInstance>& bound_instance) {
+    platform::socket_t fd, const std::shared_ptr<HubInstance>& bound_instance) {
     std::lock_guard<std::mutex> lk(mutex_);
 
-    if (fd < 0) {
+    if (!platform::socket_valid(fd)) {
         return {};
     }
 
@@ -383,7 +354,7 @@ void BoundWsSessionRegistry::unregister_session(SessionToken token) {
     sessions_by_fd_.erase(it);
 }
 
-void BoundWsSessionRegistry::unregister_session(int fd) {
+void BoundWsSessionRegistry::unregister_session(platform::socket_t fd) {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = sessions_by_fd_.find(fd);
     if (it == sessions_by_fd_.end()) {
@@ -405,9 +376,9 @@ void BoundWsSessionRegistry::unregister_session(int fd) {
     sessions_by_fd_.erase(it);
 }
 
-std::vector<int> BoundWsSessionRegistry::sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const {
+std::vector<platform::socket_t> BoundWsSessionRegistry::sessions_for_instance(const std::shared_ptr<HubInstance>& bound_instance) const {
     std::lock_guard<std::mutex> lk(mutex_);
-    std::vector<int> out;
+    std::vector<platform::socket_t> out;
     if (!bound_instance) {
         return out;
     }
@@ -417,25 +388,25 @@ std::vector<int> BoundWsSessionRegistry::sessions_for_instance(const std::shared
         return out;
     }
     out.reserve(it->second.size());
-    for (int fd : it->second) {
+    for (platform::socket_t fd : it->second) {
         out.push_back(fd);
     }
     return out;
 }
 
-std::vector<int> BoundWsSessionRegistry::hub_local_sessions() const {
+std::vector<platform::socket_t> BoundWsSessionRegistry::hub_local_sessions() const {
     std::lock_guard<std::mutex> lk(mutex_);
-    std::vector<int> out;
+    std::vector<platform::socket_t> out;
     out.reserve(hub_local_fds_.size());
-    for (int fd : hub_local_fds_) {
+    for (platform::socket_t fd : hub_local_fds_) {
         out.push_back(fd);
     }
     return out;
 }
 
-std::vector<int> BoundWsSessionRegistry::all_sessions() const {
+std::vector<platform::socket_t> BoundWsSessionRegistry::all_sessions() const {
     std::lock_guard<std::mutex> lk(mutex_);
-    std::vector<int> out;
+    std::vector<platform::socket_t> out;
     out.reserve(sessions_by_fd_.size());
     for (const auto& [fd, _binding] : sessions_by_fd_) {
         out.push_back(fd);
@@ -443,7 +414,7 @@ std::vector<int> BoundWsSessionRegistry::all_sessions() const {
     return out;
 }
 
-bool BoundWsSessionRegistry::has_session(int fd) const {
+bool BoundWsSessionRegistry::has_session(platform::socket_t fd) const {
     std::lock_guard<std::mutex> lk(mutex_);
     return sessions_by_fd_.count(fd) > 0;
 }
@@ -469,46 +440,60 @@ McpHubTransport::~McpHubTransport() {
 }
 
 bool McpHubTransport::start() {
+    platform::ensure_sockets_initialized();
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd_ < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "hub: socket() failed: {}", strerror(errno));
+    if (!platform::socket_valid(server_fd_)) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: socket() failed: {}", platform::last_socket_error_string());
         return false;
     }
 
-    int optval = 1;
-    ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if (!platform::set_reuseaddr(server_fd_)) {
+        LOG_WARN_M(log::Module::Mcp, "hub: failed to set SO_REUSEADDR: {}",
+                   platform::last_socket_error_string());
+    }
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port_);
-    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) <= 0) {
-        addr.sin_addr.s_addr = INADDR_ANY;
+    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: invalid listen address '{}'", host_);
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
+        return false;
     }
 
     if (::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "hub: bind({}:{}) failed: {}", host_, port_, strerror(errno));
-        ::close(server_fd_);
-        server_fd_ = -1;
+        LOG_ERROR_M(log::Module::Mcp, "hub: bind({}:{}) failed: {}", host_, port_, platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
         return false;
     }
 
     if (::listen(server_fd_, 128) < 0) {
-        LOG_ERROR_M(log::Module::Mcp, "hub: listen() failed: {}", strerror(errno));
-        ::close(server_fd_);
-        server_fd_ = -1;
+        LOG_ERROR_M(log::Module::Mcp, "hub: listen() failed: {}", platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
         return false;
     }
 
     struct sockaddr_in bound_addr{};
-    socklen_t bound_len = sizeof(bound_addr);
-    if (::getsockname(server_fd_, reinterpret_cast<struct sockaddr*>(&bound_addr), &bound_len) == 0) {
-        listening_port_ = ntohs(bound_addr.sin_port);
-    } else {
-        listening_port_ = port_;
+    platform::socklen_compat_t bound_len = sizeof(bound_addr);
+    if (::getsockname(server_fd_, reinterpret_cast<struct sockaddr*>(&bound_addr), &bound_len) != 0) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: getsockname() failed: {}",
+                    platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
+        return false;
     }
+    listening_port_ = ntohs(bound_addr.sin_port);
 
-    int flags = ::fcntl(server_fd_, F_GETFL, 0);
-    ::fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK);
+    if (!platform::set_nonblocking(server_fd_)) {
+        LOG_ERROR_M(log::Module::Mcp, "hub: failed to set listener non-blocking: {}",
+                    platform::last_socket_error_string());
+        platform::close_socket(server_fd_);
+        server_fd_ = platform::kInvalidSocket;
+        return false;
+    }
 
     running_.store(true);
     listener_thread_ = std::thread([this] { listener_loop(); });
@@ -535,23 +520,23 @@ void McpHubTransport::stop() {
     shutdown_all_ws_sessions();
 
     // Stop listener accept loop first.
-    int sfd = server_fd_;
-    if (sfd >= 0) {
-        ::shutdown(sfd, SHUT_RDWR);
+    platform::socket_t sfd = server_fd_;
+    if (platform::socket_valid(sfd)) {
+        platform::shutdown_both(sfd);
     }
 
     // Force all active client sockets out of recv()/poll() before joining.
-    std::vector<int> fds_to_shutdown;
+    std::vector<platform::socket_t> fds_to_shutdown;
     {
         std::lock_guard<std::mutex> lk(clients_mutex_);
         fds_to_shutdown.reserve(active_client_fds_.size());
-        for (int fd : active_client_fds_) {
+        for (platform::socket_t fd : active_client_fds_) {
             fds_to_shutdown.push_back(fd);
         }
     }
-    for (int fd : fds_to_shutdown) {
-        if (fd >= 0) {
-            ::shutdown(fd, SHUT_RDWR);
+    for (platform::socket_t fd : fds_to_shutdown) {
+        if (platform::socket_valid(fd)) {
+            platform::shutdown_both(fd);
         }
     }
 
@@ -559,9 +544,9 @@ void McpHubTransport::stop() {
         listener_thread_.get_id() != std::this_thread::get_id()) {
         listener_thread_.join();
     }
-    if (sfd >= 0) {
-        ::close(sfd);
-        server_fd_ = -1;
+    if (platform::socket_valid(sfd)) {
+        platform::close_socket(sfd);
+        server_fd_ = platform::kInvalidSocket;
     }
 
     // Stop reaper.
@@ -604,10 +589,10 @@ void McpHubTransport::stop() {
     }
 }
 
-void McpHubTransport::shutdown_fds(const std::vector<int>& fds) {
-    for (int fd : fds) {
-        if (fd >= 0) {
-            ::shutdown(fd, SHUT_RDWR);
+void McpHubTransport::shutdown_fds(const std::vector<platform::socket_t>& fds) {
+    for (platform::socket_t fd : fds) {
+        if (platform::socket_valid(fd)) {
+            platform::shutdown_both(fd);
         }
     }
 }
@@ -622,20 +607,19 @@ void McpHubTransport::shutdown_all_ws_sessions() {
 
 void McpHubTransport::listener_loop() {
     while (running_.load()) {
-        int sfd = server_fd_;
-        if (sfd < 0) break;
+        platform::socket_t sfd = server_fd_;
+        if (!platform::socket_valid(sfd)) break;
 
-        struct pollfd pfd{sfd, POLLIN, 0};
-        int ret = ::poll(&pfd, 1, 200);
+        int ret = platform::poll_one(sfd, platform::kPollIn, 200);
         if (ret <= 0) continue;
         if (!running_.load()) break;
 
         struct sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = ::accept(sfd,
+        platform::socklen_compat_t client_len = sizeof(client_addr);
+        platform::socket_t client_fd = ::accept(sfd,
                                  reinterpret_cast<struct sockaddr*>(&client_addr),
                                  &client_len);
-        if (client_fd < 0) continue;
+        if (!platform::socket_valid(client_fd)) continue;
 
         char ip_buf[INET_ADDRSTRLEN] = {};
         ::inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
@@ -656,7 +640,10 @@ void McpHubTransport::listener_loop() {
         client_threads_.emplace_back([this, client_fd, client_id, peer_is_loopback] {
             // Peek at first bytes to detect protocol
             char peek_buf[16] = {};
-            ssize_t peeked = ::recv(client_fd, peek_buf, sizeof(peek_buf) - 1, MSG_PEEK);
+            ssize_t peeked;
+            do {
+                peeked = ::recv(client_fd, peek_buf, sizeof(peek_buf) - 1, MSG_PEEK);
+            } while (peeked < 0 && platform::last_socket_error() == platform::kEIntr);
 
             if (peeked > 0 && strncmp(peek_buf, "WORKER/", 7) == 0) {
                 // Worker connection
@@ -670,20 +657,21 @@ void McpHubTransport::listener_loop() {
                 std::lock_guard<std::mutex> lk2(clients_mutex_);
                 active_client_fds_.erase(client_fd);
             }
-            ::close(client_fd);
+            platform::close_socket(client_fd);
         });
     }
 }
 
 // ─── HTTP handling (reuses McpHttpTransport protocol) ─────────────────────
 
-McpHubTransport::HttpRequest McpHubTransport::parse_http_request(int fd) {
+McpHubTransport::HttpRequest McpHubTransport::parse_http_request(platform::socket_t fd) {
     HttpRequest req;
     std::string raw;
     raw.reserve(4096);
     char buf[1024];
     while (true) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n < 0 && platform::last_socket_error() == platform::kEIntr) continue;
         if (n <= 0) return req;
         raw.append(buf, static_cast<size_t>(n));
         size_t hdr_end = raw.find("\r\n\r\n");
@@ -738,6 +726,7 @@ McpHubTransport::HttpRequest McpHubTransport::parse_http_request(int fd) {
                 size_t need = content_length - req.body.size();
                 size_t chunk = std::min(need, sizeof(buf));
                 ssize_t nb = ::recv(fd, buf, chunk, 0);
+                if (nb < 0 && platform::last_socket_error() == platform::kEIntr) continue;
                 if (nb <= 0) break;
                 req.body.append(buf, static_cast<size_t>(nb));
             }
@@ -748,7 +737,7 @@ McpHubTransport::HttpRequest McpHubTransport::parse_http_request(int fd) {
     }
 }
 
-bool McpHubTransport::send_all(int fd, std::string_view data) {
+bool McpHubTransport::send_all(platform::socket_t fd, std::string_view data) {
     return send_all_fd(fd, data);
 }
 
@@ -781,7 +770,7 @@ bool McpHubTransport::has_token_ci(std::string_view header_value, std::string_vi
     return false;
 }
 
-void McpHubTransport::send_http_response(int fd, int status,
+void McpHubTransport::send_http_response(platform::socket_t fd, int status,
                                          const std::string& content_type,
                                          const std::string& body,
                                          const std::string& extra_headers) {
@@ -864,7 +853,7 @@ json McpHubTransport::handle_ws_rpc(const std::string& bound_instance,
     }
 }
 
-void McpHubTransport::handle_websocket_client(int fd,
+void McpHubTransport::handle_websocket_client(platform::socket_t fd,
                                               const std::string& addr,
                                               bool peer_is_loopback,
                                               const HttpRequest& req) {
@@ -1054,8 +1043,9 @@ void McpHubTransport::handle_websocket_client(int fd,
 
         ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            int err = platform::last_socket_error();
+            if (err == platform::kEIntr) continue;
+            if (err == platform::kEAgain || err == platform::kEWouldBlock) continue;
             break;
         }
         if (n == 0) break;
@@ -1065,7 +1055,7 @@ void McpHubTransport::handle_websocket_client(int fd,
     LOG_INFO_M(log::Module::Mcp, "hub-ws {} disconnected from instance '{}'", addr, bound_instance);
 }
 
-void McpHubTransport::handle_http_client(int fd, const std::string& addr, bool peer_is_loopback) {
+void McpHubTransport::handle_http_client(platform::socket_t fd, const std::string& addr, bool peer_is_loopback) {
     auto req = parse_http_request(fd);
     if (!req.valid) return;
 
@@ -1165,10 +1155,13 @@ void McpHubTransport::handle_http_client(int fd, const std::string& addr, bool p
 
 // ─── Worker connection handling ───────────────────────────────────────────
 
-void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) {
+void McpHubTransport::handle_worker_connection(platform::socket_t fd, const std::string& addr) {
     // Read the "WORKER/1.0\n" greeting
     char greeting[64] = {};
-    ssize_t n = ::recv(fd, greeting, sizeof(greeting) - 1, 0);
+    ssize_t n;
+    do {
+        n = ::recv(fd, greeting, sizeof(greeting) - 1, 0);
+    } while (n < 0 && platform::last_socket_error() == platform::kEIntr);
     if (n <= 0) return;
 
     std::string greeting_str(greeting, n);
@@ -1202,6 +1195,7 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
             char buf[4096];
             while (line.find('\n') == std::string::npos) {
                 ssize_t r = ::recv(fd, buf, sizeof(buf), 0);
+                if (r < 0 && platform::last_socket_error() == platform::kEIntr) continue;
                 if (r <= 0) return;
                 line.append(buf, r);
                 if (line.size() > 65536) return;
@@ -1282,8 +1276,7 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
     std::string recv_buf;
     char buf[65536];
     while (running_.load()) {
-        struct pollfd pfd{fd, POLLIN, 0};
-        int ret = ::poll(&pfd, 1, 30000);  // 30s timeout
+        int ret = platform::poll_one(fd, platform::kPollIn, 30000);  // 30s timeout
         if (ret <= 0) {
             if (ret == 0) {
                 // Timeout — check if worker is still alive
@@ -1307,6 +1300,7 @@ void McpHubTransport::handle_worker_connection(int fd, const std::string& addr) 
         }
 
         ssize_t r = ::recv(fd, buf, sizeof(buf), 0);
+        if (r < 0 && platform::last_socket_error() == platform::kEIntr) continue;
         if (r <= 0) break;  // Connection closed
 
         recv_buf.append(buf, r);
@@ -1557,7 +1551,7 @@ void McpHubTransport::reap_stale_workers() {
 McpWorkerTransport::McpWorkerTransport(MessageHandler handler,
                                        const std::string& hub_host, uint16_t hub_port,
                                        const std::string& instance_id,
-                                       pid_t pid,
+                                       platform::pid_t_compat pid,
                                        const std::string& trace_file,
                                        const std::string& module_name)
     : handler_(std::move(handler)),
@@ -1570,45 +1564,57 @@ McpWorkerTransport::~McpWorkerTransport() {
 }
 
 bool McpWorkerTransport::connect_to_hub() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    platform::ensure_sockets_initialized();
+    platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!platform::socket_valid(fd)) return false;
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(hub_port_);
     if (::inet_pton(AF_INET, hub_host_.c_str(), &addr.sin_addr) <= 0) {
-        ::close(fd);
+        platform::close_socket(fd);
         return false;
     }
 
     // 5s connect timeout
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (!platform::set_nonblocking(fd)) {
+        LOG_ERROR_M(log::Module::Mcp, "worker: failed to set hub socket non-blocking: {}",
+                    platform::last_socket_error_string());
+        platform::close_socket(fd);
+        return false;
+    }
 
     int ret = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-    if (ret < 0 && errno != EINPROGRESS) {
-        ::close(fd);
+    if (ret < 0 && platform::last_socket_error() != platform::kEInProgress) {
+        platform::close_socket(fd);
         return false;
     }
 
     if (ret < 0) {
-        struct pollfd pfd{fd, POLLOUT, 0};
-        ret = ::poll(&pfd, 1, 5000);
+        ret = platform::poll_one(fd, platform::kPollOut, 5000);
         if (ret <= 0) {
-            ::close(fd);
+            platform::close_socket(fd);
             return false;
         }
         int err = 0;
-        socklen_t errlen = sizeof(err);
-        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+        platform::socklen_compat_t errlen = sizeof(err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errlen) != 0) {
+            LOG_WARN_M(log::Module::Mcp, "worker: getsockopt(SO_ERROR) failed: {}",
+                       platform::last_socket_error_string());
+            platform::close_socket(fd);
+            return false;
+        }
         if (err != 0) {
-            ::close(fd);
+            platform::close_socket(fd);
             return false;
         }
     }
 
     // Restore blocking mode
-    ::fcntl(fd, F_SETFL, flags);
+    if (!platform::set_blocking(fd)) {
+        LOG_WARN_M(log::Module::Mcp, "worker: failed to restore blocking mode: {}",
+                   platform::last_socket_error_string());
+    }
 
     // Keepalive
     int ka = 1;
@@ -1620,8 +1626,8 @@ bool McpWorkerTransport::connect_to_hub() {
 
 void McpWorkerTransport::register_with_hub() {
     // Send greeting without taking the send lock recursively.
-    const int fd = current_socket_fd();
-    if (fd < 0) {
+    const platform::socket_t fd = current_socket_fd();
+    if (!platform::socket_valid(fd)) {
         connected_.store(false);
         return;
     }
@@ -1629,7 +1635,7 @@ void McpWorkerTransport::register_with_hub() {
     std::string greeting = WORKER_PROTOCOL_GREETING;
     {
         std::lock_guard<std::mutex> lk(socket_mutex_);
-        if (sock_fd_ != fd || sock_fd_ < 0 || !send_all_fd(sock_fd_, greeting)) {
+        if (sock_fd_ != fd || !platform::socket_valid(sock_fd_) || !send_all_fd(sock_fd_, greeting)) {
             connected_.store(false);
             return;
         }
@@ -1717,18 +1723,18 @@ void McpWorkerTransport::request_loop() {
     char buf[65536];
 
     while (running_.load() && connected_.load()) {
-        const int fd = current_socket_fd();
-        if (fd < 0) {
+        const platform::socket_t fd = current_socket_fd();
+        if (!platform::socket_valid(fd)) {
             break;
         }
-        struct pollfd pfd{fd, POLLIN, 0};
-        int ret = ::poll(&pfd, 1, 30000);
+        int ret = platform::poll_one(fd, platform::kPollIn, 30000);
         if (ret <= 0) {
             if (ret == 0) continue;  // Timeout, loop again
             break;  // Error
         }
 
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n < 0 && platform::last_socket_error() == platform::kEIntr) continue;
         if (n <= 0) break;  // Connection closed
 
         recv_buf_.append(buf, n);
@@ -1803,7 +1809,7 @@ void McpWorkerTransport::send_heartbeat() {
 bool McpWorkerTransport::send_json(const json& msg) {
     std::string data = msg.dump() + "\n";
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd_ < 0) {
+    if (!platform::socket_valid(sock_fd_)) {
         return false;
     }
     return send_all_fd(sock_fd_, data);
@@ -1811,10 +1817,11 @@ bool McpWorkerTransport::send_json(const json& msg) {
 
 bool McpWorkerTransport::recv_line(std::string& line) {
     while (recv_buf_.find('\n') == std::string::npos) {
-        const int fd = current_socket_fd();
-        if (fd < 0) return false;
+        const platform::socket_t fd = current_socket_fd();
+        if (!platform::socket_valid(fd)) return false;
         char buf[4096];
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n < 0 && platform::last_socket_error() == platform::kEIntr) continue;
         if (n <= 0) return false;
         recv_buf_.append(buf, n);
         if (recv_buf_.size() > 65536) return false;
@@ -1825,29 +1832,29 @@ bool McpWorkerTransport::recv_line(std::string& line) {
     return true;
 }
 
-int McpWorkerTransport::current_socket_fd() const {
+platform::socket_t McpWorkerTransport::current_socket_fd() const {
     std::lock_guard<std::mutex> lk(socket_mutex_);
     return sock_fd_;
 }
 
-void McpWorkerTransport::install_socket(int fd) {
+void McpWorkerTransport::install_socket(platform::socket_t fd) {
     std::lock_guard<std::mutex> lk(socket_mutex_);
     sock_fd_ = fd;
 }
 
 void McpWorkerTransport::shutdown_connection() {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd_ >= 0) {
-        ::shutdown(sock_fd_, SHUT_RDWR);
+    if (platform::socket_valid(sock_fd_)) {
+        platform::shutdown_both(sock_fd_);
     }
 }
 
 void McpWorkerTransport::close_connection() {
     std::lock_guard<std::mutex> lk(socket_mutex_);
-    if (sock_fd_ >= 0) {
-        int fd = sock_fd_;
-        sock_fd_ = -1;
-        ::close(fd);
+    if (platform::socket_valid(sock_fd_)) {
+        platform::socket_t fd = sock_fd_;
+        sock_fd_ = platform::kInvalidSocket;
+        platform::close_socket(fd);
     }
     recv_buf_.clear();
 }

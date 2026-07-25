@@ -28,7 +28,7 @@ struct LoopResult;
 struct ThreadResult;
 
 // ─── Additional pass result types (Results panel) ──────────────────────────
-// These mirror the GUI's xxx_result_ pointers (see gui_app.h) so every
+// These mirror the TUI's xxx_result_ pointers (see tui_context.h) so every
 // catalog pass has somewhere to publish its result for TUI consumption.
 struct CFGResult;
 struct PatternResult;

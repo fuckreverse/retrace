@@ -40,8 +40,8 @@ open tenet-profile.trace
 ### 3. 附加到已运行进程
 
 ```bash
-# 先启动 tenet（例如 GUI 模式）
-./tenet trace.bin &
+# 先启动 tenet 后端（例如 TUI 或 WS 服务模式）
+./tenet --tui trace.bin &
 
 # 附加录制 30 秒
 xcrun xctrace record \
@@ -95,7 +95,6 @@ void MyPass::run(PassContext& ctx) {
 | `trace_reader.cpp` | `TraceReader::open` | trace 文件打开 |
 | `register_file.cpp` | （函数名） | 寄存器状态重建 |
 | `memory_model.cpp` | `MemoryModel::build` | 内存模型构建 |
-| `gui_app.mm` | `GuiApp::render_frame` | GUI 单帧渲染 |
 
 ## 典型分析场景
 
@@ -286,14 +285,14 @@ ctest -R perf --output-on-failure
 3. **`is_likely_pointer()` 快速过滤**：在调用 `read_region()` 前判断地址是否可能是有效 userspace 指针——过滤掉 `<0x1000`（小整数）、`>=0xFFFF000000000000`（内核地址）、top nibble 非 0/1（ObjC tagged pointer）。这些情况直接返回 nullopt，零 IO 开销。
 4. **增大 chunk size**（32→64 字节）：减少 `read_region()` 调用次数（selector 名平均 15-20 字符，一次 64B 读取通常一次完成）。
 
-### 成功案例：ankerl::unordered_dense 全量迁移（function -26%，symbol_annotation -42%）
+### 成功案例：ankerl::unordered_dense 全量迁移（function -26%，AnnotationView 前身 -42%）
 
-**问题**：`function_pass` 和 `symbol_annotation_pass` 的热路径中大量使用 `std::unordered_map/set`，其链式哈希实现每次查找涉及指针追踪，cache miss 率高。
+**问题**：`function_pass` 和 `AnnotationView` 的前身（当时还是独立的 `symbol_annotation` pass）热路径中大量使用 `std::unordered_map/set`，其链式哈希实现每次查找涉及指针追踪，cache miss 率高。
 
 **分析**：
 
 - **`function_pass`**：`FunctionResult::call_stack_at()` 和内部 `CallEvent` 按 inst_id 索引的 map（`std::unordered_map`），在 327ms 的 pass 里被百万次查询。
-- **`symbol_annotation_pass`**：`AnnotationResult::by_pc` 和 `by_inst_id` 为 `std::unordered_map<uint64_t, vector<Annotation>>`，每次 GUI 渲染或 CLI 输出都密集查询。
+- **`AnnotationView` 前身**：当时独立 pass 的 `AnnotationResult::by_pc` 和 `by_inst_id` 为 `std::unordered_map<uint64_t, vector<Annotation>>`；该能力现已降级为 `annotation_view.h` 中的轻量 helper，当前 `AnnotationView` 仍保留这两张按需构建的索引。
 - **`string_pass`**（`StringCollector`）：`bytes_` 和 `addr_first_inst_` 是每条 MEM 事件都写入的热路径 map，`std::unordered_map` 内存碎片化导致高 cache miss。
 - **根因**：`std::unordered_map` 使用链式哈希（bucket array + linked list），元素分散在堆各处，连续 `find()` 操作对 L1/L2 cache 不友好。`ankerl::unordered_dense` 采用开放寻址 + Robin Hood 哈希，所有元素紧凑存储在单一连续数组，查找路径局部性极佳。
 
@@ -307,7 +306,7 @@ ctest -R perf --output-on-failure
 | `string_pass.cpp` | `bytes_`、`addr_first_inst_`（StringCollector 热路径） |
 | `memory_string_pass.h` | `by_addr`、`by_call_site`、`unique_hashes` |
 | `memory_snapshot_pass.h` | `by_inst_id` |
-| `symbol_annotation_pass.h` | `by_pc`、`by_inst_id` |
+| `annotation_view.h`（原独立的 `symbol_annotation` pass） | `by_pc`、`by_inst_id` |
 | `objc_pass.h` | `classes`、`by_pc` |
 | `objc_crypto_pass.h` | `by_selector`、`by_class` |
 | `syscall_intercept_pass.h` | `by_callee`、`by_category`、`api_by_name_` |
@@ -322,7 +321,7 @@ ctest -R perf --output-on-failure
 | Pass | 优化前 | 优化后 | 变化 |
 |---|---:|---:|---|
 | `function_pass` | 427.8 ms | 318.0 ms | **-26%** |
-| `symbol_annotation_pass`（后续已降级为 `AnnotationView` helper） | 838.0 ms | 484.7 ms | **-42%** |
+| `symbol_annotation`（历史名称；现为 `AnnotationView` helper） | 838.0 ms | 484.7 ms | **-42%** |
 | `xref_pass` | 20.3 ms | 18.5 ms | -9% |
 | `taint_pass` | 10382.3 ms | 10156.1 ms | -2% |
 
@@ -347,7 +346,7 @@ ninja -j$(nproc) test_pass_objc test_pass_objc_crypto
 
 #### 2. 无头模式（CLI）端到端计时
 
-tenet 的 CLI 分析模式就是无头模式——传入分析参数（如 `--objc`、`--taint`、`--pattern` 等）时直接走 `batch_analysis` 路径，不启动 GUI/TUI，输出 JSON 到 stdout 后退出。这是测量单个 Pass 真实端到端耗时的标准方式：
+tenet 的 CLI 分析模式就是无头模式——传入分析参数（如 `--objc`、`--taint`、`--pattern` 等）时直接走 `batch_analysis` 路径，不启动 TUI 或任何服务，输出 JSON 到 stdout 后退出。这是测量单个 Pass 真实端到端耗时的标准方式：
 
 ```bash
 cd tools/tenet/build
@@ -403,7 +402,7 @@ done
 cd tools/tenet/build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -j$(nproc)
 
-# 无头模式 + Time Profiler（只测 pass 执行，不含 GUI 开销）
+# 无头模式 + Time Profiler（只测 pass 执行，不含 TUI、RPC/MCP/WS 服务开销）
 xcrun xctrace record --template 'Time Profiler' \
     --output objc-opt.trace \
     --launch -- ./tenet --objc /path/to/trace.bin
@@ -453,15 +452,15 @@ ninja -j$(nproc) tenet
 | `taint_source_annotation_pass` | 主结果表 |
 | `loop_pass`、`cfg_pass`、`xref_pass` | 块 / PC / xref 索引 |
 
-**可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_hashes`、`by_addr`）、`disassembly_pass`（`pc_table`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
+**可推广的 Pass**：`string_pass`（`addr_to_index`，`std::unordered_map`）、`memory_string_pass`（`unique_hashes`、`by_addr`）、`thread_pass`（call map）、`syscall_intercept_pass`（各统计表）。
 
 ---
 
-### 2. RocksDB Blob 持久化缓存（全量 Pass Cache）
+### 2. 基于文件的 Pass 结果持久化缓存（全量 Pass Cache）
 
-**原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records）写入 RocksDB。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
+**原理**：首次全量扫描后，将结果序列化为自定义紧凑二进制格式（magic + version + fixed-size records），写入 `<index_dir>/pass_cache/<pass_name>.bin` 独立缓存文件，而不是 RocksDB KV / column family。后续运行直接反序列化跳过所有计算，将"分钟级"变为"毫秒级"。比 JSON/Protobuf 序列化快 5-10×，体积更小。
 
-**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `xref`、`function`、`cfg`、`cfg_layout`、`call_graph`、`taint`、`backward_taint`、`string`、`memory_string`、`memory_snapshot`、`disassembly`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`window_stats`、`dataflow_graph`、`thread`、`syscall_intercept`、`trace_fold`。（`index_build` 不是 PassManager 里的 pass，是 `--index-build` 单独触发的索引构建/重建选项，见 [`analysis-layer.md`](analysis-layer.md)。）
+**已用 Pass**：几乎所有需要全量遍历的 Pass，包括 `xref`、`function`、`cfg`、`cfg_layout`、`call_graph`、`taint`、`backward_taint`、`strings`、`memory_strings`、`memory_snapshot`、`pattern`（内嵌 constant materialization）、`algorithm_summary`、`objc`、`objc_crypto`、`window_stats`、`dataflow_graph`、`thread`、`syscall_intercept`、`trace_fold`。（`index_build` 不是 PassManager 里的 pass，是 `--index-build` 单独触发的索引构建/重建选项，见 [`analysis-layer.md`](analysis-layer.md)。）
 
 **关键设计变体**：`memory_string`、`memory_snapshot`、`window_stats`、`trace_fold` 额外实现了**参数感知缓存**——只有当前参数与默认参数完全相同时才读写缓存，避免配置不匹配导致复用错误结果（`trace_fold` 覆盖 `min_iterations_to_fold`/`keep_iterations`/`include_reg_summary`/`include_fpr_summary`/`pattern_sample_points` 全部字段）；`cfg_layout`、`dataflow_graph` 仅在 `ctx.range().is_full_trace()`（全量扫描）时读写缓存，区间/增量扫描不受影响。
 
@@ -489,15 +488,13 @@ ninja -j$(nproc) tenet
 
 ### 4. Scan Fusion：多 Collector 单次遍历
 
-**原理**：`TraceScanEngine` 单次遍历 trace，将每条记录广播给所有注册的 `TraceCollector`。11+ 个扫描型 Pass 共享一次 IO 遍历，替代各自独立扫描。`pattern_pass` 的 `PatternCollector` 现已内嵌 movz+movk 常量物化追踪（原独立的 `constant_materialization_pass` 已合并），在同一次扫描中顺带完成，进一步减少了 trace I/O。
+**原理**：`TraceScanEngine` 单次遍历 trace，将每条记录广播给所有注册的 `TraceCollector`。当前 8 个扫描型 Pass 共享一次 IO 遍历，替代各自独立扫描。`pattern_pass` 的 `PatternCollector` 现已内嵌 movz+movk 常量物化追踪（原独立的 `constant_materialization_pass` 已合并），在同一次扫描中顺带完成，进一步减少了 trace I/O。
 
-**已用 Pass**：`xref`、`disassembly`、`cfg`、`function`、`string`、`thread`、`objc`、`pattern`（内嵌 constant materialization）、`window_stats`、`syscall_intercept`（通过 `prepare_scan()`/`finish_scan()` 接口参与）。
+**已用 Pass**：`thread`、`cfg`、`pattern`（内嵌 constant materialization）、`function`、`memory_strings`、`strings`、`syscall_intercept`、`window_stats`（覆写 `has_scan()` 与 `declare_scan()` 参与，随后在 `run()` 中读取 collector 结果）。
 
 **可推广的 Pass**：
 
 - `entropy_pass` + `memory_string_pass` 可共享同一次内存区域扫描。
-- `reg_timeline_pass` + `disassembly_pass` 可合并（都需要全量指令遍历）。
-- `string_pass` + `symbol_annotation_pass` 可合并（都扫内存读写事件）。
 
 ---
 
@@ -554,7 +551,6 @@ ninja -j$(nproc) tenet
 | `thread_filter_pass` | **Roaring64Map**（roaring bitmap）存储线程指令 ID 集合，`contains()` O(1)，内存远小于 `unordered_set<uint64_t>` |
 | `memory_snapshot_pass` | `known` 标志位向量序列化时 bit-packing（每字节存 8 个 boolean），压缩比 8:1 |
 | `xref_pass` | PC→inst_id 倒排用 `Roaring64Map` bitmap |
-| `slice_pass` | 64-bit bitmask 标记 active 寄存器集合 |
 | `taint_source_annotation_pass` | `__builtin_ctzll` 迭代寄存器 bitmask |
 
 **可推广的 Pass**：
@@ -670,9 +666,9 @@ ninja -j$(nproc) tenet
 
 **经分析，GPU offload 在当前架构下不可行，不建议投入。** 原因如下：
 
-- **尚未实现**：`src/` 下没有任何 `.metal` 文件或 Metal Compute API 调用，属于未验证的假设。
+- **尚未实现**：后端没有任何 GPU Compute API 调用，属于未验证的假设；Tauri 前端的渲染路径不在本文讨论范围。
 - **真正瓶颈不在计算**：`yara_mem_scan` 和 `entropy` 均不是高耗时 Pass（未进 Top-5）；每页 `read_region()` 是 RocksDB I/O，GPU 无法加速数据库读取。
-- **小数据量 + kernel launch overhead 倒挂**：单页 4KB，Metal kernel launch 延迟约 50-200μs，而 CPU 处理同等数据只需 < 1μs；overhead 远超计算本身。
+- **小数据量 + kernel launch overhead 倒挂**：单页仅 4KB，GPU kernel 的启动与数据传输开销会超过 CPU 处理同等数据的成本。
 - **YARA 不可 GPU 化**：Aho-Corasick 是分支密集型状态机，在 GPU warp 上存在严重的 warp divergence，实际性能可能劣于 CPU。
 - **架构不配合**：最大瓶颈 `taint_pass`（占总时间 87%）是强顺序依赖的数据流传播，是 GPU 的天然死穴。
 

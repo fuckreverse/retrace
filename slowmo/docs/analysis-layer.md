@@ -5,7 +5,7 @@ Analysis 层把 IO / Core 提供的底层能力组织成可组合的分析 pass�
 - 如何声明依赖
 - 如何避免重复扫描 trace
 - 如何把结果缓存成可复用中间产物
-- 如何让 GUI / CLI / MCP 共用同一套分析实现
+- 如何让 TUI / CLI / RPC / MCP / WS 共用同一套分析实现
 
 ## 核心对象
 
@@ -39,14 +39,14 @@ pass 通过 `PassContext::scan_orchestrator()`、`page_stats()`、`string_resolv
 
 ```mermaid
 flowchart TD
-    A[请求某个能力\nGUI / CLI / MCP] --> B[PassManager::require(name)]
+    A[请求某个能力\nTUI / CLI / RPC / MCP / WS] --> B["PassManager::require(name)"]
     B --> C{是否已缓存?}
-    C -- yes --> D[返回 PassResult]
-    C -- no --> E[递归注册/执行依赖]
-    E --> F{扫描型 pass\nhas_scan() == true?}
-    F -- yes --> G[declare_scan → ScanOrchestrator\n单次扫描服务所有 collector]
-    F -- no --> H[直接调用 pass.run(ctx)]
-    G --> I[run() 中读取 collector 结果]
+    C -->|yes| D[返回 PassResult]
+    C -->|no| E[递归注册/执行依赖]
+    E --> F{"扫描型 pass\nhas_scan() == true?"}
+    F -->|yes| G[declare_scan → ScanOrchestrator\n单次扫描服务所有 collector]
+    F -->|no| H["直接调用 pass.run(ctx)"]
+    G --> I["run() 中读取 collector 结果"]
     H --> I
     I --> J[缓存到 PassEntry]
     J --> D
@@ -60,7 +60,7 @@ flowchart TD
 - 如果没有，则按 `dependencies()` 递归要求上游 pass。
 - 用原子状态机避免重复执行。
 - **对于 `has_scan() == true` 的 pass**：如果尚未扫描，创建临时 `ScanOrchestrator`，调用 `declare_scan()` 注册 collector，然后执行单次扫描。`run()` 中直接读取 collector 结果。
-- 适合 GUI 点一下某面板、CLI 只跑一个能力、MCP 单次调用等按需分析场景。
+- 适合 TUI 交互、CLI 只跑一个能力、RPC/MCP/WS 单次调用等按需分析场景。
 
 ### `run_all(num_threads)`
 
@@ -131,7 +131,7 @@ Collector 可按记录类型覆写回调：
 
 当前 `pass_catalog()` 注册了 **30 个 pass**，分成 7 类。
 
-> `index_build` 已不是独立 pass（`--index-build` 是 CLI 里单独触发索引构建/重建的选项，不经过 PassManager）；`slice`、`producer_chain` 已被 `backward_taint` 取代并从 catalog 中移除——GUI 里保留的 `run_producer_chain()` 只是 `BackwardTaintPass` 的一个受限步数封装（quick preview），不再是独立 pass 或 MCP 工具。
+> `index_build` 已不是独立 pass（`--index-build` 是 CLI 里单独触发索引构建/重建的选项，不经过 PassManager）；`slice`、`producer_chain` 已被 `backward_taint` 取代并从 catalog 中移除，不再是独立 pass 或 MCP 工具。
 
 ### 1. Structure
 
@@ -216,11 +216,11 @@ Collector 可按记录类型覆写回调：
 | `thread` | 线程时间线与切换统计 |
 | `thread_filter` | 构建每线程 inst bitmap，用于过滤 |
 
-## Pass 详解与面板使用
+## Pass 详解与使用入口
 
-以下按分类逐一说明每个 pass 的作用、CLI 入口、MCP 工具、GUI 面板用法与 TUI 对应。
+以下按分类逐一说明每个 pass 的作用、CLI 入口、MCP 工具与 TUI 对应。Tauri 前端（`tools/tenet/web/`）通过 WS 或 MCP 服务消费同一套后端结果，具体页面组织由前端实现决定。
 
-> **约定**：CLI 指令以 `./tenet trace.bin <option>` 为前缀；MCP 工具名用 `mono` 格式；GUI 面板标题用引号标注；TUI 统一在 Results 面板（`A` 键呼出）中浏览。
+> **约定**：CLI 指令以 `./tenet trace.bin <option>` 为前缀；MCP 工具名用 `mono` 格式；TUI 统一在 Results 面板（`A` 键呼出）中浏览。
 
 ### Structure 类
 
@@ -230,9 +230,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--symbol-annotation`（间接）；`--run-pass function`
 **MCP**：`functions`、`find_function`
-**GUI 面板**：`"Call Stack"` + `"Functions"`（`panels_callstack_funcs.cpp`）
-- **Call Stack**：显示当前指令的调用栈帧列表。`Follow Call (e)` 步入被调函数，`Follow Return (F)` 步出。单击帧跳转到调用点，双击跳转到函数入口。右键菜单支持 Jump to Call Site / Function Entry / Run Xref。
-- **Functions**：函数表，三列（Name / Calls / Insts），支持文本筛选、点击表头排序。底部可折叠 Call Graph Info 子视图显示当前函数的 callers/callees。`Run Call Graph` 按钮一键启动调用图分析。行点击跳转，右键菜单支持 Jump to Invocation / Copy Name / Copy Address / Run Xref。
 **TUI**：Callstack 面板（`P` 键切换）、Functions 面板（`L` 键切换，`/` 筛选，`s` 切换排序模式：调用次数/名称/地址）
 
 ---
@@ -243,7 +240,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--run-pass xref`
 **MCP**：`xref`
-**GUI**：无独立面板；通过指令面板右键 `Jump to XRef` 和 Functions 面板右键 `Run Xref` 使用。
 **TUI**：`x` / `X` 键在 XRef 之间前进/后退导航。
 
 ---
@@ -254,21 +250,15 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--export-cfg <output.dot>`（导出 Graphviz DOT）
 **MCP**：`cfg_export`
-**GUI 面板**：`"CFG"`（`panels_cfg.cpp`）
-- 交互式 CFG 图视图。节点为基本块，边为控制流转移（含热度着色）。
-- 支持按函数提取子图：在 Functions 面板选中函数后，CFG 面板自动重建该函数的控制流图。
-- 支持缩放、平移、点击节点跳转到对应指令。
-- 大型 CFG（>2000 块）使用简化布局以保持流畅。
 **TUI**：Results 面板中 `cfg` 条目的详情视图列出所有基本块（地址 / 指令数 / 执行次数 / 终结指令类型）。
 
 ---
 
 #### `cfg_layout` — CFG 布局
 
-**作用**：为 CFG 生成 2D 布局坐标，供可视化渲染使用。依赖 `cfg`。通常由 GUI 自动触发，无需用户手动运行。
+**作用**：为 CFG 生成 2D 布局坐标，供 DOT 导出或 Tauri 前端可视化使用。依赖 `cfg`，通常由消费方按需触发，无需用户手动运行。
 
 **CLI**：无独立入口（由 `--export-cfg` 内部使用）
-**GUI**：CFG 面板内部自动调用，用户无需直接操作。
 **TUI**：不适用（终端无图布局需求）。
 
 ---
@@ -279,10 +269,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--call-graph <output.dot>`（导出 Graphviz DOT 或 JSON）
 **MCP**：`call_graph`
-**GUI 面板**：`"Call Graph"`（`panels_call_graph.cpp`）
-- 两种视图：**Hot Callees**（Top-50 最常调用函数 + 调用次数进度条）和 **Edges**（每条 caller→callee 边 + 调用次数 + 调用点 inst_id）。
-- 行点击跳转到函数入口或调用点（依赖 xref 解析 PC→inst_id）。
-- 顶部摘要显示节点数、边数、最大调用深度。
 **TUI**：Results 面板中 `call_graph` 条目的详情视图列出所有节点（按接收调用数排序，显示入度/出度）。
 
 ---
@@ -293,7 +279,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--run-pass loop`；`--symbol-annotation`（间接）
 **MCP**：`loops`
-**GUI**：无独立面板；结果通过 `"Loop Semantics"` 面板和 `"Trace Fold"` 面板间接消费。
 **TUI**：`O` 键运行循环分析；Results 面板中 `loop` 条目提供循环列表浏览。
 
 ---
@@ -306,14 +291,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--vm-abstract --vm-hints <file.json>`；或 `--vm-abstract --vm-dispatcher <pc> --vm-indirect-br <pc> --vm-handler <pc>`
 **MCP**：`vm_abstract`
-**GUI 面板**：`"VM Abstract"` / `"VM Workspace"`（`panels_vm_abstract.cpp`）
-- 独立悬浮工作区，三栏布局：
-  - **左栏 VM Handlers**：handler 列表（按频率或 PC 排序），支持文本筛选。点击跳转到该 handler 的首次分发。
-  - **中栏 VM Steps**：字节码 trace（每条 VM 指令一行），显示解码后的 opcode、VM-PC、handler 标签。支持 Linked 模式——点击 VM step 同步导航到对应的 native 指令。
-  - **中栏底部 Bytecode/Stats**：原始字节码十六进制 + 统计信息（总 VM 步数、handler 分布等）。
-  - **右栏 VM Registers**：VM 寄存器文件 / 操作数栈快照。
-  - **右栏底部 VM Memory**：VM 内存 / context 字段值。
-- dispatcher 类型标签（WhileSwitch / IndirectBranch / CallTable / ThreadedCode / Trampoline / FetchOnly）仅用于显示，不影响执行路径。
 **TUI**：Results 面板中 `vm_abstract` 条目显示 dispatcher 信息 + handler 表（按频率排序）。
 
 ---
@@ -326,7 +303,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--taint <reg_idx> [--taint-inst <inst_id>] [--taint-stop-pc <pc>]`
 **MCP**：`taint_forward`
-**GUI**：无独立面板；通过指令面板右键 `Taint from Here` 触发，结果在指令列表中以高亮显示被污点的指令。`[` / `]` 在污点指令间跳转。
 **TUI**：`t` 键运行前向污点分析；`[` / `]` 在污点指令间跳转。
 
 ---
@@ -337,7 +313,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--backward-taint <inst_id> <reg_idx> [--backward-taint-graph <output.json>]`
 **MCP**：`taint_backward`
-**GUI**：无独立面板；通过指令面板右键 `Backward Taint` 触发。GUI 的 `Producer Chain` 快捷入口是此 pass 的受限步数预览模式。
 **TUI**：`B` 键运行反向污点分析。
 
 ---
@@ -348,10 +323,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--taint-source-annotation`
 **MCP**：无独立工具（结果内嵌在 `taint_backward` 输出中）
-**GUI 面板**：`"Taint Sources"`（`panels_taint_source_annotation.cpp`）
-- 显示反向污点链叶端来源表：序号 / Kind（ObjC Getter / ObjC Arg / ObjC Return / Memory Load / Constant / Fn Return，颜色+图标编码）/ Sink Reg / PC / Summary（来源摘要）。
-- 视图模式切换：All / ObjC / Memory / Constant / Fn Return。
-- 文本筛选（按 label/summary）。行双击跳转到对应指令。
 **TUI**：Results 面板中 `taint_source_annotation` 条目显示来源摘要列表。
 
 ---
@@ -364,9 +335,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--pattern`；`--constants`（仅常量）
 **MCP**：`pattern_scan`、`constants_scan`
-**GUI 面板**：`"Patterns"`（`panels_pattern.cpp`）+ `"Constants"`（`panels_constant.cpp`）
-- **Patterns 面板**：模式匹配表，按类别分组（Crypto / AntiDebug / AntiTamper / Obfuscation / Networking / KeySchedule，颜色编码）。每行显示置信度（High/Med/Low）、模式名、anchor PC、指令范围。支持文本筛选（按名称或描述）。行点击跳转，悬停显示详情 tooltip。
-- **Constants 面板**：常量构建序列表（movz+movk）：inst_id / Value（64位十六进制）/ Reg / Parts（指令数）/ Match（匹配的已知算法常量，如 SHA-256:init_0、AES:RoundKey）。视图模式切换 All/Identified Only，文本筛选按算法名或常量名。右键菜单支持 Jump to Instructions / Copy Value / Copy PC。
 **TUI**：Results 面板中 `pattern` 条目显示所有匹配 + 已识别常量。
 
 ---
@@ -377,9 +345,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--loop-semantics`
 **MCP**：`loop_semantics`
-**GUI 面板**：`"Loop Semantics"`（`panels_loop_semantics.cpp`）
-- 循环语义分类表：PC / Kind（颜色编码）/ Iters / Confidence（进度条，绿/黄/灰）/ Features（彩色徽章：S=S-box, X=XOR, R=Rotate, A=Add, M=Mod）。
-- 行点击跳转到 `sample_iter_start`。悬停 tooltip 显示描述、活跃寄存器、body 指令数、采样范围。右键菜单 Jump to Instructions / Copy PC。
 **TUI**：Results 面板中 `loop_semantics` 条目显示循环 header 地址、类型、置信度、迭代次数。
 
 ---
@@ -390,10 +355,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--algorithm-summary`
 **MCP**：`algorithm_summary`
-**GUI 面板**：`"Algorithm Summary"`（`panels_algorithm_summary.cpp`）
-- 两种视图：**Candidates**（候选表：排名 / 算法名 / 置信度进度条 / 证据列表）和 **Summary Text**（完整 Markdown 摘要）。
-- 顶部显示候选总数（区分 confirmed / speculative），含 CRYPTO 警告标识。
-- 行点击跳转到估算的算法起始指令。
 **TUI**：Results 面板中 `algorithm_summary` 条目显示候选列表（算法名 / 置信度 / speculative 标记 / 证据）。
 
 ---
@@ -404,9 +365,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--objc-crypto`
 **MCP**：`objc_crypto`（间接，通过 `objc_messages` + `pattern_scan` 组合）
-**GUI 面板**：`"ObjC Crypto"`（`panels_objc_crypto.cpp`）
-- 关联表：序号 / Pattern（模式名 + 分类颜色标签）/ Confidence / ObjC Chain（可展开树节点显示调用栈每帧的 [class selector]，最内层绿色高亮，无 ObjC 上下文显示 "(bare)"）。
-- 视图模式切换：All / In ObjC / Bare。文本筛选按模式名或 ObjC 链摘要。行双击跳转。
 **TUI**：Results 面板中 `objc_crypto` 条目显示关联摘要。
 
 ---
@@ -419,7 +377,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--strings`
 **MCP**：`strings_scan`
-**GUI 面板**：`"Strings"`（`panels_memory_strings.cpp` 的一个视图模式）——与 Memory Strings 共用面板。
 **TUI**：Strings 面板（`I` 键切换，`/` 筛选，Enter 跳转到发现指令）
 
 ---
@@ -430,9 +387,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--memory-strings`
 **MCP**：`memory_strings`
-**GUI 面板**：`"Memory Strings"`（`panels_memory_strings.cpp`）
-- 时间感知字符串发现表：discovered_at inst_id / Content（黄色字符串）/ Source（Reg/Stack/Deep/Page + 寄存器名）/ Addr / PC（call_site_pc）。
-- 视图模式切换：All / RegPointer / StackLocal。文本筛选按内容子串。行点击跳转。悬停显示完整内容、地址、编码、来源。右键菜单 Jump to Instructions / Copy String Content / Copy Address。
 **TUI**：Results 面板中 `memory_strings` 条目显示字符串列表（地址 / call site / 内容）。
 
 ---
@@ -443,10 +397,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--memory-snapshot <inst_id> [--memory-snapshot-size <bytes>]`
 **MCP**：`memory_snapshot`
-**GUI 面板**：`"Memory Snapshots"`（`panels_memory_snapshot.cpp`）
-- 分栏布局：左侧快照列表（序号 + 地址 + inst_id + 标签），右侧 xxd 风格 hex dump（已知字节正常显示，未知字节 `??` 替代，右侧 ASCII 列）。
-- 参数表单：inst_id 输入（逗号分隔多个）、Bytes per snapshot 大小、"Auto-snapshot at BL/BLR calls" 复选框。
-- "Jump to inst" 导航按钮。已知字节比例统计。
 **TUI**：Results 面板中 `memory_snapshot` 条目显示快照列表（地址 / inst_id / 大小 / 标签）。
 
 ---
@@ -457,10 +407,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--mem-search <hex_pattern> [--mem-search-value <hex_value>] [--mem-search-range <start> <end>]`
 **MCP**：`mem_search`
-**GUI 面板**：`"Memory Search"`（`panels_mem_search.cpp`）
-- 参数表单：字节模式输入（支持 `??` 通配符）+ 标签；精确值输入（十六进制，支持 32 位截断匹配）；搜索范围复选框（Memory writes / Register values / Immediates）。
-- 结果表：inst# / PC / Source（Mem/Reg/Imm，颜色编码）/ Addr / Offset / Value（精确匹配黄色高亮，模式匹配显示 pat#N）。
-- 视图模式切换：All / MemWrite / RegDiff / Immediate。行点击跳转。
 **TUI**：Results 面板中 `mem_search` 条目显示匹配列表（source 类型 / inst_id / pc / addr / value）。
 
 ---
@@ -469,14 +415,8 @@ Collector 可按记录类型覆写回调：
 
 **作用**：对指定内存区域做 Shannon 熵分析，判断是明文（<3.5）、压缩数据（3.5-6.5）、加密数据/密钥材料（>6.5）。
 
-**CLI**：`--entropy <addr_hex> <size>`（地址为十六进制，大小为字节数，语义对齐 `EntropyConfig::addr`/`size`，与 GUI Entropy 面板的地址/大小输入一致）。可选 `--entropy-at <inst_id>` 指定采样点（默认 0 = trace 末尾）；`--entropy-timeline` 额外计算熵值时间线。
+**CLI**：`--entropy <addr_hex> <size>`（地址为十六进制，大小为字节数，语义对齐 `EntropyConfig::addr`/`size`）。可选 `--entropy-at <inst_id>` 指定采样点（默认 0 = trace 末尾）；`--entropy-timeline` 额外计算熵值时间线。
 **MCP**：`entropy_analysis`
-**GUI 面板**：`"Entropy"`（`panels_entropy.cpp`）
-- 总体熵值 + 分类（Plaintext/Compressed/Encrypted/KeyMaterial，颜色编码）。
-- 分块熵表：Offset / Size / Entropy / 彩色进度条。
-- 熵转变点列表（inst_id + 熵变化量，可点击导航）。
-- 可选时间线曲线图（PlotLines，悬停显示采样点信息）。
-- 参数表单：地址输入（含 "From Mem" 快捷按钮从当前内存面板填充）、大小输入、Compute Timeline 复选框。
 **TUI**：Results 面板中 `entropy` 条目显示总体熵、分类、分块熵、转变点（转变点可跳转）。
 
 ---
@@ -487,10 +427,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--yara-mem-scan [--yara-rules <file_or_dir>] [--yara-min-entropy <n>] [--yara-scan-code]`；`--yara-rules` 可重复
 **MCP**：无独立工具（通过 `pattern_scan` 覆盖部分功能）
-**GUI 面板**：`"YARA Memory Scan"`（`panels_yara_mem_scan.cpp`）
-- 参数表单：YARA rules 目录路径输入框。
-- 匹配列表：规则名 / 类别（颜色编码）/ 置信度 / 地址 / inst_id / 描述。
-- 类别筛选与行点击跳转。自动扫描所有内存页。
 **TUI**：Results 面板中 `yara_mem_scan` 条目显示匹配列表（规则名 / 地址 / inst_id / 描述）。
 
 ---
@@ -503,9 +439,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--objc [--objc-class <class_name>]`
 **MCP**：`objc_messages`
-**GUI 面板**：`"ObjC Messages"`（`panels_objc.cpp`）
-- 两种视图：**Messages**（消息表：class / selector / arguments / return value / inst_id，支持 class 和 selector 双筛选框）和 **Classes**（每类摘要：消息数 + 唯一 selector 数）。
-- 顶部显示消息总数和类数。行点击跳转到对应指令。
 **TUI**：Results 面板中 `objc` 条目显示消息列表（class / selector / return value / inst_id）。
 
 ---
@@ -516,10 +449,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--syscall-intercept`
 **MCP**：`syscall_intercept`
-**GUI 面板**：`"API Intercepts"` / `"Syscalls"`（`panels_syscall_intercept.cpp`）
-- 两种视图：**All**（所有拦截调用）和 **Crypto Only**（仅 CommonCrypto/SecurityFramework/CryptoKit/BoringSSL）。
-- 拦截调用表：API 名 / 类别标签（颜色编码：CC/Sec/CKit/SSL/JNI/MemOps 等）/ Summary（解码后的参数和返回值）/ Key Bytes（提取的密钥字节）/ ObjC 上下文。
-- 文本筛选，行点击跳转。
 **TUI**：Results 面板中 `syscall_intercept` 条目显示拦截调用列表（API 名 / 类别 / inst_id / 解码参数）。
 
 ---
@@ -532,10 +461,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：当前 parser 要求 `--trace-fold <reserved_start> <reserved_end>`，但两个范围值尚未接入执行，实际仍处理完整 trace；可配且会生效的参数为 `--trace-fold-min-iter` / `--trace-fold-keep-iter` / `--trace-fold-samples` / `--trace-fold-no-fpr`。
 **MCP**：无独立工具
-**GUI 面板**：`"Trace Fold"`（`panels_trace_fold.cpp`）
-- 顶部摘要：原始指令数 → 折叠后指令数（压缩比 ×N）+ 折叠区域数。
-- 折叠区域表：PC / 迭代次数 / body 大小 / 移除指令数 / 寄存器变化摘要（Monotonic/Oscillating/Constant 标签）。
-- 行点击跳转到折叠区域首条指令。
 **TUI**：Results 面板中 `trace_fold` 条目显示压缩统计摘要。
 
 ---
@@ -546,11 +471,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--reg-timeline <reg_idx> [--reg-timeline-range <start> <end>]`
 **MCP**：`reg_timeline`
-**GUI 面板**：`"Register Timeline"`（`panels_reg_timeline.cpp`）
-- 寄存器选择下拉框（x0-x28, fp, lr, sp, nzcv）。
-- Sparkline 图：寄存器值随 inst_id 变化的折线图，悬停显示采样点详情（inst_id / value）。
-- 写入事件表：inst_id / PC / 旧值 → 新值。行点击跳转。
-- Producer Chain 子视图：使用 BackwardTaintPass 追踪当前指令指定寄存器的生产者链。
 **TUI**：Results 面板中 `reg_timeline` 条目显示写入事件列表（inst_id / pc / reg / old → new）。
 
 ---
@@ -561,10 +481,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--call-context <inst_id>`
 **MCP**：`call_context`
-**GUI 面板**：`"Call Context"`（`panels_call_context.cpp`）
-- 参数表单：目标 inst_id 输入框（支持 16 进制/十进制，"Cursor" 按钮填充当前光标位置）、Before/After 上下文窗口大小。
-- 三部分结果：周围指令列表（目标指令 `>>>` 高亮）、调用栈重建（帧地址 + 尾调用标记）、循环上下文（header PC / 嵌套深度 / 迭代次数）。
-- 所有指令行和调用栈帧均可点击跳转。
 **TUI**：Results 面板中 `call_context` 条目显示上下文信息（目标 / 栈帧 / 反汇编指令）。
 
 ---
@@ -575,10 +491,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：当前 parser 要求 `--window-stats <reserved_start> <reserved_end> [--window-stats-size <n>]`，但两个范围值尚未接入执行，实际仍统计完整 trace；只有 `--window-stats-size` 生效。
 **MCP**：`window_stats`
-**GUI 面板**：`"Window Stats"`（`panels_window_stats.cpp`）
-- 统计表：序号 / Range（inst 起止）/ Insts / Entropy（助记符多样性熵，≥3.5 高亮）/ Branch% / Mem R/W（读写次数 + 唯一地址数）/ Top Mnemonic（悬停显示 Top-N 列表）。
-- 顶部热点快捷跳转按钮：Hottest Mem / Most Diverse / Densest Branch。
-- 行双击跳转。
 **TUI**：Results 面板中 `window_stats` 条目显示窗口列表（inst 范围 / 熵 / 分支密度 / 内存操作）。
 
 ---
@@ -589,10 +501,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--trace-diff <a_start> <a_end> <b_start> <b_end> [--trace-diff-file <trace_b.bin>]`，可配 `--trace-diff-window` / `--trace-diff-max-diffs`
 **MCP**：`trace_diff`
-**GUI 面板**：`"Trace Diff"`（`panels_trace_diff.cpp`）
-- 参数表单：Region A 起止 inst_id、Region B 起止 inst_id（或 Trace B 文件路径）、Resync Window 大小。
-- 对比结果表：类型（Matched/Diverged/Resync）/ A 位置 / B 位置 / PC / 详情。
-- 分叉点行可点击跳转到 A 或 B 的对应指令。统计摘要显示分叉数和匹配数。
 **TUI**：Results 面板中 `trace_diff` 条目显示分叉段列表（类型 / 位置 / PC / 详情）。
 
 ---
@@ -603,10 +511,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--dataflow-graph <start> <end> [--dataflow-graph-output <output.dot>]`
 **MCP**：`dataflow_graph`
-**GUI 面板**：`"Dataflow Graph"`（`panels_dataflow_graph.cpp`）
-- 参数表单：Start/End inst_id 输入框（含 "Cursor" 快捷按钮）。
-- 左侧节点表（inst_id / PC / Mnemonic），右侧选中节点的 Producers（入边）和 Consumers（出边）列表，含依赖类型（via xN 寄存器 / via mem 地址）。
-- 节点双击跳转。Export 按钮导出 DOT/JSON。节点数上限 5000。
 **TUI**：Results 面板中 `dataflow_graph` 条目显示节点列表（inst_id / pc / mnemonic）。
 
 ---
@@ -619,9 +523,6 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--run-pass thread`
 **MCP**：无独立工具
-**GUI 面板**：`"Threads"`（`panels_misc.cpp` 的一部分）
-- 线程列表：tid / 总指令数 / 切换次数。活动线程高亮。
-- 行点击跳转到该线程首次出现的指令。
 **TUI**：Thread 面板（全局 `S` 键跳转到下一次线程切换，`p`/`N` 前后切换）；Results 面板中 `thread` 条目显示线程摘要。
 
 ---
@@ -632,25 +533,9 @@ Collector 可按记录类型覆写回调：
 
 **CLI**：`--thread-filter [tid1,tid2,...]`；省略列表时仍构建全部线程 bitmap
 **MCP**：无独立工具
-**GUI**：通过线程面板的交互触发。
 **TUI**：Results 面板中 `thread_filter` 条目显示过滤摘要。
 
 ---
-
-### 非 Pass 面板
-
-以下 GUI 面板不对应特定 pass，而是提供基础浏览或辅助功能：
-
-| 面板 | 文件 | 功能 |
-|------|------|------|
-| `"Instructions"` | `panels_instruction.cpp` | 主指令列表，显示 inst_id / PC / 反汇编 / 内存访问。右键菜单触发污点、断点、跳转等操作 |
-| `"Registers"` | `panels_registers.cpp` | 当前指令的寄存器状态，读/写寄存器颜色高亮（绿=读、红=写、黄=读写） |
-| `"Memory"` | `panels_memory.cpp` | 当前指令的内存访问详情（READ/WRITE、地址、值、hex dump、last writer） |
-| `"Hex Dump"` | `hex_dump_view.*` | 指定地址的 hex dump 视图（GUI 和 TUI 共有，`H` 键切换） |
-| `"Output"` | `panels_log.cpp` | 日志面板，级别筛选 + 模块多选 + 文本过滤 |
-| `"Symbol Info"` | `panels_dwarf.cpp` | DWARF/nm 符号表浏览器，支持 nm 纯文本、llvm-nm JSON、addr2line/atos 输出 |
-| `"Cache Manager"` | `panels_cache_manager.cpp` | Pass 缓存管理：查看/删除/重跑已持久化的 pass 结果 |
-| `"Analysis"` | `panels_analysis.cpp` | 无参数 pass 的统一控制台：按分类列出所有 pass，显示状态/进度/摘要，一键运行/重跑 |
 
 ## 关键依赖关系
 
@@ -734,7 +619,7 @@ loop_semantics --> algorithm_summary
 - 调 `require_pass<T>()`
 - 序列化结果
 
-这让 GUI / CLI / MCP 三种入口共用完全相同的分析核心。
+这让 TUI、CLI、RPC、MCP 和 WS 等入口共用完全相同的分析核心；Tauri 前端也通过这些服务接口获取结果。
 
 ## 结果缓存与失效
 
@@ -808,5 +693,5 @@ private:
 
 - 想看底层状态是怎么重建的：读 [`core-layer.md`](core-layer.md)
 - 想看怎么真正落地一个 pass：读 [`pass-cookbook.md`](pass-cookbook.md)
-- 想看 CLI / MCP / GUI 如何把 pass 暴露出去：读 [`ui-layer.md`](ui-layer.md)
+- 想看 CLI / TUI / RPC / MCP / WS 如何把 pass 暴露出去：读 [`ui-layer.md`](ui-layer.md)
 - 想看整体装配：读 [`ARCHITECTURE.md`](ARCHITECTURE.md)

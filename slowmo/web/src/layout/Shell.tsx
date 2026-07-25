@@ -45,10 +45,17 @@ export function Shell() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      // 排除任何"主修饰键"（macOS: Cmd/metaKey；Windows/Linux: Ctrl/ctrlKey）
+      // 组合，避免和菜单快捷键 / 浏览器或系统快捷键（如 Ctrl+↓ 的桌面切换、
+      // Cmd/Ctrl+G 的浏览器"查找下一个"、Cmd/Ctrl+B 的书签栏切换）冲突。
+      // 这些单键绑定都是无修饰键的裸键快捷键，一旦按下 Cmd/Ctrl 就必须放行
+      // 给浏览器/系统/原生菜单处理，而不是仍按 e.key 命中触发。
+      const modPressed = e.metaKey || e.ctrlKey;
       if (e.altKey && e.key === 'ArrowLeft') { navBack(); e.preventDefault(); }
       else if (e.altKey && e.key === 'ArrowRight') { navForward(); e.preventDefault(); }
-      else if (e.key === 'ArrowDown' && !e.metaKey) { step(1); e.preventDefault(); }
-      else if (e.key === 'ArrowUp' && !e.metaKey) { step(-1); e.preventDefault(); }
+      else if (modPressed) { /* 交给浏览器/系统/原生菜单处理，不拦截 */ }
+      else if (e.key === 'ArrowDown') { step(1); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { step(-1); e.preventDefault(); }
       else if (e.key === 'g' || e.key === 'G') { openGotoDialog(); e.preventDefault(); }
       else if (e.key === '/') { openSearchDialog(); e.preventDefault(); }
       else if (e.key === 'b' || e.key === 'B') { toggleBookmark(currentInst); e.preventDefault(); }

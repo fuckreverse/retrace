@@ -11,9 +11,6 @@
 #if TENET_HAS_WS
 #include "ws/tenet_ws_service.h"
 #endif
-#if TENET_HAS_GUI
-#include "gui/gui_app.h"
-#endif
 #include "io/recent_files.h"
 #include "batch_analysis.h"
 
@@ -32,7 +29,7 @@
 #include <memory>
 #include <string>
 
-#ifdef __APPLE__
+#if !defined(_WIN32)
 #include <sys/resource.h>
 #endif
 
@@ -49,7 +46,7 @@ int main(int argc, char** argv) {
     // ─── Raise file descriptor limit ────────────────────────────────────
     // RocksDB's parallel SST ingest + CompactRange on large traces can open
     // thousands of files simultaneously.  macOS defaults to 256 for GUI apps.
-#ifdef __APPLE__
+#if !defined(_WIN32)
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
@@ -90,7 +87,7 @@ TENET_TIMER_MS(t_open),
 reader.file_size() / (1024.0 * 1024.0));
 
 // ─── Acquire exclusive trace session lock ────────────────────────────
-// Only one tenet instance (GUI/TUI/batch/RPC/MCP — any mode) may hold a
+// Only one tenet instance (TUI/batch/RPC/MCP — any mode) may hold a
 // given trace open at a time: concurrent instances would race on the same
 // RocksDB index directory and on interactive navigation/bookmark state.
 // See io/trace_lock.h for why this uses flock() rather than a PID check
@@ -104,9 +101,6 @@ else if (opts.opt_rpc)       session_mode = "rpc";
 else if (opts.opt_streaming) session_mode = "streaming";
 else if (has_analysis_option) session_mode = "batch-analysis";
 else if (opts.batch_mode)    session_mode = "tui-batch";
-#if TENET_HAS_GUI
-else if (!opts.force_tui)    session_mode = "gui";
-#endif
 else                          session_mode = "tui";
 
 TraceLockHolderInfo lock_holder;
@@ -319,7 +313,7 @@ if (!trace_lock && lock_holder.pid != 0) {
     // ─── Initialize RegisterFile and MemoryModel ──────────────────────────
     RegisterFile regfile(reader, index);
     // Eagerly build the dense checkpoint array so state_before()/state_after()
-    // queries work immediately for all UI modes (GUI/TUI/batch), even before
+    // queries work immediately for all modes (TUI/batch/service), even before
     // any analysis triggers PassManager::init_infra(). init_infra()'s
     // CheckpointManager::ensure_checkpoints() sees has_checkpoints() == true
     // and skips the rebuild.
@@ -352,7 +346,7 @@ if (!trace_lock && lock_holder.pid != 0) {
     } shutdown_guard{&memory, &index};
 
 
-    // Create TenetService — shared by all paths (batch, GUI, TUI).
+    // Create TenetService — shared by all paths (batch, TUI, service).
     TenetService service(reader, index, code_table, decoder, regfile, memory, opts.trace_path);
 
     // ─── Start WebSocket service (if requested) ────────────────────────────
@@ -375,23 +369,14 @@ if (!trace_lock && lock_holder.pid != 0) {
         return tenet::run_batch_analysis(opts, service);
     }
 
-    // ─── Run interactive mode (GUI / TUI) or batch mode ──────────────────
+    // ─── Run interactive TUI or batch mode ───────────────────────────────
     if (opts.batch_mode) {
         TuiApp app(service);
         return app.batch_mode(opts.start_id, opts.display_count, opts.show_regs, opts.show_mem);
     }
 
-#if TENET_HAS_GUI
-    if (!opts.force_tui) {
-        GuiApp gui(service, opts.trace_path);
-        gui.set_vm_paths(opts.vm_hints_file, opts.vm_decoder_file);
-        return gui.run();
-    }
-#else
-    (void)opts.force_tui;
-#endif
-
-    // Fallback to TUI (or --tui explicitly requested)
+    // TUI is the only native interactive frontend. The graphical frontend is
+    // the separate Tauri application in tools/tenet/web/.
     TuiApp app(service);
     return app.run();
 }

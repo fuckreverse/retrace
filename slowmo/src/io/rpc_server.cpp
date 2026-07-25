@@ -5,6 +5,7 @@
 #include "core/register_file.h"
 #include "core/memory_model.h"
 #include "analysis/pass_manager.h"
+#include "common/platform_compat.h"
 #include "common/types.h"
 #include "common/progress_manager.h"
 #include "analysis/passes/structure/xref_pass.h"
@@ -15,14 +16,8 @@
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <cstring>
-#include <sstream>
 #include <algorithm>
+#include <sstream>
 
 using json = nlohmann::json;
 
@@ -149,8 +144,8 @@ int reg_name_to_idx(const std::string& name) {
 
 // ─── RpcServer ────────────────────────────────────────────────────────────
 
-RpcServer::RpcServer(const std::string& socket_path)
-    : socket_path_(socket_path) {}
+RpcServer::RpcServer(const std::string& host, uint16_t port)
+    : host_(host), port_(port) {}
 
 RpcServer::~RpcServer() {
     stop();
@@ -162,31 +157,50 @@ void RpcServer::register_method(const std::string& method, RpcMethodHandler hand
 }
 
 bool RpcServer::start() {
-    // Create UDS
-    server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd_ < 0) return false;
+    platform::ensure_sockets_initialized();
 
-    // Remove stale socket file
-    ::unlink(socket_path_.c_str());
+    const platform::socket_t server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    server_fd_.store(server_fd);
+    if (!platform::socket_valid(server_fd)) return false;
 
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(server_fd_);
-        server_fd_ = -1;
-        return false;
-    }
-    if (listen(server_fd_, 8) < 0) {
-        ::close(server_fd_);
-        server_fd_ = -1;
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port_);
+    if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+        platform::close_socket(server_fd);
+        server_fd_.store(platform::kInvalidSocket);
         return false;
     }
 
-    // Set non-blocking so stop() can interrupt accept()
-    int flags = fcntl(server_fd_, F_GETFL, 0);
-    fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK);
+    platform::set_reuseaddr(server_fd);
+    if (::bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        platform::close_socket(server_fd);
+        server_fd_.store(platform::kInvalidSocket);
+        return false;
+    }
+    if (::listen(server_fd, 8) < 0) {
+        platform::close_socket(server_fd);
+        server_fd_.store(platform::kInvalidSocket);
+        return false;
+    }
+
+    struct sockaddr_in bound_addr{};
+    platform::socklen_compat_t bound_len = sizeof(bound_addr);
+    if (::getsockname(server_fd, reinterpret_cast<struct sockaddr*>(&bound_addr),
+                      &bound_len) < 0) {
+        platform::close_socket(server_fd);
+        server_fd_.store(platform::kInvalidSocket);
+        return false;
+    }
+    actual_port_ = ntohs(bound_addr.sin_port);
+
+    // Set non-blocking so stop() can interrupt accept().
+    if (!platform::set_nonblocking(server_fd)) {
+        platform::close_socket(server_fd);
+        server_fd_.store(platform::kInvalidSocket);
+        actual_port_ = 0;
+        return false;
+    }
 
     running_.store(true);
     worker_ = std::thread([this] { listener_thread(); });
@@ -195,45 +209,54 @@ bool RpcServer::start() {
 
 void RpcServer::stop() {
     running_.store(false);
-    if (server_fd_ >= 0) {
-        ::shutdown(server_fd_, SHUT_RDWR);
-        ::close(server_fd_);
-        server_fd_ = -1;
-        ::unlink(socket_path_.c_str());
+    const platform::socket_t server_fd = server_fd_.load();
+    if (platform::socket_valid(server_fd)) {
+        platform::shutdown_both(server_fd);
     }
     if (worker_.joinable()) {
         worker_.join();
     }
+    const platform::socket_t fd_to_close =
+        server_fd_.exchange(platform::kInvalidSocket);
+    if (platform::socket_valid(fd_to_close)) {
+        platform::close_socket(fd_to_close);
+    }
+    actual_port_ = 0;
+}
+
+std::string RpcServer::endpoint() const {
+    return fmt::format("{}:{}", host_, actual_port_);
 }
 
 void RpcServer::listener_thread() {
     while (running_.load()) {
-        // Poll with 200ms timeout (non-blocking accept loop)
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(server_fd_, &rfds);
-        struct timeval tv{0, 200000};  // 200ms
-        int ret = select(server_fd_ + 1, &rfds, nullptr, nullptr, &tv);
-        if (ret <= 0) continue;
+        // Poll with 200ms timeout (non-blocking accept loop).
+        const platform::socket_t polled_fd = server_fd_.load();
+        if (!platform::socket_valid(polled_fd)) break;
+        if (platform::poll_one(polled_fd, platform::kPollIn, 200) <= 0) continue;
 
-        struct sockaddr_un client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd_,
-                               reinterpret_cast<struct sockaddr*>(&client_addr),
-                               &client_len);
-        if (client_fd < 0) continue;
+        if (!running_.load()) break;
+        const platform::socket_t accept_fd = server_fd_.load();
+        if (!platform::socket_valid(accept_fd) || accept_fd != polled_fd) continue;
+
+        struct sockaddr_in client_addr{};
+        platform::socklen_compat_t client_len = sizeof(client_addr);
+        platform::socket_t client_fd = ::accept(
+            accept_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
+        if (!platform::socket_valid(client_fd)) continue;
+        platform::set_recv_timeout(client_fd, 5000);
         handle_client(client_fd);
-        ::close(client_fd);
+        platform::close_socket(client_fd);
     }
 }
 
-void RpcServer::handle_client(int client_fd) {
+void RpcServer::handle_client(platform::socket_t client_fd) {
     // Read newline-terminated JSON messages until EOF
     std::string buf;
     char tmp[4096];
 
     while (true) {
-        ssize_t n = ::recv(client_fd, tmp, sizeof(tmp), 0);
+        int n = ::recv(client_fd, tmp, static_cast<int>(sizeof(tmp)), 0);
         if (n <= 0) break;
         buf.append(tmp, static_cast<size_t>(n));
 
@@ -245,13 +268,13 @@ void RpcServer::handle_client(int client_fd) {
             if (line.empty()) continue;
 
             std::string resp_json = dispatch(line).to_json();
-            ::send(client_fd, resp_json.data(), resp_json.size(), 0);
+            platform::send_all(client_fd, resp_json.data(), resp_json.size());
         }
     }
     // Flush remaining partial line if any (shouldn't happen in well-behaved clients)
     if (!buf.empty() && buf != "\n") {
         std::string resp_json = dispatch(buf).to_json();
-        ::send(client_fd, resp_json.data(), resp_json.size(), 0);
+        platform::send_all(client_fd, resp_json.data(), resp_json.size());
     }
 }
 
@@ -283,12 +306,8 @@ TenetRpcService::TenetRpcService(TraceReader& reader, TraceIndex& index,
 
 TenetRpcService::~TenetRpcService() { stop(); }
 
-bool TenetRpcService::start(const std::string& socket_path) {
-    std::string path = socket_path;
-    if (path.empty()) {
-        path = fmt::format("/tmp/tenet-{}.sock", static_cast<int>(::getpid()));
-    }
-    server_ = std::make_unique<RpcServer>(path);
+bool TenetRpcService::start(const std::string& host, uint16_t port) {
+    server_ = std::make_unique<RpcServer>(host, port);
     register_methods();
     return server_->start();
 }
@@ -301,9 +320,12 @@ bool TenetRpcService::is_running() const {
     return server_ && server_->is_running();
 }
 
-const std::string& TenetRpcService::socket_path() const {
-    static std::string empty;
-    return server_ ? server_->socket_path() : empty;
+uint16_t TenetRpcService::listen_port() const {
+    return server_ ? server_->listen_port() : 0;
+}
+
+std::string TenetRpcService::endpoint() const {
+    return server_ ? server_->endpoint() : std::string{};
 }
 
 void TenetRpcService::register_methods() {

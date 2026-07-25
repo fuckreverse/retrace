@@ -1,9 +1,5 @@
 #include "io/code_table.h"
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include "common/platform_mmap.h"
 #include <cstring>
 #include <cstdint>
 
@@ -73,77 +69,54 @@ struct Elf64Phdr {
 static constexpr uint32_t ELF_PT_LOAD = 1;
 static constexpr uint32_t ELF_PF_X = 1;
 
-// ─── Destructor / move — release mmap on destruction ───────────────────────
-
-ImageFallback::~ImageFallback() {
-    if (data_) {
-        ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
-        data_ = nullptr;
-        size_ = 0;
-    }
-}
+// ─── Move support — MappedFile transfers mapping ownership ─────────────────
 
 ImageFallback::ImageFallback(ImageFallback&& other) noexcept
-    : data_(other.data_), size_(other.size_), segments_(std::move(other.segments_)) {
-    other.data_ = nullptr;
-    other.size_ = 0;
-}
+    : mapped_file_(std::move(other.mapped_file_)),
+      segments_(std::move(other.segments_)) {}
 
 ImageFallback& ImageFallback::operator=(ImageFallback&& other) noexcept {
     if (this != &other) {
-        if (data_) {
-            ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
-        }
-        data_ = other.data_;
-        size_ = other.size_;
+        mapped_file_ = std::move(other.mapped_file_);
         segments_ = std::move(other.segments_);
-        other.data_ = nullptr;
-        other.size_ = 0;
     }
     return *this;
 }
 
 bool ImageFallback::load(const std::string& path, uint64_t module_base) {
-    // Release any previously-loaded mmap before loading a new one.
-    if (data_) {
-        ::munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
-        data_ = nullptr;
-        size_ = 0;
-        segments_.clear();
-    }
+    // Release any previously loaded image before loading a new one.
+    mapped_file_.reset();
+    segments_.clear();
 
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
-    struct stat st{};
-    if (::fstat(fd, &st) < 0 || st.st_size <= 0) {
-        ::close(fd);
+    std::string map_error;
+    mapped_file_ = platform::MappedFile::open(path, &map_error);
+    if (!mapped_file_.valid() || mapped_file_.size() == 0) {
+        mapped_file_.reset();
         return false;
     }
-    void* m = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) return false;
+    mapped_file_.advise(platform::AccessHint::Random);
 
-    data_ = static_cast<const uint8_t*>(m);
-    size_ = static_cast<uint64_t>(st.st_size);
+    const uint8_t* data = mapped_file_.data();
+    const uint64_t size = mapped_file_.size();
 
     // Parse executable segments. We need the ASLR slide to map preferred
     // vmaddrs to runtime PCs. module_base is the runtime base of the image's
     // preferred load address (the lowest vmaddr among loaded segments). The
     // slide is therefore: slide = module_base - min_vmaddr.
-    const auto* p = data_;
-    if (size_ < 4) return false;
+    const auto* p = data;
+    if (size < 4) return false;
     uint32_t magic;
     std::memcpy(&magic, p, 4);
 
     if (magic == MH_MAGIC_64) {
-        if (size_ < sizeof(MachHeader64)) return false;
+        if (size < sizeof(MachHeader64)) return false;
         const auto* hdr = reinterpret_cast<const MachHeader64*>(p);
         uint32_t ncmds = hdr->ncmds;
         const uint8_t* cmd = p + sizeof(MachHeader64);
         // First pass: find min vmaddr among executable segments to compute slide.
         uint64_t min_vmaddr = UINT64_MAX;
         for (uint32_t i = 0; i < ncmds; ++i) {
-            if ((size_t)(cmd - p) + sizeof(SegmentCommand64) > size_) break;
+            if ((size_t)(cmd - p) + sizeof(SegmentCommand64) > size) break;
             const auto* seg = reinterpret_cast<const SegmentCommand64*>(cmd);
             if (seg->cmd == LC_SEGMENT_64 && (seg->initprot & VM_PROT_EXECUTE) &&
                 seg->vmsize > 0 && seg->vmaddr < min_vmaddr) {
@@ -156,7 +129,7 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
         // Second pass: record executable segments.
         cmd = p + sizeof(MachHeader64);
         for (uint32_t i = 0; i < ncmds; ++i) {
-            if ((size_t)(cmd - p) + sizeof(SegmentCommand64) > size_) break;
+            if ((size_t)(cmd - p) + sizeof(SegmentCommand64) > size) break;
             const auto* seg = reinterpret_cast<const SegmentCommand64*>(cmd);
             if (seg->cmd == LC_SEGMENT_64 && (seg->initprot & VM_PROT_EXECUTE) &&
                 seg->vmsize > 0) {
@@ -170,7 +143,7 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
         }
     } else if (magic == ELFMAG) {
         // ELF64 only (the tracer's x86_64 path).
-        if (size_ < sizeof(Elf64Ehdr)) return false;
+        if (size < sizeof(Elf64Ehdr)) return false;
         const auto* hdr = reinterpret_cast<const Elf64Ehdr*>(p);
         if (hdr->e_ident[4] != ELFCLASS64) return false;
         uint64_t phoff = hdr->e_phoff;
@@ -180,7 +153,7 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
         uint64_t min_vaddr = UINT64_MAX;
         for (uint16_t i = 0; i < phnum; ++i) {
             uint64_t off = phoff + (uint64_t)i * phentsize;
-            if (off + sizeof(Elf64Phdr) > size_) break;
+            if (off + sizeof(Elf64Phdr) > size) break;
             const auto* ph = reinterpret_cast<const Elf64Phdr*>(p + off);
             if (ph->p_type == ELF_PT_LOAD && (ph->p_flags & ELF_PF_X) &&
                 ph->p_memsz > 0 && ph->p_vaddr < min_vaddr) {
@@ -191,7 +164,7 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
         uint64_t slide = module_base - min_vaddr;
         for (uint16_t i = 0; i < phnum; ++i) {
             uint64_t off = phoff + (uint64_t)i * phentsize;
-            if (off + sizeof(Elf64Phdr) > size_) break;
+            if (off + sizeof(Elf64Phdr) > size) break;
             const auto* ph = reinterpret_cast<const Elf64Phdr*>(p + off);
             if (ph->p_type == ELF_PT_LOAD && (ph->p_flags & ELF_PF_X) && ph->p_memsz > 0) {
                 Segment s;
@@ -202,10 +175,8 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
             }
         }
     } else {
-        // Unknown format — release mmap.
-        ::munmap(m, st.st_size);
-        data_ = nullptr;
-        size_ = 0;
+        // Unknown format — release the mapping.
+        mapped_file_.reset();
         return false;
     }
 
@@ -215,7 +186,9 @@ bool ImageFallback::load(const std::string& path, uint64_t module_base) {
 }
 
 std::optional<uint32_t> ImageFallback::opcode_at(uint64_t runtime_pc) const {
-    if (segments_.empty() || data_ == nullptr) return std::nullopt;
+    const uint8_t* data = mapped_file_.data();
+    const uint64_t size = mapped_file_.size();
+    if (segments_.empty() || data == nullptr) return std::nullopt;
     // Binary search for the segment covering runtime_pc.
     size_t lo = 0, hi = segments_.size();
     while (lo < hi) {
@@ -227,9 +200,9 @@ std::optional<uint32_t> ImageFallback::opcode_at(uint64_t runtime_pc) const {
         } else {
             // Found. Map to file offset and read 4 bytes.
             uint64_t file_off = segments_[mid].file_offset + (runtime_pc - segments_[mid].runtime_start);
-            if (file_off + 4 > size_) return std::nullopt;
+            if (file_off + 4 > size) return std::nullopt;
             uint32_t op;
-            std::memcpy(&op, data_ + file_off, 4);
+            std::memcpy(&op, data + file_off, 4);
             return op;
         }
     }
@@ -237,7 +210,9 @@ std::optional<uint32_t> ImageFallback::opcode_at(uint64_t runtime_pc) const {
 }
 
 size_t ImageFallback::read_bytes_at(uint64_t runtime_addr, size_t len, uint8_t* out) const {
-    if (segments_.empty() || data_ == nullptr || len == 0) return 0;
+    const uint8_t* data = mapped_file_.data();
+    const uint64_t size = mapped_file_.size();
+    if (segments_.empty() || data == nullptr || len == 0) return 0;
     // Binary search for the segment covering runtime_addr.
     size_t lo = 0, hi = segments_.size();
     while (lo < hi) {
@@ -253,9 +228,9 @@ size_t ImageFallback::read_bytes_at(uint64_t runtime_addr, size_t len, uint8_t* 
             // Don't read past the segment's runtime end.
             uint64_t avail_in_seg = segments_[mid].runtime_end - runtime_addr;
             size_t to_read = static_cast<size_t>(
-                std::min<uint64_t>({len, avail_in_seg, size_ - file_off}));
+                std::min<uint64_t>({len, avail_in_seg, size - file_off}));
             if (to_read == 0) return 0;
-            std::memcpy(out, data_ + file_off, to_read);
+            std::memcpy(out, data + file_off, to_read);
             return to_read;
         }
     }

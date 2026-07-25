@@ -56,7 +56,9 @@ class LicenseCollectorTest(unittest.TestCase):
             (root / "Z3-LICENSE.txt").write_text("MIT License", encoding="utf-8")
             output = root / "output"
 
-            collector.build_native_notices(self.manifest["components"], root, output)
+            collector.build_native_notices(
+                self.manifest["components"], root, output, ["libtriton.dylib", "libz3.4.15.dylib"]
+            )
 
             notice = (output / "THIRD-PARTY-NOTICES.txt").read_text(encoding="utf-8")
             self.assertIn("Triton 1.0.1599 — Apache-2.0", notice)
@@ -64,6 +66,35 @@ class LicenseCollectorTest(unittest.TestCase):
             self.assertEqual(
                 "Apache License", (output / "native" / "Triton" / "LICENSE.txt").read_text(encoding="utf-8")
             )
+
+    def test_builds_notice_skips_components_not_actually_bundled(self):
+        # Z3 has a "libraries" glob but isn't present in this platform's
+        # --lib-dir listing (e.g. Triton/YARA weren't built here) — its
+        # license_files (which may be a macOS-only Homebrew absolute path)
+        # must not be resolved or copied, and it must not appear in the notice.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "LICENSE.txt").write_text("Apache License", encoding="utf-8")
+            # Deliberately do NOT create Z3-LICENSE.txt: if build_native_notices
+            # tried to resolve Z3's license_files anyway, this would raise
+            # FileNotFoundError and fail the test.
+            output = root / "output"
+
+            collector.build_native_notices(self.manifest["components"], root, output, ["libtriton.dylib"])
+
+            notice = (output / "THIRD-PARTY-NOTICES.txt").read_text(encoding="utf-8")
+            self.assertIn("Triton 1.0.1599 — Apache-2.0", notice)
+            self.assertNotIn("Z3", notice)
+            self.assertFalse((output / "native" / "Z3").exists())
+
+    def test_component_without_libraries_glob_is_always_bundled(self):
+        always_on = {
+            "name": "fmt",
+            "version": "10.2.1",
+            "license": "MIT",
+            "license_files": ["LICENSE"],
+        }
+        self.assertTrue(collector._component_is_bundled(always_on, []))
 
     def test_manifest_is_valid_json(self):
         manifest_path = Path(__file__).parents[1] / "licenses" / "native-components.json"

@@ -6,7 +6,7 @@ IO 层负责把 trace 从“磁盘文件”变成“上层可以高效查询的�
 
 - 如何**零拷贝**读取大体积 trace
 - 如何把顺序记录流变成**可随机定位、可倒排查询**的索引
-- 如何为上层提供代码字节、流式索引和本地 RPC 这种基础设施能力
+- 如何为上层提供代码字节、流式索引和 TCP JSON-RPC 这种基础设施能力
 
 ## 组件总览
 
@@ -19,9 +19,9 @@ IO 层负责把 trace 从“磁盘文件”变成“上层可以高效查询的�
 | `CodeTable` | `code_table.{h,cpp}` | 缓存 `PC -> opcode`，供反汇编与 CFG 使用 |
 | `ImageFallback` | `code_table.{h,cpp}` | 当 trace 缺少 code bytes 时，从原始镜像补码 |
 | `StreamingIndex` / `YaraRuleWatcher` | `streaming_index.{h,cpp}` | tail 增长中的 trace 并增量更新索引；监听 YARA 规则目录变化并触发重载 |
-| `RpcServer` / `TenetRpcService` | `rpc_server.{h,cpp}` | 本地 JSON-RPC over Unix socket |
+| `RpcServer` / `TenetRpcService` | `rpc_server.{h,cpp}` | JSON-RPC over TCP；默认监听 `127.0.0.1`（loopback），可通过 `--rpc [[host:]port]` 自定义 host 和端口，端口 `0` 由 OS 自动分配 |
 | `TenetMcpService` 等 | `mcp/` | MCP stdio / Streamable HTTP 服务，详见下方第 5b 节 |
-| `RecentFiles` | `recent_files.{h,cpp}` | GUI 最近打开文件列表 |
+| `RecentFiles` | `recent_files.{h,cpp}` | 持久化最近打开的 trace 列表 |
 
 ```mermaid
 flowchart LR
@@ -135,7 +135,7 @@ flowchart LR
 
 `TraceIndex` 直接支撑了很多上层能力：
 
-- `offset_of(inst_id)` / `offset_of_with_pc(inst_id, reader)`：给 GUI/TUI/CLI 随机跳转用（后者同时返回解析后的 seed PC，对 v5 pc_delta 追踪必需）
+- `offset_of(inst_id)` / `offset_of_with_pc(inst_id, reader)`：给 TUI/CLI/RPC/MCP/WS 随机跳转用（后者同时返回解析后的 seed PC，对 v5 pc_delta 追踪必需）
 - `nearest_anchor_before(inst_id)`：给 `RegisterFile` 找重建基线
 - `find_last_writer_of(reg, before_id)`：给 `backward_taint` 用（原 `slice`/`producer_chain` 的跳跃逻辑现已合并进这里）
 - `load_code_table()`：给 `CodeTable` 装载 opcode
@@ -149,7 +149,7 @@ flowchart LR
 
 ## 3. TraceFileLock：单实例独占锁
 
-多个 tenet 实例（GUI/TUI/批处理/RPC/MCP，不区分模式）绝不能同时打开同一个 trace：它们会争用同一个 RocksDB 索引目录（RocksDB 自身的 `DB::Open` 会报出不友好的底层 `LOCK` 文件错误），交互模式还假定独占持有导航/书签这类持久化在 `meta` CF 里的会话状态。`TraceFileLock`（`src/io/trace_lock.{h,cpp}`）在 `main()` 里、`TraceReader::open()` 成功之后、`TraceIndex::open_or_build()` 之前抢占式地解决这个问题。
+多个 tenet 后端实例（TUI/批处理/RPC/MCP/MCP HTTP，不区分模式）绝不能同时打开同一个 trace：它们会争用同一个 RocksDB 索引目录（RocksDB 自身的 `DB::Open` 会报出不友好的底层 `LOCK` 文件错误），交互模式还假定独占持有导航/书签这类持久化在 `meta` CF 里的会话状态。`TraceFileLock`（`src/io/trace_lock.{h,cpp}`）在 `main()` 里、`TraceReader::open()` 成功之后、`TraceIndex::open_or_build()` 之前抢占式地解决这个问题。
 
 ### 锁文件位置
 
@@ -164,11 +164,11 @@ flowchart LR
 
 ### 失败时的行为
 
-加锁失败（即已被占用）时，`main()` 直接打印占用者的 pid、host、mode（gui/tui/batch-analysis/rpc/mcp/mcp-hub/streaming 等）、打开时间，然后以非零退出码退出——**不**做等待重试、不自动强制解锁、不删除旧锁文件。锁获取本身若因基础设施问题失败（例如目录不可写），则退化为“不加锁继续运行”而不是阻塞正常使用。
+加锁失败（即已被占用）时，`main()` 直接打印占用者的 pid、host、mode（tui/tui-batch/batch-analysis/rpc/mcp/mcp-http/mcp-hub/streaming 等）、打开时间，然后以非零退出码退出——**不**做等待重试、不自动强制解锁、不删除旧锁文件。锁获取本身若因基础设施问题失败（例如目录不可写），则退化为“不加锁继续运行”而不是阻塞正常使用。
 
 ### 覆盖范围
 
-加锁逻辑只在 `main.cpp` 一处调用，覆盖所有运行模式——因为它们共享同一个 `main()` 入口，在分流到 `GuiApp`/`TuiApp`/`run_batch_analysis`/RPC/MCP 之前完成检查。持有的 `TraceFileLock` 对象在 `main()` 栈上一直存活到函数返回，覆盖整个进程运行期。
+加锁逻辑只在 `main.cpp` 一处调用，覆盖所有后端运行模式——因为它们共享同一个 `main()` 入口，在分流到 `TuiApp`、`run_batch_analysis`、RPC、MCP 或 MCP HTTP 服务之前完成检查。持有的 `TraceFileLock` 对象在 `main()` 栈上一直存活到函数返回，覆盖整个进程运行期。
 
 ## 4. CodeTable 与 ImageFallback：补齐代码字节视图
 
@@ -229,7 +229,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 
 ## 6. RpcServer：本地程序接入入口
 
-虽然 RPC 位于 IO 层，但它做的是**最底层的服务暴露**：把当前 trace 和核心对象以 Unix socket JSON-RPC 的形式暴露出去。
+虽然 RPC 位于 IO 层，但它做的是**最底层的服务暴露**：把当前 trace 和核心对象以 JSON-RPC over TCP 的形式暴露出去。RPC 默认监听 `127.0.0.1`（loopback），可通过 `--rpc [[host:]port]` 显式指定其他 host；端口传 `0` 时由操作系统自动分配。
 
 ### 标准方法
 
@@ -251,6 +251,8 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 ### 特点
 
 - 每条消息是一行 JSON
+- 默认监听 `127.0.0.1`（loopback），也可通过 `--rpc [[host:]port]` 自定义 host 和端口
+- 端口为 `0` 时由操作系统自动分配
 - 单连接串行处理
 - 适合本地脚本、插件、调试工具
 - 不承担 AI 约束语义，和 MCP 是不同定位
@@ -273,13 +275,13 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 - 只读工具走 `shared_mutex` 读锁，可并发执行；写工具（如 `set_image_base`）需要独占写锁
 - 支持 IDA 场景下的 PC rebase，便于静态/动态地址互相映射
 
-## 7. RecentFiles：GUI 的会话辅助
+## 7. RecentFiles：最近文件元数据
 
 `RecentFiles` 本身不复杂，但很实用：
 
 - 持久化最近打开的 trace
 - 记录模块名和指令数等摘要信息
-- 给 GUI 启动页提供最近文件列表
+- 为需要最近文件列表的客户端提供持久化数据
 
 ## 8. IO 层如何服务上层
 
@@ -297,7 +299,7 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 
 ### 给 UI / Service 层
 
-- GUI / TUI 随机跳转靠 `offset_of()`
+- TUI 与服务接口的随机跳转靠 `offset_of()`
 - CLI `--stats`、`--streaming` 直接读取索引统计
 - RPC / MCP 都依赖当前 trace 的只读对象集
 

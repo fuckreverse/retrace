@@ -2220,11 +2220,11 @@ pm.register_pass(std::make_unique<LoopPass>());
     // In RPC mode, start the JSON-RPC server and block until SIGINT.
     if (opts.opt_rpc) {
         TenetRpcService rpc_service(reader, index, regfile, memory, &pm);
-        if (!rpc_service.start(opts.rpc_socket_path)) {
+        if (!rpc_service.start(opts.rpc_host, opts.rpc_port)) {
             fmt::print(stderr, "[rpc] Failed to start RPC server\n");
             rc |= 1;
         } else {
-            fmt::print(stderr, "[rpc] Listening on: {}\n", rpc_service.socket_path());
+            fmt::print(stderr, "[rpc] Listening on: {}\n", rpc_service.endpoint());
             fmt::print(stderr, "[rpc] Press Ctrl+C to stop\n");
 
             // Block until SIGINT or SIGTERM

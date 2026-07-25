@@ -39,8 +39,13 @@
 #include <deque>
 #include <mutex>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>       // _write
+#else
+#include <unistd.h>   // write
+#endif
 
 #if QBDITRACE_HAVE_ZSTD
 #include <zstd.h>
@@ -54,11 +59,17 @@ namespace detail {
 inline void logIOError(const char *msg) {
   /* Format: "[qbditrace] IO ERROR: <msg>\n" */
   static const char prefix[] = "[qbditrace] IO ERROR: ";
-  (void)::write(2, prefix, sizeof(prefix) - 1);
   size_t len = 0;
   while (msg[len]) ++len;
+#if defined(_WIN32)
+  (void)::_write(2, prefix, static_cast<unsigned int>(sizeof(prefix) - 1));
+  (void)::_write(2, msg, static_cast<unsigned int>(len));
+  (void)::_write(2, "\n", 1);
+#else
+  (void)::write(2, prefix, sizeof(prefix) - 1);
   (void)::write(2, msg, len);
   (void)::write(2, "\n", 1);
+#endif
 }
 } // namespace detail
 } // namespace qbditrace
@@ -327,7 +338,11 @@ inline void BackgroundWriter::flushBlock(bool &io_error_reported) {
   if (stage_used_ == 0) return;
 
   /* Record current file position as the block's compressed offset. */
-  long pos = std::ftell(file_);
+#if defined(_WIN32)
+  int64_t pos = ::_ftelli64(file_);
+#else
+  int64_t pos = std::ftell(file_);
+#endif
   if (pos < 0) {
     if (!io_error_reported) {
       detail::logIOError("ftell failed in flushBlock");
@@ -381,7 +396,11 @@ inline void BackgroundWriter::finalizeBlocks(bool &io_error_reported) {
   if (!file_) return;
 
   /* Write the block index table. */
-  long index_pos = std::ftell(file_);
+#if defined(_WIN32)
+  int64_t index_pos = ::_ftelli64(file_);
+#else
+  int64_t index_pos = std::ftell(file_);
+#endif
   if (index_pos < 0) {
     if (!io_error_reported) {
       detail::logIOError("ftell failed before writing block index");

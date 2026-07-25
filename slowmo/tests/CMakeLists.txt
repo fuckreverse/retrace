@@ -25,18 +25,26 @@ set(TENET_TEST_INCLUDES
 )
 
 # ─── Helper: add a Catch2 test executable ───────────────────────────────────
+# Optimization flag for non-Debug test builds: -O1 on GCC/Clang, /O1 on MSVC
+# (MSVC doesn't understand the GCC-style "-O1" spelling and would fail to
+# parse it as a compiler flag).
+set(TENET_TEST_OPT_FLAG "-O1")
+if(MSVC)
+    set(TENET_TEST_OPT_FLAG "/O1")
+endif()
+
 function(tenet_add_test target_name source_file)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE tenet_lib Catch2::Catch2WithMain)
     target_include_directories(${target_name} PRIVATE ${TENET_TEST_INCLUDES})
     # Tests prioritize build speed over runtime speed:
     #  - Never use LTO (each test links ~10x faster without it).
-    #  - Cap optimization at -O1 in non-Debug configs; -O3 is pointless for
-    #    unit tests and significantly slows compilation.
+    #  - Cap optimization at -O1/-O1-equivalent in non-Debug configs; -O3 is
+    #    pointless for unit tests and significantly slows compilation.
     set_target_properties(${target_name} PROPERTIES
         INTERPROCEDURAL_OPTIMIZATION OFF)
     target_compile_options(${target_name} PRIVATE
-        $<$<NOT:$<CONFIG:Debug>>:-O1>)
+        $<$<NOT:$<CONFIG:Debug>>:${TENET_TEST_OPT_FLAG}>)
     # Catch2 test discovery: registers each TEST_CASE as a CTest entry.
     # PRE_TEST mode defers discovery to ctest run-time so configure-stage
     # doesn't need the binary to already be built (avoids _NOT_BUILT entries).
@@ -57,10 +65,8 @@ tenet_add_test(test_core_register_file     unit/test_core_register_file.cpp)
 tenet_add_test(test_core_instruction_decoder unit/test_core_instruction_decoder.cpp)
 tenet_add_test(test_core_memory_model      unit/test_core_memory_model.cpp)
 tenet_add_test(test_core_breakpoint_engine unit/test_core_breakpoint_engine.cpp)
-tenet_add_test(test_gui_metal_ownership    unit/test_gui_metal_ownership.cpp)
 tenet_add_test(test_io_index_query         unit/test_io_index_query.cpp)
 tenet_add_test(test_service_tenet_service  unit/test_service_tenet_service.cpp)
-tenet_add_test(test_gui_backward_taint_nav unit/test_gui_backward_taint_nav.cpp)
 tenet_add_test(test_cli_trace_dump         unit/test_cli_trace_dump.cpp)
 
 # ─── Unit tests: analysis passes ────────────────────────────────────────────
@@ -129,7 +135,7 @@ add_executable(test_mcp_http integration/test_mcp_http.cpp)
 target_link_libraries(test_mcp_http PRIVATE tenet_lib Catch2::Catch2WithMain)
 target_include_directories(test_mcp_http PRIVATE ${TENET_TEST_INCLUDES})
 set_target_properties(test_mcp_http PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
-target_compile_options(test_mcp_http PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O1>)
+target_compile_options(test_mcp_http PRIVATE $<$<NOT:$<CONFIG:Debug>>:${TENET_TEST_OPT_FLAG}>)
 add_test(NAME "MCP HTTP (all)" COMMAND test_mcp_http --order rand)
 
 # ─── Performance regression tests ──────────────────────────────────────────
@@ -159,4 +165,4 @@ target_link_libraries(gen_test_traces PRIVATE tenet_lib)
 target_include_directories(gen_test_traces PRIVATE ${TENET_TEST_INCLUDES})
 # Same fast-build treatment as the test targets above.
 set_target_properties(gen_test_traces PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
-target_compile_options(gen_test_traces PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O1>)
+target_compile_options(gen_test_traces PRIVATE $<$<NOT:$<CONFIG:Debug>>:${TENET_TEST_OPT_FLAG}>)

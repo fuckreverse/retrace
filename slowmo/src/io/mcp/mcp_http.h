@@ -34,6 +34,8 @@
 //   // ...
 //   transport.stop();
 
+#include "common/platform_compat.h"
+
 #include <functional>
 #include <string>
 #include <thread>
@@ -81,7 +83,7 @@ public:
 
 private:
     void listener_loop();
-    void handle_client(int client_fd, const std::string& client_addr);
+    void handle_client(platform::socket_t client_fd, const std::string& client_addr);
 
     // HTTP parsing / response helpers
     struct HttpRequest {
@@ -92,8 +94,8 @@ private:
         std::string body;
         bool valid = false;
     };
-    static HttpRequest parse_http_request(int fd);
-    static void send_http_response(int fd, int status,
+    static HttpRequest parse_http_request(platform::socket_t fd);
+    static void send_http_response(platform::socket_t fd, int status,
                                    const std::string& content_type,
                                    const std::string& body,
                                    const std::string& extra_headers = "");
@@ -103,12 +105,12 @@ private:
     static std::string base64_encode(const std::string& s);
 
     // Session management
-    bool check_session(const HttpRequest& req, int client_fd);
+    bool check_session(const HttpRequest& req, platform::socket_t client_fd);
 
     MessageHandler handler_;
     std::string host_;
     uint16_t    port_;
-    int         server_fd_ = -1;
+    platform::socket_t server_fd_ = platform::kInvalidSocket;
     uint16_t    listening_port_ = 0;  // actual port after bind (useful when port_==0)
 
     std::atomic<bool> running_{false};

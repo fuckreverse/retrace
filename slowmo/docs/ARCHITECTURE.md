@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart TB
-    UI[Frontend Layer\nGUI · TUI · CLI · RPC · MCP · MCP HTTP · WS] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
+    UI[Frontend Layer\nTauri Web UI via FlatBuffers WS · TUI · CLI · RPC · MCP · MCP HTTP · WS] --> SVC[Service Layer\nTenetService · Navigation · Row Cache · Observer]
     SVC --> ANA[Analysis Layer\nPassManager · Pass Registry · Analysis Passes]
     ANA --> INFRA[Infra Layer\nScanOrchestrator · PageStats · StringResolver · CheckpointManager]
     INFRA --> CORE[Core Layer\nRegisterFile · MemoryModel · InstructionDecoder · TritonBridge]
@@ -42,12 +42,12 @@ flowchart TD
     G --> H[RegisterFile]
     H --> CKPT[RegisterFile::build_checkpoints\neager 构建稠密 checkpoints]
     CKPT --> I[MemoryModel]
-    I --> J{has_analysis_option?}
-    J -- yes --> K[run_batch_analysis]
-    J -- no --> L[TenetService]
-    L --> M{--tui? GUI available?}
-    M -- GUI --> N[GuiApp]
-    M -- TUI --> O[TuiApp]
+    I --> J{运行模式?}
+    J -- CLI 批处理 --> K[run_batch_analysis]
+    J -->|"--tui"| L[TenetService]
+    L --> M[TuiApp]
+    J -- RPC / MCP / WS --> N[非交互服务模式]
+    TAURI[Tauri 桌面应用] -.->|"sidecar 启动<br/>--ws-port &lt;port&gt; / --mcp-hub"| A
 ```
 
 ### 启动阶段细分
@@ -56,14 +56,14 @@ flowchart TD
 |------|----------|------|
 | 参数解析 | `CliOptions` | 决定交互模式、批处理能力、服务模式 |
 | 打开 trace | `TraceReader` | `mmap` 整个 trace，解析头，提供顺序/随机记录访问 |
-| 抢占会话锁 | `TraceFileLock` | 基于 `flock` 拒绝同一 trace 的并发打开（已被占用则打印占用者信息并退出，不自动重建/等待） |
+| 抢占会话锁 | `TraceFileLock` | 通过跨平台文件锁抽象拒绝同一 trace 的并发打开（已被占用则打印占用者信息并退出，不自动重建/等待） |
 | 载入或构建索引 | `TraceIndex` | 建立 offset / anchor / mem / reg / code 等 RocksDB CF |
 | 载入代码字节 | `CodeTable` | 从索引或 trace 提取 opcode，供反汇编和 CFG 使用 |
 | 可选镜像回填 | `ImageFallback` | 处理 trace 内缺失 code bytes 的 PC |
 | 初始化 Core | `InstructionDecoder`, `RegisterFile`, `MemoryModel` | 构造寄存器、内存和指令语义对象；`main.cpp` eager 调用 `build_checkpoints()` |
 | 初始化 Infra | `PassManager::init_infra()` | 创建 4 个共享服务；`CheckpointManager` 幂等确认 checkpoint 已建立 |
 | 构建 Service | `TenetService` | 封装导航、缓存、pass 生命周期，供交互入口共享 |
-| 分流到入口 | `run_batch_analysis`, `GuiApp`, `TuiApp` | 批处理、交互或服务化 |
+| 分流到入口 | `run_batch_analysis`, `TuiApp`, RPC / MCP / WS 服务 | 批处理、终端交互或非交互服务化；Tauri 由外部 sidecar 机制启动后端 |
 
 ## 运行时对象模型
 
@@ -72,7 +72,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | 对象 | 生命周期 | 线程模型 | 备注 |
 |------|----------|----------|------|
 | `TraceReader` | 进程级 / 单 trace | 只读并发安全 | mmap 零拷贝底座 |
-| `TraceFileLock` | 进程级 / 单 trace | 单实例持有 | `flock` 独占锁，析构（含进程终止）时内核自动释放 |
+| `TraceFileLock` | 进程级 / 单 trace | 单实例持有 | POSIX / Windows 文件锁抽象，析构（含进程终止）时释放 |
 | `TraceIndex` | 进程级 / 单 trace | RocksDB 并发安全 | 持久化索引与元信息 |
 | `CodeTable` | 进程级 / 单 trace | 读多写少 | 缓存 PC→opcode 映射 |
 | `InstructionDecoder` | 进程级 | 每线程独立 Capstone handle（无锁）+ opcode 缓存读写锁 | 按 opcode（非 PC）缓存反汇编结果 |
@@ -81,26 +81,28 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | `ScanOrchestrator` | PassManager 级 | 一次执行期内编排 | 汇总 `declare_scan()` 并让多个 collector 共享单次遍历 |
 | `PageStats` / `StringResolver` | PassManager 级 | lazy 构建 | 跨 pass 共享页级统计、熵和字符串解析缓存 |
 | `CheckpointManager` | PassManager 级 | 初始化时 eager、幂等 | 确保 checkpoint 只建一次，并统一创建 cursor |
-| `TenetService` | 入口级 / 会话级 | 单线程（UI 线程调用） | 导航状态、行缓存、pass 生命周期、观察者通知 |
+| `TenetService` | 入口级 / 会话级 | 由所属入口线程调用 | 导航状态、行缓存、pass 生命周期、观察者通知 |
 | `PassManager` | 入口级 / 会话级 | 内部同步 | 调度、缓存、依赖解析，并拥有 Infra 服务 |
 
 ## Service Layer
 
-`TenetService`（`src/service/tenet_service.h`）是所有前端（GUI、TUI、CLI、MCP）共享的应用状态管理器。它拥有：
+`TenetService`（`src/service/tenet_service.h`）是 TUI、CLI 与 RPC / MCP / WS 等后端入口共享的应用状态管理器；Tauri 的浏览器端 Web UI 仅通过 FlatBuffers WebSocket 间接使用它。它拥有：
 
 - **PassManager 生命周期** — `ensure_pass_manager()`、`run_pass()`、`run_default_passes()`
 - **导航状态** — 光标位置、浏览器式前进/后退历史、书签
 - **指令行缓存** — LRU 缓存（4096 条目），缓存已解码的指令行数据
 - **Pass 结果生命周期** — 以 `shared_ptr` 钉住结果，保证线程安全的跨组件访问
 
-前端在构造时接收 `TenetService&`，并将所有共享状态操作委托给它。观察者模式（`TenetServiceObserver`）向已订阅的前端异步推送通知（pass 完成、导航变更、书签切换等）。后端对象（TraceReader、TraceIndex、RegisterFile、MemoryModel、CodeTable、InstructionDecoder）在 `main()` 中创建并以引用传入——TenetService 不持有它们的所有权。
+进程内入口及服务适配器在构造时接收 `TenetService&`，并将共享状态操作委托给它；Tauri 的浏览器端 Web UI 则经 FlatBuffers WebSocket 间接访问。观察者模式（`TenetServiceObserver`）向已订阅的入口异步推送通知（pass 完成、导航变更、书签切换等）。后端对象（TraceReader、TraceIndex、RegisterFile、MemoryModel、CodeTable、InstructionDecoder）在 `main()` 中创建并以引用传入——TenetService 不持有它们的所有权。
 
 ## 模式分流
 
 ### 交互模式
 
-- **GUI**：macOS 默认图形入口，强调浏览体验与多面板可视化。
-- **TUI**：终端环境入口，适合 SSH 和远程分析。
+- **Tauri 前端**：独立的 Tauri + React/TypeScript 桌面应用位于 `tools/tenet/web/`。Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动 `tenet`，浏览器端 Web UI 仅通过 `ws://127.0.0.1:<port>` 的 FlatBuffers WebSocket 完成多面板浏览与可视化；并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，不是 Web UI 的回退链路。它不是 `main.cpp` 内部的分支。
+- **TUI**：`tenet` 自带的终端交互入口，适合 SSH 和远程分析。
+
+`tenet` 可执行文件本身是纯分析后端，不创建原生图形窗口；原生 ImGui + Metal + SDL3 GUI 及 `TENET_ENABLE_GUI` 已移除。
 
 ### 批处理模式
 
@@ -111,10 +113,10 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 | 模式 | 入口 | 说明 |
 |------|------|------|
-| RPC | `--rpc` | Unix socket JSON-RPC，适合本地工具接入 |
+| RPC | `--rpc [[host:]port]` | TCP JSON-RPC；默认绑定 `127.0.0.1:0`（loopback），可显式指定其他 host，端口 0 由 OS 自动分配 |
 | MCP stdio | `--mcp` | AI 客户端拉起 tenet 子进程时使用 |
 | MCP HTTP | `--mcp-http` | 单实例 Streamable HTTP，默认监听 `127.0.0.1:10444` |
-| MCP Hub | `--mcp-hub` / GUI 自动启动 | `10444` 上统一承载 MCP HTTP、Worker TCP 与按实例路由的 JSON WebSocket；首实例为 Hub，其他实例为 Worker |
+| MCP Hub | `--mcp-hub` / Tauri sidecar 并行启动 | `10444` 上统一承载 MCP HTTP、Worker TCP 与按实例路由的 JSON WebSocket，面向 AI 工具与 IDAPython 等外部客户端；不参与 Web UI 渲染 |
 | Hub WS | `ws://127.0.0.1:10444/ws/<instance-id>` | 仅回环访问的 JSON-RPC/MCP 长连接，面向 IDAPython 等交互式客户端；Worker 掉线时关闭其绑定会话 |
 | WS | `--ws-port <port>` | 独立高性能 WebSocket 二进制协议（uWebSockets + FlatBuffers），面向 Web/Tauri 前端 |
 | Streaming | `--streaming` | tail 正在增长的 trace，做实时增量索引 |
@@ -139,11 +141,11 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 3. `RegisterFile::state_before(inst_id)` 直接定位稠密 checkpoint，并最多回放 K-1 条 diff。
 4. `CodeTable::opcode_at(pc)` 取 opcode，必要时走 `ImageFallback`。
 5. `InstructionDecoder` 把 opcode 反汇编成 mnemonic / operands。
-6. GUI/TUI 通过 `TenetService` 的行缓存获取 `InstructionRow` 并渲染。
+6. TUI 直接通过 `TenetService` 的行缓存获取 `InstructionRow`；Tauri 的浏览器端 Web UI 仅经 FlatBuffers WebSocket 获取结构化数据并渲染。
 
 ### 从"点击分析按钮"到"拿到结果"
 
-1. Frontend 调用 `TenetService::run_pass("cfg_layout")`。
+1. TUI 或 WS / MCP 服务适配器调用 `TenetService::run_pass("cfg_layout")`；Tauri 的浏览器端 Web UI 通过 FlatBuffers WebSocket 发起对应请求。
 2. TenetService 委托 `PassManager::require("cfg_layout")` 自动解析依赖链。
 3. 依赖 pass 先执行，结果缓存进 `PassEntry`。
 4. 当前 pass 消费 `PassContext` 与上游结果，生成 `PassResult`。
@@ -154,6 +156,8 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 - `src/analysis/pass_registry.cpp` 当前维护 **30 个 pass**。
 - MCP 工具由 `src/io/mcp/mcp_tools_{core,analysis,ai,vm}.cpp` 分组注册；基础服务与 Hub/session 模式的实际数量不同，启动日志会打印本实例的准确值。
 - CLI 参数集中在 `src/cli_options.cpp`，批处理执行集中在 `src/batch_analysis.cpp`。
+- Windows / Linux / macOS 的 socket 与进程 API、内存映射、用户配置目录和文件锁差异分别由 `platform_compat.h`、`platform_mmap.h`、`platform_paths.h`、`platform_file_lock.h` 收敛。
+- 后端与 Tauri 前端面向 Windows、Linux、macOS 的 x86_64 / arm64 构建；Windows 默认关闭 `TENET_ENABLE_WS`，因此 Web UI 暂时无法连接后端获取实时数据，这是待补齐 WS 支持的已知限制。Windows / Linux CI 持续验证中，尚未完成真实物理机上的完整人工验收。
 
 ## 扩展点
 
@@ -166,10 +170,10 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 ### 新增一个前端能力
 
-- **GUI**：在 `gui/panels_*.cpp` 增加面板或上下文菜单。
+- **Tauri 前端**：可视化、面板与交互在 `tools/tenet/web/` 实现；Web UI 所需的新后端数据应在 `src/ws/` 增加接口，`src/io/mcp/` 则服务 AI 工具、IDA 插件等外部客户端。
 - **TUI**：在 `tui/panels/` 或 `tui_app.cpp` 增加面板或命令。
 - **CLI**：在 `batch_analysis.cpp` 追加结果序列化逻辑。
-- **服务模式**：在 `rpc_server.cpp` 或 `src/io/mcp/` 加新接口。
+- **服务模式**：在 `rpc_server.cpp`、`src/ws/` 或 `src/io/mcp/` 加新接口。
 
 ## 文档地图
 
@@ -183,6 +187,6 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 | [`core-layer.md`](core-layer.md) | 寄存器 / 内存 / 解码 / Triton |
 | [`analysis-layer.md`](analysis-layer.md) | Infra 服务、pass 分类、依赖、调度、融合 |
 | [`pass-cookbook.md`](pass-cookbook.md) | 新增 pass 的实操开发指南 |
-| [`ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP |
+| [`ui-layer.md`](ui-layer.md) | Tauri 前端对接 / TUI / CLI / RPC / MCP / WS |
 | [`trace-format.md`](trace-format.md) | 与 qbditrace 的格式契约 |
 | [`profiling.md`](profiling.md) | 性能分析、Instruments、优化方法论 |

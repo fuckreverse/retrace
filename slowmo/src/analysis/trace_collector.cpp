@@ -6,8 +6,6 @@
 #include <atomic>
 #include <cstring>
 
-#include <sys/mman.h>
-
 namespace tenet {
 
 // ─── Raw pointer helpers ──────────────────────────────────────────────────

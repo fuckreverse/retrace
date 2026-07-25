@@ -6,100 +6,64 @@
 
 | 入口 | 文件 | 触发方式 | 适用场景 |
 |------|------|----------|----------|
-| GUI | `src/gui/` | 默认（macOS 且启用 GUI） | 图形化浏览、大 trace 交互分析 |
+| Tauri 前端 | `tools/tenet/web/` | 独立启动 Tauri 应用，通过 sidecar 拉起 `tenet` 子进程 | 图形化浏览、大 trace 交互分析 |
 | TUI | `src/tui/` | `--tui` | 终端环境、远程 SSH |
 | CLI 批处理 | `src/cli_options.cpp` + `src/batch_analysis.cpp` | 任意分析选项 | 批量分析、导出、脚本化 |
-| RPC | `src/io/rpc_server.cpp` | `--rpc [path]` | 本地工具经 Unix socket 接入 |
+| RPC | `src/io/rpc_server.cpp` | `--rpc [[host:]port]` | TCP JSON-RPC；默认 loopback，可自定义 host |
 | MCP stdio | `src/io/mcp/` | `--mcp` | AI 客户端通过子进程 stdio 接入 |
-| MCP HTTP | `src/io/mcp/` | `--mcp-http [host:port]` | 远程 / GUI 宿主 / 无 stdio 场景 |
-| MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | 多实例统一入口；Worker 断线自动重连 |
-| WS | `src/ws/` | `--ws-port <port>` | 高性能二进制 WebSocket，面向 Web/Electron 前端 |
+| MCP HTTP | `src/io/mcp/` | `--mcp-http [host:port]` | AI 客户端 / 远程 / 无 stdio 场景 |
+| MCP Hub | `src/io/mcp/mcp_hub.*` | `--mcp-hub [host:port]` | AI 工具、IDA 插件等外部客户端的多实例统一入口 |
+| WS | `src/ws/` | `--ws-port <port>` | 高性能二进制 WebSocket，面向 Tauri / Web 前端 |
 | Streaming | `src/io/streaming_index.*` | `--streaming` | 边录制边索引边分析 |
 
 ```mermaid
 flowchart TD
-    A[main.cpp] --> B{has_analysis_option?}
-    B -- yes --> C[run_batch_analysis]
-    B -- no --> S[TenetService]
-    S --> D{--tui or no GUI?}
-    D -- no --> E[GuiApp]
-    D -- yes --> F[TuiApp]
-    C --> G{service mode?}
-    G -- --rpc --> H[TenetRpcService]
-    G -- --mcp --> I[TenetMcpService stdio]
-    G -- --mcp-http --> J[TenetMcpService HTTP]
-    G -- --mcp-hub --> M{Hub election}
-    M -- win --> N[Hub: listen on configured port\ndefault 10444]
-    M -- lose --> O[Worker: reverse-connect to Hub]
-    C --> K{--streaming?}
-    K -- yes --> L[StreamingIndex]
-    S --> P{--ws-port?}
-    P -- yes --> Q[TenetWSService]
+    T[Tauri desktop app] -.->|"sidecar: --ws-port &lt;port&gt; / --mcp-hub"| A[main.cpp]
+    A --> B{运行模式?}
+    B -->|CLI analysis options| C[run_batch_analysis]
+    B -->|"--tui"| S[TenetService]
+    S --> F[TuiApp]
+    B -->|"--rpc"| H[TenetRpcService]
+    B -->|"--mcp"| I[TenetMcpService stdio]
+    B -->|"--mcp-http"| J[TenetMcpService HTTP]
+    B -->|"--mcp-hub"| M{Hub election}
+    M -->|win| N[Hub: listen on configured port\ndefault 10444]
+    M -->|lose| O[Worker: reverse-connect to Hub]
+    B -->|"--ws-port"| Q[TenetWSService]
+    B -->|"--streaming"| L[StreamingIndex]
 ```
 
-## GUI
+## Tauri 前端（Web UI）
 
-### 组成
+图形化体验由 `tools/tenet/web/` 下的独立 Tauri 桌面应用提供。Tauri 的 Rust shell 位于 `web/src-tauri/`，Web 前端位于 `web/src/`，使用 React + TypeScript；`web/src/layout/` 等目录实现窗口框架、侧边栏、标签页、时间线与对话框等交互组件。
 
-- `gui_app.h`：GuiApp 成员、状态与渲染入口声明。
-- `gui_app.mm`：SDL3 + Metal + ImGui 生命周期、窗口与主循环。
-- `panels_*.cpp`（约 30 个翻译单元）：每个功能面板独立成文件，其中大部分是**参数驱动型 Pass 的专属悬浮窗口**（见下）。
-- `navigation.cpp` / `popups.cpp` / `gui_settings.cpp`：导航、弹窗、设置与持久化。
+### 进程与通信模型
 
-### 与 TenetService 的关系
+1. 用户独立启动 Tauri 应用并选择 trace。
+2. Rust shell 通过 Tauri sidecar 机制启动、监控和回收独立的 `tenet` 后端子进程。
+3. Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动后端，同时开启 FlatBuffers WebSocket 服务和 MCP Hub。
+4. 浏览器端 Web UI 仅连接 `ws://127.0.0.1:<port>`，所有浏览与分析请求都使用 uWebSockets + FlatBuffers 二进制协议；不存在 MCP HTTP fallback。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径相互独立。
 
-`GuiApp` 的唯一构造参数是 `TenetService&`。导航（光标跳转、前进/后退历史）、书签管理、指令行获取和 pass 运行均委托给 TenetService。GUI 自身保留独立的异步分析线程和渲染缓存（纹理、布局尺寸等），这些是 UI 侧特有的关注点，不属于共享状态。
+Tauri 是 `tenet` 进程之外的客户端，而不是 `main.cpp` 中的 UI 分支。`tenet` 可执行文件只负责 trace 数据、状态重建、分析 pass 和 RPC / MCP / WS 服务，不创建窗口，也不执行任何图形渲染。
 
-### 核心特性
+### 职责边界
 
-- 多面板：指令、寄存器、内存、调用栈、函数、字符串、线程、CFG、分析结果等。
-- 浏览器式导航历史（由 TenetService 管理状态，GUI 驱动渲染）。
-- 右键上下文菜单触发污点、切片、导出 CFG、设断点等动作。
-- 启动后可异步预热核心 pass，不阻塞 UI。
-- 关闭时走异步 shutdown 流程，先取消分析、再安全回收。
+- 多面板浏览、CFG 与调用图可视化、寄存器/内存查看、pass 参数输入和结果展示均由 Tauri / Web 前端实现。
+- 后端通过 `TenetService` 和 `PassManager` 维护统一的导航与分析语义；`src/ws/` 向 Web UI 暴露结构化接口，`src/io/mcp/` 则向 AI 工具、IDA 插件等外部客户端提供独立接入能力。
+- 前端不复制分析算法；新增图形交互应修改 `tools/tenet/web/`，Web UI 所需的新后端数据应扩展 WS 接口。
 
-### Analysis 面板：无参数 Pass 的统一控制台
+原生 ImGui + Metal + SDL3 GUI、整个 `src/gui/` 目录及 `TENET_ENABLE_GUI` CMake 选项均已完全移除。历史上的多面板、CFG、寄存器/内存等能力正在 Tauri 前端中重新实现；具体交互设计不在本文档范围内，以 `tools/tenet/web/` 中的实现为准。
 
-`render_analysis_panel()`（`panels_analysis.cpp`）是一个按 `PassCategory`（Structure / Taint / Crypto·Pattern / Memory·String / ObjC·Platform API / Profile·Trace / Misc）分组的**扁平 pass 列表**，遍历 `tenet::pass_catalog()` 渲染：
+### 跨平台状态
 
-- 每行显示状态图标（NotRun / Running / Completed / Failed）、显示名、以及 `summarize_pass_result()` 生成的一句话摘要。
-- Running 态显示进度条、百分比与实时 progress message，可单独 Cancel；顶部 Banner 提供 “Stop All”。
-- Completed 态提供 “Rerun”（强制丢缓存重跑）；Failed 态提供重试。
-- 该面板只负责**无参数或参数已内置**的 pass（即直接 `PassManager::require()` 即可运行的那一类）。
-
-### 参数驱动型 Pass：独立悬浮窗口
-
-需要用户先输入查询参数（模式串、地址范围、YARA 规则等）的 pass，**不再共用 Analysis 面板**，而是各自拥有独立窗口，自带输入表单 + 结果表格 + 右键跳转：
-
-| 窗口标题 | 文件 | 对应 pass / 功能 |
-|----------|------|------------------|
-| Memory Search | `panels_mem_search.cpp` | `mem_search`（含原 `literal_search` 的精确值检索） |
-| YARA Memory Scan | `panels_yara_mem_scan.cpp` | `yara_mem_scan` |
-| Window Stats | `panels_window_stats.cpp` | `window_stats` |
-| Dataflow Graph | `panels_dataflow_graph.cpp` | `dataflow_graph` |
-| Register Timeline | `panels_reg_timeline.cpp` | `reg_timeline` |
-| Trace Diff | `panels_trace_diff.cpp` | `trace_diff` |
-| Trace Fold | `panels_trace_fold.cpp` | `trace_fold` |
-| Memory Snapshots | `panels_memory_snapshot.cpp` | `memory_snapshot` |
-| Call Context | `panels_call_context.cpp` | `call_context` |
-| VM Abstract / VM Workspace | `panels_vm_abstract.cpp` | `vm_abstract`（独立悬浮工作区，含 dispatcher/handler 可视化） |
-
-其余高层语义结果（Call Graph、CFG、Constants、Entropy、Loop Semantics、Algorithm Summary、ObjC Messages/Crypto、API Intercepts、Patterns、DWARF 符号信息）也各自拥有独立窗口，但多数无需前置参数输入，展示的是 `PassManager::require()` 的直接结果。
-
-### GUI 与 Analysis 的关系
-
-- 即时显示（比如当前行、寄存器、Hex Dump）通过 `TenetService` 的行缓存和底层 `RegisterFile` / `MemoryModel` / `InstructionDecoder` 获取。
-- 高层结果（比如 CFG、污点、函数列表）通过 `TenetService::run_pass()` 触发，最终委托 `PassManager::require()`。
-- 每个独立窗口自行管理"是否已运行 / 参数是否变化 / 是否需要重跑"的状态，不经过 Analysis 面板的统一列表。
-
-> 每个 pass 的详细作用、对应 GUI 面板的完整使用说明及 TUI 对应，见 [`analysis-layer.md` — Pass 详解与面板使用](analysis-layer.md#pass-详解与面板使用)。
+Tauri 前端与 `tenet` 后端面向 Windows、Linux、macOS 的 x86_64 / arm64 构建。Windows 和 Linux 的 sidecar 准备脚本已提供；但 Windows 上 `TENET_ENABLE_WS` 当前默认关闭，而浏览器端 Web UI 仅实现 FlatBuffers WebSocket 通道，因此 Windows Web UI 暂时无法连接后端获取实时数据。这是需要后续补齐 Windows WS 支持的已知限制，不存在 MCP HTTP 回退。Windows / Linux CI 正在持续运行，尚未在真实物理机上完成完整人工验收。
 
 ## TUI
 
 ### 组成
 
 - `tui_app.h/.cpp`：主循环、状态、键盘绑定、面板切换、`wire_pass_result()`（把 `PassResult` 分发进 `TuiContext` 的各个结果指针）。
-- `tui/tui_context.h`：面板间共享状态，除导航/寄存器/内存引用外，还持有 GUI 侧全部 ~20 个 pass 结果指针（`cfg_result`、`pattern_result`、`vm_abstract_result` 等），以及 `run_pass_fn` 回调（供面板发起 pass 运行请求而无需直接持有 `PassManager`）。
+- `tui/tui_context.h`：面板间共享状态，除导航/寄存器/内存引用外，还持有各类 pass 结果指针（`cfg_result`、`pattern_result`、`vm_abstract_result` 等），以及 `run_pass_fn` 回调（供面板发起 pass 运行请求而无需直接持有 `PassManager`）。
 - `tui/panels/`：寄存器、内存、调用栈、函数、字符串、线程、断点等面板。
 - `tui/panels/results_panel.h/.cpp`：**Analysis Results 面板**（详见下）。
 - `hex_dump_view.*`：终端 Hex Dump 视图。
@@ -111,23 +75,23 @@ flowchart TD
 
 ### 核心特性
 
-- 与 GUI 共享 `InstructionRow` 模型和同一套 `PassManager` / `pass_catalog()`（均由 TenetService 管理）。
+- 使用 `InstructionRow` 模型和由 TenetService 管理的同一套 `PassManager` / `pass_catalog()`。
 - 支持 Goto、搜索、书签、断点、污点跳转、XRef 跳转。
 - 适合无图形环境下的长时间分析（远程 SSH）。
 
 ### Analysis Results 面板：TUI 版统一控制台
 
-GUI 用 ~20 个独立悬浮窗口展示各 pass 结果；终端空间有限，无法照搬多窗口模式。TUI 改为一个**两级结果浏览器**（`A` 键呼出，`ResultsPanel`）：
+原生 GUI 时代曾用 ~20 个独立悬浮窗口展示各 pass 结果，现由 Tauri 前端另行实现；终端空间有限，TUI 使用一个**两级结果浏览器**（`A` 键呼出，`ResultsPanel`）：
 
 - **Level 0（目录视图）**：遍历 `tenet::pass_catalog()`，逐行显示状态图标（NotRun `·` / Running `▶` / Completed `✓` / Failed `×`）、显示名、`summarize_pass_result()` 摘要或运行进度。`Enter` 对 NotRun/Failed 的 pass 发起运行（经 `ctx_.run_pass()` → `TuiApp::run_pass_by_name()`），对 Completed 的 pass 直接进入详情；`R` 强制重跑。
 - **Level 1（详情视图）**：由 `build_result_entries()` 把当前 pass 的结构化结果（CFG blocks、pattern matches、objc messages、mem_search hits、vm_abstract handlers 等）统一适配成 `ResultEntry{text, jump_inst_id, jumpable}` 列表；`Enter` 对可跳转条目导航指令游标到对应位置，`Esc` 返回目录视图。
 - `run_pass_by_name()` 成功后自动调用 `results_panel_->focus_pass(name)` 直接跳进详情视图（`:pass <name>` 命令同样受益），无需用户手动二次导航。
-- 这一设计让**每个 catalog pass 在 TUI 里都有真实可浏览的结果**，而不是过去仅有的 `last_pass_status_` 单行摘要；同时只需一份 `build_result_entries()` 实现即可覆盖所有 pass，避免像 GUI 那样为每个 pass 单开一个面板类。
+- 这一设计让**每个 catalog pass 在 TUI 里都有真实可浏览的结果**，而不是过去仅有的 `last_pass_status_` 单行摘要；同时只需一份 `build_result_entries()` 实现即可覆盖所有 pass，避免为每个 pass 单独维护一个 TUI 面板类。
 - `:pass <name>` / `:passes` / `:analyze` 命令与 `A` 键共享同一套 `pass_registry` 注册与摘要逻辑，保证 TUI 命令行路径与面板路径结果一致。
 
 ## WebSocket 服务
 
-`TenetWSService`（`src/ws/`）是面向 Web/Electron 前端的高性能二进制服务，使用 uWebSockets 做传输、FlatBuffers 做序列化。
+`TenetWSService`（`src/ws/`）是面向 Tauri / Web 前端的高性能二进制服务，使用 uWebSockets 做传输、FlatBuffers 做序列化。
 
 ### 组成
 
@@ -147,11 +111,11 @@ uWS 事件循环在独立线程运行。由于 TenetService 不是线程安全�
 
 ### 与 TenetService 的关系
 
-`TenetWSService` 实现 `TenetServiceObserver` 接口，通过 `TenetService&` 共享全部核心对象。它与 GUI、TUI、MCP 是并列的前端入口，不重复实现分析逻辑。
+`TenetWSService` 实现 `TenetServiceObserver` 接口，通过 `TenetService&` 共享全部核心对象。它与 TUI、MCP 等后端入口并列，并作为 Tauri 前端的主要数据通道，不重复实现分析逻辑。
 
 ### 开启方式
 
-`--ws-port <port>` 启动 WS 服务，可与 GUI、TUI、MCP 等其他前端同时运行。port=0 时由操作系统分配端口。CMake 选项 `TENET_ENABLE_WS=ON/OFF` 控制是否编译 WS 服务（默认 ON）。
+`--ws-port <port>` 启动 WS 服务，可与 TUI、MCP 等其他入口同时运行。port=0 时由操作系统分配端口。CMake 选项 `TENET_ENABLE_WS=ON/OFF` 控制是否编译 WS 服务；macOS / Linux 默认开启，Windows 当前默认关闭。
 
 ## CLI 批处理
 
@@ -181,13 +145,13 @@ CLI 由两部分组成：
 
 ## RPC 服务
 
-`TenetRpcService` 提供本地 JSON-RPC over Unix socket。
+`TenetRpcService` 提供 JSON-RPC over TCP。默认绑定 `127.0.0.1`（loopback）；`--rpc [[host:]port]` 可显式指定其他 host，端口为 `0` 时由操作系统自动分配。
 
 ### 特点
 
-- 适合本地工具链接入。
+- 默认监听 loopback，也可按需绑定显式指定的其他 host；兼容 POSIX / Windows。
 - 默认是单连接串行处理。
-- 通过 `TenetService` 与 GUI / CLI 共用相同的 reader / index / regfile / memory / pass manager。
+- 通过 `TenetService` 与 TUI / CLI / MCP / WS 共用相同的 reader / index / regfile / memory / pass manager。
 
 ### 适合的场景
 
@@ -262,7 +226,7 @@ sequenceDiagram
 
 `--mcp-hub [host:port]` 启用 Hub 架构，解决多 tenet 实例端口管理问题。实现位于 `src/io/mcp/mcp_hub.h/.cpp`。
 
-**架构**：第一个启动的 tenet 实例通过 `flock` 选举成为 Hub，在配置端口（默认 10444）监听；后续实例自动成为 Worker，通过反向 TCP 连接到 Hub，不监听任何端口。MCP 客户端只需连接 Hub 的单一端口即可访问所有实例。
+**架构**：第一个启动的 tenet 实例通过跨平台文件锁选举成为 Hub，在配置端口（默认 10444）监听；后续实例自动成为 Worker，通过反向 TCP 连接到 Hub，不监听任何端口。MCP 客户端只需连接 Hub 的单一端口即可访问所有实例。
 
 **两种工作模式**：
 
@@ -278,7 +242,7 @@ sequenceDiagram
 
 **请求转发**：Hub 收到 `tools/call` 请求后，从参数中提取 `instance`，移除该参数后将剩余 JSON-RPC 转发给目标 Worker。Hub 自身的实例请求在本地处理。
 
-**故障行为**：Hub 通过 `flock(LOCK_EX | LOCK_NB)` 完成启动时选举，进程崩溃后内核会自动释放锁。Worker 会检测连接断开并持续重连，但当前运行主路径不会让存量 Worker 自动重新竞选并接管 Hub；需要新实例启动或外部拉起完成重新选主。因此这里只保证自动重连，不承诺无缝自动 failover。
+**故障行为**：Hub 通过 `platform_file_lock.h` 封装的 POSIX / Windows 文件锁完成启动时选举，进程崩溃后锁会被释放。Worker 会检测连接断开并持续重连，但当前运行主路径不会让存量 Worker 自动重新竞选并接管 Hub；需要新实例启动或外部拉起完成重新选主。因此这里只保证自动重连，不承诺无缝自动 failover。
 
 **协议复用**：Hub 在单一端口上承载三类本地连接，通过握手内容区分：以 `WORKER/1.0\n` 开头的是 Worker 反向连接（newline-delimited JSON-RPC over TCP），普通 HTTP 请求进入 `/mcp`，WebSocket Upgrade 请求进入 `/ws/<instance-id>`。Hub WebSocket 使用 JSON 文本帧承载 JSON-RPC/MCP 调用，按 URL 中的实例 ID 固定路由，并仅接受回环地址；它与 `--ws-port` 提供的 FlatBuffers 二进制 WebSocket 是两个不同协议。
 
@@ -291,7 +255,7 @@ flowchart TD
     Hub -->|TCP reverse| W2[Worker 2]
     W1 --> W1MCP[TenetMcpService]
     W2 --> W2MCP[TenetMcpService]
-    Hub -.->|flock election| Lock[(~/.tenet/mcp-hub.lock)]
+    Hub -.->|cross-platform file-lock election| Lock[(user config dir / mcp-hub.lock)]
 ```
 
 **CLI 用法**：
@@ -309,7 +273,7 @@ flowchart TD
 ./tenet --mcp-hub --mcp-hub-name "app-analysis" trace.bin
 ```
 
-**GUI 集成**：GUI 的 MCP Server 设置页自动尝试 Hub 模式（端口 10444），失败则降级为 Worker，再降级为独立 HTTP。状态指示器显示 Hub（绿）、Worker（蓝）、Standalone（绿）、Stopped（灰）四种状态。
+**与 Tauri 的关系**：Rust sidecar 会并行启动 `--mcp-hub`，但浏览器端 Web UI 不连接 MCP HTTP/Hub，也没有 MCP fallback。Hub 服务用于 AI 工具、IDAPython 插件等外部客户端接入同一个 tenet 实例，与 Web UI 使用的 `--ws-port` FlatBuffers 通道相互独立。
 
 ### IDAPython Bridge
 
@@ -352,10 +316,10 @@ MCP 不只是把 CLI 包了一层，而是额外提供了：
 tenet 的日志（`src/common/logger.h`，纯头文件）在 Level 之外叠加了 **Module** 维度，用于聚焦排查某个子系统：
 
 - **Level**：`Off/Error/Warn/Info/Debug/Trace`，由环境变量 `TENET_LOG` 控制（`0-4` 或名字）。
-- **Module**：`General/Mcp/Io/Core/Analysis/Gui/Tui/Batch`（8 个，`Module::Count` 为哨兵），由环境变量 `TENET_LOG_MODULES=mcp,io` 控制（逗号分隔白名单；不设置 = 全部模块开启，向后兼容，不给现有用户增加噪音）。
+- **Module**：`General/Mcp/Io/Core/Analysis/Gui/Tui/Batch`（8 个，`Module::Count` 为哨兵），由环境变量 `TENET_LOG_MODULES=mcp,io` 控制（逗号分隔白名单；不设置 = 全部模块开启）。其中 `Gui` 是为日志兼容保留的分类，不代表原生 GUI 仍然存在。
 - 新代码推荐使用 `LOG_INFO_M(Module::Mcp, "...")` 等带模块标签的宏；旧代码不加标签等价于 `Module::General`，行为不变。
-- **GUI Output 面板**（`panels_log.cpp`，即 `render_log_panel()`）始终接收全部模块的日志，`TENET_LOG_MODULES` 只影响 stderr 输出；面板自身提供独立的 Level 下拉 + Module 多选下拉（复选框，位掩码）+ 文本子串过滤，三者可组合，互不影响 stderr 侧的过滤逻辑。
-- Output 面板对 `Module::General` 的消息不显示模块 tag（与引入模块系统之前的输出保持视觉一致）。
+- Tauri Rust shell 捕获 sidecar 的 stdout / stderr，并把日志事件转发给 Web 前端的 Output 面板；`TENET_LOG_MODULES` 仍只控制后端 stderr 的模块过滤。
+- Web 前端负责日志级别、模块和文本过滤等展示行为，后端日志系统不依赖任何图形 UI。
 
 ## Streaming 模式
 
@@ -377,8 +341,8 @@ tenet 的日志（`src/common/logger.h`，纯头文件）在 Level 之外叠加�
 
 1. **不重复实现分析逻辑**：前端只通过 TenetService 触发 pass，不复写算法。
 2. **保持结构化输出**：CLI / RPC / MCP 优先返回 JSON / DOT / 文本摘要，而不是不可解析日志。
-3. **共享核心对象**：所有前端通过同一个 `TenetService` 实例共享 reader / index / regfile / memory / pass manager。
-4. **入口语义清晰**：GUI/TUI 偏交互；CLI 偏批处理；RPC/MCP 偏集成；streaming 偏实时索引。
+3. **共享核心对象**：进程内入口通过同一个 `TenetService` 实例共享 reader / index / regfile / memory / pass manager；Tauri 的浏览器端 Web UI 经 FlatBuffers WS 间接访问，MCP 则供外部客户端独立接入。
+4. **入口语义清晰**：Tauri 前端 / TUI 偏交互；CLI 偏批处理；RPC / MCP / WS 偏集成；streaming 偏实时索引。
 
 ## 继续阅读
 

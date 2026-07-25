@@ -37,7 +37,7 @@ static bool contains(const std::vector<uint8_t>& data, const char* needle, size_
 // ─── BackgroundWriter tests ─────────────────────────────────────────────────
 
 TEST_CASE("BackgroundWriter: start creates writable file", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_start.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_start.bin").string();
     BackgroundWriter bw;
 
     REQUIRE(bw.start(path.c_str(), 4096));
@@ -51,7 +51,7 @@ TEST_CASE("BackgroundWriter: start creates writable file", "[unit][qbditrace][ri
 }
 
 TEST_CASE("BackgroundWriter: double stop is idempotent", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_double_stop.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_double_stop.bin").string();
     BackgroundWriter bw;
 
     REQUIRE(bw.start(path.c_str(), 4096));
@@ -70,7 +70,7 @@ TEST_CASE("BackgroundWriter: ok() is false before start", "[unit][qbditrace][rin
 // ─── Header-first ordering ───────────────────────────────────────────────────
 
 TEST_CASE("BackgroundWriter: header bytes precede chunk payload", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_header.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_header.bin").string();
     BackgroundWriter bw;
     REQUIRE(bw.start(path.c_str(), 64));  // tiny chunks → forced rotation
 
@@ -102,7 +102,7 @@ TEST_CASE("BackgroundWriter: header bytes precede chunk payload", "[unit][qbditr
 // ─── ThreadBuffer tests ──────────────────────────────────────────────────────
 
 TEST_CASE("ThreadBuffer: basic reserve + flush writes both messages", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_tb_basic.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_tb_basic.bin").string();
     BackgroundWriter bw;
     REQUIRE(bw.start(path.c_str(), 4096));
 
@@ -132,7 +132,7 @@ TEST_CASE("ThreadBuffer: basic reserve + flush writes both messages", "[unit][qb
 }
 
 TEST_CASE("ThreadBuffer: thread IDs are stored correctly", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_tb_ids.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_tb_ids.bin").string();
     BackgroundWriter bw;
     REQUIRE(bw.start(path.c_str(), 256));
 
@@ -164,7 +164,7 @@ TEST_CASE("ThreadBuffer: thread IDs are stored correctly", "[unit][qbditrace][ri
 // ─── Chunk rotation ──────────────────────────────────────────────────────────
 
 TEST_CASE("BackgroundWriter: chunk rotation preserves record order", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_rotate.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_rotate.bin").string();
     BackgroundWriter bw;
     // Very small chunk size → many rotations
     REQUIRE(bw.start(path.c_str(), 128));
@@ -198,7 +198,7 @@ TEST_CASE("BackgroundWriter: chunk rotation preserves record order", "[unit][qbd
 // ─── Large record data integrity ─────────────────────────────────────────────
 
 TEST_CASE("BackgroundWriter: large records preserve data integrity", "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_large.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_large.bin").string();
     BackgroundWriter bw;
     REQUIRE(bw.start(path.c_str(), 1024));  // 1 KB chunks
 
@@ -255,7 +255,7 @@ TEST_CASE("BackgroundWriter: large records preserve data integrity", "[unit][qbd
 
 TEST_CASE("BackgroundWriter: concurrent ThreadBuffers produce distinct output",
           "[unit][qbditrace][ring_buffer]") {
-    const std::string path = "/tmp/catch2_rb_multi.bin";
+    const std::string path = (std::filesystem::temp_directory_path() / "catch2_rb_multi.bin").string();
     BackgroundWriter bw;
     REQUIRE(bw.start(path.c_str(), 256));
 

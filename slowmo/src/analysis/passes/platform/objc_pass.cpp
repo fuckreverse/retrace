@@ -10,7 +10,6 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <cstring>
-#include <sys/mman.h>
 
 namespace tenet {
 

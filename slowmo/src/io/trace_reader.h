@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/platform_mmap.h"
 #include "common/types.h"
 #include "TraceFormat.h"
 #include "io/block_cache_reader.h"
@@ -590,7 +591,7 @@ public:
     /// LRU cache size (smaller is fine for sequential scans — 4~8 blocks).
     ThreadReader create_thread_reader(size_t cache_blocks = 8) const {
         ThreadReader tr;
-        tr.mmap_base_ = static_cast<const uint8_t*>(mapped_);
+        tr.mmap_base_ = mapped_file_.data();
         tr.header_size_ = header_size_;
         if (block_cache_) {
             tr.local_cache_ = block_cache_->clone(cache_blocks);
@@ -629,7 +630,7 @@ public:
     /// returns the mmap base pointer.  For block-compressed traces, this
     /// returns nullptr — callers must use data_at() instead.
     const uint8_t* data() const {
-        return static_cast<const uint8_t*>(mapped_);
+        return mapped_file_.data();
     }
 
     /// Access byte at a given logical file offset.
@@ -727,16 +728,14 @@ private:
 
     /// Decompress a stream-compressed trace to a temp file (legacy path).
     static Result<TraceReader> decompress_to_temp(
-        TraceReader&& reader, int raw_fd, void* raw_mapped, uint64_t raw_size);
+        TraceReader&& reader, platform::MappedFile raw_mapping);
 
     /// Initialize block-compressed reading mode.
     static Result<TraceReader> init_block_compressed(
         TraceReader&& reader);
 
     std::filesystem::path path_;
-    int fd_ = -1;
-    void* mapped_ = nullptr;
-    uint64_t raw_file_size_ = 0;   // actual file size on disk (for mmap)
+    platform::MappedFile mapped_file_;
     uint64_t logical_size_ = 0;    // logical size (header + decompressed records)
     uint64_t header_size_ = 0;     // file header size (536 bytes)
     FileHeader header_;

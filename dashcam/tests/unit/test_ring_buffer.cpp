@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -46,7 +47,8 @@ static std::vector<uint8_t> read_file(const char* path) {
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 static void test_background_writer_start_stop(void) {
-    const char* path = "/tmp/test_rb_start_stop.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_start_stop.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
 
     assert(bw.start(path, 4096));
@@ -64,7 +66,8 @@ static void test_background_writer_start_stop(void) {
 }
 
 static void test_header_first_then_chunks(void) {
-    const char* path = "/tmp/test_rb_header.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_header.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
     assert(bw.start(path, 64));  // small chunk to force rotation
 
@@ -102,7 +105,8 @@ static void test_header_first_then_chunks(void) {
 }
 
 static void test_chunk_rotation(void) {
-    const char* path = "/tmp/test_rb_rotate.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_rotate.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
     // Very small chunks (128 bytes) to force frequent rotation
     assert(bw.start(path, 128));
@@ -145,7 +149,8 @@ static void test_chunk_rotation(void) {
 }
 
 static void test_thread_buffer_reserve_and_flush(void) {
-    const char* path = "/tmp/test_rb_flush.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_flush.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
     assert(bw.start(path, 4096));
 
@@ -183,7 +188,8 @@ static void test_thread_buffer_reserve_and_flush(void) {
 }
 
 static void test_data_integrity_large_records(void) {
-    const char* path = "/tmp/test_rb_large.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_large.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
     assert(bw.start(path, 1024));  // 1KB chunks
 
@@ -240,7 +246,8 @@ static void test_data_integrity_large_records(void) {
 }
 
 static void test_multiple_thread_buffers(void) {
-    const char* path = "/tmp/test_rb_multi.bin";
+    const std::string path_str = (std::filesystem::temp_directory_path() / "test_rb_multi.bin").string();
+    const char* path = path_str.c_str();
     BackgroundWriter bw;
     assert(bw.start(path, 256));
 

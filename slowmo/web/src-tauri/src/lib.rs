@@ -139,18 +139,32 @@ fn third_party_notice_path(resource_dir: PathBuf) -> PathBuf {
     resource_dir.join("licenses").join("THIRD-PARTY-NOTICES.txt")
 }
 
-#[cfg(target_os = "macos")]
+/// Open the bundled third-party license notice file in the OS's default
+/// text/file viewer. Each platform resolves "open with default app" via a
+/// different well-known launcher binary — `open` (macOS), `explorer`
+/// (Windows; note it returns a non-zero exit status even on success for
+/// some file associations, so we don't treat spawn success as a hard
+/// contract beyond "the process launched"), and `xdg-open` (Linux desktop
+/// environments, part of xdg-utils).
 fn open_third_party_notices(app: &tauri::AppHandle) -> Result<(), String> {
     let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
     let notice = third_party_notice_path(resource_dir);
     if !notice.is_file() {
         return Err(format!("Third-party notice not found: {}", notice.display()));
     }
-    std::process::Command::new("open")
+
+    #[cfg(target_os = "macos")]
+    let launcher = "open";
+    #[cfg(target_os = "windows")]
+    let launcher = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let launcher = "xdg-open";
+
+    std::process::Command::new(launcher)
         .arg(&notice)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("Failed to open {}: {e}", notice.display()))
+        .map_err(|e| format!("Failed to open {} via {launcher}: {e}", notice.display()))
 }
 
 // ── Tauri commands ──────────────────────────────────────────────────────────
@@ -601,7 +615,6 @@ let app_menu = SubmenuBuilder::new(handle, "Tenet")
         if let Some(path) = id.strip_prefix("file_recent:") {
             let _ = app_handle.emit("menu://file_recent", path);
         } else if id == "third_party_software" {
-            #[cfg(target_os = "macos")]
             if let Err(error) = open_third_party_notices(app_handle) {
                 log::error!("{error}");
             }
@@ -614,21 +627,33 @@ let app_menu = SubmenuBuilder::new(handle, "Tenet")
 }
 
 /// Truncate a filesystem path to at most `max_len` characters, preserving the
-/// tail (filename + parent directory) and prefixing with "…/" if shortened.
+/// tail (filename + parent directory) and prefixing with an ellipsis + the
+/// platform's path separator if shortened.
+///
+/// Operates on Unicode scalar values (`chars()`), not bytes: naively slicing
+/// `&path[start..]` at a byte offset can panic ("byte index N is not a char
+/// boundary") whenever that offset lands inside a multi-byte UTF-8 sequence
+/// — trace paths routinely contain non-ASCII directory/file names, so this
+/// isn't just a theoretical edge case.
 fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        return path.to_string();
-    }
-    // Keep the last `max_len - 2` characters and prepend "…/"
-    let start = path.len() - (max_len - 2);
-    format!("…/{}", &path[start..])
+let char_count = path.chars().count();
+if char_count <= max_len {
+return path.to_string();
+}
+let sep = if path.contains('\\') && !path.contains('/') { '\\' } else { '/' };
+// Keep the last `max_len - 2` *characters* (accounting for the 2-column-
+// wide ellipsis + separator prefix) and prepend "…<sep>".
+let keep = max_len.saturating_sub(2);
+let start = char_count - keep;
+let tail: String = path.chars().skip(start).collect();
+format!("\u{2026}{sep}{tail}")
 }
 
 // ── Entrypoint ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::third_party_notice_path;
+    use super::{third_party_notice_path, truncate_path};
     use std::path::PathBuf;
 
     #[test]
@@ -637,6 +662,43 @@ mod tests {
             third_party_notice_path(PathBuf::from("/Tenet.app/Contents/Resources")),
             PathBuf::from("/Tenet.app/Contents/Resources/licenses/THIRD-PARTY-NOTICES.txt")
         );
+    }
+
+    #[test]
+    fn truncate_path_leaves_short_paths_untouched() {
+        assert_eq!(truncate_path("/tmp/a.bin", 60), "/tmp/a.bin");
+    }
+
+    #[test]
+    fn truncate_path_shortens_long_posix_paths() {
+        let long = "/Users/someone/very/deeply/nested/directory/structure/trace.bin";
+        let result = truncate_path(long, 40);
+        assert!(result.chars().count() <= 40);
+        assert!(result.starts_with('\u{2026}'));
+        assert!(result.ends_with("trace.bin"));
+    }
+
+    #[test]
+    fn truncate_path_keeps_windows_backslash_separator() {
+        let long = r"C:\Users\someone\very\deeply\nested\directory\trace.bin";
+        let result = truncate_path(long, 40);
+        assert!(result.chars().count() <= 40);
+        assert!(result.starts_with('\u{2026}'));
+        assert!(result.contains('\\'));
+        assert!(!result.contains('/'));
+    }
+
+    #[test]
+    fn truncate_path_does_not_panic_on_multibyte_utf8_boundaries() {
+        // Regression test: a byte-index slice (`&path[start..]`) can panic
+        // with "byte index N is not a char boundary" once the path contains
+        // multi-byte UTF-8 characters (e.g. CJK directory/file names), since
+        // the byte offset that looks right for ASCII no longer aligns with a
+        // char boundary. truncate_path must operate on chars(), not bytes.
+        let long = "/用户/某人/非常/深层/嵌套的/目录/结构/跟踪文件名称.bin";
+        let result = truncate_path(long, 20);
+        assert!(result.chars().count() <= 20);
+        assert!(result.starts_with('\u{2026}'));
     }
 }
 

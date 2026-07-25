@@ -5,15 +5,17 @@
 1. **环境安装**（宿主机 + 目标设备）
 2. **编译** qbditrace + tenet
 3. **录制** trace（iOS / Android）
-4. **分析** trace（GUI / TUI / CLI / MCP）
+4. **分析** trace（Tauri Web 前端 / TUI / CLI / RPC / MCP / WS）
 
 ---
 
 ## 一、环境安装
 
-### 1.1 宿主机（macOS arm64，开发端）
+### 1.1 宿主机（Windows / Linux / macOS）
 
-**基础工具链：**
+`tenet` 后端与 Tauri 前端以 Windows（x86_64/arm64）、Linux（x86_64/arm64）、macOS（x86_64/arm64）为构建运行目标。三平台 CI 已建立，但尚未在真实 Windows/Linux 物理机上完成完整人工验收。以下安装命令仍以 macOS 开发环境为例；其他平台请安装对应的 CMake、Ninja、C++ 工具链及所需可选依赖。
+
+**基础工具链（macOS 示例）：**
 
 ```bash
 # Xcode Command Line Tools
@@ -49,9 +51,6 @@ pip3 install frida frida-tools
 
 # YARA（模式规则匹配，可选）
 brew install yara
-
-# SDL3（GUI 渲染，tenet GUI 模式必须）
-brew install sdl3
 ```
 
 **zstd（trace 压缩，通过 FetchContent 自动下载，通常无需手动安装）**
@@ -147,7 +146,7 @@ adb shell chmod 644 /data/local/tmp/libqbditrace.so
 
 ---
 
-### 2.3 编译 tenet 分析器（macOS host）
+### 2.3 编译 tenet 后端（Windows / Linux / macOS host）
 
 **首次构建：**
 
@@ -177,16 +176,17 @@ ninja -j$(nproc)          # 改单个 .cpp 通常 3-4 秒
 | 选项 | 默认 | 说明 |
 |------|------|------|
 | `CMAKE_BUILD_TYPE` | `RelWithDebInfo` | `Debug`/`RelWithDebInfo`/`Release`；Release 启用 ThinLTO，Apple Silicon host 还启用 `-mcpu=apple-m1` |
-| `TENET_ENABLE_TRITON` | `ON` | Triton 精确语义污点（需预装 libTriton） |
-| `TENET_ENABLE_YARA` | `ON` | YARA 模式匹配（需 `brew install yara`） |
-| `TENET_ENABLE_GUI` | `ON` | ImGui + SDL3 GUI（macOS 默认开） |
+| `TENET_ENABLE_TRITON` | Windows `OFF`，其他平台 `ON` | Triton 精确语义污点（需预装 libTriton） |
+| `TENET_ENABLE_YARA` | Windows `OFF`，其他平台 `ON` | YARA 模式匹配（需预装 YARA） |
 | `TENET_BUILD_TESTS` | `ON` | 单元测试 |
 | `TENET_ENABLE_TBB` | `ON` | Intel TBB 并行排序、DAG 调度与 Scan Fusion |
-| `TENET_ENABLE_RPC` | `ON` | Unix socket JSON-RPC 服务 |
-| `TENET_ENABLE_WS` | `ON` | uWebSockets + FlatBuffers 服务 |
-| `TENET_ENABLE_PROFILING` | `ON` | macOS `os_signpost` 插桩 |
+| `TENET_ENABLE_RPC` | `ON` | TCP loopback JSON-RPC 服务 |
+| `TENET_ENABLE_WS` | Windows `OFF`，Linux/macOS `ON` | uWebSockets + FlatBuffers 服务；Windows 支持仍待补齐 |
+| `TENET_ENABLE_PROFILING` | `ON` | 仅 macOS 生效的 `os_signpost` 插桩 |
 | `TENET_ENABLE_PYTHON` | `OFF` | pybind11 Python 绑定 |
 | `TENET_PGO_MODE` | 空 | `generate` / `use` 两阶段 PGO |
+
+跨平台兼容层位于 `src/common/platform_compat.h`、`platform_mmap.h`、`platform_paths.h`、`platform_file_lock.h`。`tenet` 可执行文件只包含 CLI / TUI / RPC / MCP / WS 等后端能力，不再包含 ImGui、Metal、SDL3 或其他原生窗口/渲染代码。
 
 不带 Triton 的快速构建：
 
@@ -391,32 +391,20 @@ tenet --stats trace.bin
 
 ## 五、用 tenet 分析 trace
 
-### 5.1 交互式 GUI（macOS，推荐入手方式）
+### 5.1 Tauri Web 前端（跨平台图形化入口）
+
+图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供。Tauri 的 Rust shell 以 `--ws-port <port> <trace_path> --mcp-hub` 通过 sidecar 启动和管理 `tenet` 后端子进程；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
+
+开发模式使用仓库中已有脚本：
 
 ```bash
-cd tools/tenet/build
-./tenet /path/to/trace.bin
+cd tools/tenet/web
+pnpm tauri:dev
 ```
 
-**GUI 主要面板：**
+Tauri 前端提供时间轴、指令、寄存器、内存/Hex Dump、函数与调用栈、CFG、字符串及分析结果等浏览和可视化能力。`tenet` 后端本身不会打开窗口；直接执行 `./tenet trace.bin` 应配合 CLI 选项、TUI 或服务模式使用。
 
-| 面板 | 快捷键/位置 | 用途 |
-|------|------------|------|
-| 指令视图 | 主面板 | 时间轴浏览，上下导航指令 |
-| 寄存器 | 右侧面板 | 查看任意指令点的寄存器值 |
-| 内存 / Hex Dump | 下方面板 | 查看任意时刻的内存内容 |
-| 函数列表 | View → Functions | 已识别函数、跳转、过滤 |
-| 调用栈 | View → Call Stack | 当前位置的调用链 |
-| CFG | 右键 → Show CFG | 当前函数控制流图 |
-| 字符串 | View → Strings | 所有运行时字符串 |
-| 分析结果 | Analysis 菜单 | 触发各类 pass 并查看结果 |
-
-**基本导航：**
-
-- `↑` / `↓`：逐条指令移动
-- `PgUp` / `PgDn`：快速滚动
-- 双击函数名：跳转到函数入口
-- 右键指令：触发污点、切片、跳转等操作
+> Windows 默认关闭 `TENET_ENABLE_WS`，而浏览器端 Web UI 仅实现 FlatBuffers WebSocket 通道，因此 Windows Web UI 暂时无法连接后端获取实时数据。这是待补齐 Windows WS 支持的已知限制，不存在 MCP HTTP 过渡方案。
 
 ---
 
@@ -427,7 +415,7 @@ cd tools/tenet/build
 ./tenet --tui /path/to/trace.bin
 ```
 
-TUI 提供与 GUI 类似的多面板浏览体验，通过键盘操作。
+TUI 提供终端内的多面板浏览体验，通过键盘操作，并与 Tauri 前端复用同一套后端 Core 和 Analysis。
 
 ---
 
@@ -565,7 +553,7 @@ scp -P 2222 root@localhost:/var/mobile/Documents/crypt.bin ./crypt.bin
 ./tenet crypt.bin --backward-taint <inst_id_of_key_use> 0
 
 # Step 6：交互式深入
-./tenet crypt.bin   # GUI 打开，右键污点/切片
+# 在 Tauri 前端中打开 crypt.bin，浏览时间轴并触发污点等分析
 ```
 
 #### 场景二：分析 ObjC App 的行为
@@ -579,8 +567,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 # ObjC 方法调用链分析
 ./tenet objc.bin --objc --call-graph cg.dot
 
-# GUI 浏览 ObjC 调用边界
-./tenet objc.bin
+# 在 Tauri 前端中打开 objc.bin，浏览 ObjC 调用边界
 ```
 
 #### 场景三：比较两次 trace 的差异（trace diff）
@@ -595,8 +582,7 @@ python3 ... --trace-mode once --output run2.bin
 # 在 tenet CLI 中对比两次 trace
 tenet run1.bin --trace-diff-file run2.bin
 
-# 或在 tenet GUI 中打开 trace diff 面板
-./tenet run1.bin   # File → Compare Trace → run2.bin
+# 也可在 Tauri 前端中打开 trace 后使用对应的可视化分析能力
 ```
 
 ---
@@ -610,7 +596,7 @@ tenet run1.bin --trace-diff-file run2.bin
 # AI 客户端通过 stdio 调用工具；实际工具数由构建和 Hub/session 模式决定，启动日志会打印
 ```
 
-**MCP HTTP / Hub（远程、GUI 与 IDA 宿主）：**
+**MCP HTTP / Hub（AI 工具、远程客户端与 IDA 插件）：**
 
 ```bash
 # 单实例 Streamable HTTP
@@ -631,7 +617,7 @@ Hub WebSocket 使用 JSON-RPC/MCP 文本帧并按 URL 中的 `instance-id` 固�
 # 将入口脚本放入 IDA 用户插件目录；确保同级可导入 tenet Python 包
 cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
 
-# 启动 tenet GUI 或 Hub 后，在 IDA 中执行：
+# 启动 Tauri 前端或 Hub 后，在 IDA 中执行：
 # Edit → Plugins → Tenet Trace Bridge → Connect
 ```
 
@@ -639,12 +625,17 @@ cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
 
 **JSON-RPC（本地脚本接入）：**
 
-```bash
-./tenet --rpc /tmp/tenet.sock trace.bin &
+RPC 使用 JSON-RPC over TCP，默认绑定 `127.0.0.1`（loopback），也可通过 `--rpc [[host:]port]` 显式指定其他 host；省略端点时使用 `127.0.0.1:0`，其中端口 `0` 表示由 OS 自动分配空闲端口。
 
-# 示例调用
-echo '{"id":1,"method":"get_stats","params":{}}' | nc -U /tmp/tenet.sock
-echo '{"id":2,"method":"get_reg","params":{"inst_id":1000,"reg":"x0"}}' | nc -U /tmp/tenet.sock
+```bash
+./tenet --rpc 127.0.0.1:10445 trace.bin &
+
+# 示例调用（TCP）
+echo '{"id":1,"method":"get_stats","params":{}}' | nc 127.0.0.1 10445
+echo '{"id":2,"method":"get_reg","params":{"inst_id":1000,"reg":"x0"}}' | nc 127.0.0.1 10445
+
+# 自动分配端口（实际监听端口见后端启动日志）
+./tenet trace.bin --rpc
 ```
 
 **边录边分析（streaming）：**
@@ -720,6 +711,6 @@ cat /tmp/pcring.txt
 | [`docs/capabilities.md`](capabilities.md) | tenet 全部能力按场景的导航地图 |
 | [`docs/trace-format.md`](trace-format.md) | 二进制格式完整规范（v4/v5/v7/flags） |
 | [`docs/analysis-layer.md`](analysis-layer.md) | 30 个 Pass 的分类、依赖和调度 |
-| [`docs/ui-layer.md`](ui-layer.md) | GUI / TUI / CLI / RPC / MCP 详细说明 |
+| [`docs/ui-layer.md`](ui-layer.md) | Tauri Web 前端 / TUI / CLI / TCP RPC / MCP / WS 说明 |
 | [`docs/pass-cookbook.md`](pass-cookbook.md) | 新增自定义 Pass 的开发指南 |
 | [`docs/profiling.md`](profiling.md) | 性能调优与 Instruments 使用 |

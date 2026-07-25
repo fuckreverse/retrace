@@ -48,26 +48,34 @@ set(TENET_PGO_MODE "" CACHE STRING "PGO mode: '' (off), 'generate', or 'use'")
 set(TENET_PGO_PROFILE "${CMAKE_BINARY_DIR}/default.profdata" CACHE FILEPATH
     "Path to merged .profdata file (for PGO 'use' mode)")
 
-if(TENET_PGO_MODE STREQUAL "generate")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-generate")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-generate")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-generate")
-    message(STATUS "PGO: instrumented build (profile generation)")
-elseif(TENET_PGO_MODE STREQUAL "use")
-    if(NOT EXISTS "${TENET_PGO_PROFILE}")
-        message(WARNING "PGO profile not found: ${TENET_PGO_PROFILE} — building without PGO")
-    else()
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
-        message(STATUS "PGO: optimized build using ${TENET_PGO_PROFILE}")
+# GCC/Clang-only flags (-fprofile-generate/-use have no MSVC equivalent here;
+# MSVC has its own /GENPROFILE /USEPROFILE PGO flow, out of scope for now).
+if(NOT MSVC)
+    if(TENET_PGO_MODE STREQUAL "generate")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-generate")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-generate")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-generate")
+        message(STATUS "PGO: instrumented build (profile generation)")
+    elseif(TENET_PGO_MODE STREQUAL "use")
+        if(NOT EXISTS "${TENET_PGO_PROFILE}")
+            message(WARNING "PGO profile not found: ${TENET_PGO_PROFILE} — building without PGO")
+        else()
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-use=${TENET_PGO_PROFILE}")
+            message(STATUS "PGO: optimized build using ${TENET_PGO_PROFILE}")
+        endif()
     endif()
+elseif(NOT TENET_PGO_MODE STREQUAL "")
+    message(STATUS "PGO: TENET_PGO_MODE ignored under MSVC (no -fprofile-* support)")
 endif()
 
 # Target Apple Silicon (M1+) for NEON auto-vectorization and LSE atomics.
 # Only set for Release builds; RelWithDebInfo keeps generic codegen to avoid
 # recompiling everything when switching between machines, and to stay
 # consistent with "no global optimizations" philosophy.
+# This is strictly an Apple/arm64 tuning flag — GCC/Clang only, never passed
+# under MSVC (which has no -mcpu flag and would fail to parse it).
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND NOT CMAKE_CROSSCOMPILING)
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
@@ -76,16 +84,42 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
+# ─── MSVC compatibility ──────────────────────────────────────────────────────
+# tenet is written against GCC/Clang idioms in a few places (e.g. __builtin_*,
+# POSIX headers guarded by platform_compat.h). This block only adjusts MSVC's
+# *compiler* behavior (exception handling model, __cplusplus reporting,
+# UTF-8 source/execution charset, min/max macro pollution) — it does not by
+# itself make every source file MSVC-portable.
+if(MSVC)
+    add_compile_options(/EHsc /utf-8 /Zc:__cplusplus /permissive-)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # ─── Options ────────────────────────────────────────────────────────────────
 option(TENET_USE_SYSTEM_ROCKSDB "Use system-installed RocksDB" OFF)
 option(TENET_USE_SYSTEM_CAPSTONE "Use system-installed Capstone" OFF)
-option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint analysis" ON)
-option(TENET_ENABLE_YARA "Enable YARA rule engine for pattern detection" ON)
-option(TENET_ENABLE_GUI "Build with ImGui GUI (requires SDL3 + Metal on macOS)" ON)
+# Triton and YARA are discovered via find_package()/pkg-config, both of which
+# are a macOS/Linux (Homebrew/apt/vcpkg-with-pkgconfig) convention; neither
+# ships an out-of-the-box story on Windows, so default them OFF there rather
+# than fail configure for users who just want the core CLI/TUI/WS backend.
+if(WIN32)
+    option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint analysis" OFF)
+    option(TENET_ENABLE_YARA "Enable YARA rule engine for pattern detection" OFF)
+else()
+    option(TENET_ENABLE_TRITON "Enable Triton semantic oracle for precise taint analysis" ON)
+    option(TENET_ENABLE_YARA "Enable YARA rule engine for pattern detection" ON)
+endif()
 option(TENET_BUILD_TESTS "Build unit tests" ON)
 option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
-option(TENET_ENABLE_RPC "Build JSON-RPC Unix socket server" ON)
-option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
+option(TENET_ENABLE_RPC "Build JSON-RPC TCP loopback server" ON)
+# uWebSockets/uSockets' bundled event loop only has POSIX epoll/kqueue
+# backends (see the TENET_ENABLE_WS block below) — no Windows IOCP backend
+# is wired up yet, so default WS OFF on Windows until that's ported.
+if(WIN32)
+    option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" OFF)
+else()
+    option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
+endif()
 option(TENET_ENABLE_PROFILING "Enable os_signpost profiling instrumentation (macOS only, visible in Instruments)" ON)
 option(TENET_ENABLE_TBB "Enable Intel oneTBB for parallel algorithms and task scheduling" ON)
 
@@ -155,7 +189,18 @@ if(NOT TENET_USE_SYSTEM_ROCKSDB)
     set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
-    set(WITH_LZ4 ON CACHE BOOL "Enable LZ4 compression in RocksDB" FORCE)
+    # LZ4 is picked up via find_package(lz4)/pkg-config on Linux/macOS (both
+    # typically ship it or make it trivial to apt/brew install). RocksDB's
+    # Windows CMake path instead expects LZ4_INCLUDE/LZ4_LIB_DEBUG/
+    # LZ4_LIB_RELEASE to point at an external install (see thirdparty.inc) —
+    # since tenet doesn't vendor or FetchContent LZ4, leave it off on Windows
+    # rather than fail the RocksDB configure/build looking for a library that
+    # was never provided.
+    if(WIN32)
+        set(WITH_LZ4 OFF CACHE BOOL "Enable LZ4 compression in RocksDB" FORCE)
+    else()
+        set(WITH_LZ4 ON CACHE BOOL "Enable LZ4 compression in RocksDB" FORCE)
+    endif()
     set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(rocksdb)
@@ -203,95 +248,6 @@ if(TENET_ENABLE_TBB)
     # don't need it for the parallel-algorithm hot paths.
     set(TBB_ENABLE_IPO OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(onetbb)
-endif()
-
-# ─── GUI dependencies (ImGui + SDL3 + imgui-node-editor) ────────────────────
-if(TENET_ENABLE_GUI)
-    if(APPLE)
-        enable_language(OBJCXX)
-    endif()
-
-    FetchContent_Declare(
-        imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG        v1.91.6-docking
-        GIT_SHALLOW    TRUE
-    )
-
-    FetchContent_Declare(
-        SDL3
-        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG        release-3.2.0
-        GIT_SHALLOW    TRUE
-    )
-
-    FetchContent_Declare(
-        imgui_node_editor
-        GIT_REPOSITORY https://github.com/thedmd/imgui-node-editor.git
-        GIT_TAG        v0.9.3
-        GIT_SHALLOW    TRUE
-    )
-
-    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-
-    FetchContent_MakeAvailable(imgui SDL3 imgui_node_editor)
-
-    # ─── ImGui custom library (no native CMake build system) ────────────────
-    add_library(imgui_lib STATIC
-        ${imgui_SOURCE_DIR}/imgui.cpp
-        ${imgui_SOURCE_DIR}/imgui_demo.cpp
-        ${imgui_SOURCE_DIR}/imgui_draw.cpp
-        ${imgui_SOURCE_DIR}/imgui_tables.cpp
-        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
-    )
-
-    target_include_directories(imgui_lib PUBLIC
-        ${imgui_SOURCE_DIR}
-        ${imgui_SOURCE_DIR}/backends
-    )
-
-    target_link_libraries(imgui_lib PUBLIC
-        SDL3::SDL3
-        "-framework Metal"
-        "-framework QuartzCore"
-        "-framework GameController"
-        "-framework CoreHaptics"
-        "-framework AppKit"
-    )
-
-    # imgui_impl_sdl3.cpp's multi-viewport support (ImGui_ImplSDL3_SetupPlatformHandles)
-    # branches on `#elif defined(__APPLE__) && defined(SDL_VIDEO_DRIVER_COCOA)` to fetch
-    # the real NSWindow* via SDL_GetPointerProperty(..., SDL_PROP_WINDOW_COCOA_WINDOW_POINTER).
-    # SDL_VIDEO_DRIVER_COCOA is normally only defined in SDL's own *private*
-    # build_config/SDL_build_config.h (SDL3's own CMakeLists.txt marks that
-    # include dir PRIVATE — by design it is not propagated to consumers via
-    # the public SDL3::SDL3 target). Since imgui_lib only links the public
-    # SDL3 headers, that macro is invisible here and the branch is silently
-    # skipped, leaving ImGuiViewport::PlatformHandleRaw == nullptr.
-    #
-    # imgui_impl_metal.mm's ImGui_ImplMetal_CreateWindow() then falls back to
-    # PlatformHandle, which SDL3 sets to a small SDL_WindowID integer (NOT a
-    # pointer) — treating that as an NSWindow* and sending it -contentView
-    # crashes with SIGSEGV (bad access at a tiny address, e.g. 0x4 for
-    # window ID 4). This only manifests once ImGuiConfigFlags_ViewportsEnable
-    # is on and a panel is dragged into its own OS window.
-    #
-    # Fix: this app only ever builds/runs on macOS, where SDL3 always uses
-    # the Cocoa video backend, so it's safe to define the macro directly for
-    # this translation unit instead of trying to reach into SDL3's private
-    # generated-header directory.
-    set_source_files_properties(
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-        PROPERTIES COMPILE_DEFINITIONS "SDL_VIDEO_DRIVER_COCOA=1"
-    )
-
-    set_source_files_properties(
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
-        PROPERTIES LANGUAGE OBJCXX
-    )
 endif()
 
 # fmt - formatting (useful utility, header-only mode)
@@ -345,6 +301,14 @@ if(TENET_ENABLE_WS)
 endif()
 
 # ── uWebSockets + uSockets (WebSocket transport for WS service) ──────────────
+if(TENET_ENABLE_WS AND WIN32)
+    message(FATAL_ERROR
+        "TENET_ENABLE_WS=ON is not supported on Windows yet: uSockets' bundled "
+        "event loop (src/eventing/epoll_kqueue.c) only implements POSIX "
+        "epoll/kqueue backends, with no libuv/IOCP backend wired into this "
+        "build. Use -DTENET_ENABLE_WS=OFF (the Windows default) until that "
+        "port lands.")
+endif()
 if(TENET_ENABLE_WS)
     FetchContent_Declare(
         uwebsockets
@@ -415,13 +379,33 @@ set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
 
 # mimalloc - high-performance allocator with global malloc override.
-# On macOS, linking the shared library (MI_OVERRIDE=ON) replaces the system
-# allocator process-wide via dyld interposing — zero code changes needed.
-# Yields 5-15% throughput on allocation-heavy paths (GUI per-frame vectors,
-# Pass concurrent containers, MCP serialization).
-set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
-set(MI_BUILD_SHARED ON CACHE BOOL "" FORCE)
-set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+# On macOS/Linux, linking the shared library (MI_OVERRIDE=ON) replaces the
+# system allocator process-wide via dyld/ld.so interposing — zero code
+# changes needed. Yields 5-15% throughput on allocation-heavy paths (Pass
+# concurrent containers, MCP serialization).
+#
+# On Windows, shared-library malloc override needs mimalloc's special
+# "mimalloc-redirect" DLL + linker trick (see mimalloc's readme, "Overriding
+# Malloc on Windows") which requires extra deployment steps (shipping
+# mimalloc-redirect.dll next to the exe, /INCLUDE:malloc-override linker
+# flag). Until that's wired into the sidecar packaging, default to a plain
+# static build without global override on Windows — tenet still explicitly
+# links mimalloc for its own allocations, it just won't intercept every
+# malloc() process-wide.
+if(WIN32)
+    set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+else()
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+endif()
+if(MI_BUILD_SHARED)
+    set(TENET_MIMALLOC_TARGET mimalloc)
+else()
+    set(TENET_MIMALLOC_TARGET mimalloc-static)
+endif()
 set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
 set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(MI_DEBUG_FULL OFF CACHE BOOL "" FORCE)
@@ -580,10 +564,23 @@ endif()
 # Triton linkage (optional)
 if(TENET_ENABLE_TRITON)
     target_compile_definitions(tenet_lib PUBLIC TENET_HAS_TRITON=1)
-    # Add Triton and Z3 headers as SYSTEM includes (after our own deps)
+    # Add Triton and Z3 headers as SYSTEM includes (after our own deps).
+    # Z3 headers needed by Triton's z3Solver.hpp aren't reported by Triton's
+    # own CMake config, so we resolve them explicitly via find_path() instead
+    # of hardcoding a Homebrew-only path (which doesn't exist on Linux/apt,
+    # vcpkg, or Windows installs).
+    find_path(Z3_INCLUDE_DIR NAMES z3++.h z3.h
+        HINTS /opt/homebrew/include /usr/local/include /usr/include
+        DOC "Directory containing z3.h / z3++.h (required by Triton's z3Solver.hpp)")
+    if(Z3_INCLUDE_DIR)
+        message(STATUS "Z3 headers found: ${Z3_INCLUDE_DIR}")
+    else()
+        message(WARNING "Z3 headers not found via find_path(); Triton build may fail. "
+                         "Pass -DZ3_INCLUDE_DIR=/path/to/z3/include if needed.")
+    endif()
     target_include_directories(tenet_lib SYSTEM PUBLIC
         ${TRITON_INCLUDE_DIRS}
-        /opt/homebrew/include  # Z3 headers needed by Triton's z3Solver.hpp
+        ${Z3_INCLUDE_DIR}
     )
     target_link_libraries(tenet_lib PUBLIC ${TRITON_LIBRARY})
 endif()
@@ -642,89 +639,27 @@ else()
     target_compile_definitions(tenet_lib PUBLIC TENET_HAS_WS=0)
 endif()
 
-# ─── GUI library (tenet_gui_lib) ────────────────────────────────────────────
-if(TENET_ENABLE_GUI)
-add_library(tenet_gui_lib STATIC
-    src/gui/gui_app.mm
-    src/gui/gui_settings.cpp
-    src/gui/gui_chrome.cpp
-    src/gui/gui_colors.cpp
-    src/gui/navigation.cpp
-    src/gui/panels_instruction.cpp
-    src/gui/panels_registers.cpp
-    src/gui/panels_memory.cpp
-    src/gui/panels_callstack_funcs.cpp
-    src/gui/panels_analysis.cpp
-    src/gui/panels_cfg.cpp
-src/gui/panels_misc.cpp
-src/gui/panels_reg_timeline.cpp
-src/gui/panels_dwarf.cpp
-src/gui/panels_trace_diff.cpp
-src/gui/panels_objc.cpp
-src/gui/panels_objc_crypto.cpp
-src/gui/panels_call_graph.cpp
-src/gui/panels_loop_semantics.cpp
-src/gui/panels_pattern.cpp
-src/gui/panels_constant.cpp
-src/gui/panels_algorithm_summary.cpp
-src/gui/panels_trace_fold.cpp
-src/gui/panels_window_stats.cpp
-src/gui/panels_dataflow_graph.cpp
-src/gui/panels_memory_strings.cpp
-src/gui/panels_entropy.cpp
-src/gui/panels_mem_search.cpp
-src/gui/panels_memory_snapshot.cpp
-src/gui/panels_yara_mem_scan.cpp
-src/gui/panels_call_context.cpp
-src/gui/panels_syscall_intercept.cpp
-src/gui/panels_objc_crypto.cpp
-src/gui/panels_vm_abstract.cpp
-src/gui/panels_taint_source_annotation.cpp
-src/gui/panels_log.cpp
-src/gui/panels_cache_manager.cpp
-src/gui/popups.cpp
-)
-
-    # Ensure gui_app.mm is compiled as Objective-C++ (for Metal __bridge casts)
-    set_source_files_properties(src/gui/gui_app.mm PROPERTIES LANGUAGE OBJCXX)
-
-    target_link_libraries(tenet_gui_lib PUBLIC
-        tenet_lib
-        imgui_lib
-        SDL3::SDL3
-    )
-
-    target_compile_definitions(tenet_gui_lib PUBLIC TENET_HAS_GUI=1)
-endif()
-
 # ─── Main executable ────────────────────────────────────────────────────────
 add_executable(tenet src/main.cpp src/batch_analysis.cpp)
 
-if(TENET_ENABLE_GUI)
-    # tenet_gui_lib already PUBLIC-links tenet_lib; no need to add tenet_lib again
-    # (avoids "ignoring duplicate libraries" linker warning on Apple ld).
-    target_link_libraries(tenet PRIVATE tenet_gui_lib)
-    target_compile_definitions(tenet PRIVATE TENET_HAS_GUI=1)
-else()
-    target_link_libraries(tenet PRIVATE tenet_lib)
-endif()
+target_link_libraries(tenet PRIVATE tenet_lib)
 
 # mimalloc: global malloc override (linked to final executables so its dyld
 # interpose records take effect process-wide, including code in tenet_lib).
-target_link_libraries(tenet PRIVATE mimalloc)
+target_link_libraries(tenet PRIVATE ${TENET_MIMALLOC_TARGET})
 
 # ─── Benchmark ───────────────────────────────────────────────────────────────
 add_executable(bench_tenet bench/bench_tenet.cpp)
-target_link_libraries(bench_tenet PRIVATE tenet_lib mimalloc)
+target_link_libraries(bench_tenet PRIVATE tenet_lib ${TENET_MIMALLOC_TARGET})
 
 add_executable(bench_all_passes bench/bench_all_passes.cpp)
-target_link_libraries(bench_all_passes PRIVATE tenet_lib mimalloc)
+target_link_libraries(bench_all_passes PRIVATE tenet_lib ${TENET_MIMALLOC_TARGET})
 
 add_executable(bench_memory_snapshot bench/bench_memory_snapshot.cpp)
-target_link_libraries(bench_memory_snapshot PRIVATE tenet_lib mimalloc)
+target_link_libraries(bench_memory_snapshot PRIVATE tenet_lib ${TENET_MIMALLOC_TARGET})
 
 add_executable(bench_loop_only bench/bench_loop_only.cpp)
-target_link_libraries(bench_loop_only PRIVATE tenet_lib mimalloc)
+target_link_libraries(bench_loop_only PRIVATE tenet_lib ${TENET_MIMALLOC_TARGET})
 
 # ─── Python bindings (tenet._core pybind11 module) ──────────────────────────
 if(TENET_ENABLE_PYTHON)

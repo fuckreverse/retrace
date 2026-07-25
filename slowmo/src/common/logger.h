@@ -58,6 +58,9 @@
 #  include <mach/mach.h>
 #elif defined(__linux__)
 #  include <sys/resource.h>
+#elif defined(_WIN32)
+#  include <windows.h>
+#  include <psapi.h>
 #endif
 
 namespace tenet {
@@ -312,6 +315,12 @@ inline double rss_mb() {
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
         // Linux: ru_maxrss is in kilobytes
         return static_cast<double>(usage.ru_maxrss) / 1024.0;
+    }
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
     }
 #endif
     return 0.0;
