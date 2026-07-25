@@ -9,11 +9,11 @@ Tenet provides two different WebSocket protocols. Choose the endpoint by client 
 | Endpoint | Protocol | Intended clients |
 |---|---|---|
 | `ws://127.0.0.1:10444/ws/<instance-id>` | JSON-RPC/MCP text frames | IDAPython and local interactive integrations |
-| `ws://host:<port>` from `--ws-port` | Binary FlatBuffers | Web/Tauri frontends and high-throughput visualization |
+| `ws://127.0.0.1:<port>` from `--ws-port` | Binary FlatBuffers | Tauri Web frontend and high-throughput visualization |
 
 ## Hub JSON WebSocket
 
-Start Tenet in Hub mode, or open a trace in the GUI, which joins the Hub automatically:
+Start Tenet in Hub mode. When a trace is opened in the Tauri desktop application, its sidecar starts in Hub mode or joins the existing Hub:
 
 ```bash
 ./tenet trace.bin --mcp-hub
@@ -36,6 +36,12 @@ Start the independent binary service on an explicit port:
 ```bash
 ./tenet trace.bin --ws-port 9090
 ```
+
+The endpoint is `ws://127.0.0.1:9090`. The current service always binds to the local loopback interface; no CLI option can change the listen host.
+
+:::caution[Windows limitation]
+On Windows, `TENET_ENABLE_WS` defaults to off and cannot currently be enabled: the uSockets event loop has POSIX epoll/kqueue backends but no Windows IOCP backend wired into this build. Consequently, `--ws-port` and the FlatBuffers WebSocket channel used by the Tauri Web frontend are not yet available on Windows. MCP Hub's JSON WebSocket does not use this uSockets/FlatBuffers service and is unaffected; CLI batch analysis, TUI, TCP JSON-RPC, and MCP also remain available.
+:::
 
 ### Protocol
 

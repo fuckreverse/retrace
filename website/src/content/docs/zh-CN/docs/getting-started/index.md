@@ -8,7 +8,7 @@ sidebar:
 
 ## 路径
 
-1. 在 Apple Silicon Mac 上[安装 Tenet](./install/)。
+1. 在 Apple Silicon Mac 上[安装 Tenet](./install/)。Tenet 后端已支持 Windows、Linux 和 macOS（x86_64/arm64），但当前公开发布的桌面安装包仍只有 macOS Apple Silicon 预览版 DMG；其他平台的独立安装包正在制作中。
 2. 用 QBDITrace 或兼容采集器[录制 Trace](../capture/)。
 3. [在 Tenet 中打开](./open-a-trace/)并等待首次索引完成。
 4. [理解核心概念](./core-concepts/) — 指令 ID、时间感知状态、分析 Pass。

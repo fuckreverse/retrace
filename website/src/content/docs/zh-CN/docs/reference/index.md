@@ -15,7 +15,7 @@ sidebar:
 | 偏移 | 大小 | 字段 | 说明 |
 |------|------|------|------|
 | 0x000 | 4 | `magic` | `0x51424454`（"QBDT"） |
-| 0x004 | 4 | `version` | 4（基线）、5（PC-delta）、6（old-value）、7（FPR） |
+| 0x004 | 4 | `version` | 4（基线）、5（PC-delta）、6（old-value）、7（FPR）、8（调用元数据） |
 | 0x008 | 4 | `arch` | 架构标签：1 = AArch64, 2 = x86_64 |
 | 0x00C | 4 | `num_gpr` | 锚点快照中的 GPR 数（AArch64: 34） |
 | 0x010 | 8 | `module_base` | 被追踪模块的运行时基地址 |
@@ -51,6 +51,7 @@ Tenet 将所有运行时 PC 归一化回静态镜像，以便与 IDA/Ghidra 匹�
 | 7 | `HF_COMPRESSED` | 遗留格式：整个记录流为一个 zstd 帧（历史） |
 | 8 | `HF_BLOCK_COMPRESSED` | 1 MiB zstd 分块 + 尾部索引，支持随机访问（默认） |
 | 9 | `HF_BRANCH_HINT` | nzcv 高 4 位编码 CALL/RET/BRANCH 分类 |
+| 10 | `HF_CALL_META` | **v8**：启用 v8 OBJC/CAPICALL 布局与 `REC_RETVAL`；可与 `HF_PC_DELTA` / `HF_HAS_FPR` 组合 |
 
 ## 版本演进
 
@@ -60,6 +61,7 @@ Tenet 将所有运行时 PC 归一化回静态镜像，以便与 IDA/Ghidra 匹�
 | v5 | `HF_PC_DELTA` | INST 头缩至 6 B（int16 PC 差值）；解码器维护运行 PC |
 | v6 | `HF_OLD_VALUE` | 内存访问记录增至 48 B（写前 old_value 字段）；**writer 已移除** |
 | v7 | `HF_HAS_FPR` | ANCHOR 增加 512 B FPR 块（共 800 B）；INST 增加 FPR 差值段 |
+| v8 | `HF_CALL_META` | 增加 `REC_RETVAL` 真实返回事实；OBJC 在线捕获 selector；CAPICALL `api_id` 扩为 `uint16_t`；可与 `HF_PC_DELTA` / `HF_HAS_FPR` 组合 |
 
 不认识某个标志的读取器**必须**拒绝该文件。
 
@@ -77,6 +79,7 @@ Tenet 将所有运行时 PC 归一化回静态镜像，以便与 IDA/Ghidra 匹�
 | `REC_OBJC` | 5 | ObjC msgSend 系列派发 |
 | `REC_CODE` | 6 | 原始指令字节（每 PC 仅一次） |
 | `REC_CAPICALL` | 7 | C/平台 API 调用，含语义参数捕获 |
+| `REC_RETVAL` | 8 | v8 的 OBJC/CAPI/SVC 真实返回事实 |
 
 ### REC_INST（kind = 0）
 
@@ -180,6 +183,8 @@ svc_head_t      72 字节
 
 ### REC_OBJC（kind = 5）
 
+**v4-v7 遗留布局：**
+
 ```
 objc_head_t     80 字节
   kind       u8
@@ -190,6 +195,8 @@ objc_head_t     80 字节
   sel        u64   （x1: 选择子; *Super 变体用 x2）
   cls[48]          （NUL 终止的运行时类名; 不可用时为 ""）
 ```
+
+**v8 布局**（`HF_CALL_META` 设置）：固定头仍为 80 字节，但加入 `sel_len` 和 `flags`；头后追加在线捕获的 selector（`sel_len` 个内容字节 + NUL，填充至 4 字节对齐）。`flags` 标记 selector 截断或读取失败。`HF_CALL_META` 是文件级布局契约，同一文件不会混用遗留与 v8 OBJC 布局。
 
 ### REC_CODE（kind = 6）
 
@@ -208,6 +215,8 @@ code_head_t     16 字节
 
 捕获已知 C/平台 API 函数的调用。固定 88 字节头 + 0–4 个变长内联字符串捕获。
 
+**v4-v7 遗留布局：**
+
 ```
 capicall_head_t     88 字节
   kind        u8
@@ -219,7 +228,9 @@ capicall_head_t     88 字节
   args[8]     8×u64 （调用时 x0..x7）
 ```
 
-后随 `str_count` 个变长捕获：
+**v8 布局**（`HF_CALL_META` 设置）：固定头仍为 88 字节，字段顺序调整并将 `api_id` 扩为 `uint16_t`，从而完整表示超过 255 的 API ID。该文件级标志要求文件内所有 CAPICALL 统一使用 v8 布局。
+
+后随 `str_count` 个变长捕获（两种布局相同）：
 
 ```
 capicall_str_t      4 字节
@@ -229,6 +240,10 @@ capicall_str_t      4 字节
   [_reserved]  u8
 str_data[str_len + 1]    （NUL 终止; 填充至 4 字节对齐）
 ```
+
+### REC_RETVAL（kind = 8）
+
+仅在 v8 `HF_CALL_META` 文件中出现。该 64 字节自描述记录把真实返回状态关联回 OBJC、CAPICALL 或 SVC 调用，包含来源 kind/ID、调用点、目标、恢复地址以及原始 `x0`、`x1`、`nzcv`；`record_size` 允许未来读取器安全跳过扩展字段。
 
 ## 压缩
 
@@ -319,9 +334,9 @@ Tenet 可打开任何 `QBDT` magic 且版本 ≥ 4 的 trace。缺失记录优�
 
 ### 平台增强
 
-增加：`REC_SVC`、`REC_OBJC`、`REC_CAPICALL`。
+增加：`REC_SVC`、`REC_OBJC`、`REC_CAPICALL`；v8 还可增加 `HF_CALL_META` 与 `REC_RETVAL`。
 
-结果：系统调用命名、ObjC 消息解析、C API 参数捕获与字符串检查。
+结果：系统调用命名、ObjC 消息解析、C API 参数捕获与字符串检查；v8 可提供在线 selector 和真实返回事实。
 
 ### 向量增强
 

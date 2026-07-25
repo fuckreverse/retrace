@@ -154,9 +154,9 @@ Use `--window-stats-size` to tune granularity: smaller windows localize hot spot
 | `--reg-timeline <reg_index>` | — | Register index (0–28 for x0–x28, 29=fp, 30=lr, 31=sp, 32=nzcv, 33=pc) |
 | `--reg-timeline-range <start> <end>` | full trace | Inst_id range to scan |
 
-### GUI / MCP entry point
+### Tauri frontend / MCP entry point
 
-The GUI offers a "Register Timeline" panel under the Profile group: select a register in the register view to populate the timeline. MCP exposes `reg_timeline` as a tool with parameters matching the CLI.
+The Tauri frontend provides a Register Timeline panel: choose a common register or enter a custom register name, inspect the plotted value changes, and click the timeline to navigate the main instruction view. MCP exposes `reg_timeline` with parameters matching the CLI.
 
 ## Call context
 
@@ -176,13 +176,13 @@ The GUI offers a "Register Timeline" panel under the Profile group: select a reg
 - `loop_contexts`: which loops contain the target, with header PC, nesting depth, and total observed iterations;
 - `instructions`: surrounding instructions (10 before / 10 after by default), each annotated with loop depth and whether it is the target.
 
-### GUI / MCP entry point
+### CLI / MCP entry point
 
-In the GUI, selecting an instruction in the timeline auto-populates the Call Context panel. MCP exposes `call_context` with either an exact `inst_id` or a `pc`; the PC form uses XRef to select an observed instruction occurrence.
+The current Tauri frontend does not implement a Call Context result panel or auto-populate it from main-timeline selection. Use `--call-context <inst_id>` above or the MCP `call_context` tool. MCP accepts either an exact `inst_id` or a `pc`; the PC form uses XRef to select an observed instruction occurrence.
 
 ## Performance profiling entry points
 
-Tenet has **no `--profile` CLI flag**. Performance analysis proceeds through the macOS Instruments toolchain:
+Tenet has **no `--profile` CLI flag**. The Instruments workflow below is a macOS-specific recommendation for Tenet developers profiling backend performance, not a platform limit on Tenet's analysis capabilities; Linux and Windows developers can use their platform profilers:
 
 - **Time Profiler** samples CPU at function level — find the slowest pass or function;
 - **System Trace** visualizes thread scheduling and context switches;
@@ -193,7 +193,7 @@ For profiling commands and methodology, see the bundled `tools/tenet/docs/profil
 
 ## Recommended workflow
 
-1. **First look** — open the trace in GUI or `--stats` to check total inst count and index status.
+1. **First look** — open the trace in the Tauri desktop application or `--stats` to check total inst count and index status.
 2. **Identify hot regions** — run `--window-stats 0 <end>` to find the most active instruction bands.
 3. **Fold noise loops** — if window_stats surfaces a dense, high-iteration region (memset-style), run `--trace-fold` on that inst_id range to collapse it before deeper analysis.
 4. **Diff behavior** — for same-function/different-input traces, use `--trace-diff` (or `--trace-diff-file`) to locate where data dependencies cause divergence.
@@ -201,9 +201,9 @@ For profiling commands and methodology, see the bundled `tools/tenet/docs/profil
 
 ## Limitations and troubleshooting
 
-- **Fold works on inst_id ranges**, not PC ranges. If you want to fold a specific loop, find its inst_id span from the GUI or `--search-pc <header_pc>` first.
+- **Fold works on inst_id ranges**, not PC ranges. If you want to fold a specific loop, find its inst_id span from the Tauri frontend or with `--search-pc <header_pc>` first.
 - **Diff requires comparable format/version.** Both traces (or both same-trace regions) must open cleanly in tenet. Delta-encoded (v5) and FPR (v7) traces are fully supported.
 - **Offline decoding** is done via `tenet --dump text` or `tenet --dump jsonl`, supporting v4/v5/v7 (including block-compressed). The legacy standalone `trace_decode` has been removed.
-- **Register timeline and call context both have GUI panels** and are also available through CLI/MCP. There is no `--profile`/`--hotspot` CLI flag — profiling uses Instruments, not a built-in sampler.
+- **Register Timeline has a Tauri frontend panel; Call Context is not yet wired into the Web frontend** and is available through CLI/MCP. There is no `--profile`/`--hotspot` CLI flag. Instruments is only a macOS backend-profiling option for developers and does not limit cross-platform trace analysis.
 - **Fold keeps representative iterations;** it does not remove them from the underlying trace data. Passes that run after fold see the original instruction stream.
 - **Window stats stride = window size** (non-overlapping) by default; overlapping windows are not exposed via CLI at this time.

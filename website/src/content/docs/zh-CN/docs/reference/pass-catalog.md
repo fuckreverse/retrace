@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，按类别分组。默认开启的 Pass 在 GUI 或 TUI 打开 Trace 时自动运行；其余按需启动。
+Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，按类别分组。默认开启的 Pass 由 Tauri Web 前端请求后端运行默认 Pass 集合，或在 TUI 启动分析时运行；其余按需启动。
 
 ## Structure
 
@@ -16,7 +16,7 @@ Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，�
 | `cfg_layout` | `--run-pass cfg_layout` | 否 | CFG 视图的图布局坐标 |
 | `call_graph` | `--run-pass call_graph` | 是 | 函数间调用图 |
 | `loop` | `--run-pass loop` | 是 | 通过 CFG 回边检测循环 |
-| `vm_abstract` | `--vm-abstract` | 否 | VM 派发器检测与 handler 提取 |
+| `vm_abstract` | `--vm-abstract` | 否 | 基于静态分析提供的 dispatcher anchor 及可选 indirect-branch/handler 等 hints 构建 VM step 序列、解码 opcode/operand，并采集上下文、寄存器与栈快照；不自动发现 dispatcher |
 
 ## Taint
 
@@ -75,15 +75,27 @@ Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，�
 
 ```text
 function ──> call_graph
+    ├───────────────> algorithm_summary
+    └───────────────> call_context
+
 xref ──> cfg ──> cfg_layout
-              └──> loop ──> loop_semantics
-                           └──> algorithm_summary
-pattern ──> algorithm_summary
-            └──> objc_crypto
-objc ──> objc_crypto
+  │       └──> loop ──> loop_semantics
+  │              │          └──> algorithm_summary
+  │              ├──────────────> trace_fold
+  │              ├──────────────> call_context
+  │              └──────────────> vm_abstract
+  ├──────────────> loop_semantics
+  ├──────────────> trace_fold
+  └──────────────> vm_abstract
+
+pattern ─────────> algorithm_summary
+  └──────────────> objc_crypto
+call_graph ──────> algorithm_summary
+objc ────────────> objc_crypto
+  └──────────────> taint_source_annotation
 backward_taint ──> taint_source_annotation
-cfg ──> vm_abstract
-loop ──> vm_abstract
+cfg ─────────────> vm_abstract
+thread ──────────> thread_filter
 ```
 
-未列在依赖图中的 Pass 无前置条件，可独立运行。
+以上列出源码声明的主要依赖关系；`taint` 仅在启用 xref 加速时依赖 `xref`。完整依赖请以 `--list-passes` 输出和各 Pass 的 `dependencies()` 声明为准。

@@ -7,10 +7,10 @@ sidebar:
 Use the TUI over SSH or on machines without a graphical session:
 
 ```bash
-./tenet --tui /path/to/trace.bin
+./tenet /path/to/trace.bin
 ```
 
-It uses the same reader, state reconstruction, pass manager and cached results as Desktop. Differences are presentation, not analysis semantics.
+With no analysis or service options, Tenet enters the interactive TUI by default. It shares backend analysis semantics and persisted state with Desktop, but their specific operation entry points and feature coverage are not identical.
 
 ## Workspace
 
@@ -27,7 +27,7 @@ Common controls include:
 | Run backward taint | `B` |
 | Run loop analysis | `O` |
 | Toggle Hex Dump | `H` |
-| Filter a list | `/` |
+| Search instructions / disassembly | `/` |
 | Run a named pass | `:pass <name>` |
 | List passes | `:passes` |
 | Start the analysis workflow | `:analyze` |
@@ -47,6 +47,6 @@ Every catalog pass has a browsable TUI result. Parameter-heavy queries are usual
 
 - Keep the terminal large enough for simultaneous timeline and state panels.
 - Let the first index build finish before disconnecting.
-- Preserve the trace's `.tenet/` directory between sessions.
+- Preserve the `<trace-file>.tenet/` persistence directory beside the trace file between sessions.
 - Use bookmarks before closing; cursor and bookmarks persist.
 - For long batch exports, prefer CLI so terminal rendering is not involved.

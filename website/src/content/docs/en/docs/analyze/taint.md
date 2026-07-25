@@ -121,9 +121,9 @@ When Triton is unavailable (build without it, or runtime absence), both passes f
 
 The heuristic is less precise for instructions with partial register updates or flag-dependent operations, but covers the vast majority of AArch64 integer code.
 
-## GUI, TUI, and MCP
+## Tauri Frontend, TUI, and MCP
 
-- **GUI**: tainted instructions are highlighted in the instruction list; the Producer Chain panel shows a bounded preview of `backward_taint` results (not a separate analysis). The "Taint" mode displays forward taint events.
+- **Tauri frontend**: tainted instructions are highlighted in the instruction list; the Producer Chain panel shows a bounded preview of `backward_taint` results (not a separate analysis). The "Taint" mode displays forward taint events.
 - **TUI**: press `t` to run forward taint and `B` (Shift+b) to run backward taint; tainted instructions are marked in the listing.
 - **MCP**: `taint_forward` requires `reg_index` and accepts `inst_id`, `mem_addrs`, `stop_pcs`, `max_width`, and step pagination. `taint_backward` uses `sink_inst_id` / `sink_reg` with optional limits and event pagination. `critical_path` takes both source and sink in one call. `dataflow_graph` uses `start_inst_id` / `end_inst_id`, with optional `max_nodes` and `format`.
 

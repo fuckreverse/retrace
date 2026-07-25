@@ -95,7 +95,7 @@ pattern（含 constants 子检测）
 ./tenet [options] trace.bin --loop-semantics
 ```
 
-MCP：`loop_semantics` tool；GUI：Loop Semantics 面板。
+MCP：`loop_semantics` tool；Tauri 前端：Loop Semantics 面板。
 
 ## 算法摘要
 
@@ -125,7 +125,7 @@ MCP：`loop_semantics` tool；GUI：Loop Semantics 面板。
 ./tenet [options] trace.bin --algorithm-summary
 ```
 
-MCP：`algorithm_summary` tool；GUI：Algorithm Summary 面板；TUI：`:algosum`。
+MCP：`algorithm_summary` tool；Tauri 前端：Algorithm Summary 面板；TUI：`:algosum`。
 
 ## ObjC × Crypto
 
@@ -139,11 +139,11 @@ MCP：`algorithm_summary` tool；GUI：Algorithm Summary 面板；TUI：`:algosu
 ./tenet [options] trace.bin --objc --pattern --objc-crypto
 ```
 
-MCP：`objc_crypto` tool；GUI：ObjC × Crypto 面板。
+MCP：`objc_crypto` tool；Tauri 前端：ObjC × Crypto 面板。
 
-## CLI / GUI / TUI / MCP 速查
+## CLI / Tauri 前端 / TUI / MCP 速查
 
-| 能力 | CLI | GUI | TUI | MCP |
+| 能力 | CLI | Tauri 前端 | TUI | MCP |
 |---|---|---|---|---|
 | 模式扫描 | `--pattern` | Patterns 面板 | `:pattern` | `pattern_scan` |
 | 常量 | `--constants --constants-min-parts 3` | Constants 面板 | — | `constants_scan` |

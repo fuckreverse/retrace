@@ -52,15 +52,9 @@ If you have a separate bytecode decoder definition, append `--vm-decoder decoder
 
 ### 3. Inspect the VM Workspace
 
-The GUI's **VM Hints** entry accepts a dropped or selected JSON file. After the pass runs, open **VM Workspace**:
+The current Tauri frontend's **VM Workspace** is a handler-summary panel that can also be popped out into a separate window. It does not accept dropped or selected hints JSON; provide JSON hints through CLI `--vm-hints <file.json>`. In the panel, enter a `dispatcher_pc`, `indirect_branch_pc`, or `mem_anchor_addr`, select the dispatch type and opcode size, then ask the backend to run `vm_abstract`.
 
-- **VM Handlers**: frequencies, labels, and native PCs;
-- **VM Steps**: opcodes, VM-PCs, labels, and native instruction ranges;
-- **Bytecode/Stats**: bytecode range and execution statistics;
-- **VM Registers / Stack**: virtual register or operand-stack snapshots;
-- **VM Memory / Ctx**: context field values.
-
-With **Linked** enabled, selecting a VM step navigates the native instruction timeline to the same execution range.
+The result table shows each observed handler's opcode, native handler PC, semantic label, and hit count. The current Web implementation has no VM Steps, Bytecode, Registers, Stack, or Memory/Ctx tab set, and no Linked mode that follows the main instruction timeline. Use the MCP VM tools for step queries, virtual-register timelines, and backward slicing.
 
 ## Hints JSON
 

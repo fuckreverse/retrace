@@ -83,7 +83,7 @@ Region size is controlled by `--memory-snapshot-size` (default 64). The CLI expo
 
 Two-phase snapshot collection: Phase A collects `(addr, inst_id)` tuples using only `RegisterFile::state_before` (~170 µs/call); Phase B sorts by page number so consecutive reads hit the thread-local page cache, transforming N random RocksDB seeks into a page-sorted sequential access pattern. Memory scaling is bounded by `config_.max_snapshots`.
 
-MCP: `memory_snapshot` tool accepts explicit `inst_ids`; GUI: **Tools → Memory Snapshot…**
+MCP: `memory_snapshot` tool accepts explicit `inst_ids`; Tauri frontend: **Tools → Memory Snapshot…**
 
 ## Value and pattern search
 
@@ -96,7 +96,7 @@ MCP: `memory_snapshot` tool accepts explicit `inst_ids`; GUI: **Tools → Memory
 
 `--literal-search` is a deprecated alias for `--mem-search-value`.
 
-`--mem-search-range <start> <end>` limits both modes to an inst_id window. `--run-pass mem_search` is a legacy shorthand and does not configure patterns / values — provide them through the CLI flags above or through GUI / MCP.
+`--mem-search-range <start> <end>` limits both modes to an inst_id window. `--run-pass mem_search` is a legacy shorthand and does not configure patterns / values — provide them through the CLI flags above or through Tauri frontend / MCP.
 
 ```bash
 ./tenet [options] trace.bin --mem-search "48 8B ?? ?? 48 89"
@@ -107,7 +107,7 @@ MCP: `memory_snapshot` tool accepts explicit `inst_ids`; GUI: **Tools → Memory
 
 MCP: `mem_search` tool accepts `patterns` (with `??` wildcards), `exact_values`, `range`, `search_reg_values`, and `search_immediates`.
 
-GUI: **Tools → Memory / Value Search…**
+Tauri frontend: **Tools → Memory / Value Search…**
 
 ## Entropy
 
@@ -125,12 +125,14 @@ GUI: **Tools → Memory / Value Search…**
 These categories are statistical signals, not proof. Compressed data may score below 7.5; small key schedules may score above 4.0. Always corroborate with `pattern` / `taint` / `loop_semantics` evidence before drawing conclusions.
 :::
 
-**CLI limitation**: the `--entropy <start> <end>` form uses `<start>` as the *single sample point*, with no way to specify address and size directly — the CLI picks defaults and is intended as a quick compatibility check.
+The actual CLI signature is `--entropy <addr_hex> <size>`: the first argument is a hexadecimal memory address and the second is a decimal byte count. Use `--entropy-at <inst_id>` to choose the sampling instant, and `--entropy-timeline` to resample the region at its write-history points.
 
-**GUI** accepts an exact `addr` + `size` and can compute a timeline by resampling at write-history points. **MCP `entropy_analysis`** currently paginates blocks from the default `entropy` pass and exposes only `offset` / `limit`; use the GUI when exact address, size, or timeline control is required.
+The Tauri frontend's Entropy panel likewise exposes address, size, sampling instant, and timeline controls. MCP `entropy_analysis` paginates the backend `entropy` pass results.
 
 ```bash
-./tenet [options] trace.bin --entropy 5000 6000    # compatibility form: samples at inst_id=5000
+./tenet [options] trace.bin --entropy 0x16fdff200 4096
+./tenet [options] trace.bin --entropy 0x16fdff200 4096 --entropy-at 5000
+./tenet [options] trace.bin --entropy 0x16fdff200 4096 --entropy-timeline
 ```
 
 MCP: `entropy_analysis` tool.
@@ -163,13 +165,13 @@ MCP: `entropy_analysis` tool.
 
 - **"YaraMemScanPass: no .yar rule files found."** The compiler succeeded but zero `.yar` files were found. Verify the rule lookup directories listed in the error message; pass an explicit `--yara-rules`.
 - **"YaraMemScanPass: failed to initialize YARA compiler."** `libyara` returned a compiler error. Check your rule syntax with `yarac` first.
-- **"YARA support not compiled in"** (GUI or MCP). This build used `TENET_ENABLE_YARA=OFF`; rebuild with YARA enabled. The menu item is greyed out rather than hidden so users know the feature exists.
+- **"YARA support not compiled in"** (Tauri frontend or MCP). This build used `TENET_ENABLE_YARA=OFF`; rebuild with YARA enabled. The menu item is greyed out rather than hidden so users know the feature exists.
 
-MCP: `yara_mem_scan` tool; GUI: **Tools → YARA Scan…**
+MCP: `yara_mem_scan` tool; Tauri frontend: **Tools → YARA Scan…**
 
-## GUI and MCP quick reference
+## Tauri frontend and MCP quick reference
 
-| Capability | GUI entry | MCP tool |
+| Capability | Tauri frontend entry | MCP tool |
 |---|---|---|
 | Memory read | Right-click addr → "Open in Hex Dump" | `memread` |
 | Write history | **Tools → Memory Write History…** | `mem_write_history` |
@@ -177,7 +179,7 @@ MCP: `yara_mem_scan` tool; GUI: **Tools → YARA Scan…**
 | Call-site strings | Strings panel (second tab) | `memory_strings` |
 | Snapshot | **Tools → Memory Snapshot…** | `memory_snapshot` |
 | Pattern / value search | **Tools → Memory / Value Search…** | `mem_search` |
-| Entropy | **Tools → Entropy…** or right-click → "Entropy Analysis…" | `entropy_analysis` |
+| Entropy | **Tools → Entropy…** | `entropy_analysis` |
 | YARA scan | **Tools → YARA Scan…** | `yara_mem_scan` |
 
 ## Evidence and limits
@@ -186,5 +188,5 @@ MCP: `yara_mem_scan` tool; GUI: **Tools → YARA Scan…**
 - Recorded reads can recover data from uninstrumented code; data never observed at all is irretrievable.
 - `strings` captures each memory write's post-write snapshot, not a single final state — overwritten values at earlier writes are still discoverable.
 - `memory_strings` discovers transient call-site arguments that `strings` can miss due to later coverage.
-- The GUI provides exact address, size, and timeline sampling. CLI `--entropy` only provides compatibility inst_id arguments, while MCP `entropy_analysis` currently paginates the default pass result.
+- Both CLI and the Tauri frontend accept an exact address and size. CLI additionally uses `--entropy-at` for the instant and `--entropy-timeline` for the timeline; MCP `entropy_analysis` paginates backend pass results.
 - YARA scans real reconstructed memory, not approximations; it is gated behind an optional build flag and must be troubleshot at the rule/compiler level.

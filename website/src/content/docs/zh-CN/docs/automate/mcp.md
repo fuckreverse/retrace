@@ -11,7 +11,7 @@ Tenet 提供两种推荐入口：
 | 模式 | 启动方式 | 适用场景 |
 |---|---|---|
 | stdio | `--mcp` | 一个客户端直接拉起一个 Tenet 进程和一份 Trace |
-| MCP Hub | `--mcp-hub` | GUI 自动接入、同时打开多份 Trace、固定端口连接 |
+| MCP Hub | `--mcp-hub` | Tauri 桌面应用启动的后端 sidecar 自动接入、同时打开多份 Trace、固定端口连接 |
 
 ## stdio：单 Trace
 
@@ -72,7 +72,7 @@ http://127.0.0.1:10444/mcp
 ```
 
 :::note[端口约定]
-MCP Hub 和 GUI 使用的默认端口是 **10444**。无需为每一份 Trace 分配单独端口。
+MCP Hub 默认监听 **10444**；Tauri 桌面应用启动的 sidecar 默认加入同一 Hub。无需为每一份 Trace 分配单独端口。
 :::
 
 ### Hub 如何组织多份 Trace
@@ -115,9 +115,9 @@ select_instance(instance="signing-trace")
 
 之后可以省略普通工具的 `instance`。`list_instances` 在两种模式下都可用；`select_instance` 只在 session 模式下注册。
 
-### GUI 行为
+### Tauri sidecar 行为
 
-GUI 打开 Trace 后会自动尝试加入 MCP Hub：首个 GUI 会话成为 Hub，后续会话成为 Worker。默认地址同样是 `127.0.0.1:10444`，默认使用 sessionless 路由。通常只需让客户端连接一次 `10444`，无需为每个 GUI 窗口重复配置。
+Tauri 桌面应用为每个 Trace 窗口启动一个带 `--mcp-hub` 的 `tenet` sidecar 进程。第一个成功获取平台文件锁的 sidecar 成为 Hub，其余 sidecar 作为 Worker 反向连接。默认地址是 `127.0.0.1:10444`，默认使用 sessionless 路由。通常只需让客户端连接一次 `10444`，无需为每个 Tauri 桌面窗口重复配置。
 
 ## 连接 IDA Pro
 
@@ -132,7 +132,7 @@ cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
 cp -R tools/tenet/python/tenet ~/.idapro/plugins/
 ```
 
-如果 IDA 用户目录不同，请使用 IDA 显示的用户插件目录。重启 IDA 并打开匹配的二进制；Tenet 打开 Trace 或通过 `--mcp-hub` 启动后，选择 **Edit → Plugins → Tenet: Connect**。
+如果 IDA 用户目录不同，请使用 IDA 显示的用户插件目录。重启 IDA 并打开匹配的二进制；在 Tenet 后端以 `--mcp-hub` 启动该 Trace，或由 Tauri 桌面应用启动对应 sidecar 后，运行 **Tenet: Connect** 插件动作。普通不带 `--mcp-hub` 的 TUI/CLI 会话不会自动提供 Hub。
 
 插件注册四个动作：
 
@@ -157,7 +157,7 @@ ws://127.0.0.1:10444/ws/<instance-id>
 - Hub WebSocket 仅允许本机回环访问，与 `--ws-port` 启动的 FlatBuffers 服务是两个独立协议。
 
 :::tip[多份 Trace]
-可以照常打开多个 Tenet GUI 窗口。插件先用当前 IDB 输入文件名匹配各实例的模块名，再回退到 Trace 文件名，最后才选择第一个可用实例。
+可以打开多个 Tauri 桌面窗口/Trace；每个窗口对应的 Tenet sidecar 会作为 Hub 或 Worker 注册。插件先用当前 IDB 输入文件名匹配各实例的模块名，再回退到 Trace 文件名，最后才选择第一个可用实例。
 :::
 
 ## 从三个工具开始

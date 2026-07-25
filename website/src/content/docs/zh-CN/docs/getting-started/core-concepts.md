@@ -32,7 +32,7 @@ Tenet 不只展示最终内存快照。它按地址和指令 ID 索引写入，�
 
 ## 分析 Pass
 
-每项分析都是声明依赖、结果可缓存的独立 Pass。GUI、TUI、CLI、RPC 和 MCP 使用同一套实现；多个扫描型 Pass 可以共享一次 Trace 遍历。
+每项分析都是声明依赖、结果可缓存的独立 Pass。独立的 Tauri 桌面应用通过 WebSocket 调用 Tenet 后端，与 TUI、CLI、RPC 和 MCP 使用同一套 Pass 实现；多个扫描型 Pass 可以共享一次 Trace 遍历。
 
 ## 能力取决于证据
 

@@ -11,7 +11,7 @@ Tenet has two recommended entry points:
 | Mode | Start with | Best for |
 |---|---|---|
 | stdio | `--mcp` | One client launching one Tenet process for one trace |
-| MCP Hub | `--mcp-hub` | GUI auto-connect, multiple open traces, and one stable endpoint |
+| MCP Hub | `--mcp-hub` | Automatic connection by backend sidecars launched by the Tauri desktop application, multiple open traces, and one stable endpoint |
 
 ## stdio: one trace
 
@@ -72,7 +72,7 @@ Client configuration example:
 ```
 
 :::note[Port convention]
-MCP Hub and the GUI use **10444** by default. You do not need a separate port for every trace.
+MCP Hub listens on **10444** by default; sidecars launched by the Tauri desktop application join the same Hub by default. You do not need a separate port for every trace.
 :::
 
 ### How the Hub organizes traces
@@ -115,9 +115,9 @@ select_instance(instance="signing-trace")
 
 Subsequent ordinary calls may omit `instance`. `list_instances` is available in both modes; `select_instance` is registered only in session mode.
 
-### GUI behavior
+### Tauri sidecar behavior
 
-After opening a trace, the GUI automatically attempts to join MCP Hub. The first GUI session becomes the Hub and later sessions become Workers. The default remains `127.0.0.1:10444`, with sessionless routing. A client normally needs only one connection to `10444`, regardless of how many GUI windows are open.
+The Tauri desktop application starts one `tenet` sidecar with `--mcp-hub` for each trace window. The first sidecar to acquire the platform file lock becomes the Hub; the remaining sidecars reverse-connect as Workers. The default remains `127.0.0.1:10444`, with sessionless routing. A client normally needs only one connection to `10444`, regardless of how many Tauri desktop windows are open.
 
 ## Connect IDA Pro
 
@@ -132,7 +132,7 @@ cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
 cp -R tools/tenet/python/tenet ~/.idapro/plugins/
 ```
 
-If your IDA user directory differs, use the directory reported by IDA for user plugins. Restart IDA, open the matching binary, then choose **Edit → Plugins → Tenet: Connect** after Tenet has opened the trace or started with `--mcp-hub`.
+If your IDA user directory differs, use the directory reported by IDA for user plugins. Restart IDA and open the matching binary. After the Tenet backend starts that trace with `--mcp-hub`, or the Tauri desktop application launches its sidecar, run the **Tenet: Connect** plugin action. An ordinary TUI/CLI session without `--mcp-hub` does not automatically provide a Hub.
 
 The plugin exposes four actions:
 
@@ -157,7 +157,7 @@ This endpoint carries JSON-RPC/MCP text messages and is bound to one trace insta
 - Hub WebSocket access is loopback-only. It is separate from the FlatBuffers service started by `--ws-port`.
 
 :::tip[Multiple traces]
-Open multiple Tenet GUI windows as usual. The plugin compares the current IDB input filename with each instance's module name, then falls back to the trace filename and finally the first available instance.
+Open multiple Tauri desktop windows/traces; the Tenet sidecar for each window registers as either the Hub or a Worker. The plugin compares the current IDB input filename with each instance's module name, then falls back to the trace filename and finally the first available instance.
 :::
 
 ## Start with three tools

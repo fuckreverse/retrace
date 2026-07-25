@@ -6,14 +6,13 @@ sidebar:
 
 ## Open locally
 
-Launch Tenet Desktop and choose a `.bin` file, or run:
+Choose a `.bin` file in the standalone Tauri desktop application for graphical exploration, or run the Tenet backend directly:
 
 ```bash
 ./tenet /path/to/trace.bin
-./tenet --tui /path/to/trace.bin
 ```
 
-Trace data stays on your Mac; the documentation site receives nothing.
+Without analysis or service options, the backend enters the terminal TUI by default; it does not open a graphical interface. Trace data stays on your local computer, and the documentation site receives nothing.
 
 ## First-open indexing
 
@@ -23,11 +22,11 @@ Do not routinely delete this directory: it also stores bookmarks, the last curso
 
 ## Session ownership
 
-Only one Tenet process may open a given trace at a time because all modes share its index and session state. If another GUI, TUI, batch, RPC or MCP process owns it, Tenet reports the owner PID, host, mode and open time. Exit that process; do not delete the lock file. Kernel `flock` releases ownership automatically after a crash.
+Only one Tenet backend process may open a given trace at a time because all modes share its index and session state. If another Tenet backend process—a Tauri sidecar, TUI, batch, RPC, or MCP instance—owns it, Tenet reports the owner PID, host, mode, and open time. Exit that process; do not delete the lock file. The operating system file lock is released automatically when the process exits, including after a crash or forced termination.
 
 ## Missing code bytes
 
-A trace with `HF_HAS_CODE` normally disassembles without an image. For sampling or legacy traces with missing bytes, provide the matching Mach-O or ELF:
+A trace with `HF_HAS_CODE` normally disassembles without an image. For sampling or legacy traces with missing bytes, provide the matching Mach-O or ELF image (PE image fallback is not currently supported):
 
 ```bash
 ./tenet trace.bin --image /path/to/binary

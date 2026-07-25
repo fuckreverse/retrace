@@ -4,7 +4,7 @@ sidebar:
   order: 2
 ---
 
-The CLI runs analysis, exports data and produces reports without an interactive session. Every batch analysis mode uses the same pass implementations as the GUI and TUI.
+The CLI runs analysis, exports data, and produces reports without an interactive session. Every batch analysis mode uses the same pass implementations as the terminal TUI and the Tauri sidecar/backend.
 
 ## Batch analysis
 
@@ -37,8 +37,8 @@ The CLI runs analysis, exports data and produces reports without an interactive 
 ./tenet trace.bin --objc --objc-class NSString
 ./tenet trace.bin --syscall-intercept
 
-# VM analysis
-./tenet trace.bin --vm-abstract
+# VM analysis (--vm-abstract requires at least one static hint)
+./tenet trace.bin --vm-abstract --vm-hints hints.json
 ./tenet trace.bin --backward-taint 10000 0 --taint-source-annotation
 
 # Trace tools (instruction-ID ranges)
@@ -70,12 +70,28 @@ Exclude ranges filter instructions during analysis. They do not modify the trace
 ./tenet trace.bin --image /path/to/binary
 ```
 
+## Interactive and service entry points
+
+There is currently no `--tui` option. Running `./tenet trace.bin` without an analysis or service option enters the terminal TUI by default.
+
+| Option | Behavior |
+|---|---|
+| `--rpc [[host:]port]` | Start TCP JSON-RPC; bare `--rpc` defaults to `127.0.0.1:0` (automatic port) |
+| `--mcp` | Start MCP JSON-RPC over stdin/stdout until stdin closes |
+| `--mcp-http [host:port]` | Start MCP Streamable HTTP, defaulting to `127.0.0.1:10444`; supports `--mcp-host`, `--mcp-port`, and `--mcp-auth` |
+| `--mcp-hub [host:port]` | Start multi-instance Hub/Worker coordination, defaulting to `127.0.0.1:10444` |
+| `--ws-port <port>` | Start the loopback-bound FlatBuffers WebSocket service; currently unavailable on Windows |
+| `--streaming` | Tail a growing trace and build its index in real time |
+| `--stats` | Print trace statistics as JSON |
+
+The Tauri desktop application launches `tenet --ws-port <port> <trace> --mcp-hub` as a sidecar. Windows builds currently do not support `--ws-port`, but CLI, TUI, RPC, and MCP remain available.
+
 ## Output and reports
 
-Most CLI modes print structured text to stdout. Graph exports (CFG, call graph, dataflow graph) write Graphviz DOT files. Profile supports JSON and CSV. Diff writes JSON. Taint graphs can be exported as JSON with `--backward-taint-graph`.
+Most CLI modes print structured text to stdout. Graph exports (CFG, call graph, dataflow graph) write Graphviz DOT files. Profile supports JSON and CSV. Diff writes JSON. `--backward-taint-graph <file>` exports `.dot` or `.json`, selected by the filename extension.
 
 ## Headless considerations
 
-- The CLI reads and writes the same `.tenet/` index as GUI/TUI sessions; it respects the same session lock.
+- The CLI, terminal TUI, and Tauri sidecar/backend read and write the same `.tenet/` index and respect the same session lock.
 - Long batch runs do not render a UI; they are faster than TUI for large exports.
 - Pass results are cached; repeated runs with the same parameters complete quickly.

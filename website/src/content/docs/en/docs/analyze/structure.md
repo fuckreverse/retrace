@@ -56,12 +56,12 @@ Memory usage is bounded by default (call events capped at 20 M, per-function ind
 The output is the annotated DOT from `cfg_layout` (`CFGLayoutResult::dot_annotated`). Open it with `dot -Tsvg all.dot -o all.svg` or any Graphviz renderer. Block color reflects execution heat; edges show observed control flow.
 
 :::note[Block-count threshold]
-Full disassembly is embedded in each node only when the CFG has ≤ 500 blocks. For larger graphs the output contains a placeholder; use the GUI or MCP `cfg_export` (JSON format) to explore individual blocks on demand.
+Full disassembly is embedded in each node only when the CFG has ≤ 500 blocks. For larger graphs the output contains a placeholder; use the Tauri frontend or MCP `cfg_export` (JSON format) to explore individual blocks on demand.
 :::
 
 ## Layout
 
-`cfg_layout` computes visual coordinates for CFG nodes using a hierarchical grid algorithm (similar to Ghidra's decompiler layout). It is registered automatically by `--export-cfg` and otherwise runs on demand when a layout view requests it. Standalone CLI use is rare; most users consume the layout through the GUI or the generated DOT.
+`cfg_layout` computes visual coordinates for CFG nodes using a hierarchical grid algorithm (similar to Ghidra's decompiler layout). It is registered automatically by `--export-cfg` and otherwise runs on demand when a layout view requests it. Standalone CLI use is rare; most users consume the layout through the Tauri frontend or the generated DOT.
 
 ## Loops
 
@@ -86,7 +86,7 @@ Each node is a function (by entry PC); edges carry call counts and site PCs.
 
 ## Recommended workflow
 
-1. Open the trace in GUI/TUI — the structure passes `function`, `xref`, `cfg`, `call_graph`, and `loop` are among the default startup set.
+1. Open the trace in the Tauri desktop application (the frontend asks the backend to run its default passes), or run `./tenet trace.bin` directly to enter the TUI and start analysis.
 2. Browse the Functions panel to locate the target function.
 3. Use the Call Stack panel to follow call/return navigation.
 4. Open the CFG panel to inspect hot blocks and edges; use prev/next visit to step through executions.
@@ -95,11 +95,11 @@ Each node is a function (by entry PC); edges carry call counts and site PCs.
 
 ## Interactive entry points
 
-- **Functions panel** (`show_functions_`): sort/filter by call count, instruction count, or name. Right-click a function to jump to its entry, run Xref, or inspect callers/callees.
-- **Call Stack panel** (`show_callstack_`): lists frames at the current instruction. Right-click a frame to jump to its call site or function entry.
-- **CFG panel** (`show_cfg_`): renders the CFG layout. Click a block to select it; use first/prev/next/last to navigate visits (powered by Xref). Right-click a block to jump to a specific execution.
-- **Call Graph panel** (`show_call_graph_`): hot-callees ranking and full edge list. Click a node to navigate to its entry.
-- **XRef navigation**: in the Call Stack panel, the PC xref controls (Prev/Next) step through every execution of the current PC. In the GUI, pressing `X` runs Xref if not already run, then cycles through visits.
+- **Functions panel**: filters by name and sorts by name, call count, or instruction count; click to select and double-click to open the function address in Hex Dump.
+- **Call Stack panel**: refreshes for the current instruction; click a frame to navigate to its call site.
+- **CFG panel**: displays blocks, edges, and execution heat, with block selection, pan, wheel/button zoom, and view reset.
+- **Call Graph panel**: offers a pannable/zoomable graph and a hot-function table; clicking a node or row uses XRef to navigate to its first observed execution.
+- **TUI XRef navigation**: first/previous/next/last visit navigation and the `X` shortcut are TUI keyboard interactions; they are not Tauri-frontend shortcuts.
 - **TUI**: `:pass function`, `:pass xref`, `:pass cfg`, `:pass loop`, `:pass call_graph` run individual passes. `:analyze` runs the default set.
 
 ## MCP call order

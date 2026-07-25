@@ -19,8 +19,8 @@ const components = [
   ['RocksDB', 'Apache-2.0', en ? 'Persistent trace indexes' : '持久化 Trace 索引'],
   ['Capstone', 'BSD-3-Clause', en ? 'Instruction disassembly' : '指令反汇编'],
   ['oneTBB', 'Apache-2.0', en ? 'Parallel task scheduling' : '并行任务调度'],
-  ['SDL', 'Zlib', en ? 'Desktop window and input integration' : '桌面窗口与输入集成'],
-  ['Dear ImGui', 'MIT', en ? 'Native analysis interface' : '原生分析界面'],
+  ['Tauri', 'Apache-2.0 OR MIT', en ? 'Cross-platform desktop application shell' : '跨平台桌面应用外壳'],
+  ['FlatBuffers', 'Apache-2.0', en ? 'Binary protocol between the desktop app and backend' : '桌面应用与后端之间的二进制协议'],
   ['zstd / LZ4', 'BSD', en ? 'Trace and index compression' : 'Trace 与索引压缩'],
   ['OpenSSL', 'Apache-2.0', en ? 'Cryptographic support used by packaged dependencies' : '随包依赖使用的密码学支持'],
 ];
@@ -57,7 +57,7 @@ const components = [
   <section class="section component-section">
     <div class="section-heading">
       <div><div class="eyebrow">{en ? 'MAJOR COMPONENTS' : '主要组件'}</div><h2>{en ? 'Core technology attributions' : '核心技术归属'}</h2></div>
-      <p>{en ? 'This overview highlights major native components. The distribution contains the authoritative, version-specific inventory, including transitive desktop dependencies.' : '本页仅概览主要原生组件。发布包内包含权威的、与具体版本对应的完整清单，包括桌面端传递依赖。'}</p>
+      <p>{en ? 'This overview highlights major third-party components across the backend and desktop app. The distribution contains the authoritative, version-specific inventory, including transitive desktop dependencies.' : '本页仅概览后端与桌面应用使用的主要第三方组件。发布包内包含权威的、与具体版本对应的完整清单，包括桌面端传递依赖。'}</p>
     </div>
     <div class="component-list">
       {components.map(([name, license, purpose], index) => (

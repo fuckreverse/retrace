@@ -15,7 +15,7 @@ The authoritative C definition is `tools/qbditrace/TraceFormat.h`. This document
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0x000 | 4 | `magic` | `0x51424454` ("QBDT") |
-| 0x004 | 4 | `version` | 4 (baseline), 5 (PC-delta), 6 (old-value), 7 (FPR) |
+| 0x004 | 4 | `version` | 4 (baseline), 5 (PC-delta), 6 (old-value), 7 (FPR), 8 (call metadata) |
 | 0x008 | 4 | `arch` | Architecture tag: 1 = AArch64, 2 = x86_64 |
 | 0x00C | 4 | `num_gpr` | GPR count in anchor snapshots (AArch64: 34) |
 | 0x010 | 8 | `module_base` | Runtime base address of the traced module |
@@ -51,6 +51,7 @@ The `flags` field at offset 0x030 controls record layout and compression. Flags 
 | 7 | `HF_COMPRESSED` | Legacy: entire record stream is one zstd frame (historical) |
 | 8 | `HF_BLOCK_COMPRESSED` | 1 MiB zstd blocks with tail index for random access (default) |
 | 9 | `HF_BRANCH_HINT` | nzcv high nibble encodes CALL/RET/BRANCH class |
+| 10 | `HF_CALL_META` | **v8**: enables v8 OBJC/CAPICALL layouts and `REC_RETVAL`; may combine with `HF_PC_DELTA` / `HF_HAS_FPR` |
 
 ## Version evolution
 
@@ -60,6 +61,7 @@ The `flags` field at offset 0x030 controls record layout and compression. Flags 
 | v5 | `HF_PC_DELTA` | INST head shrinks to 6 B (int16 PC delta); decoder maintains running PC |
 | v6 | `HF_OLD_VALUE` | Memory access records grow to 48 B (pre-write old_value fields); **writer removed** |
 | v7 | `HF_HAS_FPR` | ANCHOR gains 512 B FPR block (total 800 B); INST gains FPR diff section |
+| v8 | `HF_CALL_META` | Adds true return facts in `REC_RETVAL`, inline OBJC selectors, and a `uint16_t` CAPICALL `api_id`; may combine with `HF_PC_DELTA` / `HF_HAS_FPR` |
 
 Readers that do not recognise a flag **must** reject the file.
 
@@ -77,6 +79,7 @@ Every record begins with a single-byte `kind` tag:
 | `REC_OBJC` | 5 | ObjC msgSend-family dispatch |
 | `REC_CODE` | 6 | Raw instruction bytes (emitted once per distinct PC) |
 | `REC_CAPICALL` | 7 | C/platform API call with semantic argument captures |
+| `REC_RETVAL` | 8 | True return fact for an OBJC/CAPI/SVC call in v8 |
 
 ### REC_INST (kind = 0)
 
@@ -180,6 +183,8 @@ svc_head_t      72 bytes
 
 ### REC_OBJC (kind = 5)
 
+**Legacy v4-v7 layout:**
+
 ```
 objc_head_t     80 bytes
   kind       u8
@@ -190,6 +195,8 @@ objc_head_t     80 bytes
   sel        u64   (x1: selector; x2 for *Super variants)
   cls[48]          (NUL-terminated runtime class name; "" if unavailable)
 ```
+
+**v8 layout** (`HF_CALL_META` set): the fixed header remains 80 bytes but adds `sel_len` and `flags`; an inline selector follows as `sel_len` content bytes plus a NUL, padded to 4-byte alignment. The flags report selector truncation or read failure. `HF_CALL_META` is a file-wide layout contract, so legacy and v8 OBJC layouts are never mixed in one file.
 
 ### REC_CODE (kind = 6)
 
@@ -208,6 +215,8 @@ code_head_t     16 bytes
 
 Captures a call to a well-known C/platform API function. Contains a fixed 88-byte header plus 0–4 variable-length inline string captures.
 
+**Legacy v4-v7 layout:**
+
 ```
 capicall_head_t     88 bytes
   kind        u8
@@ -219,7 +228,9 @@ capicall_head_t     88 bytes
   args[8]     8×u64 (x0..x7 at call time)
 ```
 
-Followed by `str_count` variable-length captures:
+**v8 layout** (`HF_CALL_META` set): the fixed header remains 88 bytes, with reordered fields and a `uint16_t api_id` that preserves IDs above 255. The file-wide flag requires every CAPICALL in the file to use the v8 layout.
+
+Followed by `str_count` variable-length captures (identical for both layouts):
 
 ```
 capicall_str_t      4 bytes
@@ -229,6 +240,10 @@ capicall_str_t      4 bytes
   [_reserved]  u8
 str_data[str_len + 1]    (NUL-terminated; padded to 4-byte alignment)
 ```
+
+### REC_RETVAL (kind = 8)
+
+Present only in v8 files with `HF_CALL_META`. This 64-byte self-describing record associates true architectural return state with an OBJC, CAPICALL, or SVC call. It carries source kind/ID, call site, target, resume address, and raw `x0`, `x1`, and `nzcv`; `record_size` lets future readers safely skip extensions.
 
 ## Compression
 
@@ -319,9 +334,9 @@ Result: full CFG recovery, function boundary detection, call graphs, loop analys
 
 ### Platform-enhanced trace
 
-Add: `REC_SVC`, `REC_OBJC`, `REC_CAPICALL`.
+Add: `REC_SVC`, `REC_OBJC`, `REC_CAPICALL`; v8 traces may also add `HF_CALL_META` and `REC_RETVAL`.
 
-Result: syscall naming, ObjC message resolution, C API argument capture and string inspection.
+Result: syscall naming, ObjC message resolution, C API argument capture and string inspection; v8 adds inline selectors and true return facts.
 
 ### Vector-enhanced trace
 

@@ -168,6 +168,8 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 - **没有指令记录：** 确认运行时地址已包含 ASLR slide，且代码在 VM 接管线程运行。
 - **Frida 无法连接：** Python 绑定与设备端服务版本必须完全一致。
-- **Trace 被 Tenet 拒绝：** 确认格式 v4+，且含寄存器差值与内嵌码表 flags。
+- **Trace 被 Tenet 拒绝：** 检查 magic number 是否有效、格式版本与布局 flags 是否受支持且一致（包括版本低于 v4），以及文件是否损坏或记录不完整。
+- **缺少寄存器差值（`REG_DIFF`）：** Trace 仍可正常打开和索引，但寄存器查询、污点传播等依赖寄存器状态的分析会降级或不可用。
+- **缺少内嵌代码表（`HAS_CODE`）：** Trace 仍可正常打开；CFG、模式识别等依赖反汇编的分析需要通过 `--image` 提供外部镜像。
 - **异步工作缺失：** 单独捕获 worker 入口，或改为同步路径。
 - **目标附近崩溃：** 使用 `qbditrace_dump_pcring` 导出最近 2048 个 PC。

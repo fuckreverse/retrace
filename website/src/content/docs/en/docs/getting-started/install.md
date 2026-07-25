@@ -4,8 +4,12 @@ sidebar:
   order: 2
 ---
 
-**Goal:** install Tenet Desktop on an Apple Silicon Mac.  
+**Goal:** install the Tenet Tauri desktop application on an Apple Silicon Mac.  
 **Prerequisite:** macOS 14 or newer for the preview package.
+
+## Platform status
+
+The Tenet backend (CLI, TUI, RPC, and MCP) supports Windows, Linux, and macOS (x86_64/arm64). The only desktop package currently available from this website is the macOS Apple Silicon preview DMG; standalone packages for Windows, Linux, and macOS Intel are in progress.
 
 ## Download and verify
 

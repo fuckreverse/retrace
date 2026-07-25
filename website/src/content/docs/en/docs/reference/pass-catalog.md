@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-Every analysis in Tenet is a pass. This page lists all passes in the catalog, grouped by category. Default-on passes run automatically when a trace is opened in the GUI or TUI; others are started on demand.
+Every analysis in Tenet is a pass. This page lists all passes in the catalog, grouped by category. Default-on passes run when the Tauri Web frontend asks the backend to run the default pass set, or when analysis is started in the TUI; others are started on demand.
 
 ## Structure
 
@@ -16,7 +16,7 @@ Every analysis in Tenet is a pass. This page lists all passes in the catalog, gr
 | `cfg_layout` | `--run-pass cfg_layout` | No | Graph layout coordinates for CFG view |
 | `call_graph` | `--run-pass call_graph` | Yes | Inter-function call graph |
 | `loop` | `--run-pass loop` | Yes | Detect loops via back-edges in CFG |
-| `vm_abstract` | `--vm-abstract` | No | VM dispatcher detection and handler extraction |
+| `vm_abstract` | `--vm-abstract` | No | Use a static-analysis-provided dispatcher anchor plus optional indirect-branch/handler hints to build VM step sequences, decode opcodes/operands, and capture context/register/stack snapshots; does not discover dispatchers automatically |
 
 ## Taint
 
@@ -75,15 +75,27 @@ Every analysis in Tenet is a pass. This page lists all passes in the catalog, gr
 
 ```text
 function ──> call_graph
+    ├───────────────> algorithm_summary
+    └───────────────> call_context
+
 xref ──> cfg ──> cfg_layout
-              └──> loop ──> loop_semantics
-                           └──> algorithm_summary
-pattern ──> algorithm_summary
-            └──> objc_crypto
-objc ──> objc_crypto
+  │       └──> loop ──> loop_semantics
+  │              │          └──> algorithm_summary
+  │              ├──────────────> trace_fold
+  │              ├──────────────> call_context
+  │              └──────────────> vm_abstract
+  ├──────────────> loop_semantics
+  ├──────────────> trace_fold
+  └──────────────> vm_abstract
+
+pattern ─────────> algorithm_summary
+  └──────────────> objc_crypto
+call_graph ──────> algorithm_summary
+objc ────────────> objc_crypto
+  └──────────────> taint_source_annotation
 backward_taint ──> taint_source_annotation
-cfg ──> vm_abstract
-loop ──> vm_abstract
+cfg ─────────────> vm_abstract
+thread ──────────> thread_filter
 ```
 
-Passes not listed in the dependency graph have no prerequisite and can run independently.
+The graph above shows the main dependencies declared in the source; `taint` depends on `xref` only when xref acceleration is enabled. For the complete current set, refer to `--list-passes` and each pass's `dependencies()` declaration.

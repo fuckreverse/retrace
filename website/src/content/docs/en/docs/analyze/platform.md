@@ -132,13 +132,13 @@ Every pass above has both a CLI flag and a `--run-pass` name, so you can drive t
 
 Batch mode (`-c`, or an analysis/query option that selects non-interactive execution) writes JSON to stdout.
 
-### GUI
+### Tauri frontend
 
-`--objc` and `--syscall-intercept` both register panels in the GUI's **Platform** group after the pass runs. ObjC results show per-class message frequency; syscall results show per-API frequency. Filtering by class (`--objc-class`) narrows the GUI table.
+The Tauri frontend requests the same backend pass pipeline over WebSocket and presents ObjC and syscall results in its Platform group. ObjC results show per-class message frequency; syscall results show per-API frequency.
 
 ### TUI
 
-The same flags work with `--tui`. The TUI shows the ObjC message table and syscall intercept table as browsable lists.
+Running `./tenet trace.bin` directly opens the TUI. Supplying analysis options such as `--objc` or `--syscall-intercept` selects non-interactive batch mode and writes JSON to stdout instead of opening the TUI.
 
 ### MCP
 
@@ -162,7 +162,7 @@ MCP exposes `objc_messages`, `syscall_intercept`, and `objc_crypto`. `objc_messa
 
 ## Recommended workflow
 
-1. **Inspect platform origin** — open the trace in GUI or run `--stats` first to confirm `target_os`, module name, and record flags.
+1. **Inspect platform origin** — open the trace in the Tauri desktop application or run `--stats` first to confirm `target_os`, module name, and record flags.
 2. **For iOS traces** — run `--objc` to map user-visible behavior, then `--pattern` to find crypto primitives; combine with `--objc-crypto` to link each primitive to the ObjC method that triggered it.
 3. **For crypto material** — `--syscall-intercept` recovers keys, IVs, and plaintext buffers from CommonCrypto / BoringSSL / JNI calls. Increase `--syscall-intercept-bytes` if buffers exceed 64 B.
 4. **For classification confidence** — if the trace has no `REC_CAPICALL`, results rely on `REC_SVC` + `XFER_CALL`, which may misattribute or miss calls; note the source field in results.
@@ -185,6 +185,6 @@ MCP exposes `objc_messages`, `syscall_intercept`, and `objc_crypto`. `objc_messa
 
 - The trace is v4–v7 or otherwise lacks v8 `REC_RETVAL`; it contains no trustworthy return-time fact. Re-record with a v8 `HF_CALL_META` trace. Tenet deliberately does not infer a return from a later record's x0.
 
-### Results differ between CLI and GUI
+### Results differ between CLI and the Tauri frontend
 
-They should not; both use the same pass pipeline. If output discrepancies appear, confirm the GUI hasn't loaded a cached pass result from a previous run with different parameters — clear via `--cache-delete`.
+Both obtain results through the same backend pass pipeline and persisted cache, so identical parameters should agree. If output discrepancies appear, confirm the Tauri sidecar has not loaded a cache produced with different parameters; clear it with `--cache-delete <pass|all>` and rerun.

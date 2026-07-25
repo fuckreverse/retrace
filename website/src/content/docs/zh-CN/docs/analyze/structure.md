@@ -56,12 +56,12 @@ function ──> call_graph
 输出是 `cfg_layout` 的 annotated DOT（`CFGLayoutResult::dot_annotated`）。用 `dot -Tsvg all.dot -o all.svg` 或任意 Graphviz 渲染器打开。块颜色反映执行热度；边显示观察到的控制流。
 
 :::note[块数阈值]
-仅当 CFG 块数 ≤ 500 时，完整反汇编才会嵌入每个节点。更大图的输出会包含占位文本；请使用 GUI 或 MCP `cfg_export`（JSON 格式）按需浏览单个块。
+仅当 CFG 块数 ≤ 500 时，完整反汇编才会嵌入每个节点。更大图的输出会包含占位文本；请使用 Tauri 前端或 MCP `cfg_export`（JSON 格式）按需浏览单个块。
 :::
 
 ## Layout
 
-`cfg_layout` 使用层级网格算法（类似 Ghidra decompiler 布局）为 CFG 节点计算可视化坐标。`--export-cfg` 会自动注册它；其他布局视图按需请求时再运行。独立 CLI 使用较少；大多数用户通过 GUI 或生成的 DOT 消费布局。
+`cfg_layout` 使用层级网格算法（类似 Ghidra decompiler 布局）为 CFG 节点计算可视化坐标。`--export-cfg` 会自动注册它；其他布局视图按需请求时再运行。独立 CLI 使用较少；大多数用户通过 Tauri 前端或生成的 DOT 消费布局。
 
 ## Loops
 
@@ -86,7 +86,7 @@ function ──> call_graph
 
 ## 推荐工作流
 
-1. 在 GUI/TUI 中打开 trace——结构相关的 `function`、`xref`、`cfg`、`call_graph`、`loop` 属于默认启动集合。
+1. 在 Tauri 桌面应用中打开 trace（前端请求后端运行默认 Pass），或直接运行 `./tenet trace.bin` 进入 TUI 并启动分析。
 2. 浏览 Functions 面板定位目标函数。
 3. 使用 Call Stack 面板跟随 call/return 导航。
 4. 打开 CFG 面板检查热块和边缘；使用 上/下 访问 在多次执行间步进。
@@ -95,11 +95,11 @@ function ──> call_graph
 
 ## 交互入口
 
-- **Functions 面板** (`show_functions_`)：按调用次数、指令数或名称排序/过滤。右键函数可跳转到其入口、运行 Xref，或查看 caller/callee。
-- **Call Stack 面板** (`show_callstack_`)：列出当前指令处的栈帧。右键帧可跳转到调用点或函数入口。
-- **CFG 面板** (`show_cfg_`)：渲染 CFG 布局。点击块选中；使用 首/上/下/末 在多次访问间导航（由 Xref 驱动）。右键块可跳转到特定执行。
-- **Call Graph 面板** (`show_call_graph_`)：热 callee 排名和完整边列表。点击节点跳转到其入口。
-- **XRef 导航**：在 Call Stack 面板中，PC xref 控制（Prev/Next）在当前 PC 的每次出现间步进。在 GUI 中，按 `X` 在未运行 Xref 时启动它，然后在各次访问间循环。
+- **Functions 面板**：支持按名称过滤，并按名称、调用次数或指令数排序；单击选择条目，双击在 Hex Dump 中打开函数地址。
+- **Call Stack 面板**：随当前指令刷新调用栈；单击帧跳转到对应 call site。
+- **CFG 面板**：显示块、边和执行热度，支持块选择、平移、滚轮/按钮缩放和视图重置。
+- **Call Graph 面板**：提供可平移缩放的图视图和热点函数表视图；点击节点或表格行会通过 XRef 跳到首次观察到的执行。
+- **TUI XRef 导航**：首/上/下/末访问导航和 `X` 快捷键属于 TUI 的键盘交互；不要把它们当作 Tauri 前端快捷键。
 - **TUI**：`:pass function`、`:pass xref`、`:pass cfg`、`:pass loop`、`:pass call_graph` 运行单个 Pass。`:analyze` 运行默认集。
 
 ## MCP 调用顺序

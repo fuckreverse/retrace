@@ -168,6 +168,8 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 - **No instructions recorded:** verify runtime addresses include the ASLR slide and that the target runs on the VM-controlled thread.
 - **Frida cannot connect:** the Python bindings and device service must use matching versions.
-- **Trace rejected by Tenet:** confirm format version 4 or newer with register-diff and embedded-code flags.
+- **Trace rejected by Tenet:** check for a valid magic number, a supported format version with consistent layout flags (including rejecting versions older than v4), and a non-corrupt file with complete records.
+- **Missing register diffs (`REG_DIFF`):** the trace still opens and indexes normally, but register queries, taint propagation, and other analyses that depend on register state are degraded or unavailable.
+- **Missing embedded code table (`HAS_CODE`):** the trace still opens; disassembly-dependent analyses such as CFG and pattern recognition require an external image supplied with `--image`.
 - **Missing asynchronous work:** capture the worker entry separately or make the target path synchronous.
 - **Crash near the target:** export the 2048-entry PC ring with `qbditrace_dump_pcring` and inspect the last executed addresses.

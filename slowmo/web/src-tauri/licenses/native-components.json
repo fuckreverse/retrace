@@ -65,24 +65,6 @@
       "license_files": ["../../../_deps/onetbb-src/LICENSE.txt"]
     },
     {
-      "name": "Dear ImGui",
-      "version": "1.91.6-docking",
-      "license": "MIT",
-      "license_files": ["../../../_deps/imgui-src/LICENSE.txt"]
-    },
-    {
-      "name": "SDL",
-      "version": "3.2.0",
-      "license": "Zlib",
-      "license_files": ["../../../_deps/sdl3-src/LICENSE.txt"]
-    },
-    {
-      "name": "imgui-node-editor",
-      "version": "0.9.3",
-      "license": "MIT",
-      "license_files": ["../../../_deps/imgui_node_editor-src/LICENSE"]
-    },
-    {
       "name": "fmt",
       "version": "10.2.1",
       "license": "MIT",

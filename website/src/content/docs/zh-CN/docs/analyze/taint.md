@@ -121,9 +121,9 @@ MCP 等价工具：单次调用 `critical_path`，同时传入 `source_reg`、`s
 
 启发式对具有部分寄存器更新或标志依赖操作的指令精度较低，但覆盖绝大多数 AArch64 整数代码。
 
-## GUI、TUI 与 MCP
+## Tauri 前端、TUI 与 MCP
 
-- **GUI**：污点指令在指令列表中高亮；Producer Chain 面板显示 `backward_taint` 结果的受限预览（不是独立分析）。"Taint" 模式显示前向污点事件。
+- **Tauri 前端**：污点指令在指令列表中高亮；Producer Chain 面板显示 `backward_taint` 结果的受限预览（不是独立分析）。"Taint" 模式显示前向污点事件。
 - **TUI**：按 `t` 运行前向污点，按 `B`（Shift+b）运行反向污点；污点指令会在列表中标注。
 - **MCP**：`taint_forward` 必填 `reg_index`，并支持 `inst_id`、`mem_addrs`、`stop_pcs`、`max_width` 与步骤分页；`taint_backward` 使用 `sink_inst_id` / `sink_reg`，支持步数限制和事件分页；`critical_path` 在一次调用中同时接收 source 与 sink；`dataflow_graph` 使用 `start_inst_id` / `end_inst_id`，可选 `max_nodes`、`format`。
 

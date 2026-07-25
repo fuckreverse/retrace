@@ -8,7 +8,7 @@ sidebar:
 
 ## The path
 
-1. [Install Tenet](./install/) on an Apple Silicon Mac.
+1. [Install Tenet](./install/) on an Apple Silicon Mac. The Tenet backend supports Windows, Linux, and macOS (x86_64/arm64), but the only publicly released desktop package is currently the macOS Apple Silicon preview DMG; standalone packages for the other platforms are in progress.
 2. [Record a trace](../capture/) with QBDITrace or a compatible collector.
 3. [Open it in Tenet](./open-a-trace/) and wait for the first index build.
 4. [Understand core concepts](./core-concepts/) — instruction IDs, time-aware state, analysis passes.

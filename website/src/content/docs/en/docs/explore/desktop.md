@@ -4,50 +4,54 @@ sidebar:
   order: 2
 ---
 
-Tenet Desktop is the default Apple Silicon interface for long-form investigation. It combines immediate state views with asynchronous analysis windows without duplicating analysis logic.
+Tenet Desktop is a standalone Tauri application in `tools/tenet/web/`, not a native GUI embedded in the `tenet` executable. When a trace is opened, the app launches the headless `tenet` backend as a sidecar with arguments that include `--ws-port <port> <trace> --mcp-hub`. The React frontend accesses the backend over WebSocket using the FlatBuffers binary protocol, while MCP Hub also provides instance coordination for external tools.
+
+Desktop currently supports macOS and Linux. The Windows backend disables `TENET_ENABLE_WS` by default because the uSockets event loop used by the project does not yet have an IOCP backend; consequently, Tauri Desktop cannot currently connect to the Windows `tenet` backend.
 
 ## Main workspace
 
-| View | What it shows |
-|---|---|
-| Instructions | `inst_id`, runtime PC, disassembly and recorded memory accesses |
-| Registers | Current GPR values; green=read, red=write, yellow=read/write |
-| Memory | Access type, address, value, Hex Dump and last writer |
-| Call Stack | Dynamic frames at the cursor; jump to call site or function entry |
-| Functions | Names/addresses, invocation counts, executed instructions, callers/callees |
-| CFG | Executed basic blocks and edges with heat; click a block to navigate |
-| Strings | Final-snapshot and time-aware discovered strings |
-| Output | Filterable logs by level, subsystem and text |
+The interface is organized into `SidebarLeft`, `CenterArea`, and `SidebarRight`, with a shared timeline and status bar below them.
 
-The cursor is shared across views. Selecting a function, call frame, CFG block or analysis hit navigates the same instruction timeline.
+| Area | Current views | What they show |
+|---|---|---|
+| Left sidebar | Functions, Strings | Filtering and sorting for discovered functions, plus string-analysis results |
+| Center top | Instructions, CFG, Strings, Reg Timeline, Dataflow | The searchable instruction timeline, control-flow graph, strings, register timeline, and dataflow graph |
+| Center bottom | Analysis, Call Stack, and analysis-result tabs | The pass controller, current call stack, and views for Patterns, Algorithms, Constants, Loops, API Intercepts, ObjC, Call Graph, taint, memory search, Entropy, YARA, Trace Fold/Diff, Snapshots, DWARF, VM Workspace, Cache, Log, Settings, and more |
+| Right sidebar | Registers, Hex Dump, Mem Access | GPR/NZCV state before the current instruction, an addressable hexadecimal memory view, and memory reads/writes recorded for the current instruction |
+
+The navigation position is shared through the frontend store. Selecting an instruction, call frame, or analysis result with an instruction location updates related panels around the same `inst_id`. The toolbar, timeline, and Navigate menu also provide back/forward history, first/last jumps, Go to, search, and bookmarks.
 
 ## Navigation workflow
 
-1. Select an instruction and compare register reads/writes.
-2. Inspect recorded memory accesses and open a Hex Dump for pointers.
-3. Use the Call Stack and Functions views to identify the containing behavior.
-4. Move among repeated executions with XRef navigation.
-5. Bookmark important sources, transformations and sinks.
+1. Select an instruction in **Instructions** to inspect its runtime PC, disassembly, and search matches.
+2. Use **Registers** to compare current values, writes, and changes from the neighboring instruction.
+3. Inspect recorded reads and writes in **Mem Access**, then send an address or register value to **Hex Dump**.
+4. Add behavioral context with **Call Stack**, **Functions**, **CFG**, and the analysis-result tabs.
+5. Bookmark important sources, transformations, and sinks. Use the TUI when you need XRef previous/next, Follow Call/Return, breakpoints, or watchpoints.
 
 ## Analysis control
 
-The **Analysis** window lists catalog passes by category with Not Run, Running, Completed or Failed states. Running passes expose progress and cancellation; completed results can be rerun after invalidating their cache.
+**Analysis** is a tab in the lower center area. It groups the backend pass catalog into Structure, Taint, Crypto-Pattern, Memory-String, ObjC-Platform, Profile-Trace, and Misc categories, and reports Not Run, Running, Completed, or Failed states.
 
-Queries that require parameters use dedicated windows, including:
+A running pass shows its phase message and percentage progress. Passes that are not running can be started or rerun with the play/rerun control; completed entries display the rerun control. **Clear All** clears analysis state and results. The current panel has no per-task cancel action, so progress reporting should not be interpreted as cancellation support.
 
-- Memory Search and YARA Memory Scan
-- Register Timeline and Call Context
-- Memory Snapshots and Entropy
-- Dataflow Graph and Window Stats
-- Trace Fold and Trace Diff
-- VM Abstract / VM Workspace
-
-Other dedicated result windows cover Patterns, Constants, Loop Semantics, Algorithm Summary, ObjC Messages, ObjC × Crypto, API Intercepts, Call Graph and CFG.
+Parameterized or specialized features live in their corresponding tabs, including Memory Search, YARA, Entropy, Register Timeline, Dataflow, Backward Taint, Trace Fold, Trace Diff, and VM Workspace. Results such as Patterns, Constants, Loops, Algorithms, ObjC, ObjC×Crypto, API Intercepts, and Call Graph are also shown as tabbed panels rather than separate pop-up windows by default. At present, only **VM Workspace** is explicitly exposed through an “Open in New Window” menu item.
 
 ## Context actions
 
-Right-click an instruction to run XRef, forward or backward taint, inspect producers, set a breakpoint/watchpoint, open CFG, copy addresses or jump to related evidence. Long analyses run asynchronously; the UI remains navigable and shutdown cancels active work safely.
+The current **Instructions** context menu contains only:
+
+- Navigate Here
+- Add Bookmark / Remove Bookmark
+- Taint Forward (x0)
+- Open PC in Hex Dump
+- Copy Address
+- Copy Disassembly
+
+The **Registers** context menu can send a register value to Hex Dump or copy that value. Start XRef, backward taint, and other analyses from **Analysis** or the corresponding result tabs. Interactions such as XRef previous/next, Follow Call/Return, breakpoints, and write watchpoints are currently provided mainly by the TUI and should not be assumed to exist in the Desktop instruction context menu.
 
 ## Symbols and missing code
 
-The Symbol Info view can consume supported symbol exports. If the trace lacks some code bytes, reopen it with `--image` so disassembly and code-dependent passes can use the matching image as fallback.
+The **DWARF / Symbol Info** tab displays file, line, function, and variable information returned by the backend.
+
+If a trace does not embed the required code bytes, the backend CLI accepts `--image <path>` to load a matching image for disassembly and code-dependent analysis fallback. `--image` is a command-line argument supplied when starting the `tenet` backend. The current Tauri open-trace flow passes WebSocket, trace, and MCP Hub arguments to the sidecar, but does not expose an in-app image picker or a “reopen with `--image`” action. Use an explicit CLI workflow with `--image` when that fallback is required.

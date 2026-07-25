@@ -52,15 +52,9 @@ VMP 风格保护把原生逻辑翻译成自定义字节码，再由 dispatcher �
 
 ### 3. 在 VM Workspace 中检查结果
 
-GUI 顶部的 **VM Hints** 入口支持拖放或选择 JSON。运行后打开 **VM Workspace**：
+当前 Tauri 前端的 **VM Workspace** 是一个 handler 摘要面板，也可弹出到独立窗口。它不支持拖放/选择 hints JSON；JSON hints 请通过 CLI `--vm-hints <file.json>` 提供。面板内可填写 `dispatcher_pc`、`indirect_branch_pc` 或 `mem_anchor_addr`，选择 dispatch type 和 opcode size，然后请求后端运行 `vm_abstract`。
 
-- **VM Handlers**：频率、标签与原生 PC；
-- **VM Steps**：opcode、VM-PC、标签及对应原生指令区间；
-- **Bytecode/Stats**：字节码范围与执行统计；
-- **VM Registers / Stack**：虚拟寄存器或操作数栈快照；
-- **VM Memory / Ctx**：context 字段值。
-
-启用 **Linked** 后，选择 VM step 会同步跳转到原生指令时间线。
+运行后表格展示每个已观察 handler 的 opcode、原生 handler PC、语义标签和命中次数。当前 Web 实现没有 VM Steps、Bytecode、Registers、Stack、Memory/Ctx 多标签视图，也没有 Linked 模式联动主指令时间线；需要步骤、虚拟寄存器时间线或反向切片时使用 MCP VM 工具。
 
 ## Hints JSON
 

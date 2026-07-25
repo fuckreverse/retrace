@@ -154,9 +154,9 @@ Trace 工具对整个执行历史进行操作：压缩重复循环、比较 Trac
 | `--reg-timeline <reg_index>` | —— | 寄存器索引（0–28 = x0–x28，29=fp，30=lr，31=sp，32=nzcv，33=pc） |
 | `--reg-timeline-range <start> <end>` | 整个 Trace | 要扫描的 inst_id 区间 |
 
-### GUI / MCP 入口
+### Tauri 前端 / MCP 入口
 
-GUI 在 Profile 分组中提供"Register Timeline"面板：在寄存器视图中选择寄存器即可填充时间线。MCP 暴露 `reg_timeline` 工具，参数与 CLI 一致。
+Tauri 前端提供 Register Timeline 面板，可选择常用寄存器或输入自定义寄存器名，绘制值变化并点击时间线跳转主指令视图。MCP 暴露 `reg_timeline` 工具，参数与 CLI 一致。
 
 ## 调用上下文
 
@@ -176,13 +176,13 @@ GUI 在 Profile 分组中提供"Register Timeline"面板：在寄存器视图中
 - `loop_contexts`：包含目标的循环，含 header PC、嵌套深度、观察到的总迭代数；
 - `instructions`：周围指令（默认前 10 / 后 10），每条标注循环深度以及是否为目标。
 
-### GUI / MCP 入口
+### CLI / MCP 入口
 
-GUI 中在时间线中选择指令会自动填充 Call Context 面板。MCP 的 `call_context` 可传精确 `inst_id` 或 `pc`；PC 形式通过 XRef 选择一次已观察的指令执行。
+当前 Tauri 前端尚未实现 Call Context 结果面板，也没有“选择主时间线指令后自动填充”的联动。请使用上面的 `--call-context <inst_id>` CLI，或调用 MCP `call_context`；MCP 可传精确 `inst_id` 或 `pc`，PC 形式通过 XRef 选择一次已观察的指令执行。
 
 ## 性能剖析入口
 
-Tenet **没有** `--profile` CLI 标志。性能分析走 macOS Instruments 工具链：
+Tenet **没有** `--profile` CLI 标志。以下 Instruments 工具链是给 Tenet 开发者在 macOS 上剖析后端性能的建议，不是 Tenet 分析能力的平台限制；Linux/Windows 开发者可使用各自平台的 profiler：
 
 - **Time Profiler** —— 函数级 CPU 采样，定位最慢的 Pass 或函数；
 - **System Trace** —— 可视化线程调度与上下文切换；
@@ -193,7 +193,7 @@ Tenet **没有** `--profile` CLI 标志。性能分析走 macOS Instruments 工�
 
 ## 推荐工作流
 
-1. **初步浏览** —— 在 GUI 打开 Trace 或 `--stats`，确认总指令数与索引状态。
+1. **初步浏览** —— 在 Tauri 桌面应用中打开 Trace 或 `--stats`，确认总指令数与索引状态。
 2. **定位热区** —— 跑 `--window-stats 0 <end>` 找出最活跃的指令段。
 3. **折叠噪声循环** —— 如果窗口统计暴露了高密度高迭代区域（memset 风格），对该 inst_id 区间跑 `--trace-fold`，在深入分析前先压缩。
 4. **差异对比** —— 对同函数/不同输入的 Trace，使用 `--trace-diff`（或 `--trace-diff-file`）定位数据依赖引发的分歧。
@@ -201,9 +201,9 @@ Tenet **没有** `--profile` CLI 标志。性能分析走 macOS Instruments 工�
 
 ## 限制与排查
 
-- **折叠基于 inst_id 区间**，不是 PC。如果想折叠特定循环，先在 GUI 或 `--search-pc <header_pc>` 中定位其 inst_id 范围。
+- **折叠基于 inst_id 区间**，不是 PC。如果想折叠特定循环，先在 Tauri 前端或用 `--search-pc <header_pc>` 中定位其 inst_id 范围。
 - **差异要求格式/版本兼容**。两条 Trace（或同一 Trace 的两个区间）都能在 tenet 中正常打开。Delta 编码（v5）和 FPR（v7）Trace 在 tenet 内完全支持。
 - **离线解码**通过 `tenet --dump text` 或 `tenet --dump jsonl` 进行，支持 v4/v5/v7（含分块压缩）。独立的 `trace_decode` 已移除。
-- **寄存器时间线和调用上下文都有 GUI 面板**，也可通过 CLI/MCP 访问。没有 `--profile` / `--hotspot` CLI 标志 —— 性能剖析用 Instruments，不是内置采样器。
+- **寄存器时间线已有 Tauri 前端面板；Call Context 尚未接入 Web 前端**，后者通过 CLI/MCP 使用。没有 `--profile` / `--hotspot` CLI 标志；Instruments 仅是 macOS 开发者的后端剖析工具，不限制 Tenet 的跨平台分析能力。
 - **折叠保留代表性迭代**；并不从底层 Trace 数据中移除。折叠后运行的 Pass 仍看到原始指令流。
 - **窗口统计步长 = 窗口大小**（不重叠）；当前 CLI 不暴露重叠窗口。

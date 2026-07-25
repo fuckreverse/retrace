@@ -83,7 +83,7 @@ MCP：`memory_strings` tool。
 
 两阶段收集：Phase A 仅用 `RegisterFile::state_before`（~170 µs）收集 `(addr, inst_id)` 元组；Phase B 按页号排序，使连续读取命中线程本地页缓存，把 N 次随机 RocksDB 寻道转换为页排序顺序访问。总量受 `config_.max_snapshots` 约束。
 
-MCP：`memory_snapshot` tool 接受显式 `inst_ids`；GUI：**Tools → Memory Snapshot…**
+MCP：`memory_snapshot` tool 接受显式 `inst_ids`；Tauri 前端：**Tools → Memory Snapshot…**
 
 ## 值与模式搜索
 
@@ -96,7 +96,7 @@ MCP：`memory_snapshot` tool 接受显式 `inst_ids`；GUI：**Tools → Memory 
 
 `--literal-search` 是 `--mem-search-value` 的弃用别名。
 
-`--mem-search-range <start> <end>` 把两种模式都限制到 inst_id 窗口。`--run-pass mem_search` 是遗留简写，不配置模式/值 —— 请通过上述 CLI 参数或 GUI/MCP 提供参数。
+`--mem-search-range <start> <end>` 把两种模式都限制到 inst_id 窗口。`--run-pass mem_search` 是遗留简写，不配置模式/值 —— 请通过上述 CLI 参数或 Tauri 前端/MCP 提供参数。
 
 ```bash
 ./tenet [options] trace.bin --mem-search "48 8B ?? ?? 48 89"
@@ -107,7 +107,7 @@ MCP：`memory_snapshot` tool 接受显式 `inst_ids`；GUI：**Tools → Memory 
 
 MCP：`mem_search` tool 接受 `patterns`（可用 `??` 通配符）、`exact_values`、`range`、`search_reg_values`、`search_immediates`。
 
-GUI：**Tools → Memory / Value Search…**
+Tauri 前端：**Tools → Memory / Value Search…**
 
 ## 熵
 
@@ -125,12 +125,14 @@ GUI：**Tools → Memory / Value Search…**
 这些分类是统计信号，不是证明。压缩数据可能得分低于 7.5；小密钥调度可能高于 4.0。结论前务必用 `pattern` / `taint` / `loop_semantics` 证据交叉印证。
 :::
 
-**CLI 局限**：`--entropy <start> <end>` 形式把 `<start>` 当**单一采样点**，不能直接指定地址和大小 —— CLI 会取默认值，仅作为快速兼容检查。
+CLI 的真实签名是 `--entropy <addr_hex> <size>`：第一个参数是十六进制内存地址，第二个参数是十进制字节数。用 `--entropy-at <inst_id>` 选择采样时刻；用 `--entropy-timeline` 在该区域的写历史点重采样并输出时间线。
 
-**GUI**：可以输入精确 `addr` + `size`，并启用时间线计算，在写历史点重采样区域以观察熵变化。**MCP `entropy_analysis`** 当前用于分页读取默认 `entropy` Pass 的结果块，只暴露 `offset` / `limit`；需要精确地址、大小或时间线时请使用 GUI。
+Tauri 前端的 Entropy 面板同样提供地址、大小、采样时刻与时间线控制。MCP `entropy_analysis` 用于分页读取后端 `entropy` Pass 的结果块。
 
 ```bash
-./tenet [options] trace.bin --entropy 5000 6000    # 兼容形式：在 inst_id=5000 处采样
+./tenet [options] trace.bin --entropy 0x16fdff200 4096
+./tenet [options] trace.bin --entropy 0x16fdff200 4096 --entropy-at 5000
+./tenet [options] trace.bin --entropy 0x16fdff200 4096 --entropy-timeline
 ```
 
 MCP：`entropy_analysis` tool。
@@ -163,13 +165,13 @@ MCP：`entropy_analysis` tool。
 
 - **"YaraMemScanPass: no .yar rule files found."** 编译器成功但未找到任何 `.yar` 文件。确认错误消息列出的规则查找目录；传递显式 `--yara-rules`。
 - **"YaraMemScanPass: failed to initialize YARA compiler."** `libyara` 返回编译器错误。先用 `yarac` 检查规则语法。
-- **"YARA support not compiled in"**（GUI 或 MCP）。构建使用 `TENET_ENABLE_YARA=OFF`；需重编译启用 YARA。菜单项灰显而非隐藏，让用户知道该功能存在。
+- **"YARA support not compiled in"**（Tauri 前端或 MCP）。构建使用 `TENET_ENABLE_YARA=OFF`；需重编译启用 YARA。菜单项灰显而非隐藏，让用户知道该功能存在。
 
-MCP：`yara_mem_scan` tool；GUI：**Tools → YARA Scan…**
+MCP：`yara_mem_scan` tool；Tauri 前端：**Tools → YARA Scan…**
 
-## GUI 与 MCP 速查
+## Tauri 前端与 MCP 速查
 
-| 能力 | GUI 入口 | MCP tool |
+| 能力 | Tauri 前端入口 | MCP tool |
 |---|---|---|
 | 内存读取 | 右键地址 → "Open in Hex Dump" | `memread` |
 | 写历史 | **Tools → Memory Write History…** | `mem_write_history` |
@@ -186,5 +188,5 @@ MCP：`yara_mem_scan` tool；GUI：**Tools → YARA Scan…**
 - 已记录的 read 可恢复未插桩代码准备的数据；完全未被观察的数据不可恢复。
 - `strings` 捕获的是每次写入后的快照，不是单一最终状态 —— 早期写入的（后来被覆盖的）值仍可被发现。
 - `memory_strings` 能发现 `strings` 因后期覆盖而遗漏的瞬时调用点参数。
-- GUI 提供精确地址、大小和时间线采样；CLI `--entropy` 仅提供兼容的 inst_id 参数，MCP `entropy_analysis` 当前只分页返回默认 Pass 结果。
+- CLI 和 Tauri 前端都可指定精确地址与大小；CLI 另用 `--entropy-at` 选择时刻、`--entropy-timeline` 请求时间线。MCP `entropy_analysis` 分页返回后端 Pass 结果。
 - YARA 扫描的是重建后的真实内存，不是近似；受可选构建开关保护，必须在规则 / 编译器层面排查。

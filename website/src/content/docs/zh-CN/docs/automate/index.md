@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-选择最窄的接口匹配集成需求。所有接口使用相同的 Pass 实现和缓存结果。
+选择最窄的接口匹配集成需求。所有接口共享同一份后端实现和持久化 Pass 缓存。
 
 ## 接口
 
@@ -22,7 +22,8 @@ sidebar:
 ./tenet trace.bin --pattern --algorithm-summary --export-cfg func.dot
 
 # 启动 JSON-RPC 服务
-./tenet trace.bin --rpc-port 4321
+./tenet trace.bin --rpc 4321
+# 裸 --rpc 默认监听 127.0.0.1:0，由操作系统自动分配端口
 
 # 启动 MCP Hub（LLM 与 IDA 集成，默认 127.0.0.1:10444）
 ./tenet trace.bin --mcp-hub
@@ -32,4 +33,4 @@ sidebar:
 ./tenet trace.bin --ws-port 9090
 ```
 
-所有接口共享同一会话锁：同一 Trace 同时只能被一个进程拥有。结果被缓存并跨接口共享。
+这些接口复用同一份后端实现，并可复用持久化 Pass 缓存；这不表示多个进程能够并发共享同一个 Trace 会话。同一 Trace 受独占会话锁保护，同时只能由一个进程拥有。

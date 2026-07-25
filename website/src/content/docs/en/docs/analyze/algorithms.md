@@ -95,7 +95,7 @@ Dependencies: `loop` + `xref`.
 ./tenet [options] trace.bin --loop-semantics
 ```
 
-MCP: `loop_semantics` tool; GUI: Loop Semantics panel.
+MCP: `loop_semantics` tool; Tauri frontend: Loop Semantics panel.
 
 ## Algorithm summary
 
@@ -125,7 +125,7 @@ Every candidate carries:
 ./tenet [options] trace.bin --algorithm-summary
 ```
 
-MCP: `algorithm_summary` tool; GUI: Algorithm Summary panel; TUI: `:algosum`.
+MCP: `algorithm_summary` tool; Tauri frontend: Algorithm Summary panel; TUI: `:algosum`.
 
 ## ObjC × Crypto
 
@@ -139,11 +139,11 @@ Hard dependencies: `pattern` + `objc`.
 ./tenet [options] trace.bin --objc --pattern --objc-crypto
 ```
 
-MCP: `objc_crypto` tool; GUI: ObjC × Crypto panel.
+MCP: `objc_crypto` tool; Tauri frontend: ObjC × Crypto panel.
 
-## CLI / GUI / TUI / MCP reference
+## CLI / Tauri frontend / TUI / MCP reference
 
-| Capability | CLI | GUI | TUI | MCP |
+| Capability | CLI | Tauri frontend | TUI | MCP |
 |---|---|---|---|---|
 | Pattern scan | `--pattern` | Patterns panel | `:pattern` | `pattern_scan` |
 | Constants | `--constants --constants-min-parts 3` | Constants panel | — | `constants_scan` |

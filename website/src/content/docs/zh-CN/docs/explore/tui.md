@@ -7,10 +7,10 @@ sidebar:
 在 SSH 或无图形会话的机器上使用 TUI：
 
 ```bash
-./tenet --tui /path/to/trace.bin
+./tenet /path/to/trace.bin
 ```
 
-它与 Desktop 使用相同的 Reader、状态重建、PassManager 和缓存结果。两者只有展示差异，分析语义完全一致。
+不带分析或服务类参数时，Tenet 默认进入交互式 TUI。它与 Desktop 共享后端分析语义和持久化状态，但具体操作入口和覆盖范围不完全相同。
 
 ## 工作区
 
@@ -27,7 +27,7 @@ sidebar:
 | 运行反向污点 | `B` |
 | 运行循环分析 | `O` |
 | 切换 Hex Dump | `H` |
-| 过滤列表 | `/` |
+| 搜索指令/反汇编 | `/` |
 | 运行命名 Pass | `:pass <name>` |
 | 列出 Pass | `:passes` |
 | 启动分析流程 | `:analyze` |
@@ -47,6 +47,6 @@ sidebar:
 
 - 终端应足够大，以同时显示时间轴和状态面板。
 - 首次索引完成前不要断开。
-- 跨会话保留 Trace 的 `.tenet/` 目录。
+- 跨会话保留 Trace 文件旁的 `<trace-file>.tenet/` 持久化目录。
 - 关闭前添加书签；光标与书签会持久化。
 - 长时间批量导出应使用 CLI，避免终端渲染参与。

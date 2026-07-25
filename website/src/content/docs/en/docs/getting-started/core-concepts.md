@@ -32,7 +32,7 @@ Functions, XRefs, CFG edges, calls and loops are derived from observed execution
 
 ## Analysis passes
 
-Each analysis is an independent pass with declared dependencies and a cacheable result. GUI, TUI, CLI, RPC and MCP use the same pass implementations. Multiple scan-oriented passes can share one trace traversal.
+Each analysis is an independent pass with declared dependencies and a cacheable result. The standalone Tauri desktop application calls the Tenet backend over WebSocket and uses the same pass implementations as the TUI, CLI, RPC, and MCP interfaces. Multiple scan-oriented passes can share one trace traversal.
 
 ## Capability follows evidence
 

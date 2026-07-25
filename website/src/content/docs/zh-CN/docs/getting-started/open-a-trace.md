@@ -6,14 +6,13 @@ sidebar:
 
 ## 本地打开
 
-在 Tenet Desktop 中选择 `.bin` 文件，或运行：
+可以在独立的 Tauri 桌面应用中选择 `.bin` 文件，以图形化方式浏览；也可以直接运行 Tenet 后端：
 
 ```bash
 ./tenet /path/to/trace.bin
-./tenet --tui /path/to/trace.bin
 ```
 
-Trace 始终在你的 Mac 本地分析，文档网站不会接收任何数据。
+不带分析或服务参数时，后端默认进入终端 TUI，不会打开图形界面。Trace 始终在本机分析，文档网站不会接收任何数据。
 
 ## 首次索引
 
@@ -23,11 +22,11 @@ Trace 始终在你的 Mac 本地分析，文档网站不会接收任何数据。
 
 ## 会话独占
 
-同一 Trace 同时只能由一个 Tenet 进程打开，因为所有模式共享索引与会话状态。若另一个 GUI、TUI、批处理、RPC 或 MCP 进程已占用，Tenet 会显示其 PID、主机、模式和打开时间。请退出占用进程，不要删除锁文件；进程崩溃后内核 `flock` 会自动释放。
+同一 Trace 同时只能由一个 Tenet 后端进程打开，因为所有模式共享索引与会话状态。若另一个 Tenet 后端进程（Tauri sidecar、TUI、批处理、RPC 或 MCP 实例）已占用，Tenet 会显示其 PID、主机、模式和打开时间。请退出占用进程，不要删除锁文件；操作系统文件锁会在进程退出后自动释放，包括崩溃或被强制终止的情况。
 
 ## 缺少代码字节
 
-含 `HF_HAS_CODE` 的 Trace 通常无需镜像即可反汇编。对 sampling 或缺码的旧 Trace，可提供匹配的 Mach-O/ELF：
+含 `HF_HAS_CODE` 的 Trace 通常无需镜像即可反汇编。对 sampling 或缺码的旧 Trace，可提供匹配的 Mach-O 或 ELF 镜像（当前不支持 PE image fallback）：
 
 ```bash
 ./tenet trace.bin --image /path/to/binary

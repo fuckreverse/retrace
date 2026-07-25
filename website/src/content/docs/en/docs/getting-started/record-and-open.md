@@ -7,6 +7,8 @@ sidebar:
 **Goal:** record an iOS function and run a first analysis.  
 **Prerequisite:** a deployed QBDITrace library, a reachable Frida service, and the target's static entry offset.
 
+This tutorial uses iOS; for Android capture, see the corresponding [platform guide](/en/docs/capture/android/).
+
 ## Record
 
 ```bash
@@ -20,7 +22,13 @@ Use runtime addresses when configuring the C ABI directly. The runner resolves t
 
 ## Open and navigate
 
-Open the `.bin` file in Tenet Desktop. The first open builds a persistent index; later opens reuse it. Navigate by instruction ID or PC and compare the register panel before and after a selected instruction.
+Open the `.bin` file in the standalone Tauri desktop application. Alternatively, run the backend directly to enter the terminal TUI by default:
+
+```bash
+./tenet trace.bin
+```
+
+The first open builds a persistent index; later opens reuse it. Navigate by instruction ID or PC and compare the register panel before and after a selected instruction.
 
 ## Run a first analysis
 

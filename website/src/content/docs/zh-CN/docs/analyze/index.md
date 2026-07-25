@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-Tenet 在四种入口背后暴露相同的核心、Pass 与结果缓存。本页面向你呈现完整分析能力全貌，按问题类型引导你选择起始章节，并列出推荐的调查顺序。
+Tenet 的终端 TUI、批处理 CLI、MCP 服务与独立 Tauri 前端共享相同的核心、Pass 与结果缓存。本页面向你呈现完整分析能力全貌，按问题类型引导你选择起始章节，并列出推荐的调查顺序。
 
 ## 分析能力地图
 
@@ -67,12 +67,12 @@ Tenet 各分析在不同置信度上产出结果。下结论时应区别对待�
 
 | 入口 | 启动方式 | 适用场景 |
 |---|---|---|
-| GUI | `./tenet trace.bin` | 探索性浏览、VM Workspace、拖入 hints JSON |
-| TUI | `./tenet --tui trace.bin` | 纯终端环境、快速键盘驱动检查 |
+| Tauri 桌面应用 | 应用拉起 `tenet --ws-port <port> <trace> --mcp-hub` sidecar | 图形化探索、结构与分析结果面板 |
+| TUI | `./tenet trace.bin` | 默认交互入口；适合纯终端环境和键盘驱动检查 |
 | CLI | `./tenet --taint 0 trace.bin`（或 `--pattern`、`--call-graph`、`--export-cfg` 等） | 脚本或 CI 一次性批处理分析 |
 | MCP | `./tenet trace.bin --mcp` 或 `--mcp-hub` | Agent 驱动、IDE 集成或多 Trace 工作流 |
 
-四种入口共享同一个 reader、索引、Pass 管线和结果缓存——无论走哪条入口，分析结果完全一致。
+这些入口共享同一个 reader、索引、Pass 管线和持久化结果缓存。Tauri 应用只是通过 WebSocket/MCP 连接纯后端 `tenet` sidecar，不代表 `tenet` 可执行文件内置图形界面。
 
 ## 最小快速流程
 
@@ -81,7 +81,7 @@ Tenet 各分析在不同置信度上产出结果。下结论时应区别对待�
 tenet --dump text trace.bin --limit 100
 
 # 2. 交互式打开，等待默认 Pass 完成
-./tenet trace.bin                         # 或：./tenet --tui trace.bin
+./tenet trace.bin                         # 默认进入终端 TUI
 
 # 3. 一次性 CLI 分析
 ./tenet --pattern trace.bin
@@ -115,7 +115,7 @@ tenet --dump text trace.bin --limit 100
 |---|---|---|
 | Triton 驱动的精确污点语义 | Triton | 构建时 `TENET_ENABLE_TRITON=ON`；否则污点工具使用启发式回退 |
 | YARA 内存扫描（`yara_mem_scan`） | libyara | 构建时 `TENET_ENABLE_YARA=ON` |
-| GUI（交互式视口） | SDL3 + Metal | `TENET_ENABLE_GUI=ON`，macOS 默认启用 |
+| Tauri 桌面应用 | Tauri / Web 前端工具链 | 在 `tools/tenet/web/` 中独立构建 |
 | Trace 压缩（现代默认） | zstd | qbditrace 中 `QBDITRACE_ENABLE_ZSTD=ON` |
 | 并行索引 / 任务调度 | Intel oneTBB | `TENET_ENABLE_TBB=ON`，默认启用 |
 

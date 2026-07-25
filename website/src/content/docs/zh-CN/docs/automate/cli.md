@@ -4,7 +4,7 @@ sidebar:
   order: 2
 ---
 
-CLI 运行分析、导出数据和生成报告，无需交互会话。所有批处理模式使用与 GUI/TUI 相同的 Pass 实现。
+CLI 运行分析、导出数据和生成报告，无需交互会话。所有批处理模式与终端 TUI 及 Tauri sidecar/后端使用相同的 Pass 实现。
 
 ## 批量分析
 
@@ -37,8 +37,8 @@ CLI 运行分析、导出数据和生成报告，无需交互会话。所有批�
 ./tenet trace.bin --objc --objc-class NSString
 ./tenet trace.bin --syscall-intercept
 
-# VM 分析
-./tenet trace.bin --vm-abstract
+# VM 分析（--vm-abstract 至少需要一个静态 hint）
+./tenet trace.bin --vm-abstract --vm-hints hints.json
 ./tenet trace.bin --backward-taint 10000 0 --taint-source-annotation
 
 # Trace 工具（参数为 instruction ID 区间）
@@ -70,12 +70,28 @@ CLI 运行分析、导出数据和生成报告，无需交互会话。所有批�
 ./tenet trace.bin --image /path/to/binary
 ```
 
+## 交互与服务入口
+
+当前没有 `--tui` 参数。不带分析或服务参数运行 `./tenet trace.bin` 时，默认进入终端 TUI。
+
+| 参数 | 行为 |
+|---|---|
+| `--rpc [[host:]port]` | 启动 TCP JSON-RPC；裸 `--rpc` 默认为 `127.0.0.1:0`（自动端口） |
+| `--mcp` | 通过 stdin/stdout 启动 MCP JSON-RPC，直到 stdin 关闭 |
+| `--mcp-http [host:port]` | 启动 MCP Streamable HTTP，默认 `127.0.0.1:10444`；可配合 `--mcp-host`、`--mcp-port`、`--mcp-auth` |
+| `--mcp-hub [host:port]` | 启动多实例 Hub/Worker 协调，默认 `127.0.0.1:10444` |
+| `--ws-port <port>` | 启动固定绑定 `127.0.0.1` 的 FlatBuffers WebSocket 服务；Windows 当前不可用 |
+| `--streaming` | tail 正在增长的 Trace 并实时构建索引 |
+| `--stats` | 以 JSON 输出 Trace 统计信息 |
+
+Tauri 桌面应用会以 sidecar 方式启动 `tenet --ws-port <port> <trace> --mcp-hub`。Windows 构建当前不支持 `--ws-port`，但 CLI、TUI、RPC 和 MCP 不受影响。
+
 ## 输出与报告
 
-大多数 CLI 模式向 stdout 输出结构化文本。图导出（CFG、调用图、数据流图）写入 Graphviz DOT 文件。Profile 支持 JSON 和 CSV。Diff 写入 JSON。污点图可用 `--backward-taint-graph` 导出为 JSON。
+大多数 CLI 模式向 stdout 输出结构化文本。图导出（CFG、调用图、数据流图）写入 Graphviz DOT 文件。Profile 支持 JSON 和 CSV。Diff 写入 JSON。`--backward-taint-graph <file>` 按扩展名导出 `.dot` 或 `.json`。
 
 ## 无界面注意事项
 
-- CLI 读写与 GUI/TUI 相同的 `.tenet/` 索引，遵守相同的会话锁。
+- CLI、终端 TUI 与 Tauri sidecar/后端读写相同的 `.tenet/` 索引，并遵守相同的会话锁。
 - 长时间批处理不渲染 UI，比 TUI 更快。
 - Pass 结果会被缓存；相同参数重复运行完成很快。

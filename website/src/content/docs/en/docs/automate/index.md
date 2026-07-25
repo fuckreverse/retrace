@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-Choose the narrowest interface that fits the integration. All interfaces use the same pass implementations and cached results.
+Choose the narrowest interface that fits the integration. All interfaces share the same backend implementation and persistent pass cache.
 
 ## Interfaces
 
@@ -22,7 +22,8 @@ Choose the narrowest interface that fits the integration. All interfaces use the
 ./tenet trace.bin --pattern --algorithm-summary --export-cfg func.dot
 
 # Start JSON-RPC server
-./tenet trace.bin --rpc-port 4321
+./tenet trace.bin --rpc 4321
+# Bare --rpc defaults to 127.0.0.1:0, letting the OS choose a free port
 
 # Start MCP Hub for LLM and IDA integration (default: 127.0.0.1:10444)
 ./tenet trace.bin --mcp-hub
@@ -32,4 +33,4 @@ Choose the narrowest interface that fits the integration. All interfaces use the
 ./tenet trace.bin --ws-port 9090
 ```
 
-All interfaces share the same session lock: only one process may own a given trace at a time. Results are cached and shared across interfaces.
+These interfaces reuse the same backend implementation and can reuse the persistent pass cache; this does not mean that multiple processes can concurrently share one trace session. An exclusive session lock allows only one process to own a given trace at a time.

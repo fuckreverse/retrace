@@ -132,13 +132,13 @@ Darwin SVC 的 `x16` 为负数时，`syscall_intercept` 使用 Mach trap 表而�
 
 批处理模式（`-c`，或选择非交互执行的分析/查询参数）向 stdout 写 JSON。
 
-### GUI
+### Tauri 前端
 
-`--objc` 与 `--syscall-intercept` 都在 Pass 运行后的 GUI **Platform** 分组注册面板。ObjC 结果按类显示消息频率；syscall 结果按 API 显示频率。`--objc-class` 过滤会让 GUI 表格收窄。
+Tauri 前端通过 WebSocket 请求同一后端 Pass 管线，并在 Platform 分组展示 ObjC 与 syscall 结果。ObjC 结果按类显示消息频率；syscall 结果按 API 显示频率。
 
 ### TUI
 
-同样的标志配合 `--tui` 使用。TUI 以可浏览列表显示 ObjC 消息表和 syscall 拦截表。
+直接运行 `./tenet trace.bin` 会进入 TUI。带 `--objc`、`--syscall-intercept` 等分析参数时，CLI 进入非交互批处理模式并向 stdout 输出 JSON，而不是启动 TUI。
 
 ### MCP
 
@@ -162,7 +162,7 @@ MCP 将平台分析暴露为 `objc_messages`、`syscall_intercept`、`objc_crypt
 
 ## 推荐工作流
 
-1. **判断平台来源** —— 先在 GUI 打开 Trace 或运行 `--stats`，确认 `target_os`、模块名、记录 flags。
+1. **判断平台来源** —— 先在 Tauri 桌面应用中打开 Trace，或运行 `--stats`，确认 `target_os`、模块名、记录 flags。
 2. **iOS Trace** —— 先 `--objc` 映射用户可见行为，再 `--pattern` 定位密码学原语；配合 `--objc-crypto` 把每个原语链接到触发它的 ObjC 方法。
 3. **提取密码学素材** —— `--syscall-intercept` 从 CommonCrypto / BoringSSL / JNI 调用中恢复密钥、IV、明文缓冲区。缓冲区超过 64 B 时增大 `--syscall-intercept-bytes`。
 4. **评估分类可信度** —— 如果 Trace 没有 `REC_CAPICALL`，结果依赖 `REC_SVC` + `XFER_CALL`，可能误归或遗漏；查看结果中 `source` 字段。
@@ -185,6 +185,6 @@ MCP 将平台分析暴露为 `objc_messages`、`syscall_intercept`、`objc_crypt
 
 - Trace 为 v4–v7，或缺少 v8 `REC_RETVAL`，因此不存在可信的返回时刻事实。请以 v8 `HF_CALL_META` 重新录制；Tenet 刻意不从后续记录的 x0 推断返回值。
 
-### CLI 与 GUI 结果不一致
+### CLI 与 Tauri 前端结果不一致
 
-两者不应有差异 —— 都走同一 Pass 管线。如果输出不符，确认 GUI 没有从之前不同参数的 Pass 缓存中加载结果 —— 用 `--cache-delete` 清除。
+两者都通过同一后端 Pass 管线和持久化缓存获得结果，因而相同参数应产生一致结果。如果输出不符，确认 Tauri sidecar 没有加载以前用不同参数生成的缓存；可用 `--cache-delete <pass|all>` 清除后重跑。

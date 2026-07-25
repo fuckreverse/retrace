@@ -9,11 +9,11 @@ Tenet 提供两套不同的 WebSocket 协议。请按客户端类型选择端点
 | 端点 | 协议 | 适用客户端 |
 |---|---|---|
 | `ws://127.0.0.1:10444/ws/<instance-id>` | JSON-RPC/MCP 文本帧 | IDAPython 与本地交互式集成 |
-| `--ws-port` 提供的 `ws://host:<port>` | FlatBuffers 二进制帧 | Web/Tauri 前端与高吞吐可视化 |
+| `--ws-port` 提供的 `ws://127.0.0.1:<port>` | FlatBuffers 二进制帧 | Tauri Web 前端与高吞吐可视化 |
 
 ## Hub JSON WebSocket
 
-以 Hub 模式启动 Tenet；也可以直接在 GUI 中打开 Trace，GUI 会自动加入 Hub：
+以 Hub 模式启动 Tenet；在 Tauri 桌面应用中打开 Trace 时，对应 sidecar 会以 Hub 模式启动或加入现有 Hub：
 
 ```bash
 ./tenet trace.bin --mcp-hub
@@ -36,6 +36,12 @@ Hub JSON 端点刻意限制为**仅回环访问**，用于 [IDA Pro Bridge](./mc
 ```bash
 ./tenet trace.bin --ws-port 9090
 ```
+
+服务端点为 `ws://127.0.0.1:9090`。当前实现固定绑定本机 loopback，没有 CLI 参数可以修改监听 host。
+
+:::caution[Windows 限制]
+Windows 上 `TENET_ENABLE_WS` 默认关闭且当前不支持开启：uSockets 的事件循环只有 POSIX epoll/kqueue 后端，尚无接入此构建的 Windows IOCP 后端。因此 `--ws-port` 和供 Tauri Web 前端使用的 FlatBuffers WebSocket 通道暂不支持 Windows。MCP Hub 的 JSON WebSocket 不使用这套 uSockets/FlatBuffers 服务，不受此限制；CLI 批处理、TUI、TCP JSON-RPC 与 MCP 也可正常使用。
+:::
 
 ### 协议
 

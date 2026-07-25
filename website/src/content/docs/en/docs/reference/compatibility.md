@@ -73,9 +73,11 @@ Tenet opens any trace with version ≥ 4.
 | Loop structure | For loop semantics | No loop classification |
 | Call graph | For algorithm summary | No cross-referencing |
 | Platform API | For `objc_crypto` | No ObjC correlation |
-| Loop structure + CFG | For `vm_abstract` | No VM handler analysis |
+| Static-analysis VM hints + loop structure/CFG/xref | For `vm_abstract` | No VM execution abstraction; the pass does not discover dispatchers automatically |
 
-## Platform support
+## Trace capture target platform support
+
+Here, platform means the instrumented target process recorded in `target_os`, not the host OS that runs the `tenet` backend.
 
 | Platform | ObjC | API intercepts | FPR | Notes |
 |---|---|---|---|---|
@@ -83,6 +85,12 @@ Tenet opens any trace with version ≥ 4.
 | Android | Skipped | BoringSSL, JNI | v7 | No ObjC |
 | Linux | Skipped | OpenSSL, syscalls | v7 | No ObjC |
 | Unknown | Heuristic | Heuristic from module name | — | Reduced precision |
+
+## Tenet backend host platforms
+
+The pure-backend `tenet` executable targets Windows, Linux, and macOS on x86_64 and arm64. This is independent of the trace capture target dimension above: traces captured on iOS, Android, or Linux are offline files and can be analyzed on any supported host through the CLI, TUI, TCP-loopback RPC, or MCP.
+
+WebSocket service is enabled by default on macOS and Linux. On Windows, uSockets has no IOCP backend wired into the current build, so `TENET_ENABLE_WS` defaults to `OFF` and enabling it is currently unsupported. Consequently, the standalone Tauri desktop/Web frontend cannot yet connect to a Windows backend over FlatBuffers WebSocket. This does not affect offline CLI/TUI/RPC/MCP analysis on the Windows backend.
 
 ## Sampling traces
 

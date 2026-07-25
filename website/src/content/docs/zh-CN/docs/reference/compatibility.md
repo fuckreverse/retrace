@@ -73,9 +73,11 @@ Tenet 可打开 version ≥ 4 的任何 Trace。
 | 循环结构 | 循环语义需要 | 无循环分类 |
 | 调用图 | 算法摘要需要 | 无交叉引用 |
 | 平台 API | `objc_crypto` 需要 | 无 ObjC 关联 |
-| 循环结构 + CFG | `vm_abstract` 需要 | 无 VM handler 分析 |
+| 静态分析 VM hints + 循环结构/CFG/xref | `vm_abstract` 需要 | 无 VM 执行抽象；该 Pass 不自动发现 dispatcher |
 
-## 平台支持
+## Trace 采集目标平台支持
+
+此处的平台是被 qbditrace 插桩并写入 `target_os` 的目标进程平台，不是运行 `tenet` 后端的宿主系统。
 
 | 平台 | ObjC | API 拦截 | FPR | 备注 |
 |---|---|---|---|---|
@@ -83,6 +85,12 @@ Tenet 可打开 version ≥ 4 的任何 Trace。
 | Android | 跳过 | BoringSSL、JNI | v7 | 无 ObjC |
 | Linux | 跳过 | OpenSSL、系统调用 | v7 | 无 ObjC |
 | Unknown | 启发式 | 基于模块名的启发式 | — | 降低精度 |
+
+## Tenet 后端宿主平台
+
+纯后端 `tenet` 可执行文件的目标宿主平台是 Windows、Linux 和 macOS，覆盖 x86_64 与 arm64。它与上面的 Trace 采集目标平台是独立维度：iOS、Android 或 Linux 上采集的 Trace 都是离线文件，可在任意受支持宿主平台上通过 CLI、TUI、TCP loopback RPC 或 MCP 分析。
+
+macOS 和 Linux 构建默认启用 WebSocket 服务。Windows 上由于 uSockets 尚无接入当前构建的 IOCP 后端，`TENET_ENABLE_WS` 默认为 `OFF`，且当前不支持强制开启；因此独立的 Tauri 桌面/Web 前端暂时无法通过 FlatBuffers WebSocket 连接 Windows 版后端。这一限制不影响 Windows 后端上的离线 CLI/TUI/RPC/MCP 分析。
 
 ## Sampling Trace
 

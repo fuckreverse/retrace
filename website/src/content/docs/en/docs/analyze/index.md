@@ -4,7 +4,7 @@ sidebar:
   order: 1
 ---
 
-Tenet exposes the same core, passes, and result cache across four entry points. This page orients you to the full analysis surface, helps you pick a starting chapter by problem type, and lays out a recommended investigation order.
+Tenet's terminal TUI, batch CLI, MCP services, and separate Tauri frontend share the same core, passes, and result cache. This page orients you to the full analysis surface, helps you pick a starting chapter by problem type, and lays out a recommended investigation order.
 
 ## Analysis capability map
 
@@ -67,12 +67,12 @@ Do not treat a candidate explanation as a recorded fact. Use `verify_evidence` (
 
 | Entry | Start with | Best for |
 |---|---|---|
-| GUI | `./tenet trace.bin` | Exploratory browsing, VM Workspace, dragging hints JSON |
-| TUI | `./tenet --tui trace.bin` | Terminal-only environments, quick keyboard-driven inspection |
+| Tauri desktop application | The app launches a `tenet --ws-port <port> <trace> --mcp-hub` sidecar | Graphical exploration and structure/analysis panels |
+| TUI | `./tenet trace.bin` | Default interactive entry; terminal-only, keyboard-driven inspection |
 | CLI | `./tenet --taint 0 trace.bin` (or `--pattern`, `--call-graph`, `--export-cfg`, …) | One-shot batch analysis from scripts or CI |
 | MCP | `./tenet trace.bin --mcp` or `--mcp-hub` | Agent-driven, IDE-integrated, or multi-trace workflows |
 
-All four share the same reader, index, pass pipeline, and result cache — the analysis is identical regardless of entry.
+These entry points share the same reader, index, pass pipeline, and persisted result cache. The Tauri application connects to a pure-backend `tenet` sidecar over WebSocket/MCP; the `tenet` executable does not contain a graphical interface.
 
 ## Minimal quick flow
 
@@ -81,7 +81,7 @@ All four share the same reader, index, pass pipeline, and result cache — the a
 tenet --dump text trace.bin --limit 100
 
 # 2. Open interactively and let default passes run
-./tenet trace.bin                         # or: ./tenet --tui trace.bin
+./tenet trace.bin                         # opens the terminal TUI by default
 
 # 3. Run one-shot CLI analyses
 ./tenet --pattern trace.bin
@@ -115,7 +115,7 @@ tenet --dump text trace.bin --limit 100
 |---|---|---|
 | Triton-backed taint semantics | Triton | `TENET_ENABLE_TRITON=ON`; otherwise taint tools use their heuristic fallback |
 | YARA memory scan (`yara_mem_scan`) | libyara | `TENET_ENABLE_YARA=ON` at build time |
-| GUI (interactive viewport) | SDL3 + Metal | `TENET_ENABLE_GUI=ON`, default on macOS |
+| Tauri desktop application | Tauri / Web frontend toolchain | Built separately under `tools/tenet/web/` |
 | Trace compression (modern default) | zstd | `QBDITRACE_ENABLE_ZSTD=ON` in qbditrace |
 | Parallel indexing / task scheduling | Intel oneTBB | `TENET_ENABLE_TBB=ON`, default on |
 

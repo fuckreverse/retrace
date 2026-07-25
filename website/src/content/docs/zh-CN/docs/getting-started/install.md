@@ -4,8 +4,12 @@ sidebar:
   order: 2
 ---
 
-**目标：** 在 Apple Silicon Mac 上安装 Tenet Desktop。  
+**目标：** 在 Apple Silicon Mac 上安装 Tenet Tauri 桌面应用。  
 **前置条件：** 预览包要求 macOS 14 或更高版本。
+
+## 平台状态
+
+Tenet 后端（CLI、TUI、RPC 和 MCP）已支持 Windows、Linux 和 macOS（x86_64/arm64）。当前网站可下载的桌面安装包仍只有 macOS Apple Silicon 预览版 DMG；Windows、Linux 和 macOS Intel 的独立安装包正在制作中。
 
 ## 下载并校验
 
