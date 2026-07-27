@@ -14,10 +14,9 @@ import { selectTab } from '@/lib/tabRouting';
 import { openPanelWindow } from '@/lib/openPanelWindow';
 import {
   backwardTaintToDot,
-  blocksToDot,
   callGraphToDot,
   dataflowToDot,
-  downloadTextFile,
+  saveTextFile,
 } from '@/lib/dotExport';
 import { api } from '@/api/service';
 import { useTraceStore } from '@/store/traceStore';
@@ -109,18 +108,18 @@ async function exportDot(id: ExportId, currentInst: number): Promise<void> {
   try {
     switch (id) {
       case 'export_cfg':
-        downloadTextFile(exportFilename('cfg'), blocksToDot(await api.cfg()));
+        await saveTextFile(exportFilename('cfg'), await api.cfgDot());
         return;
       case 'export_callgraph':
-        downloadTextFile(exportFilename('callgraph'), callGraphToDot(await api.callGraph()));
+        await saveTextFile(exportFilename('callgraph'), callGraphToDot(await api.callGraph()));
         return;
       case 'export_dataflow':
-        downloadTextFile(exportFilename('dataflow'), dataflowToDot(await api.dataflowGraph()));
+        await saveTextFile(exportFilename('dataflow'), dataflowToDot(await api.dataflowGraph()));
         return;
       case 'export_backtaint': {
         const reg = 'x0';
         const steps = await api.backwardTaint(currentInst, reg);
-        downloadTextFile(
+        await saveTextFile(
           exportFilename('backward-taint'),
           backwardTaintToDot(steps, currentInst, reg),
         );

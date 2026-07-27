@@ -195,6 +195,19 @@ fn load_config() -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to load config: {e}"))
 }
 
+/// Write arbitrary text content to an absolute path chosen by the user via
+/// the native save dialog (`@tauri-apps/plugin-dialog`'s `save()`).
+///
+/// This avoids pulling in the full `tauri-plugin-fs` (with its own
+/// capability/scope configuration) just to support "Export … (DOT)" writing
+/// to a user-picked path: the path already comes from a trusted native
+/// dialog, so a single narrow command is sufficient and keeps the
+/// capabilities file minimal.
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("Failed to write {path}: {e}"))
+}
+
 /// Check whether a given trace path is already open in this session.
 #[tauri::command]
 fn is_trace_open(state: tauri::State<'_, OpenTraces>, path: String) -> bool {
@@ -717,6 +730,7 @@ pub fn run() {
             close_trace,
             save_config,
             load_config,
+            write_text_file,
         ])
         .setup(|app| {
             // Registered unconditionally (not just in debug builds) so the

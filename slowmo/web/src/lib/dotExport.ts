@@ -1,6 +1,7 @@
 /**
  * Graphviz DOT 导出工具：把分析结果序列化为可移植的文本图，并触发浏览器下载。
  */
+import { isTauri } from '@/lib/env';
 import type {
   BackwardTaintStep,
   CallGraphResult,
@@ -51,14 +52,15 @@ export function blocksToDot(cfg: CfgResult): string {
 
 export function callGraphToDot(cg: CallGraphResult): string {
   const lines = [
-    'digraph CallGraph {',
-    '  rankdir=TB;',
-    '  node [shape=box, fontname="sans-serif"];',
+    'digraph callgraph {',
+    '  node [shape=box, style=filled, fillcolor=lightyellow];',
+    '  edge [color=gray40];',
+    '',
   ];
 
   for (const node of cg.nodes) {
     const label = `${node.name}\n${node.pc}\ncalls: ${node.calls_made} / received: ${node.calls_received}`;
-    const rootStyle = node.is_root ? ', style=filled, fillcolor=lightgreen' : '';
+    const rootStyle = node.is_root ? ', fillcolor=lightgreen' : '';
     lines.push(`  ${quoted(node.pc)} [label=${quoted(label)}${rootStyle}];`);
   }
 
@@ -79,19 +81,26 @@ const DATAFLOW_COLORS: Record<DataflowNode['kind'], string> = {
 
 export function dataflowToDot(df: DataflowGraph): string {
   const lines = [
-    'digraph Dataflow {',
-    '  rankdir=LR;',
-    '  node [shape=box, style=filled, fontname="monospace"];',
+    'digraph dataflow {',
+    '  rankdir=TB;',
+    '  node [shape=box, style=filled, fillcolor="#e8e8e8", fontname="Courier", fontsize=10];',
+    '  edge [fontname="Courier", fontsize=9];',
+    '',
   ];
 
   for (const node of df.nodes) {
-    const label = node.inst_id != null ? `${node.label}\ninst #${node.inst_id}` : node.label;
-    lines.push(`  ${quoted(node.id)} [label=${quoted(label)}, fillcolor=${DATAFLOW_COLORS[node.kind]}];`);
+    const label = node.inst_id != null ? `#${node.inst_id}: ${node.label}` : node.label;
+    const id = node.inst_id != null ? `n${node.inst_id}` : node.id;
+    lines.push(`  ${quoted(id)} [label=${quoted(label)}, fillcolor=${DATAFLOW_COLORS[node.kind]}];`);
   }
 
+  const nodeIds = new Map(df.nodes.map((node) => [
+    node.id,
+    node.inst_id != null ? `n${node.inst_id}` : node.id,
+  ]));
   for (const edge of df.edges) {
     const label = edge.label ? ` [label=${quoted(edge.label)}]` : '';
-    lines.push(`  ${quoted(edge.from)} -> ${quoted(edge.to)}${label};`);
+    lines.push(`  ${quoted(nodeIds.get(edge.from) ?? edge.from)} -> ${quoted(nodeIds.get(edge.to) ?? edge.to)}${label};`);
   }
 
   lines.push('}');
@@ -106,19 +115,22 @@ export function backwardTaintToDot(
   const title = `Backward taint from inst #${instId} register ${reg}`;
   const lines = [
     `// Export parameters: current instruction #${instId}, default register ${reg}`,
-    'digraph BackwardTaint {',
+    'digraph backward_taint {',
     `  label=${quoted(title)};`,
     '  labelloc=t;',
-    '  rankdir=LR;',
-    '  node [shape=box, fontname="monospace"];',
+    '  rankdir=BT;',
+    '  node [shape=box, style=filled, fillcolor=lightyellow, fontsize=10];',
+    '  edge [color=gray40];',
+    '',
   ];
 
   steps.forEach((step, index) => {
-    const id = `step-${index}`;
-    const label = `#${step.inst_id} ${step.pc}\n${step.reg}\n${step.contribution}`;
+    const id = `n${step.inst_id}`;
+    const label = `#${step.inst_id} pc=${step.pc} def:${step.reg}\n${step.contribution}`;
     lines.push(`  ${quoted(id)} [label=${quoted(label)}];`);
     if (index > 0) {
-      lines.push(`  ${quoted(`step-${index - 1}`)} -> ${quoted(id)};`);
+      // BackwardTaintStep 暂无 via_reg/via_mem，后端补充字段后可在此扩展边标签。
+      lines.push(`  ${quoted(`n${steps[index - 1].inst_id}`)} -> ${quoted(id)};`);
     }
   });
 
@@ -140,4 +152,27 @@ export function downloadTextFile(filename: string, content: string): void {
     link.remove();
     URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * 浏览器：直接触发 Blob 下载。
+ * Tauri：弹出原生保存对话框选择路径，再通过 Rust 端 `write_text_file` 命令
+ * 写入该路径（而非拉入完整的 tauri-plugin-fs——保存路径已经来自可信的原生
+ * 对话框，一个窄接口的 command 就够用，也让 capabilities 文件保持最小化）。
+ */
+export async function saveTextFile(filename: string, content: string): Promise<void> {
+  if (!isTauri()) {
+    downloadTextFile(filename, content);
+    return;
+  }
+
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  const path = await save({
+    defaultPath: filename,
+    filters: [{ name: 'Graphviz DOT', extensions: ['dot'] }],
+  });
+  if (path == null) return;
+
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('write_text_file', { path, content });
 }

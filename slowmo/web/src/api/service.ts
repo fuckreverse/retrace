@@ -281,6 +281,20 @@ export const api = {
     );
   },
 
+  /** 获取后端预生成的权威 CFG DOT（与 CLI --export-cfg 共用 CFGLayoutResult.dot_annotated）。 */
+  async cfgDot(): Promise<string> {
+    return analysis<string>(
+      'cfg_export',
+      { format: 'dot' },
+      (raw) => {
+        if (!raw || typeof raw !== 'object') return '';
+        const dot = (raw as Record<string, unknown>).dot;
+        return typeof dot === 'string' ? dot : '';
+      },
+      () => '',
+    );
+  },
+
   async patterns(): Promise<PatternMatch[]> {
     return analysis<PatternMatch[]>(
       'pattern_scan',

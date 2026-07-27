@@ -31,6 +31,10 @@ interface TraceState {
   // Hex Dump 联动地址
   hexAddr: string | null;
 
+  // Instructions 面板当前可视区间
+  viewportStart: number;
+  viewportEnd: number;
+
   // 高亮集合(taint / producer chain)
   taintForward: Set<number>;
   taintBackward: Set<number>;
@@ -54,6 +58,7 @@ interface TraceState {
   canForward: () => boolean;
   toggleBookmark: (instId: number) => void;
   setHexAddr: (addr: string | null) => void;
+  setViewport: (start: number, end: number) => void;
   setSearch: (query: string, results: number[]) => void;
   searchNext: () => void;
   searchPrev: () => void;
@@ -77,6 +82,8 @@ export const useTraceStore = create<TraceState>((set, get) => ({
   searchResults: [],
   searchCurrent: -1,
   hexAddr: null,
+  viewportStart: 0,
+  viewportEnd: 0,
   taintForward: new Set(),
   taintBackward: new Set(),
   producerChain: new Set(),
@@ -161,6 +168,10 @@ export const useTraceStore = create<TraceState>((set, get) => ({
 
   setHexAddr(addr) {
     set({ hexAddr: addr });
+  },
+
+  setViewport(start, end) {
+    set({ viewportStart: start, viewportEnd: end });
   },
 
   setSearch(query, results) {

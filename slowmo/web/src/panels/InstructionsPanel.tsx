@@ -56,6 +56,7 @@ export function InstructionsPanel() {
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const toggleBookmark = useTraceStore((s) => s.toggleBookmark);
   const setHexAddr = useTraceStore((s) => s.setHexAddr);
+  const setViewport = useTraceStore((s) => s.setViewport);
   const setTaintFwd = useTraceStore((s) => s.setTaintForward);
   const searchNext = useTraceStore((s) => s.searchNext);
   const searchPrev = useTraceStore((s) => s.searchPrev);
@@ -79,6 +80,10 @@ export function InstructionsPanel() {
   // 计算可见区间
   const first = Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN);
   const last = Math.min(total, Math.ceil((scrollTop + viewH) / rowH) + OVERSCAN);
+
+  useEffect(() => {
+    setViewport(first, last);
+  }, [first, last, setViewport]);
 
   // 拉取窗口数据
   useEffect(() => {

@@ -18,6 +18,8 @@ export function Timeline() {
   const bookmarks = useTraceStore((s) => s.bookmarks);
   const taintFwd = useTraceStore((s) => s.taintForward);
   const searchResults = useTraceStore((s) => s.searchResults);
+  const viewportStart = useTraceStore((s) => s.viewportStart);
+  const viewportEnd = useTraceStore((s) => s.viewportEnd);
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const [windows, setWindows] = useState<WindowStat[]>([]);
   const [hover, setHover] = useState<HoverInfo | null>(null);
@@ -60,11 +62,24 @@ export function Timeline() {
         const instAtX = (x / pixelW) * total;
         while (wi < windows.length - 1 && windows[wi].window_end < instAtX) wi++;
         const win = windows[wi];
-        const density = win ? win.inst_count / maxCount : 0;
+        const rawDensity = win ? win.inst_count / maxCount : 0;
+        const density = Math.pow(rawDensity, 0.5);
         const alpha = 0.12 + density * 0.5;
         ctx.fillStyle = `rgba(76, 141, 255, ${alpha})`;
         ctx.fillRect(x, h * 0.15, 1.2, h * 0.5);
       }
+    }
+
+    // Instructions 面板当前可视区间
+    if (viewportEnd > viewportStart && total > 0) {
+      const vx1 = (viewportStart / total) * w;
+      const vx2 = (viewportEnd / total) * w;
+      const viewportWidth = Math.max(1, vx2 - vx1);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.fillRect(vx1, 0, viewportWidth, h);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(vx1 + 0.5, 0.5, viewportWidth - 1, h - 1);
     }
 
     // 污点覆盖(绿色标记)
@@ -118,7 +133,7 @@ export function Timeline() {
     ctx.beginPath();
     ctx.arc(cx, h / 2, 3, 0, Math.PI * 2);
     ctx.fill();
-  }, [total, cur, bookmarks, taintFwd, searchResults, windows, hover]);
+  }, [total, cur, bookmarks, taintFwd, searchResults, viewportStart, viewportEnd, windows, hover]);
 
   const instAtClientX = useCallback((clientX: number) => {
     const rect = ref.current?.getBoundingClientRect();

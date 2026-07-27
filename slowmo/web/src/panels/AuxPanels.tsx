@@ -499,7 +499,7 @@ export function SettingsPanel() {
             <b>Tenet Web</b>
             <small>QBDI trace 离线分析器 · 飞象风格 Web 前端</small>
           </div>
-          <span className="mono dim">v0.1</span>
+          <span className="mono dim">v{__APP_VERSION__}</span>
         </div>
       </div>
     </div>
