@@ -59,7 +59,6 @@ export function RegistersPanel() {
             <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(val)}>
               Copy Value
             </ContextMenu.Item>
-            <ContextMenu.Item className="ctx-item">Trace Producer Chain</ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>

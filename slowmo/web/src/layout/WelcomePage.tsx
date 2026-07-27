@@ -252,7 +252,7 @@ export function WelcomePage() {
       </div>
 
       {/* Footer */}
-      <div className="welcome-footer">v0.1.0</div>
+      <div className="welcome-footer">v{__APP_VERSION__}</div>
 
       {/* Error toast */}
       {error && (

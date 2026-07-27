@@ -3,6 +3,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { clsx } from 'clsx';
+import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { FunctionEntry } from '@/types/tenet';
@@ -39,6 +40,11 @@ export function FunctionsPanel() {
     else { setSortKey(k); setAsc(k === 'name'); }
   };
 
+  const gotoFunc = async (pc: string) => {
+    const xref = await api.xref(pc);
+    if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]);
+  };
+
   return (
     <div className="list-panel">
       <div className="list-toolbar">
@@ -56,11 +62,32 @@ export function FunctionsPanel() {
           </thead>
           <tbody>
             {rows.map((f) => (
-              <tr key={f.pc} onClick={() => navigateTo(0)} onDoubleClick={() => setHexAddr(f.pc)}>
-                <td className={clsx('mono', f.name.startsWith('-[') && 'objc-name')}>{f.name}</td>
-                <td className="mono num">{f.calls}</td>
-                <td className="mono num dim">{f.insts}</td>
-              </tr>
+              <ContextMenu.Root key={f.pc}>
+                <ContextMenu.Trigger asChild>
+                  <tr onClick={() => void gotoFunc(f.pc)} onDoubleClick={() => setHexAddr(f.pc)}>
+                    <td className={clsx('mono', f.name.startsWith('-[') && 'objc-name')}>{f.name}</td>
+                    <td className="mono num">{f.calls}</td>
+                    <td className="mono num dim">{f.insts}</td>
+                  </tr>
+                </ContextMenu.Trigger>
+                <ContextMenu.Portal>
+                  <ContextMenu.Content className="ctx-menu">
+                    <ContextMenu.Item className="ctx-item" onSelect={() => void gotoFunc(f.pc)}>
+                      Navigate to Function
+                    </ContextMenu.Item>
+                    <ContextMenu.Item className="ctx-item" onSelect={() => setHexAddr(f.pc)}>
+                      Open in Hex Dump
+                    </ContextMenu.Item>
+                    <ContextMenu.Separator className="ctx-sep" />
+                    <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.name)}>
+                      Copy Function Name
+                    </ContextMenu.Item>
+                    <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.pc)}>
+                      Copy Address
+                    </ContextMenu.Item>
+                  </ContextMenu.Content>
+                </ContextMenu.Portal>
+              </ContextMenu.Root>
             ))}
           </tbody>
         </table>

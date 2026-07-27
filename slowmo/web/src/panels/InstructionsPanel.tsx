@@ -10,11 +10,39 @@ import { api } from '@/api/service';
 import type { InstRow } from '@/types/tenet';
 import { Icon } from '@/components/icons';
 import { IconButton, Input } from '@/components/ui';
+import { selectTab } from '@/lib/tabRouting';
+import { useSettingsStore } from '@/store/settingsStore';
 import './instructions.css';
 
-const ROW_H = 24;
+const TAINT_FORWARD_REGS = [
+  { name: 'x0', index: 0 },
+  { name: 'x1', index: 1 },
+  { name: 'x2', index: 2 },
+  { name: 'x3', index: 3 },
+  { name: 'x8', index: 8 },
+  { name: 'x19', index: 19 },
+  { name: 'x20', index: 20 },
+  { name: 'x21', index: 21 },
+  { name: 'lr', index: 30 },
+] as const;
+
+const ROW_H_FALLBACK = 22; // 与 tokens.css 默认 --row-h 一致，CSS 变量不可用时兜底
 const OVERSCAN = 12;
 const WINDOW = 400; // 每次向后端拉取的窗口
+
+/**
+ * 读取当前生效的 --row-h CSS 变量（px）。
+ * 虚拟滚动的行高计算必须与 .inst-row 实际渲染高度一致，否则不同 UI 密度
+ * （compact/default/comfortable，见 settingsStore 的 DENSITY_TOKENS）下会产生
+ * 累积的位置偏差。依赖 density 触发重新读取，因为 injectCSS 只在 <html> 上
+ * setProperty，不会触发 React 重渲染。
+ */
+function readRowHeightPx(): number {
+  if (typeof document === 'undefined') return ROW_H_FALLBACK;
+  const raw = getComputedStyle(document.documentElement).getPropertyValue('--row-h').trim();
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n > 0 ? n : ROW_H_FALLBACK;
+}
 
 export function InstructionsPanel() {
   const total = useTraceStore((s) => s.totalInst);
@@ -34,18 +62,23 @@ export function InstructionsPanel() {
   const clearSearch = useTraceStore((s) => s.clearSearch);
   const setSearch = useTraceStore((s) => s.setSearch);
 
+  const density = useSettingsStore((s) => s.density);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(600);
   const [rows, setRows] = useState<Map<number, InstRow>>(new Map());
   const [searchInput, setSearchInput] = useState('');
   const [taintBusy, setTaintBusy] = useState<number | null>(null);
+  const [rowH, setRowH] = useState(ROW_H_FALLBACK);
+
+  // density 变化时（含首帧）重新读取实际生效的行高，保持与 CSS 一致
+  useEffect(() => { setRowH(readRowHeightPx()); }, [density]);
 
   const searchSet = new Set(searchResults);
 
   // 计算可见区间
-  const first = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
-  const last = Math.min(total, Math.ceil((scrollTop + viewH) / ROW_H) + OVERSCAN);
+  const first = Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN);
+  const last = Math.min(total, Math.ceil((scrollTop + viewH) / rowH) + OVERSCAN);
 
   // 拉取窗口数据
   useEffect(() => {
@@ -85,11 +118,11 @@ export function InstructionsPanel() {
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const y = cur * ROW_H;
+    const y = cur * rowH;
     if (y < el.scrollTop + 40 || y > el.scrollTop + el.clientHeight - 60) {
       el.scrollTop = Math.max(0, y - el.clientHeight / 2);
     }
-  }, [cur]);
+  }, [cur, rowH]);
 
   const [searching, setSearching] = useState(false);
 
@@ -116,16 +149,21 @@ export function InstructionsPanel() {
     return '';
   };
 
-  /** 右键 "Taint Forward (x0)"：真实调用后端 taint_forward pass，从该指令处 x0 寄存器开始正向污点传播 */
-  const runTaintForward = useCallback(async (instId: number) => {
+  /** 从指定指令和寄存器开始运行后端 taint_forward pass。 */
+  const runTaintForward = useCallback(async (instId: number, regIndex: number) => {
     setTaintBusy(instId);
     try {
-      const steps = await api.taintForward(0 /* x0 */, instId);
+      const steps = await api.taintForward(regIndex, instId);
       setTaintFwd(steps.map((s) => s.inst_id));
     } finally {
       setTaintBusy(null);
     }
   }, [setTaintFwd]);
+
+  const runTaintBackward = useCallback((instId: number) => {
+    navigateTo(instId);
+    selectTab('center-bottom', 'backtaint');
+  }, [navigateTo]);
 
   const visible: number[] = [];
   for (let i = first; i < last; i++) visible.push(i);
@@ -163,7 +201,7 @@ export function InstructionsPanel() {
         ref={scrollRef}
         onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
       >
-        <div style={{ height: total * ROW_H, position: 'relative' }}>
+        <div style={{ height: total * rowH, position: 'relative' }}>
           {visible.map((id) => {
             const row = rows.get(id);
             return (
@@ -171,13 +209,14 @@ export function InstructionsPanel() {
                 key={id}
                 id={id}
                 row={row}
-                top={id * ROW_H}
+                top={id * rowH}
                 cls={rowClass(id)}
                 hasBookmark={bookmarks.has(id)}
                 onClick={() => navigateTo(id)}
                 onBookmark={() => toggleBookmark(id)}
                 onHex={() => row && setHexAddr(row.pc)}
-                onTaint={() => runTaintForward(id)}
+                onTaint={(regIndex) => runTaintForward(id, regIndex)}
+                onBackwardTaint={() => runTaintBackward(id)}
               />
             );
           })}
@@ -188,7 +227,7 @@ export function InstructionsPanel() {
 }
 
 function InstRowView({
-  id, row, top, cls, hasBookmark, onClick, onBookmark, onHex, onTaint,
+  id, row, top, cls, hasBookmark, onClick, onBookmark, onHex, onTaint, onBackwardTaint,
 }: {
   id: number;
   row?: InstRow;
@@ -198,7 +237,8 @@ function InstRowView({
   onClick: () => void;
   onBookmark: () => void;
   onHex: () => void;
-  onTaint: () => void;
+  onTaint: (regIndex: number) => void;
+  onBackwardTaint: () => void;
 }) {
   return (
     <ContextMenu.Root>
@@ -224,7 +264,23 @@ function InstRowView({
             {hasBookmark ? 'Remove Bookmark' : 'Add Bookmark'}
           </ContextMenu.Item>
           <ContextMenu.Separator className="ctx-sep" />
-          <ContextMenu.Item className="ctx-item" onSelect={onTaint}>Taint Forward (x0)</ContextMenu.Item>
+          <ContextMenu.Sub>
+            <ContextMenu.SubTrigger className="ctx-item">Taint Forward From…</ContextMenu.SubTrigger>
+            <ContextMenu.Portal>
+              <ContextMenu.SubContent className="ctx-menu">
+                {TAINT_FORWARD_REGS.map((reg) => (
+                  <ContextMenu.Item
+                    key={reg.name}
+                    className="ctx-item"
+                    onSelect={() => onTaint(reg.index)}
+                  >
+                    {reg.name}
+                  </ContextMenu.Item>
+                ))}
+              </ContextMenu.SubContent>
+            </ContextMenu.Portal>
+          </ContextMenu.Sub>
+          <ContextMenu.Item className="ctx-item" onSelect={onBackwardTaint}>Backward Taint from Here</ContextMenu.Item>
           <ContextMenu.Item className="ctx-item" onSelect={onHex}>Open PC in Hex Dump</ContextMenu.Item>
           <ContextMenu.Separator className="ctx-sep" />
           <ContextMenu.Item className="ctx-item" onSelect={() => row && navigator.clipboard?.writeText(row.pc)}>

@@ -68,6 +68,20 @@ export interface SettingsState {
   // ─── 滚动条 ─────────────────────────────────────────
   scrollbarWidth: ScrollbarWidth;
 
+  // ─── 布局（可拖拽分割条 + 折叠状态，均持久化） ──────
+  /** 左侧栏宽度 (px) */
+  sidebarLeftWidth: number;
+  /** 右侧栏宽度 (px) */
+  sidebarRightWidth: number;
+  /** 中央区上/下比例 (0.15~0.85，表示 top 占比) */
+  centerSplitRatio: number;
+  /** 左侧栏是否折叠 */
+  sidebarLeftCollapsed: boolean;
+  /** 右侧栏是否折叠 */
+  sidebarRightCollapsed: boolean;
+  /** 各 Tab 分组上次选中的 tab（key 为 TabGroup id） */
+  lastTabByGroup: Record<string, string>;
+
   // ─── actions ────────────────────────────────────────
   setZoom: (z: ZoomLevel) => void;
   setFontSans: (f: string) => void;
@@ -78,8 +92,15 @@ export interface SettingsState {
   setColorScheme: (s: ColorScheme) => void;
   setAccentHue: (h: number | null) => void;
   setScrollbarWidth: (w: ScrollbarWidth) => void;
+  setSidebarLeftWidth: (w: number) => void;
+  setSidebarRightWidth: (w: number) => void;
+  setCenterSplitRatio: (r: number) => void;
+  toggleSidebarLeftCollapsed: () => void;
+  toggleSidebarRightCollapsed: () => void;
+  setLastTab: (group: string, tab: string) => void;
   resetToDefaults: () => void;
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  Defaults                                                           */
@@ -95,11 +116,19 @@ const DEFAULTS: Omit<SettingsState, keyof SettingsActions> = {
   colorScheme: 'dark',
   accentHue: null,
   scrollbarWidth: 'default',
+  sidebarLeftWidth: 230,
+  sidebarRightWidth: 348,
+  centerSplitRatio: 0.58, // 对应旧的 flex: 1.4 / (1.4+1)
+  sidebarLeftCollapsed: false,
+  sidebarRightCollapsed: false,
+  lastTabByGroup: {},
 };
 
 type SettingsActions = Pick<SettingsState,
   | 'setZoom' | 'setFontSans' | 'setFontMono' | 'setFsBase' | 'setFsMonoScale'
   | 'setDensity' | 'setColorScheme' | 'setAccentHue' | 'setScrollbarWidth'
+  | 'setSidebarLeftWidth' | 'setSidebarRightWidth' | 'setCenterSplitRatio'
+  | 'toggleSidebarLeftCollapsed' | 'toggleSidebarRightCollapsed' | 'setLastTab'
   | 'resetToDefaults'
 >;
 
@@ -138,6 +167,11 @@ export async function initFromTauri() {
     store.setColorScheme(merged.colorScheme);
     store.setAccentHue(merged.accentHue);
     store.setScrollbarWidth(merged.scrollbarWidth);
+    store.setSidebarLeftWidth(merged.sidebarLeftWidth);
+    store.setSidebarRightWidth(merged.sidebarRightWidth);
+    store.setCenterSplitRatio(merged.centerSplitRatio);
+    if (merged.sidebarLeftCollapsed !== store.sidebarLeftCollapsed) store.toggleSidebarLeftCollapsed();
+    if (merged.sidebarRightCollapsed !== store.sidebarRightCollapsed) store.toggleSidebarRightCollapsed();
   } catch { /* ignore */ }
 }
 
@@ -335,6 +369,15 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setColorScheme(s) { set({ colorScheme: s }); injectCSS({ colorScheme: s }); persist(get()); },
   setAccentHue(h) { set({ accentHue: h }); injectCSS({ accentHue: h }); persist(get()); },
   setScrollbarWidth(w) { set({ scrollbarWidth: w }); injectCSS({ scrollbarWidth: w }); persist(get()); },
+  setSidebarLeftWidth(w) { set({ sidebarLeftWidth: w }); persist(get()); },
+  setSidebarRightWidth(w) { set({ sidebarRightWidth: w }); persist(get()); },
+  setCenterSplitRatio(r) { set({ centerSplitRatio: r }); persist(get()); },
+  toggleSidebarLeftCollapsed() { set((s) => ({ sidebarLeftCollapsed: !s.sidebarLeftCollapsed })); persist(get()); },
+  toggleSidebarRightCollapsed() { set((s) => ({ sidebarRightCollapsed: !s.sidebarRightCollapsed })); persist(get()); },
+  setLastTab(group, tab) {
+    set((s) => ({ lastTabByGroup: { ...s.lastTabByGroup, [group]: tab } }));
+    persist(get());
+  },
 
   resetToDefaults() {
     set(DEFAULTS);

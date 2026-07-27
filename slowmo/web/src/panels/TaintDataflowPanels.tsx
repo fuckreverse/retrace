@@ -13,7 +13,8 @@ import type {
   ObjcCryptoLink,
   TaintSource,
 } from '@/types/tenet';
-import { Chip } from '@/components/ui';
+import { Button, Chip, IconButton } from '@/components/ui';
+import { Icon } from '@/components/icons';
 import './lists.css';
 import './cfg.css';
 
@@ -72,57 +73,86 @@ function nodeFill(kind: DataflowNode['kind']): string {
 }
 export function DataflowGraphPanel() {
   const [data, setData] = useState<DataflowGraph | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 20, y: 10 });
+  const cur = useTraceStore((s) => s.currentInst);
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ x: number; y: number } | null>(null);
 
-  useEffect(() => { api.dataflowGraph().then(setData); }, []);
+  useEffect(() => { void api.dataflowGraph().then(setData); }, []);
+
+  const centerNode = (node: DataflowNode, targetZoom = zoom) => {
+    const canvas = wrapRef.current;
+    if (!canvas) return;
+    setZoom(targetZoom);
+    setPan({
+      x: canvas.clientWidth / 2 - (node.x + NODE_W / 2) * targetZoom,
+      y: canvas.clientHeight / 2 - (node.y + NODE_H / 2) * targetZoom,
+    });
+  };
+
+  useEffect(() => {
+    const node = data?.nodes.find((n) => n.inst_id === cur);
+    const canvas = wrapRef.current;
+    if (!node || !canvas) return;
+    const left = pan.x + node.x * zoom, top = pan.y + node.y * zoom;
+    const visible = left >= 0 && top >= 0 && left + NODE_W * zoom <= canvas.clientWidth && top + NODE_H * zoom <= canvas.clientHeight;
+    if (!visible) centerNode(node);
+    // pan/zoom intentionally omitted: only cursor/data changes trigger following.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cur, data]);
+
   if (!data) return null;
-
-  const nodeById = (id: string) => data.nodes.find((n) => n.id === id)!;
+  const nodeById = (id: string) => data.nodes.find((n) => n.id === id);
+  const fitToScreen = () => {
+    const canvas = wrapRef.current;
+    if (!canvas || data.nodes.length === 0) return;
+    const minX = Math.min(...data.nodes.map((n) => n.x)), minY = Math.min(...data.nodes.map((n) => n.y));
+    const maxX = Math.max(...data.nodes.map((n) => n.x + NODE_W)), maxY = Math.max(...data.nodes.map((n) => n.y + NODE_H));
+    const width = Math.max(1, maxX - minX), height = Math.max(1, maxY - minY);
+    const nextZoom = Math.min(4, Math.max(0.2, Math.min((canvas.clientWidth - 80) / width, (canvas.clientHeight - 80) / height)));
+    setZoom(nextZoom);
+    setPan({ x: (canvas.clientWidth - width * nextZoom) / 2 - minX * nextZoom, y: (canvas.clientHeight - height * nextZoom) / 2 - minY * nextZoom });
+  };
+  const onWheel = (e: React.WheelEvent) => { e.preventDefault(); setZoom((z) => Math.min(4, Math.max(0.2, z - e.deltaY * 0.001))); };
+  const onDown = (e: React.MouseEvent) => { dragRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; };
+  const onMove = (e: React.MouseEvent) => { if (dragRef.current) setPan({ x: e.clientX - dragRef.current.x, y: e.clientY - dragRef.current.y }); };
+  const onUp = () => { dragRef.current = null; };
 
   return (
     <div className="cfg-panel">
       <div className="cfg-toolbar">
         <span className="list-count">{data.nodes.length} nodes / {data.edges.length} edges · def-use 数据流</span>
+        <IconButton title="放大" onClick={() => setZoom((z) => Math.min(4, z + 0.2))}><Icon.Forward /></IconButton>
+        <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>
+        <IconButton title="缩小" onClick={() => setZoom((z) => Math.max(0.2, z - 0.2))}><Icon.Back /></IconButton>
+        <IconButton title="Fit to Screen" onClick={fitToScreen}><Icon.Box /></IconButton>
+        <Button size="sm" variant="ghost" onClick={() => { setZoom(1); setPan({ x: 20, y: 10 }); }}>Reset View</Button>
         <div className="cfg-legend" style={{ marginLeft: 'auto' }}>
-          <span><i style={{ background: 'var(--hl-reg)' }} />reg</span>
-          <span><i style={{ background: 'var(--hl-addr)' }} />mem</span>
-          <span><i style={{ background: 'var(--hl-imm)' }} />const</span>
-          <span><i style={{ background: 'var(--accent)' }} />op</span>
+          <span><i style={{ background: 'var(--hl-reg)' }} />reg</span><span><i style={{ background: 'var(--hl-addr)' }} />mem</span>
+          <span><i style={{ background: 'var(--hl-imm)' }} />const</span><span><i style={{ background: 'var(--accent)' }} />op</span>
         </div>
       </div>
-      <div className="cfg-canvas-wrap" ref={wrapRef}>
-        <svg width={data.canvas_width} height={data.canvas_height} className="cfg-svg">
-          <defs>
-            <marker id="df-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-              <path d="M0 0L8 4L0 8z" fill="var(--border-strong)" />
-            </marker>
-          </defs>
+      <div className="cfg-canvas" ref={wrapRef} onWheel={onWheel} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}>
+        <svg width="100%" height="100%" className="cfg-svg"><g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
+          <defs><marker id="df-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8z" fill="var(--border-strong)" /></marker></defs>
           {data.edges.map((e, i) => {
             const a = nodeById(e.from), b = nodeById(e.to);
-            const x1 = a.x + NODE_W, y1 = a.y + NODE_H / 2;
-            const x2 = b.x, y2 = b.y + NODE_H / 2;
-            const mx = (x1 + x2) / 2;
-            return (
-              <g key={i}>
-                <path
-                  d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
-                  fill="none" stroke="var(--border-strong)" strokeWidth={1.5} markerEnd="url(#df-arrow)"
-                />
-                {e.label && <text x={mx} y={(y1 + y2) / 2 - 4} className="df-edge-label">{e.label}</text>}
-              </g>
-            );
+            if (!a || !b) return null;
+            const x1 = a.x + NODE_W, y1 = a.y + NODE_H / 2, x2 = b.x, y2 = b.y + NODE_H / 2, mx = (x1 + x2) / 2;
+            return <g key={i}><path d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`} fill="none" stroke="var(--border-strong)" strokeWidth={1.5} markerEnd="url(#df-arrow)" />{e.label && <text x={mx} y={(y1 + y2) / 2 - 4} className="df-edge-label">{e.label}</text>}</g>;
           })}
-          {data.nodes.map((n) => (
-            <g key={n.id} className="df-node" onClick={() => n.inst_id != null && navigateTo(n.inst_id)}>
-              <rect x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx={8}
-                fill="var(--bg-elevated)" stroke={nodeFill(n.kind)} strokeWidth={1.5} />
+          {data.nodes.map((n) => {
+            const isCurrent = n.inst_id === cur;
+            return <g key={n.id} className={`df-node${isCurrent ? ' df-node-current' : ''}`} onClick={(event) => { event.stopPropagation(); if (n.inst_id != null) navigateTo(n.inst_id); }}>
+              <rect x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx={8} fill="var(--bg-elevated)" stroke={isCurrent ? 'var(--success)' : nodeFill(n.kind)} strokeWidth={isCurrent ? 3 : 1.5} />
               <circle cx={n.x + 12} cy={n.y + NODE_H / 2} r={4} fill={nodeFill(n.kind)} />
               <text x={n.x + 24} y={n.y + NODE_H / 2 + 4} className="df-node-label">{n.label}</text>
               {n.inst_id != null && <text x={n.x + NODE_W - 6} y={n.y + 13} className="df-node-inst">#{n.inst_id}</text>}
-            </g>
-          ))}
-        </svg>
+            </g>;
+          })}
+        </g></svg>
       </div>
     </div>
   );

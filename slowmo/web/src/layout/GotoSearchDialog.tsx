@@ -11,8 +11,30 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { clsx } from 'clsx';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
+import { Icon } from '@/components/icons';
+import { IconButton } from '@/components/ui';
 import type { FunctionEntry } from '@/types/tenet';
 import './goto-search.css';
+
+const GOTO_HISTORY_KEY = 'tenet-goto-history';
+const SEARCH_HISTORY_KEY = 'tenet-search-history';
+const HISTORY_LIMIT = 10;
+
+function loadHistory(key: string): string[] {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(key) ?? '[]');
+    if (Array.isArray(raw)) {
+      return raw.filter((item): item is string => typeof item === 'string').slice(0, HISTORY_LIMIT);
+    }
+  } catch { /* ignore unavailable or corrupt storage */ }
+  return [];
+}
+
+function addHistoryItem(key: string, history: string[], value: string): string[] {
+  const next = [value, ...history.filter((item) => item !== value)].slice(0, HISTORY_LIMIT);
+  try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* ignore unavailable or full storage */ }
+  return next;
+}
 
 /** 判断字符串是否可解析为 inst_id（纯十进制数字） */
 function parseInstId(s: string): number | null {
@@ -39,6 +61,7 @@ export function GotoDialog() {
   const totalInst = useTraceStore((s) => s.totalInst);
 
   const [query, setQuery] = useState('');
+  const [history, setHistory] = useState<string[]>(() => loadHistory(GOTO_HISTORY_KEY));
   const [funcs, setFuncs] = useState<FunctionEntry[]>([]);
   const [selected, setSelected] = useState(-1);
   const [busy, setBusy] = useState(false);
@@ -47,6 +70,7 @@ export function GotoDialog() {
   useEffect(() => {
     if (!open) return;
     setQuery('');
+    setHistory(loadHistory(GOTO_HISTORY_KEY));
     setSelected(-1);
     api.functions().then(setFuncs);
     // Radix Dialog 打开动画期间聚焦，稍作延迟保证元素已挂载
@@ -61,32 +85,44 @@ export function GotoDialog() {
     return [...prefix, ...contains].slice(0, 12);
   }, [funcs, query]);
 
+  const showRecent = query.trim().length === 0 && history.length > 0;
+  const selectableTargets = showRecent
+    ? [...history, ...candidates.map((candidate) => candidate.name)]
+    : candidates.map((candidate) => candidate.name);
+
   const commit = async (text: string) => {
     const s = text.trim();
     if (!s) return;
     setBusy(true);
     try {
+      let destination: number | null = null;
       const instId = parseInstId(s);
       if (instId != null) {
-        if (instId < totalInst) navigateTo(instId);
-        close();
-        return;
+        if (instId < totalInst) destination = instId;
+      } else {
+        const addr = parseHexAddr(s);
+        if (addr != null) {
+          const pc = `0x${addr.toString(16)}`;
+          const xref = await api.xref(pc);
+          destination = xref.inst_ids[0] ?? null;
+        } else {
+          // 函数名：精确 → 前缀 → 包含。首次打开时函数列表可能仍在加载，按需等待。
+          const availableFuncs = funcs.length > 0 ? funcs : await api.functions();
+          if (funcs.length === 0) setFuncs(availableFuncs);
+          const ql = s.toLowerCase();
+          const exact = availableFuncs.find((f) => f.name.toLowerCase() === ql);
+          const prefix = availableFuncs.find((f) => f.name.toLowerCase().startsWith(ql));
+          const contains = availableFuncs.find((f) => f.name.toLowerCase().includes(ql));
+          const target = exact ?? prefix ?? contains;
+          if (target) {
+            const xref = await api.xref(target.pc);
+            destination = xref.inst_ids[0] ?? null;
+          }
+        }
       }
-      const addr = parseHexAddr(s);
-      if (addr != null) {
-        const pc = `0x${addr.toString(16)}`;
-        const xref = await api.xref(pc);
-        if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]);
-        close();
-        return;
-      }
-      // 函数名：精确 → 前缀 → 包含
-      const ql = s.toLowerCase();
-      const exact = funcs.find((f) => f.name.toLowerCase() === ql);
-      const target = exact ?? candidates[0];
-      if (target) {
-        const xref = await api.xref(target.pc);
-        if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]);
+      if (destination != null) {
+        navigateTo(destination);
+        setHistory((current) => addHistoryItem(GOTO_HISTORY_KEY, current, s));
       }
       close();
     } finally {
@@ -109,10 +145,10 @@ export function GotoDialog() {
               onChange={(e) => { setQuery(e.target.value); setSelected(-1); }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
-                  void commit(selected >= 0 ? candidates[selected].name : query);
+                  void commit(selected >= 0 ? selectableTargets[selected] : query);
                 } else if (e.key === 'ArrowDown') {
                   e.preventDefault();
-                  setSelected((i) => Math.min(candidates.length - 1, i + 1));
+                  setSelected((i) => Math.min(selectableTargets.length - 1, i + 1));
                 } else if (e.key === 'ArrowUp') {
                   e.preventDefault();
                   setSelected((i) => Math.max(0, i - 1));
@@ -123,20 +159,43 @@ export function GotoDialog() {
               placeholder="0x100004a10, 4210, or -[CryptoManager deriveKey:]"
               disabled={busy}
             />
-            {candidates.length > 0 && (
+            {(showRecent || candidates.length > 0) && (
               <div className="gs-list">
-                {candidates.map((f, i) => (
-                  <div
-                    key={f.pc}
-                    className={clsx('gs-list-item', i === selected && 'selected')}
-                    onMouseEnter={() => setSelected(i)}
-                    onClick={() => void commit(f.name)}
-                  >
-                    <span className="mono gs-list-name">{f.name}</span>
-                    <span className="mono dim gs-list-pc">{f.pc}</span>
-                    <span className="dim gs-list-calls">{f.calls} calls</span>
+                {showRecent && (
+                  <div className="gs-list-group">
+                    <div className="gs-list-heading">Recent</div>
+                    {history.map((item, i) => (
+                      <div
+                        key={item}
+                        className={clsx('gs-list-item', 'gs-recent-item', i === selected && 'selected')}
+                        onMouseEnter={() => setSelected(i)}
+                        onClick={() => void commit(item)}
+                      >
+                        <span className="mono gs-list-name">{item}</span>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                )}
+                {candidates.length > 0 && (
+                  <div className="gs-list-group">
+                    {showRecent && <div className="gs-list-heading">Functions</div>}
+                    {candidates.map((f, i) => {
+                      const itemIndex = (showRecent ? history.length : 0) + i;
+                      return (
+                        <div
+                          key={f.pc}
+                          className={clsx('gs-list-item', itemIndex === selected && 'selected')}
+                          onMouseEnter={() => setSelected(itemIndex)}
+                          onClick={() => void commit(f.name)}
+                        >
+                          <span className="mono gs-list-name">{f.name}</span>
+                          <span className="mono dim gs-list-pc">{f.pc}</span>
+                          <span className="dim gs-list-calls">{f.calls} calls</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
             <div className="gs-footer">
@@ -159,28 +218,39 @@ export function SearchDialog() {
   const cur = useTraceStore((s) => s.currentInst);
   const setSearch = useTraceStore((s) => s.setSearch);
   const searchResults = useTraceStore((s) => s.searchResults);
+  const searchNext = useTraceStore((s) => s.searchNext);
+  const searchPrev = useTraceStore((s) => s.searchPrev);
 
   const [query, setQuery] = useState('');
+  const [history, setHistory] = useState<string[]>(() => loadHistory(SEARCH_HISTORY_KEY));
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!open) return;
     setQuery('');
+    setHistory(loadHistory(SEARCH_HISTORY_KEY));
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [open]);
 
-  const run = async () => {
-    const q = query.trim();
+  const run = async (text = query) => {
+    const q = text.trim();
     if (!q) return;
     setBusy(true);
     try {
       const hits = await api.searchForward(q, cur);
+      setQuery(q);
       setSearch(q, hits);
-      close();
+      setHistory((current) => addHistoryItem(SEARCH_HISTORY_KEY, current, q));
     } finally {
       setBusy(false);
     }
+  };
+
+  const navigateSearch = (direction: 'prev' | 'next') => {
+    if (direction === 'prev') searchPrev();
+    else searchNext();
+    close();
   };
 
   return (
@@ -203,13 +273,33 @@ export function SearchDialog() {
               placeholder="e.g. bl, ldr x0, str"
               disabled={busy}
             />
+            {query.trim().length === 0 && history.length > 0 && (
+              <div className="gs-list gs-history-list">
+                <div className="gs-list-heading">Recent</div>
+                {history.map((item) => (
+                  <div
+                    key={item}
+                    className="gs-list-item gs-recent-item"
+                    onClick={() => void run(item)}
+                  >
+                    <span className="mono gs-list-name">{item}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="gs-footer">
               <button className="gs-btn" onClick={close} type="button">Cancel</button>
               <button className="gs-btn gs-btn-primary" onClick={() => void run()} type="button" disabled={busy}>
                 {busy ? 'Searching…' : 'Find'}
               </button>
               {searchResults.length > 0 && (
-                <span className="gs-key-hint">上次命中 {searchResults.length} 处</span>
+                <>
+                  <span className="gs-key-hint">命中 {searchResults.length} 处</span>
+                  <div className="gs-search-nav">
+                    <IconButton title="上一个" type="button" onClick={() => navigateSearch('prev')}><Icon.Prev /></IconButton>
+                    <IconButton title="下一个" type="button" onClick={() => navigateSearch('next')}><Icon.Next /></IconButton>
+                  </div>
+                </>
               )}
             </div>
           </div>

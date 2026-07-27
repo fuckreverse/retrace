@@ -207,35 +207,83 @@ export function CallGraphPanel() {
   const [data, setData] = useState<CallGraphResult | null>(null);
   const [view, setView] = useState<CgView>('graph');
   const [selected, setSelected] = useState<string | null>(null);
+  const [currentPc, setCurrentPc] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 20, y: 10 });
+  const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
+  const cur = useTraceStore((s) => s.currentInst);
   const navigateTo = useTraceStore((s) => s.navigateTo);
 
-  useEffect(() => { api.callGraph().then(setData); }, []);
+  useEffect(() => { void api.callGraph().then(setData); }, []);
 
   const layout = useMemo(() => (data ? layoutCallGraph(data) : null), [data]);
   const nodeByPc = useMemo(() => new Map(layout?.nodes.map((n) => [n.pc, n])), [layout]);
+  const matches = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return query && layout ? layout.nodes.filter((n) => n.name.toLowerCase().includes(query)) : [];
+  }, [layout, search]);
+  const matchingPcs = useMemo(() => new Set(matches.map((n) => n.pc)), [matches]);
+
+  const centerNode = (node: CgLayoutNode, targetZoom = zoom) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setZoom(targetZoom);
+    setPan({
+      x: canvas.clientWidth / 2 - (node.x + CG_NODE_W / 2) * targetZoom,
+      y: canvas.clientHeight / 2 - (node.y + CG_NODE_H / 2) * targetZoom,
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.callStack(cur).then((frames) => {
+      if (cancelled) return;
+      const top = frames[frames.length - 1];
+      const node = top ? nodeByPc.get(top.func_pc) ?? layout?.nodes.find((n) => n.name === top.func_name) : undefined;
+      setCurrentPc(node?.pc ?? null);
+      const canvas = canvasRef.current;
+      if (node && canvas) {
+        const left = pan.x + node.x * zoom, topY = pan.y + node.y * zoom;
+        const visible = left >= 0 && topY >= 0 && left + CG_NODE_W * zoom <= canvas.clientWidth && topY + CG_NODE_H * zoom <= canvas.clientHeight;
+        if (!visible) centerNode(node);
+      }
+    });
+    return () => { cancelled = true; };
+    // pan/zoom intentionally omitted: user navigation should not retrigger following.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cur, layout, nodeByPc]);
+
+  useEffect(() => {
+    const query = search.trim().toLowerCase();
+    const exact = matches.find((node) => node.name.toLowerCase() === query);
+    if (exact) centerNode(exact, Math.min(4, Math.max(1.2, zoom)));
+    // Only a newly entered exact query should trigger automatic location.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, matches]);
 
   if (!data || !layout) return <div className="empty-state">正在加载调用图…</div>;
 
   const nameOf = (pc: string) => data.nodes.find((n) => n.pc === pc)?.name ?? pc;
   const hot = [...data.nodes].sort((a, b) => b.calls_received - a.calls_received).slice(0, 50);
   const maxCalls = Math.max(1, ...data.nodes.map((n) => n.calls_received));
+  const gotoFunc = async (pc: string) => { const xref = await api.xref(pc); if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]); };
 
-  const gotoFunc = async (pc: string) => {
-    const xref = await api.xref(pc);
-    if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]);
+  const fitToScreen = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || layout.nodes.length === 0) return;
+    const minX = Math.min(...layout.nodes.map((n) => n.x)), minY = Math.min(...layout.nodes.map((n) => n.y));
+    const maxX = Math.max(...layout.nodes.map((n) => n.x + CG_NODE_W)), maxY = Math.max(...layout.nodes.map((n) => n.y + CG_NODE_H));
+    const width = Math.max(1, maxX - minX), height = Math.max(1, maxY - minY);
+    const nextZoom = Math.min(4, Math.max(0.15, Math.min((canvas.clientWidth - 80) / width, (canvas.clientHeight - 80) / height)));
+    setZoom(nextZoom);
+    setPan({ x: (canvas.clientWidth - width * nextZoom) / 2 - minX * nextZoom, y: (canvas.clientHeight - height * nextZoom) / 2 - minY * nextZoom });
   };
-
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    setZoom((z) => Math.min(4, Math.max(0.15, z - e.deltaY * 0.001)));
-  };
+  const locateSearch = () => { if (matches[0]) centerNode(matches[0], Math.min(4, Math.max(1.2, zoom))); };
+  const onWheel = (e: React.WheelEvent) => { e.preventDefault(); setZoom((z) => Math.min(4, Math.max(0.15, z - e.deltaY * 0.001))); };
   const onDown = (e: React.MouseEvent) => { dragRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; };
-  const onMove = (e: React.MouseEvent) => {
-    if (dragRef.current) setPan({ x: e.clientX - dragRef.current.x, y: e.clientY - dragRef.current.y });
-  };
+  const onMove = (e: React.MouseEvent) => { if (dragRef.current) setPan({ x: e.clientX - dragRef.current.x, y: e.clientY - dragRef.current.y }); };
   const onUp = () => { dragRef.current = null; };
 
   return (
@@ -243,101 +291,42 @@ export function CallGraphPanel() {
       <div className="cfg-toolbar">
         <Chip active={view === 'graph'} onClick={() => setView('graph')}>Graph</Chip>
         <Chip active={view === 'table'} onClick={() => setView('table')}>Table</Chip>
-        {view === 'graph' && (
-          <>
-            <div className="toolbar-sep" />
-            <IconButton title="放大" onClick={() => setZoom((z) => Math.min(4, z + 0.2))}><Icon.Forward /></IconButton>
-            <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>
-            <IconButton title="缩小" onClick={() => setZoom((z) => Math.max(0.15, z - 0.2))}><Icon.Back /></IconButton>
-            <Button size="sm" variant="ghost" onClick={() => { setZoom(1); setPan({ x: 20, y: 10 }); }}>Reset View</Button>
-          </>
-        )}
+        {view === 'graph' && <>
+          <Input aria-label="搜索函数" placeholder="Search function…" value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') locateSearch(); }} style={{ width: 160 }} />
+          <div className="toolbar-sep" />
+          <IconButton title="放大" onClick={() => setZoom((z) => Math.min(4, z + 0.2))}><Icon.Forward /></IconButton>
+          <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>
+          <IconButton title="缩小" onClick={() => setZoom((z) => Math.max(0.15, z - 0.2))}><Icon.Back /></IconButton>
+          <IconButton title="Fit to Screen" onClick={fitToScreen}><Icon.Box /></IconButton>
+          <Button size="sm" variant="ghost" onClick={() => { setZoom(1); setPan({ x: 20, y: 10 }); }}>Reset View</Button>
+        </>}
         <span className="dim" style={{ marginLeft: 'auto' }}>{data.nodes.length} nodes · {data.edges.length} edges</span>
       </div>
-      {view === 'table' ? (
-        <div className="list-scroll">
-          <table className="data-table">
-            <thead><tr><th>Function</th><th style={{ width: 90 }}>Received</th><th style={{ width: 80 }}>Made</th></tr></thead>
-            <tbody>
-              {hot.map((n) => (
-                <tr key={n.pc} onClick={() => void gotoFunc(n.pc)}>
-                  <td className={clsx('mono', n.name.startsWith('-[') && 'objc-name')}>
-                    {n.is_root && <span className="cat-tag cat-accent" style={{ marginRight: 6 }}>root</span>}
-                    {nameOf(n.pc)}
-                  </td>
-                  <td className="mono num">{n.calls_received}</td>
-                  <td className="mono num dim">{n.calls_made}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div
-          className="cfg-canvas"
-          onWheel={onWheel}
-          onMouseDown={onDown}
-          onMouseMove={onMove}
-          onMouseUp={onUp}
-          onMouseLeave={onUp}
-        >
-          <svg width="100%" height="100%">
-            <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
-              <defs>
-                <marker id="cg-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                  <path d="M0 0L8 4L0 8z" fill="var(--border-strong)" />
-                </marker>
-              </defs>
-              {data.edges.map((e, i) => {
-                const a = nodeByPc.get(e.caller);
-                const b = nodeByPc.get(e.callee);
-                if (!a || !b) return null;
-                const x1 = a.x + CG_NODE_W, y1 = a.y + CG_NODE_H / 2;
-                const x2 = b.x, y2 = b.y + CG_NODE_H / 2;
-                const mx = (x1 + x2) / 2;
-                const highlighted = selected === e.caller || selected === e.callee;
-                return (
-                  <path
-                    key={i}
-                    d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`}
-                    fill="none"
-                    stroke={highlighted ? 'var(--accent)' : 'var(--border-strong)'}
-                    strokeWidth={highlighted ? 2 : Math.min(3, 1 + (e.call_count ?? 1) / 200)}
-                    opacity={highlighted ? 0.9 : 0.5}
-                    markerEnd="url(#cg-arrow)"
-                  />
-                );
-              })}
-              {layout.nodes.map((n) => {
-                const heat = n.calls_received / maxCalls;
-                const isSel = selected === n.pc;
-                return (
-                  <g
-                    key={n.pc}
-                    className="df-node"
-                    transform={`translate(${n.x},${n.y})`}
-                    onClick={(ev) => { ev.stopPropagation(); setSelected(n.pc); void gotoFunc(n.pc); }}
-                  >
-                    <rect
-                      width={CG_NODE_W}
-                      height={CG_NODE_H}
-                      rx={8}
-                      fill="var(--bg-elevated)"
-                      stroke={isSel ? 'var(--accent)' : n.is_root ? 'var(--success)' : 'var(--border-strong)'}
-                      strokeWidth={isSel || n.is_root ? 2 : 1}
-                    />
-                    <rect width={Math.max(2, CG_NODE_W * heat)} height={3} y={CG_NODE_H - 3} fill="var(--accent)" opacity={0.6} />
-                    <text x={8} y={16} className={clsx('df-node-label', n.name.startsWith('-[') && 'objc-name')}>
-                      {n.name.length > 20 ? n.name.slice(0, 20) + '…' : n.name}
-                    </text>
-                    <text x={8} y={30} className="df-node-inst" textAnchor="start">
-                      recv {n.calls_received} · made {n.calls_made}
-                    </text>
-                  </g>
-                );
-              })}
-            </g>
-          </svg>
+      {view === 'table' ? <div className="list-scroll"><table className="data-table">
+        <thead><tr><th>Function</th><th style={{ width: 90 }}>Received</th><th style={{ width: 80 }}>Made</th></tr></thead>
+        <tbody>{hot.map((n) => <tr key={n.pc} onClick={() => void gotoFunc(n.pc)}><td className={clsx('mono', n.name.startsWith('-[') && 'objc-name')}>{n.is_root && <span className="cat-tag cat-accent" style={{ marginRight: 6 }}>root</span>}{nameOf(n.pc)}</td><td className="mono num">{n.calls_received}</td><td className="mono num dim">{n.calls_made}</td></tr>)}</tbody>
+      </table></div> : (
+        <div ref={canvasRef} className="cfg-canvas" onWheel={onWheel} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}>
+          <svg width="100%" height="100%"><g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
+            <defs><marker id="cg-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8z" fill="var(--border-strong)" /></marker></defs>
+            {data.edges.map((e, i) => {
+              const a = nodeByPc.get(e.caller), b = nodeByPc.get(e.callee);
+              if (!a || !b) return null;
+              const x1 = a.x + CG_NODE_W, y1 = a.y + CG_NODE_H / 2, x2 = b.x, y2 = b.y + CG_NODE_H / 2, mx = (x1 + x2) / 2;
+              const highlighted = selected === e.caller || selected === e.callee;
+              return <path key={i} d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`} fill="none" stroke={highlighted ? 'var(--accent)' : 'var(--border-strong)'} strokeWidth={highlighted ? 2 : Math.min(3, 1 + (e.call_count ?? 1) / 200)} opacity={highlighted ? 0.9 : 0.5} markerEnd="url(#cg-arrow)" />;
+            })}
+            {layout.nodes.map((n) => {
+              const heat = n.calls_received / maxCalls, isSel = selected === n.pc, isCurrent = currentPc === n.pc, isMatch = matchingPcs.has(n.pc);
+              const stroke = isCurrent ? 'var(--success)' : isMatch ? 'var(--warning)' : isSel ? 'var(--accent)' : n.is_root ? 'var(--success)' : 'var(--border-strong)';
+              return <g key={n.pc} className={`df-node${isCurrent ? ' cg-node-current' : ''}${isMatch ? ' cg-node-match' : ''}`} transform={`translate(${n.x},${n.y})`} onClick={(ev) => { ev.stopPropagation(); setSelected(n.pc); void gotoFunc(n.pc); }}>
+                <rect width={CG_NODE_W} height={CG_NODE_H} rx={8} fill="var(--bg-elevated)" stroke={stroke} strokeWidth={isCurrent ? 3 : isSel || isMatch || n.is_root ? 2 : 1} />
+                <rect width={Math.max(2, CG_NODE_W * heat)} height={3} y={CG_NODE_H - 3} fill="var(--accent)" opacity={0.6} />
+                <text x={8} y={16} className={clsx('df-node-label', n.name.startsWith('-[') && 'objc-name')}>{n.name.length > 20 ? `${n.name.slice(0, 20)}…` : n.name}</text>
+                <text x={8} y={30} className="df-node-inst" textAnchor="start">recv {n.calls_received} · made {n.calls_made}</text>
+              </g>;
+            })}
+          </g></svg>
         </div>
       )}
     </div>

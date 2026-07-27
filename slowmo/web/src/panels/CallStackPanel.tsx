@@ -3,6 +3,7 @@
  */
 import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
+import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { CallFrame } from '@/types/tenet';
@@ -26,17 +27,33 @@ export function CallStackPanel() {
     <div className="list-panel">
       <div className="callstack">
         {frames.map((f, i) => (
-          <div
-            key={i}
-            className={clsx('frame', i === frames.length - 1 && 'frame-top')}
-            style={{ paddingLeft: 8 + f.depth * 14 }}
-            onClick={() => navigateTo(f.call_inst_id)}
-            title="单击跳转到 call site"
-          >
-            <span className="frame-marker">{i === frames.length - 1 ? '▸' : '·'}</span>
-            <span className={clsx('frame-name mono', f.func_name.startsWith('-[') && 'objc-name')}>{f.func_name}</span>
-            <span className="frame-at dim mono">@{f.call_inst_id}</span>
-          </div>
+          <ContextMenu.Root key={i}>
+            <ContextMenu.Trigger asChild>
+              <div
+                className={clsx('frame', i === frames.length - 1 && 'frame-top')}
+                style={{ paddingLeft: 8 + f.depth * 14 }}
+                onClick={() => navigateTo(f.call_inst_id)}
+                title="单击跳转到 call site"
+              >
+                <span className="frame-marker">{i === frames.length - 1 ? '▸' : '·'}</span>
+                <span className={clsx('frame-name mono', f.func_name.startsWith('-[') && 'objc-name')}>{f.func_name}</span>
+                <span className="frame-at dim mono">@{f.call_inst_id}</span>
+              </div>
+            </ContextMenu.Trigger>
+            <ContextMenu.Portal>
+              <ContextMenu.Content className="ctx-menu">
+                <ContextMenu.Item className="ctx-item" onSelect={() => navigateTo(f.call_inst_id)}>
+                  Navigate to Call Site
+                </ContextMenu.Item>
+                <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.func_name)}>
+                  Copy Function Name
+                </ContextMenu.Item>
+                <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(String(f.call_inst_id))}>
+                  Copy Call Inst ID
+                </ContextMenu.Item>
+              </ContextMenu.Content>
+            </ContextMenu.Portal>
+          </ContextMenu.Root>
         ))}
       </div>
     </div>

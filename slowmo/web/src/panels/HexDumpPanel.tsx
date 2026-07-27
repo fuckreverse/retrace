@@ -3,6 +3,7 @@
  */
 import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
+import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { MemReadResult } from '@/types/tenet';
@@ -40,6 +41,12 @@ export function HexDumpPanel() {
 
   const baseAddr = data ? BigInt(data.addr) : 0n;
 
+  const gotoCurrentInst = async () => {
+    const dis = await api.disasm(cur, 1);
+    const pc = dis.rows[0]?.pc;
+    setHexAddr(pc ?? '0x16D000000');
+  };
+
   return (
     <div className="hex-panel">
       <div className="hex-toolbar">
@@ -51,7 +58,7 @@ export function HexDumpPanel() {
           style={{ width: 160 }}
         />
         <Button size="sm" onClick={() => setHexAddr(addrInput)}>Go</Button>
-        <Button size="sm" variant="ghost" onClick={() => { setHexAddr(null); setAddrInput('0x16D000000'); }}>
+        <Button size="sm" variant="ghost" onClick={() => void gotoCurrentInst()}>
           From Inst
         </Button>
         <span className="dim hex-known">
@@ -70,13 +77,36 @@ export function HexDumpPanel() {
                     const idx = row * 16 + col;
                     const known = data.known?.[idx] ?? false;
                     const val = data.data?.[idx] ?? 0;
+                    const byteAddr = '0x' + (rowAddr + BigInt(col)).toString(16).toUpperCase();
                     return (
-                      <span
-                        key={col}
-                        className={clsx('hex-byte', !known && 'hex-unknown', known && val !== 0 && 'hex-hot')}
-                      >
-                        {known ? val.toString(16).padStart(2, '0') : '··'}
-                      </span>
+                      <ContextMenu.Root key={col}>
+                        <ContextMenu.Trigger asChild>
+                          <span
+                            className={clsx('hex-byte', !known && 'hex-unknown', known && val !== 0 && 'hex-hot')}
+                            title={byteAddr}
+                            onClick={() => setHexAddr(byteAddr)}
+                          >
+                            {known ? val.toString(16).padStart(2, '0') : '··'}
+                          </span>
+                        </ContextMenu.Trigger>
+                        <ContextMenu.Portal>
+                          <ContextMenu.Content className="ctx-menu">
+                            <ContextMenu.Item
+                              className="ctx-item"
+                              onSelect={() => navigator.clipboard?.writeText(`0x${val.toString(16).padStart(2, '0').toUpperCase()}`)}
+                            >
+                              Copy Byte Value
+                            </ContextMenu.Item>
+                            <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(byteAddr)}>
+                              Copy Address
+                            </ContextMenu.Item>
+                            <ContextMenu.Separator className="ctx-sep" />
+                            <ContextMenu.Item className="ctx-item" onSelect={() => setHexAddr(byteAddr)}>
+                              Go to Address in Hex Dump
+                            </ContextMenu.Item>
+                          </ContextMenu.Content>
+                        </ContextMenu.Portal>
+                      </ContextMenu.Root>
                     );
                   })}
                 </span>

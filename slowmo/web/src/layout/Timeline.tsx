@@ -1,7 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { WindowStat } from '@/types/tenet';
+
+interface HoverInfo {
+  x: number;
+  instId: number;
+  instCount?: number;
+  bookmark: boolean;
+}
 
 /** 执行密度 + 污点覆盖 + 当前游标的时间线泳道 */
 export function Timeline() {
@@ -13,6 +20,12 @@ export function Timeline() {
   const searchResults = useTraceStore((s) => s.searchResults);
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const [windows, setWindows] = useState<WindowStat[]>([]);
+  const [hover, setHover] = useState<HoverInfo | null>(null);
+  const dragging = useRef(false);
+  const pendingInst = useRef<number | null>(null);
+  const raf = useRef<number | null>(null);
+  const previousCursor = useRef('');
+  const previousUserSelect = useRef('');
 
   // 执行密度真实数据：一次性拉取 window_stats（后端 pass，trace 加载后才有意义）
   useEffect(() => {
@@ -80,6 +93,19 @@ export function Timeline() {
       ctx.fill();
     });
 
+    // Hover 游标（淡色虚线，当前游标仍绘制在它上方）
+    if (hover) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hover.x, 0);
+      ctx.lineTo(hover.x, h);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // 当前游标
     const cx = (cur / total) * w;
     ctx.strokeStyle = '#fff';
@@ -92,17 +118,110 @@ export function Timeline() {
     ctx.beginPath();
     ctx.arc(cx, h / 2, 3, 0, Math.PI * 2);
     ctx.fill();
-  }, [total, cur, bookmarks, taintFwd, searchResults, windows]);
+  }, [total, cur, bookmarks, taintFwd, searchResults, windows, hover]);
 
-  const onClick = (e: React.MouseEvent) => {
-    const rect = ref.current!.getBoundingClientRect();
-    const t = (e.clientX - rect.left) / rect.width;
-    navigateTo(Math.round(t * total));
+  const instAtClientX = useCallback((clientX: number) => {
+    const rect = ref.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || total <= 0) return null;
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return Math.round(ratio * Math.max(0, total - 1));
+  }, [total]);
+
+  const flushScrub = useCallback(() => {
+    raf.current = null;
+    const instId = pendingInst.current;
+    pendingInst.current = null;
+    if (instId !== null) navigateTo(instId, false);
+  }, [navigateTo]);
+
+  const queueScrub = useCallback((clientX: number) => {
+    const instId = instAtClientX(clientX);
+    if (instId === null) return;
+    pendingInst.current = instId;
+    if (raf.current === null) raf.current = requestAnimationFrame(flushScrub);
+  }, [flushScrub, instAtClientX]);
+
+  const stopScrub = useCallback((event?: PointerEvent) => {
+    if (!dragging.current) return;
+    if (event) {
+      const instId = instAtClientX(event.clientX);
+      if (instId !== null) pendingInst.current = instId;
+    }
+    dragging.current = false;
+    document.body.style.cursor = previousCursor.current;
+    document.body.style.userSelect = previousUserSelect.current;
+    if (raf.current !== null) {
+      cancelAnimationFrame(raf.current);
+      raf.current = null;
+    }
+    const finalInst = pendingInst.current;
+    pendingInst.current = null;
+    // 拖动期间不污染导航历史；释放时仅提交一个最终历史节点。
+    if (finalInst !== null) navigateTo(finalInst);
+  }, [instAtClientX, navigateTo]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      if (dragging.current) queueScrub(event.clientX);
+    };
+    const onPointerUp = (event: PointerEvent) => stopScrub(event);
+    const onPointerCancel = (event: PointerEvent) => stopScrub(event);
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+    document.addEventListener('pointercancel', onPointerCancel);
+    return () => {
+      document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', onPointerUp);
+      document.removeEventListener('pointercancel', onPointerCancel);
+      stopScrub();
+      if (raf.current !== null) cancelAnimationFrame(raf.current);
+    };
+  }, [queueScrub, stopScrub]);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || total <= 0) return;
+    event.preventDefault();
+    dragging.current = true;
+    setHover(null);
+    previousCursor.current = document.body.style.cursor;
+    previousUserSelect.current = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    queueScrub(event.clientX);
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragging.current || total <= 0) return;
+    const canvas = ref.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const instId = instAtClientX(event.clientX);
+    if (instId === null) return;
+    const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+    const windowStat = windows.find(
+      (win) => instId >= win.window_start && instId <= win.window_end,
+    );
+    const bookmark = [...bookmarks].some(
+      (id) => Math.abs((id / Math.max(1, total)) * rect.width - x) <= 3,
+    );
+    setHover({ x, instId, instCount: windowStat?.inst_count, bookmark });
   };
 
   return (
-    <div className="timeline" onClick={onClick}>
+    <div
+      className="timeline"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerLeave={() => { if (!dragging.current) setHover(null); }}
+    >
       <canvas ref={ref} />
+      {hover && (
+        <div className="timeline-tooltip" style={{ left: hover.x }}>
+          <span>inst_id: {hover.instId}</span>
+          {hover.instCount !== undefined && <span>inst_count: {hover.instCount}</span>}
+          {hover.bookmark && <span>Bookmark</span>}
+        </div>
+      )}
     </div>
   );
 }

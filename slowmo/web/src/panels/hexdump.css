@@ -38,3 +38,27 @@
 .hex-hot { color: var(--hl-imm); }
 .hex-unknown { color: var(--text-disabled); }
 .hex-ascii { color: var(--text-secondary); letter-spacing: 1px; }
+
+.ctx-menu {
+  min-width: 200px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  box-shadow: var(--shadow-popover);
+  z-index: 200;
+}
+.ctx-item {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  outline: none;
+  user-select: none;
+}
+.ctx-item[data-highlighted] { background: var(--accent-soft); color: var(--accent); }
+.ctx-sep { height: 1px; background: var(--border-subtle); margin: var(--space-2) 0; }

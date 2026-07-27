@@ -58,9 +58,18 @@ function hex(v: bigint | number): string {
   return '0x' + (b & 0xffffffffffffffffn).toString(16).toUpperCase();
 }
 
-// 简单确定性 PRNG
+// 简单确定性 PRNG（LCG）。
+// 小种子（如循环下标 0~100）直接喂给 LCG 时，首次输出的低位熵不足，
+// 会导致连续种子的第一次采样高度聚集（例如 mockCallGraph 曾出现
+// 全部种子首次采样都 <0.6，导致恒定生成 0 条边）。这里先用 32 位整数
+// 哈希（xorshift 变体）把种子打散，避免小种子/连续种子的强相关性；
+// 打散仅用于播种，不改变后续调用序列的分布性质。
 function rng(seed: number): () => number {
   let s = seed >>> 0;
+  s ^= s << 13; s >>>= 0;
+  s ^= s >>> 17;
+  s ^= s << 5; s >>>= 0;
+  s = (s ^ 0x9e3779b9) >>> 0;
   return () => {
     s = (s * 1664525 + 1013904223) >>> 0;
     return s / 0xffffffff;

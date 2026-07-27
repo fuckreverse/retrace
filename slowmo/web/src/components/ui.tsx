@@ -52,10 +52,16 @@ export function Button({ variant = 'default', size = 'md', active, className, ..
 export function IconButton({
   children,
   title,
+  className,
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & { title?: string }) {
   const btn = (
-    <button className="icon-btn" {...rest}>
+    <button
+      className={clsx('icon-btn', className)}
+      title={title}
+      aria-label={title}
+      {...rest}
+    >
       {children}
     </button>
   );

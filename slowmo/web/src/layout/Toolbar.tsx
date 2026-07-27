@@ -43,12 +43,6 @@ export function Toolbar() {
         <IconButton title="下一条 (↓)" onClick={() => step(1)}><Icon.Next /></IconButton>
         <IconButton title="末条指令 (End)" onClick={() => navigateTo(total - 1)}><Icon.Last /></IconButton>
       </div>
-      <div className="toolbar-sep" />
-      <div className="toolbar-group">
-        <IconButton title="跟随 Call (E)" onClick={() => step(1)}><Icon.Play /></IconButton>
-        <IconButton title="跟随 Return (R)" onClick={() => step(-1)}><Icon.Stop /></IconButton>
-      </div>
-
       <div className="toolbar-cur">
         <span>
           inst <span className="cur-inst">#{cur}</span> / {total.toLocaleString()}

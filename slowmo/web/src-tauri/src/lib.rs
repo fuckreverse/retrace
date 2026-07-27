@@ -514,8 +514,8 @@ let app_menu = SubmenuBuilder::new(handle, "Tenet")
 
     // ── Navigate ────────────────────────────────────────────────────────
     let navigate_menu = SubmenuBuilder::new(handle, "Navigate")
-        .item(disabled!("nav_goto", "Go to Instruction…"))
-        .item(disabled!("nav_search", "Search…"))
+        .text("nav_goto", "Go to Instruction…")
+        .text("nav_search", "Search…")
         .separator()
         .text("nav_back", "Back")
         .text("nav_forward", "Forward")

@@ -83,7 +83,7 @@ export const MENU_BAR: TopMenu[] = [
     id: 'file',
     label: 'File',
     items: [
-      item('file_open', 'Open Trace…', 'Cmd+O', true),
+      item('file_open', 'Open Trace…', 'Cmd+O'),
       sub('file_recent', 'Open Recent', [
         item('file_recent_empty', '(No Recent Files)', undefined, true),
       ]),

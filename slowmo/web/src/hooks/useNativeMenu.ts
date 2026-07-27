@@ -12,6 +12,14 @@ import { isTauri } from '@/lib/env';
 import { ALL_MENU_IDS, type TabGroup } from '@/lib/menu';
 import { selectTab } from '@/lib/tabRouting';
 import { openPanelWindow } from '@/lib/openPanelWindow';
+import {
+  backwardTaintToDot,
+  blocksToDot,
+  callGraphToDot,
+  dataflowToDot,
+  downloadTextFile,
+} from '@/lib/dotExport';
+import { api } from '@/api/service';
 import { useTraceStore } from '@/store/traceStore';
 import { useThemeStore } from '@/store/themeStore';
 import { useAppStore } from '@/store/appStore';
@@ -75,13 +83,6 @@ const TAB_TARGETS: Record<string, { group: TabGroup; tab: string }> = {
   an_winstats: { group: 'center-bottom', tab: 'winstats' },
   an_tracediff: { group: 'center-bottom', tab: 'tracediff' },
   an_memstrings: { group: 'center-bottom', tab: 'memstrings' },
-
-  // Export（切到对应面板，实际导出动作后续接入）
-  export_cfg: { group: 'center-top', tab: 'cfg' },
-  export_callgraph: { group: 'center-bottom', tab: 'callgraph' },
-  export_backtaint: { group: 'center-bottom', tab: 'backtaint' },
-  export_dataflow: { group: 'center-top', tab: 'dataflow' },
-
   // Tools
   tools_entropy: { group: 'center-bottom', tab: 'entropy' },
   tools_snapshot: { group: 'center-bottom', tab: 'snapshots' },
@@ -90,6 +91,47 @@ const TAB_TARGETS: Record<string, { group: TabGroup; tab: string }> = {
   tools_memhistory: { group: 'right', tab: 'memory' },
   tools_dataflow_cursor: { group: 'center-top', tab: 'dataflow' },
 };
+
+const EXPORT_IDS = ['export_cfg', 'export_callgraph', 'export_backtaint', 'export_dataflow'] as const;
+type ExportId = (typeof EXPORT_IDS)[number];
+
+function isExportId(id: string): id is ExportId {
+  return EXPORT_IDS.some((exportId) => exportId === id);
+}
+
+function exportFilename(prefix: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `${prefix}-export-${timestamp}.dot`;
+}
+
+/** 获取最新分析数据并导出 DOT；反向污点明确使用当前指令与默认 x0。 */
+async function exportDot(id: ExportId, currentInst: number): Promise<void> {
+  try {
+    switch (id) {
+      case 'export_cfg':
+        downloadTextFile(exportFilename('cfg'), blocksToDot(await api.cfg()));
+        return;
+      case 'export_callgraph':
+        downloadTextFile(exportFilename('callgraph'), callGraphToDot(await api.callGraph()));
+        return;
+      case 'export_dataflow':
+        downloadTextFile(exportFilename('dataflow'), dataflowToDot(await api.dataflowGraph()));
+        return;
+      case 'export_backtaint': {
+        const reg = 'x0';
+        const steps = await api.backwardTaint(currentInst, reg);
+        downloadTextFile(
+          exportFilename('backward-taint'),
+          backwardTaintToDot(steps, currentInst, reg),
+        );
+        return;
+      }
+    }
+  } catch (error) {
+    console.error(`Failed to export ${id} as DOT`, error);
+    window.alert('DOT export failed. Please check the backend connection and try again.');
+  }
+}
 
 /** 执行一个菜单叶子动作 */
 export function runMenuAction(id: string): void {
@@ -125,6 +167,12 @@ export function runMenuAction(id: string): void {
   if (id.startsWith('file_recent:')) {
     const path = id.slice('file_recent:'.length);
     app.requestOpenTrace(path);
+    return;
+  }
+
+  // Export menu — 获取数据后直接下载 DOT，不再跳转面板
+  if (isExportId(id)) {
+    void exportDot(id, trace.currentInst);
     return;
   }
 
