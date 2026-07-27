@@ -61,7 +61,7 @@
 .pass-progress {
   height: 4px;
   background: var(--bg-inset);
-  border-radius: var(--radius-full);
+  border-radius: 2px;
   margin-top: 4px;
   overflow: hidden;
 }

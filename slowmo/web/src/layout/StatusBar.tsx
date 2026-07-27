@@ -21,7 +21,7 @@ export function StatusBar() {
         anchors <b className="mono">{info?.anchor_count ?? 0}</b>
       </span>
       <span className="sb-item">
-        {source === 'live' ? '● 已连接 TenetService' : '● 使用 Mock 数据(后端未连接)'}
+        {source === 'live' ? '已连接 TenetService' : '使用 Mock 数据(后端未连接)'}
       </span>
     </div>
   );

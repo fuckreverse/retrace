@@ -151,8 +151,8 @@
 .titlebar-logo {
   width: 22px;
   height: 22px;
-  border-radius: var(--radius-md);
-  background: linear-gradient(135deg, var(--accent), #7c5cff);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -190,7 +190,7 @@
   align-items: center;
   gap: var(--space-2);
   padding: 2px var(--space-4);
-  border-radius: var(--radius-full);
+  border-radius: var(--radius-sm);
   font-size: var(--fs-xs);
   font-weight: 600;
 }

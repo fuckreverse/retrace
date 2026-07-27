@@ -79,8 +79,7 @@ export function AnalysisPanel() {
           <div className="mini-spinner" />
           <span>分析进行中… ({runningCount})</span>
         </> : <>
-          <Icon.Dot style={{ color: 'var(--success)', width: 14 }} />
-          <span>就绪 · {passes.filter((pass) => passState(tasks.get(pass.name), pass.state) === 'completed').length}/{passes.length} 已完成</span>
+          <span>已完成 {passes.filter((pass) => passState(tasks.get(pass.name), pass.state) === 'completed').length}/{passes.length}</span>
           <Button size="sm" variant="ghost" style={{ marginLeft: 'auto' }} onClick={clearAll}>Clear All</Button>
         </>}
       </div>
