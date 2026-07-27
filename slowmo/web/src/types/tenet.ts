@@ -110,7 +110,9 @@ export interface CfgBlock {
   y: number;
   width: number;
   height: number;
+  end_pc?: string;
   executions?: number;
+  terminator?: 'fallthrough' | 'branch' | 'conditional_branch' | 'call' | 'return' | 'indirect_branch';
   disasm?: string[];
 }
 export interface CfgEdge {
@@ -119,9 +121,12 @@ export interface CfgEdge {
   arrow?: string;
   kind?: 'fallthrough' | 'branch';
   taken_count?: number;
+  polyline?: { x: number; y: number }[];
 }
 export interface CfgResult {
   format: string;
+  scope?: 'function' | 'global';
+  function?: { entry_pc: string; name: string; total_calls?: number };
   blocks: CfgBlock[];
   edges: CfgEdge[];
   canvas_width?: number;

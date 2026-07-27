@@ -244,13 +244,16 @@ export const api = {
 
   /**
    * 导出控制流图（对齐后端 cfg_export，见 mcp_tools_core.cpp register_graph_tools）。
-   * blocks[].executions / disasm 与 edges[].kind / taken_count 均为可选：
-   * 大 CFG（>500 blocks）时后端会跳过 disasm 反汇编预览以控制 payload 体积。
+   * 传 entryPc 或 instId 时为函数作用域（disasm 全量、含 polyline 边路由）；
+   * 不传为全图模式（>500 blocks 时后端跳过 disasm 预览以控制 payload 体积）。
    */
-  async cfg(): Promise<CfgResult> {
+  async cfg(opts?: { entryPc?: string; instId?: number }): Promise<CfgResult> {
+    const params: Record<string, unknown> = { format: 'json' };
+    if (opts?.entryPc != null) params.entry_pc = opts.entryPc;
+    if (opts?.instId != null) params.inst_id = opts.instId;
     return analysis<CfgResult>(
       'cfg_export',
-      { format: 'json' },
+      params,
       (raw) => {
         const r = raw as Record<string, unknown>;
         const blocks = arr<Record<string, unknown>>(r, 'blocks').map((b) => ({
@@ -259,7 +262,11 @@ export const api = {
           y: Number(b.y ?? 0),
           width: Number(b.width ?? 0),
           height: Number(b.height ?? 0),
+          end_pc: b.end_pc != null ? String(b.end_pc) : undefined,
           executions: b.executions != null ? Number(b.executions) : undefined,
+          terminator: typeof b.terminator === 'string'
+            ? b.terminator as NonNullable<CfgResult['blocks'][number]['terminator']>
+            : undefined,
           disasm: Array.isArray(b.disasm) ? b.disasm as string[] : undefined,
         }));
         const edges = arr<Record<string, unknown>>(r, 'edges').map((e) => ({
@@ -268,9 +275,24 @@ export const api = {
           arrow: typeof e.arrow === 'string' ? e.arrow : undefined,
           kind: e.kind === 'fallthrough' ? 'fallthrough' as const : e.kind === 'branch' ? 'branch' as const : undefined,
           taken_count: e.taken_count != null ? Number(e.taken_count) : undefined,
+          polyline: Array.isArray(e.polyline)
+            ? e.polyline.map((p) => {
+                const point = p as Record<string, unknown>;
+                return { x: Number(point.x), y: Number(point.y) };
+              })
+            : undefined,
         }));
+        const fn = r.function && typeof r.function === 'object'
+          ? r.function as Record<string, unknown>
+          : undefined;
         return {
           format: String(r.format ?? 'json'),
+          scope: typeof r.scope === 'string' ? r.scope as NonNullable<CfgResult['scope']> : undefined,
+          function: fn ? {
+            entry_pc: String(fn.entry_pc ?? ''),
+            name: String(fn.name ?? ''),
+            total_calls: fn.total_calls != null ? Number(fn.total_calls) : undefined,
+          } : undefined,
           blocks,
           edges,
           canvas_width: r.canvas_width != null ? Number(r.canvas_width) : undefined,

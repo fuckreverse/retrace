@@ -5,6 +5,7 @@
   min-height: 0;
   width: 100%;
 }
+
 .cfg-toolbar {
   display: flex;
   align-items: center;
@@ -12,8 +13,58 @@
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
+  overflow-x: auto;
 }
+
+.cfg-function-select {
+  min-width: 180px;
+  max-width: 260px;
+  height: 28px;
+  padding: 0 var(--space-2);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.cfg-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.cfg-toggle input { accent-color: var(--accent); }
+
+.cfg-function-name {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cfg-zoom {
+  width: 46px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.cfg-stats {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .cfg-canvas {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
@@ -22,15 +73,84 @@
   background-size: 22px 22px;
   cursor: grab;
 }
+
 .cfg-canvas:active { cursor: grabbing; }
 .cfg-block { cursor: pointer; }
 .cfg-block-rect { fill: var(--bg-elevated); }
 .cfg-block:hover .cfg-block-rect { fill: var(--bg-hover); }
-.cfg-block-head { font-size: 11px; font-weight: 700; }
-.cfg-block-exec { font-size: 10px; fill: var(--text-tertiary); }
+.cfg-block-head { font-size: 10px; font-weight: 700; }
+.cfg-block-exec { font-size: 9px; fill: var(--text-tertiary); }
 .cfg-block-line { font-size: 10px; fill: var(--text-secondary); }
+.cfg-edge polyline,
+.cfg-edge path { vector-effect: non-scaling-stroke; }
+.cfg-edge-count {
+  fill: var(--text-secondary);
+  stroke: var(--bg-base);
+  stroke-width: 3px;
+  paint-order: stroke fill;
+  text-anchor: middle;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+}
 
-/* ---------- legend ---------- */
+.cfg-terminator-strip { fill: var(--cfg-fallthrough); }
+.cfg-terminator-call .cfg-terminator-strip { fill: var(--cfg-call); }
+.cfg-terminator-return .cfg-terminator-strip { fill: var(--cfg-return); }
+.cfg-terminator-indirect_branch .cfg-terminator-strip { fill: var(--cfg-indirect); }
+.cfg-terminator-conditional_branch .cfg-terminator-strip { fill: var(--cfg-conditional); }
+.cfg-terminator-branch .cfg-terminator-strip { fill: var(--cfg-branch); }
+.cfg-terminator-fallthrough .cfg-terminator-strip { fill: var(--cfg-fallthrough); }
+
+.cfg-canvas {
+  --cfg-call: var(--accent);
+  --cfg-return: var(--success);
+  --cfg-indirect: var(--warning);
+  --cfg-conditional: var(--hl-branch);
+  --cfg-branch: var(--danger);
+  --cfg-fallthrough: var(--hl-read);
+}
+
+.cfg-terminator-legend {
+  position: absolute;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  max-width: 360px;
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-elevated) 90%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.cfg-terminator-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.cfg-terminator-legend i {
+  display: inline-block;
+  width: 4px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.cfg-legend-call { background: var(--cfg-call); }
+.cfg-legend-return { background: var(--cfg-return); }
+.cfg-legend-indirect_branch { background: var(--cfg-indirect); }
+.cfg-legend-conditional_branch { background: var(--cfg-conditional); }
+.cfg-legend-branch { background: var(--cfg-branch); }
+.cfg-legend-fallthrough { background: var(--cfg-fallthrough); }
+
+/* ---------- shared graph styles ---------- */
 .cfg-legend {
   display: flex;
   align-items: center;

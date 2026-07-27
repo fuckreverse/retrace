@@ -17,6 +17,7 @@
 #include "analysis/passes/structure/xref_pass.h"
 #include "analysis/passes/structure/cfg_pass.h"
 #include "analysis/passes/structure/cfg_layout_pass.h"
+#include "analysis/passes/GraphGridLayout.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
 #include "analysis/passes/structure/function_pass.h"
@@ -684,102 +685,260 @@ void TenetMcpService::register_graph_tools() {
     // -- cfg_export
     register_tool(
         {"cfg_export",
-         "Export the Control Flow Graph. Returns DOT or JSON format.",
+         "Export the Control Flow Graph. Returns DOT or JSON format. Optionally "
+         "scope the graph to the function containing entry_pc or inst_id.",
          {{"type", "object"},
           {"properties", {
-              {"format", {{"type", "string"}, {"description", "\"dot\" or \"json\""}, {"default", "json"}}}
+              {"format", {{"type", "string"}, {"description", "\"dot\" or \"json\""}, {"default", "json"}}},
+              {"entry_pc", {{"type", json::array({"string", "integer"})}, {"description", "Function entry PC in the rebased display address space"}}},
+              {"inst_id", {{"type", "integer"}, {"description", "Instruction ID whose containing function should be exported"}}}
           }}}},
         [this](const json& args) -> json {
             if (!pm_) throw std::runtime_error("PassManager not available");
+            if (args.contains("entry_pc") && args.contains("inst_id")) {
+                throw std::runtime_error("Provide only one of 'entry_pc' or 'inst_id'.");
+            }
+
             std::string format = args.value("format", "json");
+            bool function_scope = args.contains("entry_pc") || args.contains("inst_id");
 
             tenet::register_pass_by_name(*pm_, "xref");
             tenet::register_pass_by_name(*pm_, "cfg");
-            tenet::register_pass_by_name(*pm_, "cfg_layout");
-
-            const auto& raw = require_pass_nb(pm_, "cfg_layout");
-            if (!raw.ok()) throw std::runtime_error("CFG pass failed: " + raw.error_message);
-            const auto& layout = raw.get<CFGLayoutResult>();
-
-            if (format == "dot") {
-                return {{"format", "dot"}, {"dot", layout.dot_annotated}};
+            if (function_scope) {
+                tenet::register_pass_by_name(*pm_, "function");
+            } else {
+                tenet::register_pass_by_name(*pm_, "cfg_layout");
             }
 
-            // Pull execution counts / instruction PCs / edge kind from the
-            // underlying CFGResult (cfg_layout only carries geometry).
             const auto& cfg_raw = require_pass_nb(pm_, "cfg");
-            const CFGResult* cfg = (cfg_raw.ok()) ? &cfg_raw.get<CFGResult>() : nullptr;
+            if (!cfg_raw.ok()) throw std::runtime_error("CFG pass failed: " + cfg_raw.error_message);
+            const auto& full_cfg = cfg_raw.get<CFGResult>();
 
-            // Cap per-block disassembly preview: large CFGs would otherwise
-            // produce a huge JSON payload just for text nobody scrolls to.
-            constexpr size_t kMaxDisasmLines = 24;
-            constexpr size_t kMaxBlocksForDisasm = 500;
-            bool emit_disasm = cfg && cfg->blocks.size() <= kMaxBlocksForDisasm;
+            CFGResult function_cfg;
+            CFGLayoutResult function_layout;
+            const CFGResult* cfg = &full_cfg;
+            const CFGLayoutResult* layout = nullptr;
+            const FunctionInfo* function_info = nullptr;
+            uint64_t function_entry = 0;
+
+            if (function_scope) {
+                const auto& function_raw = require_pass_nb(pm_, "function");
+                if (!function_raw.ok()) {
+                    throw std::runtime_error("Function pass failed: " + function_raw.error_message);
+                }
+                const auto& functions = function_raw.get<FunctionResult>();
+
+                if (args.contains("inst_id")) {
+                    uint64_t inst_id = args.at("inst_id").get<uint64_t>();
+                    if (inst_id >= index_.inst_count()) {
+                        throw std::runtime_error("inst_id is out of trace range");
+                    }
+                    function_info = functions.function_at(inst_id);
+                    if (function_info) {
+                        function_entry = function_info->entry_pc;
+                    } else {
+                        auto [offset, seed_pc] = index_.offset_of_with_pc(inst_id, reader_);
+                        auto rv = reader_.record_at(offset, seed_pc);
+                        if (rv.kind != RecordKind::Inst) {
+                            throw std::runtime_error("inst_id does not refer to an instruction record");
+                        }
+                        auto inst = rv.as_inst();
+                        uint64_t pc = inst.pc != 0 ? inst.pc : rv.resolved_pc;
+                        const auto* block = full_cfg.block_containing(pc);
+                        if (!block) {
+                            throw std::runtime_error("No CFG block contains the instruction PC");
+                        }
+                        function_entry = block->start_pc;
+                    }
+                } else {
+                    const auto& entry_arg = args.at("entry_pc");
+                    uint64_t displayed_pc = entry_arg.is_string()
+                        ? parse_hex(entry_arg.get<std::string>())
+                        : entry_arg.get<uint64_t>();
+                    uint64_t runtime_pc = unrebase(displayed_pc);
+                    const auto* block = full_cfg.block_containing(runtime_pc);
+                    if (!block) {
+                        throw std::runtime_error(fmt::format(
+                            "No CFG block contains entry_pc 0x{:X}", displayed_pc));
+                    }
+                    function_entry = block->start_pc;
+                }
+
+                // Function metadata may use an address inside the normalized entry block.
+                if (!function_info) {
+                    auto exact = functions.functions.find(function_entry);
+                    if (exact != functions.functions.end()) {
+                        function_info = &exact->second;
+                    } else {
+                        for (const auto& [pc, info] : functions.functions) {
+                            const auto* block = full_cfg.block_containing(pc);
+                            if (block && block->start_pc == function_entry) {
+                                function_info = &info;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                const auto* entry_block = full_cfg.block_containing(function_entry);
+                if (!entry_block) {
+                    throw std::runtime_error("Function entry is not contained in the CFG");
+                }
+                function_entry = entry_block->start_pc;
+                function_cfg = full_cfg.extract_function(function_entry);
+                if (function_cfg.blocks.empty()) {
+                    throw std::runtime_error("Function CFG is empty");
+                }
+                cfg = &function_cfg;
+
+                Graph graph;
+                graph.reserve(function_cfg.blocks.size());
+                for (const auto& [pc, block] : function_cfg.blocks) {
+                    GraphBlock gb;
+                    gb.entry = pc;
+                    gb.width = 200;
+                    gb.height = std::max(14 * static_cast<int>(block.instructions.size() + 1), 24);
+                    graph.emplace(pc, std::move(gb));
+                }
+                for (const auto& edge : function_cfg.edges) {
+                    auto it = graph.find(edge.from_block);
+                    if (it != graph.end() && graph.find(edge.to_block) != graph.end()) {
+                        it->second.edges.emplace_back(edge.to_block);
+                    }
+                }
+
+                GraphGridLayout layout_algo(GraphGridLayout::LayoutType::Medium);
+                layout_algo.calculateLayout(graph, function_cfg.blocks.begin()->first,
+                                            function_layout.canvas_width,
+                                            function_layout.canvas_height);
+                for (const auto& [pc, gb] : graph) {
+                    function_layout.block_layouts[pc] = {gb.x, gb.y, gb.width, gb.height};
+                    for (const auto& ge : gb.edges) {
+                        function_layout.edge_layouts.push_back(
+                            {pc, ge.target, ge.polyline, ge.arrow});
+                    }
+                }
+                layout = &function_layout;
+            } else {
+                const auto& layout_raw = require_pass_nb(pm_, "cfg_layout");
+                if (!layout_raw.ok()) {
+                    throw std::runtime_error("CFG layout pass failed: " + layout_raw.error_message);
+                }
+                layout = &layout_raw.get<CFGLayoutResult>();
+            }
+
+            if (format == "dot") {
+                std::string dot;
+                if (function_scope && code_table_ && decoder_) {
+                    dot = generate_dot_annotated(*cfg, *decoder_, *code_table_);
+                } else if (function_scope) {
+                    dot = generate_dot(*cfg);
+                } else {
+                    dot = layout->dot_annotated;
+                }
+                return {{"format", "dot"}, {"dot", std::move(dot)}};
+            }
+
+            constexpr size_t kGlobalMaxDisasmLines = 24;
+            constexpr size_t kFunctionMaxDisasmLines = 256;
+            constexpr size_t kMaxBlocksForGlobalDisasm = 500;
+            bool emit_disasm = function_scope || cfg->blocks.size() <= kMaxBlocksForGlobalDisasm;
+            size_t max_disasm_lines = function_scope
+                ? kFunctionMaxDisasmLines : kGlobalMaxDisasmLines;
 
             static const char* kArrowNames[] = {"down", "left", "up", "right", "none"};
             auto arrow_name = [](GraphEdge::ArrowDirection a) -> const char* {
                 auto idx = static_cast<size_t>(a);
                 return idx < 5 ? kArrowNames[idx] : "down";
             };
+            auto terminator_name = [](TerminatorKind kind) -> const char* {
+                switch (kind) {
+                    case TerminatorKind::Fallthrough:       return "fallthrough";
+                    case TerminatorKind::Branch:            return "branch";
+                    case TerminatorKind::ConditionalBranch: return "conditional_branch";
+                    case TerminatorKind::Call:              return "call";
+                    case TerminatorKind::Return:            return "return";
+                    case TerminatorKind::IndirectBranch:    return "indirect_branch";
+                }
+                return "fallthrough";
+            };
 
             json blocks = json::array();
-            for (const auto& [pc, bl] : layout.block_layouts) {
+            for (const auto& [pc, bl] : layout->block_layouts) {
                 json block = {{"pc", fmt::format("0x{:X}", rebase(pc))},
                               {"x", bl.x}, {"y", bl.y},
                               {"width", bl.width}, {"height", bl.height}};
 
-                if (cfg) {
-                    auto it = cfg->blocks.find(pc);
-                    if (it != cfg->blocks.end()) {
-                        const auto& blk = it->second;
-                        block["executions"] = blk.execution_count;
-                        if (emit_disasm && code_table_ && decoder_) {
-                            json disasm = json::array();
-                            size_t n = 0;
-                            for (uint64_t insn_pc : blk.instructions) {
-                                if (n++ >= kMaxDisasmLines) break;
-                                auto opcode = code_table_->opcode_at(insn_pc);
-                                std::string line;
-                                if (opcode) {
-                                    auto d = decoder_->decode(insn_pc, *opcode);
-                                    if (d) {
-                                        line = fmt::format("0x{:x}  {} {}", rebase(insn_pc), d->mnemonic, d->op_str);
-                                    } else {
-                                        line = fmt::format("0x{:x}  .word 0x{:08x}", rebase(insn_pc), *opcode);
-                                    }
+                auto it = cfg->blocks.find(pc);
+                if (it != cfg->blocks.end()) {
+                    const auto& blk = it->second;
+                    block["end_pc"] = fmt::format("0x{:X}", rebase(blk.end_pc));
+                    block["executions"] = blk.execution_count;
+                    block["terminator"] = terminator_name(blk.terminator);
+                    if (emit_disasm && code_table_ && decoder_) {
+                        json disasm = json::array();
+                        size_t n = 0;
+                        for (uint64_t insn_pc : blk.instructions) {
+                            if (n++ >= max_disasm_lines) break;
+                            auto opcode = code_table_->opcode_at(insn_pc);
+                            std::string line;
+                            if (opcode) {
+                                auto d = decoder_->decode(insn_pc, *opcode);
+                                if (d) {
+                                    line = fmt::format("0x{:x}  {} {}", rebase(insn_pc), d->mnemonic, d->op_str);
                                 } else {
-                                    line = fmt::format("0x{:x}  <no code>", rebase(insn_pc));
+                                    line = fmt::format("0x{:x}  .word 0x{:08x}", rebase(insn_pc), *opcode);
                                 }
-                                disasm.push_back(std::move(line));
+                            } else {
+                                line = fmt::format("0x{:x}  <no code>", rebase(insn_pc));
                             }
-                            block["disasm"] = std::move(disasm);
+                            disasm.push_back(std::move(line));
                         }
+                        block["disasm"] = std::move(disasm);
                     }
                 }
                 blocks.push_back(std::move(block));
             }
 
             json edges = json::array();
-            for (const auto& el : layout.edge_layouts) {
+            for (const auto& el : layout->edge_layouts) {
+                json polyline = json::array();
+                for (const auto& point : el.polyline) {
+                    polyline.push_back({{"x", point.x}, {"y", point.y}});
+                }
                 json edge = {
                     {"from", fmt::format("0x{:X}", rebase(el.from_block))},
-                    {"to",   fmt::format("0x{:X}", rebase(el.to_block))},
-                    {"arrow", arrow_name(el.arrow)}
+                    {"to", fmt::format("0x{:X}", rebase(el.to_block))},
+                    {"arrow", arrow_name(el.arrow)},
+                    {"polyline", std::move(polyline)}
                 };
-                if (cfg) {
-                    // O(1) lookup via cfg's adjacency index instead of an O(E) linear
-                    // scan per layout edge (which would make this loop O(E^2)).
-                    for (const auto* e : cfg->successors(el.from_block)) {
-                        if (e->to_block == el.to_block) {
-                            edge["taken_count"] = e->taken_count;
-                            edge["kind"] = e->is_fallthrough ? "fallthrough" : "branch";
-                            break;
-                        }
+                for (const auto* cfg_edge : cfg->successors(el.from_block)) {
+                    if (cfg_edge->to_block == el.to_block) {
+                        edge["taken_count"] = cfg_edge->taken_count;
+                        edge["kind"] = cfg_edge->is_fallthrough ? "fallthrough" : "branch";
+                        break;
                     }
                 }
                 edges.push_back(std::move(edge));
             }
-            return {{"format", "json"}, {"blocks", std::move(blocks)}, {"edges", std::move(edges)}};
+
+            json result = {{"format", "json"},
+                           {"blocks", std::move(blocks)},
+                           {"edges", std::move(edges)}};
+            if (function_scope) {
+                json function = {
+                    {"entry_pc", fmt::format("0x{:X}", rebase(function_entry))},
+                    {"name", function_info && !function_info->name.empty()
+                        ? function_info->name
+                        : fmt::format("sub_{:X}", rebase(function_entry))}
+                };
+                if (function_info) function["total_calls"] = function_info->total_calls;
+                result["scope"] = "function";
+                result["function"] = std::move(function);
+                result["canvas_width"] = layout->canvas_width;
+                result["canvas_height"] = layout->canvas_height;
+            }
+            return result;
         }
     );
 

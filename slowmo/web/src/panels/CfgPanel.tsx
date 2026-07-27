@@ -1,10 +1,10 @@
 /**
- * CFG 面板 —— 可交互控制流图(SVG)，块热力着色 + 平移缩放。
+ * CFG 面板 —— 函数作用域的可交互控制流图，支持平移、缩放与动态执行信息。
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
-import type { CfgBlock, CfgResult } from '@/types/tenet';
+import type { CfgBlock, CfgEdge, CfgResult, FunctionEntry } from '@/types/tenet';
 import { Button, IconButton, Input } from '@/components/ui';
 import { Icon } from '@/components/icons';
 import './cfg.css';
@@ -12,6 +12,21 @@ import './cfg.css';
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 4;
 const VIEW_PADDING = 40;
+const CULL_MARGIN = 100;
+const DISASM_LINE_HEIGHT = 14;
+const HEADER_HEIGHT = 14;
+
+type Point = { x: number; y: number };
+type Terminator = NonNullable<CfgBlock['terminator']>;
+
+const TERMINATORS: { type: Terminator; label: string }[] = [
+  { type: 'call', label: 'Call' },
+  { type: 'return', label: 'Return' },
+  { type: 'indirect_branch', label: 'Indirect' },
+  { type: 'conditional_branch', label: 'Conditional' },
+  { type: 'branch', label: 'Branch' },
+  { type: 'fallthrough', label: 'Fallthrough' },
+];
 
 function heatColor(exec: number, max: number): string {
   const t = max > 0 ? Math.log(exec + 1) / Math.log(max + 1) : 0;
@@ -32,12 +47,17 @@ function address(value: string): bigint | null {
 function blockForPc(blocks: CfgBlock[], pc: string): CfgBlock | null {
   const target = address(pc);
   if (target == null) return null;
-
-  // disasm 含地址时优先做精确匹配，避免把块间空洞误认为前一个块。
   const exact = blocks.find((block) => block.disasm?.some((line) => address(line) === target));
   if (exact) return exact;
 
-  // 大 CFG 可能省略 disasm；此时以排序后的相邻 block 起始地址作为范围边界。
+  const containing = blocks.find((block) => {
+    const start = address(block.pc);
+    const end = block.end_pc ? address(block.end_pc) : null;
+    // end_pc 为闭区间（块内最后一条指令的 PC），见后端 BasicBlock::end_pc。
+    return start != null && end != null && target >= start && target <= end;
+  });
+  if (containing) return containing;
+
   const sorted = blocks
     .map((block) => ({ block, start: address(block.pc) }))
     .filter((item): item is { block: CfgBlock; start: bigint } => item.start != null)
@@ -49,26 +69,101 @@ function blockForPc(blocks: CfgBlock[], pc: string): CfgBlock | null {
   return null;
 }
 
+function polylineMidpoint(points: Point[]): Point | null {
+  if (points.length === 0) return null;
+  if (points.length === 1) return points[0];
+  const lengths = points.slice(1).map((point, i) => Math.hypot(point.x - points[i].x, point.y - points[i].y));
+  const half = lengths.reduce((sum, length) => sum + length, 0) / 2;
+  let walked = 0;
+  for (let i = 0; i < lengths.length; i += 1) {
+    if (walked + lengths[i] >= half) {
+      const ratio = lengths[i] === 0 ? 0 : (half - walked) / lengths[i];
+      return {
+        x: points[i].x + (points[i + 1].x - points[i].x) * ratio,
+        y: points[i].y + (points[i + 1].y - points[i].y) * ratio,
+      };
+    }
+    walked += lengths[i];
+  }
+  return points[points.length - 1];
+}
+
+function truncateLine(line: string, blockWidth: number): string {
+  const maxChars = Math.max(8, Math.floor((blockWidth - 20) / 6));
+  return line.length > maxChars ? `${line.slice(0, maxChars - 1)}…` : line;
+}
+
 export function CfgPanel() {
   const [cfg, setCfg] = useState<CfgResult | null>(null);
+  const [functions, setFunctions] = useState<FunctionEntry[]>([]);
+  const [selectedFunctionPc, setSelectedFunctionPc] = useState('');
+  const [followCurrent, setFollowCurrent] = useState(true);
+  const [heatMode, setHeatMode] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [currentBlockPc, setCurrentBlockPc] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [searchIndex, setSearchIndex] = useState(-1);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 20, y: 10 });
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
+  const cfgRequestRef = useRef(0);
   const cur = useTraceStore((s) => s.currentInst);
   const navigateTo = useTraceStore((s) => s.navigateTo);
 
-  useEffect(() => { void api.cfg().then(setCfg); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    void api.functions().then((entries) => { if (!cancelled) setFunctions(entries); });
+    return () => { cancelled = true; };
+  }, []);
 
-  const blockMap = useMemo(() => new Map(cfg?.blocks.map((b) => [b.pc, b])), [cfg]);
+  // 统一的光标跟随逻辑：先解析当前 PC，仅当它落在已展示 CFG 之外时才
+  // 重新拉取所在函数的 CFG（避免同函数内移动光标时全量重取/重排布局），
+  // 然后更新当前块高亮并在必要时居中。手动选函数（follow 关闭）时只更新高亮。
+  useEffect(() => {
+    const requestId = ++cfgRequestRef.current;
+    let cancelled = false;
+    void api.disasm(cur, 1).then(async (result) => {
+      if (cancelled || requestId !== cfgRequestRef.current) return;
+      const pc = result.rows[0]?.pc;
+      let activeCfg = cfg;
+      if (followCurrent && pc && (!cfg || !blockForPc(cfg.blocks, pc))) {
+        const fetched = await api.cfg({ instId: cur });
+        if (cancelled || requestId !== cfgRequestRef.current) return;
+        activeCfg = fetched;
+        setCfg(fetched);
+        setSelectedFunctionPc(fetched.function?.entry_pc ?? '');
+      }
+      const block = pc && activeCfg ? blockForPc(activeCfg.blocks, pc) : null;
+      setCurrentBlockPc(block?.pc ?? null);
+      if (block && !isBlockFullyVisible(block)) centerBlock(block);
+    });
+    return () => { cancelled = true; };
+    // centerBlock/isBlockFullyVisible 是不稳定函数引用，刻意不入依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cur, followCurrent, cfg]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const updateSize = () => setCanvasSize({ width: canvas.clientWidth, height: canvas.clientHeight });
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  const blockMap = useMemo(() => new Map(cfg?.blocks.map((block) => [block.pc, block])), [cfg]);
   const matches = useMemo(() => {
     const query = search.trim().toLowerCase();
-    return query && cfg ? cfg.blocks.filter((b) => b.pc.toLowerCase().includes(query)) : [];
+    if (!query || !cfg) return [];
+    return cfg.blocks.filter((block) => block.pc.toLowerCase().includes(query)
+      || block.disasm?.some((line) => line.toLowerCase().includes(query)));
   }, [cfg, search]);
-  const matchingPcs = useMemo(() => new Set(matches.map((b) => b.pc)), [matches]);
+  const matchingPcs = useMemo(() => new Set(matches.map((block) => block.pc)), [matches]);
+
+  useEffect(() => { setSearchIndex(-1); }, [search, cfg]);
 
   const centerBlock = (block: CfgBlock, targetZoom = zoom) => {
     const canvas = canvasRef.current;
@@ -80,7 +175,21 @@ export function CfgPanel() {
     });
   };
 
-  const isBlockVisible = (block: CfgBlock) => {
+  const visibleRect = useMemo(() => ({
+    left: (-pan.x - CULL_MARGIN) / zoom,
+    top: (-pan.y - CULL_MARGIN) / zoom,
+    right: (canvasSize.width - pan.x + CULL_MARGIN) / zoom,
+    bottom: (canvasSize.height - pan.y + CULL_MARGIN) / zoom,
+  }), [canvasSize, pan, zoom]);
+
+  const visiblePcs = useMemo(() => new Set((cfg?.blocks ?? []).filter((block) => (
+    block.x + block.width >= visibleRect.left
+    && block.x <= visibleRect.right
+    && block.y + block.height >= visibleRect.top
+    && block.y <= visibleRect.bottom
+  )).map((block) => block.pc)), [cfg, visibleRect]);
+
+  const isBlockFullyVisible = (block: CfgBlock) => {
     const canvas = canvasRef.current;
     if (!canvas) return true;
     const left = pan.x + block.x * zoom;
@@ -90,26 +199,14 @@ export function CfgPanel() {
     return left >= 0 && top >= 0 && right <= canvas.clientWidth && bottom <= canvas.clientHeight;
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    void api.disasm(cur, 1).then((result) => {
-      if (cancelled) return;
-      const block = cfg && result.rows[0] ? blockForPc(cfg.blocks, result.rows[0].pc) : null;
-      setCurrentBlockPc(block?.pc ?? null);
-      if (block && !isBlockVisible(block)) centerBlock(block);
-    });
-    return () => { cancelled = true; };
-    // pan/zoom intentionally omitted: only a cursor or CFG change should trigger following.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cur, cfg]);
 
   const fitToScreen = () => {
     const canvas = canvasRef.current;
     if (!canvas || !cfg || cfg.blocks.length === 0) return;
-    const minX = Math.min(...cfg.blocks.map((b) => b.x));
-    const minY = Math.min(...cfg.blocks.map((b) => b.y));
-    const maxX = Math.max(...cfg.blocks.map((b) => b.x + b.width));
-    const maxY = Math.max(...cfg.blocks.map((b) => b.y + b.height));
+    const minX = Math.min(...cfg.blocks.map((block) => block.x));
+    const minY = Math.min(...cfg.blocks.map((block) => block.y));
+    const maxX = Math.max(...cfg.blocks.map((block) => block.x + block.width));
+    const maxY = Math.max(...cfg.blocks.map((block) => block.y + block.height));
     const width = Math.max(1, maxX - minX);
     const height = Math.max(1, maxY - minY);
     const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM,
@@ -121,63 +218,116 @@ export function CfgPanel() {
     });
   };
 
-  const locateSearch = () => { if (matches[0]) centerBlock(matches[0], Math.min(MAX_ZOOM, Math.max(1.2, zoom))); };
-  useEffect(() => {
-    const query = search.trim().toLowerCase();
-    const exact = matches.find((block) => block.pc.toLowerCase() === query);
-    if (exact) centerBlock(exact, Math.min(MAX_ZOOM, Math.max(1.2, zoom)));
-    // Only a newly entered exact query should trigger automatic location.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, matches]);
-  const maxExec = cfg ? Math.max(1, ...cfg.blocks.map((b) => b.executions ?? 1)) : 1;
-  const onWheel = (e: React.WheelEvent) => { e.preventDefault(); setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z - e.deltaY * 0.001))); };
-  const onDown = (e: React.MouseEvent) => { dragRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; };
-  const onMove = (e: React.MouseEvent) => { if (dragRef.current) setPan({ x: e.clientX - dragRef.current.x, y: e.clientY - dragRef.current.y }); };
+  const locateSearch = () => {
+    if (matches.length === 0) return;
+    const nextIndex = (searchIndex + 1) % matches.length;
+    setSearchIndex(nextIndex);
+    centerBlock(matches[nextIndex], Math.min(MAX_ZOOM, Math.max(1.2, zoom)));
+  };
+
+  const selectFunction = (entryPc: string) => {
+    setSelectedFunctionPc(entryPc);
+    setFollowCurrent(false);
+    const requestId = ++cfgRequestRef.current;
+    if (!entryPc) return;
+    void api.cfg({ entryPc }).then((result) => {
+      if (requestId === cfgRequestRef.current) setCfg(result);
+    });
+  };
+
+  const locateCurrentPc = () => {
+    const block = currentBlockPc ? blockMap.get(currentBlockPc) : null;
+    if (block) centerBlock(block, Math.max(1, zoom));
+  };
+
+  const maxExec = cfg ? Math.max(1, ...cfg.blocks.map((block) => block.executions ?? 1)) : 1;
+  const onWheel = (event: React.WheelEvent) => { event.preventDefault(); setZoom((value) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value - event.deltaY * 0.001))); };
+  const onDown = (event: React.MouseEvent) => { dragRef.current = { x: event.clientX - pan.x, y: event.clientY - pan.y }; };
+  const onMove = (event: React.MouseEvent) => { if (dragRef.current) setPan({ x: event.clientX - dragRef.current.x, y: event.clientY - dragRef.current.y }); };
   const onUp = () => { dragRef.current = null; };
   const gotoBlock = async (pc: string) => { const xref = await api.xref(pc); if (xref.inst_ids.length > 0) navigateTo(xref.inst_ids[0]); };
+
+  const renderEdge = (edge: CfgEdge, index: number) => {
+    const from = blockMap.get(edge.from);
+    const to = blockMap.get(edge.to);
+    if (!from || !to || (!visiblePcs.has(edge.from) && !visiblePcs.has(edge.to))) return null;
+    const stroke = edge.kind === 'fallthrough' ? 'var(--hl-read)' : 'var(--hl-branch)';
+    const strokeWidth = 1 + Math.min(3, (edge.taken_count ?? 1) / 100);
+    const showLabel = zoom >= 0.8 && edge.taken_count != null;
+    let shape: React.ReactNode;
+    let labelPoint: Point | null;
+
+    if (edge.polyline && edge.polyline.length >= 2) {
+      shape = <polyline points={edge.polyline.map((point) => `${point.x},${point.y}`).join(' ')} />;
+      labelPoint = polylineMidpoint(edge.polyline);
+    } else {
+      const x1 = from.x + from.width / 2;
+      const y1 = from.y + from.height;
+      const x2 = to.x + to.width / 2;
+      const y2 = to.y;
+      const midY = (y1 + y2) / 2;
+      const c1 = to.y <= from.y ? { x: x1 + 120, y: y1 + 40 } : { x: x1, y: midY };
+      const c2 = to.y <= from.y ? { x: x2 + 120, y: y2 - 40 } : { x: x2, y: midY };
+      shape = <path d={`M${x1},${y1} C${c1.x},${c1.y} ${c2.x},${c2.y} ${x2},${y2}`} />;
+      labelPoint = { x: (c1.x + c2.x) / 2, y: (c1.y + c2.y) / 2 };
+    }
+
+    return (
+      <g key={`${edge.from}-${edge.to}-${index}`} className="cfg-edge" fill="none" stroke={stroke} strokeWidth={strokeWidth} opacity={0.75} markerEnd="url(#cfg-arrow)">
+        {shape}
+        {showLabel && labelPoint && <text x={labelPoint.x} y={labelPoint.y - 4} className="cfg-edge-count" markerEnd="none">{edge.taken_count}</text>}
+      </g>
+    );
+  };
 
   return (
     <div className="cfg-panel">
       <div className="cfg-toolbar">
-        <Button size="sm" variant="ghost">Run CFG Layout</Button>
-        <Input aria-label="搜索块地址" placeholder="Search address…" value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') locateSearch(); }} style={{ width: 150 }} />
+        <select className="cfg-function-select" aria-label="选择函数" value={selectedFunctionPc} onChange={(event) => selectFunction(event.target.value)}>
+          <option value="">选择函数…</option>
+          {functions.map((fn) => <option key={fn.pc} value={fn.pc}>{fn.name} ({fn.pc})</option>)}
+        </select>
+        <label className="cfg-toggle"><input type="checkbox" checked={followCurrent} onChange={(event) => setFollowCurrent(event.target.checked)} /> 跟随当前函数</label>
+        <label className="cfg-toggle"><input type="checkbox" checked={heatMode} onChange={(event) => setHeatMode(event.target.checked)} /> 热力模式</label>
+        <span className="cfg-function-name" title={cfg?.function?.name}>{cfg?.function?.name ?? ''}</span>
+        <Input aria-label="搜索块地址或反汇编" placeholder="Search address / disasm…" value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') locateSearch(); }} style={{ width: 190 }} />
         <div className="toolbar-sep" />
-        <IconButton title="放大" onClick={() => setZoom((z) => Math.min(MAX_ZOOM, z + 0.2))}><Icon.Forward /></IconButton>
-        <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>
-        <IconButton title="缩小" onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z - 0.2))}><Icon.Back /></IconButton>
+        <IconButton title="放大" onClick={() => setZoom((value) => Math.min(MAX_ZOOM, value + 0.2))}><Icon.Forward /></IconButton>
+        <span className="dim cfg-zoom">{(zoom * 100).toFixed(0)}%</span>
+        <IconButton title="缩小" onClick={() => setZoom((value) => Math.max(MIN_ZOOM, value - 0.2))}><Icon.Back /></IconButton>
         <IconButton title="Fit to Screen" onClick={fitToScreen}><Icon.Box /></IconButton>
+        <Button size="sm" variant="ghost" onClick={locateCurrentPc} disabled={!currentBlockPc}>定位当前 PC</Button>
         <Button size="sm" variant="ghost" onClick={() => { setZoom(1); setPan({ x: 20, y: 10 }); }}>Reset View</Button>
-        <span className="dim" style={{ marginLeft: 'auto' }}>{cfg ? `${cfg.blocks.length} blocks · ${cfg.edges.length} edges` : ''}</span>
+        <span className="dim cfg-stats">{cfg ? `${cfg.blocks.length} blocks · ${cfg.edges.length} edges` : ''}</span>
       </div>
       <div ref={canvasRef} className="cfg-canvas" onWheel={onWheel} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}>
         <svg width="100%" height="100%">
+          <defs><marker id="cfg-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--text-tertiary)" /></marker></defs>
           <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
-            {cfg?.edges.map((e, i) => {
-              const a = blockMap.get(e.from), b = blockMap.get(e.to);
-              if (!a || !b) return null;
-              const x1 = a.x + a.width / 2, y1 = a.y + a.height, x2 = b.x + b.width / 2, y2 = b.y;
-              const midY = (y1 + y2) / 2;
-              const path = b.y <= a.y ? `M${x1},${y1} C${x1 + 120},${y1 + 40} ${x2 + 120},${y2 - 40} ${x2},${y2}` : `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
-              return <path key={i} d={path} fill="none" stroke={e.kind === 'fallthrough' ? 'var(--hl-read)' : 'var(--hl-branch)'} strokeWidth={1 + Math.min(3, (e.taken_count ?? 1) / 100)} opacity={0.7} markerEnd="url(#arrow)" />;
-            })}
-            <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--text-tertiary)" /></marker></defs>
-            {cfg?.blocks.map((b) => {
-              const color = heatColor(b.executions ?? 1, maxExec);
-              const isSel = selected === b.pc, isCurrent = currentBlockPc === b.pc, isMatch = matchingPcs.has(b.pc);
+            {cfg?.edges.map(renderEdge)}
+            {cfg?.blocks.filter((block) => visiblePcs.has(block.pc)).map((block) => {
+              const color = heatColor(block.executions ?? 1, maxExec);
+              const isSel = selected === block.pc;
+              const isCurrent = currentBlockPc === block.pc;
+              const isMatch = matchingPcs.has(block.pc);
               const stroke = isCurrent ? 'var(--success)' : isMatch ? 'var(--warning)' : isSel ? 'var(--accent)' : 'var(--border-strong)';
+              const terminator = block.terminator ?? 'fallthrough';
               return (
-                <g key={b.pc} transform={`translate(${b.x},${b.y})`} className={`cfg-block${isCurrent ? ' cfg-block-current' : ''}${isMatch ? ' cfg-block-match' : ''}`} onClick={(ev) => { ev.stopPropagation(); setSelected(b.pc); void gotoBlock(b.pc); }}>
-                  <rect width={b.width} height={b.height} rx={8} className="cfg-block-rect" stroke={stroke} strokeWidth={isCurrent ? 3 : isSel || isMatch ? 2 : 1} />
-                  <rect width={b.width} height={22} rx={8} fill={color} opacity={0.25} />
-                  <rect y={16} width={b.width} height={6} fill="var(--bg-surface)" />
-                  <text x={10} y={15} className="cfg-block-head mono" fill={color}>{b.pc}</text>
-                  <text x={b.width - 10} y={15} textAnchor="end" className="cfg-block-exec mono">{b.executions}×</text>
-                  {b.disasm?.slice(0, 3).map((line, li) => <text key={li} x={10} y={38 + li * 16} className="cfg-block-line mono">{line.length > 30 ? `${line.slice(0, 30)}…` : line}</text>)}
+                <g key={block.pc} transform={`translate(${block.x},${block.y})`} className={`cfg-block cfg-terminator-${terminator}${isCurrent ? ' cfg-block-current' : ''}${isMatch ? ' cfg-block-match' : ''}`} onClick={(event) => { event.stopPropagation(); setSelected(block.pc); void gotoBlock(block.pc); }}>
+                  <rect width={block.width} height={block.height} rx={8} className="cfg-block-rect" style={heatMode ? { fill: color, fillOpacity: 0.24 } : undefined} stroke={stroke} strokeWidth={isCurrent ? 3 : isSel || isMatch ? 2 : 1} />
+                  {!heatMode && <><rect width={block.width} height={HEADER_HEIGHT} rx={8} fill={color} opacity={0.25} /><rect y={HEADER_HEIGHT - 4} width={block.width} height={4} fill="var(--bg-surface)" /></>}
+                  <rect width={4} height={block.height} className="cfg-terminator-strip" />
+                  <text x={10} y={11} className="cfg-block-head mono" fill={color}>{block.pc}</text>
+                  <text x={block.width - 10} y={11} textAnchor="end" className="cfg-block-exec mono">{block.executions ?? 0}×</text>
+                  {block.disasm?.map((line, lineIndex) => <text key={lineIndex} x={10} y={HEADER_HEIGHT + 11 + lineIndex * DISASM_LINE_HEIGHT} className="cfg-block-line mono">{truncateLine(line, block.width)}</text>)}
                 </g>
               );
             })}
           </g>
         </svg>
+        <div className="cfg-terminator-legend">
+          {TERMINATORS.map(({ type, label }) => <span key={type}><i className={`cfg-legend-${type}`} />{label}</span>)}
+        </div>
       </div>
     </div>
   );

@@ -307,7 +307,11 @@ export function mockCallGraph(): CallGraphResult {
 
 export function mockCfg(): CfgResult {
   const r = rng(42);
-  const blocks = [];
+  const blocks: CfgResult['blocks'] = [];
+  const terminators: NonNullable<CfgResult['blocks'][number]['terminator']>[] = [
+    'fallthrough', 'conditional_branch', 'call', 'fallthrough',
+    'conditional_branch', 'call', 'return',
+  ];
   const nBlocks = 7;
   for (let i = 0; i < nBlocks; i++) {
     const pc = FUNCS[1].pc + BigInt(i * 0x20) - 0x100000000n + IMAGE_BASE;
@@ -317,7 +321,9 @@ export function mockCfg(): CfgResult {
       y: 40 + Math.floor(i / 3) * 150,
       width: 200,
       height: 90,
+      end_pc: hex(pc + 8n),
       executions: 1 + Math.floor(r() * 500),
+      terminator: terminators[i],
       disasm: [
         `${hex(pc)}  ldr  x0, [sp, #0x10]`,
         `${hex(pc + 4n)}  add  x0, x0, #0x1`,
@@ -326,17 +332,38 @@ export function mockCfg(): CfgResult {
     });
   }
   const edges: CfgResult['edges'] = [];
-  for (let i = 0; i < nBlocks - 1; i++) {
+  const addEdge = (fromIndex: number, toIndex: number, kind: 'fallthrough' | 'branch', takenCount: number) => {
+    const from = blocks[fromIndex];
+    const to = blocks[toIndex];
+    const start = { x: from.x + from.width / 2, y: from.y + from.height };
+    const end = { x: to.x + to.width / 2, y: to.y };
+    const bendY = (start.y + end.y) / 2;
     edges.push({
-      from: blocks[i].pc,
-      to: blocks[i + 1].pc,
-      kind: i % 2 === 0 ? 'fallthrough' : 'branch',
-      taken_count: 1 + Math.floor(r() * 300),
+      from: from.pc,
+      to: to.pc,
+      kind,
+      taken_count: takenCount,
+      polyline: [start, { x: start.x, y: bendY }, { x: end.x, y: bendY }, end],
     });
+  };
+  for (let i = 0; i < nBlocks - 1; i++) {
+    addEdge(i, i + 1, i % 2 === 0 ? 'fallthrough' : 'branch', 1 + Math.floor(r() * 300));
   }
   // 一条回边(循环)
-  edges.push({ from: blocks[4].pc, to: blocks[2].pc, kind: 'branch', taken_count: 120 });
-  return { format: 'json', blocks, edges, canvas_width: 780, canvas_height: 360 };
+  addEdge(4, 2, 'branch', 120);
+  return {
+    format: 'json',
+    scope: 'function',
+    function: {
+      entry_pc: hex(FUNCS[1].pc - 0x100000000n + IMAGE_BASE),
+      name: FUNCS[1].name,
+      total_calls: 37,
+    },
+    blocks,
+    edges,
+    canvas_width: 780,
+    canvas_height: 360,
+  };
 }
 
 export function mockCallStack(instId: number): CallFrame[] {

@@ -249,7 +249,7 @@ Collector 可按记录类型覆写回调：
 **作用**：从动态执行恢复控制流图（基本块 + 边），包含每个块的执行计数和终结指令类型。依赖 `xref`。
 
 **CLI**：`--export-cfg <output.dot>`（导出 Graphviz DOT）
-**MCP**：`cfg_export`
+**MCP**：`cfg_export`——默认导出全图（含布局坐标、边路由折线、terminator 类型）；传 `entry_pc` 或 `inst_id` 时导出函数作用域子图（`extract_function` + 现场布局，disasm 全量），Tauri CFG 面板以此按函数浏览。
 **TUI**：Results 面板中 `cfg` 条目的详情视图列出所有基本块（地址 / 指令数 / 执行次数 / 终结指令类型）。
 
 ---
