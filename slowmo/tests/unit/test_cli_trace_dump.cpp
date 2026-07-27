@@ -215,6 +215,42 @@ TEST_CASE("v8 call metadata crosses reader passes and trace dump",
     }
 }
 
+TEST_CASE("dump_trace emits MEMIMG summaries", "[unit][cli][dump][snapshot]") {
+    // Arrange
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header_v9();
+        tw.write_memimg(0x300001000ULL, {0x10, 0x20, 0x30}, 7);
+    }, "dump_v9_memimg");
+    REQUIRE(env != nullptr);
+
+    SECTION("text summary") {
+        std::ostringstream os;
+        DumpOptions options;
+        options.format = DumpFormat::Text;
+
+        // Act
+        REQUIRE(dump_trace(*env->reader, options, os).has_value());
+
+        // Assert
+        CHECK(os.str().find("MEMIMG seq=7 addr=0x0000000300001000 len=3") !=
+              std::string::npos);
+    }
+
+    SECTION("JSONL summary") {
+        std::ostringstream os;
+        DumpOptions options;
+        options.format = DumpFormat::Jsonl;
+
+        // Act
+        REQUIRE(dump_trace(*env->reader, options, os).has_value());
+
+        // Assert
+        CHECK(os.str().find("{\"type\":\"memimg\",\"seq\":7,"
+                            "\"addr\":\"0x300001000\",\"len\":3}") !=
+              std::string::npos);
+    }
+}
+
 TEST_CASE("dump_trace jsonl limit and no-regs/no-mem", "[unit][cli][dump]") {
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 1024;

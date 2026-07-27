@@ -654,6 +654,13 @@ public:
           statsUpdateElapsed);
       writeFileHeader();
       writer_started_ = true;
+      /* Memory image snapshot: emitted once, right after the header, so ALL
+       * MEMIMG records precede the first INST record (format contract).
+       * configure() runs before any VM starts, so no thread buffers exist
+       * yet and chunk ordering is guaranteed. */
+      if (cfg_.mem_snapshot) {
+        emitMemSnapshot();
+      }
     }
     configured_ = true;
     return true;
@@ -662,6 +669,98 @@ public:
   bool configured() const { return configured_; }
   const Config &cfg() const { return cfg_; }
   BackgroundWriter &writer() { return writer_; }
+
+  /* Capture cfg_.snapshot_ranges[] into REC_MEMIMG records.
+   *
+   * Reads are page-granular (4 KiB) via the fault-tolerant safeRead(): a
+   * guard page or unmapped hole inside a range simply produces a gap in the
+   * record stream instead of aborting the snapshot.  Contiguous readable
+   * pages are coalesced into records of at most QBDITRACE_MEMIMG_CHUNK_MAX
+   * payload bytes.  A hard safety cap (256 MiB total payload) prevents a
+   * misconfigured range (e.g. end == -1) from producing gigabytes of trace.
+   *
+   * Records are appended to BackgroundWriter chunks, so they flow through
+   * the same block-compression pipeline as regular trace records. */
+  void emitMemSnapshot() {
+    static constexpr uint64_t kMaxTotalPayload = 256ull * 1024 * 1024;
+    static constexpr size_t kPage = 4096;
+
+    uint64_t total_payload = 0;
+    uint32_t seq = 0;
+    Chunk chunk = writer_.acquire();
+
+    auto appendRecord = [&](uint64_t addr, const uint8_t *data, size_t len) {
+      const size_t rec_size = sizeof(qbditrace_memimg_t) + len;
+      if (chunk.room() < rec_size) {
+        writer_.submit(std::move(chunk));
+        chunk = writer_.acquire();
+      }
+      qbditrace_memimg_t hdr;
+      hdr.kind = QBDITRACE_REC_MEMIMG;
+      hdr.flags = 0;
+      hdr.record_size = static_cast<uint16_t>(rec_size);
+      hdr.seq = seq++;
+      hdr.addr = addr;
+      hdr.len = static_cast<uint32_t>(len);
+      hdr.reserved = 0;
+      std::memcpy(chunk.data + chunk.used, &hdr, sizeof(hdr));
+      chunk.used += sizeof(hdr);
+      std::memcpy(chunk.data + chunk.used, data, len);
+      chunk.used += len;
+    };
+
+    std::vector<uint8_t> pagebuf(kPage);
+    /* Pending coalescing run: [pend_addr, pend_addr + pend.size()). */
+    std::vector<uint8_t> pend;
+    uint64_t pend_addr = 0;
+
+    auto flushPend = [&]() {
+      size_t off = 0;
+      while (off < pend.size()) {
+        size_t n = std::min(pend.size() - off,
+                            (size_t)QBDITRACE_MEMIMG_CHUNK_MAX);
+        appendRecord(pend_addr + off, pend.data() + off, n);
+        off += n;
+      }
+      pend.clear();
+    };
+
+    for (uint32_t i = 0; i < cfg_.n_snapshot_ranges; ++i) {
+      uint64_t start = cfg_.snapshot_ranges[i].start;
+      uint64_t end = cfg_.snapshot_ranges[i].end;
+      if (end <= start) {
+        continue;
+      }
+      for (uint64_t addr = start;
+           addr < end && total_payload < kMaxTotalPayload;) {
+        size_t plen = (size_t)std::min<uint64_t>(kPage, end - addr);
+        plen = (size_t)std::min<uint64_t>(plen,
+                                          kMaxTotalPayload - total_payload);
+        if (safeRead(addr, pagebuf.data(), plen)) {
+          if (!pend.empty() && pend_addr + pend.size() != addr) {
+            flushPend(); /* non-contiguous: start a new run */
+          }
+          if (pend.empty()) {
+            pend_addr = addr;
+          }
+          pend.insert(pend.end(), pagebuf.data(), pagebuf.data() + plen);
+          total_payload += plen;
+          if (pend.size() >= QBDITRACE_MEMIMG_CHUNK_MAX) {
+            flushPend();
+          }
+        } else if (!pend.empty()) {
+          flushPend(); /* unreadable page: close the current run */
+        }
+        addr += plen;
+      }
+    }
+    flushPend();
+    if (chunk.used > 0) {
+      writer_.submit(std::move(chunk));
+    } else if (chunk.data) {
+      writer_.submit(std::move(chunk)); /* empty chunk: recycled by submit() */
+    }
+  }
 
   /* Look up (or compute and cache) the GPRs written by the instruction at `pc`.
    * Computed once per PC via QBDI's operand analysis; later executions are a
@@ -764,7 +863,10 @@ private:
                                            QBDITRACE_REC_MSGSEND |
                                            QBDITRACE_REC_CAPI)) != 0;
     // v8 is a file-wide call metadata contract and composes with PC delta/FPR.
-    if (call_meta)
+    // v9 (MEMIMG snapshot) composes with all of the above and wins the tag.
+    if (cfg_.mem_snapshot)
+      h.version = QBDITRACE_VERSION_V9_MEMIMG;
+    else if (call_meta)
       h.version = QBDITRACE_VERSION_V8_CALL_META;
     else if (cfg_.fpr_mode)
       h.version = QBDITRACE_VERSION_V7_HAS_FPR;
@@ -802,6 +904,8 @@ private:
       h.flags |= QBDITRACE_HF_BRANCH_HINT;
     if (call_meta)
       h.flags |= QBDITRACE_HF_CALL_META;
+    if (cfg_.mem_snapshot)
+      h.flags |= QBDITRACE_HF_MEMIMG;
     std::strncpy(h.module_name, cfg_.module_name.c_str(),
                  sizeof(h.module_name) - 1);
 #if defined(__APPLE__)
@@ -2683,6 +2787,19 @@ extern "C" int qbditrace_configure(const qbditrace_config_t *in) {
     cfg.capi_funcs[i].api_id   = in->capi_funcs[i].api_id;
     cfg.capi_funcs[i].n_args   = in->capi_funcs[i].n_args;
     cfg.capi_funcs[i].str_args = in->capi_funcs[i].str_args;
+  }
+  /* Memory image snapshot: non-zero enables it (positive sense, opt-in). */
+  cfg.mem_snapshot = (in->enable_mem_snapshot != 0);
+  cfg.n_snapshot_ranges = in->n_snapshot_ranges;
+  if (cfg.n_snapshot_ranges > Config::kMaxSnapshotRanges) {
+    cfg.n_snapshot_ranges = Config::kMaxSnapshotRanges;
+  }
+  for (uint32_t i = 0; i < cfg.n_snapshot_ranges; ++i) {
+    cfg.snapshot_ranges[i].start = in->snapshot_ranges[i].start;
+    cfg.snapshot_ranges[i].end   = in->snapshot_ranges[i].end;
+  }
+  if (cfg.n_snapshot_ranges == 0) {
+    cfg.mem_snapshot = false;
   }
   return Tracer::get().configure(cfg) ? 0 : -2;
 }

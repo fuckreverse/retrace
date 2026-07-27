@@ -207,6 +207,17 @@ struct ObjcView {
     }
 };
 
+struct MemImgView {
+    uint32_t seq;
+    uint64_t addr;
+    uint32_t len;
+    const uint8_t* data;
+
+    size_t byte_size() const {
+        return sizeof(qbditrace::qbditrace_memimg_t) + len;
+    }
+};
+
 struct RetvalView {
     uint8_t source_kind;
     uint8_t flags;
@@ -330,6 +341,7 @@ struct RecordView {
     CapiCallView as_capicall() const;
     ThreadView as_thread() const;
     RetvalView as_retval() const;
+    MemImgView as_memimg() const;
 
     /// Compute the byte size of this record (needed to advance to next)
     size_t byte_size(uint32_t num_gpr) const;
@@ -390,14 +402,15 @@ struct FileHeader {
     bool has_branch_hint() const  { return flags & qbditrace::QBDITRACE_HF_BRANCH_HINT; }
     /// Compatibility spelling for v8 call metadata.
     bool has_call_meta() const      { return flags & qbditrace::QBDITRACE_HF_CALL_META; }
+    bool has_memimg() const         { return flags & qbditrace::QBDITRACE_HF_MEMIMG; }
     bool has_wide_api_id() const    { return has_call_meta(); }
 };
 
 // ─── Shared raw record size calculation ───────────────────────────────────
 //
 // Computes the byte size of a trace record from a raw pointer.
-// Handles ALL 8 record types (INST, ANCHOR, THREAD, EVENT, SVC, OBJC, CODE,
-// CapiCall) and ALL 4 INST header formats (v4=16B, v5=6B, v7=24B, v7+v5=8B).
+// Handles all record types (INST, ANCHOR, THREAD, EVENT, SVC, OBJC, CODE,
+// CapiCall, RETVAL, MEMIMG) and all INST header formats.
 //
 // This is the single source of truth for raw-pointer-based record sizing.
 // All fast-scan passes (xref, objc, trace_collector) should use this instead
@@ -490,6 +503,10 @@ inline size_t raw_record_size(const uint8_t* ptr, uint32_t num_gpr,
         const auto* rv = reinterpret_cast<const qbditrace::qbditrace_retval_t*>(ptr);
         return std::max<size_t>(rv->record_size, sizeof(qbditrace::qbditrace_retval_t));
     }
+    case 9: { // MEMIMG — self describing
+        const auto* memimg = reinterpret_cast<const qbditrace::qbditrace_memimg_t*>(ptr);
+        return std::max<size_t>(memimg->record_size, sizeof(qbditrace::qbditrace_memimg_t));
+    }
     default:
         return 1; // shouldn't happen
     }
@@ -528,6 +545,13 @@ inline size_t inst_header_size(bool is_v5, bool is_v7) {
 }
 
 // ─── TraceReader ──────────────────────────────────────────────────────────
+
+/// One contiguous region of the configure-time memory snapshot (v9 REC_MEMIMG).
+struct MemSnapshotRegion {
+    uint64_t addr = 0;              // runtime start address
+    std::vector<uint8_t> data;      // region bytes
+    uint64_t end() const { return addr + data.size(); }
+};
 
 class TraceReader {
 public:
@@ -714,6 +738,14 @@ return rv;
 
     Iterator begin() const;
     Iterator end() const;
+
+    /// Collect all REC_MEMIMG records into merged contiguous regions.
+    /// Per the format contract all MEMIMG records precede the first REC_INST,
+    /// so this stops scanning at the first Inst record (cheap prefix scan).
+    /// Regions are sorted by addr; records whose addr is exactly the end of the
+    /// previous region are merged into it. Overlapping duplicate bytes are
+    /// ignored (first writer wins).
+    std::vector<MemSnapshotRegion> collect_memimg_regions() const;
 
     /// Create iterators that use a ThreadReader for lock-free data access.
     Iterator begin(const ThreadReader& tr) const;

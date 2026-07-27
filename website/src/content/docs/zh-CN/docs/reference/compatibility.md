@@ -14,6 +14,7 @@ Tenet 在 Trace 证据不完整时优雅降级。本页记录每项能力所需�
 | v5 | `HF_PC_DELTA` | 减小文件体积（pc_delta 模式）；Tenet 自动检测 |
 | v7 | `HF_HAS_FPR` | FPR（NEON v0-v31）重建 |
 | v8 | `HF_CALL_META`（必需；可与 `HF_PC_DELTA` / `HF_HAS_FPR` 组合） | 调用元数据：真实返回值（`REC_RETVAL`）、在线 selector 与更宽的 API ID |
+| v9 | `HF_MEMIMG`（v9 必需；与所有布局 flag 正交） | configure 时内存快照（`REC_MEMIMG`）；由 `qbditrace --snapshot-range` 录制，全部记录位于首个 `INST` 之前 |
 | v6 | `HF_OLD_VALUE` | 写前内存值（writer 已移除；当前无 Trace 生成此格式） |
 
 Tenet 可打开 version ≥ 4 的任何 Trace。
@@ -53,6 +54,7 @@ Tenet 可打开 version ≥ 4 的任何 Trace。
 |---|---|---|
 | 内存访问（写） | 是 | 无内存重建 |
 | 内存访问（读） | 未插桩数据需要 | 未读页面为未知字节 |
+| `REC_MEMIMG` 快照（v9，可选） | 从未被触碰的全局量需要 | 未触碰页面保持未知；快照字节以 `kSnapshotWriterId` 标注为 trace 起始时刻的近似值 |
 | 内嵌代码或镜像 | 字符串扫描需要 | 仅栈/堆 |
 
 ### 平台 API

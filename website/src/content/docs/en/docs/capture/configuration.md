@@ -66,7 +66,17 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--fpr` | off | Enable v7 FPR/NEON recording: FPR diffs per instruction + 512 B FPR snapshot per anchor |
 | `--no-compress` | off | Disable default 1 MiB block zstd compression |
 | `--exclude-range` | none | Exclude address ranges (format: `START-END` or `START:SIZE`, hex static offsets). Up to 8 ranges. Code inside excluded ranges runs natively with zero trace overhead |
+| `--snapshot-range` | none | Opt-in memory snapshot of an absolute runtime range `START END` (decimal or 0x hex), captured once at configure time (v9 `REC_MEMIMG`). Repeatable, up to 8 ranges. Aim at the module's writable data sections (`__DATA`/`__bss`) — do not dump rodata (Tenet's `--image` fallback already covers it), heap, or stack. Tenet resolves bytes from the write/read logs first and uses the snapshot only as an explicitly-marked base layer |
 | `--sampling` | off | **Scout mode**: bare PC stream only (no registers, memory, or sequence events). ≈80%+ size reduction while loop counts and back-edges remain exact. Implies `--pc-delta` and a large anchor interval. See *Scout workflow* below |
+
+```bash
+# Snapshot the module's writable data segment before tracing
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --snapshot-range 0x100010000 0x100012000 \
+    --output /var/mobile/Documents/trace.bin
+```
 
 ## Pre-trace memory patches
 

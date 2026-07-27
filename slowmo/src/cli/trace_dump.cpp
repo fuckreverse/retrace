@@ -552,6 +552,19 @@ if (rv.source_kind == qbditrace::QBDITRACE_REC_SVC) {
             break;
         }
 
+        case RecordKind::MemImg: {
+            const auto memimg = rec.as_memimg();
+            if (options.format == DumpFormat::Text) {
+                out << fmt::format("MEMIMG seq={} addr=0x{:016X} len={}\n",
+                                   memimg.seq, memimg.addr, memimg.len);
+            } else {
+                out << fmt::format("{{\"type\":\"memimg\",\"seq\":{},"
+                                   "\"addr\":\"0x{:X}\",\"len\":{}}}\n",
+                                   memimg.seq, memimg.addr, memimg.len);
+            }
+            break;
+        }
+
         case RecordKind::Anchor: {
             // Anchor records are internal state markers; skip in dump output
             break;

@@ -963,6 +963,10 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
                 case RecordKind::Retval:
                     rec_size = raw_record_size(ptr, reader.header());
                     break;
+                case RecordKind::MemImg:
+                    if (remaining < sizeof(qbditrace::qbditrace_memimg_t)) return pos;
+                    rec_size = raw_record_size(ptr, reader.header());
+                    break;
                 default: rec_size = 1; break;
                 }
                 if (rec_size == 0) return pos;  // corrupt record guard
@@ -1091,8 +1095,17 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
                     break;
                 }
 case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + ptr[1]; break;
-case RecordKind::Retval: rec_size = raw_record_size(ptr, reader.header()); break;
-default: rec_size = 1; break;
+            case RecordKind::Retval:
+                rec_size = raw_record_size(ptr, reader.header());
+                break;
+            case RecordKind::MemImg:
+                if (file_size - scan_offset < sizeof(qbditrace::qbditrace_memimg_t)) {
+                    rec_size = file_size - scan_offset;
+                } else {
+                    rec_size = raw_record_size(ptr, reader.header());
+                }
+                break;
+            default: rec_size = 1; break;
                 }
                 if (rec_size == 0) break;
                 scan_offset += rec_size;
@@ -1530,6 +1543,11 @@ struct ShardResult {
                 break;
             }
             case RecordKind::Retval:
+                rec_size = raw_record_size(ptr, reader.header());
+                if (remaining < rec_size) return 0;
+                break;
+            case RecordKind::MemImg:
+                if (remaining < sizeof(qbditrace::qbditrace_memimg_t)) return 0;
                 rec_size = raw_record_size(ptr, reader.header());
                 if (remaining < rec_size) return 0;
                 break;

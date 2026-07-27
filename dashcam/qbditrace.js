@@ -21,6 +21,7 @@
  *   1. Python loader spawns/attaches to the target, loads this script.
  *   2. Python sends CONFIG via script.post({ type: 'config', payload: {...} }).
  *   3. This script receives CONFIG, loads libqbditrace.dylib, resolves addresses.
+ *      Optional CONFIG.memSnapshot.ranges captures absolute runtime memory ranges.
  *   4. Interceptor.replace(entryFunc) -> qbditrace_run_call(retOut, func, args)
  *   5. After the call returns, qbditrace_stop() flushes the trace to disk.
  *   6. Script sends status messages back to Python via send().
@@ -163,10 +164,16 @@ function buildConfigStruct(opts) {
    * offset 288  capi_funcs[0..127]   128×{u64 addr, u16 api_id, u8 n_args, u8 str_args, u8 pad[4]}
    *                                  = 128×16 = 2048 bytes (C natural alignment: the struct's
    *                                  8-byte alignment pads each 12-byte entry up to 16)
+   * offset 2336 enable_mem_snapshot  u32
+   * offset 2340 n_snapshot_ranges    u32
+   * offset 2344 snapshot_ranges[0..7] 8×{u64 start, u64 end} = 128 bytes
    *
-   * Total: 280 + 4 + 4 + 2048 = 2336 bytes
+   * Offset derivation: capi_funcs starts at 288 and occupies 128×16 = 2048
+   * bytes, ending at 2336. The two u32 fields occupy 8 bytes, so the u64-aligned
+   * range array starts naturally at 2344 with no extra padding.
+   * Total: 2344 + 128 = 2472 bytes
    */
-  const SIZE = 2336;
+  const SIZE = 2472;
   const cfg = Memory.alloc(SIZE);
   for (let i = 0; i < SIZE; i += 8) cfg.add(i).writePointer(ptr(0));
 
@@ -226,6 +233,16 @@ function buildConfigStruct(opts) {
    cfg.add(base + 8).writeU16(capiFuncs[i].apiId || 0);
    cfg.add(base + 10).writeU8(capiFuncs[i].nArgs || 0);
    cfg.add(base + 11).writeU8(capiFuncs[i].strArgs || 0);
+  }
+
+  /* Opt-in memory image snapshot. Ranges are absolute runtime addresses. */
+  const snapshotRanges = opts.snapshotRanges || [];
+  cfg.add(2336).writeU32(snapshotRanges.length > 0 ? 1 : 0);
+  cfg.add(2340).writeU32(snapshotRanges.length);
+  for (let i = 0; i < snapshotRanges.length && i < 8; i++) {
+    const base = 2344 + i * 16;
+    cfg.add(base).writePointer(snapshotRanges[i].start);
+    cfg.add(base + 8).writePointer(snapshotRanges[i].end);
   }
   return cfg;
 }
@@ -1178,6 +1195,19 @@ function mainImpl() {
           ' - 0x' + r.end.toString(16) + ')');
     });
   }
+  const snapshotConfig = CONFIG.memSnapshot || {};
+  const snapshotRanges = (snapshotConfig.ranges || []).map(function(r, idx) {
+    const start = ptr(r.start);
+    const end = ptr(r.end);
+    if (end.compare(start) <= 0) {
+      fail('memSnapshot.ranges[' + idx + ']: end must be greater than start');
+    }
+    log('snapshot[' + idx + '] = ' + start + ' - ' + end + ' (absolute runtime range)');
+    return { start: start, end: end };
+  });
+  if (snapshotRanges.length > 8) {
+    fail('memSnapshot.ranges: maximum 8 ranges supported');
+  }
 
   /* Always run the planner so disabled MSGSEND capture is diagnosed explicitly.
    * It performs no ObjC runtime/module access on Android or when disabled. */
@@ -1227,6 +1257,7 @@ function mainImpl() {
     objcMsgSendStret: objc.objcMsgSendStret,
     enableCapiIntercept: capiIntercept,  /* native resolves standard funcs when capiFuncs is empty */
     capiFuncs: capiFuncs,
+    snapshotRanges: snapshotRanges,
   };
 
   function makeOutputPath(traceIndex) {

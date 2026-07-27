@@ -97,6 +97,15 @@ struct Config {
   bool compress         = true;
   bool branch_hint_mode = true;
 
+  /* Memory image snapshot (opt-in, default off).  Captured once at
+   * configure() time and emitted as REC_MEMIMG records before the first
+   * INST record. */
+  bool mem_snapshot = false;
+  struct SnapshotRange { uint64_t start; uint64_t end; };
+  static constexpr uint32_t kMaxSnapshotRanges = QBDITRACE_MAX_SNAPSHOT_RANGES;
+  uint32_t n_snapshot_ranges = 0;
+  SnapshotRange snapshot_ranges[kMaxSnapshotRanges] = {};
+
   /* Build the sorted capi_lookup table from capi_funcs[0..n_capi_funcs).
    * Entries with addr == 0 are skipped.  Call this after populating capi_funcs. */
   void buildCapiLookup() {

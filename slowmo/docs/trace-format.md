@@ -1,9 +1,9 @@
-# Trace Format 接口契约（v4–v8）
+# Trace Format 接口契约（v4–v9）
 
 ## 概述
 
 本文档是 **tenet 分析器**与 **qbditrace 记录器**之间的接口契约。
-tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8）定义的格式读取 `.bin` trace 文件。
+tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8/v9）定义的格式读取 `.bin` trace 文件。
 
 **权威来源**：`tools/qbditrace/TraceFormat.h`。本文档是该头文件的人类可读解释，
 并标注 tenet 特有的处理策略和未来增强方向。如有冲突，以 `.h` 文件为准。
@@ -51,7 +51,7 @@ tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8）定义的格式读取 `.b
 | 偏移 | 大小 | 字段 | 值/说明 |
 |------|------|------|---------|
 | 0x00 | 4 | magic | `0x51424454` ("QBDT") |
-| 0x04 | 4 | version | 4（基线）/ 5（+PC_DELTA）/ 6（+OLD_VALUE）/ 7（+HAS_FPR）/ 8（+CALL_META） |
+| 0x04 | 4 | version | 4（基线）/ 5（+PC_DELTA）/ 6（+OLD_VALUE）/ 7（+HAS_FPR）/ 8（+CALL_META）/ 9（+MEMIMG） |
 | 0x08 | 4 | arch | `QBDITRACE_ARCH_AARCH64 = 1` |
 | 0x0C | 4 | num_gpr | 34 (AArch64) |
 | 0x10 | 8 | module_base | 被追踪模块的运行时基址 |
@@ -78,6 +78,7 @@ tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8）定义的格式读取 `.b
 | BLOCK_COMPRESSED | bit 8 | 分块压缩格式：多个独立 zstd frame + 尾部索引（见下方"分块压缩"节） |
 | BRANCH_HINT | bit 9 | INST nzcv 字节高 4 位编码分支类别（见下方"Branch Hint"节） |
 | CALL_META | bit 10 | v8：OBJC/CAPICALL 使用 v8 布局，且允许 REC_RETVAL |
+| MEMIMG | bit 11 | v9：流中包含 REC_MEMIMG 内存快照记录（位于首个 INST 之前） |
 
 > **注**：`COMPRESSED` 与 `BLOCK_COMPRESSED` 互斥。当前 qbditrace writer 默认产生
 > `BLOCK_COMPRESSED`；`COMPRESSED` 单帧流格式仅为历史读取兼容，当前 writer 不产生。
@@ -90,6 +91,7 @@ tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8）定义的格式读取 `.b
 | 5 | PC_DELTA | INST 头缩小为 6B |
 | 7 | HAS_FPR | ANCHOR + INST 携带 FPR 快照/差值 |
 | 8 | CALL_META | OBJC/CAPICALL v8 布局，并增加 RETVAL 返回事实记录 |
+| 9 | MEMIMG | 增加 REC_MEMIMG 内存快照记录（configure 时发射） |
 
 > v6 (`OLD_VALUE`) 已从 writer 移除（`config_t._reserved_old_value` 被忽略），但格式定义保留以支持旧 trace 读取。
 
@@ -107,7 +109,8 @@ qbditrace 在录制时通过编译期宏自动填写此字段。tenet 读取时�
 **tenet 打开条件**：magic == `0x51424454` 且 version >= 4。`REG_DIFF`、`HAS_MEM`、
 `HAS_NZCV` 可关闭（sampling trace 即如此）；缺少 `HAS_CODE` 时仍可解析记录流，但依赖
 反汇编的分析需要外部镜像或会降级。`HF_CALL_META` 仅允许 version=8，且 version=8 必须设置
-`HF_CALL_META`；v8 可与 `PC_DELTA`、`HAS_FPR`、`OLD_VALUE` 组合。
+`HF_CALL_META`；v8 可与 `PC_DELTA`、`HAS_FPR`、`OLD_VALUE` 组合。`HF_MEMIMG` 仅允许
+version=9，且 version=9 必须设置 `HF_MEMIMG`；v9 与上述所有布局 flag 正交组合。
 
 ---
 
@@ -177,6 +180,7 @@ struct RegState {
 | CODE | 6 | `qbditrace_code_head_t` + bytes[] | 指令原始字节 |
 | CAPICALL | 7 | `qbditrace_capicall_head_t`/`_v8_t` + str_caps[] | C/平台 API 调用（含参数快照） |
 | RETVAL | 8 | `qbditrace_retval_t` | OBJC/CAPICALL/SVC 的返回事实 |
+| MEMIMG | 9 | `qbditrace_memimg_t` + bytes[] | 内存快照块（v9，configure 时发射） |
 
 > **磁盘布局说明**：所有记录以 C struct 自然对齐方式存储（writer 用 `memcpy(p, &struct, sizeof)`），
 > 磁盘大小 = `sizeof(struct)`，**含对齐 padding**。下方各记录的 "Total" 均为 sizeof 口径，
@@ -595,6 +599,38 @@ OBJC、CAPICALL 或 SVC 的实际返回状态：
 
 ---
 
+## REC_MEMIMG — 内存快照块（v9）
+
+`HF_MEMIMG` 下，`qbditrace_configure()` 在写完文件头后立即对调用方指定的内存范围
+（`qbditrace_config_t::snapshot_ranges[]`，默认关闭）做一次快照，以 REC_MEMIMG 记录写入。
+**流契约：所有 MEMIMG 记录位于第一个 REC_INST 之前**，因此 reader 可用一次廉价的前缀扫描收集。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `kind/flags/record_size` | u8 + u8 + u16 | `kind=9`；`record_size = 24 + len`（自描述，可按值跳过整条记录） |
+| `seq` | u32 | 块序号（快照内单调递增） |
+| `addr` | u64 | `data[0]` 的运行时地址 |
+| `len/reserved` | u32 × 2 | payload 字节数；保留字必须为 0 |
+| `data[len]` | u8[] | 原始内存字节（无尾部对齐填充） |
+
+- 固定头 24B（`qbditrace_memimg_t`），单块 payload ≤ `QBDITRACE_MEMIMG_CHUNK_MAX`（32 KiB）。
+- 录制时按 4 KiB 页用容错读（`safeRead`）捕获：不可读页（guard page/未映射洞）在流中形成空洞，
+  相邻可读页合并为大块；总量硬上限 256 MiB。`end <= start` 的无效范围被静默跳过。
+- **设计意图**：指令的写/读日志只覆盖被追踪代码实际触碰的地址。trace 开始前由未插桩代码
+  （解密壳、启动代码）写入的全局状态（.data/.bss 里的解密字符串、运行时表）若从未被读/写，
+  对分析不可见；快照补的正是这一块。不要 dump rodata（与 tenet `--image` 回退重复）、heap/stack。
+
+**tenet 使用**：
+- `TraceReader::collect_memimg_regions()` 前缀扫描并合并相邻块为排序的连续区域。
+- `MemoryModel` 将其作为**快照基底层**：读查询按 写日志 → 读日志 → 快照 的顺序解析，
+  快照只填日志未覆盖的字节；`at_inst_id == 0` 时直接以快照作答（这正是 t=0 的状态）。
+- 快照字节的 `MemReadResult.writer_id` 标记为哨兵 `MemoryModel::kSnapshotWriterId`
+  （= UINT64_MAX，`is_snapshot_writer()` 判定）：它是 t=0 时刻的值，用于更晚时刻是**显式标注的
+  近似**，而非静默近似。快照不计入 `active_pages()`/`was_accessed()`。
+- `tenet --dump` 输出 MEMIMG 摘要（seq/addr/len），不 hexdump payload。
+
+---
+
 ## Branch Hint 编码（HF_BRANCH_HINT）
 
 当 `HF_BRANCH_HINT` (bit 9) 设置时，每条 REC_INST 的 `nzcv` 字节高 4 位编码分支类别：
@@ -665,7 +701,7 @@ REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B
 | # | 假设 | 违反时处理 |
 |---|------|-----------|
 | 1 | Header 为 536 字节，magic = "QBDT" | 拒绝打开 |
-| 2 | version >= 4 | < 4 拒绝；> 8 警告并尝试继续 |
+| 2 | version >= 4 | < 4 拒绝；> 9 警告并尝试继续 |
 | 3 | flags 包含 REG_DIFF（常规完整 trace） | 不强制：REG_DIFF/NZCV/MEM 均可关闭（见 `QBDITRACE_REC_SAMPLING`），此时 RegisterFile/MemoryModel 相关能力降级，但 `xref`/`cfg`/`loop`/`window_stats` 等只需 PC 流 + REC_CODE 的 pass 正常工作 |
 | 4 | flags 包含 HAS_CODE | 不含则需要外部 image |
 | 5 | 记录按写入顺序排列（时间单调递增） | 索引依赖此假设 |
@@ -674,6 +710,7 @@ REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B
 | 8 | num_gpr = 34 (AArch64) | 其他值按 header 声明处理 |
 | 9 | CAPICALL 记录（若存在）紧随对应 XFER_CALL Event 之前 | SyscallInterceptCollector 用 capicall_seen_ 去重 |
 | 10 | `HF_CALL_META` 仅随 v8 出现，且 v8 必带该 flag | 其他组合拒绝；v8 可组合 PC_DELTA/HAS_FPR/OLD_VALUE |
+| 11 | `HF_MEMIMG` 仅随 v9 出现，且 v9 必带该 flag；MEMIMG 记录全部位于首个 INST 之前 | 无 flag 的 v9 拒绝；前缀扫描遇到 INST 即停 |
 
 ---
 

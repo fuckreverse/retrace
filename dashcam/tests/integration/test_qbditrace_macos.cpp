@@ -29,11 +29,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
+#include <sys/mman.h>
 #include <unistd.h>
 
 // qbditrace public API
@@ -93,6 +96,101 @@ uint64_t integration_target(uint64_t seed) {
 }
 
 void integration_target_end(void) {}  // sentinel
+
+// ─── MEMIMG snapshot helpers ──────────────────────────────────────────────────
+
+class TempTraceFile {
+public:
+    TempTraceFile() {
+        char path[] = "/tmp/qbditrace_memimg_XXXXXX";
+        const int fd = mkstemp(path);
+        if (fd >= 0) close(fd);
+        path_ = path;
+    }
+
+    ~TempTraceFile() { unlink(path_.c_str()); }
+
+    const char* c_str() const { return path_.c_str(); }
+
+private:
+    std::string path_;
+};
+
+struct MemimgRecord {
+    qbditrace_memimg_t header{};
+    std::vector<uint8_t> payload;
+};
+
+struct ParsedMemimgTrace {
+    qbditrace_file_header_t header{};
+    std::vector<MemimgRecord> records;
+    bool saw_inst = false;
+    bool valid = false;
+};
+
+static ParsedMemimgTrace parse_memimg_trace(const char* path) {
+    ParsedMemimgTrace result;
+    FILE* file = fopen(path, "rb");
+    if (file == nullptr) return result;
+    if (fread(&result.header, sizeof(result.header), 1, file) != 1) {
+        fclose(file);
+        return result;
+    }
+
+    while (true) {
+        uint8_t kind = 0;
+        if (fread(&kind, 1, 1, file) != 1) break;
+        if (fseek(file, -1, SEEK_CUR) != 0) break;
+        if (kind == QBDITRACE_REC_INST) {
+            result.saw_inst = true;
+            break;
+        }
+        if (kind != QBDITRACE_REC_MEMIMG) break;
+
+        MemimgRecord record;
+        if (fread(&record.header, sizeof(record.header), 1, file) != 1 ||
+            record.header.record_size != sizeof(record.header) + record.header.len) {
+            fclose(file);
+            return result;
+        }
+        record.payload.resize(record.header.len);
+        if (!record.payload.empty() &&
+            fread(record.payload.data(), 1, record.payload.size(), file) !=
+                record.payload.size()) {
+            fclose(file);
+            return result;
+        }
+        result.records.push_back(std::move(record));
+    }
+
+    result.valid = !ferror(file);
+    fclose(file);
+    return result;
+}
+
+static qbditrace_config_t make_snapshot_config(const char* output_path) {
+    qbditrace_config_t cfg{};
+    cfg.struct_size = sizeof(cfg);
+    cfg.trace_start = (uint64_t)(uintptr_t)&integration_target;
+    cfg.trace_end = (uint64_t)(uintptr_t)&integration_target_end;
+    if (cfg.trace_end <= cfg.trace_start || cfg.trace_end - cfg.trace_start > 0x8000)
+        cfg.trace_end = cfg.trace_start + 0x2000;
+    cfg.module_base = cfg.trace_start;
+    cfg.module_name = "memimg_test";
+    cfg.output_path = output_path;
+    cfg.record = QBDITRACE_REC_DEFAULT;
+    cfg.anchor_interval = 64;
+    // MEMIMG itself also supports compression, but raw output keeps this test's
+    // parser focused on snapshot framing and content rather than zstd blocks.
+    cfg.disable_compress = 1;
+    return cfg;
+}
+
+static bool configure_and_stop(qbditrace_config_t* cfg) {
+    const int rc = qbditrace_configure(cfg);
+    if (rc == 0) qbditrace_stop();
+    return rc == 0;
+}
 
 // ─── Helper: run tracer and return trace path ─────────────────────────────────
 
@@ -446,6 +544,132 @@ TEST_CASE("qbditrace: Mach thread_self_trap records return value (raw scan)",
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("qbditrace: MEMIMG snapshots a readable range in bounded chunks",
+          "[integration][qbditrace][memimg]") {
+    // In: a range larger than three maximum-size chunks.
+    static uint8_t snapshot[100 * 1024];
+    for (size_t i = 0; i < sizeof(snapshot); ++i)
+        snapshot[i] = static_cast<uint8_t>((i * 131u + 17u) & 0xffu);
+
+    TempTraceFile output;
+    auto cfg = make_snapshot_config(output.c_str());
+    cfg.enable_mem_snapshot = 1;
+    cfg.n_snapshot_ranges = 1;
+    cfg.snapshot_ranges[0].start = (uint64_t)(uintptr_t)snapshot;
+    cfg.snapshot_ranges[0].end = cfg.snapshot_ranges[0].start + sizeof(snapshot);
+
+    // Got.
+    REQUIRE(configure_and_stop(&cfg));
+    const auto got = parse_memimg_trace(output.c_str());
+
+    // Want: v9 framing, increasing sequence numbers, and exact reconstruction.
+    REQUIRE(got.valid);
+    CHECK(got.header.version == QBDITRACE_VERSION_V9_MEMIMG);
+    CHECK((got.header.flags & QBDITRACE_HF_MEMIMG) != 0);
+    CHECK_FALSE(got.saw_inst);
+    REQUIRE_FALSE(got.records.empty());
+
+    std::vector<uint8_t> rebuilt(sizeof(snapshot));
+    size_t rebuilt_bytes = 0;
+    for (size_t i = 0; i < got.records.size(); ++i) {
+        const auto& record = got.records[i];
+        CAPTURE(i, record.header.addr, record.header.len);
+        CHECK(record.header.kind == QBDITRACE_REC_MEMIMG);
+        CHECK(record.header.flags == 0);
+        CHECK(record.header.reserved == 0);
+        CHECK(record.header.seq == i);
+        CHECK(record.header.len <= QBDITRACE_MEMIMG_CHUNK_MAX);
+        CHECK(record.header.record_size == sizeof(qbditrace_memimg_t) + record.header.len);
+        REQUIRE(record.header.addr >= cfg.snapshot_ranges[0].start);
+        const size_t offset = static_cast<size_t>(record.header.addr -
+                                                  cfg.snapshot_ranges[0].start);
+        REQUIRE(offset + record.payload.size() <= rebuilt.size());
+        std::copy(record.payload.begin(), record.payload.end(), rebuilt.begin() + offset);
+        rebuilt_bytes += record.payload.size();
+    }
+    CHECK(rebuilt_bytes == sizeof(snapshot));
+    CHECK(rebuilt == std::vector<uint8_t>(snapshot, snapshot + sizeof(snapshot)));
+}
+
+TEST_CASE("qbditrace: MEMIMG leaves unreadable pages as holes",
+          "[integration][qbditrace][memimg]") {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    REQUIRE(page_size > 0);
+    auto* mapping = static_cast<uint8_t*>(mmap(nullptr, page_size * 3,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
+    REQUIRE(mapping != MAP_FAILED);
+    std::memset(mapping, 0x3c, page_size);
+    std::memset(mapping + page_size * 2, 0xa7, page_size);
+    REQUIRE(mprotect(mapping + page_size, page_size, PROT_NONE) == 0);
+
+    TempTraceFile output;
+    auto cfg = make_snapshot_config(output.c_str());
+    cfg.enable_mem_snapshot = 1;
+    cfg.n_snapshot_ranges = 1;
+    cfg.snapshot_ranges[0].start = (uint64_t)(uintptr_t)mapping;
+    cfg.snapshot_ranges[0].end = cfg.snapshot_ranges[0].start + page_size * 3;
+
+    REQUIRE(configure_and_stop(&cfg));
+    const auto got = parse_memimg_trace(output.c_str());
+
+    REQUIRE(got.valid);
+    REQUIRE_FALSE(got.records.empty());
+    size_t first_page_bytes = 0;
+    size_t last_page_bytes = 0;
+    const uint64_t hole_start = cfg.snapshot_ranges[0].start + page_size;
+    const uint64_t hole_end = hole_start + page_size;
+    for (const auto& record : got.records) {
+        const uint64_t record_end = record.header.addr + record.header.len;
+        CHECK((record_end <= hole_start || record.header.addr >= hole_end));
+        if (record.header.addr < hole_start) {
+            first_page_bytes += record.header.len;
+            CHECK(std::all_of(record.payload.begin(), record.payload.end(),
+                              [](uint8_t byte) { return byte == 0x3c; }));
+        } else if (record.header.addr >= hole_end) {
+            last_page_bytes += record.header.len;
+            CHECK(std::all_of(record.payload.begin(), record.payload.end(),
+                              [](uint8_t byte) { return byte == 0xa7; }));
+        }
+    }
+    CHECK(first_page_bytes == page_size);
+    CHECK(last_page_bytes == page_size);
+
+    CHECK(mprotect(mapping + page_size, page_size, PROT_READ | PROT_WRITE) == 0);
+    CHECK(munmap(mapping, page_size * 3) == 0);
+}
+
+TEST_CASE("qbditrace: MEMIMG remains disabled by default",
+          "[integration][qbditrace][memimg]") {
+    TempTraceFile output;
+    auto cfg = make_snapshot_config(output.c_str());
+
+    REQUIRE(configure_and_stop(&cfg));
+    const auto got = parse_memimg_trace(output.c_str());
+
+    REQUIRE(got.valid);
+    CHECK(got.header.version != QBDITRACE_VERSION_V9_MEMIMG);
+    CHECK((got.header.flags & QBDITRACE_HF_MEMIMG) == 0);
+    CHECK(got.records.empty());
+}
+
+TEST_CASE("qbditrace: MEMIMG skips ranges whose end is not after start",
+          "[integration][qbditrace][memimg]") {
+    TempTraceFile output;
+    auto cfg = make_snapshot_config(output.c_str());
+    cfg.enable_mem_snapshot = 1;
+    cfg.n_snapshot_ranges = 2;
+    cfg.snapshot_ranges[0] = {0x2000, 0x2000};
+    cfg.snapshot_ranges[1] = {0x3000, 0x2000};
+
+    REQUIRE(configure_and_stop(&cfg));
+    const auto got = parse_memimg_trace(output.c_str());
+
+    REQUIRE(got.valid);
+    CHECK(got.header.version == QBDITRACE_VERSION_V9_MEMIMG);
+    CHECK((got.header.flags & QBDITRACE_HF_MEMIMG) != 0);
+    CHECK(got.records.empty());
+}
 
 TEST_CASE("qbditrace: real CAPI transfer records its return value",
           "[integration][qbditrace][capi][retval]") {

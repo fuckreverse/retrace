@@ -60,6 +60,9 @@ std::optional<size_t> complete_record_size(const uint8_t* ptr, size_t remaining,
     case qbditrace::QBDITRACE_REC_RETVAL:
         if (!fits(sizeof(qbditrace::qbditrace_retval_t))) return std::nullopt;
         break;
+    case qbditrace::QBDITRACE_REC_MEMIMG:
+        if (!fits(sizeof(qbditrace::qbditrace_memimg_t))) return std::nullopt;
+        break;
     default:
         return size_t{1};
     }

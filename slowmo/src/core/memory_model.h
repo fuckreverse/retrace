@@ -56,8 +56,24 @@ struct MemReadResult {
 ///   - Queries use a single RocksDB iterator for the entire read range
 ///   - In-memory LRU cache of hot pages for repeated queries
 ///   - Column family: "mem_write" in the shared trace index DB
+///
+/// Configure-time REC_MEMIMG regions form a lazily loaded base layer beneath
+/// the access logs. Queries resolve bytes in this order: write log, read log,
+/// then snapshot. Snapshot bytes represent memory at trace start (inst_id 0),
+/// so using them at a later query instant is an explicit approximation marked
+/// by kSnapshotWriterId rather than a traced writer instruction.
 class MemoryModel {
 public:
+    /// Sentinel writer_id marking bytes resolved from the configure-time memory
+    /// snapshot (REC_MEMIMG) rather than from the write/read log. The value is
+    /// the memory content at trace start (inst_id 0); it is an APPROXIMATION of
+    /// the value at the query instant for any address that was never logged.
+    static constexpr uint64_t kSnapshotWriterId = UINT64_MAX;
+
+    static bool is_snapshot_writer(uint64_t writer_id) {
+        return writer_id == kSnapshotWriterId;
+    }
+
     /// Open MemoryModel backed by RocksDB.
     /// `db` is the shared trace index DB (must outlive MemoryModel).
     /// `mem_cf` is the "mem_write" column family handle.
@@ -74,6 +90,10 @@ public:
 
     /// Read `size` bytes at `addr` as they were at time `at_inst_id`.
     MemReadResult read(uint64_t addr, uint8_t size, uint64_t at_inst_id);
+
+    /// Return whether the trace contains a configure-time memory snapshot.
+    /// This lazily collects REC_MEMIMG regions on first use.
+    bool has_snapshot() const;
 
     /// Find the inst_id that last wrote to [addr, addr+size) before `before_inst_id`.
     uint64_t last_writer(uint64_t addr, uint8_t size, uint64_t before_inst_id);
@@ -302,6 +322,13 @@ private:
     /// Ensure build has been performed.
     void ensure_built();
 
+    /// Lazily collect and sort the configure-time REC_MEMIMG base layer.
+    void ensure_snapshot_loaded();
+
+    /// Fill unresolved bytes from the snapshot base layer.
+    void apply_snapshot(uint64_t addr, uint8_t size, MemReadResult& result);
+    void apply_snapshot(uint64_t addr, RegionReadResult& result);
+
     // ─── In-memory fallback helpers (used when has_rocksdb_ == false) ────
     MemReadResult read_inmemory(uint64_t addr, uint8_t size, uint64_t at_inst_id);
     uint64_t last_writer_inmemory(uint64_t addr, uint8_t size, uint64_t search_id);
@@ -370,6 +397,14 @@ private:
     // mutex caused under run_all(N).
     mutable std::shared_mutex index_cache_mutex_;  // protects page_index_cache_
     mutable std::mutex page_cache_mutex_;           // protects page_cache_ (in-mem fallback)
+
+    // Lazily loaded REC_MEMIMG base layer. It is intentionally excluded from
+    // active_pages()/was_accessed(): a snapshot is initial state, not an access.
+    // snapshot_regions_ is written once under snapshot_mutex_ before
+    // snapshot_loaded_ is released; afterwards it is read lock-free.
+    std::vector<MemSnapshotRegion> snapshot_regions_;
+    std::atomic<bool> snapshot_loaded_{false};
+    mutable std::mutex snapshot_mutex_;
 
     // Page activity cache (populated during build, never changes after)
     std::vector<PageActivity> page_activity_cache_;

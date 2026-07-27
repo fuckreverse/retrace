@@ -86,6 +86,7 @@ namespace qbditrace {
 #define QBDITRACE_VERSION_V6_OLD_VALUE 6u /* version tag written when HF_OLD_VALUE is used */
 #define QBDITRACE_VERSION_V7_HAS_FPR   7u /* version tag written when HF_HAS_FPR is used */
 #define QBDITRACE_VERSION_V8_CALL_META 8u /* v8 call metadata: CAPI/OBJC/RETVAL */
+#define QBDITRACE_VERSION_V9_MEMIMG   9u /* v9: REC_MEMIMG memory snapshot chunks */
 /* Source compatibility for the short-lived wide-id name. */
 #define QBDITRACE_VERSION_V8_WIDE_API_ID QBDITRACE_VERSION_V8_CALL_META
 
@@ -216,6 +217,14 @@ typedef enum {
   QBDITRACE_HF_CALL_META = 1u << 10,
   /* Source compatibility alias for the initial v8 prototype. */
   QBDITRACE_HF_WIDE_API_ID = QBDITRACE_HF_CALL_META,
+  /* v9: the stream contains REC_MEMIMG records (memory-image snapshot chunks
+   * captured at configure() time, before the first traced instruction).
+   * All MEMIMG records appear BEFORE the first REC_INST in the logical
+   * stream, so a reader can collect them with a cheap prefix scan.
+   * Enabling this flag also bumps the file version to
+   * QBDITRACE_VERSION_V9_MEMIMG; readers that do not support v9 must reject
+   * the file (unknown record kinds cannot be skipped safely by old readers). */
+  QBDITRACE_HF_MEMIMG = 1u << 11,
 } qbditrace_header_flags;
 
 /* Branch-hint nibble values (bits[7:4] of the nzcv byte in REC_INST). */
@@ -256,6 +265,7 @@ typedef enum {
   QBDITRACE_REC_CODE = 6,     /* raw instruction bytes for one distinct PC */
   QBDITRACE_REC_CAPICALL = 7, /* C/platform API call site with semantic args */
   QBDITRACE_REC_RETVAL = 8,   /* return fact for OBJC/CAPI/SVC */
+  QBDITRACE_REC_MEMIMG = 9,   /* memory-image snapshot chunk (configure-time) */
 } qbditrace_record_kind_t;
 
 /* ---- QBDITRACE_REC_INST ----
@@ -666,6 +676,45 @@ typedef struct {
   uint8_t _reserved;
   /* followed by str_len + 1 bytes of NUL-terminated content, padded to 4B alignment */
 } qbditrace_capicall_str_t;
+
+/* ---- QBDITRACE_REC_MEMIMG ----
+ *
+ * One chunk of a process-memory snapshot captured at qbditrace_configure()
+ * time (i.e. the state BEFORE the first traced instruction executes).  The
+ * writer emits these only when the caller opts in via
+ * qbditrace_config_t::enable_mem_snapshot + snapshot_ranges[].
+ *
+ * Purpose: give the offline analyser (tenet) a base layer for addresses that
+ * were set up by UNINSTRUMENTED code before tracing started (decrypted
+ * strings/keys in .data/.bss, runtime-filled tables) and are never written
+ * by traced code.  tenet layers it UNDER the per-instruction write/read log:
+ * a byte resolved from the write or read log always wins; the snapshot only
+ * fills bytes that have no logged access, and is explicitly tagged as
+ * "snapshot" (an approximation of the value at query time).
+ *
+ * Layout: fixed 24-byte header followed by `len` raw bytes (no trailing
+ * padding).  record_size == sizeof(header) + len, making the record fully
+ * self-describing (readers may skip it via record_size alone).
+ *
+ * Stream contract: ALL MEMIMG records precede the first REC_INST record.
+ * Chunks belonging to one configured range share monotonically increasing
+ * `seq`; chunks are at most QBDITRACE_MEMIMG_CHUNK_MAX bytes of payload.
+ * Ranges that are (partially) unreadable are emitted with holes: only the
+ * readable runs appear as records. */
+typedef struct {
+  uint8_t  kind;        /* == QBDITRACE_REC_MEMIMG */
+  uint8_t  flags;       /* reserved, must be 0 */
+  uint16_t record_size; /* total bytes of this record (header + len) */
+  uint32_t seq;         /* chunk sequence number within the snapshot (0-based) */
+  uint64_t addr;        /* runtime address of data[0] */
+  uint32_t len;         /* number of valid payload bytes that follow */
+  uint32_t reserved;    /* must be 0 */
+  /* uint8_t data[len]; — raw bytes follow immediately */
+} qbditrace_memimg_t;
+
+/* Maximum payload bytes per MEMIMG record.  Chosen so record_size
+ * (24 + payload) stays well within the uint16_t record_size field. */
+#define QBDITRACE_MEMIMG_CHUNK_MAX (32u * 1024u)
 
 /* ---- qbditrace_capi_id_t ----
  * Stable numeric identifiers for well-known C / platform API functions.
@@ -1086,6 +1135,8 @@ static_assert(sizeof(qbditrace_objc_head_v8_t) == 80,
               "objc head v8 must remain 80 bytes");
 static_assert(sizeof(qbditrace_retval_t) == 64,
               "retval record must be 64 bytes");
+static_assert(sizeof(qbditrace_memimg_t) == 24,
+              "memimg head must be 24 bytes (4B + 4B seq + 8B addr + 4B len + 4B reserved)");
 static_assert(sizeof(qbditrace_capicall_str_t) == 4,
               "capicall str must be 4 bytes (4 × u8)");
 #endif

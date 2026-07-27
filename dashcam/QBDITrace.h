@@ -271,6 +271,44 @@ typedef struct {
  * stride is therefore 16 bytes; external writers (e.g. the Frida agent)
  * must use the 16-byte stride and zero the padding. */
   } capi_funcs[QBDITRACE_MAX_CAPI_FUNCS];
+
+  /* ---- Memory image snapshot (opt-in, default OFF) ----
+   *
+   * When enable_mem_snapshot is non-zero, the tracer captures the contents of
+   * each [start, end) range in snapshot_ranges[] at qbditrace_configure()
+   * time (before the first traced instruction executes) and writes them into
+   * the trace as REC_MEMIMG records (version 9, HF_MEMIMG).
+   *
+   * Rationale: the per-instruction write/read log only covers addresses that
+   * traced code actually touches.  Globals set up by UNINSTRUMENTED code
+   * before tracing started (decrypted strings/keys in .data/.bss,
+   * runtime-filled tables) are invisible to the offline analyser unless they
+   * happen to be read.  The snapshot gives tenet a base memory layer for
+   * exactly those addresses; bytes covered by the write/read log still win,
+   * and snapshot bytes are explicitly tagged as such.
+   *
+   * Intended ranges are the traced module's writable data sections
+   * (__DATA/__bss on Mach-O, .data/.bss on ELF).  Do NOT add rodata
+   * (redundant with tenet's --image fallback), heap, or stack — dumping
+   * large mappings wastes file space for no analytical gain.
+   *
+   * Unreadable pages inside a range are skipped (the record stream simply
+   * has a hole there); a hard safety cap of 256 MiB total payload applies.
+   * Zero (the default) disables the feature entirely and produces a
+   * bit-identical trace to previous versions.
+   *
+   * n_snapshot_ranges: number of valid entries (0..QBDITRACE_MAX_SNAPSHOT_RANGES).
+   * Entries where end <= start are silently skipped. */
+  uint32_t enable_mem_snapshot; /* non-zero to enable (default: 0 = off) */
+  uint32_t n_snapshot_ranges;
+
+  /* Maximum number of memory snapshot ranges. */
+#define QBDITRACE_MAX_SNAPSHOT_RANGES 8
+
+  struct {
+    uint64_t start;  /* runtime start address */
+    uint64_t end;    /* runtime end address (excluded) */
+  } snapshot_ranges[QBDITRACE_MAX_SNAPSHOT_RANGES];
 } qbditrace_config_t;
 
 /*

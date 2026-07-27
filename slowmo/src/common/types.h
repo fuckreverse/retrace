@@ -104,7 +104,7 @@ public:
 
 constexpr uint32_t TRACE_MAGIC = 0x51424454u;  // "QBDT"
 constexpr uint32_t TRACE_VERSION = 4u;
-constexpr uint32_t TRACE_VERSION_MAX = 8u;  // highest supported version
+constexpr uint32_t TRACE_VERSION_MAX = 9u;  // highest supported version
 
 constexpr uint8_t AARCH64_GPR_COUNT = 34;  // x0-x28, fp(x29), lr(x30), sp, nzcv, pc
 constexpr uint8_t AARCH64_FPR_COUNT = 32;  // v0-v31 (128-bit each)
@@ -126,6 +126,7 @@ enum class RecordKind : uint8_t {
     Code     = 6,
     CapiCall = 7,   /* C/platform API call with semantic args (mem*, str*, JNI, etc.) */
     Retval   = 8,   /* return fact for ObjC/CAPI/SVC */
+    MemImg   = 9,   /* configure-time memory snapshot chunk */
 };
 
 // ─── FPR value (128-bit vector register) ─────────────────────────────────

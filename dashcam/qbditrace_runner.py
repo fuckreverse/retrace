@@ -50,6 +50,13 @@ Examples:
         --trace-gcd \\
         --output /var/mobile/Documents/trace.bin
 
+    # Capture an opt-in memory snapshot before tracing
+    python3 qbditrace_runner.py \\
+        --target com.example.app \\
+        --entry 0xABC \\
+        --snapshot-range 0x100010000 0x100012000 \\
+        --output /var/mobile/Documents/trace.bin
+
     # Attach to running process
     python3 qbditrace_runner.py \\
         --target com.example.app \\
@@ -344,6 +351,11 @@ def parse_args():
                           'START:SIZE, hex). Can be specified multiple times (max 8). '
                           'Code in excluded ranges executes natively without recording. '
                           'Example: --exclude-range 0x1234-0x5678 --exclude-range 0xA000:0x200')
+    rec.add_argument('--snapshot-range', nargs=2, metavar=('START', 'END'),
+                     action='append', default=[],
+                     help='Capture an opt-in memory snapshot of absolute runtime range '
+                          '[START, END) before tracing. Addresses accept decimal or 0x-prefixed '
+                          'hex. Can be specified multiple times (max 8).')
     rec.add_argument('--sampling', action='store_true',
                      help='Reconnaissance mode: produce a small, bare PC-stream trace '
                           '(record = QBDITRACE_REC_SAMPLING, i.e. only REC_INST + '
@@ -509,6 +521,24 @@ def parse_args():
     for patch_raw in args.patch:
         args._patches.append(_parse_patch_spec(patch_raw, p))
 
+    # Parse --snapshot-range (absolute runtime addresses).
+    args._snapshot_ranges = []
+    if len(args.snapshot_range) > 8:
+        p.error('--snapshot-range: maximum 8 ranges supported')
+    for start_raw, end_raw in args.snapshot_range:
+        try:
+            start = int(start_raw, 0)
+            end = int(end_raw, 0)
+        except ValueError:
+            p.error(f'--snapshot-range "{start_raw} {end_raw}": invalid address; '
+                    f'use decimal or 0x-prefixed hexadecimal')
+        if start < 0 or end < 0:
+            p.error(f'--snapshot-range "{start_raw} {end_raw}": addresses must be non-negative')
+        if end <= start:
+            p.error(f'--snapshot-range "{start_raw} {end_raw}": end must be greater than start')
+        # Encode as strings so JSON transport does not lose 64-bit address precision.
+        args._snapshot_ranges.append({'start': hex(start), 'end': hex(end)})
+
     # Parse --exclude-range (can be specified multiple times): "START-END" or "START:SIZE"
     args._exclude_ranges = []
     if len(args.exclude_range) > 8:
@@ -570,6 +600,7 @@ def build_config(args):
         'fpr': args.fpr,
         'noCompress': args.no_compress,
         'excludeRanges': args._exclude_ranges,
+        'memSnapshot': {'ranges': args._snapshot_ranges},
         'argCount': args.arg_count,
         'traceMode': args.trace_mode,
         'rehook': not args.no_rehook,
@@ -873,6 +904,10 @@ def main():
     for i, er in enumerate(args._exclude_ranges):
         print(f'  Exclude[{i}]:  0x{er["start"]:X} - 0x{er["end"]:X} '
               f'(size 0x{er["end"] - er["start"]:X})')
+    for i, sr in enumerate(args._snapshot_ranges):
+        start = int(sr['start'], 0)
+        end = int(sr['end'], 0)
+        print(f'  Snapshot[{i}]: 0x{start:X} - 0x{end:X} (size 0x{end - start:X})')
     for i, p in enumerate(args._patches):
         prefix = '+' if p['is_offset'] else ''
         nbytes = len(p['hex']) // 2

@@ -810,6 +810,39 @@ struct TraceWriter {
         fwrite(&hdr, sizeof(hdr), 1, fp);
     }
 
+    /// Write a v9 memory snapshot header. Passing false is useful for testing
+    /// rejection of a v9 version tag without its required HF_MEMIMG flag.
+    void write_header_v9(bool include_memimg_flag = true,
+                         uint64_t code_size = 0x100000) {
+        qbditrace::qbditrace_file_header_t hdr = {};
+        hdr.magic = QBDITRACE_MAGIC;
+        hdr.version = QBDITRACE_VERSION_V9_MEMIMG;
+        hdr.arch = QBDITRACE_ARCH_AARCH64;
+        hdr.num_gpr = num_gpr;
+        hdr.module_base = module_base;
+        hdr.module_slide = module_slide;
+        hdr.trace_start = module_base + module_slide;
+        hdr.trace_end = module_base + module_slide + code_size;
+        hdr.flags = QBDITRACE_HF_HAS_MEM | QBDITRACE_HF_HAS_NZCV |
+                    QBDITRACE_HF_REG_DIFF | QBDITRACE_HF_HAS_CODE;
+        if (include_memimg_flag) hdr.flags |= QBDITRACE_HF_MEMIMG;
+        strncpy(hdr.module_name, module_name, sizeof(hdr.module_name) - 1);
+        fwrite(&hdr, sizeof(hdr), 1, fp);
+    }
+
+    /// Write one variable-length REC_MEMIMG record without payload padding.
+    void write_memimg(uint64_t addr, const std::vector<uint8_t>& bytes,
+                      uint32_t seq = 0) {
+        qbditrace::qbditrace_memimg_t h = {};
+        h.kind = QBDITRACE_REC_MEMIMG;
+        h.record_size = static_cast<uint16_t>(sizeof(h) + bytes.size());
+        h.seq = seq;
+        h.addr = addr;
+        h.len = static_cast<uint32_t>(bytes.size());
+        fwrite(&h, sizeof(h), 1, fp);
+        if (!bytes.empty()) fwrite(bytes.data(), 1, bytes.size(), fp);
+    }
+
     /// Emit a REC_CAPICALL record using the v8 88-byte header.
     /// Must be called after write_header_v8().
     void emit_capicall_v8(uint16_t api_id, uint64_t pc, uint64_t target,

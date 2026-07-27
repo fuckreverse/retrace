@@ -17,7 +17,13 @@ The time model uses an exclusive `at_inst_id`: queries find writes with `inst_id
 
 This semantics is guarded by `compute_trace_fingerprint()` schema version (currently 2), which invalidates stale persisted indexes to force rebuild.
 
-Recorded reads can recover data prepared by uninstrumented code (shared cache, system libraries). Data never observed at all remains irretrievable.
+Recorded reads can recover data prepared by uninstrumented code (shared cache, system libraries). Data never observed at all remains irretrievable — unless it was captured in a configure-time snapshot (below).
+
+### Configure-time snapshot base layer (v9)
+
+When the trace was recorded with `qbditrace --snapshot-range` (v9 `REC_MEMIMG` records), `MemoryModel` lazily loads those chunks as a **base layer beneath the access logs**. Byte resolution order is: write log → read log → snapshot. The snapshot fills only bytes no traced instruction ever touched — typically globals set up by uninstrumented code before tracing started (decrypted strings or keys in `.data`/`.bss`, runtime-filled tables).
+
+Snapshot bytes carry the sentinel `writer_inst_id` `kSnapshotWriterId` (`UINT64_MAX`, check with `is_snapshot_writer()`): the value is the memory content at trace start (`inst_id 0`), so using it at a later instant is an *explicitly marked approximation*, never a silent one. At `at_inst_id == 0` the snapshot answers directly. Snapshot regions do not count as accesses — they never appear in `active_pages()` or `was_accessed()`.
 
 ## Time-aware memory read
 
@@ -185,7 +191,7 @@ MCP: `yara_mem_scan` tool; Tauri frontend: **Tools → YARA Scan…**
 ## Evidence and limits
 
 - All memory results depend on **recorded writes and reads**. Unaccessed pages remain unknown.
-- Recorded reads can recover data from uninstrumented code; data never observed at all is irretrievable.
+- Recorded reads can recover data from uninstrumented code; data never observed at all is irretrievable unless a v9 `REC_MEMIMG` snapshot covers it (snapshot bytes are marked with the `kSnapshotWriterId` sentinel and represent trace-start state).
 - `strings` captures each memory write's post-write snapshot, not a single final state — overwritten values at earlier writes are still discoverable.
 - `memory_strings` discovers transient call-site arguments that `strings` can miss due to later coverage.
 - Both CLI and the Tauri frontend accept an exact address and size. CLI additionally uses `--entropy-at` for the instant and `--entropy-timeline` for the timeline; MCP `entropy_analysis` paginates backend pass results.

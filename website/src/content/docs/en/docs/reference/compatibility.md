@@ -14,6 +14,7 @@ Tenet degrades gracefully when trace evidence is incomplete. This page documents
 | v5 | `HF_PC_DELTA` | Reduced file size (pc_delta mode); Tenet auto-detects |
 | v7 | `HF_HAS_FPR` | FPR (NEON v0-v31) reconstruction |
 | v8 | `HF_CALL_META` (required; may combine with `HF_PC_DELTA` / `HF_HAS_FPR`) | Call metadata: true return values (`REC_RETVAL`), inline selectors, and wider API IDs |
+| v9 | `HF_MEMIMG` (required for v9; orthogonal to all layout flags) | Configure-time memory snapshot (`REC_MEMIMG`); recorded with `qbditrace --snapshot-range`, all records precede the first `INST` |
 | v6 | `HF_OLD_VALUE` | Pre-write memory values (writer removed; no current trace produces this) |
 
 Tenet opens any trace with version ≥ 4.
@@ -53,6 +54,7 @@ Tenet opens any trace with version ≥ 4.
 |---|---|---|
 | Memory accesses (writes) | Yes | No memory reconstruction |
 | Memory accesses (reads) | For uninstrumented data | Unknown bytes for unread pages |
+| `REC_MEMIMG` snapshot (v9, opt-in) | For never-touched globals | Untouched pages stay unknown; snapshot bytes are marked as trace-start approximations (`kSnapshotWriterId`) |
 | Embedded code or image | For string scanning | Stack/heap only |
 
 ### Platform API

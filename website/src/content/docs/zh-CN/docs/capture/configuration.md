@@ -66,7 +66,17 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--fpr` | off | 启用 v7 FPR/NEON 记录：每条指令写 FPR diff + 每个锚点增加 512B FPR 快照 |
 | `--no-compress` | off | 关闭默认 1 MiB 分块 zstd 压缩 |
 | `--exclude-range` | 无 | 排除地址范围（格式：`START-END` 或 `START:SIZE`，hex 静态偏移）。最多 8 个。区间内代码原生执行，零 trace 开销 |
+| `--snapshot-range` | 无 | 可选内存快照：对绝对运行时范围 `START END`（十进制或 0x 十六进制）在 configure 时做一次快照（v9 `REC_MEMIMG`）。可重复，最多 8 个。目标应为模块可写数据段（`__DATA`/`__bss`）——不要 dump rodata（Tenet 的 `--image` 回退已覆盖）、heap 或 stack。Tenet 解析字节时优先写/读日志，快照只作为显式标注的基底层 |
 | `--sampling` | off | **侦察模式**：只记录裸 PC 流（不含寄存器/内存/序列事件），体积缩小 ≈80%+，但循环次数与回边完全精确。隐含开启 `--pc-delta` 与大 anchor interval。见下方*侦察工作流* |
+
+```bash
+# 在 trace 前快照模块的可写数据段
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --entry 0xABC \
+    --snapshot-range 0x100010000 0x100012000 \
+    --output /var/mobile/Documents/trace.bin
+```
 
 ## Pre-trace 内存 patch
 

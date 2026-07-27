@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>    // std::make_unique
+#include <algorithm>
 
 #if TENET_HAS_ZSTD
 #include <zstd.h>
@@ -172,6 +173,13 @@ ThreadView RecordView::as_thread() const {
     return v;
 }
 
+MemImgView RecordView::as_memimg() const {
+    qbditrace::qbditrace_memimg_t hdr{};
+    std::memcpy(&hdr, raw_ptr, std::min(available_size, sizeof(hdr)));
+    return {hdr.seq, hdr.addr, hdr.len,
+            raw_ptr + sizeof(qbditrace::qbditrace_memimg_t)};
+}
+
 RetvalView RecordView::as_retval() const {
     qbditrace::qbditrace_retval_t hdr{};
     std::memcpy(&hdr, raw_ptr, std::min(available_size, sizeof(hdr)));
@@ -244,6 +252,8 @@ size_t RecordView::byte_size(uint32_t num_gpr) const {
     }
     case RecordKind::Retval:
         return as_retval().byte_size();
+    case RecordKind::MemImg:
+        return as_memimg().byte_size();
     }
     return 1;  // unknown kind, skip 1 byte (shouldn't happen)
 }
@@ -312,8 +322,8 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
         return Error::invalid_magic();
     }
 
-    // Version tags describe the newest layout contract in use. CALL_META is
-    // strictly v8-only; v8 requires it and may compose with earlier layouts.
+    // Version tags describe the newest layout contract in use. v8 CALL_META
+    // and v9 MEMIMG may compose with earlier layout flags.
     const uint32_t ver = raw_hdr->version;
     const uint64_t flg = raw_hdr->flags;
     const bool pc_delta = (flg & qbditrace::QBDITRACE_HF_PC_DELTA) != 0;
@@ -336,6 +346,9 @@ Result<TraceReader> TraceReader::open(const std::filesystem::path& path) {
         break;
     case QBDITRACE_VERSION_V8_CALL_META:
         version_ok = call_meta;
+        break;
+    case QBDITRACE_VERSION_V9_MEMIMG:
+        version_ok = (flg & qbditrace::QBDITRACE_HF_MEMIMG) != 0;
         break;
     default:
         break;
@@ -802,6 +815,13 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
                                         sizeof(qbditrace::qbditrace_retval_t));
         }
         break;
+    case RecordKind::MemImg:
+        if (remaining < sizeof(qbditrace::qbditrace_memimg_t)) {
+            rec_size = remaining;
+        } else {
+            rec_size = raw_record_size(ptr, reader_->header_, remaining);
+        }
+        break;
     default:
         // Fallback: parse via RecordView (shouldn't happen in valid traces)
         rec_size = reader_->record_at(offset_).byte_size(reader_->header_.num_gpr);
@@ -830,6 +850,58 @@ TraceReader::Iterator TraceReader::begin() const {
 
 TraceReader::Iterator TraceReader::end() const {
     return Iterator(this, logical_size_);
+}
+
+std::vector<MemSnapshotRegion> TraceReader::collect_memimg_regions() const {
+    std::vector<MemSnapshotRegion> regions;
+    for (auto it = begin(); it != end(); ++it) {
+        const auto rec = *it;
+        if (rec.kind == RecordKind::Inst) break;
+        if (rec.kind != RecordKind::MemImg) continue;
+
+        const auto memimg = rec.as_memimg();
+        if (memimg.len == 0) continue;
+
+        const auto* raw_header = reinterpret_cast<const qbditrace::qbditrace_memimg_t*>(
+            rec.raw_ptr);
+        const size_t record_payload = raw_header->record_size > sizeof(*raw_header)
+            ? raw_header->record_size - sizeof(*raw_header)
+            : 0;
+        const size_t stream_payload = rec.available_size > sizeof(*raw_header)
+            ? rec.available_size - sizeof(*raw_header)
+            : 0;
+        const size_t payload_size = std::min<size_t>(
+            memimg.len, std::min(record_payload, stream_payload));
+        if (payload_size == 0) continue;
+
+        MemSnapshotRegion region;
+        region.addr = memimg.addr;
+        region.data.assign(memimg.data, memimg.data + payload_size);
+        regions.push_back(std::move(region));
+    }
+
+    std::stable_sort(regions.begin(), regions.end(),
+                     [](const MemSnapshotRegion& lhs, const MemSnapshotRegion& rhs) {
+                         return lhs.addr < rhs.addr;
+                     });
+
+    std::vector<MemSnapshotRegion> merged;
+    merged.reserve(regions.size());
+    for (auto& region : regions) {
+        if (merged.empty() || region.addr > merged.back().end()) {
+            merged.push_back(std::move(region));
+            continue;
+        }
+
+        auto& previous = merged.back();
+        if (region.end() <= previous.end()) continue;
+
+        const size_t overlap = static_cast<size_t>(previous.end() - region.addr);
+        previous.data.insert(previous.data.end(),
+                             region.data.begin() + static_cast<std::ptrdiff_t>(overlap),
+                             region.data.end());
+    }
+    return merged;
 }
 
 TraceReader::Iterator TraceReader::begin(const ThreadReader& tr) const {

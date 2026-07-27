@@ -11,7 +11,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include "TraceFormat.h"
 
 using namespace qbditrace;
@@ -46,6 +48,11 @@ static_assert(sizeof(qbditrace_objc_head_v8_t) == 80,
     "v8 objc head must remain 80 bytes");
 static_assert(sizeof(qbditrace_retval_t) == 64,
     "retval must be 64 bytes");
+static_assert(sizeof(qbditrace_memimg_t) == 24,
+    "memimg head must be 24 bytes");
+static_assert(QBDITRACE_MEMIMG_CHUNK_MAX + sizeof(qbditrace_memimg_t) <=
+                  std::numeric_limits<uint16_t>::max(),
+    "maximum memimg record must fit in record_size");
 static_assert(offsetof(qbditrace_retval_t, source_id) == 8,
     "retval source_id must start at byte 8");
 static_assert(offsetof(qbditrace_retval_t, nzcv) == 56,
@@ -77,6 +84,7 @@ TEST_CASE("TraceFormat: record kind enum values", "[unit][qbditrace][trace_forma
     CHECK(QBDITRACE_REC_CODE   == 6);
     CHECK(QBDITRACE_REC_CAPICALL == 7);
     CHECK(QBDITRACE_REC_RETVAL == 8);
+    CHECK(QBDITRACE_REC_MEMIMG == 9);
 }
 
 // ─── Header flag bits ─────────────────────────────────────────────────────────
@@ -89,6 +97,17 @@ TEST_CASE("TraceFormat: header flag bit values", "[unit][qbditrace][trace_format
     CHECK(QBDITRACE_HF_PC_DELTA == 16u);
     CHECK(QBDITRACE_HF_CALL_META == (1u << 10));
     CHECK(QBDITRACE_HF_WIDE_API_ID == QBDITRACE_HF_CALL_META);
+    CHECK(QBDITRACE_HF_MEMIMG == (1u << 11));
+}
+
+TEST_CASE("TraceFormat: MEMIMG maximum record fits record_size",
+          "[unit][qbditrace][trace_format][memimg]") {
+    // In-Got-Want: the fixed header and maximum payload must fit uint16_t.
+    const size_t got = sizeof(qbditrace_memimg_t) + QBDITRACE_MEMIMG_CHUNK_MAX;
+    const size_t want_max = std::numeric_limits<uint16_t>::max();
+
+    CHECK(sizeof(qbditrace_memimg_t) == 24);
+    CHECK(got <= want_max);
 }
 
 // ─── File header initialization ──────────────────────────────────────────────

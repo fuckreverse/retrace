@@ -17,7 +17,13 @@ Tenet 在选定时刻重建内存、发现字符串、捕获快照、搜索模�
 
 该语义由 `compute_trace_fingerprint()` 的 schema 版本号（当前 = 2）保护，版本不匹配会失效旧持久化索引以触发重建。
 
-已记录的 read 可恢复由未插桩代码准备的数据（共享缓存、系统库）。完全未被观察的数据不可恢复。
+已记录的 read 可恢复由未插桩代码准备的数据（共享缓存、系统库）。完全未被观察的数据不可恢复——除非它被 configure 时的快照覆盖（见下）。
+
+### configure 时快照基底层（v9）
+
+如果 trace 录制时用了 `qbditrace --snapshot-range`（v9 `REC_MEMIMG` 记录），`MemoryModel` 会把这些快照块懒加载为**访问日志之下的基底层**。字节解析顺序：写日志 → 读日志 → 快照。快照只填补从未被任何指令触碰的字节——典型场景是 trace 开始前由未插桩代码（解密壳、启动代码）写入的全局状态（`.data`/`.bss` 中的解密字符串/密钥、运行时填充的表）。
+
+快照字节的 `writer_inst_id` 为哨兵值 `kSnapshotWriterId`（`UINT64_MAX`，用 `is_snapshot_writer()` 判定）：它是 trace 起始时刻（`inst_id 0`）的值，用于更晚时刻是**显式标注的近似**，绝不静默。`at_inst_id == 0` 时快照直接作答。快照区域不算访问——不会出现在 `active_pages()` / `was_accessed()` 中。
 
 ## 时间感知内存读取
 
@@ -185,7 +191,7 @@ MCP：`yara_mem_scan` tool；Tauri 前端：**Tools → YARA Scan…**
 ## 证据与限制
 
 - 所有内存结果依赖**已记录的写入与读取**。未访问页保持未知。
-- 已记录的 read 可恢复未插桩代码准备的数据；完全未被观察的数据不可恢复。
+- 已记录的 read 可恢复未插桩代码准备的数据；完全未被观察的数据不可恢复，除非被 v9 `REC_MEMIMG` 快照覆盖（快照字节以 `kSnapshotWriterId` 哨兵标注，代表 trace 起始状态）。
 - `strings` 捕获的是每次写入后的快照，不是单一最终状态 —— 早期写入的（后来被覆盖的）值仍可被发现。
 - `memory_strings` 能发现 `strings` 因后期覆盖而遗漏的瞬时调用点参数。
 - CLI 和 Tauri 前端都可指定精确地址与大小；CLI 另用 `--entropy-at` 选择时刻、`--entropy-timeline` 请求时间线。MCP `entropy_analysis` 分页返回后端 Pass 结果。

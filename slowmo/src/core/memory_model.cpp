@@ -857,6 +857,79 @@ void MemoryModel::find_covering_write(rocksdb::Iterator* iter,
 
 // ─── Public query methods ─────────────────────────────────────────────────
 
+void MemoryModel::ensure_snapshot_loaded() {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (snapshot_loaded_.load(std::memory_order_relaxed)) return;
+
+    snapshot_regions_ = reader_.collect_memimg_regions();
+    std::sort(snapshot_regions_.begin(), snapshot_regions_.end(),
+              [](const MemSnapshotRegion& lhs, const MemSnapshotRegion& rhs) {
+                  return lhs.addr < rhs.addr;
+              });
+    // Release-publish: readers that observe snapshot_loaded_ == true (acquire)
+    // are guaranteed to see the fully populated snapshot_regions_.
+    snapshot_loaded_.store(true, std::memory_order_release);
+}
+
+bool MemoryModel::has_snapshot() const {
+    if (!snapshot_loaded_.load(std::memory_order_acquire)) {
+        const_cast<MemoryModel*>(this)->ensure_snapshot_loaded();
+    }
+    return !snapshot_regions_.empty();
+}
+
+void MemoryModel::apply_snapshot(uint64_t addr, uint8_t size, MemReadResult& result) {
+    // Lock-free fast path: once loaded, snapshot_regions_ is immutable.
+    if (!snapshot_loaded_.load(std::memory_order_acquire)) {
+        ensure_snapshot_loaded();
+    }
+    if (snapshot_regions_.empty()) return;
+
+    for (uint8_t i = 0; i < size; ++i) {
+        if (result.known[i]) continue;
+
+        const uint64_t target = addr + i;
+        auto it = std::upper_bound(
+            snapshot_regions_.begin(), snapshot_regions_.end(), target,
+            [](uint64_t address, const MemSnapshotRegion& region) {
+                return address < region.addr;
+            });
+        if (it == snapshot_regions_.begin()) continue;
+        --it;
+        if (target < it->addr || target >= it->end()) continue;
+
+        result.data[i] = it->data[static_cast<size_t>(target - it->addr)];
+        result.known[i] = true;
+        result.writer_id[i] = kSnapshotWriterId;
+    }
+}
+
+void MemoryModel::apply_snapshot(uint64_t addr, RegionReadResult& result) {
+    // Lock-free fast path: once loaded, snapshot_regions_ is immutable.
+    if (!snapshot_loaded_.load(std::memory_order_acquire)) {
+        ensure_snapshot_loaded();
+    }
+    if (snapshot_regions_.empty()) return;
+
+    for (size_t i = 0; i < result.data.size(); ++i) {
+        if (result.known[i]) continue;
+
+        const uint64_t target = addr + i;
+        auto it = std::upper_bound(
+            snapshot_regions_.begin(), snapshot_regions_.end(), target,
+            [](uint64_t address, const MemSnapshotRegion& region) {
+                return address < region.addr;
+            });
+        if (it == snapshot_regions_.begin()) continue;
+        --it;
+        if (target < it->addr || target >= it->end()) continue;
+
+        result.data[i] = it->data[static_cast<size_t>(target - it->addr)];
+        result.known[i] = true;
+        ++result.known_count;
+    }
+}
+
 MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id) {
     MemReadResult result{};
     if (size == 0 || size > 16) return result;
@@ -865,11 +938,9 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
     // at_inst_id is exclusive: find the most recent write with inst_id < at_inst_id.
     // This matches the "state before instruction at_inst_id executes" semantics used
-    // everywhere in tenet (state_before, last_writer, etc.).
-    // When at_inst_id == 0, no writes have occurred yet → result is all-unknown.
-    if (at_inst_id == 0) return result;
-
-    if (has_rocksdb_) {
+    // everywhere in tenet (state_before, last_writer, etc.). At inst_id 0, skip
+    // access logs but still resolve bytes from the configure-time snapshot.
+    if (at_inst_id > 0 && has_rocksdb_) {
         // Optimised path: use index_read_range() for batch reading with
         // thread-local page cache to skip mutex on repeated same-page hits.
         //
@@ -956,10 +1027,11 @@ MemReadResult MemoryModel::read(uint64_t addr, uint8_t size, uint64_t at_inst_id
 
             offset += chunk;
         }
-    } else {
+    } else if (!has_rocksdb_) {
         return read_inmemory(addr, size, at_inst_id);
     }
 
+    apply_snapshot(addr, size, result);
     return result;
 }
 
@@ -1234,36 +1306,39 @@ size_t MemoryModel::index_read_range(const PageWriteIndex& idx,
 
 MemReadResult MemoryModel::read_inmemory(uint64_t addr, uint8_t size, uint64_t at_inst_id) {
     MemReadResult result{};
-    std::lock_guard<std::mutex> lk(page_cache_mutex_);
-    for (uint8_t i = 0; i < size; i++) {
-        uint64_t byte_addr = addr + i;
-        uint64_t page = page_of(byte_addr);
+    {
+        std::lock_guard<std::mutex> lk(page_cache_mutex_);
+        for (uint8_t i = 0; i < size; i++) {
+            uint64_t byte_addr = addr + i;
+            uint64_t page = page_of(byte_addr);
 
-        auto* writes = page_cache_.get_mutable(page);
-        if (!writes) continue;
+            auto* writes = page_cache_.get_mutable(page);
+            if (!writes) continue;
 
-        stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+            stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
 
-        // Scan from newest to oldest to find last write covering this byte.
-        // at_inst_id is exclusive: we want inst_id < at_inst_id ("before" semantics),
-        // matching the RocksDB path which uses search_id = at_inst_id - 1.
-        const MemWrite* best = nullptr;
-        for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
-            if (rit->inst_id >= at_inst_id) continue;
-            // Check if this write covers our byte
-            if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
-                best = &(*rit);
-                break;
+            // Scan from newest to oldest to find last write covering this byte.
+            // at_inst_id is exclusive: we want inst_id < at_inst_id ("before" semantics),
+            // matching the RocksDB path which uses search_id = at_inst_id - 1.
+            const MemWrite* best = nullptr;
+            for (auto rit = writes->rbegin(); rit != writes->rend(); ++rit) {
+                if (rit->inst_id >= at_inst_id) continue;
+                // Check if this write covers our byte
+                if (byte_addr >= rit->addr && byte_addr < rit->addr + rit->size) {
+                    best = &(*rit);
+                    break;
+                }
+            }
+
+            if (best) {
+                uint8_t offset_in_write = static_cast<uint8_t>(byte_addr - best->addr);
+                result.data[i] = best->data[offset_in_write];
+                result.known[i] = true;
+                result.writer_id[i] = best->inst_id;
             }
         }
-
-        if (best) {
-            uint8_t offset_in_write = static_cast<uint8_t>(byte_addr - best->addr);
-            result.data[i] = best->data[offset_in_write];
-            result.known[i] = true;
-            result.writer_id[i] = best->inst_id;
-        }
     }
+    apply_snapshot(addr, size, result);
     return result;
 }
 
@@ -1359,7 +1434,10 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
         return result;
     }
 
-    if (at_inst_id == 0) return result;
+    if (at_inst_id == 0) {
+        apply_snapshot(addr, result);
+        return result;
+    }
     const uint64_t search_id = at_inst_id - 1;
 
     // Get thread-local iterators (needed for load_page_index on cache miss).
@@ -1441,6 +1519,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region(uint64_t addr, size_t siz
         off += bytes_on_page;
     }
 
+    apply_snapshot(addr, result);
     return result;
 }
 
@@ -1496,8 +1575,12 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
     result.known_count = 0;
 
     if (size == 0) return result;
-    // at_inst_id == 0 means before any instruction — nothing written yet.
-    if (at_inst_id == 0) return result;
+    // At inst_id 0 no access-log entries are eligible, but the snapshot is
+    // precisely the configure-time base state and remains queryable.
+    if (at_inst_id == 0) {
+        apply_snapshot(addr, result);
+        return result;
+    }
 
     // Exclusive semantics: find writes with inst_id < at_inst_id.
     const uint64_t search_id = at_inst_id - 1;
@@ -1648,6 +1731,7 @@ MemoryModel::RegionReadResult MemoryModel::read_region_impl(
         }
     }
 
+    apply_snapshot(addr, result);
     return result;
 }
 
