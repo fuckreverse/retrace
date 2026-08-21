@@ -95,10 +95,64 @@ Examples:
 import argparse
 import frida
 import os
+from pathlib import Path
 import signal
 import sys
 import threading
 import time
+
+# Frida 17.x: ObjC/Java bridges are loaded on-demand via 'frida:load-bridge' messages.
+# We need to handle these requests by sending back the bridge source from frida_tools/bridges/.
+_BRIDGES_DIR = None
+def _find_bridges_dir():
+    global _BRIDGES_DIR
+    if _BRIDGES_DIR is not None:
+        return _BRIDGES_DIR
+    # Try frida_tools package
+    try:
+        import frida_tools
+        candidate = Path(frida_tools.__file__).parent / 'bridges'
+        if candidate.is_dir():
+            _BRIDGES_DIR = candidate
+            return _BRIDGES_DIR
+    except ImportError:
+        pass
+    # Try common locations
+    for p in [Path(sys.prefix) / 'lib' / 'python3' / 'site-packages' / 'frida_tools' / 'bridges',
+              Path.home() / 'Library' / 'Python' / '3.14' / 'lib' / 'python' / 'site-packages' / 'frida_tools' / 'bridges']:
+        if p.is_dir():
+            _BRIDGES_DIR = p
+            return _BRIDGES_DIR
+    return None
+
+# Bridge loader JS snippet — inject this before the agent code so ObjC/Java globals are available.
+_BRIDGE_LOADER_JS = r'''
+(function() {
+    function loadBridge(name) {
+        send({type: "frida:load-bridge", name: name});
+        var result = null;
+        recv("frida:bridge-loaded", function(msg) {
+            result = msg;
+        }).wait();
+        if (result === null) throw new Error("Failed to load bridge: " + name);
+        return Script.evaluate("/frida/bridges/" + result.filename,
+            "(function () { " + [result.source,
+            "Object.defineProperty(globalThis, '" + name + "', { value: bridge });",
+            "return bridge;"].join("\\n") + " })();");
+    }
+    ["ObjC", "Java", "Swift"].forEach(function(name) {
+        Object.defineProperty(globalThis, name, {
+            enumerable: true,
+            configurable: true,
+            get: function() {
+                var bridge = loadBridge(name);
+                Object.defineProperty(globalThis, name, { value: bridge });
+                return bridge;
+            }
+        });
+    });
+})();
+'''
 
 
 # =============================================================================
@@ -677,6 +731,9 @@ class TracerSession:
         with open(agent_path, 'r') as f:
             agent_source = f.read()
 
+        # Frida 17.x: prepend bridge loader so ObjC/Java globals work
+        agent_source = _BRIDGE_LOADER_JS + '\n' + agent_source
+
         self.script = self.session.create_script(agent_source)
         self.script.on('message', self._on_message)
         self.script.set_log_handler(self._on_log)
@@ -733,6 +790,29 @@ class TracerSession:
         """Handle messages from the JS agent."""
         if message['type'] == 'send':
             payload = message['payload']
+
+            # Frida 17.x: handle on-demand bridge loading
+            if isinstance(payload, dict) and payload.get('type') == 'frida:load-bridge':
+                name = payload['name']
+                bridges_dir = _find_bridges_dir()
+                if bridges_dir is not None:
+                    bridge_file = bridges_dir / (name.lower() + '.js')
+                    if bridge_file.exists():
+                        source = bridge_file.read_text(encoding='utf-8')
+                        self.script.post({
+                            'type': 'frida:bridge-loaded',
+                            'filename': bridge_file.name,
+                            'source': source
+                        })
+                        return
+                print(f'\033[91m[bridge] Failed to load {name} bridge\033[0m', file=sys.stderr)
+                self.script.post({
+                    'type': 'frida:bridge-loaded',
+                    'filename': name.lower() + '.js',
+                    'source': 'var bridge = {};'
+                })
+                return
+
             msg_type = payload.get('type', '')
 
             if msg_type == 'log':
