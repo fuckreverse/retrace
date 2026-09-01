@@ -77,6 +77,10 @@ export function InstructionsPanel() {
 
   const searchSet = new Set(searchResults);
 
+  // 线程过滤：选中线程集合（空 = 不过滤）。
+  // 过滤模式下非选中线程的指令行以零高度占位方式隐藏（保留 inst_id 与虚拟
+  // 滚动坐标一致，避免全量重排）：直接跳过渲染即可。
+
   // 计算可见区间
   const first = Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN);
   const last = Math.min(total, Math.ceil((scrollTop + viewH) / rowH) + OVERSCAN);
@@ -170,8 +174,15 @@ export function InstructionsPanel() {
     selectTab('center-bottom', 'backtaint');
   }, [navigateTo]);
 
+  const threadFilterActive = useTraceStore((s) => s.threadFilterIds.length > 0);
+  const threadFilterCount = useTraceStore((s) => s.threadFilterCount);
+  const includesFn = useTraceStore((s) => s.threadFilterIncludes);
+
   const visible: number[] = [];
-  for (let i = first; i < last; i++) visible.push(i);
+  for (let i = first; i < last; i++) {
+    if (threadFilterActive && !includesFn(i)) continue;
+    visible.push(i);
+  }
 
   return (
     <div className="inst-panel">
@@ -197,6 +208,11 @@ export function InstructionsPanel() {
           </div>
         )}
         <span className="inst-bm dim">★ {bookmarks.size}</span>
+        {threadFilterActive && (
+          <span className="mono dim" style={{ marginLeft: 8 }}>
+            [thread filter: {threadFilterCount} insts]
+          </span>
+        )}
         {searching && <span className="dim mono" style={{ marginLeft: 8 }}>搜索中…</span>}
         {taintBusy != null && <span className="dim mono" style={{ marginLeft: 8 }}>污点分析中…</span>}
       </div>

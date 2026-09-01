@@ -15,11 +15,12 @@ import { MemorySearchPanel, MemoryStringsPanel, EntropyPanel, YaraPanel } from '
 import { WindowStatsPanel, TraceFoldPanel, TraceDiffPanel } from '@/panels/ProfileTracePanels';
 import { TaintSourcesPanel, DataflowGraphPanel, BackwardTaintPanel, ObjcCryptoPanel } from '@/panels/TaintDataflowPanels';
 import { SnapshotsPanel, DwarfPanel, VmWorkspacePanel, LogPanel, CacheManagerPanel, SettingsPanel } from '@/panels/AuxPanels';
+import { ThreadsPanel, XThreadDataflowPanel } from '@/panels/ThreadsPanel';
 
 const TOP_TABS = ['instructions', 'cfg', 'strings', 'regtl', 'dataflow'] as const;
 const BOTTOM_TABS = [
   'analysis', 'callstack', 'patterns', 'algorithms', 'constants', 'loops', 'api', 'objc',
-  'objccrypto', 'callgraph', 'taintsrc', 'backtaint', 'memsearch', 'memstrings', 'entropy',
+  'objccrypto', 'callgraph', 'threads', 'xdataflow', 'taintsrc', 'backtaint', 'memsearch', 'memstrings', 'entropy',
   'yara', 'winstats', 'tracefold', 'tracediff', 'snapshots', 'dwarf', 'vm', 'cache', 'log', 'settings',
 ] as const;
 
@@ -67,6 +68,8 @@ export function CenterArea() {
       tabs: [
         { value: 'callstack', label: 'Call Stack', icon: <Icon.Stack />, content: <CallStackPanel /> },
         { value: 'callgraph', label: 'Call Graph', icon: <Icon.Graph />, content: <CallGraphPanel /> },
+        { value: 'threads', label: 'Threads', icon: <Icon.List />, content: <ThreadsPanel /> },
+        { value: 'xdataflow', label: 'XThread Data', icon: <Icon.Flow />, content: <XThreadDataflowPanel /> },
         { value: 'api', label: 'API Intercepts', icon: <Icon.Terminal />, content: <ApiInterceptsPanel /> },
         { value: 'objc', label: 'ObjC', icon: <Icon.Chip />, content: <ObjcPanel /> },
       ],

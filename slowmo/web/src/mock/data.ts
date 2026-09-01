@@ -41,6 +41,9 @@ import type {
   WindowStat,
   XrefResult,
   YaraMatch,
+  ThreadsResult,
+  ThreadFilterResult,
+  CrossThreadDataflowResult,
 } from '@/types/tenet';
 
 const GPR_NAMES = [
@@ -776,4 +779,77 @@ export function mockCache(): CacheEntry[] {
     { name: 'cfg.layout.cache', kind: 'memoized', size_bytes: 131_072, status: 'stale', last_built: '5m ago' },
     { name: 'triton.semantics.cache', kind: 'memoized', size_bytes: 2_097_152, status: 'building', last_built: '—' },
   ];
+}
+
+// ─── 多线程分析 mock ─────────────────────────────────────────────────────
+
+export function mockThreads(): ThreadsResult {
+  return {
+    total_threads: 2,
+    total_switches: 3,
+    threads: [
+      { thread_id: 4711, first_seen_inst: 0, last_seen_inst: 1999, instructions: 2000, switch_in_count: 2 },
+      { thread_id: 8244, first_seen_inst: 2000, last_seen_inst: 3499, instructions: 1500, switch_in_count: 1 },
+    ],
+    switch_events: [
+      { inst_id: 2000, thread_id: 8244 },
+      { inst_id: 3000, thread_id: 4711 },
+      { inst_id: 3500, thread_id: 8244 },
+    ],
+  };
+}
+
+export function mockThreadFilter(threadIds: number[]): ThreadFilterResult {
+  const t1: Array<[number, number]> = [[0, 2000], [3000, 500]];
+  const t2: Array<[number, number]> = [[2000, 1000], [3500, 800]];
+  const byThread = new Map<number, { instructions: number; ranges: Array<[number, number]> }>([
+    [4711, { instructions: 2500, ranges: t1 }],
+    [8244, { instructions: 1800, ranges: t2 }],
+  ]);
+  const merged: Array<[number, number]> = [];
+  if (threadIds.length === 0) {
+    return { thread_count: 2, is_filtered: false, threads: [...byThread].map(([thread_id, v]) => ({ thread_id, ...v })) };
+  }
+  const all = [...t1, ...t2].filter((_, i) => threadIds.includes(i < 2 ? 4711 : 8244));
+  all.sort((a, b) => a[0] - b[0]);
+  for (const r of all) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[0] + last[1]) last[1] = Math.max(last[1], r[0] + r[1] - last[0]);
+    else merged.push([r[0], r[1]]);
+  }
+  const count = merged.reduce((s, r) => s + r[1], 0);
+  return {
+    thread_count: 2,
+    is_filtered: true,
+    filtered_count: count,
+    filtered_ranges: merged,
+    threads: [...byThread].map(([thread_id, v]) => ({ thread_id, ...v })),
+  };
+}
+
+export function mockCrossThreadDataflow(): CrossThreadDataflowResult {
+  return {
+    total_hand_offs: 2,
+    total_channels: 1,
+    thread_pair_count: 1,
+    edges: [
+      { writer_inst: 1200, writer_thread: 4711, reader_inst: 2050, reader_thread: 8244, addr: '0x100006A40', size: 4 },
+      { writer_inst: 3100, writer_thread: 4711, reader_inst: 3600, reader_thread: 8244, addr: '0x100006A44', size: 8 },
+    ],
+    edges_offset: 0,
+    edges_returned: 2,
+    edges_has_more: false,
+    channels: [
+      {
+        addr: '0x100006A40',
+        from_thread: 4711,
+        to_thread: 8244,
+        hand_offs: 2,
+        edges: [
+          { writer_inst: 1200, reader_inst: 2050 },
+          { writer_inst: 3100, reader_inst: 3600 },
+        ],
+      },
+    ],
+  };
 }

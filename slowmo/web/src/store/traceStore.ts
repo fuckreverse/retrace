@@ -48,6 +48,17 @@ interface TraceState {
   openSearchDialog: () => void;
   closeSearchDialog: () => void;
 
+  // 线程过滤（多线程 trace）：选中线程集合 → 指令视图只显示这些线程的指令。
+  // includedInstSet 为压缩的区间并集（[start, end) 半开），由 thread_filter
+  // MCP 工具返回的 filtered_ranges 展开；空集合 = 无过滤。
+  threadFilterIds: number[];
+  threadFilterRanges: Array<[number, number]>;
+  threadFilterCount: number;
+  setThreadFilter: (ids: number[], ranges: Array<[number, number]>, count: number) => void;
+  clearThreadFilter: () => void;
+  threadFilterIncludes: (instId: number) => boolean;
+  threadFilterFirstInst: () => number | null;
+
   // actions
   init: () => Promise<void>;
   navigateTo: (instId: number, pushHistory?: boolean, notifyBackend?: boolean) => void;
@@ -210,5 +221,40 @@ export const useTraceStore = create<TraceState>((set, get) => ({
   },
   clearHighlights() {
     set({ taintForward: new Set(), taintBackward: new Set(), producerChain: new Set() });
+  },
+
+  // ── 线程过滤 ─────────────────────────────────────────────────────────
+  threadFilterIds: [],
+  threadFilterRanges: [],
+  threadFilterCount: 0,
+  setThreadFilter(ids, ranges, count) {
+    set({ threadFilterIds: ids, threadFilterRanges: ranges, threadFilterCount: count });
+    // 过滤开启后，若当前指令不在过滤集内，跳到第一条可见指令
+    const { currentInst, navigateTo } = get();
+    if (!get().threadFilterIncludes(currentInst)) {
+      const first = get().threadFilterFirstInst();
+      if (first !== null) navigateTo(first, true, false);
+    }
+  },
+  clearThreadFilter() {
+    set({ threadFilterIds: [], threadFilterRanges: [], threadFilterCount: 0 });
+  },
+  threadFilterIncludes(instId) {
+    const ranges = get().threadFilterRanges;
+    if (ranges.length === 0) return true;
+    // 二分：ranges 按升序、互不重叠（Roaring 迭代序保证）
+    let lo = 0, hi = ranges.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const r = ranges[mid]!;
+      if (instId < r[0]) hi = mid - 1;
+      else if (instId >= r[0] + r[1]) lo = mid + 1;
+      else return true;
+    }
+    return false;
+  },
+  threadFilterFirstInst() {
+    const ranges = get().threadFilterRanges;
+    return ranges.length > 0 ? ranges[0]![0] : null;
   },
 }));

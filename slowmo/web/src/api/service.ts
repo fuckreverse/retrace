@@ -49,11 +49,16 @@ import type {
   StringEntry,
   TaintSource,
   TaintStep,
+  ThreadFilterResult,
+  ThreadsResult,
+  ThreadSummary,
+  ThreadSwitchEvent,
   TraceInfo,
   VmHandler,
   WindowStat,
   XrefResult,
   YaraMatch,
+  CrossThreadDataflowResult,
 } from '@/types/tenet';
 
 export type DataSource = 'live' | 'mock' | 'unknown';
@@ -101,7 +106,16 @@ async function route<T>(wsFn: () => Promise<T>, fallback: () => T): Promise<T> {
 /**
  * 通用分析路由：走 wsRunAnalysis(toolName, params)，
  * 用 pick 从返回 JSON 里取字段（贴合各能力的返回形状），失败回退 mock。
+ *
+ * Pass 调度是异步的：首次调用某分析工具时，后端可能还在后台跑 pass，
+ * WS 会返回 "pass not ready" 错误。此时按 500ms 间隔重试（与后端
+ * PassNotReady → "pass not ready" 错误语义对齐），最多约 20 秒，
+ * 而不是立刻降级到 mock 数据。
  */
+const PASS_NOT_READY_RE = /pass not ready/i;
+const PASS_NOT_READY_RETRIES = 40; // 40 × 500ms = 20s
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 async function analysis<T>(
   toolName: string,
   params: Record<string, unknown>,
@@ -109,8 +123,19 @@ async function analysis<T>(
   fallback: () => T,
 ): Promise<T> {
   return route(async () => {
-    const raw = await ws.wsRunAnalysis(toolName, params);
-    return pick(raw);
+    for (let attempt = 0; ; ++attempt) {
+      try {
+        const raw = await ws.wsRunAnalysis(toolName, params);
+        return pick(raw);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (attempt < PASS_NOT_READY_RETRIES && PASS_NOT_READY_RE.test(msg)) {
+          await sleep(500);
+          continue;
+        }
+        throw err;
+      }
+    }
   }, fallback);
 }
 
@@ -608,6 +633,51 @@ export const api = {
         };
       }),
       () => mock.mockVmHandlers(),
+    );
+  },
+
+  // ─── 无对应后端工具：仅 mock ────────────────────────────────────────────
+
+  // ─── 多线程分析（threads / thread_filter / cross_thread_dataflow）────────
+
+  /** 线程概要：每线程首末指令、指令数、切换次数 + 切换事件序列 */
+  async threads(): Promise<ThreadsResult> {
+    return analysis<ThreadsResult>(
+      'threads',
+      {},
+      (raw) => {
+        const r = raw as Record<string, unknown>;
+        return {
+          total_threads: Number(r.total_threads ?? 0),
+          total_switches: Number(r.total_switches ?? 0),
+          threads: (Array.isArray(r.threads) ? r.threads : []) as ThreadSummary[],
+          switch_events: (Array.isArray(r.switch_events) ? r.switch_events : []) as ThreadSwitchEvent[],
+        };
+      },
+      () => mock.mockThreads(),
+    );
+  },
+
+  /**
+   * 线程过滤区间：选中线程集合 → 后端返回合并的指令区间并集（游程编码）。
+   * threads 参数为线程 id 数组；空数组 = 全部线程（无过滤）。
+   */
+  async threadFilter(threadIds: number[]): Promise<ThreadFilterResult> {
+    return analysis<ThreadFilterResult>(
+      'thread_filter',
+      { thread_ids: threadIds },
+      (raw) => raw as ThreadFilterResult,
+      () => mock.mockThreadFilter(threadIds),
+    );
+  },
+
+  /** 跨线程数据交接（共享内存 hand-off 检测） */
+  async crossThreadDataflow(edgeOffset = 0, edgeLimit = 100): Promise<CrossThreadDataflowResult> {
+    return analysis<CrossThreadDataflowResult>(
+      'cross_thread_dataflow',
+      { edge_offset: edgeOffset, edge_limit: edgeLimit },
+      (raw) => raw as CrossThreadDataflowResult,
+      () => mock.mockCrossThreadDataflow(),
     );
   },
 

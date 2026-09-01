@@ -433,3 +433,72 @@ export interface CacheEntry {
   status: 'fresh' | 'stale' | 'building';
   last_built: string;
 }
+
+// ─── 多线程分析 ─────────────────────────────────────────────────────────────
+
+/** threads 工具返回的单个线程概要 */
+export interface ThreadSummary {
+  thread_id: number;
+  first_seen_inst: number;
+  last_seen_inst: number;
+  instructions: number;
+  switch_in_count: number;
+}
+
+/** threads 工具返回的线程切换事件 */
+export interface ThreadSwitchEvent {
+  inst_id: number;
+  thread_id: number;
+}
+
+/** threads 工具结果 */
+export interface ThreadsResult {
+  total_threads: number;
+  total_switches: number;
+  threads: ThreadSummary[];
+  switch_events: ThreadSwitchEvent[];
+}
+
+/** thread_filter 工具结果（区间为 [start, count) 游程编码） */
+export interface ThreadFilterResult {
+  thread_count: number;
+  is_filtered: boolean;
+  filtered_count?: number;
+  filtered_ranges?: Array<[number, number]>;
+  threads: Array<{
+    thread_id: number;
+    instructions: number;
+    ranges: Array<[number, number]>;
+  }>;
+}
+
+/** cross_thread_dataflow 工具：一次跨线程内存交接 */
+export interface CrossThreadHandoff {
+  writer_inst: number;
+  writer_thread: number;
+  reader_inst: number;
+  reader_thread: number;
+  addr: string;
+  size: number;
+}
+
+/** cross_thread_dataflow 工具：共享内存通道（按地址聚合） */
+export interface CrossThreadChannel {
+  addr: string;
+  from_thread: number;
+  to_thread: number;
+  hand_offs: number;
+  edges: Array<{ writer_inst: number; reader_inst: number }>;
+}
+
+/** cross_thread_dataflow 工具结果 */
+export interface CrossThreadDataflowResult {
+  total_hand_offs: number;
+  total_channels: number;
+  thread_pair_count: number;
+  edges: CrossThreadHandoff[];
+  edges_offset: number;
+  edges_returned: number;
+  edges_has_more: boolean;
+  channels: CrossThreadChannel[];
+}
