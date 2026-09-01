@@ -135,10 +135,14 @@ _BRIDGE_LOADER_JS = r'''
             result = msg;
         }).wait();
         if (result === null) throw new Error("Failed to load bridge: " + name);
+        /* join("\n") — the newline itself. (This file is a Python r-string: a
+         * raw "\\n" reaches JS as a two-character backslash-n literal, which
+         * splices a bare '\' between the joined lines and makes
+         * Script.evaluate fail with "unexpected token '\'".) */
         return Script.evaluate("/frida/bridges/" + result.filename,
             "(function () { " + [result.source,
             "Object.defineProperty(globalThis, '" + name + "', { value: bridge });",
-            "return bridge;"].join("\\n") + " })();");
+            "return bridge;"].join("\n") + " })();");
     }
     ["ObjC", "Java", "Swift"].forEach(function(name) {
         Object.defineProperty(globalThis, name, {
@@ -333,6 +337,11 @@ def parse_args():
                       help='Frida remote device address (default: 127.0.0.1:27042)')
     conn.add_argument('--usb', action='store_true',
                       help='Use USB device instead of remote')
+    conn.add_argument('--device-id', type=str, default=None,
+                      help='Explicit Frida device id for --usb (e.g. an Android '
+                           'serial). Necessary when several USB devices are '
+                           'attached — otherwise the first one wins, which may '
+                           'be the wrong phone.')
     conn.add_argument('--android', action='store_true',
                       help='Target is an Android device (adjusts default paths)')
 
@@ -725,7 +734,17 @@ class TracerSession:
     def connect(self):
         """Connect to the Frida device."""
         if self.args.usb:
-            self.device = frida.get_usb_device()
+            if self.args.device_id:
+                self.device = frida.get_device(self.args.device_id, timeout=5)
+            else:
+                usb_devices = [d for d in frida.enumerate_devices()
+                               if d.type == 'usb']
+                if len(usb_devices) > 1:
+                    ids = ', '.join(f'{d.id} ({d.name})' for d in usb_devices)
+                    raise RuntimeError(
+                        f'{len(usb_devices)} USB devices attached ({ids}). '
+                        f'Pick one explicitly with --device-id <id>.')
+                self.device = frida.get_usb_device()
         else:
             mgr = frida.get_device_manager()
             self.device = mgr.add_remote_device(self.args.host)

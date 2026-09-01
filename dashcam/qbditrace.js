@@ -106,6 +106,14 @@ function resolveExports(dylibModule) {
   if (runThread !== null && !runThread.isNull()) {
     ex.qbditrace_run_thread = runThread;
   }
+  /* Crash diagnostics: optional export — dumps the last-executed-PC ring
+   * (in-memory, survives the fault) to a file or stderr. Used by the invoke/
+   * hook fault recovery paths when the entry function SIGSEGVs inside the VM
+   * (Frida's exceptor sees the fault before our native handler can run). */
+  const dumpPcRing = dylibModule.findExportByName('qbditrace_dump_pcring');
+  if (dumpPcRing !== null && !dumpPcRing.isNull()) {
+    ex.qbditrace_dump_pcring = dumpPcRing;
+  }
   return ex;
 }
 
@@ -152,6 +160,10 @@ function buildNativeFunctions(ex) {
   if (ex.qbditrace_run_thread) {
     fns.runThread = new NativeFunction(ex.qbditrace_run_thread, 'int',
         ['pointer', 'pointer', 'pointer']);
+  }
+  if (ex.qbditrace_dump_pcring) {
+    fns.dumpPcRing = new NativeFunction(ex.qbditrace_dump_pcring, 'int',
+        ['pointer']);
   }
   return fns;
 }
@@ -622,17 +634,34 @@ function resolveJniVtable() {
     if (vm.isNull()) return null;
 
     /* Step 2: JavaVM->GetEnv(JavaVM*, void**, jint version) */
-    /* JavaVM vtable layout: [0]=DestroyJavaVM,[1]=AttachCurrentThread,
-     *                        [2]=DetachCurrentThread,[3]=GetEnv,
-     *                        [4]=AttachCurrentThreadAsDaemon */
+    /* JNIInvokeInterface_ layout (as array indices from the vtable pointer):
+     *   [0..2] = reserved0..2, [3] = DestroyJavaVM,
+     *   [4] = AttachCurrentThread, [5] = DetachCurrentThread,
+     *   [6] = GetEnv, [7] = AttachCurrentThreadAsDaemon.
+     * GetEnv is therefore at byte offset 6 * pointerSize. (An earlier version
+     * used 3 here — that slot is DestroyJavaVM, which blocks waiting for all
+     * attached threads to exit and never returns GetEnv's JNIEnv.) */
     var vmVtable = vm.readPointer();  /* JNIInvokeInterface_ * */
-    var getEnvFnPtr = vmVtable.add(3 * Process.pointerSize).readPointer();
+    var getEnvFnPtr = vmVtable.add(6 * Process.pointerSize).readPointer();
     if (getEnvFnPtr.isNull()) return null;
 
     var getEnvFn = new NativeFunction(getEnvFnPtr, 'int', ['pointer', 'pointer', 'int']);
     var envBuf = Memory.alloc(8);
     var JNI_VERSION_1_6 = 0x00010006;
     rc = getEnvFn(vm, envBuf, JNI_VERSION_1_6);
+    if (rc === -2 /* JNI_EDETACHED: this thread (the Frida gum-js thread) is
+                   * not attached to the VM yet. Attach it first — slot 4 is
+                   * AttachCurrentThread(JavaVM*, JNIEnv**, JavaVMAttachArgs*),
+                   * and NULL args selects the defaults. */ ) {
+      var attachFnPtr = vmVtable.add(4 * Process.pointerSize).readPointer();
+      var attachFn = new NativeFunction(attachFnPtr, 'int',
+          ['pointer', 'pointer', 'pointer']);
+      rc = attachFn(vm, envBuf, NULL);
+      if (rc === 0) {
+        log('JNI vtable: thread was detached — attached to VM, retrying GetEnv');
+        rc = getEnvFn(vm, envBuf, JNI_VERSION_1_6);
+      }
+    }
     if (rc !== 0) {
       log('JNI vtable: GetEnv failed rc=' + rc);
       return null;
@@ -954,8 +983,21 @@ function buildIndexedOutputPath(template, index) {
 
 /* Pure policy helper — maps a Frida Java argument type name to a conversion
  * strategy. Kept at top level so it can be unit-tested without a runtime. */
+/* Some Frida Java-bridge versions report argument/return type names as JVM
+ * signatures ('I', 'J', 'Ljava.lang.String;', '[B') instead of the spelled-out
+ * form ('int', 'long', ...). Normalize both shapes to one canonical name so
+ * the switches below work on either bridge. */
+function normalizeJavaTypeName(t) {
+  var sigMap = {
+    'I': 'int', 'J': 'long', 'S': 'short', 'B': 'byte',
+    'C': 'char', 'Z': 'boolean', 'F': 'float', 'D': 'double',
+    'Ljava.lang.String;': 'java.lang.String', '[B': '[B',
+  };
+  return sigMap[t] || t;
+}
+
 function javaArgKind(typeName) {
-  switch (typeName) {
+  switch (normalizeJavaTypeName(typeName)) {
     case 'int':
     case 'long':
     case 'short':
@@ -978,7 +1020,7 @@ function javaArgKind(typeName) {
 /* Pure policy helper — maps a Frida Java return type name to a conversion
  * strategy for the uint64 returned by qbditrace_run_call. */
 function javaRetKind(typeName) {
-  switch (typeName) {
+  switch (normalizeJavaTypeName(typeName)) {
     case 'void':
       return 'void';
     case 'int':
@@ -1041,8 +1083,27 @@ function installJavaEntryHook(opts) {
     function javaArgToPointer(v, typeName) {
       const kind = javaArgKind(typeName);
       if (kind === 'primitive') {
-        const n = (v !== null && v !== undefined && v.toNumber)
-            ? v.toNumber() : Number(v);
+        /* Bridge-version robustness: some Java-bridge versions hand the
+         * argument over as a wrapped object whose Number() coercion is NaN
+         * (NaN >>> 0 === 0 — silently tracing with seed 0). Coerce through
+         * toNumber() / intValue() / valueOf() before falling back. */
+        let n = NaN;
+        const tryNum = function (f) {
+          try { const r = f(); return (typeof r === 'number') ? r : NaN; }
+          catch (e) { return NaN; }
+        };
+        if (v !== null && v !== undefined) {
+          if (typeof v === 'number') n = v;
+          else if (typeof v.toNumber === 'function') n = tryNum(v.toNumber.bind(v));
+          else if (typeof v.intValue === 'function') n = tryNum(v.intValue.bind(v));
+          else if (typeof v.valueOf === 'function') n = tryNum(v.valueOf.bind(v));
+          else n = tryNum(function () { return Number(v); });
+        }
+        if (typeof n !== 'number' || isNaN(n)) {
+          log('WARNING: Java primitive arg could not be coerced (' +
+              typeName + ') — passing 0');
+          n = 0;
+        }
         return ptr(n >>> 0);
       }
       if (kind === 'float') {
@@ -1064,7 +1125,15 @@ function installJavaEntryHook(opts) {
       const kind = javaRetKind(typeName);
       if (kind === 'void') return undefined;
       if (kind === 'int32') return ret.toUInt32();
-      if (kind === 'int64') return ret.toString();
+      /* Java long: the bridge requires a value compatible with long — a JS
+       * number when it fits exactly (|x| < 2^53), otherwise a decimal string
+       * (a hex string is NOT accepted). NativePointer has no toNumber();
+       * go via its string form. */
+      if (kind === 'int64') {
+        const s = ret.toString(10);
+        const n = parseInt(s, 10);
+        return Number.isSafeInteger(n) ? n : s;
+      }
       if (kind === 'float') {
         log('WARNING: Java float/double return not supported — returning 0');
         return 0;
@@ -1712,14 +1781,47 @@ function mainImpl() {
         ' with ' + invokeArgc + ' args...');
 
     startStatsPolling();
-    var invokeRc = fn.runCall(invokeRetOut, funcStart, invokeArgc, invokeArgv);
-    if (invokeRc !== 0) {
+    var invokeRc = -1;
+    var crashed = false;
+    try {
+      invokeRc = fn.runCall(invokeRetOut, funcStart, invokeArgc, invokeArgv);
+    } catch (e) {
+      /* Fault recovery: Frida's exceptor turns an in-VM SIGSEGV into this JS
+       * exception before qbditrace's native fault handler can run. Dump the
+       * still-intact in-memory PC ring for crash triage, then stop() so the
+       * instructions recorded *before* the fault are flushed to the trace
+       * file (otherwise it stays a bare 536-byte header). */
+      crashed = true;
+      log('!! entry function faulted: ' + e.message + ' — recovering crash context');
+      if (fn.dumpPcRing) {
+        try {
+          var ringPath = CONFIG.outputPath + '.pcring';
+          var nPc = fn.dumpPcRing(Memory.allocUtf8String(ringPath));
+          log('pcring: ' + nPc + ' last PCs appended to ' + ringPath);
+        } catch (e2) {
+          log('pcring dump failed: ' + e2.message);
+        }
+      }
+    }
+    if (crashed) {
+      log('qbditrace_run_call crashed (access violation)');
+    } else if (invokeRc !== 0) {
       log('qbditrace_run_call returned error rc=' + invokeRc);
     }
-    var invokeRet = invokeRetOut.readPointer();
 
     fn.stop();
     stopStatsPolling();
+
+    if (crashed) {
+      /* Partial trace is still on disk — surface the path, then bail out. */
+      var crashOutFile = fn.outputPath().readUtf8String();
+      log('<- invoke CRASHED. partial output = ' + crashOutFile +
+          ' (instructions before the fault were flushed)');
+      status('trace_done', { index: 1, crashed: true, output: crashOutFile });
+      send({ type: 'error', text: 'entry function crashed: ' + 'access violation (partial trace + pcring saved)' });
+      return;
+    }
+    var invokeRet = invokeRetOut.readPointer();
 
     // Restore patched memory
     restorePatches(savedPatches);
@@ -1815,15 +1917,43 @@ function mainImpl() {
         removeHook();
 
         startStatsPolling();
-        const r = fn.runCall(retOut, funcStart, argc, argv);
-        if (r !== 0) {
+        let r = -1;
+        let crashed = false;
+        try {
+          r = fn.runCall(retOut, funcStart, argc, argv);
+        } catch (e) {
+          /* Same fault-recovery as the invoke path: dump the in-memory PC
+           * ring, flush the pre-fault partial trace, and stop tracing. */
+          crashed = true;
+          log('!! entry function faulted (trace #' + thisTrace + '): ' +
+              e.message + ' — recovering crash context');
+          if (fn.dumpPcRing) {
+            try {
+              const ringPath = CONFIG.outputPath + '.pcring';
+              const nPc = fn.dumpPcRing(Memory.allocUtf8String(ringPath));
+              log('pcring: ' + nPc + ' last PCs appended to ' + ringPath);
+            } catch (e2) {
+              log('pcring dump failed: ' + e2.message);
+            }
+          }
+        }
+        if (crashed) {
+          log('qbditrace_run_call crashed (access violation)');
+        } else if (r !== 0) {
           log('qbditrace_run_call returned error rc=' + r);
         }
-        const ret = retOut.readPointer();
 
         fn.stop();
         stopStatsPolling();
         const outFile = fn.outputPath().readUtf8String();
+        if (crashed) {
+          log('<- trace #' + thisTrace + ' CRASHED. partial output = ' + outFile +
+              ' (instructions before the fault were flushed)');
+          status('trace_done', { index: thisTrace, crashed: true, output: outFile });
+          inTrace = false;
+          return;
+        }
+        const ret = retOut.readPointer();
         log('<- trace #' + thisTrace + ' done, ret = ' + ret + '. output = ' + outFile);
         status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });
 
