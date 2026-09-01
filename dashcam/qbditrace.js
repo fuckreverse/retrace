@@ -100,6 +100,12 @@ function resolveExports(dylibModule) {
     }
     ex[n] = p;
   }
+  /* Phase 2 (multi-thread): optional export — older dylibs simply lack it,
+   * and installPthreadHooks() disables itself when absent. */
+  const runThread = dylibModule.findExportByName('qbditrace_run_thread');
+  if (runThread !== null && !runThread.isNull()) {
+    ex.qbditrace_run_thread = runThread;
+  }
   return ex;
 }
 
@@ -119,7 +125,7 @@ function resolveTargetModule() {
 }
 
 function buildNativeFunctions(ex) {
-  return {
+  const fns = {
     configure: new NativeFunction(ex.qbditrace_configure, 'int', ['pointer']),
     runCall: new NativeFunction(ex.qbditrace_run_call, 'int',
         ['pointer', 'pointer', 'uint32', 'pointer']),
@@ -127,6 +133,11 @@ function buildNativeFunctions(ex) {
     outputPath: new NativeFunction(ex.qbditrace_output_path, 'pointer', []),
     statsPage: new NativeFunction(ex.qbditrace_stats_page, 'pointer', []),
   };
+  if (ex.qbditrace_run_thread) {
+    fns.runThread = new NativeFunction(ex.qbditrace_run_thread, 'int',
+        ['pointer', 'pointer', 'uint64']);
+  }
+  return fns;
 }
 
 function buildConfigStruct(opts) {
@@ -1242,6 +1253,93 @@ function installGCDHooks(opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-thread tracing (Phase 2): pthread_create interception.
+//
+// When the traced code spawns worker threads whose start_routine lives in the
+// target module, we swap the routine with a NativeCallback of the exact
+// pthread ABI (void *(*)(void *)). The callback redirects the child thread
+// into qbditrace_run_thread(), which runs the real routine inside a dedicated
+// QBDI VM recording into the SAME trace file (interleaved chunks with
+// THREAD markers — the Phase 1 reader contract).
+//
+// Unlike the GCD path, this does NOT reconfigure/stop per capture: the parent
+// trace stays open, and qbditrace_stop() (called once by the loader after the
+// main traced call) flushes all registered thread buffers.
+// ---------------------------------------------------------------------------
+function installPthreadHooks(opts) {
+  const { fn, mod } = opts;
+  const moduleStart = mod.base;
+  const moduleEnd = mod.base.add(mod.size);
+  const filterByModule = CONFIG.pthreadFilterByModule !== false;
+  const maxCaptures = CONFIG.pthreadMaxCaptures || 0;
+
+  if (!fn.runThread) {
+    log('[pthread] qbditrace_run_thread not exported by this dylib — ' +
+        'multi-thread tracing disabled (rebuild libqbditrace)');
+    return;
+  }
+
+  let pthreadTraceCount = 0;
+  // Per-child trampolines must stay alive for the child's whole lifetime.
+  const keepAlive = [];
+
+  function isInModule(addr) {
+    return addr.compare(moduleStart) >= 0 && addr.compare(moduleEnd) < 0;
+  }
+
+  let createAddr = null;
+  try { createAddr = Module.getGlobalExportByName('pthread_create'); } catch (e) {}
+  if (!createAddr || createAddr.isNull()) {
+    log('[pthread] pthread_create not found — multi-thread tracing disabled');
+    return;
+  }
+
+  Interceptor.attach(createAddr, {
+    onEnter(args) {
+      const routine = args[2];
+      if (routine.isNull()) return;
+      if (filterByModule && !isInModule(routine)) return;
+      if (maxCaptures > 0 && pthreadTraceCount >= maxCaptures) return;
+
+      pthreadTraceCount++;
+      const idx = pthreadTraceCount;
+      const arg = args[3];
+
+      // Exact pthread start_routine ABI: void *(*)(void *).
+      // `routine` and `arg` are captured by value below; NativeCallback
+      // receives the trampoline's own argument (pthreads may repackage it,
+      // but by contract it is exactly the original arg pointer).
+      const trampoline = new NativeCallback(function (realArg) {
+        log('[pthread] child #' + idx + ' tracing routine @ ' + routine +
+            ' (offset 0x' + routine.sub(moduleStart).toString(16) + ')');
+        const retOut = Memory.alloc(8);
+        // NativePointer → uint64: pass the raw pointer value without
+        // truncation (toUInt32 would corrupt 64-bit arg pointers).
+        const rc = fn.runThread(retOut, routine, realArg);
+        if (rc !== 0) {
+          log('[pthread] WARNING: run_thread failed for child #' + idx +
+              ', rc=' + rc + ' — falling back to native execution');
+          // Native fallback: call the real routine directly outside the VM.
+          const direct = new NativeFunction(routine, 'pointer', ['pointer']);
+          return direct(realArg);
+        }
+        return retOut.readPointer();
+      }, 'pointer', ['pointer']);
+      keepAlive.push(trampoline);
+
+      args[2] = trampoline;
+      log('[pthread] create #' + idx + ': routine ' + routine + ' swapped to ' +
+          'trampoline');
+      status('pthread_trace_start', { index: idx, routine: routine.toString() });
+    }
+  });
+
+  log('[pthread] pthread_create hooked @ ' + createAddr + '. Threads whose ' +
+      'start_routine is within ' + mod.name + ' will be traced.' +
+      (maxCaptures > 0 ? ' (max ' + maxCaptures + ' children)' : ''));
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point — called after CONFIG is received from Python
 // ---------------------------------------------------------------------------
 
@@ -1729,21 +1827,42 @@ function mainImpl() {
       }, 'pointer', buildArgTypes(argc)));
     }
 
-    installHook();
-    status('hook_installed', {
-      funcStart: funcStart.toString(),
-      moduleName: mod.name,
-      moduleSize: '0x' + mod.size.toString(16),
-      mode: CONFIG.traceMode,
-      maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
-    });
-
-    if (multiMode) {
-      log('hook installed on ' + funcStart + ' (mode=' + CONFIG.traceMode +
-          ', max=' + maxTraces + '). Trigger the entry function to trace.');
+    if (CONFIG.javaEntry) {
+      // --- Java-entry trigger (Android): hook a Java method that calls
+      // into the native target; Java args are materialized natively. ---
+      if (!isAndroid()) {
+        fail('javaEntry mode is Android-only (use --android)');
+      }
+      installJavaEntryHook({
+        fn: fn,
+        mod: mod,
+        baseOpts: baseOpts,
+        funcStart: funcStart,
+        configureForTrace: configureForTrace,
+        makeOutputPath: makeOutputPath,
+        maxTraces: maxTraces,
+        startStatsPolling: startStatsPolling,
+        stopStatsPolling: stopStatsPolling,
+      });
+      log('Java-entry mode: waiting for ' + CONFIG.javaEntry + ' to be called. ' +
+          'Native target: ' + funcStart);
     } else {
-      log('hook installed on ' + funcStart +
-          '. Trigger the entry function to trace.');
+      installHook();
+      status('hook_installed', {
+        funcStart: funcStart.toString(),
+        moduleName: mod.name,
+        moduleSize: '0x' + mod.size.toString(16),
+        mode: CONFIG.traceMode,
+        maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
+      });
+
+      if (multiMode) {
+        log('hook installed on ' + funcStart + ' (mode=' + CONFIG.traceMode +
+            ', max=' + maxTraces + '). Trigger the entry function to trace.');
+      } else {
+        log('hook installed on ' + funcStart +
+            '. Trigger the entry function to trace.');
+      }
     }
 
     // --- Optional: GCD block tracing (iOS/macOS only) ---
@@ -1768,6 +1887,16 @@ function mainImpl() {
           makeGCDOutputPath: makeGCDOutputPath,
         });
       }
+    }
+
+    // --- Optional: multi-thread tracing via pthread_create interception ---
+    // Trace children spawned by the traced code into the SAME trace file
+    // (interleaved THREAD chunks). Requires CONFIG.traceThreads.
+    if (CONFIG.traceThreads) {
+      installPthreadHooks({
+        fn: fn,
+        mod: mod,
+      });
     }
   }
 }

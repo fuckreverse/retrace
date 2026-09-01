@@ -34,7 +34,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -873,6 +876,264 @@ scan_done:
     }
 }
 
+// ─── Phase 2: multi-thread recording (parent run_call + child run_thread) ────
+
+// Child-thread entry, driven through qbditrace_run_thread from a real pthread
+// (exactly what the Frida pthread_create trampoline does in qbditrace.js).
+__attribute__((noinline)) static uint64_t mt_child_worker(uint64_t arg) {
+    uint64_t acc = arg;
+    for (int i = 0; i < 64; i++) acc = acc * 3 + (uint64_t)i;
+    return acc;
+}
+
+// Parent target, driven through the normal qbditrace_run_call path on the
+// main thread, CONCURRENTLY with the child.
+__attribute__((noinline)) static uint64_t mt_parent_target(uint64_t seed) {
+    uint64_t x = (seed & 1) ? seed + 13 : seed * 3;
+    uint64_t buf[4];
+    for (int i = 0; i < 4; i++) buf[i] = seed + (uint64_t)i;
+    return x ^ buf[0] ^ buf[3];
+}
+
+// Records a two-thread trace into `out` and returns both return values via
+// out-params. Returns false if configure/run failed or semantics broke.
+// NOTE: empty "end sentinel" functions are reordered by the linker below the
+// noinline bodies at -O2, so instead we bound the traced range from the two
+// function entry points with a fixed slack window (both bodies are < 0x100
+// bytes of machine code and the entries are defined adjacently).
+static bool run_multi_thread_trace(const char* out, uint64_t* child_ret,
+                                    uint64_t* parent_ret) {
+    const uint64_t c_start = (uint64_t)(uintptr_t)&mt_child_worker;
+    const uint64_t p_start = (uint64_t)(uintptr_t)&mt_parent_target;
+
+    const uint64_t start = std::min(c_start, p_start);
+    const uint64_t end   = std::max(c_start, p_start) + 0x1000;
+    if (end <= start || end - start > 0x8000) {  // layout drifted
+        fprintf(stderr, "[mt] layout: start=%llx end=%llx span=%llu\n",
+                (unsigned long long)start, (unsigned long long)end,
+                (unsigned long long)(end - start));
+        return false;
+    }
+
+    qbditrace_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = sizeof(cfg);
+    cfg.trace_start = start;
+    cfg.trace_end   = end;
+    cfg.module_base = start;
+    cfg.module_name = "mt_test";
+    cfg.output_path = out;
+    cfg.record      = QBDITRACE_REC_DEFAULT;
+    cfg.anchor_interval = 32;
+    cfg.disable_compress = 1;  // raw scan below parses records directly
+
+    const int cfg_rc = qbditrace_configure(&cfg);
+    if (cfg_rc != 0) {
+        fprintf(stderr, "[mt] configure rc=%d\n", cfg_rc);
+        return false;
+    }
+
+    constexpr uint64_t kChildArg  = 0x1234;
+    constexpr uint64_t kParentArg = 0x9876;
+
+    // Child: a real pthread whose body goes through qbditrace_run_thread —
+    // the same shape as the Frida pthread_create trampoline in qbditrace.js.
+    // Catch2 assertions are unsafe off the main thread, so collect rc only.
+    int child_rc = -1;
+    std::thread child([&]() {
+        child_rc = qbditrace_run_thread(child_ret, c_start, kChildArg);
+    });
+
+    // Parent: normal run_call on the main thread, concurrently.
+    uint64_t pargs[1] = {kParentArg};
+    const int parent_rc = qbditrace_run_call(parent_ret, p_start, 1, pargs);
+
+    child.join();
+    qbditrace_stop();
+
+    if (child_rc != 0 || parent_rc != 0 ||
+        *child_ret != mt_child_worker(kChildArg) ||
+        *parent_ret != mt_parent_target(kParentArg)) {
+        fprintf(stderr,
+                "[mt] child_rc=%d parent_rc=%d child_ret=%llx want=%llx "
+                "parent_ret=%llx want=%llx\n",
+                child_rc, parent_rc,
+                (unsigned long long)*child_ret,
+                (unsigned long long)mt_child_worker(kChildArg),
+                (unsigned long long)*parent_ret,
+                (unsigned long long)mt_parent_target(kParentArg));
+        return false;
+    }
+    return true;
+}
+
+// Raw-scan result for the multi-thread trace.
+struct MtScanResult {
+    qbditrace::qbditrace_file_header_t header{};
+    std::set<uint64_t> thread_ids;
+    std::map<uint64_t, int> inst_per_thread;
+    int marker_count = 0;
+    bool marker_always_anchored = true;  // chunk anchor before first INST
+    bool parse_ok = false;
+};
+
+static MtScanResult scan_multi_thread_trace(const char* path) {
+    MtScanResult r;
+    FILE* f = fopen(path, "rb");
+    if (f == nullptr) return r;
+    if (fread(&r.header, sizeof(r.header), 1, f) != 1) {
+        fclose(f);
+        return r;
+    }
+
+    const bool has_fpr = (r.header.flags & QBDITRACE_HF_HAS_FPR) != 0;
+    const bool is_v5   = r.header.version >= 5 &&
+                         (r.header.flags & QBDITRACE_HF_PC_DELTA) != 0;
+    const bool is_v6   = (r.header.flags & QBDITRACE_HF_OLD_VALUE) != 0;
+    const size_t macc_size = is_v6 ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+                                   : sizeof(qbditrace::qbditrace_memacc_t);
+
+    uint64_t cur_tid = 0;
+    // Writer contract (self-containment): after every THREAD marker, an
+    // ANCHOR is emitted before the chunk's first INST — the anchor may be
+    // preceded by non-INST records (EVENT/CODE/RETVAL also carry markers via
+    // prepareRecord), but an INST must never appear before its chunk anchor.
+    bool marker_seen = false;
+    bool marker_anchored = true;
+
+    for (int iter = 0; iter < 200000; iter++) {
+        uint8_t kind = 0;
+        if (fread(&kind, 1, 1, f) != 1) break;
+        fseek(f, -1, SEEK_CUR);
+
+        if (marker_seen && kind == QBDITRACE_REC_INST && !marker_anchored)
+            r.marker_always_anchored = false;  // INST before its chunk anchor
+
+        if (kind == QBDITRACE_REC_INST) {
+            marker_seen = false;
+            marker_anchored = true;
+            uint8_t n_regdiff = 0, n_mem = 0, n_fprdiff = 0;
+            if (has_fpr && is_v5) {
+                qbditrace::qbditrace_inst_head_v7_v5_t ih;
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (has_fpr) {
+                qbditrace::qbditrace_inst_head_v7_t ih;
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem; n_fprdiff = ih.n_fprdiff;
+            } else if (is_v5) {
+                qbditrace::qbditrace_inst_head_v5_t ih;
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            } else {
+                qbditrace::qbditrace_inst_head_t ih;
+                if (fread(&ih, sizeof(ih), 1, f) != 1) break;
+                n_regdiff = ih.n_regdiff; n_mem = ih.n_mem;
+            }
+            const size_t tail = n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                              + n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t)
+                              + n_mem     * macc_size;
+            fseek(f, (long)tail, SEEK_CUR);
+            r.inst_per_thread[cur_tid]++;
+        } else if (kind == QBDITRACE_REC_ANCHOR) {
+            marker_anchored = true;  // chunk anchor arrived (if pending)
+            qbditrace::qbditrace_anchor_head_t ah;
+            if (fread(&ah, sizeof(ah), 1, f) != 1) break;
+            const size_t gpr_bytes = r.header.num_gpr * 8;
+            const size_t fpr_bytes = has_fpr
+                ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
+            fseek(f, (long)(gpr_bytes + fpr_bytes), SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_THREAD) {
+            qbditrace::qbditrace_thread_head_t th;
+            if (fread(&th, sizeof(th), 1, f) != 1) break;
+            cur_tid = th.thread_id;
+            r.thread_ids.insert(cur_tid);
+            r.marker_count++;
+            marker_seen = true;
+            marker_anchored = false;
+        } else if (kind == QBDITRACE_REC_CODE) {
+            qbditrace::qbditrace_code_head_t ch;
+            if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            fseek(f, ch.size, SEEK_CUR);
+        } else if (kind == QBDITRACE_REC_EVENT) {
+            qbditrace::qbditrace_event_head_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_SVC) {
+            qbditrace::qbditrace_svc_head_t sh;
+            if (fread(&sh, sizeof(sh), 1, f) != 1) break;
+        } else if (kind == QBDITRACE_REC_OBJC) {
+            if (r.header.flags & QBDITRACE_HF_CALL_META) {
+                qbditrace::qbditrace_objc_head_v8_t oh;
+                if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+                const uint32_t padded =
+                    ((uint32_t)(oh.sel_len + 1u) + 3u) & ~3u;
+                fseek(f, (long)padded, SEEK_CUR);
+            } else {
+                qbditrace::qbditrace_objc_head_t oh;
+                if (fread(&oh, sizeof(oh), 1, f) != 1) break;
+            }
+        } else if (kind == QBDITRACE_REC_CAPICALL) {
+            qbditrace::qbditrace_capicall_head_v8_t ch;
+            if (r.header.flags & QBDITRACE_HF_CALL_META) {
+                if (fread(&ch, sizeof(ch), 1, f) != 1) break;
+            } else {
+                qbditrace::qbditrace_capicall_head_t old;
+                if (fread(&old, sizeof(old), 1, f) != 1) break;
+                ch.str_count = old.str_count;
+            }
+            for (uint8_t si = 0;
+                 si < ch.str_count && si < QBDITRACE_CAPICALL_MAX_STR_CAPS; ++si) {
+                qbditrace::qbditrace_capicall_str_t sh;
+                if (fread(&sh, sizeof(sh), 1, f) != 1) goto mt_scan_done;
+                const uint32_t padded =
+                    ((uint32_t)(sh.str_len + 1u) + 3u) & ~3u;
+                fseek(f, (long)padded, SEEK_CUR);
+            }
+        } else if (kind == QBDITRACE_REC_RETVAL) {
+            qbditrace::qbditrace_retval_t rv;
+            if (fread(&rv, sizeof(rv), 1, f) != 1) break;
+            if (rv.record_size > sizeof(rv))
+                fseek(f, (long)(rv.record_size - sizeof(rv)), SEEK_CUR);
+        } else {
+            break;  // unknown record kind: stop scanning
+        }
+    }
+mt_scan_done:
+    r.parse_ok = !ferror(f);
+    fclose(f);
+    return r;
+}
+
+TEST_CASE("qbditrace multi-thread: parent + child threads interleave into one trace",
+          "[integration][qbditrace][multithread]") {
+    const char* out = "/tmp/qbditrace_test_mt.bin";
+    uint64_t child_ret = 0, parent_ret = 0;
+    const bool ok = run_multi_thread_trace(out, &child_ret, &parent_ret);
+    REQUIRE(ok);
+
+    const MtScanResult scan = scan_multi_thread_trace(out);
+    REQUIRE(scan.parse_ok);
+
+    SECTION("both threads produced at least one THREAD marker") {
+        REQUIRE(scan.marker_count >= 2);
+        REQUIRE(scan.thread_ids.size() >= 2);
+    }
+
+    SECTION("every THREAD-marked chunk has an ANCHOR before its first INST") {
+        // Self-containment contract: a reader must be able to resume the
+        // thread's chunk (v5 PC chain + register state) from a chunk-local
+        // anchor without cross-thread context.
+        REQUIRE(scan.marker_always_anchored);
+    }
+
+    SECTION("both parent and child threads recorded instructions") {
+        int threads_with_insts = 0;
+        for (const auto& kv : scan.inst_per_thread)
+            if (kv.second > 0) threads_with_insts++;
+        REQUIRE(threads_with_insts >= 2);
+    }
+}
+
 // ─── Tenet joint analysis (only when tenet headers are available) ─────────────
 
 #ifdef QBDITRACE_TENET_INTEGRATION
@@ -1384,6 +1645,60 @@ TEST_CASE("qbditrace + tenet: SyscallInterceptPass intercepts CCCrypt CAPICALL",
         auto json_str = result.to_json();
         CHECK_FALSE(json_str.empty());
         CHECK(json_str.find("\"calls\"") != std::string::npos);
+    }
+}
+
+TEST_CASE("qbditrace + tenet: multi-thread trace indexes per-thread state",
+          "[integration][qbditrace][tenet][multithread]") {
+    const char* out = "/tmp/qbditrace_test_mt_tenet.bin";
+    uint64_t child_ret = 0, parent_ret = 0;
+    const bool ok = run_multi_thread_trace(out, &child_ret, &parent_ret);
+    REQUIRE(ok);
+
+    auto reader_result = TraceReader::open(std::filesystem::path(out));
+    REQUIRE(reader_result.has_value());
+    auto reader = std::make_unique<TraceReader>(std::move(*reader_result));
+
+    auto index_result = TraceIndex::open_or_build(*reader, nullptr);
+    REQUIRE(index_result.has_value());
+    auto index = std::make_unique<TraceIndex>(std::move(*index_result));
+
+    SECTION("thread table has >= 2 threads") {
+        REQUIRE(index->thread_ids().size() >= 2);
+    }
+
+    SECTION("anchors carry thread attribution") {
+        REQUIRE(index->anchors_have_threads());
+    }
+
+    SECTION("state_before_thread reconstructs the child entry argument") {
+        // Find the first INST of the child function; its owning thread is the
+        // child tid, and x0 must still hold kChildArg (0x1234).
+        const uint64_t child_start = (uint64_t)(uintptr_t)&mt_child_worker;
+        uint64_t child_first_inst = UINT64_MAX;
+        uint64_t child_tid = 0;
+        uint64_t inst_id = 0;
+        for (auto it = reader->begin(); it != reader->end(); ++it) {
+            const auto rec = *it;
+            if (rec.kind != RecordKind::Inst) continue;
+            if (child_first_inst == UINT64_MAX &&
+                rec.as_inst().pc == child_start) {
+                child_first_inst = inst_id;
+                child_tid = it.current_thread_id();
+            }
+            inst_id++;
+        }
+        REQUIRE(child_first_inst != UINT64_MAX);
+        REQUIRE(child_tid != 0);
+
+        // The index must attribute this inst to the same thread the iterator
+        // reported.
+        REQUIRE(index->thread_at(child_first_inst) == child_tid);
+
+        RegisterFile regfile(*reader, *index);
+        const auto st = regfile.state_before_thread(child_first_inst, child_tid);
+        CAPTURE(child_first_inst, child_tid, st.gpr[0]);
+        REQUIRE(st.gpr[0] == 0x1234);  // kChildArg reaches the child unmodified
     }
 }
 

@@ -1736,8 +1736,20 @@ QBDI::VMAction preInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
    * mutex) inside the LL/SC critical section, which would break the hardware
    * reservation and cause the STXR to always fail (infinite retry loop). */
   if (!c->ldxr_pending &&
-      (c->need_anchor || c->since_anchor >= cfg.anchor_interval)) {
-    emitAnchor(c->buf, gpr, fpr, c->cur_pc, cfg.fpr_mode); /* handles marker/chunk atomicity */
+      (c->need_anchor || c->buf->needAnchorAfterMarker() ||
+       c->since_anchor >= cfg.anchor_interval)) {
+    /* An ANCHOR is a v5 PC-delta resync point. Its PC is the upcoming
+     * instruction's PC, so the immediately following INST must use a zero
+     * delta from this exact PC. Keep writer-side last_emitted_pc in sync;
+     * otherwise periodic anchors decode the first following instruction as
+     * `anchor_pc + (anchor_pc - previous_inst_pc)`.
+     *
+     * The extra needAnchorAfterMarker() condition makes every THREAD-marked
+     * chunk self-contained when writer chunks from several threads interleave.
+     */
+    emitAnchor(c->buf, gpr, fpr, c->cur_pc, cfg.fpr_mode);
+    c->last_emitted_pc = c->cur_pc;
+    c->buf->anchorAfterMarkerEmitted();
     c->since_anchor = 0;
     c->need_anchor = false;
   }
@@ -1931,6 +1943,8 @@ QBDI::VMAction postInstCB(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     if (c->last_emitted_pc == 0 ||
         raw_delta < -32768 || raw_delta > 32767) {
       emitAnchor(c->buf, gpr, fpr, exec_pc, cfg.fpr_mode);
+      c->last_emitted_pc = exec_pc;
+      c->buf->anchorAfterMarkerEmitted();
       c->since_anchor = 0;
       c->need_anchor = false;
       raw_delta = 0;
@@ -2821,6 +2835,42 @@ extern "C" int qbditrace_run_at(uint64_t *ret_out, uint64_t start_pc,
   return runWithVMState(ret_out, start_pc, gpr, sp, lr) ? 0 : -3;
 #else
   (void)ret_out; (void)start_pc; (void)gpr; (void)sp; (void)lr;
+  return -1;
+#endif
+}
+
+/* Multi-thread tracing (Phase 2): child-thread entry point.
+ *
+ * A trampoline above pthread_create (Frida Interceptor.attach onEnter swaps
+ * args[2]) redirects here on the NEW thread when the user's start_routine
+ * lives in the traced module. runWithVM() already:
+ *   - creates a per-call QBDI::VM (QBDI VMs are not thread-safe, but each
+ *     child owns its own instance),
+ *   - calls ensureThreadCtx(), which creates a ThreadBuffer stamped with the
+ *     child's OS thread id and registers it with Tracer (chunks interleave in
+ *     the shared BackgroundWriter output — the THREAD/ANCHOR chunk contract
+ *     from Phase 1),
+ *   - flushes the thread's buffer when the run completes.
+ *
+ * runWithVM allocates a fresh virtual stack, which is exactly what a new
+ * thread's start_routine needs (it never returns to a real caller frame —
+ * pthreads wraps it; our stop sentinel is the safe ret page).
+ *
+ * We only guard against misuse on the main tracer thread: a recursion /
+ * re-entrancy guard is unnecessary because the trampoline runs on the child. */
+extern "C" int qbditrace_run_thread(uint64_t *ret_out, uint64_t routine,
+                                    uint64_t arg) {
+#if !defined(__x86_64__)
+  if (!routine) {
+    return -1;
+  }
+  if (!Tracer::get().configured()) {
+    return -1;
+  }
+  const uint64_t argv[1] = {arg};
+  return runWithVM(ret_out, routine, 1, argv) ? 0 : -3;
+#else
+  (void)ret_out; (void)routine; (void)arg;
   return -1;
 #endif
 }

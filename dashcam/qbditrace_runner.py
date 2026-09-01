@@ -474,6 +474,24 @@ def parse_args():
     gcd.add_argument('--gcd-max', type=int, default=0,
                      help='Max GCD block captures (0 = unlimited)')
 
+    # --- Multi-thread ---
+    mt = p.add_argument_group('Multi-thread tracing')
+    mt.add_argument('--trace-threads', action='store_true',
+                    help='Trace pthread child threads whose start_routine is in the '
+                         'target module, into the SAME trace file (interleaved '
+                         'THREAD chunks; analyze with tenet --thread)')
+    mt.add_argument('--threads-no-filter', action='store_true',
+                    help='Trace ALL pthread children, not just module-resident routines')
+    mt.add_argument('--threads-max', type=int, default=0,
+                    help='Max traced child threads (0 = unlimited)')
+
+    je = p.add_argument_group('Java entry trigger (Android only)')
+    je.add_argument('--java-entry', type=str, default=None, metavar='CLASS.METHOD',
+                    help='Hook a Java method (e.g. com.example.NativeBridge.doWork) '
+                         'as the trace trigger: Java args are materialized into '
+                         'native pointers and the native entry is invoked via '
+                         'run_call. Android only; requires --android')
+
     # --- Runtime ---
     rt = p.add_argument_group('Runtime control')
     rt.add_argument('--timeout', type=int, default=0,
@@ -483,6 +501,15 @@ def parse_args():
                          '(default in "once" mode)')
 
     args = p.parse_args()
+
+    # --- Validate --java-entry ---
+    if args.java_entry:
+        if not args.android:
+            p.error('--java-entry requires --android')
+        if args.invoke:
+            p.error('--java-entry and --invoke are mutually exclusive')
+        if '.' not in args.java_entry:
+            p.error('--java-entry must be "fully.qualified.Class.method"')
 
     # --- Apply --sampling preset (before generic record/anchor defaulting) ---
     # Sampling mode overrides --record entirely (a real "record almost
@@ -661,6 +688,14 @@ def build_config(args):
         'traceGCD': args.trace_gcd,
         'gcdFilterByModule': not args.gcd_no_filter,
         'gcdMaxCaptures': args.gcd_max,
+
+        # Multi-thread tracing (Phase 2)
+        'traceThreads': args.trace_threads,
+        'pthreadFilterByModule': not args.threads_no_filter,
+        'pthreadMaxCaptures': args.threads_max,
+
+        # Java entry trigger (Android)
+        'javaEntry': args.java_entry,
 
         # Invoke mode
         'invoke': args.invoke,
@@ -1004,6 +1039,8 @@ def main():
         print(f'  Mode:        HOOK (passive, trace-mode={args.trace_mode})')
     if args.trace_gcd:
         print(f'  GCD trace:   ON (filter={not args.gcd_no_filter}, max={args.gcd_max})')
+    if args.trace_threads:
+        print(f'  Threads:     ON (filter={not args.threads_no_filter}, max={args.threads_max})')
     if args.timeout:
         print(f'  Timeout:     {args.timeout}s')
     print('=' * 60)

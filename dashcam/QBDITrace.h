@@ -368,6 +368,24 @@ int qbditrace_run_at(uint64_t *ret_out, uint64_t start_pc, const uint64_t *gpr,
                      uint64_t sp, uint64_t lr);
 
 /*
+ * Child-thread entry point for multi-thread tracing (Phase 2).
+ *
+ * A trampoline installed on top of pthread_create (Frida JS side, or the
+ * native helper below) calls this INSTEAD of the user's start_routine when
+ * the routine lives in the traced module. The function executes inside a
+ * dedicated QBDI VM on the calling (child) thread with the single `arg`
+ * forwarded, records into the SAME trace file as the parent (a THREAD
+ * marker + immediate ANCHOR are emitted so the chunk is self-contained),
+ * and returns the routine's return value for the pthreads machinery.
+ *
+ * The caller must already have called qbditrace_configure(); calling this
+ * on the main tracer thread while a run_call is active is a usage error.
+ * Returns 0 on success; *ret_out receives the routine's return value when
+ * non-NULL. (arm64 only.)
+ */
+int qbditrace_run_thread(uint64_t *ret_out, uint64_t routine, uint64_t arg);
+
+/*
  * Flush all pending buffers to disk and finalize the trace file. Safe to call
  * multiple times. Implicitly called at process exit, but calling it explicitly
  * (e.g. from the loader after the traced call returns) guarantees the trace is

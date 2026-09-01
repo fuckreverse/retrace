@@ -596,12 +596,32 @@ public:
        * keeps a running cur_thread that only advances on THREAD records). The
        * rotate() path already does this; flush() must too. */
       need_marker_ = true;
+      need_anchor_after_marker_ = true;
     }
   }
 
   uint64_t threadId() const { return thread_id_; }
   bool needThreadMarker() const { return need_marker_; }
   void markerEmitted() { need_marker_ = false; }
+
+  /*
+   * After a THREAD marker is emitted (chunk rotation / flush), the decoder's
+   * per-thread v5 PC-delta chain for THIS thread must be re-anchored with an
+   * absolute-PC ANCHOR before any INST record is emitted into the new chunk.
+   * Query this right after prepareRecord() returned the slow path (i.e. the
+   * marker was just emitted); it clears itself once the caller emits an
+   * anchor and calls anchorAfterMarkerEmitted().
+   *
+   * Why: chunks from different threads interleave on disk. A v5 decoder that
+   * keeps one running PC per thread would otherwise start the new chunk's
+   * delta chain from the thread's stale pre-rotation PC. An ANCHOR right
+   * after the marker makes each chunk self-contained. (v4 absolute-PC traces
+   * do not strictly need it, but we emit it unconditionally anyway — it is
+   * one 288-byte record per ~64 MB chunk, and it also guarantees a correct
+   * register snapshot when a reader jumps straight to the chunk boundary.)
+   */
+  bool needAnchorAfterMarker() const { return need_anchor_after_marker_; }
+  void anchorAfterMarkerEmitted() { need_anchor_after_marker_ = false; }
 
 private:
   void rotate() {
@@ -610,12 +630,14 @@ private:
     cur_.thread_id = thread_id_;
     /* New chunk: decoder needs a THREAD marker to know who owns it. */
     need_marker_ = true;
+    need_anchor_after_marker_ = true;
   }
 
   BackgroundWriter *writer_;
   uint64_t thread_id_;
   Chunk cur_;
   bool need_marker_ = true;
+  bool need_anchor_after_marker_ = true;
 };
 
 } // namespace qbditrace
