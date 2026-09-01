@@ -38,7 +38,8 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                            std::atomic<uint64_t>& progress_counter,
                            const TraceReader::ThreadReader& thread_reader,
                            const std::atomic<bool>* cancel_token,
-                           const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges) {
+                           const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges,
+                           const std::vector<uint64_t>& include_thread_ids) {
     uint64_t offset = shard.file_start;
     const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
@@ -51,10 +52,21 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
         : 0;
     const size_t fprdiff_offset = fprdiff_byte_offset(is_v5, is_v7);
     const bool has_excludes = !exclude_ranges.empty();
+    // Thread include filter (multi-thread traces). THREAD records switch the
+    // active producer thread; instructions of excluded threads are skipped.
+    const bool has_thread_filter = !include_thread_ids.empty();
+    uint64_t cur_thread = 0;
 
     while (offset < end_offset) {
         const uint8_t* ptr = thread_reader.data_at(offset);
         uint8_t kind = ptr[0];
+
+        if (kind == qbditrace::QBDITRACE_REC_THREAD) {
+            const auto* th = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr);
+            cur_thread = th->thread_id;
+            offset += sizeof(qbditrace::qbditrace_thread_head_t);
+            continue;
+        }
 
         if (kind == 0) { // INST — hot path
             uint64_t pc;
@@ -84,6 +96,10 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
                 for (const auto& [start, end] : exclude_ranges) {
                     if (pc >= start && pc < end) { excluded = true; break; }
                 }
+            }
+            if (!excluded && has_thread_filter) {
+                excluded = !std::binary_search(include_thread_ids.begin(),
+                                               include_thread_ids.end(), cur_thread);
             }
 
             uint8_t n_fprdiff = is_v7 ? ptr[fprdiff_offset] : 0;
@@ -176,7 +192,8 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
         case RecordKind::Inst: {
             if (inst_id >= start_inst_id) {
                 auto inst = rec.as_inst();
-                if (exclude_pc_ranges_.empty() || !is_pc_excluded(inst.pc)) {
+                if ((exclude_pc_ranges_.empty() || !is_pc_excluded(inst.pc)) &&
+                    thread_included(it.current_thread_id())) {
                     for (auto* c : active) {
                         c->on_inst(inst_id, inst);
                     }
@@ -382,14 +399,15 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     // Launch worker threads for shards[1..N-1]
     const std::atomic<bool>* cancel_tok = cancel_token_;
     const auto& excludes = exclude_pc_ranges_;
+    const auto& includes = include_thread_ids_;
     for (size_t i = 1; i < shards.size(); i++) {
-        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, num_gpr, is_v5, is_v6, is_v7, is_v8, cancel_tok, i]() {
-            scan_shard_collectors(shards[i], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes);
+        threads.emplace_back([&shards, &shard_clone_ptrs, &progress_counter, &thread_readers, &excludes, &includes, num_gpr, is_v5, is_v6, is_v7, is_v8, cancel_tok, i]() {
+            scan_shard_collectors(shards[i], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[i], progress_counter, thread_readers[i], cancel_tok, excludes, includes);
         });
     }
 
     // Shard 0 on current thread
-    scan_shard_collectors(shards[0], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes);
+    scan_shard_collectors(shards[0], num_gpr, is_v5, is_v6, is_v7, is_v8, shard_clone_ptrs[0], progress_counter, thread_readers[0], cancel_tok, excludes, includes);
 
     // Report progress while waiting
     if (progress_fn_) {

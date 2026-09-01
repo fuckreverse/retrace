@@ -26,6 +26,11 @@ uint64_t ScanOrchestrator::execute_scan(const AnalysisRange& range,
         engine.set_exclude_pc_ranges(range.exclude_pc_ranges);
     }
 
+    // Apply thread include filter from AnalysisRange (multi-thread traces)
+    if (!range.include_thread_ids.empty()) {
+        engine.set_include_thread_ids(range.include_thread_ids);
+    }
+
     // Set cancellation
     engine.set_cancel_token(&cancel_token);
     engine.set_cancel_check([&cancel_token]() {

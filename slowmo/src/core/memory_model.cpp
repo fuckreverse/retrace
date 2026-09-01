@@ -1985,6 +1985,26 @@ std::vector<uint64_t> MemoryModel::write_history(uint64_t addr, uint8_t size) {
     return result;
 }
 
+// ─── Multi-thread: writer thread annotation ────────────────────────────────
+
+uint64_t MemoryModel::writer_thread(uint64_t writer_inst_id) const {
+    return index_.thread_at(writer_inst_id);
+}
+
+uint64_t MemoryModel::last_writer_on_thread(uint64_t addr, uint8_t size,
+                                            uint64_t before_inst_id,
+                                            uint64_t thread_id) {
+    if (before_inst_id == 0) return 0;
+    auto history = write_history(addr, size);
+    // History is ascending; walk backwards to the most recent write of the
+    // requested thread strictly before before_inst_id.
+    for (auto it = history.rbegin(); it != history.rend(); ++it) {
+        if (*it >= before_inst_id) continue;
+        if (index_.thread_at(*it) == thread_id) return *it;
+    }
+    return 0;
+}
+
 std::optional<uint8_t> MemoryModel::byte_at(uint64_t addr, uint64_t at_inst_id) {
     ensure_built();
 

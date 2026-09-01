@@ -144,6 +144,15 @@ public:
         exclude_pc_ranges_ = std::move(ranges);
     }
 
+    /// Set producer thread IDs to include from delivery to collectors.
+    /// Instructions emitted by threads NOT in this list are silently skipped
+    /// (multi-thread traces). Thread ownership follows THREAD records: the
+    /// active producer thread switches at each marker. Empty = all threads.
+    void set_include_thread_ids(std::vector<uint64_t> ids) {
+        include_thread_ids_ = std::move(ids);
+        std::sort(include_thread_ids_.begin(), include_thread_ids_.end());
+    }
+
 private:
     /// Check if a PC is in any excluded range. Inline for hot-path performance.
     bool is_pc_excluded(uint64_t pc) const {
@@ -153,12 +162,20 @@ private:
         return false;
     }
 
+    /// Check if a producer thread passes the include filter (hot path).
+    bool thread_included(uint64_t tid) const {
+        if (include_thread_ids_.empty()) return true;
+        return std::binary_search(include_thread_ids_.begin(),
+                                  include_thread_ids_.end(), tid);
+    }
+
 
     const TraceReader& reader_;
     uint64_t inst_count_;
     const TraceIndex* index_ = nullptr;
     std::vector<TraceCollector*> collectors_;
     std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges_;
+    std::vector<uint64_t> include_thread_ids_;
     ProgressFn progress_fn_;
     std::function<bool()> cancel_fn_;
     const std::atomic<bool>* cancel_token_ = nullptr;

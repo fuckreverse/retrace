@@ -403,6 +403,17 @@ struct TraceWriter {
         for (uint8_t i = 0; i < arg_count; ++i) h.args[i] = args[i];
         fwrite(&h, sizeof(h), 1, fp);
 
+        write_capicall_strings(strs);
+    }
+
+private:
+    /// Shared inline-string payload writer used by emit_capicall() and
+    /// emit_capicall_v8(). Each capture is {idx, len, flags} + content +
+    /// NUL, padded to 4-byte alignment.
+    void write_capicall_strings(const std::vector<CapiStr>& strs) {
+        uint8_t str_count = static_cast<uint8_t>(
+            std::min<size_t>(strs.size(), QBDITRACE_CAPICALL_MAX_STR_CAPS));
+
         // Write variable-length string payloads.
         for (uint8_t si = 0; si < str_count; ++si) {
             const auto& s = strs[si];
@@ -430,6 +441,7 @@ struct TraceWriter {
         }
     }
 
+public:
     void emit_objc(uint64_t pc, uint64_t recv, uint64_t sel, const char* cls) {
         qbditrace::qbditrace_objc_head_t h = {};
         h.kind = QBDITRACE_REC_OBJC; h.variant = QBDITRACE_OBJC_MSGSEND;

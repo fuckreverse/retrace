@@ -104,6 +104,21 @@ public:
     /// Get a single byte value at a specific time.
     std::optional<uint8_t> byte_at(uint64_t addr, uint64_t at_inst_id);
 
+    // ─── Multi-thread: writer thread annotation ──────────────────────────
+    // inst_ids are file-wide; the owning producer thread is resolved via the
+    // trace index's thread chunk table (TraceIndex::thread_at).
+
+    /// Producer thread of the write at `writer_inst_id` (multi-thread
+    /// traces). 0 for single-producer traces or snapshot writers.
+    uint64_t writer_thread(uint64_t writer_inst_id) const;
+
+    /// Last writer of [addr, addr+size) before `before_inst_id` whose
+    /// producer thread == `thread_id`. Returns 0 when no such write exists.
+    /// Walks the write history backwards, so it is O(history) — fine for
+    /// spot queries, not for bulk scans.
+    uint64_t last_writer_on_thread(uint64_t addr, uint8_t size,
+                                   uint64_t before_inst_id, uint64_t thread_id);
+
     // ─── Extended API for bulk memory operations ──────────────────────────
 
     /// Read a region of arbitrary size at a specific point in time.

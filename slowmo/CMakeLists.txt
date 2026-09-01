@@ -491,6 +491,7 @@ add_library(tenet_lib STATIC
     src/analysis/passes/memory/memory_string_pass.cpp
     src/analysis/passes/profile/dataflow_graph_pass.cpp
     src/analysis/passes/platform/objc_pass.cpp
+    src/analysis/passes/platform/linux_syscalls.cpp
     src/analysis/passes/misc/thread_pass.cpp
     src/analysis/passes/profile/trace_fold_pass.cpp
     src/analysis/passes/profile/reg_timeline_pass.cpp
@@ -500,6 +501,7 @@ add_library(tenet_lib STATIC
     src/analysis/passes/memory/entropy_pass.cpp
     src/analysis/passes/memory/yara_mem_scan_pass.cpp
     src/analysis/passes/misc/thread_filter_pass.cpp
+    src/analysis/passes/misc/cross_thread_dataflow_pass.cpp
     src/analysis/passes/crypto/objc_crypto_pass.cpp
     src/analysis/passes/platform/syscall_intercept_pass.cpp
     src/analysis/passes/taint/taint_source_annotation_pass.cpp

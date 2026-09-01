@@ -96,6 +96,67 @@ private:
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ThreadIsolatedCursor — register reconstruction for ONE producer thread.
+//
+// Multi-thread traces interleave per-thread chunks on disk; the plain
+// RegisterFileCursor assumes a single coherent instruction stream and would
+// apply foreign threads' regdiffs. This cursor walks the same records but:
+//   • seeds from the nearest anchor OWNED by the target thread
+//     (TraceIndex::nearest_thread_anchor_before);
+//   • tracks THREAD markers to know which thread owns the current chunk;
+//   • applies INST/ANCHOR records only while inside the target thread's
+//     chunks, skipping everything else;
+//   • terminates once current_inst_id >= target (inst_id is global).
+//
+// Cost model: between two of the thread's anchors the file may contain many
+// other threads' chunks; the scan is still linear over the file region but
+// cheap per foreign record (kind check + skip). For heavy interleave the
+// thread_filter pass's bitmaps tell which inst_ids belong to the thread, but
+// byte-level skipping needs the record walk anyway — THREAD markers make it
+// correct without any bitmap dependency.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class ThreadIsolatedCursor {
+public:
+    ThreadIsolatedCursor(const TraceReader& reader, const TraceIndex& index,
+                         uint64_t thread_id);
+    ~ThreadIsolatedCursor();
+
+    ThreadIsolatedCursor(const ThreadIsolatedCursor&) = delete;
+    ThreadIsolatedCursor& operator=(const ThreadIsolatedCursor&) = delete;
+
+    /// Register state of `thread_id` BEFORE global inst_id executes.
+    /// Forward-only (targets must be non-decreasing), same contract as
+    /// RegisterFileCursor::advance_to().
+    const RegState& advance_to(uint64_t target_inst_id);
+
+    uint64_t current_inst_id() const { return current_inst_id_; }
+    bool initialized() const { return initialized_; }
+
+private:
+    void init_from_anchor(uint64_t target_inst_id);
+    void load_anchor_state(const uint8_t* ptr);
+
+    const TraceReader& reader_;
+    const TraceIndex& index_;
+    const uint64_t thread_id_;
+
+    RegState state_{};
+    uint64_t current_inst_id_ = 0;
+    uint64_t current_offset_ = 0;
+    bool initialized_ = false;
+    bool in_target_chunk_ = false;
+
+    uint32_t num_gpr_;
+    size_t inst_hdr_size_;
+    size_t memacc_size_;
+    size_t anchor_total_;
+    bool is_v5_;
+    bool is_v6_;
+    bool is_v7_;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // RegisterFile — random-access register state reconstruction.
 //
 // Single query strategy: a **dense checkpoint array** built eagerly at
@@ -129,6 +190,14 @@ public:
     /// Get the register state AFTER instruction `inst_id` executes.
     /// Equivalent to state_before(inst_id) + applying inst_id's diffs.
     RegState state_after(uint64_t inst_id);
+
+    /// Register state of `thread_id` BEFORE `inst_id` in a MULTI-THREAD trace.
+    /// Uses ThreadIsolatedCursor semantics: seeded from a thread-owned anchor,
+    /// replays only that thread's regdiffs. Falls back to the plain
+    /// state_before() when the trace has no THREAD records (single producer).
+    /// NOTE: not checkpoint-accelerated; intended for interactive queries on
+    /// a selected thread, not bulk passes.
+    RegState state_before_thread(uint64_t inst_id, uint64_t thread_id);
 
     /// Sample GPR[0..30] at multiple inst_ids in one call.
     ///

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 
 namespace tenet {
 
@@ -705,15 +706,24 @@ return rv;
     class Iterator {
     public:
         Iterator(const TraceReader* reader, uint64_t offset)
-            : reader_(reader), offset_(offset), current_pc_(0) {}
+            : reader_(reader), offset_(offset), current_pc_(0) {
+            thread_pcs_.emplace(0, 0);
+        }
 
         // Constructor with a pre-seeded `current_pc` for v5 mid-stream seek.
         Iterator(const TraceReader* reader, uint64_t offset, uint64_t seed_pc)
-            : reader_(reader), offset_(offset), current_pc_(seed_pc) {}
+            : reader_(reader), offset_(offset), current_pc_(seed_pc) {
+            // Random-access callers without a thread identity retain the
+            // legacy tid=0 behavior. Thread-aware offset lookup supplies its
+            // own seed through a sequential iterator at a THREAD boundary.
+            thread_pcs_.emplace(0, seed_pc);
+        }
 
         // Constructor with a ThreadReader for lock-free data access.
         Iterator(const TraceReader* reader, uint64_t offset, const ThreadReader* thread_reader)
-            : reader_(reader), offset_(offset), current_pc_(0), thread_reader_(thread_reader) {}
+            : reader_(reader), offset_(offset), current_pc_(0), thread_reader_(thread_reader) {
+            thread_pcs_.emplace(0, 0);
+        }
 
         RecordView operator*() const;
         Iterator& operator++();
@@ -732,7 +742,20 @@ return rv;
 
         const TraceReader* reader_;
         uint64_t offset_;
-        mutable uint64_t current_pc_;  // running PC for HF_PC_DELTA reconstruction
+        // HF_PC_DELTA uses a PC chain per producer thread. Thread chunks can
+        // interleave in one trace file, so a single running-PC accumulator
+        // would decode a resumed thread from another thread's last PC.
+        mutable uint64_t current_pc_;
+        mutable uint64_t current_thread_id_ = 0;
+
+    public:
+        /// Producer thread of the record last dereferenced (multi-thread
+        /// traces). Updated at each THREAD marker. 0 for single-producer
+        /// traces.
+        uint64_t current_thread_id() const { return current_thread_id_; }
+
+    private:
+        mutable std::unordered_map<uint64_t, uint64_t> thread_pcs_;
         const ThreadReader* thread_reader_ = nullptr;
     };
 

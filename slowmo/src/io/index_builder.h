@@ -138,6 +138,37 @@ public:
     };
     AnchorInfo nearest_anchor_before(uint64_t inst_id) const;
 
+    /// Nearest anchor at or before inst_id that belongs to producer thread
+    /// `thread_id` (multi-thread traces). When the anchor table carries no
+    /// thread annotations (single-thread legacy trace), this falls back to
+    /// nearest_anchor_before(). The returned anchor belongs to the thread's
+    /// own instruction stream, so replaying forward from it — skipping
+    /// foreign-thread INST records — reconstructs that thread's register
+    /// state correctly.
+    AnchorInfo nearest_thread_anchor_before(uint64_t inst_id,
+                                            uint64_t thread_id) const;
+
+    /// Whether the anchor table carries per-anchor thread annotations
+    /// (i.e. the trace contains THREAD records).
+    bool anchors_have_threads() const { return anchors_have_threads_; }
+
+    /// ── Thread chunk table (multi-thread traces) ─────────────────────────
+    /// One entry per THREAD marker: (first inst_id of the chunk, thread_id).
+    /// Chunks partition the global inst_id space; `thread_at(inst_id)` is a
+    /// binary search. The table is persisted in the META CF so cached
+    /// indexes answer thread queries without re-scanning the trace.
+    /// Empty for single-producer traces (thread_at() then reports 0).
+    const std::vector<std::pair<uint64_t, uint64_t>>& thread_chunks() const {
+        return thread_chunks_;
+    }
+
+    /// Producer thread of the instruction at `inst_id`. Returns 0 for
+    /// single-producer traces or inst_ids before the first THREAD marker.
+    uint64_t thread_at(uint64_t inst_id) const;
+
+    /// Distinct producer threads observed in the trace (sorted).
+    std::vector<uint64_t> thread_ids() const;
+
     /// Find the most recent instruction before `before_id` that wrote `reg_idx`.
     /// Uses the REG_WRITES inverted index: O(log N) via RocksDB SeekForPrev.
     /// Returns the inst_id of the last writer, or 0 if no writer exists.
@@ -260,6 +291,18 @@ private:
         uint64_t file_offset;
     };
     std::vector<AnchorEntry> anchors_;
+
+    // Per-anchor owning thread (parallel to anchors_). Built during the same
+    // Phase 0 scan: THREAD records observed while walking the file assign
+    // every anchor until the next THREAD marker. Empty for traces without
+    // any THREAD record (single-producer legacy format) — thread_at_anchor()
+    // then reports 0.
+    std::vector<uint64_t> anchor_threads_;
+    bool anchors_have_threads_ = false;
+
+    // Thread chunk table: (first inst_id of chunk, thread_id), ascending.
+    // Collected during Phase 0 and persisted in the META CF.
+    std::vector<std::pair<uint64_t, uint64_t>> thread_chunks_;
 
     // Sparse offset granularity (adaptive: set at build time based on inst_count).
     // Default 256; for large traces (>16M inst) this is increased to keep the

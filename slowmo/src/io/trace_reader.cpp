@@ -669,17 +669,29 @@ RecordView TraceReader::Iterator::operator*() const {
     rv.is_v7 = use_fpr;
     rv.is_v8 = use_wide_api;
 
-    if (rv.kind == RecordKind::Inst && use_pc_delta) {
-        // v5/v6+v5/v7+v5: reconstruct absolute PC from pc_delta.
+    if (rv.kind == RecordKind::Thread) {
+        // THREAD markers delimit per-producer streams. Keep the legacy scalar
+        // current_pc_ in sync for old single-thread traces, but maintain an
+        // independent v5 delta chain for every observed thread.
+        const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(rv.raw_ptr);
+        current_thread_id_ = hdr->thread_id;
+        const auto it = thread_pcs_.try_emplace(current_thread_id_, 0).first;
+        current_pc_ = it->second;
+    } else if (rv.kind == RecordKind::Inst && use_pc_delta) {
+        // v5/v6+v5/v7+v5: reconstruct absolute PC from this producer
+        // thread's PC chain. The no-THREAD legacy stream uses tid=0.
         const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_inst_head_v5_t*>(rv.raw_ptr);
         int16_t delta;
         std::memcpy(&delta, &hdr->pc_delta, sizeof(delta));  // LE decode
-        uint64_t new_pc = current_pc_ + static_cast<int64_t>(delta);
+        auto& running_pc = thread_pcs_[current_thread_id_];
+        const uint64_t new_pc = running_pc + static_cast<int64_t>(delta);
         rv.resolved_pc = new_pc;
-        current_pc_ = new_pc;  // advance state
+        running_pc = new_pc;
+        current_pc_ = new_pc;
     } else if (rv.kind == RecordKind::Anchor && use_pc_delta) {
-        // Anchor carries absolute PC — resync running_pc
+        // Anchor carries absolute PC — resync the current producer thread.
         const auto* hdr = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(rv.raw_ptr);
+        thread_pcs_[current_thread_id_] = hdr->pc;
         current_pc_ = hdr->pc;
     }
 

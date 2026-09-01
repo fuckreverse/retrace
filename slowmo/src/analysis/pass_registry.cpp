@@ -20,6 +20,7 @@
 #include "analysis/passes/taint/taint_source_annotation_pass.h"
 #include "analysis/passes/misc/thread_pass.h"
 #include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/misc/cross_thread_dataflow_pass.h"
 
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
@@ -195,6 +196,9 @@ if (name == "loop_semantics")          return std::make_unique<LoopSemanticsPass
         c.build_bitmaps = true;
         return std::make_unique<ThreadFilterPass>(std::move(c));
     }
+    if (name == "cross_thread_dataflow") {
+        return std::make_unique<CrossThreadDataflowPass>();
+    }
     if (name == "trace_diff") {
         TraceDiffConfig c;
         uint64_t mid = ctx.total_inst ? ctx.total_inst / 2 : 0;
@@ -286,6 +290,7 @@ const std::vector<PassCatalogEntry>& pass_catalog() {
         // — Misc —
         {"thread",                "Threads",       "Thread timeline / switching",                            PassCategory::Misc,      PassDefault::Yes},
         {"thread_filter",         "Thread Filter", "Per-thread instruction bitmaps for filtering",           PassCategory::Misc,      PassDefault::No},
+        {"cross_thread_dataflow", "XThread Dataflow", "Cross-thread data hand-offs through shared memory",    PassCategory::Misc,      PassDefault::No},
         {"vm_abstract",           "VM Abstract",   "VM dispatcher detection, handler extraction, execution abstraction", PassCategory::Structure, PassDefault::No},
     };
     return catalog;
@@ -515,6 +520,12 @@ if (name == "loop_semantics") {
         if (auto* r = try_get<ThreadFilterResult>(result))
             return fmt::format("threads: {}, filtered: {}",
                                r->thread_count, r->is_filtered ? "yes" : "no");
+    }
+    if (name == "cross_thread_dataflow") {
+        if (auto* r = try_get<CrossThreadDataflowResult>(result))
+            return fmt::format("hand-offs: {}, channels: {}, pairs: {}",
+                               r->edges.size(), r->channels.size(),
+                               r->thread_pair_count);
     }
     if (name == "vm_abstract") {
         if (auto* r = try_get<VMAbstractResult>(result))

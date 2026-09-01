@@ -84,6 +84,11 @@ struct AnalysisRange {
         }
         return false;
     }
+
+    /// Producer thread IDs to include (multi-thread traces).
+    /// Instructions emitted by other threads are not delivered to passes —
+    /// the same visibility semantics as exclude_pc_ranges. Empty = all.
+    std::vector<uint64_t> include_thread_ids;
 };
 
 // ─── Pass context ─────────────────────────────────────────────────────────

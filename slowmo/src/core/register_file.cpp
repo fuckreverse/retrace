@@ -423,4 +423,188 @@ void RegisterFile::build_checkpoints(uint64_t stride,
     checkpoints_built_.store(true, std::memory_order_release);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ThreadIsolatedCursor implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+ThreadIsolatedCursor::ThreadIsolatedCursor(const TraceReader& reader,
+                                           const TraceIndex& index,
+                                           uint64_t thread_id)
+    : reader_(reader), index_(index), thread_id_(thread_id)
+    , num_gpr_(reader.header().num_gpr)
+    , is_v5_((reader.header().flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0)
+    , is_v6_((reader.header().flags & qbditrace::QBDITRACE_HF_OLD_VALUE) != 0)
+    , is_v7_((reader.header().flags & qbditrace::QBDITRACE_HF_HAS_FPR) != 0)
+{
+    if (is_v7_ && is_v5_)      inst_hdr_size_ = sizeof(qbditrace::qbditrace_inst_head_v7_v5_t);
+    else if (is_v7_)           inst_hdr_size_ = sizeof(qbditrace::qbditrace_inst_head_v7_t);
+    else if (is_v5_)           inst_hdr_size_ = sizeof(qbditrace::qbditrace_inst_head_v5_t);
+    else                       inst_hdr_size_ = sizeof(qbditrace::qbditrace_inst_head_t);
+
+    memacc_size_ = is_v6_ ? sizeof(qbditrace::qbditrace_memacc_v6_t)
+                          : sizeof(qbditrace::qbditrace_memacc_t);
+    anchor_total_ = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr_ * 8
+                  + (is_v7_ ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0);
+
+    reader_.pin_all();
+}
+
+ThreadIsolatedCursor::~ThreadIsolatedCursor() {
+    reader_.unpin_all();
+}
+
+void ThreadIsolatedCursor::load_anchor_state(const uint8_t* ptr) {
+    const uint8_t* gpr_start = ptr + sizeof(qbditrace::qbditrace_anchor_head_t);
+    const uint64_t* gpr_ptr = reinterpret_cast<const uint64_t*>(gpr_start);
+    uint32_t count = std::min(static_cast<uint32_t>(AARCH64_GPR_COUNT), num_gpr_);
+    std::memcpy(state_.gpr, gpr_ptr, count * 8);
+    if (is_v7_) {
+        const uint64_t* fpr_lo = reinterpret_cast<const uint64_t*>(gpr_start + num_gpr_ * 8);
+        const uint64_t* fpr_hi = fpr_lo + AARCH64_FPR_COUNT;
+        for (uint8_t i = 0; i < AARCH64_FPR_COUNT; ++i) {
+            state_.fpr[i].lo = fpr_lo[i];
+            state_.fpr[i].hi = fpr_hi[i];
+        }
+    }
+}
+
+void ThreadIsolatedCursor::init_from_anchor(uint64_t target_inst_id) {
+    auto anchor_info = index_.nearest_thread_anchor_before(target_inst_id, thread_id_);
+
+    current_offset_ = anchor_info.file_offset;
+    current_inst_id_ = anchor_info.inst_id;
+    // nearest_thread_anchor_before() starts on an anchor owned by this thread;
+    // if the preceding THREAD marker lies outside the seek window, retain that
+    // ownership explicitly rather than waiting to observe a new marker.
+    in_target_chunk_ = (anchor_info.file_offset !=
+                        sizeof(qbditrace::qbditrace_file_header_t));
+
+    // Seed the thread's v5 PC chain from the anchor's absolute PC (the anchor
+    // itself is the state at the NEXT instruction of this thread, whose delta
+    // from the anchor is 0 — the writer guarantees this on re-anchor).
+    const uint8_t* ptr = reader_.data_at(current_offset_);
+    if (current_offset_ < reader_.file_size() &&
+        ptr[0] == qbditrace::QBDITRACE_REC_ANCHOR) {
+        const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+        load_anchor_state(ptr);
+        state_.gpr[IDX_PC] = ah->pc;
+        current_offset_ += anchor_total_;
+    }
+
+    initialized_ = true;
+}
+
+const RegState& ThreadIsolatedCursor::advance_to(uint64_t target_inst_id) {
+    if (!initialized_) {
+        init_from_anchor(target_inst_id);
+    }
+
+    const uint64_t file_end = reader_.file_size();
+
+    while (current_inst_id_ < target_inst_id && current_offset_ < file_end) {
+        const uint8_t* ptr = reader_.data_at(current_offset_);
+        const uint8_t kind = ptr[0];
+
+        if (kind == qbditrace::QBDITRACE_REC_THREAD) {
+            // Chunk ownership switch.
+            const auto* th = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr);
+            in_target_chunk_ = (th->thread_id == thread_id_);
+            current_offset_ += sizeof(qbditrace::qbditrace_thread_head_t);
+            continue;
+        }
+
+        if (!in_target_chunk_) {
+            // Foreign chunk: skip without applying its register diffs, but
+            // still advance the GLOBAL instruction id. inst_id is file-wide,
+            // not per-thread, and is the query coordinate used by all passes.
+            auto rec = reader_.record_at(current_offset_);
+            rec.is_v7 = is_v7_;
+            if (kind == qbditrace::QBDITRACE_REC_INST) {
+                current_inst_id_++;
+            }
+            current_offset_ += rec.byte_size(num_gpr_);
+            continue;
+        }
+
+        if (kind == qbditrace::QBDITRACE_REC_INST) {
+            const uint8_t n_regdiff = ptr[2];
+            const uint8_t n_mem     = ptr[3];
+            uint8_t n_fprdiff = 0;
+            if (is_v7_ && is_v5_)      n_fprdiff = ptr[6];
+            else if (is_v7_)           n_fprdiff = ptr[16];
+
+            if (is_v5_) {
+                int16_t pc_delta;
+                std::memcpy(&pc_delta, ptr + 4, 2);
+                state_.gpr[IDX_PC] += static_cast<int64_t>(pc_delta);
+            } else if (is_v7_) {
+                std::memcpy(&state_.gpr[IDX_PC], ptr + 4, 8);
+            } else {
+                std::memcpy(&state_.gpr[IDX_PC], ptr + 8, 8);
+            }
+
+            const uint8_t* diffs = ptr + inst_hdr_size_;
+            for (uint8_t i = 0; i < n_regdiff; i++) {
+                const auto* d = reinterpret_cast<const qbditrace::qbditrace_regdiff_t*>(
+                    diffs + i * sizeof(qbditrace::qbditrace_regdiff_t));
+                if (d->reg_index < AARCH64_GPR_COUNT) {
+                    state_.gpr[d->reg_index] = d->value;
+                }
+            }
+
+            if (is_v7_ && n_fprdiff > 0) {
+                const uint8_t* fpr_diffs = diffs +
+                    n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t);
+                for (uint8_t i = 0; i < n_fprdiff; i++) {
+                    const auto* d = reinterpret_cast<const qbditrace::qbditrace_fprdiff_t*>(
+                        fpr_diffs + i * sizeof(qbditrace::qbditrace_fprdiff_t));
+                    if (d->fpr_index < AARCH64_FPR_COUNT) {
+                        state_.fpr[d->fpr_index].lo = d->lo;
+                        state_.fpr[d->fpr_index].hi = d->hi;
+                    }
+                }
+            }
+
+            const uint8_t nzcv = ptr[1];
+            if (nzcv != 0) {
+                state_.gpr[IDX_NZCV] = nzcv & 0xF;
+            }
+
+            current_offset_ += inst_hdr_size_
+                + n_regdiff * sizeof(qbditrace::qbditrace_regdiff_t)
+                + n_fprdiff * sizeof(qbditrace::qbditrace_fprdiff_t)
+                + n_mem * memacc_size_;
+            current_inst_id_++;
+
+        } else if (kind == qbditrace::QBDITRACE_REC_ANCHOR) {
+            // Thread-owned anchor: full state overwrite.
+            load_anchor_state(ptr);
+            const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
+            state_.gpr[IDX_PC] = ah->pc;
+            current_offset_ += anchor_total_;
+
+        } else {
+            // Other records of the same thread (SVC/CAPI/…) — skip.
+            auto rec = reader_.record_at(current_offset_);
+            rec.is_v7 = is_v7_;
+            current_offset_ += rec.byte_size(num_gpr_);
+        }
+    }
+
+    return state_;
+}
+
+RegState RegisterFile::state_before_thread(uint64_t inst_id, uint64_t thread_id) {
+    TENET_ZONE;
+
+    // Single-producer trace: no THREAD markers anywhere → plain semantics.
+    if (!index_.anchors_have_threads()) {
+        return state_before(inst_id);
+    }
+    // Checkpoints are built over the interleaved stream and are meaningless
+    // for a single thread's reconstruction — always use the isolated cursor.
+    ThreadIsolatedCursor cursor(reader_, index_, thread_id);
+    return cursor.advance_to(inst_id);
+}
+
 }  // namespace tenet
