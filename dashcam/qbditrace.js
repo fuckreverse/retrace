@@ -109,19 +109,35 @@ function resolveExports(dylibModule) {
   return ex;
 }
 
-function resolveTargetModule() {
-  let m;
-  if (CONFIG.moduleName) {
-    m = Process.findModuleByName(CONFIG.moduleName);
-    if (!m) {
-      fail('module not found: ' + CONFIG.moduleName);
+/* Resolve the target module. On Android spawn scenarios the module may not be
+ * loaded yet (lazy System.loadLibrary) — poll asynchronously every 2s for up
+ * to `timeoutMs` (default 60s). Calls `onResolved(module)` on success.
+ * Busy-waiting would deadlock: the JS thread must yield for the app to make
+ * progress loading the module. */
+function resolveTargetModuleAsync(timeoutMs, onResolved, onRetry) {
+  const deadline = Date.now() + (timeoutMs || 60000);
+  function attempt() {
+    let m;
+    if (CONFIG.moduleName) {
+      m = Process.findModuleByName(CONFIG.moduleName);
+    } else {
+      m = Process.enumerateModules()[0];
     }
-  } else {
-    m = Process.enumerateModules()[0];
+    if (m) {
+      log('target module: ' + m.name + ' base=' + m.base + ' size=0x' +
+          m.size.toString(16) + ' (' + m.size + ' bytes)');
+      onResolved(m);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      fail('module not found (waited ' + Math.round((timeoutMs || 60000) / 1000) +
+           's): ' + CONFIG.moduleName);
+      return;
+    }
+    if (onRetry) onRetry(Math.round((deadline - Date.now()) / 1000));
+    setTimeout(attempt, 2000);
   }
-  log('target module: ' + m.name + ' base=' + m.base + ' size=0x' +
-      m.size.toString(16) + ' (' + m.size + ' bytes)');
-  return m;
+  attempt();
 }
 
 function buildNativeFunctions(ex) {
@@ -135,7 +151,7 @@ function buildNativeFunctions(ex) {
   };
   if (ex.qbditrace_run_thread) {
     fns.runThread = new NativeFunction(ex.qbditrace_run_thread, 'int',
-        ['pointer', 'pointer', 'uint64']);
+        ['pointer', 'pointer', 'pointer']);
   }
   return fns;
 }
@@ -1360,7 +1376,12 @@ function mainImpl() {
   const dylib = loadDylib(CONFIG.dylibPath);
   const ex = resolveExports(dylib);
   const fn = buildNativeFunctions(ex);
-  const mod = resolveTargetModule();
+
+  // Module may not be loaded yet in Android spawn scenarios (lazy
+  // System.loadLibrary) — resolve asynchronously and continue setup in the
+  // callback. Busy-waiting here would deadlock the app.
+  resolveTargetModuleAsync(CONFIG.moduleWaitMs, function (mod) {
+  const modRef = mod;
 
   // --- Live stats polling ---
   // After configure(), obtain the stats page pointer once, then poll with
@@ -1645,13 +1666,23 @@ function mainImpl() {
     if (traceIndex === 1) {
       status('objc_configuration', objc.diagnostic);
     }
-    return cfg;
+        return cfg;
+  }
+
+  // --- Optional: multi-thread tracing via pthread_create interception ---
+  // Install before either trace trigger. In INVOKE mode the entry function runs
+  // synchronously below, so installing this after the branch would miss every
+  // pthread_create issued by that invocation.
+  if (CONFIG.traceThreads) {
+    installPthreadHooks({
+      fn: fn,
+      mod: modRef,
+    });
   }
 
   // ==========================================================================
   // Branch: INVOKE mode vs HOOK mode
   // ==========================================================================
-
   if (CONFIG.invoke) {
     // --- INVOKE MODE: actively call the entry function with supplied args ---
     log('invoke mode: preparing to call ' + funcStart + ' with ' +
@@ -1889,16 +1920,11 @@ function mainImpl() {
       }
     }
 
-    // --- Optional: multi-thread tracing via pthread_create interception ---
-    // Trace children spawned by the traced code into the SAME trace file
-    // (interleaved THREAD chunks). Requires CONFIG.traceThreads.
-    if (CONFIG.traceThreads) {
-      installPthreadHooks({
-        fn: fn,
-        mod: mod,
-      });
-    }
   }
+  }, function (secondsLeft) {
+    log('waiting for module "' + CONFIG.moduleName + '" to load... ' +
+        secondsLeft + 's left');
+  });
 }
 
 // ===========================================================================
