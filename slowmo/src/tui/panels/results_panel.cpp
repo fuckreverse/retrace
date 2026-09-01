@@ -26,6 +26,7 @@
 #include "analysis/passes/profile/dataflow_graph_pass.h"
 #include "analysis/passes/taint/taint_source_annotation_pass.h"
 #include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/misc/cross_thread_dataflow_pass.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
 
 #include "io/trace_reader.h"
@@ -340,6 +341,36 @@ std::vector<ResultEntry> build_result_entries(const TuiContext& ctx, std::string
             (void)r;
             // ThreadFilterResult has no per-item list worth browsing beyond
             // the one-line catalog summary (thread_count / is_filtered).
+        }
+    } else if (name == "cross_thread_dataflow") {
+        if (auto* r = ctx.cross_thread_dataflow_result) {
+            if (r->edges.empty()) {
+                out.push_back({"no cross-thread memory hand-offs "
+                               "(single-thread trace or no shared-memory reads)",
+                               0, false});
+            }
+            // Channels (busiest first), each with its top hand-off edges.
+            for (const auto& ch : r->channels) {
+                out.push_back({fmt::format(
+                    "channel 0x{:016x}  tid 0x{:x} → 0x{:x}  hand-offs={}",
+                    ch.addr, ch.from_thread, ch.to_thread, ch.edge_count),
+                    0, false});
+                // Up to 5 sample edges per channel, newest (latest consumer).
+                size_t shown = 0;
+                for (auto it = ch.edge_indices.rbegin();
+                     it != ch.edge_indices.rend() && shown < 5; ++it, ++shown) {
+                    const auto& e = r->edges[*it];
+                    out.push_back({fmt::format(
+                        "  #{}: write@{} (tid 0x{:x})  →  read@{} (tid 0x{:x})",
+                        *it, e.from_inst_id, e.from_thread,
+                        e.to_inst_id, e.to_thread),
+                        e.to_inst_id, true});  // jump to the consumer read
+                }
+                if (ch.edge_count > 5) {
+                    out.push_back({fmt::format("  … {} more hand-offs",
+                                               ch.edge_count - 5), 0, false});
+                }
+            }
         }
     }
 

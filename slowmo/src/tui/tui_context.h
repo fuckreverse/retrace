@@ -51,6 +51,7 @@ struct RegTimelineResult;
 struct TraceDiffResult;
 struct TaintSourceAnnotationResult;
 struct ThreadFilterResult;
+struct CrossThreadDataflowResult;
 struct CFGLayoutResult;
 
 /// Shared context that all TUI panels can read from and write to.
@@ -111,6 +112,14 @@ struct TuiContext {
     const TraceDiffResult*               trace_diff_result = nullptr;
     const TaintSourceAnnotationResult*   taint_source_annotation_result = nullptr;
     const ThreadFilterResult*            thread_filter_result = nullptr;
+    const CrossThreadDataflowResult*      cross_thread_dataflow_result = nullptr;
+
+    // ─── Thread view filter (set by ThreadPanel, read by TuiApp) ───────
+    /// When non-empty, the instruction list shows ONLY instructions whose
+    /// inst_id appears in thread_filter_result->included_inst_ids.
+    /// Mapped through the bitmap so j/k navigate thread-local positions.
+    std::vector<uint64_t> thread_filter_ids;   // included thread tids
+    bool thread_filter_active = false;
 
     bool show_taint = false;
     bool show_backward_taint = false;

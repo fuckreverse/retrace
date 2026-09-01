@@ -26,7 +26,7 @@ bool CliOptions::has_analysis_option() const {
            opt_entropy ||
            opt_dump_memaccess ||
            // P3 options
-           opt_yara_mem_scan || opt_thread_filter ||
+           opt_yara_mem_scan || opt_thread_filter || opt_cross_thread_dataflow ||
            opt_rpc || opt_mcp || opt_mcp_http || opt_mcp_hub || opt_streaming || opt_stats_only ||
            opt_objc_crypto || opt_syscall_intercept ||
            opt_taint_source_annotation ||
@@ -130,6 +130,8 @@ fmt::print(stderr, "  --trace-diff-max-diffs <n>        Max divergence segments 
     fmt::print(stderr, "  --yara-min-entropy <N>            Skip pages with Shannon entropy < N (default: 0)\n");
     fmt::print(stderr, "  --yara-scan-code                  Also scan code bytes buffer\n");
     fmt::print(stderr, "  --thread-filter [tid1,tid2,...]   Build per-thread instruction bitmaps\n");
+    fmt::print(stderr, "  --cross-thread-dataflow          Detect cross-thread data hand-offs via shared memory\n");
+    fmt::print(stderr, "  --thread <tid1,tid2,...>          Restrict ALL analysis to given threads\n");
     fmt::print(stderr, "  --exclude-range <start> <end>     Exclude PC range [start,end) from analysis (hex, repeatable)\n");
     fmt::print(stderr, "  --rpc [[host:]port]               Start JSON-RPC server over TCP loopback\n");
     fmt::print(stderr, "                                    Default: 127.0.0.1:0 (auto port; blocks until SIGINT)\n");
@@ -415,6 +417,31 @@ CliOptions parse_args(int argc, char** argv) {
                         tok.push_back(c);
                     }
                 }
+            }
+        } else if (arg == "--cross-thread-dataflow") {
+            opts.opt_cross_thread_dataflow = true;
+        } else if (arg == "--thread" && i + 1 < argc) {
+            // --thread <tid[,tid...]>: scope ALL pass analysis to the listed
+            // producer threads (multi-thread traces). Also implies --thread-filter
+            // id list so per-thread bitmaps are available.
+            opts.opt_thread_scope = true;
+            std::string tids_str = argv[++i];
+            std::string tok;
+            for (char c : tids_str + ",") {
+                if (c == ',') {
+                    if (!tok.empty()) {
+                        uint64_t tid = std::stoull(tok);
+                        opts.thread_scope_ids.push_back(tid);
+                        opts.thread_filter_ids.push_back(tid);
+                        tok.clear();
+                    }
+                } else {
+                    tok.push_back(c);
+                }
+            }
+            if (opts.thread_scope_ids.empty()) {
+                fmt::print(stderr, "[!] --thread: expected comma-separated thread ids\n");
+                return opts;  // parse_status stays 0; caller flags error
             }
         } else if (arg == "--exclude-range" && i + 2 < argc) {
             // --exclude-range <start_hex> <end_hex>

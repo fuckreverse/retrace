@@ -38,6 +38,7 @@
 #include "analysis/passes/profile/dataflow_graph_pass.h"
 #include "analysis/passes/taint/taint_source_annotation_pass.h"
 #include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/misc/cross_thread_dataflow_pass.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
@@ -163,6 +164,19 @@ InstructionRow TuiApp::fetch_row(uint64_t inst_id) {
 std::vector<InstructionRow> TuiApp::fetch_viewport_rows() {
     std::vector<InstructionRow> rows;
     rows.reserve(viewport_height_);
+
+    // Thread-filtered mode: walk the filtered bitmap from the cursor's rank.
+    if (thread_filter_view_active()) {
+        uint64_t rank = thread_filter_rank(current_inst_);
+        if (rank == UINT64_MAX) rank = 0;
+        for (int i = 0; i < viewport_height_; i++) {
+            uint64_t id = thread_filter_inst_at(rank + static_cast<uint64_t>(i));
+            if (id == UINT64_MAX) break;
+            rows.push_back(fetch_row(id));
+        }
+        return rows;
+    }
+
     for (int i = 0; i < viewport_height_; i++) {
         uint64_t id = viewport_top_ + i;
         if (id >= total_inst_) break;
@@ -330,6 +344,23 @@ Element TuiApp::render_status_bar() {
             | color(Color::White),
     });
 
+    // Thread filter indicator: which thread(s) the view is restricted to.
+    if (thread_filter_view_active()) {
+        std::string tids;
+        for (size_t i = 0; i < ctx_.thread_filter_ids.size() && i < 3; i++) {
+            if (i) tids += ",";
+            tids += fmt::format("0x{:x}", ctx_.thread_filter_ids[i]);
+        }
+        if (ctx_.thread_filter_ids.size() > 3)
+            tids += fmt::format("+{}", ctx_.thread_filter_ids.size() - 3);
+        auto filter_tag = text(fmt::format("  [thread {} {}/{}] ", tids,
+                              thread_filter_rank(current_inst_) != UINT64_MAX
+                                  ? thread_filter_rank(current_inst_) + 1 : 1,
+                              thread_filter_count()))
+            | bgcolor(Color::Magenta) | color(Color::White) | bold;
+        left = hbox({left, filter_tag});
+    }
+
     // Compact help line — shows the most important new bindings
     auto right = text("j/k:nav g:goto /:srch b:bkm  \":\"cmd(:b/:w/:rc/:rb)  "
                       "t/S/B/C:analysis [/]:taint {/}:hist p:mem P:stk f/F L I O V H A q")
@@ -384,6 +415,7 @@ Element TuiApp::render_hex_dump_panel() {
 
 Element TuiApp::render_main_layout() {
     sync_context();
+    sync_thread_filter();
 
     // Render visible right-side panels via the panel registry
     Elements panel_elements;
@@ -485,6 +517,127 @@ void TuiApp::update_viewport() {
         viewport_top_ = current_inst_;
     } else if (current_inst_ >= viewport_top_ + static_cast<uint64_t>(viewport_height_)) {
         viewport_top_ = current_inst_ - static_cast<uint64_t>(viewport_height_) + 1;
+    }
+}
+
+// ─── Thread view filter (Phase 3 multi-thread) ─────────────────────────
+
+bool TuiApp::thread_filter_view_active() const {
+    return ctx_.thread_filter_active && !ctx_.thread_filter_ids.empty() &&
+           ctx_.thread_filter_result != nullptr;
+}
+
+uint64_t TuiApp::thread_filter_count() const {
+    if (!thread_filter_view_active()) return 0;
+    return ctx_.thread_filter_result->included_inst_ids.cardinality();
+}
+
+uint64_t TuiApp::thread_filter_rank(uint64_t inst_id) const {
+    if (!thread_filter_view_active()) return UINT64_MAX;
+    if (!ctx_.thread_filter_result->included_inst_ids.contains(inst_id))
+        return UINT64_MAX;
+    // rank(x) = number of elements < x, so the element itself sits at that
+    // position in ascending order.
+    return ctx_.thread_filter_result->included_inst_ids.rank(inst_id);
+}
+
+uint64_t TuiApp::thread_filter_inst_at(uint64_t rank) const {
+    if (!thread_filter_view_active() || rank >= thread_filter_count())
+        return UINT64_MAX;
+    uint64_t element = 0;
+    if (!ctx_.thread_filter_result->included_inst_ids.select(rank, &element))
+        return UINT64_MAX;
+    return element;
+}
+
+void TuiApp::sync_thread_filter() {
+    // Determine desired state: active with a non-empty id list.
+    const bool want_active = ctx_.thread_filter_active &&
+                             !ctx_.thread_filter_ids.empty();
+
+    if (!want_active) {
+        if (thread_filter_built_valid_) {
+            // Filter was just turned off — drop the stale result pointer.
+            ctx_.thread_filter_result = nullptr;
+            thread_filter_built_valid_ = false;
+            thread_filter_built_ids_.clear();
+            // Snap cursor/viewport back to a valid global position.
+            update_viewport();
+        }
+        return;
+    }
+
+    // Already built for exactly this id set?
+    bool same = thread_filter_built_valid_ &&
+                thread_filter_built_ids_.size() == ctx_.thread_filter_ids.size();
+    if (same) {
+        for (size_t i = 0; i < thread_filter_built_ids_.size(); i++) {
+            if (thread_filter_built_ids_[i] != ctx_.thread_filter_ids[i]) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (same && ctx_.thread_filter_result != nullptr) return;  // up to date
+
+    // (Re)run the thread_filter pass with the selected ids.
+    ensure_pass_manager();
+    auto* pm = service_->pass_manager();
+    if (!pm) return;
+
+    // Replace any previous registration so the new config takes effect.
+    // NOTE: register_pass_by_name() is idempotent (short-circuits when the
+    // pass already exists) and would NOT apply the new ids — register the
+    // pass directly; PassManager::register_pass() replaces NotRun entries.
+    pm->invalidate("thread_filter");
+    ThreadFilterConfig tfc;
+    tfc.include_thread_ids = ctx_.thread_filter_ids;
+    tfc.build_bitmaps = true;
+    pm->register_pass(std::make_unique<ThreadFilterPass>(std::move(tfc)));
+    auto& raw = pm->require("thread_filter");
+    if (!raw.ok()) {
+        last_pass_status_ = fmt::format("thread_filter: {}", raw.error_message);
+        ctx_.thread_filter_result = nullptr;
+        thread_filter_built_valid_ = false;
+        return;
+    }
+    wire_pass_result("thread_filter", raw);
+
+    thread_filter_built_ids_ = ctx_.thread_filter_ids;
+    thread_filter_built_valid_ = true;
+
+    // Make sure the cursor is on a visible (filtered-in) instruction.
+    if (thread_filter_view_active() &&
+        thread_filter_rank(current_inst_) == UINT64_MAX) {
+        uint64_t first = thread_filter_inst_at(0);
+        if (first != UINT64_MAX) current_inst_ = first;
+    }
+    update_viewport();
+}
+
+void TuiApp::navigate_filtered(int64_t delta) {
+    if (!thread_filter_view_active()) {
+        navigate_relative(delta);
+        return;
+    }
+    const uint64_t count = thread_filter_count();
+    if (count == 0) return;
+
+    uint64_t rank = thread_filter_rank(current_inst_);
+    if (rank == UINT64_MAX) {
+        // Cursor off-filter: enter from the nearest end.
+        rank = (delta > 0) ? 0 : count - 1;
+    } else if (delta > 0) {
+        uint64_t d = static_cast<uint64_t>(delta);
+        rank = (rank + d >= count - 1) ? count - 1 : rank + d;
+    } else {
+        uint64_t d = static_cast<uint64_t>(-delta);
+        rank = (rank <= d) ? 0 : rank - d;
+    }
+    uint64_t inst = thread_filter_inst_at(rank);
+    if (inst != UINT64_MAX) {
+        current_inst_ = inst;
+        update_viewport();
     }
 }
 
@@ -860,26 +1013,64 @@ void TuiApp::init_key_bindings() {
     }, "quit");
 
     // ─── Navigation ──────────────────────────────────────────────────────
-    normal_keys_.bind(Event::Character('j'), [this] { navigate_relative(1); return true; }, "down");
-    normal_keys_.bind(Event::ArrowDown,      [this] { navigate_relative(1); return true; }, "down");
-    normal_keys_.bind(Event::Character('k'), [this] { navigate_relative(-1); return true; }, "up");
-    normal_keys_.bind(Event::ArrowUp,        [this] { navigate_relative(-1); return true; }, "up");
+    // When a thread filter is active, j/k/arrow keys move within the filtered
+    // bitmap order (thread-local positions) instead of raw inst_id + 1.
+    normal_keys_.bind(Event::Character('j'), [this] {
+        thread_filter_view_active() ? navigate_filtered(1) : navigate_relative(1);
+        return true;
+    }, "down");
+    normal_keys_.bind(Event::ArrowDown,      [this] {
+        thread_filter_view_active() ? navigate_filtered(1) : navigate_relative(1);
+        return true;
+    }, "down");
+    normal_keys_.bind(Event::Character('k'), [this] {
+        thread_filter_view_active() ? navigate_filtered(-1) : navigate_relative(-1);
+        return true;
+    }, "up");
+    normal_keys_.bind(Event::ArrowUp,        [this] {
+        thread_filter_view_active() ? navigate_filtered(-1) : navigate_relative(-1);
+        return true;
+    }, "up");
     normal_keys_.bind(Event::Character('K'), [this] {
         if (current_inst_ > 0) navigate_to(current_inst_ - 1);
         return true;
     }, "reverse step");
     normal_keys_.bind(Event::Character('G'), [this] {
-        navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0); return true;
+        if (thread_filter_view_active()) {
+            uint64_t last = thread_filter_inst_at(thread_filter_count() > 0
+                ? thread_filter_count() - 1 : 0);
+            if (last != UINT64_MAX) current_inst_ = last;
+        } else {
+            navigate_to(total_inst_ > 0 ? total_inst_ - 1 : 0);
+        }
+        return true;
     }, "goto end");
-    normal_keys_.bind(Event::Character('0'), [this] { navigate_to(0); return true; }, "goto start");
+    normal_keys_.bind(Event::Character('0'), [this] {
+        if (thread_filter_view_active()) {
+            uint64_t first = thread_filter_inst_at(0);
+            if (first != UINT64_MAX) current_inst_ = first;
+        } else {
+            navigate_to(0);
+        }
+        return true;
+    }, "goto start");
     normal_keys_.bind(Event::Character(' '), [this] {
-        navigate_relative(viewport_height_ / 2); return true;
+        thread_filter_view_active()
+            ? navigate_filtered(viewport_height_ / 2)
+            : navigate_relative(viewport_height_ / 2);
+        return true;
     }, "page down");
     normal_keys_.bind(Event::Character('d'), [this] {
-        navigate_relative(viewport_height_ / 2); return true;
+        thread_filter_view_active()
+            ? navigate_filtered(viewport_height_ / 2)
+            : navigate_relative(viewport_height_ / 2);
+        return true;
     }, "page down");
     normal_keys_.bind(Event::Character('u'), [this] {
-        navigate_relative(-(viewport_height_ / 2)); return true;
+        thread_filter_view_active()
+            ? navigate_filtered(-(viewport_height_ / 2))
+            : navigate_relative(-(viewport_height_ / 2));
+        return true;
     }, "page up");
 
     // ─── Dialogs ─────────────────────────────────────────────────────────
@@ -1502,6 +1693,8 @@ void TuiApp::wire_pass_result(std::string_view name, const PassResult& raw) {
         thread_panel_->set_visible(true);
     } else if (name == "thread_filter") {
         ctx_.thread_filter_result = &raw.get<ThreadFilterResult>();
+    } else if (name == "cross_thread_dataflow") {
+        ctx_.cross_thread_dataflow_result = &raw.get<CrossThreadDataflowResult>();
     } else if (name == "vm_abstract") {
         ctx_.vm_abstract_result = &raw.get<VMAbstractResult>();
     }

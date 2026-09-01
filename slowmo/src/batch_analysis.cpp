@@ -33,6 +33,7 @@
 #include "analysis/passes/memory/entropy_pass.h"
 #include "analysis/passes/memory/yara_mem_scan_pass.h"
 #include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/misc/cross_thread_dataflow_pass.h"
 #include "analysis/passes/crypto/objc_crypto_pass.h"
 #include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "analysis/passes/taint/taint_source_annotation_pass.h"
@@ -688,6 +689,21 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         AnalysisRange range;
         range.exclude_pc_ranges = opts.exclude_pc_ranges;
         pm.set_range(range);
+    }
+
+    // Apply thread scope (--thread): restrict pass delivery to the listed
+    // producer threads. Applied in combination with exclude ranges.
+    if (opts.opt_thread_scope) {
+        AnalysisRange range;
+        range.exclude_pc_ranges = opts.exclude_pc_ranges;
+        range.include_thread_ids = opts.thread_scope_ids;
+        pm.set_range(range);
+        fmt::print(stderr, "[thread] analysis scoped to {} thread(s): ",
+                   opts.thread_scope_ids.size());
+        for (size_t k = 0; k < opts.thread_scope_ids.size(); ++k) {
+            fmt::print(stderr, "{}{}", k ? "," : "", opts.thread_scope_ids[k]);
+        }
+        fmt::print(stderr, "\n");
     }
 
     // Register passes needed by the requested options
@@ -2149,6 +2165,52 @@ pm.register_pass(std::make_unique<LoopPass>());
             }
             tf_json["threads"] = std::move(threads_arr);
             fmt::print("{}\n", tf_json.dump(2));
+        }
+    }
+
+    // ── P3: --cross-thread-dataflow ────────────────────────────────────
+    if (opts.opt_cross_thread_dataflow) {
+        // thread pass is a dependency
+        pm.register_pass(std::make_unique<tenet::ThreadPass>());
+        pm.register_pass(std::make_unique<CrossThreadDataflowPass>());
+        const auto& ct_raw = pm.require("cross_thread_dataflow");
+        if (!ct_raw.ok()) {
+            fmt::print(stderr, "[cross-thread] Pass failed: {}\n", ct_raw.error_message);
+            rc |= 1;
+        } else {
+            const auto& ct = ct_raw.get<CrossThreadDataflowResult>();
+            fmt::print(stderr, "[cross-thread] {} hand-offs, {} channels, {} thread pairs\n",
+                       ct.edges.size(), ct.channels.size(), ct.thread_pair_count);
+
+            json ct_json;
+            ct_json["edge_count"]     = ct.edges.size();
+            ct_json["channel_count"]  = ct.channels.size();
+            ct_json["thread_pair_count"] = ct.thread_pair_count;
+
+            json channels_arr = json::array();
+            for (const auto& ch : ct.channels) {
+                json ch_json;
+                ch_json["addr"]       = ch.addr;
+                ch_json["from_thread"] = ch.from_thread;
+                ch_json["to_thread"]   = ch.to_thread;
+                ch_json["hand_offs"]   = ch.edge_count;
+                json edges_arr = json::array();
+                // Up to 20 sample edges per channel in the JSON output.
+                size_t shown = 0;
+                for (auto idx : ch.edge_indices) {
+                    if (shown++ >= 20) break;
+                    const auto& e = ct.edges[idx];
+                    edges_arr.push_back({
+                        {"writer_inst", e.from_inst_id},
+                        {"reader_inst", e.to_inst_id},
+                        {"size",        e.size}
+                    });
+                }
+                ch_json["edges"] = std::move(edges_arr);
+                channels_arr.push_back(std::move(ch_json));
+            }
+            ct_json["channels"] = std::move(channels_arr);
+            fmt::print("{}\n", ct_json.dump(2));
         }
     }
 

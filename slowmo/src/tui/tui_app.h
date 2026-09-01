@@ -146,6 +146,34 @@ private:
     void update_viewport();
     void handle_resize();
 
+    // ─── Thread view filter (Phase 3 multi-thread) ───────────────────────
+    /// Ensures ctx_.thread_filter_result matches ctx_.thread_filter_ids:
+    /// invalidates + re-registers + runs the thread_filter pass when the
+    /// selected thread set changed since the last run. Called from the
+    /// render path (cheap no-op when nothing changed).
+    void sync_thread_filter();
+
+    /// True when a thread filter is active AND its bitmap is available.
+    bool thread_filter_view_active() const;
+
+    /// Map global inst_id → position in the filtered bitmap (rank).
+    /// Returns UINT64_MAX when inst_id is not in the filter.
+    uint64_t thread_filter_rank(uint64_t inst_id) const;
+
+    /// Map filtered position (rank) → global inst_id. Returns UINT64_MAX on
+    /// out-of-range rank.
+    uint64_t thread_filter_inst_at(uint64_t rank) const;
+
+    /// Total instructions in the active filter (0 = no filter).
+    uint64_t thread_filter_count() const;
+
+    // Filter bookkeeping: last ids the thread_filter pass was built with.
+    std::vector<uint64_t> thread_filter_built_ids_;
+    bool thread_filter_built_valid_ = false;
+
+    /// j/k in filtered mode: move within the bitmap order.
+    void navigate_filtered(int64_t delta);
+
     // ─── Xref navigation ─────────────────────────────────────────────────
     void follow_call();
     void follow_return();

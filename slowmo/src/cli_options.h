@@ -153,7 +153,14 @@ bool entropy_timeline = false;  // --entropy-timeline
 
     // --- P3: Thread filter ---
     bool opt_thread_filter = false;
+    bool opt_cross_thread_dataflow = false;
     std::vector<uint64_t> thread_filter_ids;
+
+    /// --thread <tid[,tid...]>: restrict ALL pass analysis to the listed
+    /// producer threads (multi-thread traces). Same id list feeds the
+    /// thread_filter pass bitmaps and the scan-engine delivery filter.
+    bool opt_thread_scope = false;
+    std::vector<uint64_t> thread_scope_ids;
 
     // --- Exclude ranges (analysis-level filtering) ---
     /// PC address ranges to exclude from analysis. Instructions whose PC falls
