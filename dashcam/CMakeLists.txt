@@ -50,7 +50,9 @@
 #
 #   bash tools/qbditrace/build-qbditrace-android.sh
 #
-# Or manually:
+# Or manually (zstd must be prebuilt for arm64, e.g. build-android/libzstd.a —
+# passing it via QBDITRACE_ZSTD_STATIC_LIB avoids FetchContent clobbering the
+# shared host-built zstd under tenet/_deps):
 #
 #   cmake -S tools/qbditrace -B tools/qbditrace/build-android -G Ninja \
 #         -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
@@ -58,6 +60,7 @@
 #         -DQBDI_INCLUDE_DIR=$PWD/include \
 #         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-android/include;$PWD/build-android/include-static" \
 #         -DQBDI_STATIC_LIB=$PWD/build-android/libQBDI.a \
+#         -DQBDITRACE_ZSTD_STATIC_LIB=$PWD/build-android/libzstd.a \
 #         -DQBDITRACE_BUILD_DYLIB=ON \
 #         -DQBDITRACE_BUILD_TESTS=OFF
 #   cmake --build tools/qbditrace/build-android
@@ -94,8 +97,19 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
 
 # ---------------------------------------------------------------------------
 # Zstd (static, source build via FetchContent)
+#
+# Cross-compile note: FetchContent shares <name>-build dirs across build trees
+# under FETCHCONTENT_BASE_DIR, so cross-compiling zstd through the shared
+# tenet/_deps cache would clobber the host-built zstd used by tenet. For
+# cross builds pass -DQBDITRACE_ZSTD_STATIC_LIB=/path/to/libzstd.a instead
+# (the iOS/Android build scripts cross-compile it once and cache it).
 # ---------------------------------------------------------------------------
-if(QBDITRACE_ENABLE_ZSTD)
+set(QBDITRACE_ZSTD_STATIC_LIB "" CACHE FILEPATH
+    "Path to a prebuilt libzstd.a for the target platform (cross-compile only)")
+set(QBDITRACE_ZSTD_INCLUDE_DIR "" CACHE PATH
+    "zstd include dir matching QBDITRACE_ZSTD_STATIC_LIB (cross-compile only)")
+
+if(QBDITRACE_ENABLE_ZSTD AND NOT QBDITRACE_ZSTD_STATIC_LIB)
   # Disable everything except the static library.
   set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
   set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -149,7 +163,24 @@ if(QBDITRACE_BUILD_DYLIB)
       "-framework Foundation" "-framework CoreFoundation")
   endif()
 
-  if(QBDITRACE_ENABLE_ZSTD AND TARGET libzstd_static)
+  # Android: __android_log_* interception targets live in liblog; dlsym-based
+  # C API resolution needs libdl (dladdr/dl_iterate_phdr come via the NDK
+  # toolchain implicitly, but keep the link explicit).
+  if(ANDROID)
+    target_link_libraries(qbditrace PRIVATE log dl)
+  endif()
+
+  if(QBDITRACE_ENABLE_ZSTD AND QBDITRACE_ZSTD_STATIC_LIB)
+    # Prebuilt cross-compiled libzstd.a provided by the build scripts.
+    if(NOT EXISTS "${QBDITRACE_ZSTD_STATIC_LIB}")
+      message(FATAL_ERROR "QBDITRACE_ZSTD_STATIC_LIB not found: ${QBDITRACE_ZSTD_STATIC_LIB}")
+    endif()
+    if(QBDITRACE_ZSTD_INCLUDE_DIR)
+      target_include_directories(qbditrace PRIVATE "${QBDITRACE_ZSTD_INCLUDE_DIR}")
+    endif()
+    target_link_libraries(qbditrace PRIVATE "${QBDITRACE_ZSTD_STATIC_LIB}")
+    target_compile_definitions(qbditrace PRIVATE QBDITRACE_HAVE_ZSTD=1)
+  elseif(QBDITRACE_ENABLE_ZSTD AND TARGET libzstd_static)
     target_link_libraries(qbditrace PRIVATE libzstd_static)
     target_compile_definitions(qbditrace PRIVATE QBDITRACE_HAVE_ZSTD=1)
   endif()

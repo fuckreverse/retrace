@@ -6,6 +6,7 @@
 #include "io/code_table.h"
 #include "core/memory_model.h"
 #include "common/byte_codec.h"
+#include "analysis/passes/platform/linux_syscalls.h"
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -1057,7 +1058,7 @@ SyscallInterceptCollector::capi_entry(uint16_t api_id) {
         case 205: { static CapiEntry e{"IBinder_transact",      nullptr}; return e; }
         case 206: { static CapiEntry e{"dlopen",                nullptr}; return e; }
         case 207: { static CapiEntry e{"dlsym",                 nullptr}; return e; }
-        // 280–300 JNI base
+        // 280–301 JNI base (301 = RegisterNatives)
         case 280: { static CapiEntry e{"GetStringUTFChars",     nullptr}; return e; }
         case 281: { static CapiEntry e{"ReleaseStringUTFChars", nullptr}; return e; }
         case 282: { static CapiEntry e{"NewStringUTF",          nullptr}; return e; }
@@ -1079,6 +1080,66 @@ SyscallInterceptCollector::capi_entry(uint16_t api_id) {
         case 298: { static CapiEntry e{"ExceptionCheck",        nullptr}; return e; }
         case 299: { static CapiEntry e{"ExceptionClear",        nullptr}; return e; }
         case 300: { static CapiEntry e{"DefineClass",           nullptr}; return e; }
+        case 301: { static CapiEntry e{"RegisterNatives",       nullptr}; return e; }
+        // 302–359 JNI extended (full vtable coverage, see TraceFormat.h)
+        case 302: { static CapiEntry e{"NewString",                 nullptr}; return e; }
+        case 303: { static CapiEntry e{"GetStringLength",           nullptr}; return e; }
+        case 304: { static CapiEntry e{"GetStringChars",            nullptr}; return e; }
+        case 305: { static CapiEntry e{"ReleaseStringChars",        nullptr}; return e; }
+        case 306: { static CapiEntry e{"GetStringRegion",           nullptr}; return e; }
+        case 307: { static CapiEntry e{"GetPrimitiveArrayCritical", nullptr}; return e; }
+        case 308: { static CapiEntry e{"ReleasePrimitiveArrayCritical", nullptr}; return e; }
+        case 309: { static CapiEntry e{"NewDirectByteBuffer",       nullptr}; return e; }
+        case 310: { static CapiEntry e{"GetDirectBufferAddress",    nullptr}; return e; }
+        case 311: { static CapiEntry e{"GetDirectBufferCapacity",   nullptr}; return e; }
+        case 312: { static CapiEntry e{"GetObjectClass",            nullptr}; return e; }
+        case 313: { static CapiEntry e{"GetSuperclass",             nullptr}; return e; }
+        case 314: { static CapiEntry e{"GetObjectRefType",          nullptr}; return e; }
+        case 315: { static CapiEntry e{"NewWeakGlobalRef",          nullptr}; return e; }
+        case 316: { static CapiEntry e{"DeleteWeakGlobalRef",       nullptr}; return e; }
+        case 317: { static CapiEntry e{"IsSameObject",              nullptr}; return e; }
+        case 318: { static CapiEntry e{"NewLocalRef",               nullptr}; return e; }
+        case 319: { static CapiEntry e{"ExceptionOccurred",         nullptr}; return e; }
+        case 320: { static CapiEntry e{"ThrowNew",                  nullptr}; return e; }
+        case 321: { static CapiEntry e{"Throw",                     nullptr}; return e; }
+        case 322: { static CapiEntry e{"UnregisterNatives",         nullptr}; return e; }
+        case 323: { static CapiEntry e{"GetBooleanField",           nullptr}; return e; }
+        case 324: { static CapiEntry e{"GetByteField",              nullptr}; return e; }
+        case 325: { static CapiEntry e{"GetCharField",              nullptr}; return e; }
+        case 326: { static CapiEntry e{"GetShortField",             nullptr}; return e; }
+        case 327: { static CapiEntry e{"SetIntField",               nullptr}; return e; }
+        case 328: { static CapiEntry e{"SetLongField",              nullptr}; return e; }
+        case 329: { static CapiEntry e{"GetStaticObjectField",      nullptr}; return e; }
+        case 330: { static CapiEntry e{"GetStaticBooleanField",     nullptr}; return e; }
+        case 331: { static CapiEntry e{"GetStaticIntField",         nullptr}; return e; }
+        case 332: { static CapiEntry e{"GetStaticLongField",        nullptr}; return e; }
+        case 333: { static CapiEntry e{"SetStaticObjectField",      nullptr}; return e; }
+        case 334: { static CapiEntry e{"SetStaticIntField",         nullptr}; return e; }
+        case 335: { static CapiEntry e{"SetStaticLongField",        nullptr}; return e; }
+        case 336: { static CapiEntry e{"CallByteMethod",            nullptr}; return e; }
+        case 337: { static CapiEntry e{"CallCharMethod",            nullptr}; return e; }
+        case 338: { static CapiEntry e{"CallShortMethod",           nullptr}; return e; }
+        case 339: { static CapiEntry e{"CallFloatMethod",           nullptr}; return e; }
+        case 340: { static CapiEntry e{"CallDoubleMethod",          nullptr}; return e; }
+        case 341: { static CapiEntry e{"CallNonvirtualObjectMethod",nullptr}; return e; }
+        case 342: { static CapiEntry e{"CallNonvirtualIntMethod",   nullptr}; return e; }
+        case 343: { static CapiEntry e{"CallNonvirtualLongMethod",  nullptr}; return e; }
+        case 344: { static CapiEntry e{"CallNonvirtualVoidMethod",  nullptr}; return e; }
+        case 345: { static CapiEntry e{"CallStaticLongMethod",      nullptr}; return e; }
+        case 346: { static CapiEntry e{"CallStaticByteMethod",      nullptr}; return e; }
+        case 347: { static CapiEntry e{"CallStaticCharMethod",      nullptr}; return e; }
+        case 348: { static CapiEntry e{"CallStaticDoubleMethod",    nullptr}; return e; }
+        case 349: { static CapiEntry e{"NewCharArray",              nullptr}; return e; }
+        case 350: { static CapiEntry e{"NewShortArray",             nullptr}; return e; }
+        case 351: { static CapiEntry e{"NewLongArray",              nullptr}; return e; }
+        case 352: { static CapiEntry e{"NewFloatArray",             nullptr}; return e; }
+        case 353: { static CapiEntry e{"NewDoubleArray",            nullptr}; return e; }
+        case 354: { static CapiEntry e{"GetCharArrayElements",      nullptr}; return e; }
+        case 355: { static CapiEntry e{"ReleaseCharArrayElements",  nullptr}; return e; }
+        case 356: { static CapiEntry e{"GetShortArrayElements",     nullptr}; return e; }
+        case 357: { static CapiEntry e{"ReleaseShortArrayElements", nullptr}; return e; }
+        case 358: { static CapiEntry e{"GetLongArrayElements",      nullptr}; return e; }
+        case 359: { static CapiEntry e{"ReleaseLongArrayElements",  nullptr}; return e; }
         // 360–363 pthread
         case 360: { static CapiEntry e{"pthread_create",        nullptr}; return e; }
         case 361: { static CapiEntry e{"pthread_join",          nullptr}; return e; }
@@ -1249,6 +1310,12 @@ SyscallInterceptCollector::capi_entry(uint16_t api_id) {
         case 724: { static CapiEntry e{"MonitorEnter",          nullptr}; return e; }
         case 725: { static CapiEntry e{"MonitorExit",           nullptr}; return e; }
         case 726: { static CapiEntry e{"GetJavaVM",             nullptr}; return e; }
+        // 727–731 JNI extended (array regions + CallStaticVoidMethod)
+        case 727: { static CapiEntry e{"GetIntArrayRegion",     nullptr}; return e; }
+        case 728: { static CapiEntry e{"SetIntArrayRegion",     nullptr}; return e; }
+        case 729: { static CapiEntry e{"GetLongArrayRegion",    nullptr}; return e; }
+        case 730: { static CapiEntry e{"SetLongArrayRegion",    nullptr}; return e; }
+        case 731: { static CapiEntry e{"CallStaticVoidMethod",  nullptr}; return e; }
         default: break;
     }
     return kFallback;
@@ -1286,22 +1353,10 @@ std::string SyscallInterceptCollector::syscall_name(uint64_t raw_syscall_no) con
         default: break;
         }
     } else if (target_os_ == qbditrace::QBDITRACE_OS_ANDROID || target_os_ == qbditrace::QBDITRACE_OS_LINUX) {
-        switch (syscall_no) {
-        case 56: return "openat";
-        case 57: return "close";
-        case 63: return "read";
-        case 64: return "write";
-        case 117: return "ptrace";
-        case 172: return "getpid";
-        case 198: return "socket";
-        case 203: return "connect";
-        case 206: return "send";   // sendto on the raw arm64 ABI
-        case 207: return "recv";   // recvfrom on the raw arm64 ABI
-        case 222: return "mmap";
-        case 226: return "mprotect";
-        case 278: return "getentropy"; // libc getentropy is backed by getrandom
-        case 1024: return "open";  // asm-generic compatibility number
-        default: break;
+        // Full arm64 asm-generic table (generated from the kernel's
+        // asm-generic/unistd.h; see platform/linux_syscalls.h).
+        if (const char* name = linux_syscall_name(syscall_no)) {
+            return name;
         }
     }
     return fmt::format("syscall_{}", raw_syscall_no);
@@ -1313,7 +1368,14 @@ void SyscallInterceptCollector::on_svc(uint64_t inst_id, const SvcView& svc) {
     call.call_site_pc = svc.pc;
     call.callee_pc    = 0;
     call.callee_name  = syscall_name(svc.syscall_no);
-    call.category     = ApiCategory::Syscall;
+    // Anti-debug syscalls (ptrace / process_vm_readv / kill(SIGTRAP) ...) get
+    // their own category so pattern reports can surface them immediately;
+    // everything else stays ApiCategory::Syscall.
+    call.category     = ((target_os_ == qbditrace::QBDITRACE_OS_ANDROID ||
+                          target_os_ == qbditrace::QBDITRACE_OS_LINUX) &&
+                         linux_syscall_is_anti_debug(svc.syscall_no))
+                            ? ApiCategory::AntiDebug
+                            : ApiCategory::Syscall;
     call.svc_flags    = svc.flags;
     call.arg_count    = 6;
     for (uint8_t i = 0; i < 6; ++i) call.raw_args[i] = svc.args[i];
@@ -1448,8 +1510,8 @@ void SyscallInterceptCollector::on_capicall(uint64_t inst_id, const CapiCallView
             call.category = ait->second->category;
         } else if (capi.api_id >= 600 && capi.api_id <= 629) {
             call.category = ApiCategory::BoringSSL;
-        } else if ((capi.api_id >= 280 && capi.api_id <= 300) ||
-                   (capi.api_id >= 700 && capi.api_id <= 726)) {
+        } else if ((capi.api_id >= 280 && capi.api_id <= 359) ||
+                   (capi.api_id >= 700 && capi.api_id <= 731)) {
             call.category = ApiCategory::JNI;
         }
     }

@@ -410,166 +410,149 @@ function resolveObjcDispatchers() {
  *   3. Index into the vtable using the well-known slot offsets from jni.h.
  *
  * All offsets are for 64-bit AArch64 (8 bytes per pointer slot).
- * The JNINativeInterface_ vtable layout (jni.h, AArch64 LP64):
- *   slot  0: reserved0
- *   slot  1: reserved1
- *   slot  2: reserved2
- *   slot  3: reserved3
- *   slot  4: GetVersion
- *   slot  5: DefineClass
- *   slot  6: FindClass
- *   slot  7: FromReflectedMethod
- *   slot  8: FromReflectedField
- *   slot  9: ToReflectedMethod
- *   slot 10: GetSuperclass
- *   slot 11: IsAssignableFrom
- *   slot 12: ToReflectedField
- *   slot 13: Throw
- *   slot 14: ThrowNew
- *   slot 15: ExceptionOccurred
- *   slot 16: ExceptionDescribe
- *   slot 17: ExceptionClear
- *   slot 18: FatalError
- *   slot 19: PushLocalFrame
- *   slot 20: PopLocalFrame
- *   slot 21: NewGlobalRef
- *   slot 22: DeleteGlobalRef
- *   slot 23: DeleteLocalRef
- *   slot 24: IsSameObject
- *   slot 25: NewLocalRef
- *   slot 26: EnsureLocalCapacity
- *   slot 27: AllocObject
- *   slot 28: NewObject
- *   slot 29: NewObjectV
- *   slot 30: NewObjectA
- *   slot 31: GetObjectClass
- *   slot 32: IsInstanceOf
- *   slot 33: GetMethodID
- *   slot 34: CallObjectMethod
- *   slot 36: CallObjectMethodA
- *   slot 37: CallBooleanMethod
- *   slot 40: CallBooleanMethodA
- *   slot 41: CallByteMethod
- *   slot 43: CallByteMethodA
- *   slot 44: CallCharMethod
- *   slot 47: CallIntMethod
- *   slot 50: CallLongMethod
- *   slot 53: CallFloatMethod
- *   slot 56: CallDoubleMethod
- *   slot 59: CallVoidMethod
- *   slot 62: CallVoidMethodA
- *   slot 63: CallNonvirtualObjectMethod
- *   slot 72: GetFieldID
- *   slot 73: GetObjectField
- *   slot 74: GetBooleanField
- *   slot 75: GetByteField
- *   slot 76: GetCharField
- *   slot 77: GetShortField
- *   slot 78: GetIntField
- *   slot 79: GetLongField
- *   slot 80: GetFloatField
- *   slot 81: GetDoubleField
- *   slot 82: SetObjectField
- *   slot 85: SetIntField
- *   slot 87: SetLongField
- *   slot 90: GetStaticMethodID
- *   slot 91: CallStaticObjectMethod
- *   slot 95: CallStaticBooleanMethod
- *   slot 99: CallStaticIntMethod
- *   slot 103: CallStaticLongMethod
- *   slot 107: CallStaticVoidMethod
- *   slot 110: GetStaticFieldID
- *   slot 111: GetStaticObjectField
- *   slot 119: SetStaticObjectField
- *   slot 124: NewString
- *   slot 125: GetStringLength
- *   slot 126: GetStringChars
- *   slot 127: ReleaseStringChars
- *   slot 128: NewStringUTF
- *   slot 129: GetStringUTFLength
- *   slot 130: GetStringUTFChars
- *   slot 131: ReleaseStringUTFChars
- *   slot 132: GetArrayLength
- *   slot 133: NewObjectArray
- *   slot 134: GetObjectArrayElement
- *   slot 135: SetObjectArrayElement
- *   slot 136: NewBooleanArray
- *   slot 137: NewByteArray
- *   slot 140: NewIntArray
- *   slot 152: GetByteArrayElements
- *   slot 156: GetIntArrayElements
- *   slot 162: ReleaseBooleanArrayElements
- *   slot 163: ReleaseByteArrayElements
- *   slot 167: ReleaseIntArrayElements
- *   slot 175: GetByteArrayRegion
- *   slot 179: GetIntArrayRegion
- *   slot 185: SetByteArrayRegion
- *   slot 189: SetIntArrayRegion
- *   slot 195: RegisterNatives
- *   slot 196: UnregisterNatives
- *   slot 197: MonitorEnter
- *   slot 198: MonitorExit
- *   slot 199: GetJavaVM
- *   slot 200: GetStringRegion
- *   slot 201: GetStringUTFRegion
- *   slot 204: NewWeakGlobalRef
- *   slot 205: DeleteWeakGlobalRef
- *   slot 206: ExceptionCheck
- *   slot 209: ExceptionClear (duplicate in some impls)
- *   slot 212: GetVersion (duplicate in some impls)
+ *
+ * ⚠ The slot numbers below follow the JNINativeInterface_ vtable layout as
+ * FIXED BY THE JNI SPECIFICATION (0-based index; reserved0-3 occupy 0..3).
+ * Every Call*Method family occupies THREE consecutive slots (Method,
+ * MethodV, MethodA). Key reference points: GetVersion=4, GetMethodID=33,
+ * CallVoidMethod=61, GetFieldID=94, GetStaticMethodID=113, GetStaticFieldID=144,
+ * NewString=163, NewStringUTF=167, GetStringUTFChars=169, GetArrayLength=171,
+ * GetByteArrayElements=184, RegisterNatives=215, GetJavaVM=219,
+ * ExceptionCheck=228, GetObjectRefType=232.
+ *
+ * 112 high-value slots are intercepted (crypto-relevant string/array ops,
+ * RegisterNatives binding-table exposure, direct byte buffers, all common
+ * Call/Field families). api_ids are allocated in TraceFormat.h:
+ * 280-301 (base), 302-359 (full vtable coverage), 700-731 (extended).
  */
 var JNI_VTABLE_SLOTS = [
+  // -- version / class / exceptions (4-18) --
   { slot:   4, apiId: 723, nArgs: 1, strArgs: 0x00, name: 'GetVersion' },
-  { slot:   5, apiId: 300, nArgs: 4, strArgs: 0x03, name: 'DefineClass' },  // a1=name, a2=loader
-  { slot:   6, apiId: 289, nArgs: 2, strArgs: 0x02, name: 'FindClass' },    // a1=name
+  { slot:   5, apiId: 300, nArgs: 4, strArgs: 0x02, name: 'DefineClass' },   // a1=name
+  { slot:   6, apiId: 289, nArgs: 2, strArgs: 0x02, name: 'FindClass' },     // a1=name
+  { slot:  10, apiId: 313, nArgs: 2, strArgs: 0x00, name: 'GetSuperclass' },
+  { slot:  13, apiId: 321, nArgs: 2, strArgs: 0x00, name: 'Throw' },
+  { slot:  14, apiId: 320, nArgs: 3, strArgs: 0x04, name: 'ThrowNew' },      // a2=msg
+  { slot:  15, apiId: 319, nArgs: 1, strArgs: 0x00, name: 'ExceptionOccurred' },
+  { slot:  17, apiId: 299, nArgs: 1, strArgs: 0x00, name: 'ExceptionClear' },
+  // -- local/global refs (19-26) --
   { slot:  19, apiId: 721, nArgs: 2, strArgs: 0x00, name: 'PushLocalFrame' },
   { slot:  20, apiId: 722, nArgs: 2, strArgs: 0x00, name: 'PopLocalFrame' },
   { slot:  21, apiId: 718, nArgs: 2, strArgs: 0x00, name: 'NewGlobalRef' },
   { slot:  22, apiId: 719, nArgs: 2, strArgs: 0x00, name: 'DeleteGlobalRef' },
   { slot:  23, apiId: 720, nArgs: 2, strArgs: 0x00, name: 'DeleteLocalRef' },
+  { slot:  24, apiId: 317, nArgs: 3, strArgs: 0x00, name: 'IsSameObject' },
+  { slot:  25, apiId: 318, nArgs: 2, strArgs: 0x00, name: 'NewLocalRef' },
+  // -- object construction (27-32) --
   { slot:  28, apiId: 716, nArgs: 3, strArgs: 0x00, name: 'NewObject' },
+  { slot:  31, apiId: 312, nArgs: 2, strArgs: 0x00, name: 'GetObjectClass' },
   { slot:  32, apiId: 717, nArgs: 3, strArgs: 0x00, name: 'IsInstanceOf' },
-  { slot:  33, apiId: 290, nArgs: 4, strArgs: 0x06, name: 'GetMethodID' },  // a2=name,a3=sig
+  // -- instance method calls (33-63; each family = Method/V/A x3) --
+  { slot:  33, apiId: 290, nArgs: 4, strArgs: 0x06, name: 'GetMethodID' },   // a2=name,a3=sig
   { slot:  34, apiId: 292, nArgs: 3, strArgs: 0x00, name: 'CallObjectMethod' },
   { slot:  37, apiId: 295, nArgs: 3, strArgs: 0x00, name: 'CallBooleanMethod' },
-  { slot:  47, apiId: 296, nArgs: 3, strArgs: 0x00, name: 'CallIntMethod' },
-  { slot:  50, apiId: 297, nArgs: 3, strArgs: 0x00, name: 'CallLongMethod' },
-  { slot:  59, apiId: 294, nArgs: 3, strArgs: 0x00, name: 'CallVoidMethod' },
-  { slot:  72, apiId: 704, nArgs: 4, strArgs: 0x06, name: 'GetFieldID' },   // a2=name,a3=sig
-  { slot:  73, apiId: 702, nArgs: 3, strArgs: 0x00, name: 'GetObjectField' },
-  { slot:  78, apiId: 700, nArgs: 3, strArgs: 0x00, name: 'GetIntField' },
-  { slot:  79, apiId: 701, nArgs: 3, strArgs: 0x00, name: 'GetLongField' },
-  { slot:  82, apiId: 703, nArgs: 4, strArgs: 0x00, name: 'SetObjectField' },
-  { slot:  90, apiId: 291, nArgs: 4, strArgs: 0x06, name: 'GetStaticMethodID' }, // a2=name,a3=sig
-  { slot:  91, apiId: 293, nArgs: 3, strArgs: 0x00, name: 'CallStaticObjectMethod' },
-  { slot:  95, apiId: 715, nArgs: 3, strArgs: 0x00, name: 'CallStaticBooleanMethod' },
-  { slot:  99, apiId: 714, nArgs: 3, strArgs: 0x00, name: 'CallStaticIntMethod' },
-  { slot: 107, apiId: 294, nArgs: 3, strArgs: 0x00, name: 'CallStaticVoidMethod' },
-  { slot: 110, apiId: 705, nArgs: 4, strArgs: 0x06, name: 'GetStaticFieldID' },
-  { slot: 124, apiId: 282, nArgs: 2, strArgs: 0x00, name: 'NewStringUTF' },
-  { slot: 128, apiId: 282, nArgs: 2, strArgs: 0x02, name: 'NewStringUTF' }, // a1=bytes
-  { slot: 129, apiId: 283, nArgs: 2, strArgs: 0x00, name: 'GetStringUTFLength' },
-  { slot: 130, apiId: 280, nArgs: 3, strArgs: 0x00, name: 'GetStringUTFChars' },
-  { slot: 131, apiId: 281, nArgs: 3, strArgs: 0x00, name: 'ReleaseStringUTFChars' },
-  { slot: 132, apiId: 707, nArgs: 2, strArgs: 0x00, name: 'GetArrayLength' },
-  { slot: 133, apiId: 708, nArgs: 4, strArgs: 0x00, name: 'NewObjectArray' },
-  { slot: 134, apiId: 709, nArgs: 3, strArgs: 0x00, name: 'GetObjectArrayElement' },
-  { slot: 135, apiId: 710, nArgs: 4, strArgs: 0x00, name: 'SetObjectArrayElement' },
-  { slot: 137, apiId: 288, nArgs: 2, strArgs: 0x00, name: 'NewByteArray' },
-  { slot: 140, apiId: 711, nArgs: 2, strArgs: 0x00, name: 'NewIntArray' },
-  { slot: 152, apiId: 284, nArgs: 3, strArgs: 0x00, name: 'GetByteArrayElements' },
-  { slot: 156, apiId: 712, nArgs: 3, strArgs: 0x00, name: 'GetIntArrayElements' },
-  { slot: 163, apiId: 285, nArgs: 4, strArgs: 0x00, name: 'ReleaseByteArrayElements' },
-  { slot: 167, apiId: 713, nArgs: 4, strArgs: 0x00, name: 'ReleaseIntArrayElements' },
-  { slot: 175, apiId: 286, nArgs: 5, strArgs: 0x00, name: 'GetByteArrayRegion' },
-  { slot: 179, apiId: 712, nArgs: 5, strArgs: 0x00, name: 'GetIntArrayRegion' },
-  { slot: 185, apiId: 287, nArgs: 5, strArgs: 0x00, name: 'SetByteArrayRegion' },
-  { slot: 189, apiId: 713, nArgs: 5, strArgs: 0x00, name: 'SetIntArrayRegion' },
-  { slot: 197, apiId: 724, nArgs: 2, strArgs: 0x00, name: 'MonitorEnter' },
-  { slot: 198, apiId: 725, nArgs: 2, strArgs: 0x00, name: 'MonitorExit' },
-  { slot: 199, apiId: 726, nArgs: 2, strArgs: 0x00, name: 'GetJavaVM' },
-  { slot: 201, apiId: 706, nArgs: 5, strArgs: 0x00, name: 'GetStringUTFRegion' },
-  { slot: 206, apiId: 298, nArgs: 1, strArgs: 0x00, name: 'ExceptionCheck' },
+  { slot:  40, apiId: 336, nArgs: 3, strArgs: 0x00, name: 'CallByteMethod' },
+  { slot:  43, apiId: 337, nArgs: 3, strArgs: 0x00, name: 'CallCharMethod' },
+  { slot:  46, apiId: 338, nArgs: 3, strArgs: 0x00, name: 'CallShortMethod' },
+  { slot:  49, apiId: 296, nArgs: 3, strArgs: 0x00, name: 'CallIntMethod' },
+  { slot:  52, apiId: 297, nArgs: 3, strArgs: 0x00, name: 'CallLongMethod' },
+  { slot:  55, apiId: 339, nArgs: 3, strArgs: 0x00, name: 'CallFloatMethod' },
+  { slot:  58, apiId: 340, nArgs: 3, strArgs: 0x00, name: 'CallDoubleMethod' },
+  { slot:  61, apiId: 294, nArgs: 3, strArgs: 0x00, name: 'CallVoidMethod' },
+  // -- nonvirtual calls (64-93) --
+  { slot:  64, apiId: 341, nArgs: 4, strArgs: 0x00, name: 'CallNonvirtualObjectMethod' },
+  { slot:  79, apiId: 342, nArgs: 4, strArgs: 0x00, name: 'CallNonvirtualIntMethod' },
+  { slot:  82, apiId: 343, nArgs: 4, strArgs: 0x00, name: 'CallNonvirtualLongMethod' },
+  { slot:  91, apiId: 344, nArgs: 4, strArgs: 0x00, name: 'CallNonvirtualVoidMethod' },
+  // -- instance fields (94-112) --
+  { slot:  94, apiId: 704, nArgs: 4, strArgs: 0x06, name: 'GetFieldID' },    // a2=name,a3=sig
+  { slot:  95, apiId: 702, nArgs: 3, strArgs: 0x00, name: 'GetObjectField' },
+  { slot:  96, apiId: 323, nArgs: 3, strArgs: 0x00, name: 'GetBooleanField' },
+  { slot:  97, apiId: 324, nArgs: 3, strArgs: 0x00, name: 'GetByteField' },
+  { slot:  98, apiId: 325, nArgs: 3, strArgs: 0x00, name: 'GetCharField' },
+  { slot:  99, apiId: 326, nArgs: 3, strArgs: 0x00, name: 'GetShortField' },
+  { slot: 100, apiId: 700, nArgs: 3, strArgs: 0x00, name: 'GetIntField' },
+  { slot: 101, apiId: 701, nArgs: 3, strArgs: 0x00, name: 'GetLongField' },
+  { slot: 104, apiId: 703, nArgs: 4, strArgs: 0x00, name: 'SetObjectField' },
+  { slot: 109, apiId: 327, nArgs: 4, strArgs: 0x00, name: 'SetIntField' },
+  { slot: 110, apiId: 328, nArgs: 4, strArgs: 0x00, name: 'SetLongField' },
+  // -- static methods (113-143) --
+  { slot: 113, apiId: 291, nArgs: 4, strArgs: 0x06, name: 'GetStaticMethodID' }, // a2=name,a3=sig
+  { slot: 114, apiId: 293, nArgs: 3, strArgs: 0x00, name: 'CallStaticObjectMethod' },
+  { slot: 117, apiId: 715, nArgs: 3, strArgs: 0x00, name: 'CallStaticBooleanMethod' },
+  { slot: 120, apiId: 346, nArgs: 3, strArgs: 0x00, name: 'CallStaticByteMethod' },
+  { slot: 123, apiId: 347, nArgs: 3, strArgs: 0x00, name: 'CallStaticCharMethod' },
+  { slot: 129, apiId: 714, nArgs: 3, strArgs: 0x00, name: 'CallStaticIntMethod' },
+  { slot: 132, apiId: 345, nArgs: 3, strArgs: 0x00, name: 'CallStaticLongMethod' },
+  { slot: 138, apiId: 348, nArgs: 3, strArgs: 0x00, name: 'CallStaticDoubleMethod' },
+  { slot: 141, apiId: 731, nArgs: 3, strArgs: 0x00, name: 'CallStaticVoidMethod' },
+  // -- static fields (144-162) --
+  { slot: 144, apiId: 705, nArgs: 4, strArgs: 0x06, name: 'GetStaticFieldID' },
+  { slot: 145, apiId: 329, nArgs: 3, strArgs: 0x00, name: 'GetStaticObjectField' },
+  { slot: 146, apiId: 330, nArgs: 3, strArgs: 0x00, name: 'GetStaticBooleanField' },
+  { slot: 150, apiId: 331, nArgs: 3, strArgs: 0x00, name: 'GetStaticIntField' },
+  { slot: 151, apiId: 332, nArgs: 3, strArgs: 0x00, name: 'GetStaticLongField' },
+  { slot: 154, apiId: 333, nArgs: 4, strArgs: 0x00, name: 'SetStaticObjectField' },
+  { slot: 159, apiId: 334, nArgs: 4, strArgs: 0x00, name: 'SetStaticIntField' },
+  { slot: 160, apiId: 335, nArgs: 4, strArgs: 0x00, name: 'SetStaticLongField' },
+  // -- strings (163-170) --
+  { slot: 163, apiId: 302, nArgs: 3, strArgs: 0x00, name: 'NewString' },
+  { slot: 164, apiId: 303, nArgs: 2, strArgs: 0x00, name: 'GetStringLength' },
+  { slot: 165, apiId: 304, nArgs: 3, strArgs: 0x00, name: 'GetStringChars' },
+  { slot: 166, apiId: 305, nArgs: 3, strArgs: 0x00, name: 'ReleaseStringChars' },
+  { slot: 167, apiId: 282, nArgs: 2, strArgs: 0x02, name: 'NewStringUTF' },  // a1=bytes
+  { slot: 168, apiId: 283, nArgs: 2, strArgs: 0x00, name: 'GetStringUTFLength' },
+  { slot: 169, apiId: 280, nArgs: 3, strArgs: 0x00, name: 'GetStringUTFChars' },
+  { slot: 170, apiId: 281, nArgs: 3, strArgs: 0x00, name: 'ReleaseStringUTFChars' },
+  // -- arrays (171-214) --
+  { slot: 171, apiId: 707, nArgs: 2, strArgs: 0x00, name: 'GetArrayLength' },
+  { slot: 172, apiId: 708, nArgs: 4, strArgs: 0x00, name: 'NewObjectArray' },
+  { slot: 173, apiId: 709, nArgs: 3, strArgs: 0x00, name: 'GetObjectArrayElement' },
+  { slot: 174, apiId: 710, nArgs: 4, strArgs: 0x00, name: 'SetObjectArrayElement' },
+  { slot: 176, apiId: 288, nArgs: 2, strArgs: 0x00, name: 'NewByteArray' },
+  { slot: 177, apiId: 349, nArgs: 2, strArgs: 0x00, name: 'NewCharArray' },
+  { slot: 178, apiId: 350, nArgs: 2, strArgs: 0x00, name: 'NewShortArray' },
+  { slot: 179, apiId: 711, nArgs: 2, strArgs: 0x00, name: 'NewIntArray' },
+  { slot: 180, apiId: 351, nArgs: 2, strArgs: 0x00, name: 'NewLongArray' },
+  { slot: 181, apiId: 352, nArgs: 2, strArgs: 0x00, name: 'NewFloatArray' },
+  { slot: 182, apiId: 353, nArgs: 2, strArgs: 0x00, name: 'NewDoubleArray' },
+  { slot: 184, apiId: 284, nArgs: 3, strArgs: 0x00, name: 'GetByteArrayElements' },
+  { slot: 185, apiId: 354, nArgs: 3, strArgs: 0x00, name: 'GetCharArrayElements' },
+  { slot: 186, apiId: 356, nArgs: 3, strArgs: 0x00, name: 'GetShortArrayElements' },
+  { slot: 187, apiId: 712, nArgs: 3, strArgs: 0x00, name: 'GetIntArrayElements' },
+  { slot: 188, apiId: 358, nArgs: 3, strArgs: 0x00, name: 'GetLongArrayElements' },
+  { slot: 192, apiId: 285, nArgs: 4, strArgs: 0x00, name: 'ReleaseByteArrayElements' },
+  { slot: 193, apiId: 355, nArgs: 4, strArgs: 0x00, name: 'ReleaseCharArrayElements' },
+  { slot: 194, apiId: 357, nArgs: 4, strArgs: 0x00, name: 'ReleaseShortArrayElements' },
+  { slot: 195, apiId: 713, nArgs: 4, strArgs: 0x00, name: 'ReleaseIntArrayElements' },
+  { slot: 196, apiId: 359, nArgs: 4, strArgs: 0x00, name: 'ReleaseLongArrayElements' },
+  { slot: 200, apiId: 286, nArgs: 5, strArgs: 0x00, name: 'GetByteArrayRegion' },
+  { slot: 203, apiId: 727, nArgs: 5, strArgs: 0x00, name: 'GetIntArrayRegion' },
+  { slot: 204, apiId: 729, nArgs: 5, strArgs: 0x00, name: 'GetLongArrayRegion' },
+  { slot: 208, apiId: 287, nArgs: 5, strArgs: 0x00, name: 'SetByteArrayRegion' },
+  { slot: 211, apiId: 728, nArgs: 5, strArgs: 0x00, name: 'SetIntArrayRegion' },
+  { slot: 212, apiId: 730, nArgs: 5, strArgs: 0x00, name: 'SetLongArrayRegion' },
+  // -- native registration / sync (215-219) --
+  /* RegisterNatives exposes the JNINativeMethod binding table:
+   * x2 = methods array pointer, x3 = nMethods count. */
+  { slot: 215, apiId: 301, nArgs: 4, strArgs: 0x00, name: 'RegisterNatives' },
+  { slot: 216, apiId: 322, nArgs: 2, strArgs: 0x00, name: 'UnregisterNatives' },
+  { slot: 217, apiId: 724, nArgs: 2, strArgs: 0x00, name: 'MonitorEnter' },
+  { slot: 218, apiId: 725, nArgs: 2, strArgs: 0x00, name: 'MonitorExit' },
+  { slot: 219, apiId: 726, nArgs: 2, strArgs: 0x00, name: 'GetJavaVM' },
+  // -- string regions / critical (220-225) --
+  { slot: 220, apiId: 306, nArgs: 5, strArgs: 0x00, name: 'GetStringRegion' },
+  { slot: 221, apiId: 706, nArgs: 5, strArgs: 0x00, name: 'GetStringUTFRegion' },
+  { slot: 222, apiId: 307, nArgs: 3, strArgs: 0x00, name: 'GetPrimitiveArrayCritical' },
+  { slot: 223, apiId: 308, nArgs: 4, strArgs: 0x00, name: 'ReleasePrimitiveArrayCritical' },
+  // -- weak refs / exceptions / direct buffers (226-232) --
+  { slot: 226, apiId: 315, nArgs: 2, strArgs: 0x00, name: 'NewWeakGlobalRef' },
+  { slot: 227, apiId: 316, nArgs: 2, strArgs: 0x00, name: 'DeleteWeakGlobalRef' },
+  { slot: 228, apiId: 298, nArgs: 1, strArgs: 0x00, name: 'ExceptionCheck' },
+  { slot: 229, apiId: 309, nArgs: 3, strArgs: 0x00, name: 'NewDirectByteBuffer' },
+  { slot: 230, apiId: 310, nArgs: 2, strArgs: 0x00, name: 'GetDirectBufferAddress' },
+  { slot: 231, apiId: 311, nArgs: 2, strArgs: 0x00, name: 'GetDirectBufferCapacity' },
+  { slot: 232, apiId: 314, nArgs: 2, strArgs: 0x00, name: 'GetObjectRefType' },
 ];
 
 /* Attempt to obtain a JNIEnv pointer via JNI_GetCreatedJavaVMs (libart.so).
@@ -929,6 +912,218 @@ function buildIndexedOutputPath(template, index) {
 }
 
 // ---------------------------------------------------------------------------
+// Java Entry Trigger (Android only)
+//
+// Uses the Frida Java bridge to hook a Java method (typically the JNI
+// wrapper that calls into the target native library). When the method fires,
+// the Java arguments are materialized into native pointers and the target
+// native function is invoked through qbditrace_run_call — the trace captures
+// the native execution with real Java-supplied inputs.
+//
+// NOTE: the original Java implementation is bypassed while tracing (the
+// native function is called directly). Any Java-side logic before/after the
+// native call does not run during the traced invocation.
+// ---------------------------------------------------------------------------
+
+/* Pure policy helper — maps a Frida Java argument type name to a conversion
+ * strategy. Kept at top level so it can be unit-tested without a runtime. */
+function javaArgKind(typeName) {
+  switch (typeName) {
+    case 'int':
+    case 'long':
+    case 'short':
+    case 'byte':
+    case 'char':
+    case 'boolean':
+      return 'primitive';
+    case 'float':
+    case 'double':
+      return 'float';       // raw bits are passed; semantics may not match
+    case 'java.lang.String':
+      return 'utf8';        // allocate a C string via allocUtf8String
+    case '[B':
+      return 'bytearray';   // copy into a native buffer (unsupported for now)
+    default:
+      return 'object';      // pass the jobject handle as-is
+  }
+}
+
+/* Pure policy helper — maps a Frida Java return type name to a conversion
+ * strategy for the uint64 returned by qbditrace_run_call. */
+function javaRetKind(typeName) {
+  switch (typeName) {
+    case 'void':
+      return 'void';
+    case 'int':
+    case 'short':
+    case 'byte':
+    case 'char':
+    case 'boolean':
+      return 'int32';
+    case 'long':
+      return 'int64';
+    case 'float':
+    case 'double':
+      return 'float';       // unsupported: bits cannot be reinterpreted safely
+    default:
+      return 'object';      // unsupported: cannot rebuild a jobject from a raw pointer
+  }
+}
+
+function installJavaEntryHook(opts) {
+  const { fn, mod, baseOpts, funcStart, configureForTrace, makeOutputPath,
+          maxTraces, startStatsPolling, stopStatsPolling } = opts;
+
+  const spec = CONFIG.javaEntry;
+  const lastDot = spec.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot === spec.length - 1) {
+    fail('javaEntry must be "fully.qualified.Class.method", got: ' + spec);
+  }
+  const clsName = spec.slice(0, lastDot);
+  const methName = spec.slice(lastDot + 1);
+
+  Java.perform(function () {
+    let javaTraceCount = 0;
+    let javaInTrace = false;
+    const retOut = Memory.alloc(8);
+
+    let Klass;
+    try {
+      Klass = Java.use(clsName);
+    } catch (e) {
+      fail('Java.use("' + clsName + '") failed: ' + e.message);
+      return;
+    }
+
+    const method = Klass[methName];
+    if (!method || !method.overloads || method.overloads.length === 0) {
+      fail('Java method not found: ' + spec);
+      return;
+    }
+    const target = method.overloads[0];
+    if (method.overloads.length > 1) {
+      log('WARNING: ' + spec + ' has ' + method.overloads.length +
+          ' overloads — hooking the first');
+    }
+    const retTypeName = target.returnType ? target.returnType.name : 'void';
+    const argTypes = target.argumentTypes || [];
+
+    log('[Java] hooking ' + spec + ' (' + argTypes.length +
+        ' arg(s), returns ' + retTypeName + ') — native target ' + funcStart);
+
+    function javaArgToPointer(v, typeName) {
+      const kind = javaArgKind(typeName);
+      if (kind === 'primitive') {
+        const n = (v !== null && v !== undefined && v.toNumber)
+            ? v.toNumber() : Number(v);
+        return ptr(n >>> 0);
+      }
+      if (kind === 'float') {
+        log('WARNING: Java float/double arg ("' + typeName +
+            '") passed as raw bits — semantics may not match');
+        return ptr(0);
+      }
+      if (kind === 'utf8') {
+        return Memory.allocUtf8String(String(v));
+      }
+      if (kind === 'bytearray') {
+        log('WARNING: Java byte[] arg passed as jobject handle (no copy)');
+        return (v && v.$h) ? v.$h : NULL;
+      }
+      return (v && v.$h) ? v.$h : NULL;
+    }
+
+    function javaRetFromPointer(ret, typeName) {
+      const kind = javaRetKind(typeName);
+      if (kind === 'void') return undefined;
+      if (kind === 'int32') return ret.toUInt32();
+      if (kind === 'int64') return ret.toString();
+      if (kind === 'float') {
+        log('WARNING: Java float/double return not supported — returning 0');
+        return 0;
+      }
+      log('WARNING: Java object return (' + typeName +
+          ') cannot be rebuilt from pointer ' + ret + ' — returning null');
+      return null;
+    }
+
+    target.implementation = function () {
+      if (javaInTrace) {
+        log('WARNING: re-entrant Java call to ' + spec +
+            ' during trace — calling original implementation');
+        return this[methName].apply(this, arguments);
+      }
+      if (javaTraceCount >= maxTraces) {
+        return this[methName].apply(this, arguments);
+      }
+
+      javaInTrace = true;
+      javaTraceCount++;
+      const thisTrace = javaTraceCount;
+
+      log('[Java] -> ' + spec + ' (trace #' + thisTrace + ') with ' +
+          argTypes.length + ' Java arg(s)');
+      status('trace_start', { index: thisTrace, trigger: 'java' });
+
+      const argPtrs = [];
+      for (let i = 0; i < argTypes.length && i < 8; i++) {
+        argPtrs.push(javaArgToPointer(arguments[i], argTypes[i].name));
+      }
+      if (argTypes.length > 8) {
+        log('WARNING: ' + argTypes.length +
+            ' Java args exceed the run_call limit (8) — tracing with the first 8');
+      }
+      const argc = argPtrs.length;
+      const argv = argc > 0 ? Memory.alloc(8 * argc) : NULL;
+      for (let i = 0; i < argc; i++) {
+        argv.add(i * 8).writePointer(argPtrs[i]);
+      }
+
+      const cfg = configureForTrace(thisTrace);
+      if (cfg === null) {
+        logError('[Java] configure failed for trace #' + thisTrace +
+                 ' — calling original implementation');
+        javaInTrace = false;
+        return this[methName].apply(this, arguments);
+      }
+
+      startStatsPolling();
+      const r = fn.runCall(retOut, funcStart, argc, argv);
+      if (r !== 0) {
+        log('qbditrace_run_call returned error rc=' + r);
+      }
+      const ret = retOut.readPointer();
+      fn.stop();
+      stopStatsPolling();
+
+      const outFile = fn.outputPath().readUtf8String();
+      log('[Java] <- trace #' + thisTrace + ' done, native ret = ' + ret +
+          '. output = ' + outFile);
+      status('trace_done', { index: thisTrace, ret: ret.toString(), output: outFile });
+
+      javaInTrace = false;
+
+      if (javaTraceCount >= maxTraces) {
+        log('all ' + javaTraceCount + ' trace(s) captured. Java hook stays installed but now passes through.');
+        status('all_done', { total: javaTraceCount });
+      }
+
+      return javaRetFromPointer(ret, retTypeName);
+    };
+
+    status('java_hook_installed', {
+      class: clsName,
+      method: methName,
+      nativeTarget: funcStart.toString(),
+      argCount: argTypes.length,
+      returnType: retTypeName,
+      mode: CONFIG.traceMode,
+      maxTraces: maxTraces === Infinity ? 'unlimited' : maxTraces,
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // GCD Block Tracing
 // ---------------------------------------------------------------------------
 
@@ -1217,6 +1412,64 @@ function mainImpl() {
   const capiIntercept = CONFIG.enableCapiIntercept !== false;  // on by default
   const capiFuncs = capiIntercept ? resolveCApiFunctions() : [];
 
+  // --- libart timing robustness (Android) ---
+  // The JNI vtable can only be read once a JavaVM exists. On early attach
+  // (spawn gating, JNI_OnLoad era) libart may not have created the VM yet,
+  // and resolveCApiFunctions() silently misses every JNI function. Recover
+  // by retrying in the background and refreshing the explicit capi table
+  // right before each qbditrace_configure() call — by trace time the
+  // runtime is guaranteed to be up.
+  let jniPending = false;
+  let mergeJniEntries = null;
+  if (isAndroid() && capiIntercept) {
+    const isJniId = function (id) {
+      return (id >= 280 && id <= 359) || (id >= 700 && id <= 731);
+    };
+    jniPending = !capiFuncs.some(function (f) { return isJniId(f.apiId); });
+
+    mergeJniEntries = function () {
+      const vtable = resolveJniVtable();
+      if (!vtable) return false;
+      const jniFuncs = resolveJniFunctions(vtable);
+      if (jniFuncs.length === 0) return false;
+      const known = {};
+      for (let i = 0; i < capiFuncs.length; i++) {
+        known[capiFuncs[i].addr.toString()] = true;
+      }
+      let added = 0;
+      for (let i = 0; i < jniFuncs.length && capiFuncs.length < 128; i++) {
+        const key = jniFuncs[i].addr.toString();
+        if (known[key]) continue;
+        known[key] = true;
+        capiFuncs.push(jniFuncs[i]);
+        added++;
+      }
+      if (added > 0) {
+        log('JNI vtable: +' + added + ' entries recovered (total capi funcs: ' +
+            capiFuncs.length + ') — effective on next configure');
+        baseOpts.capiFuncs = capiFuncs;
+      }
+      return true;
+    };
+
+    if (jniPending) {
+      log('JNI vtable: not ready yet (libart/JavaVM pending) — retrying every 2s');
+      let attempts = 0;
+      const retryTimer = setInterval(function () {
+        attempts++;
+        if (mergeJniEntries()) {
+          clearInterval(retryTimer);
+          log('JNI vtable resolved after ' + attempts + ' retry attempt(s)');
+          jniPending = false;
+        } else if (attempts >= 30) {
+          clearInterval(retryTimer);
+          log('JNI vtable: giving up after ' + attempts +
+              ' attempts — C API interception runs without JNI entries');
+        }
+      }, 2000);
+    }
+  }
+
   let maxTraces;
   const mode = CONFIG.traceMode;
   if (mode === 'once' || mode === 1) {
@@ -1268,6 +1521,12 @@ function mainImpl() {
   }
 
   function configureForTrace(traceIndex) {
+    // Late JNI recovery: if libart was not up when the agent started, the
+    // vtable is read now (hook mode implies the runtime is alive) so the
+    // config below already carries the JNI interception table.
+    if (jniPending && mergeJniEntries) {
+      jniPending = !mergeJniEntries();
+    }
     const outPath = makeOutputPath(traceIndex);
     const cfg = buildConfigStruct(Object.assign({}, baseOpts, { outputPath: outPath }));
     const rc = fn.configure(cfg);

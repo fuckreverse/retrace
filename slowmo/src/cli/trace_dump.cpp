@@ -3,6 +3,7 @@
 #include "io/trace_reader.h"
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
+#include "analysis/passes/platform/linux_syscalls.h"
 #include "TraceFormat.h"
 
 #include <fmt/core.h>
@@ -100,16 +101,9 @@ static const char* syscall_name(uint64_t raw_syscall_no, TargetOS target_os) {
         }
     }
 
-    switch (raw_syscall_no) {
-    case 56:  return "openat";
-    case 57:  return "close";
-    case 63:  return "read";
-    case 64:  return "write";
-    case 117: return "ptrace";
-    case 172: return "getpid";
-    case 198: return "socket";
-    default:  return "unknown";
-    }
+    // Android/Linux: full arm64 asm-generic table shared with the
+    // syscall_intercept pass (platform/linux_syscalls.h).
+    return tenet::linux_syscall_name(raw_syscall_no);
 }
 
 // ─── JSON helpers ──────────────────────────────────────────────────────────

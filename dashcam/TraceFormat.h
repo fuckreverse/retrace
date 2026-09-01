@@ -863,7 +863,72 @@ typedef enum {
   QBDITRACE_CAPI_JNI_EXCEPTION_CHECK = 298, /* ExceptionCheck(env)                 */
   QBDITRACE_CAPI_JNI_EXCEPTION_CLEAR = 299, /* ExceptionClear(env)                 */
   QBDITRACE_CAPI_JNI_DEFINE_CLASS    = 300, /* DefineClass(env,name,ld,buf,len)    */
-  /* 301–359 reserved for JNI */
+  QBDITRACE_CAPI_JNI_REGISTER_NATIVES= 301, /* RegisterNatives(env,cls,methods,n) —
+                                               * methods points at a JNINativeMethod
+                                               * array {name, sig, fnPtr}; captured
+                                               * x2/x3 expose the binding table.  */
+
+  /* ── JNI functions — full vtable coverage (302–359) [jni] ────────────
+   * Slot numbers follow the JNINativeInterface_ layout fixed by the JNI
+   * spec (0-based index into the vtable; reserved0-3 = 0..3). */
+  QBDITRACE_CAPI_JNI_NEW_STRING      = 302, /* NewString(env, uchars, len)          */
+  QBDITRACE_CAPI_JNI_GET_STR_LEN     = 303, /* GetStringLength(env, str)            */
+  QBDITRACE_CAPI_JNI_GET_STR_CHARS   = 304, /* GetStringChars(env, str, isCopy)     */
+  QBDITRACE_CAPI_JNI_REL_STR_CHARS   = 305, /* ReleaseStringChars(env, str, chars)  */
+  QBDITRACE_CAPI_JNI_GET_STR_REGION  = 306, /* GetStringRegion(env,s,st,len,buf)    */
+  QBDITRACE_CAPI_JNI_GET_ARR_CRIT    = 307, /* GetPrimitiveArrayCritical(env,a,c)   */
+  QBDITRACE_CAPI_JNI_REL_ARR_CRIT    = 308, /* ReleasePrimitiveArrayCritical(...)   */
+  QBDITRACE_CAPI_JNI_NEW_DIRECT_BB   = 309, /* NewDirectByteBuffer(env,addr,cap)    */
+  QBDITRACE_CAPI_JNI_DIRECT_BB_ADDR  = 310, /* GetDirectBufferAddress(env, buf)     */
+  QBDITRACE_CAPI_JNI_DIRECT_BB_CAP   = 311, /* GetDirectBufferCapacity(env, buf)    */
+  QBDITRACE_CAPI_JNI_GET_OBJ_CLASS   = 312, /* GetObjectClass(env, obj)             */
+  QBDITRACE_CAPI_JNI_GET_SUPERCLASS  = 313, /* GetSuperclass(env, cls)              */
+  QBDITRACE_CAPI_JNI_GET_OBJ_REF_TYP = 314, /* GetObjectRefType(env, obj)           */
+  QBDITRACE_CAPI_JNI_NEW_WEAK_GREF   = 315, /* NewWeakGlobalRef(env, obj)           */
+  QBDITRACE_CAPI_JNI_DEL_WEAK_GREF   = 316, /* DeleteWeakGlobalRef(env, ref)        */
+  QBDITRACE_CAPI_JNI_IS_SAME_OBJ     = 317, /* IsSameObject(env, a, b)              */
+  QBDITRACE_CAPI_JNI_NEW_LOCAL_REF   = 318, /* NewLocalRef(env, ref)                */
+  QBDITRACE_CAPI_JNI_EXC_OCCURRED    = 319, /* ExceptionOccurred(env)               */
+  QBDITRACE_CAPI_JNI_THROW_NEW       = 320, /* ThrowNew(env, cls, msg)              */
+  QBDITRACE_CAPI_JNI_THROW           = 321, /* Throw(env, throwable)                */
+  QBDITRACE_CAPI_JNI_UNREG_NATIVES   = 322, /* UnregisterNatives(env, cls)          */
+  QBDITRACE_CAPI_JNI_GET_BOOL_FIELD  = 323, /* GetBooleanField(env, obj, fid)       */
+  QBDITRACE_CAPI_JNI_GET_BYTE_FIELD  = 324, /* GetByteField(env, obj, fid)          */
+  QBDITRACE_CAPI_JNI_GET_CHAR_FIELD  = 325, /* GetCharField(env, obj, fid)          */
+  QBDITRACE_CAPI_JNI_GET_SHORT_FIELD = 326, /* GetShortField(env, obj, fid)         */
+  QBDITRACE_CAPI_JNI_SET_INT_FIELD   = 327, /* SetIntField(env, obj, fid, val)      */
+  QBDITRACE_CAPI_JNI_SET_LONG_FIELD  = 328, /* SetLongField(env, obj, fid, val)     */
+  QBDITRACE_CAPI_JNI_GET_ST_OBJ_FLD  = 329, /* GetStaticObjectField(env, cls, fid)  */
+  QBDITRACE_CAPI_JNI_GET_ST_BOOL_FLD = 330, /* GetStaticBooleanField(env, cls, fid) */
+  QBDITRACE_CAPI_JNI_GET_ST_INT_FLD  = 331, /* GetStaticIntField(env, cls, fid)     */
+  QBDITRACE_CAPI_JNI_GET_ST_LONG_FLD = 332, /* GetStaticLongField(env, cls, fid)    */
+  QBDITRACE_CAPI_JNI_SET_ST_OBJ_FLD  = 333, /* SetStaticObjectField(env,cls,fid,v)  */
+  QBDITRACE_CAPI_JNI_SET_ST_INT_FLD  = 334, /* SetStaticIntField(env, cls, fid, v)  */
+  QBDITRACE_CAPI_JNI_SET_ST_LONG_FLD = 335, /* SetStaticLongField(env, cls, fid, v) */
+  QBDITRACE_CAPI_JNI_CALL_BYTE_M     = 336, /* CallByteMethod(env, obj, mid, ...)   */
+  QBDITRACE_CAPI_JNI_CALL_CHAR_M     = 337, /* CallCharMethod(env, obj, mid, ...)   */
+  QBDITRACE_CAPI_JNI_CALL_SHORT_M    = 338, /* CallShortMethod(env, obj, mid, ...)  */
+  QBDITRACE_CAPI_JNI_CALL_FLOAT_M    = 339, /* CallFloatMethod(env, obj, mid, ...)  */
+  QBDITRACE_CAPI_JNI_CALL_DOUBLE_M   = 340, /* CallDoubleMethod(env, obj, mid, ...) */
+  QBDITRACE_CAPI_JNI_CALL_NV_OBJ_M   = 341, /* CallNonvirtualObjectMethod(...)      */
+  QBDITRACE_CAPI_JNI_CALL_NV_INT_M   = 342, /* CallNonvirtualIntMethod(...)         */
+  QBDITRACE_CAPI_JNI_CALL_NV_LONG_M  = 343, /* CallNonvirtualLongMethod(...)        */
+  QBDITRACE_CAPI_JNI_CALL_NV_VOID_M  = 344, /* CallNonvirtualVoidMethod(...)        */
+  QBDITRACE_CAPI_JNI_CALL_ST_LONG_M  = 345, /* CallStaticLongMethod(env,cls,mid,..) */
+  QBDITRACE_CAPI_JNI_CALL_ST_BYTE_M  = 346, /* CallStaticByteMethod(...)            */
+  QBDITRACE_CAPI_JNI_CALL_ST_CHAR_M  = 347, /* CallStaticCharMethod(...)            */
+  QBDITRACE_CAPI_JNI_CALL_ST_DBL_M   = 348, /* CallStaticDoubleMethod(...)          */
+  QBDITRACE_CAPI_JNI_NEW_CHAR_ARR    = 349, /* NewCharArray(env, length)            */
+  QBDITRACE_CAPI_JNI_NEW_SHORT_ARR   = 350, /* NewShortArray(env, length)           */
+  QBDITRACE_CAPI_JNI_NEW_LONG_ARR    = 351, /* NewLongArray(env, length)            */
+  QBDITRACE_CAPI_JNI_NEW_FLOAT_ARR   = 352, /* NewFloatArray(env, length)           */
+  QBDITRACE_CAPI_JNI_NEW_DOUBLE_ARR  = 353, /* NewDoubleArray(env, length)          */
+  QBDITRACE_CAPI_JNI_GET_CHAR_ARR_EL = 354, /* GetCharArrayElements(env, arr, c)    */
+  QBDITRACE_CAPI_JNI_REL_CHAR_ARR_EL = 355, /* ReleaseCharArrayElements(...)        */
+  QBDITRACE_CAPI_JNI_GET_SHORT_ARR_EL= 356, /* GetShortArrayElements(env, arr, c)   */
+  QBDITRACE_CAPI_JNI_REL_SHORT_ARR_EL= 357, /* ReleaseShortArrayElements(...)       */
+  QBDITRACE_CAPI_JNI_GET_LONG_ARR_EL = 358, /* GetLongArrayElements(env, arr, c)    */
+  QBDITRACE_CAPI_JNI_REL_LONG_ARR_EL = 359, /* ReleaseLongArrayElements(...)        */
 
   /* ── pthread / synchronization (360–379) [common] ───────────────── */
   QBDITRACE_CAPI_PTHREAD_CREATE      = 360, /* pthread_create(thr,attr,fn,arg)    */
@@ -1060,7 +1125,14 @@ typedef enum {
   QBDITRACE_CAPI_JNI_MONITOR_ENTER   = 724, /* MonitorEnter(env, obj)               */
   QBDITRACE_CAPI_JNI_MONITOR_EXIT    = 725, /* MonitorExit(env, obj)                */
   QBDITRACE_CAPI_JNI_GET_JAVA_VM     = 726, /* GetJavaVM(env, vm)                   */
-  /* 727–799 reserved for JNI */
+
+  /* ── JNI functions — vtable coverage cont. (727–799) [jni] ────────── */
+  QBDITRACE_CAPI_JNI_GET_INT_ARR_REG = 727, /* GetIntArrayRegion(env,a,st,l,buf)    */
+  QBDITRACE_CAPI_JNI_SET_INT_ARR_REG = 728, /* SetIntArrayRegion(env,a,st,l,buf)    */
+  QBDITRACE_CAPI_JNI_GET_LONG_ARR_REG= 729, /* GetLongArrayRegion(env,a,st,l,buf)   */
+  QBDITRACE_CAPI_JNI_SET_LONG_ARR_REG= 730, /* SetLongArrayRegion(env,a,st,l,buf)   */
+  QBDITRACE_CAPI_JNI_CALL_ST_VOID_M  = 731, /* CallStaticVoidMethod(env,cls,mid,..) */
+  /* 732–799 reserved for JNI */
 
 } qbditrace_capi_id_t;
 

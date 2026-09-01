@@ -72,7 +72,7 @@ test('buildConfigStruct writes 16-bit C API ids without truncation', () => {
   assert.equal(cfg.bytes.readUInt8(314), 7, 'entry 1 nArgs uses its native offset');
   assert.equal(cfg.bytes.readUInt8(315), 9, 'entry 1 strArgs uses its native offset');
   assert.equal(cfg.bytes.readUInt32LE(300), 0, 'entry 0 trailing padding stays zero');
-  assert.equal(cfg.bytes.length, 2336, 'config size matches native sizeof(qbditrace_config_t)');
+  assert.equal(cfg.bytes.length, 2472, 'config size matches native sizeof(qbditrace_config_t)');
 });
 
 test('explicit ObjC address takes priority over automatic discovery', () => {
@@ -147,4 +147,91 @@ test('Android skips all ObjC resolution even when MSGSEND is requested', () => {
   assert.equal(result.enabled, true);
   assert.equal(lookupCalls, 0);
   assert.equal(result.entries.every(entry => entry.address === null), true);
+});
+
+// ─── Java entry trigger policy helpers ──────────────────────────────────────
+
+const javaArgKind = vm.runInContext('javaArgKind', context);
+const javaRetKind = vm.runInContext('javaRetKind', context);
+
+test('javaArgKind maps primitive Java types to primitive conversion', () => {
+  for (const t of ['int', 'long', 'short', 'byte', 'char', 'boolean']) {
+    assert.equal(javaArgKind(t), 'primitive', t);
+  }
+});
+
+test('javaArgKind maps float/double/String/byte[]/objects', () => {
+  assert.equal(javaArgKind('float'), 'float');
+  assert.equal(javaArgKind('double'), 'float');
+  assert.equal(javaArgKind('java.lang.String'), 'utf8');
+  assert.equal(javaArgKind('[B'), 'bytearray');
+  assert.equal(javaArgKind('java.lang.Object'), 'object');
+  assert.equal(javaArgKind('[Ljava.lang.String;'), 'object');
+});
+
+test('javaRetKind maps return types to conversion strategies', () => {
+  assert.equal(javaRetKind('void'), 'void');
+  assert.equal(javaRetKind('int'), 'int32');
+  assert.equal(javaRetKind('boolean'), 'int32');
+  assert.equal(javaRetKind('long'), 'int64');
+  assert.equal(javaRetKind('double'), 'float');
+  assert.equal(javaRetKind('java.lang.String'), 'object');
+});
+
+// ─── JNI vtable slot table integrity ────────────────────────────────────────
+
+const jniSlots = vm.runInContext('JNI_VTABLE_SLOTS', context);
+
+test('JNI vtable slots are unique and sorted', () => {
+  // Array.from bridges the vm-realm array into this realm (deepEqual is
+  // prototype-sensitive across realms).
+  const slots = Array.from(jniSlots.map(e => e.slot));
+  const sorted = [...slots].sort((a, b) => a - b);
+  assert.deepEqual(slots, sorted, 'slot table must stay sorted');
+  assert.equal(new Set(slots).size, slots.length, 'no duplicate slots');
+  // The vtable ends at GetObjectRefType (slot 232) per the JNI spec.
+  assert.ok(slots[slots.length - 1] <= 232, 'slot numbers must fit the vtable');
+});
+
+test('JNI vtable apiIds are unique and within the allocated id ranges', () => {
+  const ids = Array.from(jniSlots.map(e => e.apiId));
+  assert.equal(new Set(ids).size, ids.length,
+      'every intercepted slot must map to a distinct C API id');
+  for (const id of ids) {
+    const inBase = id >= 280 && id <= 359;      // JNI base + full vtable coverage
+    const inExt  = id >= 700 && id <= 731;      // JNI extended
+    assert.ok(inBase || inExt, `apiId ${id} outside the JNI id ranges`);
+  }
+});
+
+test('JNI vtable slots follow the JNI spec layout (anchor points)', () => {
+  // Anchors from the JNINativeInterface_ layout fixed by the JNI spec —
+  // guards against the historical slot-numbering drift bug.
+  const bySlot = slot => jniSlots.find(e => e.slot === slot);
+  const anchors = {
+    4: 'GetVersion',        33: 'GetMethodID',        61: 'CallVoidMethod',
+    94: 'GetFieldID',       113: 'GetStaticMethodID', 144: 'GetStaticFieldID',
+    167: 'NewStringUTF',    169: 'GetStringUTFChars', 171: 'GetArrayLength',
+    215: 'RegisterNatives', 219: 'GetJavaVM',         228: 'ExceptionCheck',
+    232: 'GetObjectRefType',
+  };
+  for (const [slot, name] of Object.entries(anchors)) {
+    const e = bySlot(+slot);
+    assert.ok(e, `slot ${slot} must be intercepted`);
+    assert.equal(e.name, name, `slot ${slot} must be ${name}`);
+  }
+});
+
+test('RegisterNatives is intercepted at spec slot 215 with apiId 301', () => {
+  const entry = jniSlots.find(e => e.slot === 215);
+  assert.ok(entry, 'slot 215 (RegisterNatives) must be intercepted');
+  assert.equal(entry.apiId, 301);
+  assert.equal(entry.name, 'RegisterNatives');
+});
+
+test('NewStringUTF lives at spec slot 167 with a unique apiId 282', () => {
+  const newStringUtf = jniSlots.filter(e => e.apiId === 282);
+  assert.equal(newStringUtf.length, 1, 'exactly one entry maps to NewStringUTF');
+  assert.equal(newStringUtf[0].slot, 167);
+  assert.equal(newStringUtf[0].name, 'NewStringUTF');
 });

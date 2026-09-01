@@ -164,6 +164,27 @@ static std::unique_ptr<TraceEnv> make_with_svc_android() {
     }, "si_svc_android");
 }
 
+/// Trace with target_os=Android mixing an anti-debug syscall (ptrace=117,
+/// process_vm_readv=270, perf_event_open=241) and a normal one (mmap=222).
+/// Guards the full asm-generic name table and the AntiDebug categorization.
+static std::unique_ptr<TraceEnv> make_with_svc_android_anti_debug() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_svc(tw.rt(0x1004), /*ptrace*/  117, 0, 0);
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_svc(tw.rt(0x1008), /*process_vm_readv*/ 270, 0, 0);
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        tw.emit_svc(tw.rt(0x100C), /*perf_event_open*/ 241, 0, 0);
+        tw.emit(ms, 0x100C, enc::nop(), {{33, tw.rt(0x1010)}}, {});
+        tw.emit_svc(tw.rt(0x1010), /*mmap*/ 222, 0, 0);
+        tw.emit(ms, 0x1010, enc::nop(), {{33, tw.rt(0x1014)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_svc_android_anti_debug");
+}
+
 static void plant_bytes(TraceWriter& tw, MachineState& ms, uint64_t addr,
                         const std::vector<uint8_t>& bytes) {
     for (size_t off = 0; off < bytes.size(); off += sizeof(uint64_t)) {
@@ -757,6 +778,143 @@ TEST_CASE("SyscallInterceptPass: SVC record works end-to-end with target_os=Andr
 
     SECTION("category is Syscall") {
         REQUIRE(res.calls[0].category == ApiCategory::Syscall);
+    }
+}
+
+/// Trace with target_os=Android and a RegisterNatives CAPICALL (api_id=301).
+/// RegisterNatives is the highest-value JNI hook for reverse engineering: its
+/// x2/x3 args expose the JNINativeMethod binding table (Java method name,
+/// signature, native function pointer). Guards the id->name decode table and
+/// the JNI category fallback range (280–301) in one shot.
+static std::unique_ptr<TraceEnv> make_with_capicall_register_natives() {
+    return make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_v8_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        // RegisterNatives(env=0x7000, cls=0x8000, methods=0x9000, nMethods=3)
+        tw.emit_capicall_v8(301, tw.rt(0x1004), 0xB000200ULL,
+                            {0x7000ULL, 0x8000ULL, 0x9000ULL, 3, 0, 0, 0, 0});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_capicall_register_natives");
+}
+
+TEST_CASE("SyscallInterceptPass: RegisterNatives (api_id=301) decodes as JNI",
+          "[unit][pass][syscall_intercept][capicall][android][jni]") {
+    auto env = make_with_capicall_register_natives();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+
+    SECTION("exactly one call recorded") {
+        REQUIRE(res.total() == 1);
+    }
+
+    SECTION("callee resolves to RegisterNatives") {
+        REQUIRE(res.calls[0].callee_name == "RegisterNatives");
+    }
+
+    SECTION("category is JNI") {
+        REQUIRE(res.calls[0].category == ApiCategory::JNI);
+    }
+
+    SECTION("binding-table args are preserved (x2=methods, x3=nMethods)") {
+        REQUIRE(res.calls[0].arg_count >= 4);
+        REQUIRE(res.calls[0].raw_args[2] == 0x9000ULL);
+        REQUIRE(res.calls[0].raw_args[3] == 3ULL);
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: Android anti-debug syscalls get AntiDebug category",
+          "[unit][pass][syscall_intercept][svc][android][antidebug]") {
+    // Guards the full asm-generic arm64 syscall name table (linux_syscalls.cpp)
+    // and the anti-debug classification added for Android/Linux traces.
+    auto env = make_with_svc_android_anti_debug();
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+    REQUIRE(res.total() == 4);
+
+    // Call order matches emission order: ptrace, process_vm_readv,
+    // perf_event_open, mmap.
+    SECTION("ptrace (117) resolves via full name table") {
+        REQUIRE(res.calls[0].callee_name == "ptrace");
+    }
+    SECTION("process_vm_readv (270) resolves via full name table") {
+        REQUIRE(res.calls[1].callee_name == "process_vm_readv");
+    }
+    SECTION("perf_event_open (241) resolves via full name table") {
+        REQUIRE(res.calls[2].callee_name == "perf_event_open");
+    }
+    SECTION("mmap (222) resolves via full name table") {
+        REQUIRE(res.calls[3].callee_name == "mmap");
+    }
+
+    SECTION("ptrace/process_vm_readv/perf_event_open categorized AntiDebug") {
+        REQUIRE(res.calls[0].category == ApiCategory::AntiDebug);
+        REQUIRE(res.calls[1].category == ApiCategory::AntiDebug);
+        REQUIRE(res.calls[2].category == ApiCategory::AntiDebug);
+    }
+    SECTION("mmap stays plain Syscall") {
+        REQUIRE(res.calls[3].category == ApiCategory::Syscall);
+    }
+}
+
+TEST_CASE("SyscallInterceptPass: JNI extended api_ids (302-359, 727-731) decode",
+          "[unit][pass][syscall_intercept][capicall][android][jni]") {
+    // Guards the id->name decode table and the JNI category fallback range,
+    // which must cover 280-359 and 700-731 (full vtable coverage IDs).
+    auto env = make_env([](TraceWriter& tw) {
+        tw.anchor_interval = 256;
+        tw.write_header_v8_target_os(QBDITRACE_OS_ANDROID);
+        MachineState ms; ms.sp() = 0x16F000000ULL;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        // One extended-range CAPICALL per emitted instruction.
+        tw.emit_capicall_v8(302, tw.rt(0x1004), 0xB000200ULL, {0x7000ULL, 0, 3, 0, 0, 0, 0, 0}); // NewString
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+        tw.emit_capicall_v8(359, tw.rt(0x1008), 0xB000200ULL, {0x7000ULL, 0, 0, 0, 0, 0, 0, 0}); // ReleaseLongArrayElements
+        tw.emit(ms, 0x1008, enc::nop(), {{33, tw.rt(0x100C)}}, {});
+        tw.emit_capicall_v8(727, tw.rt(0x100C), 0xB000200ULL, {0x7000ULL, 0, 0, 0, 0, 0, 0, 0}); // GetIntArrayRegion
+        tw.emit(ms, 0x100C, enc::nop(), {{33, tw.rt(0x1010)}}, {});
+        tw.emit_capicall_v8(731, tw.rt(0x1010), 0xB000200ULL, {0x7000ULL, 0, 0, 0, 0, 0, 0, 0}); // CallStaticVoidMethod
+        tw.emit(ms, 0x1010, enc::nop(), {{33, tw.rt(0x1014)}}, {});
+        tw.emit_anchor(ms);
+    }, "si_capicall_jni_extended");
+
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<SyscallInterceptPass>());
+
+    auto& raw = pm->require("syscall_intercept");
+    REQUIRE(raw.ok());
+
+    const auto& res = raw.get<SyscallInterceptResult>();
+    REQUIRE(res.total() == 4);
+
+    SECTION("names resolve from extended decode table") {
+        REQUIRE(res.calls[0].callee_name == "NewString");
+        REQUIRE(res.calls[1].callee_name == "ReleaseLongArrayElements");
+        REQUIRE(res.calls[2].callee_name == "GetIntArrayRegion");
+        REQUIRE(res.calls[3].callee_name == "CallStaticVoidMethod");
+    }
+    SECTION("all categorized as JNI") {
+        for (const auto& c : res.calls) {
+            REQUIRE(c.category == ApiCategory::JNI);
+        }
     }
 }
 

@@ -71,7 +71,9 @@ TEST_CASE("dump_trace text includes core sections", "[unit][cli][dump]") {
     REQUIRE(s.find("mem") != std::string::npos);
     REQUIRE(s.find("THREAD") != std::string::npos);
     REQUIRE(s.find("EVENT") != std::string::npos);
-    REQUIRE(s.find("SVC name=unknown raw_syscall_no=128") != std::string::npos);
+    // syscall 128 now resolves through the shared full arm64 asm-generic
+    // name table (target_os=Unknown falls back to the Linux ABI table).
+    REQUIRE(s.find("SVC name=restart_syscall raw_syscall_no=128") != std::string::npos);
     REQUIRE(s.find("return=unknown (legacy)") != std::string::npos);
     REQUIRE(s.find("class=unknown class_resolution=unknown") != std::string::npos);
     REQUIRE(s.find("selector_source=hex selector_resolution=unresolved return=unknown (legacy)") != std::string::npos);
