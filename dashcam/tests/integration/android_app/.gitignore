@@ -6,3 +6,4 @@ classes.dex
 AndroidManifest.xml
 hellotrace.apk
 hellotrace-unsigned.apk
+*.idsig
