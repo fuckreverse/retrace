@@ -253,6 +253,16 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --entry 0x1234 \
     --output /data/local/tmp/trace.bin
 
+# Java 方法作为触发器：hook Java 层 native bridge，参数自动物化
+# （int/long → 立即数，String → UTF-8 字符串，对象 → jobject handle）
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --android \
+    --module libnative.so \
+    --entry 0x1234 \
+    --java-entry com.example.NativeBridge.doWork \
+    --output /data/local/tmp/trace.bin
+
 # 录制完成后拉回宿主机
 adb pull /data/local/tmp/trace.bin ./trace.bin
 ```
@@ -476,6 +486,15 @@ TUI 提供终端内的多面板浏览体验，通过键盘操作，并与 Tauri 
 
 # 系统调用分析
 ./tenet trace.bin --syscall-intercept
+
+# 多线程：线程概要与切换
+./tenet trace.bin --run-pass thread
+
+# 多线程：只看指定线程的指令（可多个 tid）
+./tenet trace.bin --thread-filter 4711,4712
+
+# 多线程：共享内存跨线程交接（writer→reader）
+./tenet trace.bin --cross-thread-dataflow
 
 # 全部算法分析一次跑完
 ./tenet trace.bin --pattern --constants --loop-semantics --algorithm-summary

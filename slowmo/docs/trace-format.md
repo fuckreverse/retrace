@@ -369,7 +369,9 @@ XFER_CALL/RETURN）**不**触发 ANCHOR——寄存器 diff 存的是绝对值�
 Total: 16 字节 (`sizeof(qbditrace_thread_head_t)`，含对齐 padding)
 ```
 
-标记后续记录属于哪个线程。tenet 当前假设单线程（忽略 THREAD 记录），未来扩展多线程支持。
+标记后续记录属于哪个线程。qbditrace 会在线程切换（QBDI 执行权移交）时写入；`qbditrace_run_thread`（pthread_create 拦截）启动的新线程也以 THREAD 记录开头。
+
+tenet 已支持多线程 trace 分析：`TraceIndex` 为每个 anchor 标注写者线程并维护线程 chunk 表；`thread` / `thread_filter` / `cross_thread_dataflow` pass 基于这些标注工作（详见 analysis-layer.md）。单线程语义的分析（如调用栈）以线程隔离 cursor 重建，不会跨线程串扰。
 
 ---
 
@@ -531,7 +533,7 @@ v8（`HF_CALL_META`）固定头改为 `qbditrace_capicall_head_v8_t`，仍为 **
 | 100–129 | libc 级 Crypto（arc4random/getrandom） | 通用 |
 | 130–199 | iOS/macOS 平台 API（CommonCrypto/Security.framework/CF） | [ios] |
 | 200–279 | Android/Bionic 平台 API（BoringSSL/android_log/Binder） | [android] |
-| 280–359 | JNI 函数（GetStringUTFChars/FindClass/…） | [jni] |
+| 280–359 | JNI 函数（280–301 基础集 + 302–359 扩展，覆盖 JNINativeInterface_ 全 vtable 约 112 个 slot） | [jni] |
 | 360–379 | pthread / 同步原语 | 通用 |
 | 380–399 | 网络（socket/connect/send/recv/…） | 通用 |
 | 400–419 | 编码（base64_encode/decode） | 通用 |
@@ -539,6 +541,7 @@ v8（`HF_CALL_META`）固定头改为 `qbditrace_capicall_head_v8_t`，仍为 **
 | 450–469 | 扩展文件系统（mmap/mprotect/…） | 通用 |
 | 470–599 | iOS/macOS 扩展（CCHmac*/CCCryptorCreate*/CFString*…） | [ios] |
 | 600–699 | Android/Bionic 扩展（EVP_Encrypt*/HMAC_*/AES_*…） | [android] |
+| 700–731 | JNI 扩展（GetIntField/NewObject/GetVersion/GetIntArrayRegion/…） | [jni] |
 
 **关键 iOS crypto api_id**：
 

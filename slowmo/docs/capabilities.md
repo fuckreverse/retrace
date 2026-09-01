@@ -170,7 +170,7 @@ mindmap
 | 算法摘要 | `--algorithm-summary`, `algorithm_summary` | 汇总 pattern + constants + loop + call graph |
 | ObjC 消息 | `--objc`, `objc_messages` | 提取类名、selector、调用点（仅 Darwin 目标） |
 | ObjC × Crypto | `--objc-crypto`, `objc_crypto` | 关联高层调用栈与密码学逻辑（仅 Darwin 目标） |
-| 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL）；Darwin `REC_SVC` 支持 BSD syscall、负号 Mach trap 与发送 Mach 消息的常用 MIG routine 解析 |
+| 系统调用拦截 | `--syscall-intercept`, `syscall_intercept` | 按平台自动选择 API 表（CommonCrypto/BoringSSL）；Darwin `REC_SVC` 支持 BSD syscall、负号 Mach trap 与发送 Mach 消息的常用 MIG routine 解析；Android/Linux `REC_SVC` 使用全量 arm64 asm-generic 名表（318 项）并将 ptrace/process_vm_readv/perf_event_open 等自动归类 `AntiDebug` |
 | VMP 抽象 | `--vm-abstract`, `vm_abstract` | **需静态分析 hint**（anchor PC/PC集/内存写，来自 IDA/Ghidra）：在每条 VM 指令的 anchor 命中点快照 VM 上下文，派生 handler 执行次数、解码 opcode、读取 VM context/寄存器文件/栈快照 |
 
 典型命令：
@@ -232,6 +232,7 @@ mindmap
 
 - Core / trace / query / taint / graph：基础 trace 查询与图分析
 - Analysis / search / pass：高层分析与 pass 封装
+- 多线程：`threads`（线程概要与切换事件）、`thread_filter`（按线程集合过滤指令区间）、`cross_thread_dataflow`（共享内存跨线程交接）
 - AI tools：`verify_evidence`, `batch_query`, 假设账本工具
 
 参考：[`ui-layer.md`](ui-layer.md)
@@ -276,6 +277,6 @@ mindmap
 | 我想让 AI 自动分析 | 单实例用 `--mcp`，多 Trace 固定入口用 `--mcp-hub`（默认 `10444`） |
 | 我想在 IDA 与 Trace 间双向跳转 | 启动 Tauri 前端或 `--mcp-hub`，加载 `python/tenet_ida.py`，通过 Hub JSON WebSocket 同步 |
 | 我想边录边看 | `--streaming` |
-| 我在分析 Android trace | `syscall_intercept`（BoringSSL）, `pattern`, `taint` — ObjC 相关 pass 自动跳过 |
+| 我在分析 Android trace | `syscall_intercept`（BoringSSL/JNI——录制时拦截 JNINativeInterface_ 全 vtable 约 112 个 slot，含 RegisterNatives 绑定表暴露；syscall 全量名表 + 反调试自动归类）, `pattern`, `taint` — ObjC 相关 pass 自动跳过；录制时可用 qbditrace `--java-entry` 以 Java 方法为触发器 |
 | 我想排除噪声代码区间 | qbditrace `--exclude-range`（录制时排除），tenet `--exclude-range`（分析时过滤） |
 | 我想优化 tenet 本身 | `profiling.md` |

@@ -129,7 +129,29 @@ block 不在当前 VM 的接管范围内，只能看到 dispatcher 的跨模块�
   queue-specific data 或必须运行在特定线程上的 block 不适合此模式。
 - 默认只捕获 invoke 指针位于目标模块内的 block；`--gcd-no-filter` 可关闭过滤，
   `--gcd-max` 可限制额外执行次数。
-- 真正的多线程并发 trace 仍不支持。正式录制应尽量串行化，避免多个线程同时进入 tracer。
+- 真正的多线程并发 trace（多个线程同时进入 VM）仍不支持。正式录制应尽量串行化，避免多个线程同时进入 tracer。
+
+### 多线程录制：pthread_create 拦截（`qbditrace_run_thread`）
+
+对于 pthread 生态（iOS/Android/Linux），qbditrace 提供**子线程追踪**：拦截
+`pthread_create`，把用户线程函数包装进 trampoline，在新线程内部先调
+`qbditrace_run_thread(fn, arg, ret_out)` 建立 QBDI VM 并启动 trace，再执行原函数。
+每个被跟踪线程都有自己的 `ThreadCtx`，输出统一交错写入同一个 `.bin`（记录流中
+THREAD 标记分隔线程边界），tenet 端按线程重建并分析。
+
+- **C ABI**：`int qbditrace_run_thread(uint64_t *ret_out, uint64_t fn, uint64_t arg);`
+  —— 在**当前线程**（必须是新线程自己）内启动 VM 并执行 `fn(arg)`。
+- **Frida JS**：`qbditrace.js` 导出 `interceptThreads(sub /* optional */)`；agent 会
+  replace `pthread_create`，为每个新线程装 trampoline。`sub` 可选指定只跟踪
+  特定起点函数（默认全部 pthread_create 的线程）。
+- **Python runner**：`qbditrace_runner.py` 支持 `--trace-threads`（自动
+  `interceptThreads()`）与 `--thread-entry <fn>`（只跟踪指定入口）。
+- 语义边界：拦截的是 **pthread**；GCD 线程池（`dispatch_async` 到 libdispatch
+  worker）不经过 `pthread_create`，仍需要 `--trace-gcd` 或目标自身再 spawn pthread。
+  线程并发进入 VM 的部分按先后串行化录制（QBDI VM 实例按线程独立）。
+- tenet 侧配套：`THREAD` 记录被 `TraceIndex` 用于 anchor 线程标注与线程 chunk 表；
+  `--thread <tid>`（CLI 过滤）、Thread 面板（TUI/Web）与
+  `threads` / `thread_filter` / `cross_thread_dataflow` MCP 工具提供分析入口。
 
 ## 文件结构
 
@@ -181,6 +203,10 @@ bash tools/qbditrace/build-qbditrace-android.sh
 adb push libqbditrace.so /data/local/tmp/libqbditrace.so
 ```
 
+脚本驱动 CMake NDK toolchain 在固定目录 `tools/qbditrace/build-android/` 内构建
+（不会另建 build 目录）。zstd 用 NDK clang 交叉编译一次并缓存在
+`build-android/libzstd.a`（复用 `tools/tenet/_deps/zstd-src` 源码；不走
+FetchContent，避免覆盖共享缓存里 tenet 的 host 版 zstd）。
 脚本默认使用 Android API 24（可通过 `ANDROID_API_LEVEL` 覆盖），并输出仓库根目录下的
 `libqbditrace.so`。运行 loader 时加 `--android`；默认 dylib 路径会切换为
 `/data/local/tmp/libqbditrace.so`。
@@ -354,6 +380,17 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --invoke \
     --args "nsstr:hello" "nsdata:aabbccdd" "int:0" \
     --output /var/mobile/Documents/trace.bin
+
+# ── Java entry 触发模式（Android） ──────────────────────
+# hook Java 方法作为 trace 触发器：Java 参数自动物化为 native 指针，
+# 调用发生时用真实 Java 层输入直接 run_call native 入口
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app --attach \
+    --android \
+    --module libnative.so \
+    --entry 0x8A10 \
+    --java-entry com.example.NativeBridge.doWork \
+    --output /data/local/tmp/trace.bin
 ```
 
 ### 2.3 完整参数列表
@@ -409,6 +446,8 @@ python3 tools/qbditrace/qbditrace_runner.py \
 |------|--------|------|
 | `--invoke` | off | 主动调用入口函数并 trace，而非 hook 等待被动触发。需配合 `--args` 提供参数 |
 | `--args` | 无 | 类型化参数列表（最多 8 个），语法为 `TYPE:VALUE`。支持的类型见下表 |
+| `--trace-threads` | off | 拦截 `pthread_create`，跟踪目标 spawn 的所有子线程（agent 自动 `interceptThreads()`） |
+| `--thread-entry` | 无 | 与 `--trace-threads` 配合：只跟踪起点为指定函数名的子线程，其它 pthread 原样运行 |
 
 `--args` 支持的参数类型：
 
@@ -440,6 +479,12 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--trace-gcd` | off | hook GCD dispatcher，并在提交点同步额外执行、单独 trace block invoke；不是跟踪原工作线程 |
 | `--gcd-no-filter` | off | trace 所有 block（不限 invoke 是否位于目标模块） |
 | `--gcd-max` | 0 (无限) | 最大额外执行/捕获的 block 数 |
+
+**Java entry 触发（Android）：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--java-entry` | 无 | hook 指定 Java 方法（`fully.qualified.Class.method`）作为 trace 触发器：调用发生时，Java 参数自动物化为 native 指针（int/long → 立即数，String → UTF-8 C 字符串，其他对象 → jobject handle），再通过 `run_call` 直接调用 `--entry` 指定的 native 函数。需 `--android`；与 `--invoke` 互斥。重载方法默认 hook 第一个；超过 8 个参数只传前 8 个；float/double 与对象返回值不支持转换（会警告并降级） |
 
 **运行控制：**
 
@@ -583,6 +628,7 @@ int  qbditrace_run_call(uint64_t *ret_out, uint64_t function,
                         uint32_t argc, const uint64_t *argv);
 int  qbditrace_run_at(uint64_t *ret_out, uint64_t start_pc,
                       const uint64_t *gpr, uint64_t sp, uint64_t lr);
+int  qbditrace_run_thread(uint64_t *ret_out, uint64_t fn, uint64_t arg);
 void qbditrace_stop(void);
 int  qbditrace_force_anchor(void);
 const char *qbditrace_output_path(void);
@@ -620,6 +666,14 @@ VM dispatch 入口），它们不能在隔离环境下正确执行。
 - `gpr`：30 个值的数组 = x0..x28 (idx 0..28) + x29/FP (idx 29)
 - `sp`：入口时捕获的真实栈指针
 - `lr`：入口时捕获的真实返回地址；VM 运行到此地址时停止
+
+### qbditrace_run_thread
+
+在**当前线程**内启动 VM 并执行 `fn(arg)`，返回值写入 `*ret_out`。与
+`qbditrace_run_call` 的区别：它面向 pthread trampoline —— 拦截
+`pthread_create` 后由 trampoline 在新线程内部调用，为新线程建立独立的
+`ThreadCtx`，输出以 THREAD 记录分隔写入同一 trace 文件。不要在已有 VM
+线程上调用。
 
 ### qbditrace_stop
 
@@ -679,7 +733,7 @@ signal handler 不会运行）。返回写出的 PC 条目数。
 | `exclude_ranges[8]` | `struct{u64,u64}` | 排除区间数组，每项 {start, end}（运行时地址）。区间内代码以原生速度执行，不产生 trace 记录。最多 8 个 |
 | `enable_capi_intercept` | `uint32_t` | 非零启用 C API 拦截（仍需 `record` 含 `QBDITRACE_REC_CAPI`）；官方 Frida agent 默认启用 |
 | `n_capi_funcs` | `uint32_t` | `capi_funcs[]` 中有效项数（0..128）。为 0 时 native 在 configure 阶段用 `dlsym` 自动解析标准 C/平台 API |
-| `capi_funcs[128]` | `struct{addr,api_id,n_args,str_args}` | 可选的显式函数表。每项含运行时地址、api_id、参数数量、指针参数捕获位掩码。Frida agent 主要用它传入无法由 `dlsym` 获取的 Android JNI vtable 地址 |
+| `capi_funcs[128]` | `struct{addr,api_id,n_args,str_args}` | 可选的显式函数表。每项含运行时地址、api_id、参数数量、指针参数捕获位掩码。Frida agent 主要用它传入无法由 `dlsym` 获取的 Android JNI vtable 地址——agent 会经 `JNI_GetCreatedJavaVMs → JavaVM->GetEnv` 解析 `JNINativeInterface_` 全 vtable（约 112 个 slot，api_id 280–359/700–731），libart 尚未就绪时后台每 2s 重试（最多 30 次）并在 `qbditrace_configure` 前刷新 |
 
 **`run_call` vs `run_at` 的选择**：`run_call` 创建隔离假栈，适合大多数场景。
 `run_at` 使用真实栈帧和完整寄存器上下文，适合行为依赖调用者栈帧的薄包装函数。
@@ -773,8 +827,10 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
     str_count 个可变长字符串捕获（88 字节固定头 + 可变尾）。当 `enable_capi_intercept != 0`
     且 XFER_CALL 目标命中 `capi_funcs[]` 时发射；携带调用点的参数寄存器与指针参数的
     内联字符串内容（最多 4 个，每个最多 255 字节）。完整枚举见 `TraceFormat.h` 的
-    `qbditrace_capi_id_t`；当前磁盘字段仍为 `uint8_t`，所以 **api_id >= 256 会截断**，
-    Android 扩展 BoringSSL/JNI ID 暂不能可靠 round-trip。
+    `qbditrace_capi_id_t`。v8（`HF_CALL_META`）起磁盘字段为 `uint16_t`，
+    Android 扩展 BoringSSL/JNI ID（≥256）可完整 round-trip；record 含
+    SVC/CAPI 位时 writer 默认置位 v8。仅 legacy v4–v7 trace 的 api_id 为
+    `uint8_t`（读取兼容，高段 ID 会截断）。
 - 寄存器索引采用 QBDI GPR 顺序：0..28=x0..x28，29=fp，30=lr，31=sp，
   32=nzcv，33=pc。
 - 内存访问含 `value`（低 8B）+ `value_hi`（高 8B，用于 stp/NEON 9-16B store）。
@@ -799,10 +855,13 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
 - 默认 `--trace-mode once` 只 trace 首次调用。使用 `--trace-mode multi` 或
   `--trace-mode N` 可捕获多次调用。
 - 主路径支持 iOS / Android AArch64；x86_64 写入路径未做完整适配。
+- `--java-entry`（Android）会绕过 Java 层实现直接调用 native 函数：Java 侧的
+  前后置逻辑（参数校验、异常包装等）在 trace 期间不会执行；float/double 参数
+  与对象返回值不支持转换（警告并降级）。
 - 离线解码已统一由 tenet 处理（`tenet --dump`），支持全格式（v4/v5/v7，含默认分块压缩）。独立的 `trace_decode` 已移除。
 - objc 记录的 cls 字段容量 48 字节；`*Super` 变体跳过类名解析（接收者为 objc_super
   结构体指针）。选择子通常可离线还原为方法名字符串。
-- syscall 名表只覆盖常见子集，未命中的号码按原始数字显示；Mach trap 不在此表内。
+- Android/Linux syscall 名由 tenet 的全量 arm64 asm-generic 表解析（`platform/linux_syscalls.*`，318 项，未命中按 `syscall_N` 显示）；Darwin BSD/Mach trap 名表由 tenet 内置。
 - GCD / 跨线程派发的原始执行不在当前 VM 内；`--trace-gcd` 通过在提交点同步额外执行
   block 来生成独立 trace，可能重复副作用，不能等同于真实工作线程跟踪。
 - `addInstrumentedModuleFromAddr` 整模块插桩；模块解析失败时退化为固定窗口。

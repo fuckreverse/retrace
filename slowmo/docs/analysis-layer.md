@@ -215,6 +215,7 @@ Collector 可按记录类型覆写回调：
 |------|----------|
 | `thread` | 线程时间线与切换统计 |
 | `thread_filter` | 构建每线程 inst bitmap，用于过滤 |
+| `cross_thread_dataflow` | 共享内存跨线程交接检测（writer→reader 边） |
 
 ## Pass 详解与使用入口
 
@@ -447,6 +448,8 @@ Collector 可按记录类型覆写回调：
 
 **作用**：按 target_os 自动选择 API 表（Darwin→CommonCrypto/Security.framework，Android/Linux→BoringSSL/OpenSSL）。三路数据来源（优先级递降）：① REC_CAPICALL（tracer 侧已解析）② REC_SVC（系统调用号分类）③ Event XFER_CALL 启发式（地址匹配 API 签名表）。
 
+Android/Linux 的 SVC 解析使用共享的全量 arm64 asm-generic 名表（`platform/linux_syscalls.h/.cpp`，由 NDK 头经 `clang -dM -E` 生成，覆盖 0–463 全部 318 项），未命中才降级为 `syscall_N`；target_os 为 Unknown 时同样回退到该 Linux ABI 表（`--dump` 共用）。反调试相关系统调用（ptrace/process_vm_readv/perf_event_open 等）自动归类为 `AntiDebug`，与 Darwin 的 Mach trap 分类增强对齐。JNI 的 CAPICALL 解码覆盖全部 ID 段（280–359、700–731，对应 JNINativeInterface_ 全 vtable 拦截），统一归类 `JNI`。
+
 **CLI**：`--syscall-intercept`
 **MCP**：`syscall_intercept`
 **TUI**：Results 面板中 `syscall_intercept` 条目显示拦截调用列表（API 名 / 类别 / inst_id / 解码参数）。
@@ -522,18 +525,30 @@ Collector 可按记录类型覆写回调：
 **作用**：线程时间线与切换统计，提供线程列表、每线程指令数、上下文切换事件。
 
 **CLI**：`--run-pass thread`
-**MCP**：无独立工具
+**MCP**：`threads`（线程列表 + switch 事件；`spans_limit` 参数控制 span 输出分页）
 **TUI**：Thread 面板（全局 `S` 键跳转到下一次线程切换，`p`/`N` 前后切换）；Results 面板中 `thread` 条目显示线程摘要。
 
 ---
 
 #### `thread_filter` — 线程过滤
 
-**作用**：构建每线程 inst bitmap，用于按线程过滤指令。依赖 `thread`。
+**作用**：构建每线程 inst bitmap（Roaring64Map），用于按线程过滤指令。依赖 `thread`。结果包含游程编码的 `[start, count)` 区间并集，供 TUI/Web 前端做逐行包含判断。
 
 **CLI**：`--thread-filter [tid1,tid2,...]`；省略列表时仍构建全部线程 bitmap
-**MCP**：无独立工具
-**TUI**：Results 面板中 `thread_filter` 条目显示过滤摘要。
+**MCP**：`thread_filter`（`thread_ids` 数组参数；首次调用会重建 pass，返回过滤后区间）
+**TUI**：Thread 面板内 Enter 切换线程选中态，指令视图同步过滤。
+
+**注意**：`thread_filter` 的配置（选中线程集合）是可变的——重新配置时后端通过 `PassManager::invalidate + register_pass`（直接注册）替换旧实例；`register_pass_by_name` 是幂等的，无法应用新配置。
+
+---
+
+#### `cross_thread_dataflow` — 跨线程数据流
+
+**作用**：检测经共享内存的跨线程数据交接。扫描 MemoryModel 写历史，为每个「线程 A 写地址 X → 线程 B 读地址 X（中间无其它写）」对生成一条 edge；按地址聚合成 channel，并给出 producer→consumer 线程对统计。依赖 `thread` 与 MemoryModel 写者线程标注（第一期引入）。
+
+**CLI**：`--cross-thread-dataflow`
+**MCP**：`cross_thread_dataflow`（`edge_offset`/`edge_limit`/`channel_limit` 分页参数）
+**TUI**：XThread 面板；Web 前端 "XThread Data" 标签页。
 
 ---
 
