@@ -1,0 +1,8 @@
+# APK 构建产物（build_apk.sh 每次重新生成）
+out/
+obj/
+lib/
+classes.dex
+AndroidManifest.xml
+hellotrace.apk
+hellotrace-unsigned.apk
