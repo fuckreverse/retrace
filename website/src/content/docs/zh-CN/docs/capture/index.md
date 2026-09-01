@@ -55,7 +55,10 @@ adb push tools/qbditrace/build-android/libqbditrace.so /data/local/tmp/
 
 ### 线程与 GCD
 
-QBDI VM 只接管发起调用的线程。通过 `dispatch_async` 转移到其他线程的工作不会被包含。可选的 `--trace-gcd` 模式 hook GCD dispatcher，在提交点同步额外执行发现的 block invoke 指针——每个 block 生成独立 trace 文件。这**不是**真正的多线程 trace：block 在调用线程上额外执行一次，有副作用或依赖特定队列的 block 可能表现不同。尽量串行化捕获。
+QBDI VM 只接管发起调用的线程。转移到其他线程的工作有两种捕获方式：
+
+- **Android —— `--trace-threads`：** 拦截 `pthread_create`，将 start routine 位于被追踪模块内的子线程重定向到 `qbditrace_run_thread()`——routine 在子线程自己的 QBDI VM 中执行。所有线程记录进**同一个 trace 文件**，以 `THREAD` 标记区分——这是真正的多线程 trace。Tenet 可按线程切分（`--run-pass thread`、`--thread-filter`）。
+- **iOS —— `--trace-gcd`：** hook GCD dispatcher，在提交点同步额外执行发现的 block invoke 指针——每个 block 生成独立 trace 文件。这**不是**真正的多线程 trace：block 在调用线程上额外执行一次，有副作用或依赖特定队列的 block 可能表现不同。尽量串行化捕获。
 
 ## 自定义采集器
 

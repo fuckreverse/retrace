@@ -55,7 +55,10 @@ adb push tools/qbditrace/build-android/libqbditrace.so /data/local/tmp/
 
 ### Threading and GCD
 
-A QBDI VM controls only the calling thread. Work dispatched to other threads via `dispatch_async` is not included. The optional `--trace-gcd` mode hooks the GCD dispatcher and synchronously re-invokes discovered block invoke pointers—each in its own trace file. This is **not** a true multi-thread trace: blocks execute an extra time on the calling thread, so side-effectful or queue-dependent blocks may behave differently. Prefer serializing capture whenever possible.
+A QBDI VM controls only the calling thread. Work moved to other threads is captured two ways:
+
+- **Android — `--trace-threads`:** intercepts `pthread_create` and redirects each child thread whose start routine lives in the traced module into `qbditrace_run_thread()`, which runs the routine inside the child's own QBDI VM. All threads record into the **same trace file**, interleaved and separated by `THREAD` markers — a true multi-thread trace. Tenet partitions it per thread (`--run-pass thread`, `--thread-filter`).
+- **iOS — `--trace-gcd`:** hooks the GCD dispatcher and synchronously re-invokes discovered block invoke pointers—each in its own trace file. This is **not** a true multi-thread trace: blocks execute an extra time on the calling thread, so side-effectful or queue-dependent blocks may behave differently. Prefer serializing capture whenever possible.
 
 ## Custom collectors
 

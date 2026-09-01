@@ -57,4 +57,4 @@ codesign --verify --deep --strict --verbose=2 /Applications/Tenet.app
 
 未来正式版本计划采用 Developer ID 签名并完成 Apple 公证，从而不再需要上述手动首次启动步骤。
 
-捕获端还需要 Python 3.9+、Frida Python 绑定，以及目标设备上版本完全匹配的 Frida 服务。
+捕获端还需要 Python 3.9+、Frida Python 绑定（16.x 或 17.x），以及目标设备上版本完全匹配的 Frida 服务。Frida 17.x 下 ObjC/Java/Swift 桥接脚本由 tracer 动态加载，无需单独安装 bridge。连接多台 USB 设备时，请给 loader 传 `--device-id` 指定目标手机。

@@ -56,6 +56,21 @@ The CLI runs analysis, exports data, and produces reports without an interactive
 
 Use `--run-pass` for fine-grained control when the convenience flags do not map to the desired pass set.
 
+## Multi-thread analysis
+
+```bash
+# Thread summary and switch events
+./tenet trace.bin --run-pass thread
+
+# Restrict the instruction view to specific threads (comma-separated tids)
+./tenet trace.bin --thread-filter 4711,4712
+
+# Cross-thread handoffs through shared memory (writer → reader edges)
+./tenet trace.bin --cross-thread-dataflow
+```
+
+`--thread-filter` builds a per-thread instruction bitmap; omit the tid list to build all bitmaps first and filter later. `--cross-thread-dataflow` scans the memory write history and reports each "thread A writes address X → thread B reads address X (no intervening write)" pair, aggregated by address into channels with producer→consumer statistics.
+
 ## Exclude ranges
 
 ```bash

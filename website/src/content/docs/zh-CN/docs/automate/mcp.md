@@ -198,6 +198,14 @@ ws://127.0.0.1:10444/ws/<instance-id>
 | `call_graph` | 导出动态调用图（JSON/DOT） |
 | `dataflow_graph` | 导出限定指令区间的数据流图 |
 
+### 多线程
+
+| 工具 | 用途 |
+|---|---|
+| `threads` | 多线程 trace 的线程概要与切换事件 |
+| `thread_filter` | 将指令视图限制到一组线程 id（以新选择重建 pass） |
+| `cross_thread_dataflow` | 共享内存跨线程交接：writer→reader 边按地址聚合为 channel 并附 producer→consumer 统计（`edge_offset`/`edge_limit`/`channel_limit` 分页） |
+
 ### 结构、模式与平台语义
 
 | 工具 | 用途 |

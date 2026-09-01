@@ -57,4 +57,4 @@ The current package contains ARM64 binaries and runs on Apple Silicon Macs. Remo
 
 Future production releases are intended to use Developer ID signing and Apple notarization so this manual first-launch step is no longer required.
 
-For capture you also need Python 3.9 or newer, Frida Python bindings, and a matching Frida service on the target device.
+For capture you also need Python 3.9 or newer, Frida Python bindings (16.x or 17.x), and a matching Frida service on the target device. On Frida 17.x the ObjC/Java/Swift bridge scripts are loaded dynamically by the tracer, so no separate bridge installation is required. When several USB devices are attached, pass `--device-id` to the loader so it selects the intended phone.

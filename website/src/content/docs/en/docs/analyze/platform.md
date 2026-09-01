@@ -91,8 +91,8 @@ For `REC_CAPICALL`, `REC_SVC`, and ObjC, v8 `REC_RETVAL` supplies the actual x0/
 | Platform | APIs classified |
 |---|---|
 | Darwin (iOS) | **CommonCrypto:** `CCCrypt`, `CCCryptorCreate`, `CCCryptorCreateWithMode`, `CCHmac`, digest/PBKDF families  **Security.framework:** `SecKeyCreateSignature`, `SecKeyRawSign`, `SecKeyRawVerify`, `SecKeyEncrypt`, `SecKeyDecrypt`, `SecKeyCreateWithData`  **BoringSSL / OpenSSL:** EVP cipher and digest families |
-| Android | **BoringSSL:** same EVP/SSL surface as above  **JNI:** `RegisterNatives`, `FindClass`, `CallVoidMethod`, `GetMethodID`, etc. |
-| Linux | **OpenSSL:** EVP_* and friends  **Syscall-level:** `mmap`, `mprotect`, `write`, `open`, `ioctl`, etc. (from `REC_SVC` where present) |
+| Android | **BoringSSL:** same EVP/SSL surface as above, plus `RAND_bytes`  **SQLite:** `sqlite3_open`/`sqlite3_exec`/`sqlite3_close` etc.  **liblog:** `__android_log_print`, `__android_log_write`  **JNI:** the full `JNINativeInterface_` vtable is read at capture time (`RegisterNatives`, `FindClass`, `GetMethodID`, `CallVoidMethod`, `GetStringUTFChars`, … — 112 function pointers), so calls through the JNIEnv vtable are classified too |
+| Linux | **OpenSSL:** EVP_* and friends  **Syscall-level:** `mmap`, `mprotect`, `write`, `open`, `ioctl`, `socket`, `getrandom`, etc. (from `REC_SVC` where present; inline `svc` instructions get names from the Linux syscall table) |
 | Unknown | Heuristic — tries both iOS and Android tables; quality depends on which modules appear in the trace |
 
 ```bash

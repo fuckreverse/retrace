@@ -34,6 +34,10 @@ Common controls include:
 
 The exact key legend is displayed in the active build; use it when a terminal or version remaps a key.
 
+## Thread panel (multi-thread traces)
+
+For traces recorded with multiple threads, the Thread panel lists every thread with its instruction count. `Enter` toggles a thread's selection; the instruction view filters to the selected set through the `thread_filter` pass. The XThread panel shows cross-thread dataflow — shared-memory handoffs between a writer thread and a reader thread, aggregated per address.
+
 ## Analysis Results
 
 Press `A` to open a two-level browser:

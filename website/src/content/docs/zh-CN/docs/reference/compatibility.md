@@ -104,6 +104,6 @@ Sampling Trace（设置了 `REG_DIFF`、`HAS_MEM` 或 `HAS_NZCV` 采样标志）
 
 Tenet 可打开并索引 Sampling Trace；分析 Pass 会报告可用的证据类别并相应限制结果。
 
-## 单线程假设
+## 多线程 Trace
 
-Tenet 当前假设单线程 Trace。`THREAD` 记录会被解析但不分割时间轴。多线程 Trace 打开时会有警告；分析应用于交错指令流。如需隔离单线程指令，可使用 `thread_filter`。
+多线程 trace 已完整支持。`THREAD` 记录按线程分割交错的指令流：`TraceIndex` 为每个 anchor 标注写者线程并维护线程 chunk 表。`thread` / `thread_filter` / `cross_thread_dataflow` pass 基于这些标注工作——线程内分析（如调用栈）以线程隔离 cursor 重建，线程之间不会串扰。`--run-pass thread` 输出线程概要，`--thread-filter <tid>[,<tid>...]` 将指令视图限制到指定线程，`--cross-thread-dataflow` 追踪经共享内存在线程间交接的数据。

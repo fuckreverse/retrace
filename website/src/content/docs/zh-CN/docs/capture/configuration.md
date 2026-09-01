@@ -35,6 +35,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 |------|--------|------|
 | `--host` | `127.0.0.1:27042` | Frida 远程设备地址 |
 | `--usb` | off | 使用 USB 连接 |
+| `--device-id` | (第一个 USB 设备) | 显式指定 Frida 设备 id（如 Android 序列号）。**多台 USB 设备并存时必填**——否则默认取第一个，可能选错手机 |
 | `--android` | off | 使用 Android 默认路径；dylib 切换为 `/data/local/tmp/libqbditrace.so` |
 
 ## 目标参数
@@ -134,11 +135,33 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--trace-mode` | `once` | `once` / `multi`（无限）/ 正整数 N |
 | `--no-rehook` | off | 多次模式下不重装 hook |
 
+## 多线程参数（Android）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--trace-threads` | off | 拦截 `pthread_create`，录制 start routine 位于被追踪模块内的子线程。每个子线程经 `qbditrace_run_thread()` 在自己的 QBDI VM 中执行，记录进同一 trace 文件，以 `THREAD` 标记区分 |
+| `--threads-no-filter` | off | 不限 start routine 是否在目标模块内，trace 所有子线程 |
+| `--threads-max` | 0 (无限) | 最大捕获的子线程数 |
+
+## Java 入口（Android）
+
+`--java-entry fully.qualified.Class.method` 以 Java 方法作为 trace 触发器，替代 hook native 入口。agent 通过 `Java.perform` hook 该 Java 方法；App 调用时自动物化参数并在 VM 内调用 native 入口。Java `int`/`long` 转立即数，`String` 转 UTF-8 缓冲，其余对象以 jobject handle 传递。需要 `--android`；与 `--invoke` 互斥。
+
+```bash
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --android \
+    --module libnative.so \
+    --entry 0x1234 \
+    --java-entry com.example.NativeBridge.doWork \
+    --output /data/local/tmp/trace.bin
+```
+
 ## GCD 参数（iOS）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--trace-gcd` | off | hook GCD dispatcher，在提交点同步额外执行发现的 block invoke 指针（每个独立 trace 文件）。非真正多线程 trace |
+| `--trace-gcd` | off | hook GCD dispatcher，在提交点同步额外执行发现的 block invoke 指针（每个独立 trace 文件）。非真正多线程 trace——Android 上请用 `--trace-threads` 获得真多线程捕获 |
 | `--gcd-no-filter` | off | 不限 invoke 是否在目标模块内，trace 所有 block |
 | `--gcd-max` | 0 (无限) | 最大额外执行/捕获的 block 数 |
 
@@ -181,5 +204,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 - **Trace 被 Tenet 拒绝：** 检查 magic number 是否有效、格式版本与布局 flags 是否受支持且一致（包括版本低于 v4），以及文件是否损坏或记录不完整。
 - **缺少寄存器差值（`REG_DIFF`）：** Trace 仍可正常打开和索引，但寄存器查询、污点传播等依赖寄存器状态的分析会降级或不可用。
 - **缺少内嵌代码表（`HAS_CODE`）：** Trace 仍可正常打开；CFG、模式识别等依赖反汇编的分析需要通过 `--image` 提供外部镜像。
-- **异步工作缺失：** 单独捕获 worker 入口，或改为同步路径。
-- **目标附近崩溃：** 使用 `qbditrace_dump_pcring` 导出最近 2048 个 PC。
+- **异步工作缺失：** 单独捕获 worker 入口、改为同步路径，或使用 `--trace-threads`（Android）/ `--trace-gcd`（iOS）。
+- **Android App 无法写输出：** App 不能在 `/data/local/tmp` 下创建文件（目录 DAC 拒绝 app uid）。改写到 App 数据目录（`/data/data/<package>/…`）并用 `su` 拉取。同理 App 不能 `dlopen` `/data/local/tmp` 的 `.so`——native 库需打包进 APK。
+- **连接多台手机：** 传 `--device-id` 显式指定序列号，否则 loader 可能选错 USB 设备。
+- **目标附近崩溃：** agent 会自动把最近 2048 条 PC 环 dump 到 `<output>.pcring`，并刷盘崩溃前已录制的指令——部分 trace 仍可分析。也可手动调用 `qbditrace_dump_pcring`。

@@ -16,7 +16,7 @@ The interface is organized into `SidebarLeft`, `CenterArea`, and `SidebarRight`,
 |---|---|---|
 | Left sidebar | Functions, Strings | Filtering and sorting for discovered functions, plus string-analysis results |
 | Center top | Instructions, CFG, Strings, Reg Timeline, Dataflow | The searchable instruction timeline, control-flow graph, strings, register timeline, and dataflow graph |
-| Center bottom | Analysis, Call Stack, and analysis-result tabs | The pass controller, current call stack, and views for Patterns, Algorithms, Constants, Loops, API Intercepts, ObjC, Call Graph, taint, memory search, Entropy, YARA, Trace Fold/Diff, Snapshots, DWARF, VM Workspace, Cache, Log, Settings, and more |
+| Center bottom | Analysis, Call Stack, and analysis-result tabs | The pass controller, current call stack, and views for Patterns, Algorithms, Constants, Loops, API Intercepts, ObjC, Call Graph, taint, memory search, Entropy, YARA, Trace Fold/Diff, Snapshots, Threads / XThread Data (multi-thread), DWARF, VM Workspace, Cache, Log, Settings, and more |
 | Right sidebar | Registers, Hex Dump, Mem Access | GPR/NZCV state before the current instruction, an addressable hexadecimal memory view, and memory reads/writes recorded for the current instruction |
 
 The navigation position is shared through the frontend store. Selecting an instruction, call frame, or analysis result with an instruction location updates related panels around the same `inst_id`. The toolbar, timeline, and Navigate menu also provide back/forward history, first/last jumps, Go to, search, and bookmarks.
@@ -36,6 +36,8 @@ The navigation position is shared through the frontend store. Selecting an instr
 A running pass shows its phase message and percentage progress. Passes that are not running can be started or rerun with the play/rerun control; completed entries display the rerun control. **Clear All** clears analysis state and results. The current panel has no per-task cancel action, so progress reporting should not be interpreted as cancellation support.
 
 Parameterized or specialized features live in their corresponding tabs, including Memory Search, YARA, Entropy, Register Timeline, Dataflow, Backward Taint, Trace Fold, Trace Diff, and VM Workspace. Results such as Patterns, Constants, Loops, Algorithms, ObjC, ObjC×Crypto, API Intercepts, and Call Graph are also shown as tabbed panels rather than separate pop-up windows by default. At present, only **VM Workspace** is explicitly exposed through an “Open in New Window” menu item.
+
+For multi-thread traces, the **Threads** tab lists every thread with its instruction count and switch events — selecting threads filters the instruction view through the `thread_filter` pass. The **XThread Data** tab shows cross-thread dataflow: shared-memory handoffs between a writer thread and a reader thread, aggregated per address into channels with producer→consumer statistics.
 
 ## Context actions
 

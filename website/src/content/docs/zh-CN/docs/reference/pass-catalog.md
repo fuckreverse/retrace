@@ -64,12 +64,13 @@ Tenet 中的每项分析都是一个 Pass。本页列出目录中全部 Pass，�
 | `trace_diff` | `--trace-diff` | 否 | 比较两个 Trace 区域的差异 |
 | `dataflow_graph` | `--dataflow-graph` | 否 | 区域的寄存器级数据流图 |
 
-## Misc
+## 多线程
 
 | Pass | CLI 标志 | 默认 | 摘要 |
 |---|---|---|---|
-| `thread` | `--run-pass thread` | 是 | 线程时间线/切换 |
-| `thread_filter` | `--run-pass thread_filter` | 否 | 每线程指令位图用于过滤 |
+| `thread` | `--run-pass thread` | 是 | 多线程 trace 的线程时间线/切换统计 |
+| `thread_filter` | `--thread-filter [tid,…]` | 否 | 每线程指令位图；将指令视图限制到指定 tid（可重配——每次新选择会重新注册 pass） |
+| `cross_thread_dataflow` | `--cross-thread-dataflow` | 否 | 共享内存跨线程交接：writer→reader 边按地址聚合为 channel，附 producer→consumer 统计 |
 
 ## 依赖图
 

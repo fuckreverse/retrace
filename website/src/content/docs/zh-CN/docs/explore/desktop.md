@@ -16,7 +16,7 @@ Desktop 当前支持 macOS 和 Linux。Windows 版后端默认关闭 `TENET_ENAB
 |---|---|---|
 | 左侧栏 | Functions、Strings | 已发现函数的过滤与排序，以及字符串分析结果 |
 | 中央上部 | Instructions、CFG、Strings、Reg Timeline、Dataflow | 指令时间线与搜索、控制流图、字符串、寄存器时间线和数据流图 |
-| 中央下部 | Analysis、Call Stack 及分析结果标签页 | Pass 控制台、当前调用栈，以及 Patterns、Algorithms、Constants、Loops、API Intercepts、ObjC、Call Graph、污点、内存搜索、Entropy、YARA、Trace Fold/Diff、Snapshots、DWARF、VM Workspace、Cache、Log 和 Settings 等视图 |
+| 中央下部 | Analysis、Call Stack 及分析结果标签页 | Pass 控制台、当前调用栈，以及 Patterns、Algorithms、Constants、Loops、API Intercepts、ObjC、Call Graph、污点、内存搜索、Entropy、YARA、Trace Fold/Diff、Snapshots、Threads / XThread Data（多线程）、DWARF、VM Workspace、Cache、Log 和 Settings 等视图 |
 | 右侧栏 | Registers、Hex Dump、Mem Access | 当前指令执行前的 GPR/NZCV、可定位的十六进制内存视图，以及当前指令记录的内存读写 |
 
 导航位置由前端 store 共享。选择指令、调用栈帧或带指令位置的分析结果时，相关面板会围绕同一个 `inst_id` 更新。工具栏、时间线和 Navigate 菜单还提供前进/后退、首尾跳转、Go to、搜索与书签。
@@ -36,6 +36,8 @@ Desktop 当前支持 macOS 和 Linux。Windows 版后端默认关闭 `TENET_ENAB
 运行中的 Pass 会显示阶段消息和百分比进度。未运行或已结束的 Pass 可通过播放/重跑按钮执行；已完成项显示重跑按钮。**Clear All** 会清除分析状态与结果。当前面板没有单任务取消操作，因此不要把进度显示理解为可取消任务。
 
 需要参数或专门展示的能力位于对应标签页，例如 Memory Search、YARA、Entropy、Register Timeline、Dataflow、Backward Taint、Trace Fold、Trace Diff 和 VM Workspace。Patterns、Constants、Loops、Algorithms、ObjC、ObjC×Crypto、API Intercepts、Call Graph 等结果也在标签页面板中展示，而不是默认作为独立弹出窗口。当前只有菜单中的 **VM Workspace** 明确提供 “Open in New Window”。
+
+多线程 trace 中，**Threads** 标签页列出每个线程的指令数与切换事件——选中线程后指令视图经 `thread_filter` pass 过滤。**XThread Data** 标签页展示跨线程数据流：写者线程与读者线程之间经共享内存的交接，按地址聚合为 channel 并附 producer→consumer 统计。
 
 ## 上下文操作
 

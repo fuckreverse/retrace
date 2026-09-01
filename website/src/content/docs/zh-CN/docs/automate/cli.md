@@ -56,6 +56,21 @@ CLI 运行分析、导出数据和生成报告，无需交互会话。所有批�
 
 当便利标志不映射到所需 Pass 集时，使用 `--run-pass` 进行精细控制。
 
+## 多线程分析
+
+```bash
+# 线程概要与切换事件
+./tenet trace.bin --run-pass thread
+
+# 只看指定线程的指令（逗号分隔多个 tid）
+./tenet trace.bin --thread-filter 4711,4712
+
+# 共享内存跨线程交接（writer → reader 边）
+./tenet trace.bin --cross-thread-dataflow
+```
+
+`--thread-filter` 构建每线程指令 bitmap；省略 tid 列表则先构建全部线程 bitmap，之后再过滤。`--cross-thread-dataflow` 扫描内存写历史，报告每对「线程 A 写地址 X → 线程 B 读地址 X（中间无其它写）」，按地址聚合成 channel 并给出 producer→consumer 统计。
+
 ## 排除区间
 
 ```bash

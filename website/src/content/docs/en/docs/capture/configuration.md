@@ -35,6 +35,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 |------|---------|-------------|
 | `--host` | `127.0.0.1:27042` | Frida remote device address |
 | `--usb` | off | Use USB connection instead of remote |
+| `--device-id` | (first USB device) | Explicit Frida device id (e.g. an Android serial). **Required when several USB devices are attached** — otherwise the first one wins, which may be the wrong phone |
 | `--android` | off | Use Android default paths; dylib switches to `/data/local/tmp/libqbditrace.so` |
 
 ## Target options
@@ -134,11 +135,33 @@ python3 tools/qbditrace/qbditrace_runner.py \
 | `--trace-mode` | `once` | `once` / `multi` (unlimited) / positive integer N |
 | `--no-rehook` | off | Do not reinstall hook in multi-trace mode |
 
+## Multi-thread options (Android)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--trace-threads` | off | Intercept `pthread_create` and record child threads whose start routine is inside the traced module. Each child runs inside its own QBDI VM via `qbditrace_run_thread()` and records into the same trace file, separated by `THREAD` markers |
+| `--threads-no-filter` | off | Trace child threads regardless of whether the start routine is inside the target module |
+| `--threads-max` | 0 (unlimited) | Maximum number of child threads to capture |
+
+## Java entry (Android)
+
+`--java-entry fully.qualified.Class.method` uses a Java method as the trace trigger instead of hooking a native entry. The agent hooks the Java method (via `Java.perform`); when the app calls it, the arguments are materialized and the native entry is invoked inside the VM. Java `int`/`long` become immediates, `String` becomes a UTF-8 buffer, and other objects are passed as jobject handles. Requires `--android`; mutually exclusive with `--invoke`.
+
+```bash
+python3 tools/qbditrace/qbditrace_runner.py \
+    --target com.example.app \
+    --android \
+    --module libnative.so \
+    --entry 0x1234 \
+    --java-entry com.example.NativeBridge.doWork \
+    --output /data/local/tmp/trace.bin
+```
+
 ## GCD options (iOS)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--trace-gcd` | off | Hook GCD dispatcher and synchronously re-invoke discovered block invoke pointers (each in its own trace file). Not a true multi-thread trace |
+| `--trace-gcd` | off | Hook GCD dispatcher and synchronously re-invoke discovered block invoke pointers (each in its own trace file). Not a true multi-thread trace — prefer `--trace-threads` on Android for real multi-thread capture |
 | `--gcd-no-filter` | off | Trace all blocks regardless of whether invoke is inside the target module |
 | `--gcd-max` | 0 (unlimited) | Maximum number of extra block executions to capture |
 
@@ -181,5 +204,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 - **Trace rejected by Tenet:** check for a valid magic number, a supported format version with consistent layout flags (including rejecting versions older than v4), and a non-corrupt file with complete records.
 - **Missing register diffs (`REG_DIFF`):** the trace still opens and indexes normally, but register queries, taint propagation, and other analyses that depend on register state are degraded or unavailable.
 - **Missing embedded code table (`HAS_CODE`):** the trace still opens; disassembly-dependent analyses such as CFG and pattern recognition require an external image supplied with `--image`.
-- **Missing asynchronous work:** capture the worker entry separately or make the target path synchronous.
-- **Crash near the target:** export the 2048-entry PC ring with `qbditrace_dump_pcring` and inspect the last executed addresses.
+- **Missing asynchronous work:** capture the worker entry separately, make the target path synchronous, or use `--trace-threads` (Android) / `--trace-gcd` (iOS).
+- **Android app cannot write the output:** apps cannot create files under `/data/local/tmp` (directory DAC denies the app uid). Write into the app data directory instead (`/data/data/<package>/…`) and pull with `su`. Likewise, an app cannot `dlopen` a `.so` from `/data/local/tmp` — bundle native libs inside the APK.
+- **Several phones attached:** pass `--device-id` with the explicit serial; otherwise the loader may pick the wrong USB device.
+- **Crash near the target:** the agent dumps the 2048-entry PC ring to `<output>.pcring` and flushes the instructions recorded before the fault, so the partial trace is still analyzable. `qbditrace_dump_pcring` can also be invoked manually.

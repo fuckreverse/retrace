@@ -104,6 +104,6 @@ Sampling traces (where `REG_DIFF`, `HAS_MEM` or `HAS_NZCV` sampling flags are se
 
 Tenet opens and indexes sampling traces; analysis passes report which evidence categories are available and limit their results accordingly.
 
-## Single-thread assumption
+## Multi-thread traces
 
-Tenet currently assumes single-thread traces. `THREAD` records are parsed but do not partition the timeline. Multi-thread traces open with a warning; analysis applies to the interleaved instruction stream. Use `thread_filter` to isolate a single thread's instructions if needed.
+Multi-thread traces are fully supported. `THREAD` records partition the interleaved instruction stream per thread: `TraceIndex` tags every anchor with its writer thread and maintains a per-thread chunk table. The `thread` / `thread_filter` / `cross_thread_dataflow` passes build on these annotations — thread-local analyses (e.g. call stacks) are reconstructed with per-thread isolated cursors, so threads never bleed into each other. Use `--run-pass thread` for a thread summary, `--thread-filter <tid>[,<tid>...]` to restrict the instruction view to specific threads, and `--cross-thread-dataflow` to trace handoffs between threads through shared memory.

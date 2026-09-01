@@ -64,12 +64,13 @@ Every analysis in Tenet is a pass. This page lists all passes in the catalog, gr
 | `trace_diff` | `--trace-diff` | No | Compare two trace regions for divergence |
 | `dataflow_graph` | `--dataflow-graph` | No | Register-level data-flow graph for a region |
 
-## Misc
+## Multi-thread
 
 | Pass | CLI flag | Default | Summary |
 |---|---|---|---|
-| `thread` | `--run-pass thread` | Yes | Thread timeline / switching |
-| `thread_filter` | `--run-pass thread_filter` | No | Per-thread instruction bitmaps for filtering |
+| `thread` | `--run-pass thread` | Yes | Thread timeline / switching statistics for multi-thread traces |
+| `thread_filter` | `--thread-filter [tid,…]` | No | Per-thread instruction bitmaps; restricts the instruction view to the given tids (re-configurable — the pass is re-registered on each new selection) |
+| `cross_thread_dataflow` | `--cross-thread-dataflow` | No | Shared-memory handoffs between threads: writer→reader edges aggregated into channels with producer→consumer statistics |
 
 ## Dependency graph
 

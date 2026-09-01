@@ -91,8 +91,8 @@ Darwin SVC 的 `x16` 为负数时，`syscall_intercept` 使用 Mach trap 表而�
 | 平台 | 分类的 API |
 |---|---|
 | Darwin (iOS) | **CommonCrypto：** `CCCrypt`、`CCCryptorCreate`、`CCCryptorCreateWithMode`、`CCHmac`、摘要/PBKDF 系列  **Security.framework：** `SecKeyCreateSignature`、`SecKeyRawSign`、`SecKeyRawVerify`、`SecKeyEncrypt`、`SecKeyDecrypt`、`SecKeyCreateWithData`  **BoringSSL / OpenSSL：** EVP cipher 与 digest 系列 |
-| Android | **BoringSSL：** 同上 EVP/SSL 接口  **JNI：** `RegisterNatives`、`FindClass`、`CallVoidMethod`、`GetMethodID` 等 |
-| Linux | **OpenSSL：** EVP_* 系列  **系统调用：** `mmap`、`mprotect`、`write`、`open`、`ioctl` 等（需要 `REC_SVC` 记录） |
+| Android | **BoringSSL：** 同上 EVP/SSL 接口，另含 `RAND_bytes`  **SQLite：** `sqlite3_open`/`sqlite3_exec`/`sqlite3_close` 等  **liblog：** `__android_log_print`、`__android_log_write`  **JNI：** 录制时读取完整 `JNINativeInterface_` vtable（`RegisterNatives`、`FindClass`、`GetMethodID`、`CallVoidMethod`、`GetStringUTFChars`……共 112 个函数指针），经 JNIEnv vtable 的调用同样可分类 |
+| Linux | **OpenSSL：** EVP_* 系列  **系统调用：** `mmap`、`mprotect`、`write`、`open`、`ioctl`、`socket`、`getrandom` 等（需要 `REC_SVC` 记录；内联 `svc` 指令按 Linux syscall 名字表命名） |
 | Unknown | 启发式 —— 同时尝试 iOS 与 Android 表；质量取决于 Trace 中出现的模块 |
 
 ```bash

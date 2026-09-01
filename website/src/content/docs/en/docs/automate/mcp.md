@@ -198,6 +198,14 @@ Tool schemas are the authoritative parameter reference. Clients should use MCP `
 | `call_graph` | Export the dynamic call graph as JSON or DOT |
 | `dataflow_graph` | Export data flow for a bounded instruction range |
 
+### Multi-thread
+
+| Tool | Purpose |
+|---|---|
+| `threads` | Thread summary and switch events for multi-thread traces |
+| `thread_filter` | Restrict the instruction view to a set of thread ids (rebuilds the pass with the new selection) |
+| `cross_thread_dataflow` | Shared-memory handoffs between threads: writer→reader edges, aggregated into channels with producer→consumer statistics (paginated via `edge_offset`/`edge_limit`/`channel_limit`) |
+
 ### Structure, patterns, and platform semantics
 
 | Tool | Purpose |
