@@ -25,7 +25,9 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <numeric>
 #include <sstream>
+#include <unordered_map>
 
 namespace tenet {
 
@@ -68,7 +70,7 @@ namespace tenet {
 //      walk in offset_of_with_pc() — the seed_pc is read directly from the
 //      sparse index instead of being reconstructed by linear-scanning pc_delta
 //      from the nearest anchor.  Caches built with schema ≤v11 are invalid.
-static constexpr uint32_t INDEX_SCHEMA_VERSION = 12;
+static constexpr uint32_t INDEX_SCHEMA_VERSION = 13;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -272,6 +274,9 @@ TraceIndex::TraceIndex(TraceIndex&& other) noexcept
       stats_(other.stats_),
       db_path_(std::move(other.db_path_)),
       anchors_(std::move(other.anchors_)),
+      anchor_threads_(std::move(other.anchor_threads_)),
+      anchors_have_threads_(other.anchors_have_threads_),
+      thread_chunks_(std::move(other.thread_chunks_)),
       sparse_interval_(other.sparse_interval_) {
     other.cf_handles_.clear();
 }
@@ -286,6 +291,9 @@ TraceIndex& TraceIndex::operator=(TraceIndex&& other) noexcept {
         stats_ = other.stats_;
         db_path_ = std::move(other.db_path_);
         anchors_ = std::move(other.anchors_);
+        anchor_threads_ = std::move(other.anchor_threads_);
+        anchors_have_threads_ = other.anchors_have_threads_;
+        thread_chunks_ = std::move(other.thread_chunks_);
         sparse_interval_ = other.sparse_interval_;
         other.cf_handles_.clear();
     }
@@ -621,18 +629,42 @@ Result<TraceIndex> TraceIndex::open_or_build(
                 for (it->SeekToFirst(); it->Valid(); it->Next()) {
                     AnchorEntry entry;
                     entry.inst_id = decode_u64(it->key());
+                    // v13: 16-byte value = (file_offset, thread_id).
+                    // Defensive: a legacy 8-byte value (shouldn't survive the
+                    // schema bump, but just in case) decodes as thread 0.
                     std::memcpy(&entry.file_offset, it->value().data(),
                                std::min(it->value().size(), size_t(8)));
                     idx.anchors_.push_back(entry);
+                    uint64_t tid = 0;
+                    if (it->value().size() >= 16) {
+                        std::memcpy(&tid, it->value().data() + 8, 8);
+                        idx.anchors_have_threads_ = true;
+                    }
+                    idx.anchor_threads_.push_back(tid);
                 }
                 std::sort(idx.anchors_.begin(), idx.anchors_.end(),
                           [](const auto& a, const auto& b) {
                               return a.inst_id < b.inst_id;
                           });
+                // anchor_threads_ was collected in (anchor-key → inst_id) order,
+                // which is already ascending by inst_id; the anchors_ sort above
+                // is a no-op safety net for the same ordering.
                 // Derive anchor_count from the loaded vector so the stat is
                 // always consistent with the in-memory table (and the display
                 // shows the real count instead of 0 when loading from cache).
                 idx.stats_.anchor_count = idx.anchors_.size();
+
+                // Load thread chunk table (multi-thread traces).
+                {
+                    std::string tc_val;
+                    if (idx.db_->Get(rocksdb::ReadOptions(), meta_cf,
+                                     "thread_chunks", &tc_val).ok() &&
+                        tc_val.size() % 16 == 0) {
+                        const size_t n = tc_val.size() / 16;
+                        idx.thread_chunks_.resize(n);
+                        std::memcpy(idx.thread_chunks_.data(), tc_val.data(), tc_val.size());
+                    }
+                }
 
                 LOG_INFO_M(::tenet::log::Module::Io, "Index cache hit: {} instructions, {} anchors",
                          idx.stats_.inst_count, idx.stats_.anchor_count);
@@ -854,6 +886,7 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
         uint64_t file_start;  // inclusive
         uint64_t file_end;    // exclusive
         uint64_t inst_id_start;
+        uint64_t thread_id_start = 0;  // owning thread at file_start (v13)
     };
 
     std::vector<ShardBoundary> shard_bounds;
@@ -867,6 +900,15 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
         };
         std::vector<RawAnchor> raw_anchors;
         raw_anchors.reserve(4096);
+        // Thread attribution for each raw anchor (parallel vector).
+        // THREAD records encountered during the scan reassign cur_thread;
+        // every anchor stamped after that belongs to it.
+        std::vector<uint64_t> raw_anchor_threads;
+        uint64_t cur_thread = 0;
+        bool saw_thread_record = false;
+        // Thread chunk table: (first inst_id of chunk, thread_id), ascending.
+        // One entry per THREAD marker; persisted in the META CF.
+        std::vector<std::pair<uint64_t, uint64_t>> raw_thread_chunks;
 
         uint64_t scan_id = 0;
         const uint64_t hdr_sz = sizeof(qbditrace::qbditrace_file_header_t);
@@ -924,9 +966,17 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
                     rec_size = anchor_rec_sz;
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
                     raw_anchors.push_back({scan_id, base_file_offset + pos, ah->pc});
+                    raw_anchor_threads.push_back(cur_thread);
                     break;
                 }
-                case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
+                case RecordKind::Thread: {
+                    rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
+                    const auto* th = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr);
+                    cur_thread = th->thread_id;
+                    saw_thread_record = true;
+                    raw_thread_chunks.push_back({scan_id, cur_thread});
+                    break;
+                }
                 case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
                 case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
                 case RecordKind::Objc:   rec_size = raw_record_size(ptr, reader.header()); break;
@@ -1062,9 +1112,17 @@ const bool     is_v8       = (reader.header().flags & qbditrace::QBDITRACE_HF_WI
                     rec_size = anchor_rec_sz;
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
                     raw_anchors.push_back({scan_id, scan_offset, ah->pc});
+                    raw_anchor_threads.push_back(cur_thread);
                     break;
                 }
-                case RecordKind::Thread: rec_size = sizeof(qbditrace::qbditrace_thread_head_t); break;
+                case RecordKind::Thread: {
+                    rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
+                    const auto* th = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr);
+                    cur_thread = th->thread_id;
+                    saw_thread_record = true;
+                    raw_thread_chunks.push_back({scan_id, cur_thread});
+                    break;
+                }
                 case RecordKind::Event:  rec_size = sizeof(qbditrace::qbditrace_event_head_t);  break;
                 case RecordKind::Svc:    rec_size = sizeof(qbditrace::qbditrace_svc_head_t);    break;
                 case RecordKind::Objc:   rec_size = raw_record_size(ptr, reader.header()); break;
@@ -1142,7 +1200,10 @@ case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + p
         for (const auto& a : raw_anchors) {
             idx.anchors_.push_back({a.inst_id, a.file_offset});
         }
-        // anchors_ will be sorted after build
+        idx.anchors_have_threads_ = saw_thread_record;
+        // NOTE: raw_anchor_threads / raw_thread_chunks are moved into idx AFTER
+        // the shard-bounds computation below — the shard loop reads
+        // raw_anchor_threads[anchor_idx], which would be empty after the move.
 
         // P1.6 fix: recompute sparse_interval_ from the EXACT inst_count
         // obtained by Phase 0 scanning. The initial adaptive_interval was
@@ -1167,7 +1228,7 @@ case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + p
 
         const uint64_t records_start = sizeof(qbditrace::qbditrace_file_header_t);
         if (num_shards == 1 || raw_anchors.empty()) {
-            shard_bounds.push_back({records_start, file_size, 0});
+            shard_bounds.push_back({records_start, file_size, 0, 0});
         } else {
             // Distribute anchors roughly evenly, always starting each shard at
             // an ANCHOR boundary so the shard's first record is a full snapshot.
@@ -1182,9 +1243,15 @@ case RecordKind::Code:   rec_size = sizeof(qbditrace::qbditrace_code_head_t) + p
                     ? raw_anchors[(s + 1) * anchors_per_shard].file_offset
                     : file_size;
                 uint64_t id_start = (s == 0) ? 0 : raw_anchors[anchor_idx].inst_id;
-                shard_bounds.push_back({fstart, fend, id_start});
+                uint64_t tid_start = (s == 0) ? 0 : raw_anchor_threads[anchor_idx];
+                shard_bounds.push_back({fstart, fend, id_start, tid_start});
             }
         }
+
+        // Move thread metadata into the index now that the shard loop above no
+        // longer needs the local vectors (raw_anchors itself is never moved).
+        idx.anchor_threads_ = std::move(raw_anchor_threads);
+        idx.thread_chunks_ = std::move(raw_thread_chunks);
     }
 
     // ── Phase 1: Parallel shard processing (SST bulk-load) ──────────────
@@ -1385,15 +1452,20 @@ struct ShardResult {
         };
         std::vector<CodeEntry> code_entries;
 
-        // v5 seed_pc tracking: accumulate pc_delta across INST records,
-        // reset from ANCHOR records.  Stored alongside file_offset in the
-        // OFFSET CF so offset_of_with_pc() can skip the ANCHOR walk.
-        uint64_t running_pc = 0;
+        // v5 seed_pc tracking: each producer thread has an independent
+        // pc_delta chain. THREAD records switch the active accumulator;
+        // ANCHOR records reset that thread's chain. Stored alongside each
+        // sparse file offset so offset_of_with_pc() avoids an anchor walk.
+        std::unordered_map<uint64_t, uint64_t> running_pcs;
+        running_pcs.emplace(0, 0);
 
         uint64_t scan_offset = bounds.file_start;
         const uint64_t scan_end = bounds.file_end;
 
         uint64_t inst_id = bounds.inst_id_start;
+        // Producer thread currently owning the records being scanned (v13:
+        // updated at THREAD records; used to annotate ANCHOR CF values).
+        uint64_t cur_thread = bounds.thread_id_start;
 
         // SST rotation threshold: ~500K entries per SST file.
         constexpr uint64_t SST_ROTATE_THRESHOLD = 500000;
@@ -1416,11 +1488,12 @@ struct ShardResult {
                     + n_fprdiff_val * sizeof(qbditrace::qbditrace_fprdiff_t)
                     + ptr[3] * memacc_sz;
                 if (remaining < rec_size) return 0;
-                // v5: accumulate pc_delta so running_pc holds this inst's absolute PC
+                // v5: accumulate this producer's pc_delta chain so the
+                // sparse entry holds this INST's resolved absolute PC.
                 if (is_v5) {
                     int16_t delta;
                     std::memcpy(&delta, ptr + 4, 2);
-                    running_pc += static_cast<int64_t>(delta);
+                    running_pcs[cur_thread] += static_cast<int64_t>(delta);
                 }
                 // P1.6: Sparse offset with adaptive interval
                 if (inst_id % idx.sparse_interval_ == 0) {
@@ -1430,7 +1503,7 @@ struct ShardResult {
                     // For v5 traces seed_pc is the running PC; for others it's 0.
                     char val_buf[16];
                     std::memcpy(val_buf, &rec_offset, 8);
-                    uint64_t seed = is_v5 ? running_pc : 0;
+                    uint64_t seed = is_v5 ? running_pcs[cur_thread] : 0;
                     std::memcpy(val_buf + 8, &seed, 8);
                     auto s = offset_w.add(
                         rocksdb::Slice(key_buf, 8),
@@ -1465,16 +1538,22 @@ struct ShardResult {
                 size_t anchor_fpr = is_v7 ? QBDITRACE_AARCH64_FPR_SNAPSHOT_BYTES : 0;
                 rec_size = sizeof(qbditrace::qbditrace_anchor_head_t) + num_gpr * 8 + anchor_fpr;
                 if (remaining < rec_size) return 0;
-                // v5: reset running_pc from the anchor's absolute PC
+                // v5: reset this producer's pc chain from the anchor's
+                // absolute PC (ANCHOR re-anchors a single thread's chain).
                 if (is_v5) {
                     const auto* ah = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
-                    running_pc = ah->pc;
+                    running_pcs[cur_thread] = ah->pc;
                 }
                 char anchor_key_buf[8];
                 encode_u64_to(inst_id, anchor_key_buf);
+                // v13: 16-byte value = (file_offset, owning_thread_id).
+                // Legacy 8-byte caches are rejected by the schema bump.
+                char anchor_val_buf[16];
+                std::memcpy(anchor_val_buf, &rec_offset, 8);
+                std::memcpy(anchor_val_buf + 8, &cur_thread, 8);
                 auto s = anchor_w.add(
                     rocksdb::Slice(anchor_key_buf, 8),
-                    rocksdb::Slice(reinterpret_cast<const char*>(&rec_offset), 8));
+                    rocksdb::Slice(anchor_val_buf, 16));
                 if (!s.ok()) { result.error = s.ToString(); return 0; }
                 result.anchor_count++;
                 break;
@@ -1498,10 +1577,16 @@ struct ShardResult {
                 if (remaining < rec_size) return 0;
                 result.event_count++;
                 break;
-            case RecordKind::Thread:
+            case RecordKind::Thread: {
                 rec_size = sizeof(qbditrace::qbditrace_thread_head_t);
                 if (remaining < rec_size) return 0;
+                cur_thread = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr)->thread_id;
+                // Each producer keeps its own pc_delta chain; a fresh
+                // THREAD marker starts a chunk whose first ANCHOR (emitted
+                // immediately by the writer) re-anchors the chain.
+                running_pcs.try_emplace(cur_thread, 0);
                 break;
+            }
             case RecordKind::Svc:
                 rec_size = sizeof(qbditrace::qbditrace_svc_head_t);
                 if (remaining < rec_size) return 0;
@@ -1894,6 +1979,21 @@ struct ShardResult {
                    rocksdb::Slice(reinterpret_cast<const char*>(&idx.stats_.num_shards), 4));
     meta_batch.Put(meta_cf, "trace_hash",
                    rocksdb::Slice(reinterpret_cast<const char*>(&trace_hash), 8));
+    meta_batch.Put(meta_cf, "anchors_have_threads",
+                   rocksdb::Slice(reinterpret_cast<const char*>(&idx.anchors_have_threads_), 1));
+    // Thread chunk table (multi-thread traces): 16 bytes per THREAD marker —
+    // (first inst_id of chunk, thread_id), ascending. Consumed by
+    // thread_at() without re-scanning the trace.
+    if (!idx.thread_chunks_.empty()) {
+        std::string chunks_blob;
+        chunks_blob.reserve(idx.thread_chunks_.size() * 16);
+        for (const auto& [iid, tid] : idx.thread_chunks_) {
+            chunks_blob.append(reinterpret_cast<const char*>(&iid), 8);
+            chunks_blob.append(reinterpret_cast<const char*>(&tid), 8);
+        }
+        meta_batch.Put(meta_cf, "thread_chunks",
+                       rocksdb::Slice(chunks_blob.data(), chunks_blob.size()));
+    }
     {
         rocksdb::WriteOptions wo;
         wo.sync = true;  // Sync meta to disk: must survive crashes / OOM-kills.
@@ -1920,6 +2020,24 @@ struct ShardResult {
     std::sort(idx.anchors_.begin(), idx.anchors_.end(),
               [](const auto& a, const auto& b) { return a.inst_id < b.inst_id; });
 #endif
+    // Keep anchor_threads_ parallel to anchors_: pair them and sort together.
+    // Phase 0 produced both in file order (ascending inst_id), but dedup of
+    // anchors sharing an inst_id can only happen in the CF layer — the raw
+    // vectors here stay 1:1, so an index-permutation sort is sufficient.
+    if (idx.anchor_threads_.size() != idx.anchors_.size()) {
+        idx.anchor_threads_.assign(idx.anchors_.size(), 0);
+    } else {
+        std::vector<uint32_t> order(idx.anchors_.size());
+        std::iota(order.begin(), order.end(), 0u);
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return idx.anchors_[a].inst_id < idx.anchors_[b].inst_id;
+        });
+        std::vector<uint64_t> sorted_tids(order.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            sorted_tids[i] = idx.anchor_threads_[order[i]];
+        }
+        idx.anchor_threads_ = std::move(sorted_tids);
+    }
 
     reader.advise_random();
 
@@ -2108,6 +2226,69 @@ TraceIndex::AnchorInfo TraceIndex::nearest_anchor_before(uint64_t inst_id) const
     --it;  // Now points to the largest anchor <= inst_id
     auto idx = static_cast<uint64_t>(std::distance(anchors_.begin(), it));
     return {idx, it->file_offset, it->inst_id};
+}
+
+// ─── Query: nearest_thread_anchor_before ──────────────────────────────────
+
+TraceIndex::AnchorInfo TraceIndex::nearest_thread_anchor_before(
+    uint64_t inst_id, uint64_t thread_id) const {
+    // Single-thread traces (no THREAD records) or unmatched annotations fall
+    // back to the plain anchor lookup.
+    if (!anchors_have_threads_) {
+        return nearest_anchor_before(inst_id);
+    }
+
+    if (anchors_.empty() ||
+        anchor_threads_.size() != anchors_.size()) {
+        return {0, sizeof(qbditrace::qbditrace_file_header_t), 0};
+    }
+
+    // Binary search for the largest anchor inst_id <= inst_id, then walk back
+    // to the most recent anchor owned by thread_id. Anchors are spaced by
+    // anchor_interval instructions, so the walk back is bounded in practice
+    // (interleaved threads make each thread's anchors sparser, but the total
+    // anchor count is inst_count / interval).
+    AnchorEntry target{inst_id, 0};
+    auto it = std::upper_bound(anchors_.begin(), anchors_.end(), target,
+                               [](const AnchorEntry& a, const AnchorEntry& b) {
+                                   return a.inst_id < b.inst_id;
+                               });
+
+    while (it != anchors_.begin()) {
+        --it;
+        const auto i = static_cast<size_t>(std::distance(anchors_.begin(), it));
+        if (anchor_threads_[i] == thread_id) {
+            return {static_cast<uint64_t>(i), it->file_offset, it->inst_id};
+        }
+    }
+    // No anchor of this thread at or before inst_id.
+    return {0, sizeof(qbditrace::qbditrace_file_header_t), 0};
+}
+
+// ─── Query: thread_at / thread_ids ─────────────────────────────────────────
+
+uint64_t TraceIndex::thread_at(uint64_t inst_id) const {
+    if (thread_chunks_.empty()) return 0;
+    // Find the last chunk whose first inst_id <= inst_id. Chunks are
+    // ascending by inst_id; std::upper_bound finds the first chunk with
+    // first_id > inst_id, so the chunk before it (if any) owns inst_id.
+    auto it = std::upper_bound(
+        thread_chunks_.begin(), thread_chunks_.end(), inst_id,
+        [](uint64_t v, const std::pair<uint64_t, uint64_t>& chunk) {
+            return v < chunk.first;
+        });
+    if (it == thread_chunks_.begin()) return 0;  // before first THREAD marker
+    --it;
+    return it->second;
+}
+
+std::vector<uint64_t> TraceIndex::thread_ids() const {
+    std::vector<uint64_t> ids;
+    ids.reserve(thread_chunks_.size());
+    for (const auto& [iid, tid] : thread_chunks_) ids.push_back(tid);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
 }
 
 // ─── Query: find_last_writer_of ───────────────────────────────────────────
