@@ -39,6 +39,9 @@
 #include "analysis/passes/profile/window_stats_pass.h"
 #include "analysis/passes/memory/entropy_pass.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
+#include "analysis/passes/misc/thread_pass.h"
+#include "analysis/passes/misc/thread_filter_pass.h"
+#include "analysis/passes/misc/cross_thread_dataflow_pass.h"
 
 #include <fmt/core.h>
 
@@ -1648,6 +1651,233 @@ void TenetMcpService::register_pass_tools() {
             // Statistics
             output["total_native_instructions"] = result.total_native_instructions;
 
+            return output;
+        }
+    );
+
+    // ── threads ──────────────────────────────────────────────────────────
+    // Multi-thread trace surface: per-thread timeline from the thread pass.
+    register_tool(
+        {"threads",
+         "List all threads observed in the trace with per-thread execution "
+         "timelines: first/last seen inst_id, instruction counts, switch-in "
+         "counts, and contiguous execution spans. Also returns thread switch "
+         "events in temporal order.",
+         {{"type", "object"},
+          {"properties", {
+              {"spans_limit", {{"type", "integer"}, {"description", "Max spans returned (0 = span summaries only, no span list)"}, {"default", 0}}}
+          }}, {"required", json::array()}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "thread");
+            const auto& result = require_pass<ThreadResult>(pm_, "thread", "Thread pass failed");
+
+            json threads = json::array();
+            // Map thread_id -> inst count so spans can piggyback per-thread stats.
+            for (const auto& [tid, t] : result.threads) {
+                threads.push_back({
+                    {"thread_id",       tid},
+                    {"first_seen_inst", t.first_seen_inst},
+                    {"last_seen_inst",  t.last_seen_inst},
+                    {"instructions",    t.total_instructions},
+                    {"switch_in_count", t.switch_in_count}
+                });
+            }
+
+            json switches = json::array();
+            for (const auto& s : result.switch_events) {
+                switches.push_back({
+                    {"inst_id",   s.inst_id},
+                    {"thread_id", s.thread_id}
+                });
+            }
+
+            json output = {
+                {"total_threads",      result.thread_count()},
+                {"total_switches",     result.switch_count()},
+                {"threads",            std::move(threads)},
+                {"switch_events",      std::move(switches)}
+            };
+
+            // Optional span dump (bounded). Spans give the contiguous
+            // same-thread ranges; a filter UI typically only needs thread
+            // summaries + bitmaps (thread_filter tool), so default is 0.
+            size_t spans_limit = args.value("spans_limit", size_t(0));
+            if (spans_limit > 0) {
+                size_t n = std::min(spans_limit, result.spans.size());
+                json spans = json::array();
+                for (size_t i = 0; i < n; i++) {
+                    const auto& sp = result.spans[i];
+                    spans.push_back({
+                        {"thread_id",     sp.thread_id},
+                        {"start_inst_id", sp.start_inst_id},
+                        {"end_inst_id",   sp.end_inst_id},
+                        {"inst_count",    sp.inst_count}
+                    });
+                }
+                output["spans"] = std::move(spans);
+                output["spans_total"] = result.spans.size();
+                output["spans_returned"] = n;
+                output["spans_has_more"] = n < result.spans.size();
+            }
+            return output;
+        }
+    );
+
+    // ── thread_filter ────────────────────────────────────────────────────
+    // Per-thread instruction bitmaps. Returns compact run-length ranges
+    // per thread plus (optionally) the filtered bitmap for a thread set.
+    register_tool(
+        {"thread_filter",
+         "Get per-thread instruction-id sets for filtering the instruction "
+         "view to specific threads. Each thread returns its instruction "
+         "count and a run-length compressed list of [start, count) ranges "
+         "covering every inst_id that executed on that thread. Optionally "
+         "pass thread_ids to get the merged filtered view.",
+         {{"type", "object"},
+          {"properties", {
+              {"thread_ids", {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", "Thread IDs to include in the merged filtered range list (empty = no merged view)"}}}
+          }}, {"required", json::array()}}},
+        [this](const json& args) -> json {
+            std::vector<uint64_t> include_ids;
+            if (args.contains("thread_ids") && args.at("thread_ids").is_array()) {
+                for (const auto& v : args.at("thread_ids")) {
+                    if (v.is_number_unsigned()) include_ids.push_back(v.get<uint64_t>());
+                }
+            }
+
+            // Re-register so a second call with different thread_ids
+            // invalidates and re-runs the pass, then run synchronously.
+            // register_pass_by_name() is idempotent and would NOT apply the
+            // new ids — register directly; PassManager::register_pass()
+            // replaces NotRun entries.
+            pm_->invalidate("thread_filter");
+            ThreadFilterConfig tfc;
+            tfc.include_thread_ids = std::move(include_ids);
+            tfc.build_bitmaps = true;
+            pm_->register_pass(std::make_unique<ThreadFilterPass>(std::move(tfc)));
+            const auto& raw = pm_->require("thread_filter");
+            if (!raw.ok()) throw std::runtime_error("Thread filter pass failed");
+            const auto& result = raw.get<ThreadFilterResult>();
+
+            // Roaring64Map range iteration → run-length compression.
+            auto ranges_of = [](const roaring::Roaring64Map& bm) {
+                json ranges = json::array();
+                // Roaring64Map iteration is already in ascending order.
+                auto it = bm.begin();
+                const auto end_it = bm.end();
+                if (it != end_it) {
+                    uint64_t run_start = *it;
+                    uint64_t run_len = 1;
+                    auto prev = it;
+                    ++it;
+                    for (; it != end_it; ++it) {
+                        if (*it == *prev + 1) {
+                            ++run_len;
+                        } else {
+                            ranges.push_back(json::array({run_start, run_len}));
+                            run_start = *it;
+                            run_len = 1;
+                        }
+                        prev = it;
+                    }
+                    ranges.push_back(json::array({run_start, run_len}));
+                }
+                return ranges;
+            };
+
+            json threads = json::array();
+            for (const auto& [tid, bm] : result.thread_inst_bitmaps) {
+                threads.push_back({
+                    {"thread_id",    tid},
+                    {"instructions", bm.cardinality()},
+                    {"ranges",       ranges_of(bm)}
+                });
+            }
+
+            json output = {
+                {"thread_count",   result.thread_count},
+                {"is_filtered",    result.is_filtered},
+                {"threads",        std::move(threads)}
+            };
+
+            if (result.is_filtered) {
+                output["filtered_count"] = result.included_inst_ids.cardinality();
+                output["filtered_ranges"] = ranges_of(result.included_inst_ids);
+            }
+            return output;
+        }
+    );
+
+    // ── cross_thread_dataflow ────────────────────────────────────────────
+    // Cross-thread data hand-offs through shared memory.
+    register_tool(
+        {"cross_thread_dataflow",
+         "Detect cross-thread data hand-offs: instructions where a thread "
+         "reads a memory address whose last writer was a different thread. "
+         "Returns hand-off edges, per-channel aggregation (by address), and "
+         "thread-pair statistics. Supports pagination on edges/channels.",
+         {{"type", "object"},
+          {"properties", {
+              {"edge_offset", {{"type", "integer"}, {"description", "Pagination: skip first N hand-off edges"}, {"default", 0}}},
+              {"edge_limit",  {{"type", "integer"}, {"description", "Pagination: max edges per page (max 1000)"}, {"default", 100}}},
+              {"channel_limit",{{"type", "integer"}, {"description", "Pagination: max channels per page (max 500)"}, {"default", 50}}}
+          }}, {"required", json::array()}}},
+        [this](const json& args) -> json {
+            tenet::register_pass_by_name(*pm_, "cross_thread_dataflow");
+            const auto& result =
+                require_pass<CrossThreadDataflowResult>(pm_, "cross_thread_dataflow", "Cross-thread dataflow pass failed");
+
+            size_t edge_offset = args.value("edge_offset", size_t(0));
+            size_t edge_limit  = std::min(args.value("edge_limit", size_t(100)), size_t(1000));
+            size_t edge_start  = std::min(edge_offset, result.edges.size());
+            size_t edge_end    = std::min(edge_start + edge_limit, result.edges.size());
+
+                json edges = json::array();
+                for (size_t i = edge_start; i < edge_end; i++) {
+                    const auto& e = result.edges[i];
+                    edges.push_back({
+                        {"writer_inst",   e.from_inst_id},
+                        {"writer_thread", e.from_thread},
+                        {"reader_inst",   e.to_inst_id},
+                        {"reader_thread", e.to_thread},
+                        {"addr",          fmt::format("0x{:X}", e.addr)},
+                        {"size",          e.size}
+                    });
+                }
+
+            size_t channel_limit = std::min(args.value("channel_limit", size_t(50)), size_t(500));
+            size_t ch_end = std::min(channel_limit, result.channels.size());
+            json channels = json::array();
+            for (size_t i = 0; i < ch_end; i++) {
+                const auto& c = result.channels[i];
+                json cedges = json::array();
+                size_t nce = std::min<size_t>(c.edge_indices.size(), 20);
+                for (size_t k = 0; k < nce; k++) {
+                    const auto& e = result.edges[c.edge_indices[k]];
+                    cedges.push_back({
+                        {"writer_inst", e.from_inst_id},
+                        {"reader_inst", e.to_inst_id}
+                    });
+                }
+                channels.push_back({
+                    {"addr",          fmt::format("0x{:X}", c.addr)},
+                    {"from_thread",   c.from_thread},
+                    {"to_thread",     c.to_thread},
+                    {"hand_offs",     c.edge_count},
+                    {"edges",         std::move(cedges)}
+                });
+            }
+
+            json output = {
+                {"total_hand_offs",  result.edges.size()},
+                {"total_channels",   result.channels.size()},
+                {"thread_pair_count", result.thread_pair_count},
+                {"edges",            std::move(edges)},
+                {"edges_offset",     edge_start},
+                {"edges_returned",   edge_end - edge_start},
+                {"edges_has_more",   edge_end < result.edges.size()},
+                {"channels",         std::move(channels)}
+            };
             return output;
         }
     );
