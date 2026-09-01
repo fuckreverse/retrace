@@ -234,6 +234,17 @@ public:
 
     SyscallInterceptResult take_result() { return std::move(result_); }
 
+    /* Canonical qbditrace_capi_id_t → name lookup. Public so non-pass
+     * consumers (e.g. cli/trace_dump.cpp's --dump text/jsonl rendering) share
+     * the ONE authoritative table instead of drifting private copies — the
+     * dump side used to carry a 7-entry fragment that rendered every other
+     * id as "unknown_api_NNN" even though the full table had the name. */
+    struct CapiEntry {
+        const char* name = nullptr;
+        const ApiSignature* sig = nullptr;
+    };
+    static const CapiEntry& capi_entry(uint16_t api_id);
+
 private:
     std::vector<uint8_t> read_memory_at(uint64_t addr, uint32_t max_bytes, uint64_t at_inst_id);
     void decode_known_api(InterceptedCall& call, const ApiSignature& sig);
@@ -245,11 +256,6 @@ private:
     static const std::vector<ApiSignature>& known_apis();
     static const std::vector<ApiSignature>& known_android_apis();
 
-    struct CapiEntry {
-        const char* name = nullptr;
-        const ApiSignature* sig = nullptr;
-    };
-    static const CapiEntry& capi_entry(uint16_t api_id);
 
     // ── Configuration ──
     const SyscallInterceptConfig& config_;

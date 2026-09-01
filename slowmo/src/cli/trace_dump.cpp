@@ -4,6 +4,7 @@
 #include "io/code_table.h"
 #include "core/instruction_decoder.h"
 #include "analysis/passes/platform/linux_syscalls.h"
+#include "analysis/passes/platform/syscall_intercept_pass.h"
 #include "TraceFormat.h"
 
 #include <fmt/core.h>
@@ -69,16 +70,13 @@ static const char* unknown_return_label(bool has_call_metadata) {
 }
 
 static std::string capi_name(uint16_t api_id) {
-    switch (api_id) {
-    case qbditrace::QBDITRACE_CAPI_MEMCPY: return "memcpy";
-    case 600: return "EVP_EncryptInit_ex";
-    case 601: return "EVP_EncryptUpdate";
-    case 602: return "EVP_EncryptFinal_ex";
-    case 603: return "EVP_DecryptInit_ex";
-    case 604: return "EVP_DecryptUpdate";
-    case 605: return "EVP_DecryptFinal_ex";
-    default:  return fmt::format("unknown_api_{}", api_id);
-    }
+    /* Delegate to the ONE canonical table (SyscallInterceptCollector's
+     * compact array + extended switch, 326/327 qbditrace_capi_id_t values).
+     * This file previously kept a private 7-entry fragment that rendered
+     * every other id as unknown_api_NNN. */
+    const auto& e = SyscallInterceptCollector::capi_entry(api_id);
+    if (e.name != nullptr) return e.name;
+    return fmt::format("unknown_api_{}", api_id);
 }
 
 static const char* syscall_name(uint64_t raw_syscall_no, TargetOS target_os) {
