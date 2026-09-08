@@ -7,6 +7,7 @@
  * 并通过 windowSync（BroadcastChannel）与主窗口实时联动。
  */
 import { isTauri } from './env';
+import { getWsPort } from '@/api/ws';
 import { panelWindowUrl, POPOUT_PANELS } from './panelWindow';
 
 /** 已打开的浏览器子窗口引用（避免重复开、便于聚焦） */
@@ -27,7 +28,10 @@ export async function openPanelWindow(panelId: string): Promise<void> {
         return;
       }
       const win = new WebviewWindow(label, {
-        url: `index.html?panel=${encodeURIComponent(panelId)}`,
+        // 附加当前后端 WS 端口：子窗口是独立 JS 上下文，不共享主窗口的
+        // dynamicWsPort，必须通过 URL 传递才能连到正确的后端实例
+        //（多 trace 并行时端口是 9090+n）。
+        url: `index.html?panel=${encodeURIComponent(panelId)}${getWsPort() != null ? `&ws=${getWsPort()}` : ''}`,
         title: `Tenet · ${title}`,
         width: 900,
         height: 640,
@@ -51,7 +55,7 @@ export async function openPanelWindow(panelId: string): Promise<void> {
     return;
   }
   const w = window.open(
-    panelWindowUrl(panelId),
+    panelWindowUrl(panelId, getWsPort()),
     `tenet-panel-${panelId}`,
     'width=900,height=640,menubar=no,toolbar=no',
   );

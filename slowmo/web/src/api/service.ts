@@ -65,8 +65,25 @@ export type DataSource = 'live' | 'mock' | 'unknown';
 
 let dataSource: DataSource = 'unknown';
 
+const dataSourceListeners = new Set<(s: DataSource) => void>();
+
+function setDataSource(s: DataSource): void {
+  if (dataSource === s) return;
+  dataSource = s;
+  for (const fn of dataSourceListeners) fn(s);
+}
+
 export function getDataSource(): DataSource {
   return dataSource;
+}
+
+/**
+ * 订阅数据源变更（live ↔ mock）。降级到 mock 不再静默：StatusBar
+ * 等组件订阅此事件实时展示警示，避免用户把假数据当成真实分析结果。
+ */
+export function subscribeDataSource(fn: (s: DataSource) => void): () => void {
+  dataSourceListeners.add(fn);
+  return () => dataSourceListeners.delete(fn);
 }
 
 /**
@@ -87,18 +104,18 @@ let wsUnavailable = isMockMode();
  */
 async function route<T>(wsFn: () => Promise<T>, fallback: () => T): Promise<T> {
   if (wsUnavailable) {
-    dataSource = 'mock';
+    setDataSource('mock');
     return fallback();
   }
   try {
     const res = await wsFn();
-    dataSource = 'live';
+    setDataSource('live');
     return res;
   } catch {
     if (!wsTransport().isEverConnected()) {
       wsUnavailable = true;
     }
-    dataSource = 'mock';
+    setDataSource('mock');
     return fallback();
   }
 }
@@ -193,10 +210,20 @@ export const api = {
     if (wsUnavailable) return mock.mockRunPass(name);
     try {
       const res = await ws.wsRunPass(name);
-      dataSource = 'live';
+      setDataSource('live');
       return res;
     } catch (e) {
       if (!wsTransport().isEverConnected()) wsUnavailable = true;
+      return { ok: false, message: e instanceof Error ? e.message : String(e) };
+    }
+  },
+
+  /** 运行后端默认 pass 集（一次请求批量排队，进度仍由 progress() 查询） */
+  async runDefaultPasses(): Promise<{ ok: boolean; message: string }> {
+    if (wsUnavailable) return { ok: false, message: 'backend unavailable' };
+    try {
+      return await ws.wsRunDefaultPasses();
+    } catch (e) {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
   },
@@ -228,6 +255,18 @@ export const api = {
   onServerNavigation(cb: (instId: number) => void): () => void {
     if (wsUnavailable) return () => {};
     return ws.onServerNavigation(cb);
+  },
+
+  /** 订阅服务端 pass 完成推送（EvtPassCompleted）；WS 不可用时为 no-op */
+  onPassCompleted(cb: (evt: ws.PassCompletedEvent) => void): () => void {
+    if (wsUnavailable) return () => {};
+    return ws.onPassCompleted(cb);
+  },
+
+  /** 订阅服务端书签变更推送（EvtBookmarkChanged）；WS 不可用时为 no-op */
+  onBookmarkChanged(cb: (bookmarks: number[]) => void): () => void {
+    if (wsUnavailable) return () => {};
+    return ws.onBookmarkChanged(cb);
   },
 
   /**

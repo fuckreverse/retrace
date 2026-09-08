@@ -403,7 +403,7 @@ tenet --stats trace.bin
 
 ### 5.1 Tauri Web 前端（跨平台图形化入口）
 
-图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供。Tauri 的 Rust shell 以 `--ws-port <port> <trace_path> --mcp-hub` 通过 sidecar 启动和管理 `tenet` 后端子进程；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
+图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供。Tauri 的 Rust shell 以 `--ws-port <port> --progress-json <trace_path> --mcp-hub` 通过 sidecar 启动和管理 `tenet` 后端子进程（`--progress-json` 让索引构建等早期阶段以 `TENET-PROGRESS` 行上报进度，驱动 loading 页进度条，详见 `ui-layer.md`）；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
 
 开发模式使用仓库中已有脚本：
 

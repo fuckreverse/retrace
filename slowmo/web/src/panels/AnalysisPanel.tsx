@@ -27,6 +27,7 @@ export function AnalysisPanel() {
   const [passes, setPasses] = useState<PassInfo[]>([]);
   const [tasks, setTasks] = useState<Map<string, ProgressTask>>(new Map());
   const [submitting, setSubmitting] = useState<Set<string>>(new Set());
+  const [runningDefault, setRunningDefault] = useState(false);
 
   const refreshPasses = useCallback(() => { void api.passes().then(setPasses); }, []);
   const refreshProgress = useCallback(async () => {
@@ -40,6 +41,15 @@ export function AnalysisPanel() {
     const timer = window.setInterval(() => { void refreshProgress(); }, 250);
     return () => window.clearInterval(timer);
   }, [refreshProgress]);
+
+  // 服务端推送（EvtPassCompleted）：pass 一结束就立即刷新目录状态，
+  // 不必等下一次 250ms 轮询；轮询仅负责运行中的百分比进度。
+  useEffect(() => {
+    return api.onPassCompleted(() => {
+      void refreshPasses();
+      void refreshProgress();
+    });
+  }, [refreshPasses, refreshProgress]);
 
   const grouped = useMemo(() => {
     const groups = new Map<string, PassInfo[]>();
@@ -72,6 +82,17 @@ export function AnalysisPanel() {
     await Promise.all([refreshProgress(), Promise.resolve(refreshPasses())]);
   };
 
+  // 一键运行后端默认 pass 集（RunDefaultPassesReq，后端串行排队执行）
+  const runDefault = async () => {
+    setRunningDefault(true);
+    try {
+      const result = await api.runDefaultPasses();
+      if (result.ok) await refreshProgress();
+    } finally {
+      setRunningDefault(false);
+    }
+  };
+
   return (
     <div className="analysis-panel">
       <div className={clsx('analysis-banner', runningCount > 0 && 'running')}>
@@ -80,6 +101,7 @@ export function AnalysisPanel() {
           <span>分析进行中… ({runningCount})</span>
         </> : <>
           <span>已完成 {passes.filter((pass) => passState(tasks.get(pass.name), pass.state) === 'completed').length}/{passes.length}</span>
+          <Button size="sm" variant="ghost" disabled={runningDefault} onClick={() => void runDefault()}>{runningDefault ? '启动中…' : 'Run Default'}</Button>
           <Button size="sm" variant="ghost" style={{ marginLeft: 'auto' }} onClick={clearAll}>Clear All</Button>
         </>}
       </div>

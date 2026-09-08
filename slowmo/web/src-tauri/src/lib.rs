@@ -41,6 +41,53 @@ struct BackendLogLine {
     message: String,
 }
 
+/// One structured progress update from the `tenet` sidecar, parsed from a
+/// `TENET-PROGRESS {json}` line the backend emits when started with
+/// `--progress-json` (see tools/tenet/src/main.cpp). Forwarded to the
+/// webview as a `backend-progress` event so the loading screen can show
+/// real index-build progress — the WS service only comes up *after* the
+/// index is built, so this stderr channel is the only live signal during
+/// the (potentially minute-long) open phase.
+#[derive(Clone, serde::Serialize)]
+struct BackendProgressEvent {
+    /// Canonicalized trace path this sidecar instance belongs to.
+    trace_path: String,
+    /// Task kind: "index" | "pass" | "streaming" | ...
+    kind: String,
+    /// Sub-phase within the task ("scan", "compact", ...).
+    phase: String,
+    /// Task state ("running", "completed", "failed", ...).
+    state: String,
+    /// 0.0..1.0 (fraction) — meaningful while state == "running".
+    progress: f64,
+    completed: u64,
+    total: u64,
+    /// Human-readable progress line (e.g. "Indexing 42.3% [180 MB/s]").
+    message: String,
+    /// Error text when state == "failed".
+    error: String,
+}
+
+/// Parse a `TENET-PROGRESS {json}` line into a `BackendProgressEvent`.
+/// Returns `None` for any other line (the caller falls through to normal
+/// log forwarding). Malformed JSON also returns `None` — progress display
+/// is best-effort and must never break log capture.
+fn parse_progress_line(line: &str, trace_path: &str) -> Option<BackendProgressEvent> {
+    let rest = line.strip_prefix("TENET-PROGRESS ")?;
+    let v: serde_json::Value = serde_json::from_str(rest).ok()?;
+    Some(BackendProgressEvent {
+        trace_path: trace_path.to_string(),
+        kind: v.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        phase: v.get("phase").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        state: v.get("state").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        progress: v.get("progress").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        completed: v.get("completed").and_then(|x| x.as_u64()).unwrap_or(0),
+        total: v.get("total").and_then(|x| x.as_u64()).unwrap_or(0),
+        message: v.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        error: v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
+}
+
 /// Strip ANSI SGR escape sequences (`\x1b[...m`) from a line of text.
 ///
 /// tenet's logger (`common/logger.h`) always colorizes its stderr output via
@@ -272,7 +319,10 @@ async fn open_trace(
         .map_err(|e| format!("Failed to resolve tenet sidecar: {e}"))?;
 
     let (mut rx, child) = sidecar
-        .args(["--ws-port", &ws_port.to_string(), &abs_path, "--mcp-hub"])
+        // `--progress-json` MUST NOT come after `--mcp-hub` (its parser
+        // greedily consumes the next non-flag token as host:port) — keep it
+        // before the trace path, same rule as the path itself.
+        .args(["--ws-port", &ws_port.to_string(), "--progress-json", &abs_path, "--mcp-hub"])
         .spawn()
         .map_err(|e| {
             // Roll back the open-traces set on failure.
@@ -311,6 +361,13 @@ async fn open_trace(
                     // garbled `←[36m`-style text instead of plain messages.
                     let text = strip_ansi_codes(raw);
                     let text = text.as_str();
+                    // Structured progress lines bypass the log panel (they
+                    // would spam it at 10Hz) and become `backend-progress`
+                    // events instead, consumed by the loading screen.
+                    if let Some(ev) = parse_progress_line(text, &terminated_path) {
+                        let _ = terminated_app.emit("backend-progress", ev);
+                        continue;
+                    }
                     log::info!(target: "tenet-backend", "{text}");
                     // Broadcast to the frontend regardless of build type (the
                     // `log` crate sink below is debug-only / best-effort), so

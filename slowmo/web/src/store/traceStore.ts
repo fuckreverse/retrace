@@ -9,6 +9,9 @@ import type { TraceInfo } from '@/types/tenet';
 /** 服务端导航推送订阅句柄（模块级，跨 init 复用避免重复订阅） */
 let serverNavUnsub: (() => void) | null = null;
 
+/** 服务端书签变更推送订阅句柄（同上，模块级复用） */
+let bookmarkEvtUnsub: (() => void) | null = null;
+
 interface TraceState {
   info: TraceInfo | null;
   totalInst: number;
@@ -124,6 +127,15 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       serverNavUnsub = api.onServerNavigation((instId) => {
         if (instId === get().currentInst) return;
         get().navigateTo(instId, true, /* notifyBackend */ false);
+      });
+    }
+
+    // 订阅服务端书签变更推送（EvtBookmarkChanged，GUI / 其他客户端触发的
+    // 书签操作）。本窗口自己的 toggleBookmark 也广播此事件，但服务端返回
+    // 的是权威集合，重复 set 同值无副作用且不会回环（不触发新的 WS 调用）。
+    if (!bookmarkEvtUnsub) {
+      bookmarkEvtUnsub = api.onBookmarkChanged((bookmarks) => {
+        set({ bookmarks: new Set(bookmarks) });
       });
     }
   },

@@ -27,6 +27,16 @@ export function setWsPort(port: number): void {
 }
 
 /**
+ * 当前动态 WS 端口（未设置时为 null）。
+ * 供弹出面板窗口（openPanelWindow）把它写进子窗口 URL——子窗口是独立的
+ * JS 上下文，不共享本模块的 dynamicWsPort，没有这个参数就会错误地连到
+ * 默认 9090（多 trace 并行时后端实际分配在 9090+n）。
+ */
+export function getWsPort(): number | null {
+  return dynamicWsPort;
+}
+
+/**
  * 运行环境自适应的 WS 地址：
  *  - Tauri webview：直连后端绝对地址（无 dev proxy），webview 允许跨源 WS。
  *  - 浏览器 dev：走 Vite proxy 的 /ws（避免混合内容/跨源问题）。

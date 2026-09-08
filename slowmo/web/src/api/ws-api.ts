@@ -40,6 +40,9 @@ import {
   GetFunctionsResponse,
   RunAnalysisRequest,
   RunAnalysisResponse,
+  RunDefaultPassesResponse,
+  EvtPassCompletedMsg,
+  EvtBookmarkChangedMsg,
   GetProgressResponse,
 } from './ws-gen/tenet/ws';
 import type {
@@ -353,6 +356,58 @@ export async function wsRunPass(
   const bb = expect(resp, MessageType.RunPassResp);
   const r = RunPassResponse.getRootAsRunPassResponse(bb);
   return { ok: r.ok(), message: r.message() ?? '' };
+}
+
+/** 运行后端默认 pass 集（对齐打开 trace 时的 "standard" 预设） */
+export async function wsRunDefaultPasses(): Promise<{ ok: boolean; message: string }> {
+  const resp = await wsRequest(MessageType.RunDefaultPassesReq, (b) => {
+    b.startObject(0);
+    return b.endObject();
+  });
+  const bb = expect(resp, MessageType.RunDefaultPassesResp);
+  const r = RunDefaultPassesResponse.getRootAsRunDefaultPassesResponse(bb);
+  return { ok: r.ok(), message: r.message() ?? '' };
+}
+
+// ─── 服务端推送事件（除导航外的其余推送） ───────────────────────
+
+/** EvtPassCompleted 载荷：一个 pass 结束（成功或失败） */
+export interface PassCompletedEvent {
+  name: string;
+  ok: boolean;
+  summary: string;
+}
+
+/**
+ * 订阅服务端 pass 完成推送。返回取消订阅函数。
+ * 与轮询互补：推送保证目录状态即时刷新，轮询负责运行中的百分比。
+ */
+export function onPassCompleted(cb: (evt: PassCompletedEvent) => void): () => void {
+  return wsTransport().onEvent((type, payload) => {
+    if (type !== MessageType.EvtPassCompleted) return;
+    const bb = new flatbuffers.ByteBuffer(payload);
+    const evt = EvtPassCompletedMsg.getRootAsEvtPassCompletedMsg(bb);
+    cb({ name: evt.name() ?? '', ok: evt.ok(), summary: evt.summary() ?? '' });
+  });
+}
+
+/**
+ * 订阅服务端书签变更推送（其他客户端 / GUI 触发的书签操作）。
+ * 回调收到权威书签集合。返回取消订阅函数。
+ */
+export function onBookmarkChanged(cb: (bookmarks: number[]) => void): () => void {
+  return wsTransport().onEvent((type, payload) => {
+    if (type !== MessageType.EvtBookmarkChanged) return;
+    const bb = new flatbuffers.ByteBuffer(payload);
+    const evt = EvtBookmarkChangedMsg.getRootAsEvtBookmarkChangedMsg(bb);
+    const out: number[] = [];
+    const n = evt.bookmarksLength();
+    for (let i = 0; i < n; i++) {
+      const v = evt.bookmarks(i);
+      if (v !== null) out.push(Number(v));
+    }
+    cb(out);
+  });
 }
 
 /** 清空所有已运行分析结果（PassManager 全量 reset），对齐 GUI "Clear All Analysis" */

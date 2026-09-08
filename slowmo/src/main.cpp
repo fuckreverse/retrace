@@ -21,6 +21,8 @@
 #include <fmt/core.h>
 #include <fmt/color.h>
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -65,6 +68,44 @@ int main(int argc, char** argv) {
         return opts.parse_status == 2 ? 0 : 1;
 
     bool has_analysis_option = opts.has_analysis_option();
+
+    // ─── Machine-readable progress channel (--progress-json) ────────────
+    // Emits one `TENET-PROGRESS {json}` line per ProgressManager task update
+    // to stderr. The Tauri shell parses these lines and re-emits them to the
+    // webview as `backend-progress` events — this covers the loading-screen
+    // blind spot: the WS service only starts AFTER the index is built, so
+    // without this channel the GUI cannot show index-build progress.
+    // Lines are throttled to one per task per 100ms (terminal states are
+    // always emitted) so a fast-progressing scan cannot flood the pipe.
+    // NOTE: the returned Subscription must be kept alive for the whole
+    // process lifetime — its destructor unsubscribes the listener.
+    tenet::ProgressManager::Subscription progress_json_sub;
+    if (opts.progress_json) {
+        static std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+            last_emit;
+        progress_json_sub = ProgressManager::global().subscribe([](const ProgressTask& task) {
+            const bool terminal = task.state != ProgressState::Pending &&
+                                  task.state != ProgressState::Running;
+            auto now = std::chrono::steady_clock::now();
+            auto [it, inserted] = last_emit.try_emplace(task.id, now);
+            if (!terminal && !inserted) {
+                using namespace std::chrono_literals;
+                if (now - it->second < 100ms) return;
+                it->second = now;
+            }
+            nlohmann::json j;
+            j["kind"] = task.kind;
+            j["phase"] = task.phase;
+            j["state"] = ProgressManager::state_name(task.state);
+            j["progress"] = task.progress;
+            j["completed"] = task.completed;
+            j["total"] = task.total;
+            j["message"] = task.message;
+            j["error"] = task.error;
+            fmt::print(stderr, "TENET-PROGRESS {}\n", j.dump());
+            fflush(stderr);
+        });
+    }
 
 
     // ─── Open trace file ────────────────────────────────────────────────

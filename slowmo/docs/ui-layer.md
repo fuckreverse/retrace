@@ -39,10 +39,19 @@ flowchart TD
 
 ### 进程与通信模型
 
-1. 用户独立启动 Tauri 应用并选择 trace。
+1. 用户独立启动 Tauri 应用并选择 trace（可选 pass 预设 Minimal/Standard/Full/Custom）。
 2. Rust shell 通过 Tauri sidecar 机制启动、监控和回收独立的 `tenet` 后端子进程。
-3. Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动后端，同时开启 FlatBuffers WebSocket 服务和 MCP Hub。
+3. Rust sidecar 以 `--ws-port <port> --progress-json <trace_path> --mcp-hub` 启动后端，同时开启 FlatBuffers WebSocket 服务和 MCP Hub。
 4. 浏览器端 Web UI 仅连接 `ws://127.0.0.1:<port>`，所有浏览与分析请求都使用 uWebSockets + FlatBuffers 二进制协议；不存在 MCP HTTP fallback。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径相互独立。
+5. WS 握手成功后，前端按所选预设逐个发送 `RunPassReq`（Custom 预设同样生效），AnalysisPanel 中的 "Run Default" 按钮对应 `RunDefaultPassesReq`。
+
+### 打开阶段的进度侧信道
+
+WS 服务要到索引构建完成之后才启动，而首次打开大 trace 的 RocksDB 索引构建可达分钟级——这段窗口期前端无法通过 WS 获取进度。解决方案是 `--progress-json`：后端把每个 `ProgressManager` 任务更新以 `TENET-PROGRESS {json}` 行（100ms 节流）写到 stderr，Rust shell 解析后以 `backend-progress` 事件转发给 webview，loading 页据此渲染真实进度条（含索引扫描速度、compaction 阶段）。前端等待超时模型为“绝对上限 10 分钟 + 90 秒无进度窗口”，只要进度事件持续就不放弃。
+
+### 推送事件与轮询的分工
+
+服务端主动推送（msg_id=0）中，`EvtNavigation` 用于跨客户端导航同步，`EvtPassCompleted` 驱动 AnalysisPanel 在 pass 结束时立即刷新目录状态（250ms 轮询仅负责运行中百分比），`EvtBookmarkChanged` 驱动书签集合的跨客户端同步。WS 不可用时前端降级 mock 数据，但 StatusBar 会实时显示警示（live/mock 状态订阅自 service 层，不再静默切换）。弹出面板子窗口通过 URL 参数 `?panel=<id>&ws=<port>` 继承正确的后端端口（多 trace 并行时为 9090+n）。
 
 Tauri 是 `tenet` 进程之外的客户端，而不是 `main.cpp` 中的 UI 分支。`tenet` 可执行文件只负责 trace 数据、状态重建、分析 pass 和 RPC / MCP / WS 服务，不创建窗口，也不执行任何图形渲染。
 

@@ -6,6 +6,7 @@
  */
 import { create } from 'zustand';
 import { isTauri, isMockMode } from '@/lib/env';
+import { api } from '@/api/service';
 import { setWsPort, resetWsTransport, probeWs } from '@/api/ws';
 
 /* ------------------------------------------------------------------ */
@@ -29,6 +30,29 @@ export interface BackendPorts {
   ws_port: number;
   mcp_port: number;
   trace_path: string;
+}
+
+/**
+ * 后端实时进度事件载荷（Rust 侧 `backend-progress`，由 sidecar 的
+ * `TENET-PROGRESS` 行解析而来，见 src-tauri/src/lib.rs 与
+ * tools/tenet/src/main.cpp 的 --progress-json）。仅在 loading 阶段消费：
+ * WS 服务要到索引建完才启动，这段窗口期的进度只能靠这条侧信道。
+ */
+export interface BackendProgress {
+  trace_path: string;
+  /** "index" | "pass" | "streaming" | ... */
+  kind: string;
+  /** 子阶段："scan" / "compact" / ... */
+  phase: string;
+  /** "running" / "completed" / "failed" / ... */
+  state: string;
+  /** 0..1，state === 'running' 时有意义 */
+  progress: number;
+  completed: number;
+  total: number;
+  /** 人类可读进度行，如 "Indexing 42.3% [180 MB/s]" */
+  message: string;
+  error: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -125,6 +149,8 @@ interface AppState {
   pendingTracePath: string | null;
   /** Whether the pass preset dialog is shown */
   showPassPresetDialog: boolean;
+  /** loading 阶段的后端实时进度（null = 尚未收到任何进度事件） */
+  loadingProgress: BackendProgress | null;
 
   // actions
   setView: (view: AppView) => void;
@@ -149,6 +175,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   error: null,
   pendingTracePath: null,
   showPassPresetDialog: false,
+  loadingProgress: null,
 
   setView(view) {
     set({ view });
@@ -176,11 +203,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   async openTrace(path) {
-    set({ view: 'loading', error: null, showPassPresetDialog: false });
+    set({ view: 'loading', error: null, showPassPresetDialog: false, loadingProgress: null });
+
+    // Pass 预设：连接就绪后自动触发所选 pass（后端串行排队执行）。
+    // 以前预设只被传给 Rust 侧 open_trace 的一个死参数，从未生效；
+    // 现在改为前端在 WS 握手成功后逐个调 RunPass，自定义预设同样适用。
+    const runPresetPasses = () => {
+      const { passPreset, customPasses } = get();
+      for (const name of getPassesForPreset(passPreset, customPasses)) {
+        void api.runPass(name);
+      }
+    };
 
     if (!isTauri()) {
       // Browser mode: directly go to analysis (backend must already be running)
       set({ view: 'analysis' });
+      runPresetPasses();
       return;
     }
 
@@ -194,11 +232,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
 
-      const { passPreset, customPasses } = get();
-      const passes = getPassesForPreset(passPreset, customPasses);
-
-      // Open the trace via Tauri backend
-      const ports = await tauriInvoke<BackendPorts>('open_trace', { path, passes });
+      // Open the trace via Tauri backend (Rust spawns the sidecar with
+      // --progress-json so we get structured progress during index build)
+      const ports = await tauriInvoke<BackendPorts>('open_trace', { path });
 
       // Configure WS connection to use the allocated port.
       // 注：ports.mcp_port 仍由后端分配（供 AI agent 的 MCP 服务使用），
@@ -225,33 +261,58 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
 
+      // Subscribe to structured backend progress (index build, etc.) —
+      // Rust parses the sidecar's TENET-PROGRESS stderr lines and emits
+      // `backend-progress`. This drives the loading screen's progress bar
+      // and also feeds the liveness timeout below (as long as the backend
+      // keeps reporting progress, we keep waiting).
+      let lastProgressAt = Date.now();
+      let unlistenProgress: (() => void) | null = null;
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlistenProgress = await listen<BackendProgress>('backend-progress', (event) => {
+          if (event.payload.trace_path !== path) return;
+          lastProgressAt = Date.now();
+          set({ loadingProgress: event.payload });
+        });
+      } catch {
+        /* progress display is best-effort — fall back to a plain spinner */
+      }
+
       // Wait for the C++ backend to become ready (WS handshake).
-      // The backend needs time to open the trace, build/load the index, etc.
-      const maxWait = 60_000; // 60s timeout (large traces can take a while)
+      // Timeout model: absolute cap of 10 minutes, plus a 90s no-progress
+      // window — a large first-time index build can legitimately take
+      // minutes, but only while progress events keep flowing. Backends
+      // without --progress-json support degrade to the 90s fixed wait.
+      const absoluteMaxWait = 600_000;
+      const noProgressTimeout = 90_000;
       const pollInterval = 500;
       const start = Date.now();
       let ready = false;
-      while (Date.now() - start < maxWait) {
+      while (Date.now() - start < absoluteMaxWait && Date.now() - lastProgressAt < noProgressTimeout) {
         if (crashed) break;
         ready = await probeWs();
         if (ready) break;
         await new Promise((r) => setTimeout(r, pollInterval));
       }
+      unlistenProgress?.();
       unlistenCrash?.();
       if (crashed) {
-        set({ view: 'welcome', error: 'Backend exited unexpectedly. Check the app logs for details.' });
+        set({ view: 'welcome', loadingProgress: null, error: 'Backend exited unexpectedly. Check the app logs for details.' });
         return;
       }
       if (!ready) {
-        set({ view: 'welcome', error: 'Backend did not start in time. Check the trace file.' });
+        set({ view: 'welcome', loadingProgress: null, error: 'Backend did not start in time. Check the trace file.' });
         return;
       }
 
       const traces = new Set(get().openTraces);
       traces.add(path);
-      set({ backendPorts: ports, openTraces: traces, view: 'analysis' });
+      set({ backendPorts: ports, openTraces: traces, view: 'analysis', loadingProgress: null });
+      // 预设 pass 自动运行（不阻塞视图切换，进度由 AnalysisPanel 展示）
+      runPresetPasses();
     } catch (e) {
-      set({ view: 'welcome', error: String(e) });
+      set({ view: 'welcome', loadingProgress: null, error: String(e) });
     }
   },
 

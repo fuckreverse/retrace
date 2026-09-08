@@ -212,6 +212,14 @@ bool entropy_timeline = false;  // --entropy-timeline
     // --- P3: WebSocket service ---
     uint16_t ws_port = 0;                      ///< --ws-port <port>: start WS service (0 = disabled)
 
+    // --- Machine-readable progress (for the Tauri sidecar) ---
+    /// --progress-json: emit one `TENET-PROGRESS {json}` line per
+    /// ProgressManager task update to stderr. The Tauri shell parses these
+    /// lines and forwards them to the webview as `backend-progress` events,
+    /// so the loading screen can show real index-build progress before the
+    /// WS service is even up (WS starts only after the index is built).
+    bool progress_json = false;
+
     // --- P3: MCP Streamable HTTP server ---
     bool opt_mcp_http = false;
     McpHttpConfig mcp_http_cfg;
