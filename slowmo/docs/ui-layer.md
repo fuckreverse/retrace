@@ -51,7 +51,9 @@ WS 服务要到索引构建完成之后才启动，而首次打开大 trace 的 
 
 ### 推送事件与轮询的分工
 
-服务端主动推送（msg_id=0）中，`EvtNavigation` 用于跨客户端导航同步，`EvtPassCompleted` 驱动 AnalysisPanel 在 pass 结束时立即刷新目录状态（250ms 轮询仅负责运行中百分比），`EvtBookmarkChanged` 驱动书签集合的跨客户端同步。WS 不可用时前端降级 mock 数据，但 StatusBar 会实时显示警示（live/mock 状态订阅自 service 层，不再静默切换）。弹出面板子窗口通过 URL 参数 `?panel=<id>&ws=<port>` 继承正确的后端端口（多 trace 并行时为 9090+n）。
+服务端主动推送（msg_id=0）中，`EvtNavigation` 用于跨客户端导航同步，`EvtPassCompleted` 驱动 pass 结束时的即时刷新（目录状态 + 任务快照补拉），`EvtBookmarkChanged` 驱动书签集合的跨客户端同步。运行中百分比由前端的**全局任务监视器**（`web/src/store/taskStore.ts`，随主窗口 Shell 启动）以 500ms 轮询 `GetProgress` 获取，它是全量任务快照的单一数据源，供 AnalysisPanel（pass 进度 + 非 pass 后台任务）与 StatusBar（运行中任务指示器，点击跳转 Analysis 面板）共享消费。pass 结束事件同时写入前端统一日志流（LogPanel 可见，`backendLog.appendUiLog`）；失败时弹全局 toast，成功只记日志避免刷屏。WS 不可用时前端降级 mock 数据，但 StatusBar 实时显示警示 + toast 提醒（live/mock 状态订阅自 service 层，不再静默切换）。弹出面板子窗口通过 URL 参数 `?panel=<id>&ws=<port>` 继承正确的后端端口（多 trace 并行时为 9090+n）。
+
+Web 前端的 Log 面板聚合两类日志源：Tauri `backend-log` 事件转发的后端（sidecar）stdout/stderr，以及 UI 层事件（pass 完成/失败、启动失败等）；支持级别过滤、关键字过滤、跟随/暂停滚动（手动上滚自动暂停）与清空缓冲。
 
 Tauri 是 `tenet` 进程之外的客户端，而不是 `main.cpp` 中的 UI 分支。`tenet` 可执行文件只负责 trace 数据、状态重建、分析 pass 和 RPC / MCP / WS 服务，不创建窗口，也不执行任何图形渲染。
 
@@ -328,7 +330,7 @@ tenet 的日志（`src/common/logger.h`，纯头文件）在 Level 之外叠加�
 - **Module**：`General/Mcp/Io/Core/Analysis/Gui/Tui/Batch`（8 个，`Module::Count` 为哨兵），由环境变量 `TENET_LOG_MODULES=mcp,io` 控制（逗号分隔白名单；不设置 = 全部模块开启）。其中 `Gui` 是为日志兼容保留的分类，不代表原生 GUI 仍然存在。
 - 新代码推荐使用 `LOG_INFO_M(Module::Mcp, "...")` 等带模块标签的宏；旧代码不加标签等价于 `Module::General`，行为不变。
 - Tauri Rust shell 捕获 sidecar 的 stdout / stderr，并把日志事件转发给 Web 前端的 Output 面板；`TENET_LOG_MODULES` 仍只控制后端 stderr 的模块过滤。
-- Web 前端负责日志级别、模块和文本过滤等展示行为，后端日志系统不依赖任何图形 UI。
+- Web 前端负责日志级别、关键字文本过滤、跟随/暂停滚动与清空等展示行为，后端日志系统不依赖任何图形 UI。
 
 ## Streaming 模式
 

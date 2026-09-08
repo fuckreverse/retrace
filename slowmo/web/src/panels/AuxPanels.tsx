@@ -2,7 +2,7 @@
  * 辅助面板集合。
  * SnapshotsPanel / DwarfPanel / VmWorkspacePanel / LogPanel / CacheManagerPanel / SettingsPanel。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import { useTraceStore } from '@/store/traceStore';
 import {
@@ -15,7 +15,7 @@ import {
 import { getDataSource } from '@/api/service';
 import { api } from '@/api/service';
 import { isTauri } from '@/lib/env';
-import { subscribeBackendLog } from '@/lib/backendLog';
+import { subscribeBackendLog, getBackendLogSnapshot, clearBackendLog } from '@/lib/backendLog';
 import type {
   CacheEntry,
   DwarfEntry,
@@ -181,30 +181,87 @@ export function VmWorkspacePanel() {
 
 /* ---------- Log ---------- */
 const LOG_LEVELS = ['all', 'debug', 'info', 'warn', 'error'] as const;
+/** 距底部小于该像素数视为“已在底部”，保持跟随 */
+const FOLLOW_THRESHOLD_PX = 24;
+
 export function LogPanel() {
-  const [rows, setRows] = useState<LogEntry[]>([]);
+  // 浏览器/mock 模式下的种子行（api.log() 的 mock 数据），Tauri 下为空——
+  // Tauri 的权威日志在 backendLog 缓冲区（初始快照 + 实时追加）。
+  const [seed, setSeed] = useState<LogEntry[]>([]);
+  // backendLog 缓冲区实时快照（Tauri：后端日志 + UI 层事件；其他环境：仅 UI 层事件）
+  const [live, setLive] = useState<LogEntry[]>([]);
   const [level, setLevel] = useState<(typeof LOG_LEVELS)[number]>('all');
+  const [query, setQuery] = useState('');
+  const [follow, setFollow] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    api.log().then(setRows);
-    // Tauri 环境下日志来自真实的 tenet 后端（sidecar）进程，会持续产生新行
-    // （见 src/lib/backendLog.ts）；订阅更新使面板打开时能实时滚动追加，
-    // 而不是只在挂载那一刻拍一张快照。浏览器 / mock 模式没有真实后端，
-    // 不需要订阅。
-    if (!isTauri()) return;
-    return subscribeBackendLog(setRows);
+    // Tauri：取当前缓冲快照，随后订阅实时追加。
+    // 浏览器/mock：没有真实后端日志，seed 一份 mock 行；UI 层事件（pass 完成
+    // 等，见 backendLog.appendUiLog）仍会实时追加到 live。
+    if (isTauri()) {
+      setLive(getBackendLogSnapshot());
+    } else {
+      api.log().then(setSeed);
+    }
+    return subscribeBackendLog(setLive);
   }, []);
 
-  const filtered = level === 'all' ? rows : rows.filter((r) => r.level === level);
+  const rows = useMemo(
+    () => (isTauri() ? live : [...seed, ...live]),
+    [live, seed],
+  );
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return rows.filter((r) =>
+      (level === 'all' || r.level === level)
+      && (q === '' || r.message.toLowerCase().includes(q) || r.source.toLowerCase().includes(q)),
+    );
+  }, [rows, level, query]);
+
+  // 跟随滚动：新行到达时若处于跟随态则滚到底部。
+  // 依赖 filtered.length 而非 rows：过滤态下不跟随无意义的滚动。
+  useEffect(() => {
+    if (!follow) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [filtered.length, follow]);
+
+  // 用户手动上滚 → 自动暂停跟随；滚回底部 → 恢复跟随。
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_THRESHOLD_PX;
+    setFollow(atBottom);
+  };
+
+  const clear = () => {
+    clearBackendLog();
+    setSeed([]);
+  };
 
   return (
     <div className="list-panel">
       <div className="list-toolbar">
         {LOG_LEVELS.map((l) => <Chip key={l} active={level === l} onClick={() => setLevel(l)}>{l}</Chip>)}
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} lines</span>
+        <input
+          className="input log-search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="过滤…"
+          spellCheck={false}
+        />
+        <Chip active={follow} onClick={() => setFollow(!follow)}>{follow ? '▼ 跟随' : '⏸ 已暂停'}</Chip>
+        <Button size="sm" variant="ghost" onClick={clear} title="清空当前日志缓冲">清空</Button>
+        <span className="list-count" style={{ marginLeft: 'auto' }}>
+          {filtered.length === rows.length ? `${rows.length} lines` : `${filtered.length}/${rows.length} lines`}
+        </span>
       </div>
-      <div className="log-list">
-        {filtered.map((r, i) => (
+      <div className="log-list" ref={scrollRef} onScroll={onScroll}>
+        {filtered.length === 0 ? (
+          <div className="empty-state">{rows.length === 0 ? '暂无日志' : '没有匹配过滤条件的日志行'}</div>
+        ) : filtered.map((r, i) => (
           <div key={i} className={clsx('log-line', `log-${r.level}`)}>
             <span className="log-time">{r.ts}</span>
             <span className="log-level">{r.level.toUpperCase()}</span>
@@ -213,6 +270,13 @@ export function LogPanel() {
           </div>
         ))}
       </div>
+      {!follow && (
+        <button className="log-follow-btn" onClick={() => {
+          setFollow(true);
+          const el = scrollRef.current;
+          if (el) el.scrollTop = el.scrollHeight;
+        }}>↓ 回到底部（跟随新日志）</button>
+      )}
     </div>
   );
 }

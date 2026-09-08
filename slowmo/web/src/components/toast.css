@@ -1,0 +1,45 @@
+/* ---------- 全局 toast 通知 ---------- */
+.toast-host {
+  position: fixed;
+  right: var(--space-5);
+  bottom: calc(var(--statusbar-h, 26px) + var(--space-4));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: 1000;
+  max-width: 380px;
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 35%);
+  font-size: var(--fs-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  pointer-events: auto;
+  animation: toast-in 0.18s var(--ease);
+}
+.toast-icon {
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+.toast-msg {
+  word-break: break-word;
+}
+.toast-info .toast-icon { color: var(--accent); }
+.toast-success { border-color: var(--success); }
+.toast-success .toast-icon { color: var(--success); }
+.toast-error { border-color: var(--danger); }
+.toast-error .toast-icon { color: var(--danger); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}

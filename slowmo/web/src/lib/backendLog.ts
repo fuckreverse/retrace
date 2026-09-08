@@ -48,18 +48,37 @@ function normalizeLevel(level: string): LogEntry['level'] {
   }
 }
 
-function push(payload: BackendLogPayload) {
+/** 追加一条日志到环形缓冲区并广播（内部通用入口）。 */
+function appendEntry(level: LogEntry['level'], source: string, message: string): void {
   const now = new Date();
   buffer.push({
     ts: now.toISOString().substring(11, 23),
-    level: normalizeLevel(payload.level),
-    source: 'tenet-backend',
-    message: payload.message,
+    level,
+    source,
+    message,
   });
   if (buffer.length > MAX_LINES) {
     buffer.splice(0, buffer.length - MAX_LINES);
   }
   notify();
+}
+
+function push(payload: BackendLogPayload) {
+  appendEntry(normalizeLevel(payload.level), 'tenet-backend', payload.message);
+}
+
+/**
+ * 追加前端/UI 层产生的日志到统一日志流（LogPanel 可见）。
+ *
+ * 用途：pass 完成/失败事件（EvtPassCompleted）、后端连接降级等此前只
+ * 在组件内部消化的事件。这些事件同样属于“分析过程发生了什么”，写入
+ * 统一日志流后，用户无需切到对应面板也能事后追溯。
+ *
+ * 与 Tauri `backend-log` 事件不同，本入口不依赖 Tauri 环境，
+ * 浏览器/mock 模式下同样生效（只是缓冲区里只有 UI 层条目）。
+ */
+export function appendUiLog(level: LogEntry['level'], source: string, message: string): void {
+  appendEntry(level, source, message);
 }
 
 /**

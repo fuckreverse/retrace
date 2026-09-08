@@ -1,9 +1,10 @@
 .list-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
-  width: 100%;
+display: flex;
+flex-direction: column;
+height: 100%;
+min-height: 0;
+width: 100%;
+position: relative;
 }
 .list-toolbar {
   display: flex;
@@ -247,6 +248,25 @@ cursor: pointer;
 .log-info  .log-level { color: var(--accent); }
 .log-warn  .log-level { color: var(--warning); }
 .log-error .log-level { color: var(--danger); }
+/* 日志工具栏：过滤输入框 + 跟随/清空 */
+.log-search { width: 130px; height: var(--btn-sm-h, 24px); font-size: var(--fs-xs); padding: 0 var(--space-3); }
+/* 暂停跟随时悬浮在日志区底部的“回到底部”按钮 */
+.log-follow-btn {
+position: absolute;
+left: 50%;
+bottom: var(--space-4);
+transform: translateX(-50%);
+border: 1px solid var(--border-default);
+border-radius: var(--radius-md);
+background: var(--bg-surface);
+color: var(--accent);
+font-size: var(--fs-xs);
+padding: var(--space-1) var(--space-4);
+cursor: pointer;
+box-shadow: 0 4px 14px rgb(0 0 0 / 30%);
+z-index: 5;
+}
+.log-follow-btn:hover { background: var(--bg-hover); }
 
 /* ---------- settings ---------- */
 .settings-wrap {

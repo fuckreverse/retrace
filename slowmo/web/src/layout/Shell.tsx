@@ -7,6 +7,10 @@ import * as Tooltip from '@radix-ui/react-tooltip';
 import { useTraceStore } from '@/store/traceStore';
 import { useNativeMenu } from '@/hooks/useNativeMenu';
 import { initWindowSync } from '@/lib/windowSync';
+import { subscribeDataSource } from '@/api/service';
+import { startTaskMonitor } from '@/store/taskStore';
+import { showToast } from '@/lib/toast';
+import { ToastHost } from '@/components/ToastHost';
 import { TitleBar } from './TitleBar';
 import { Toolbar } from './Toolbar';
 import { Timeline } from './Timeline';
@@ -39,6 +43,18 @@ export function Shell() {
 
   // 主窗口：广播 store 状态给弹出的面板窗口（跨窗口实时联动）
   useEffect(() => initWindowSync(), []);
+
+  // 全局后台任务监视（GetProgress 轮询 + pass 完成事件 → 日志/toast），
+  // 供 StatusBar 运行指示器与 AnalysisPanel 共享；幂等，应用生命周期一次。
+  useEffect(() => { startTaskMonitor(); }, []);
+
+  // 后端连接降级提示：live → mock 的转换只发生一次（service.ts 内部去重），
+  // 用 toast 明确告知“当前看到的是假数据”，避免用户把 mock 当成真实结果。
+  useEffect(() => subscribeDataSource((s) => {
+    if (s === 'mock') {
+      showToast('error', '后端连接不可用，已降级 Mock 数据（当前展示的不是真实分析结果）');
+    }
+  }), []);
 
   // 全局快捷键
   useEffect(() => {
@@ -88,6 +104,7 @@ export function Shell() {
         </div>
         <Timeline />
         <StatusBar />
+        <ToastHost />
         <GotoDialog />
         <SearchDialog />
       </div>
