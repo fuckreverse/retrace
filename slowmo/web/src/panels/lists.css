@@ -24,6 +24,17 @@ position: relative;
 .data-table td.num { text-align: right; }
 .objc-name { color: var(--hl-call); }
 
+/* 行选中态：点击选中的行（ThreadsPanel / FunctionsPanel），accent 低透明度底色 */
+.data-table tr.row-selected {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/* 当前所在函数行（反向联动高亮）：左侧 accent 边条 + 加粗，区别于 row-selected */
+.data-table tr.row-current { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.data-table tr.row-current td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+  font-weight: 700;
+}
+
 /* Call stack */
 .callstack {
   padding: var(--space-4);
@@ -45,6 +56,7 @@ position: relative;
 .frame-top { background: var(--accent-soft); }
 .frame-marker { color: var(--accent); width: 12px; }
 .frame-name { color: var(--text-primary); }
+.frame-pc { font-size: var(--fs-xs); }
 .frame-at { margin-left: auto; font-size: var(--fs-xs); }
 
 .ctx-menu {

@@ -7,7 +7,7 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { MENU_BAR, type MenuNode } from '@/lib/menu';
 import { runMenuAction } from '@/hooks/useNativeMenu';
-import { displayShortcut } from '@/lib/env';
+import { displayShortcut, isTauri } from '@/lib/env';
 import './menubar.css';
 
 function renderNodes(nodes: MenuNode[]) {
@@ -31,6 +31,10 @@ function renderNodes(nodes: MenuNode[]) {
       );
     }
     // leaf item
+    // 快捷键提示诚实化：Tauri 下原生菜单加速键真实生效，一律展示；
+    // 浏览器下仅展示 Shell 真实绑定了裸键的项（browserBound），
+    // 避免 Cmd+R/Cmd+M 等与浏览器冲突、根本不生效的误导性提示。
+    const showShortcut = isTauri() || !!node.browserBound;
     return (
       <DropdownMenu.Item
         key={node.id}
@@ -39,7 +43,7 @@ function renderNodes(nodes: MenuNode[]) {
         onSelect={() => runMenuAction(node.id)}
       >
         <span className="menu-item-label">{node.label}</span>
-        {node.shortcut && (
+        {node.shortcut && showShortcut && (
           <span className="menu-item-shortcut">{displayShortcut(node.shortcut)}</span>
         )}
       </DropdownMenu.Item>

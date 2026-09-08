@@ -29,8 +29,14 @@ export interface MenuLeaf {
   /** 全局唯一 id，Rust 侧构建原生菜单项时复用；也是事件名 `menu://<id>` 的后缀 */
   id: string;
   label: string;
-  /** 展示用快捷键提示（如 "Cmd+O"），不绑定实际按键触发，仅对齐 GUI 观感 */
+  /** 展示用快捷键提示（如 "Cmd+O"），不绑定实际按键触发，仅对齐 GUI 观感。
+   *  注意诚实化：Tauri 下加速键由原生菜单/OS 处理，提示真实生效；
+   *  浏览器下 Cmd+R/Cmd+M 等与浏览器自身快捷键冲突、根本不生效，
+   *  仅 browserBound: true（浏览器下 Shell 真实绑定了裸键）的项才展示提示。 */
   shortcut?: string;
+  /** 该快捷键在纯浏览器环境下真实生效（Shell keydown 绑定的裸键，如 G、/、B、Home、End、Alt+←/→）。
+   *  仅用于浏览器 HTML 菜单的展示过滤；Tauri 原生菜单不受影响（一律展示）。 */
+  browserBound?: boolean;
   /** 灰显（功能尚未接入或依赖未满足），仅展示结构 */
   disabled?: boolean;
 }
@@ -70,6 +76,11 @@ const sub = (id: string, label: string, items: MenuNode[]): MenuSubmenu => ({
   id,
   label,
   items,
+});
+/** 快捷键在纯浏览器下真实生效的菜单项（Shell keydown 绑定的裸键），提示可以诚实展示 */
+const itemBound = (id: string, label: string, shortcut?: string, disabled?: boolean): MenuLeaf => ({
+  ...item(id, label, shortcut, disabled),
+  browserBound: true,
 });
 
 /**
@@ -153,16 +164,16 @@ export const MENU_BAR: TopMenu[] = [
     id: 'navigate',
     label: 'Navigate',
     items: [
-      item('nav_goto', 'Go to Instruction…', 'G'),
-      item('nav_search', 'Search…', '/'),
+      itemBound('nav_goto', 'Go to Instruction…', 'G'),
+      itemBound('nav_search', 'Search…', '/'),
       sep,
-      item('nav_back', 'Back', 'Alt+←'),
-      item('nav_forward', 'Forward', 'Alt+→'),
+      itemBound('nav_back', 'Back', 'Alt+←'),
+      itemBound('nav_forward', 'Forward', 'Alt+→'),
       sep,
-      item('nav_first', 'First Instruction', 'Home'),
-      item('nav_last', 'Last Instruction', 'End'),
+      itemBound('nav_first', 'First Instruction', 'Home'),
+      itemBound('nav_last', 'Last Instruction', 'End'),
       sep,
-      item('nav_bookmark', 'Toggle Bookmark', 'B'),
+      itemBound('nav_bookmark', 'Toggle Bookmark', 'B'),
     ],
   },
 

@@ -136,7 +136,7 @@ export function GotoDialog() {
         <Dialog.Overlay className="gs-overlay" />
         <Dialog.Content className="gs-dialog" aria-describedby={undefined}>
           <div className="gs-card">
-            <Dialog.Title className="gs-title">Go to…</Dialog.Title>
+            <Dialog.Title className="gs-title">跳转到…</Dialog.Title>
             <div className="gs-hint">0x&lt;static addr&gt;（IDA 地址）、指令编号 #id、或函数名</div>
             <input
               ref={inputRef}
@@ -199,11 +199,11 @@ export function GotoDialog() {
               </div>
             )}
             <div className="gs-footer">
-              <button className="gs-btn" onClick={close} type="button">Cancel</button>
+              <button className="gs-btn" onClick={close} type="button">取消</button>
               <button className="gs-btn gs-btn-primary" onClick={() => void commit(query)} type="button" disabled={busy}>
-                {busy ? 'Going…' : 'Go'}
+                {busy ? '跳转中…' : '跳转'}
               </button>
-              <span className="gs-key-hint">Enter=go  ↑↓=select  Esc=cancel</span>
+              <span className="gs-key-hint">Enter=跳转  ↑↓=选择  Esc=取消</span>
             </div>
           </div>
         </Dialog.Content>
@@ -259,7 +259,7 @@ export function SearchDialog() {
         <Dialog.Overlay className="gs-overlay" />
         <Dialog.Content className="gs-dialog" aria-describedby={undefined}>
           <div className="gs-card">
-            <Dialog.Title className="gs-title">Search disassembly</Dialog.Title>
+            <Dialog.Title className="gs-title">搜索反汇编</Dialog.Title>
             <div className="gs-hint">从当前指令 #{cur} 起正向扫描助记符 / 操作数子串</div>
             <input
               ref={inputRef}
@@ -288,9 +288,9 @@ export function SearchDialog() {
               </div>
             )}
             <div className="gs-footer">
-              <button className="gs-btn" onClick={close} type="button">Cancel</button>
+              <button className="gs-btn" onClick={close} type="button">取消</button>
               <button className="gs-btn gs-btn-primary" onClick={() => void run()} type="button" disabled={busy}>
-                {busy ? 'Searching…' : 'Find'}
+                {busy ? '搜索中…' : '查找'}
               </button>
               {searchResults.length > 0 && (
                 <>

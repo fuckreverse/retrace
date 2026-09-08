@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState, type DragEvent } from 'react';
 import { useAppStore, type RecentEntry } from '@/store/appStore';
 import { isTauri } from '@/lib/env';
+import { setWsPort, resetWsTransport, probeWs } from '@/api/ws';
 import { PassPresetDialog } from './PassPresetDialog';
 import './welcome.css';
 
@@ -98,6 +99,9 @@ export function WelcomePage() {
   const setError = useAppStore((s) => s.setError);
 
   const [dragging, setDragging] = useState(false);
+  // 浏览器模式：连接本机已运行后端的端口输入与请求中状态
+  const [portInput, setPortInput] = useState('9090');
+  const [connecting, setConnecting] = useState(false);
 
   // Load recent files on mount
   useEffect(() => {
@@ -179,6 +183,28 @@ export function WelcomePage() {
   // 不能伪装成"可用"——避免用户拖入文件后不知道为什么卡住。
   const browserMode = !isTauri();
 
+  // 浏览器模式直连后端：vite dev 已配置 /ws → 127.0.0.1:9090 代理（生产同源部署同理），
+  // 只要本机有 tenet --ws-port <port> trace.bin 在跑，就能直接进入分析视图。
+  // openTrace 首行会 set({view:'loading'})，浏览器下无 --progress-json 事件，
+  // LoadingPage 会显示 spinner，可接受；浏览器分支不会走 tauriInvoke，安全。
+  const onConnectBackend = useCallback(async () => {
+    if (connecting) return;
+    const port = Number(portInput) || 9090;
+    setConnecting(true);
+    try {
+      setWsPort(port);
+      resetWsTransport();
+      const ok = await probeWs();
+      if (ok) {
+        await useAppStore.getState().openTrace('browser-connect');
+      } else {
+        setError(`无法连接 127.0.0.1:${port}，请先运行 tenet --ws-port ${port} trace.bin`);
+      }
+    } finally {
+      setConnecting(false);
+    }
+  }, [connecting, portInput, setError]);
+
   return (
     <div className="welcome">
       {/* Drag area (also functions as titlebar for window dragging) */}
@@ -216,12 +242,41 @@ export function WelcomePage() {
             </span>
           </div>
 
+          {/* 浏览器模式：直连本机已运行的后端（唯一可用的入口） */}
+          {browserMode && (
+            <div className="welcome-connect">
+              <div className="welcome-connect-title">连接本机后端</div>
+              <div className="welcome-connect-row">
+                <input
+                  className="welcome-connect-port"
+                  type="text"
+                  inputMode="numeric"
+                  spellCheck={false}
+                  value={portInput}
+                  onChange={(e) => setPortInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void onConnectBackend(); }}
+                  placeholder="9090"
+                  aria-label="后端 WS 端口"
+                />
+                <button
+                  className="welcome-connect-btn"
+                  type="button"
+                  disabled={connecting}
+                  onClick={() => void onConnectBackend()}
+                >
+                  {connecting ? '连接中…' : '连接后端'}
+                </button>
+              </div>
+              <div className="welcome-connect-hint">tenet --ws-port 9090 trace.bin</div>
+            </div>
+          )}
+
           {/* Recent traces */}
           <div className="welcome-recent">
             <div className="welcome-recent-header">Recent Traces</div>
             <div className="welcome-recent-list">
               {sortedRecent.length === 0 ? (
-                <div className="welcome-recent-empty">No recent traces</div>
+                <div className="welcome-recent-empty">暂无最近打开的 trace</div>
               ) : (
                 sortedRecent.map((entry) => {
                   const isLocked = openTraces.has(entry.path);

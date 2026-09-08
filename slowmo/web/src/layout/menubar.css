@@ -61,7 +61,8 @@
 }
 .menu-item-shortcut {
   margin-left: auto;
-  padding-left: var(--space-6);
+  /* 固定间距：修复 label 与快捷键（如 "Settings…Cmd+,"）在某些 token 值下粘连 */
+  padding-left: 12px;
   font-size: 11px;
   color: var(--text-secondary);
 }

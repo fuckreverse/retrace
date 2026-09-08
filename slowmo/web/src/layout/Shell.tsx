@@ -2,14 +2,15 @@
  * 应用外壳布局 —— 复刻 GUI 主窗口：
  * 标题栏 / 工具栏 / (左栏 · 中央上下 · 右栏上下) / 时间线 / 状态栏
  */
-import { useEffect } from 'react';
+import { useCallback, useEffect } from 'react';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import { useTraceStore } from '@/store/traceStore';
 import { useNativeMenu } from '@/hooks/useNativeMenu';
 import { initWindowSync } from '@/lib/windowSync';
-import { subscribeDataSource } from '@/api/service';
+import { api, subscribeDataSource } from '@/api/service';
 import { startTaskMonitor } from '@/store/taskStore';
 import { showToast } from '@/lib/toast';
+import { followCall, followReturn } from '@/lib/nav';
 import { ToastHost } from '@/components/ToastHost';
 import { TitleBar } from './TitleBar';
 import { Toolbar } from './Toolbar';
@@ -20,6 +21,46 @@ import { SidebarLeft } from './SidebarLeft';
 import { SidebarRight } from './SidebarRight';
 import { GotoDialog, SearchDialog } from './GotoSearchDialog';
 import './shell.css';
+
+/* ------------------------------------------------------------------ */
+/*  函数起始点缓存（n / p 键跳转用，模块级，跨 keydown 事件复用）          */
+/* ------------------------------------------------------------------ */
+
+/** 全部函数首次执行指令 id（升序）；null = 尚未构建，[] = 构建过但为空/失败 */
+let funcStarts: number[] | null = null;
+/** 缓存构建中标志：重复按键去重，避免并发构建 */
+let funcStartsBuilding = false;
+
+/**
+ * 构建函数起始指令 id 缓存：
+ * 对每个函数入口 pc 调 xref 取 inst_ids[0]（首次执行点）。
+ * 用并发池（每批 8 个）避免一次性数百请求；函数数 > 500 时放弃构建
+ * （避免真实大 trace 首次按 n 卡顿）。
+ */
+async function buildFuncStarts(): Promise<number[]> {
+  const funcs = await api.functions();
+  if (funcs.length > 500) return [];
+
+  const starts: number[] = [];
+  const CONCURRENCY = 8;
+  let next = 0;
+  const worker = async () => {
+    while (next < funcs.length) {
+      const f = funcs[next++];
+      try {
+        const res = await api.xref(f.pc);
+        if (res.inst_ids.length > 0) starts.push(res.inst_ids[0]);
+      } catch {
+        // 单个函数 xref 失败不影响整体，跳过
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, funcs.length) }, worker),
+  );
+  starts.sort((a, b) => a - b);
+  return starts;
+}
 
 export function Shell() {
   const init = useTraceStore((s) => s.init);
@@ -33,6 +74,33 @@ export function Shell() {
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const currentInst = useTraceStore((s) => s.currentInst);
   const totalInst = useTraceStore((s) => s.totalInst);
+
+  /** 跳转到下一个（dir=1）/ 上一个（dir=-1）函数的首次执行指令 */
+  const nextFunction = useCallback(async (dir: 1 | -1) => {
+    if (funcStarts === null) {
+      if (funcStartsBuilding) return; // 构建中重复按键去重
+      funcStartsBuilding = true;
+      try {
+        funcStarts = await buildFuncStarts();
+      } catch {
+        funcStarts = []; // 构建失败按空处理，不再重试
+      } finally {
+        funcStartsBuilding = false;
+      }
+    }
+    if (funcStarts.length === 0) return;
+    // 读最新游标，避免闭包里 currentInst 过期
+    const cur = useTraceStore.getState().currentInst;
+    let target: number | undefined;
+    if (dir === 1) {
+      target = funcStarts.find((s) => s > cur); // 最小的大于 cur 的起点
+    } else {
+      for (let i = funcStarts.length - 1; i >= 0; i--) {
+        if (funcStarts[i] < cur) { target = funcStarts[i]; break; } // 最大的小于 cur 的起点
+      }
+    }
+    if (target !== undefined) navigateTo(target);
+  }, [navigateTo]);
 
   // 原生菜单事件桥接（仅 Tauri 生效，浏览器 no-op）
   useNativeMenu();
@@ -77,10 +145,24 @@ export function Shell() {
       else if (e.key === 'b' || e.key === 'B') { toggleBookmark(currentInst); e.preventDefault(); }
       else if (e.key === 'Home') { navigateTo(0); e.preventDefault(); }
       else if (e.key === 'End') { navigateTo(Math.max(0, totalInst - 1)); e.preventDefault(); }
+      else if (e.key === 'PageDown') { step(64); e.preventDefault(); }   // 大步快进
+      else if (e.key === 'PageUp') { step(-64); e.preventDefault(); }    // 大步快退
+else if (e.key === 'n' || e.key === 'N') { void nextFunction(1); e.preventDefault(); }
+else if (e.key === 'p' || e.key === 'P') { void nextFunction(-1); e.preventDefault(); }
+else if (e.key === 'f' || e.key === 'F') {
+  // 跟踪调用：当前指令是 bl 时跳到被调函数首次执行点
+  void followCall(currentInst).then((ok) => { if (!ok) showToast('info', '当前指令不是直接调用（bl）'); });
+  e.preventDefault();
+}
+else if (e.key === 'r' || e.key === 'R') {
+  // 跟踪返回：当前指令是 ret 时跳回调用点下一条指令
+  void followReturn(currentInst).then((ok) => { if (!ok) showToast('info', '当前指令不是返回（ret）或无调用者帧'); });
+  e.preventDefault();
+}
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [navBack, navForward, step, openGotoDialog, openSearchDialog, toggleBookmark, currentInst, navigateTo, totalInst]);
+  }, [navBack, navForward, step, openGotoDialog, openSearchDialog, toggleBookmark, currentInst, navigateTo, totalInst, nextFunction]);
 
   if (loading) {
     return (

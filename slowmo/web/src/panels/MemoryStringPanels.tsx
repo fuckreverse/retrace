@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { clsx } from 'clsx';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
+import { openInHexDump } from '@/lib/hexLink';
 import type { EntropyBlock, MemSearchHit, MemStringEntry, YaraMatch } from '@/types/tenet';
 import { Button, Chip, Input } from '@/components/ui';
 import { Icon } from '@/components/icons';
@@ -23,7 +24,6 @@ export function MemorySearchPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const navigateTo = useTraceStore((s) => s.navigateTo);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
 
   const run = async () => {
     const q = query.trim();
@@ -82,7 +82,7 @@ export function MemorySearchPanel() {
         <Button variant="primary" size="sm" onClick={() => void run()} disabled={busy || !query.trim()}>
           {busy ? '搜索中…' : '搜索'}
         </Button>
-        {hits && <span className="list-count" style={{ marginLeft: 'auto' }}>{hits.length} hits</span>}
+        {hits && <span className="list-count" style={{ marginLeft: 'auto' }}>{hits.length} 处命中</span>}
       </div>
       <div className="list-scroll">
         {error ? (
@@ -97,7 +97,7 @@ export function MemorySearchPanel() {
             <thead><tr><th style={{ width: 130 }}>Address</th><th style={{ width: 90 }}>Source</th><th>Value</th><th>Context</th><th style={{ width: 60 }}>Inst</th></tr></thead>
             <tbody>
               {hits.map((h, i) => (
-                <tr key={i} onClick={() => { navigateTo(h.inst_id); setHexAddr(h.addr); }}>
+                <tr key={i} onClick={() => { navigateTo(h.inst_id); openInHexDump(h.addr); }}>
                   <td className="mono dim">{h.addr}</td>
                   <td><span className={clsx('cat-tag', h.match_type === 'write' ? 'cat-warning' : 'cat-accent')}>{h.match_type}</span></td>
                   <td className="mono str-val">{h.value}</td>
@@ -118,7 +118,6 @@ export function MemoryStringsPanel() {
   const [rows, setRows] = useState<MemStringEntry[]>([]);
   const [region, setRegion] = useState('All');
   const navigateTo = useTraceStore((s) => s.navigateTo);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
 
   useEffect(() => { api.memStrings().then(setRows); }, []);
   const regions = useMemo(() => ['All', ...Array.from(new Set(rows.map((r) => r.region)))], [rows]);
@@ -128,14 +127,14 @@ export function MemoryStringsPanel() {
     <div className="list-panel">
       <div className="list-toolbar">
         {regions.map((r) => <Chip key={r} active={region === r} onClick={() => setRegion(r)}>{r}</Chip>)}
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} runtime strings</span>
+        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} 条运行时字符串</span>
       </div>
       <div className="list-scroll">
         <table className="data-table">
           <thead><tr><th style={{ width: 130 }}>Address</th><th style={{ width: 70 }}>Region</th><th>String</th><th style={{ width: 50 }}>Len</th><th style={{ width: 60 }}>Inst</th></tr></thead>
           <tbody>
             {filtered.map((r, i) => (
-              <tr key={i} onClick={() => { navigateTo(r.inst_id); setHexAddr(r.addr); }}>
+              <tr key={i} onClick={() => { navigateTo(r.inst_id); openInHexDump(r.addr); }}>
                 <td className="mono dim">{r.addr}</td>
                 <td><span className="cat-tag cat-default">{r.region}</span></td>
                 <td className="mono str-val">"{r.value}"</td>
@@ -160,7 +159,6 @@ function entropyColor(e: number): string {
 }
 export function EntropyPanel() {
   const [rows, setRows] = useState<EntropyBlock[]>([]);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
 
   useEffect(() => { api.entropy().then(setRows); }, []);
 
@@ -174,7 +172,7 @@ export function EntropyPanel() {
           <thead><tr><th style={{ width: 140 }}>Address</th><th style={{ width: 70 }}>Size</th><th style={{ width: 220 }}>Entropy</th><th>Classification</th></tr></thead>
           <tbody>
             {rows.map((b, i) => (
-              <tr key={i} onClick={() => setHexAddr(b.addr)}>
+              <tr key={i} onClick={() => openInHexDump(b.addr)}>
                 <td className="mono dim">{b.addr}</td>
                 <td className="mono num dim">{b.size}</td>
                 <td>
@@ -263,7 +261,7 @@ export function YaraPanel() {
         <Button variant="primary" size="sm" onClick={() => void run()} disabled={busy}>
           {busy ? '扫描中…' : '重新扫描'}
         </Button>
-        {rows && <span className="list-count" style={{ marginLeft: 'auto' }}>{rows.length} YARA rule matches</span>}
+        {rows && <span className="list-count" style={{ marginLeft: 'auto' }}>{rows.length} 条 YARA 规则命中</span>}
       </div>
       <div className="list-scroll">
         {error ? (

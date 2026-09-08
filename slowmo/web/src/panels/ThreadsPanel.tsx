@@ -56,10 +56,10 @@ export function ThreadsPanel() {
         </span>
         {filterIds.length > 0 && (
           <Button size="sm" variant="ghost" onClick={() => clearThreadFilter()} style={{ marginLeft: 'auto' }}>
-            Show All
+            显示全部
           </Button>
         )}
-        {busy && <span className="dim mono" style={{ marginLeft: 'auto' }}>filtering…</span>}
+        {busy && <span className="dim mono" style={{ marginLeft: 'auto' }}>过滤中…</span>}
       </div>
       <div className="list-scroll">
         <table className="data-table">

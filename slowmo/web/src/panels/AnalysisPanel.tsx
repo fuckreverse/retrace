@@ -92,6 +92,8 @@ export function AnalysisPanel() {
   };
 
   const clearAll = async () => {
+    // 清除全部分析结果不可撤销，先向用户二次确认。
+    if (!window.confirm('确定清除全部分析结果？该操作不可撤销')) return;
     await api.clearAnalysis();
     await Promise.all([refreshTasks(), Promise.resolve(refreshPasses())]);
   };
@@ -115,8 +117,8 @@ export function AnalysisPanel() {
           <span>分析进行中… ({runningCount})</span>
         </> : <>
           <span>已完成 {passes.filter((pass) => passState(taskMap.get(pass.name), pass.state) === 'completed').length}/{passes.length}</span>
-          <Button size="sm" variant="ghost" disabled={runningDefault} onClick={() => void runDefault()}>{runningDefault ? '启动中…' : 'Run Default'}</Button>
-          <Button size="sm" variant="ghost" style={{ marginLeft: 'auto' }} onClick={clearAll}>Clear All</Button>
+<Button size="sm" variant="ghost" disabled={runningDefault} onClick={() => void runDefault()}>{runningDefault ? '启动中…' : '运行默认预设'}</Button>
+<Button size="sm" variant="ghost" style={{ marginLeft: 'auto' }} onClick={clearAll}>清空全部</Button>
         </>}
       </div>
 

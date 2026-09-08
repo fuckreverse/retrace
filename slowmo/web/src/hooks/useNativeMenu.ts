@@ -22,6 +22,7 @@ import { api } from '@/api/service';
 import { useTraceStore } from '@/store/traceStore';
 import { useThemeStore } from '@/store/themeStore';
 import { useAppStore } from '@/store/appStore';
+import { useSettingsStore } from '@/store/settingsStore';
 
 /** id → (分组, tab)：点击后切换到对应分组容器里的面板 */
 const TAB_TARGETS: Record<string, { group: TabGroup; tab: string }> = {
@@ -212,11 +213,25 @@ export function runMenuAction(id: string): void {
     case 'popout_vm':
       void openPanelWindow('vm');
       return;
+    case 'view_registers':
+      // Registers 是右栏常驻 Panel（不是 tab），无 tab 可切；
+      // 只需确保右栏展开，面板本身可见即生效
+      if (useSettingsStore.getState().sidebarRightCollapsed) {
+        useSettingsStore.getState().toggleSidebarRightCollapsed();
+      }
+      return;
   }
 
-  // 2) tab 跳转类
+  // 2) tab 跳转类 —— 目标是侧栏 tab 时先确保对应侧栏展开：
+  // 侧栏折叠状态下 selectTab 切了也看不见（面板整个被收起）
   const target = TAB_TARGETS[id];
   if (target) {
+    const settings = useSettingsStore.getState();
+    if (target.group === 'right' && settings.sidebarRightCollapsed) {
+      settings.toggleSidebarRightCollapsed();
+    } else if (target.group === 'left' && settings.sidebarLeftCollapsed) {
+      settings.toggleSidebarLeftCollapsed();
+    }
     selectTab(target.group, target.tab);
     return;
   }

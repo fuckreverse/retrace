@@ -160,26 +160,66 @@ export function DataflowGraphPanel() {
 
 /* ---------- Backward Taint ---------- */
 const BT_REGS = ['x0', 'x1', 'x8', 'x19', 'x20', 'lr'];
+/** InstructionsPanel.runTaintBackward 派发的跨面板契约事件名。 */
+const BACKWARD_TAINT_EVENT = 'tenet:backward-taint';
+
 export function BackwardTaintPanel() {
   const cur = useTraceStore((s) => s.currentInst);
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const setProducer = useTraceStore((s) => s.setProducerChain);
   const [reg, setReg] = useState('x0');
   const [steps, setSteps] = useState<BackwardTaintStep[]>([]);
+  // 起点固定模型：start = null 表示尚未指定（惰性用挂载时的 cur 初始化），
+  // 一旦指定（右键事件）便固定不变，游标移动不再覆盖分析结果。
+  const [start, setStart] = useState<number | null>(() => useTraceStore.getState().currentInst);
+  // follow = true 时起点随游标移动（effectiveStart = cur），默认关闭。
+  const [follow, setFollow] = useState(false);
 
-  useEffect(() => {
-    api.backwardTaint(cur, reg).then((s) => {
+  // 记录上次已请求的 (起点, 寄存器) 组合：follow 关闭时游标移动虽然会
+  // 重跑 effect，但 key 不变则直接跳过，避免每步一个网络请求。
+  const lastKeyRef = useRef('');
+
+  const fetchBackward = (instId: number, register: string) => {
+    lastKeyRef.current = `${instId}:${register}`;
+    void api.backwardTaint(instId, register).then((s) => {
       setSteps(s);
       setProducer(s.map((x) => x.inst_id));
     });
-  }, [cur, reg, setProducer]);
+  };
+
+  // 数据获取：起点/寄存器变化时重算；follow 开启时才随游标重算。
+  useEffect(() => {
+    const effectiveStart = follow ? cur : (start ?? cur);
+    const key = `${effectiveStart}:${reg}`;
+    if (key === lastKeyRef.current) return; // follow 关闭时游标移动：跳过
+    fetchBackward(effectiveStart, reg);
+    // fetchBackward/setProducer 引用不稳定，刻意不入依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [start, reg, follow, cur]);
+
+  // 监听契约事件：右键“反向污点”指定新的固定起点，并立即重算一次。
+  // 显式指定起点意味着固定，因此同时关闭 follow。
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const instId = (event as CustomEvent<{ instId: number }>).detail?.instId;
+      if (typeof instId !== 'number') return;
+      setFollow(false);
+      setStart(instId);
+      fetchBackward(instId, reg); // 直接重算；effect 内靠 lastKeyRef 去重避免双请求
+    };
+    window.addEventListener(BACKWARD_TAINT_EVENT, handler);
+    return () => window.removeEventListener(BACKWARD_TAINT_EVENT, handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reg]);
 
   return (
     <div className="list-panel">
       <div className="list-toolbar">
-        <span className="dim">从 #{cur} 反向追溯</span>
+        <span className="dim">起点 #{follow ? cur : (start ?? cur)}</span>
+        <Chip active={follow} onClick={() => setFollow((v) => !v)}>跟随游标</Chip>
+        <span className="dim">{follow ? '起点随游标移动' : '起点已固定；右键指令可重新指定，开启“跟随游标”可恢复旧有行为'}</span>
         {BT_REGS.map((r) => <Chip key={r} active={reg === r} onClick={() => setReg(r)}>{r}</Chip>)}
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{steps.length} producers</span>
+        <span className="list-count" style={{ marginLeft: 'auto' }}>{steps.length} 个生产者</span>
       </div>
       <div className="list-scroll">
         <table className="data-table">

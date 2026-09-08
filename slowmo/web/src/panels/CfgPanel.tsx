@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { CfgBlock, CfgEdge, CfgResult, FunctionEntry } from '@/types/tenet';
-import { Button, IconButton, Input } from '@/components/ui';
+import { Button, Empty, IconButton, Input } from '@/components/ui';
 import { Icon } from '@/components/icons';
 import './cfg.css';
 
@@ -106,9 +106,14 @@ export function CfgPanel() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 20, y: 10 });
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+  // CFG 不含当前 PC 时的空态提示（空函数 / 入口前指令 / mock 地址不匹配等）
+  const [cfgError, setCfgError] = useState<string | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const cfgRequestRef = useRef(0);
+  // cfg 的镜像 ref：跟随 effect 依赖只有 [cur, followCurrent]，内部一律读
+  // cfgRef.current，避免 setCfg 新对象再次触发 effect 造成无限 fetch 循环。
+  const cfgRef = useRef<CfgResult | null>(null);
   const cur = useTraceStore((s) => s.currentInst);
   const navigateTo = useTraceStore((s) => s.navigateTo);
 
@@ -121,28 +126,40 @@ export function CfgPanel() {
   // 统一的光标跟随逻辑：先解析当前 PC，仅当它落在已展示 CFG 之外时才
   // 重新拉取所在函数的 CFG（避免同函数内移动光标时全量重取/重排布局），
   // 然后更新当前块高亮并在必要时居中。手动选函数（follow 关闭）时只更新高亮。
+  // 注意：依赖里没有 cfg（读 cfgRef.current），setCfg 不会重新触发本 effect；
+  // 高亮与居中在 fetch 后内联完成一次，不再依赖下一轮 effect。
   useEffect(() => {
     const requestId = ++cfgRequestRef.current;
     let cancelled = false;
     void api.disasm(cur, 1).then(async (result) => {
       if (cancelled || requestId !== cfgRequestRef.current) return;
       const pc = result.rows[0]?.pc;
-      let activeCfg = cfg;
-      if (followCurrent && pc && (!cfg || !blockForPc(cfg.blocks, pc))) {
+      const activeCfg = cfgRef.current;
+      const needFetch = followCurrent && pc && (!activeCfg || !blockForPc(activeCfg.blocks, pc));
+      if (needFetch) {
         const fetched = await api.cfg({ instId: cur });
         if (cancelled || requestId !== cfgRequestRef.current) return;
-        activeCfg = fetched;
+        // 后端返回的 CFG 不含任何基本块（空函数 / 当前指令在入口前等）：
+        // 不写入 cfg（避免无意义的重渲染与循环），改为显示空态提示。
+        if (fetched.blocks.length === 0) {
+          setCurrentBlockPc(null);
+          setCfgError('当前指令不在任何已识别函数内');
+          return;
+        }
         setCfg(fetched);
+        cfgRef.current = fetched;
         setSelectedFunctionPc(fetched.function?.entry_pc ?? '');
       }
-      const block = pc && activeCfg ? blockForPc(activeCfg.blocks, pc) : null;
+      const block = pc ? blockForPc(cfgRef.current?.blocks ?? [], pc) : null;
       setCurrentBlockPc(block?.pc ?? null);
+      if (followCurrent) setCfgError(block ? null : '当前指令不在任何已识别函数内');
+      else if (block) setCfgError(null);
       if (block && !isBlockFullyVisible(block)) centerBlock(block);
     });
     return () => { cancelled = true; };
     // centerBlock/isBlockFullyVisible 是不稳定函数引用，刻意不入依赖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cur, followCurrent, cfg]);
+  }, [cur, followCurrent]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -231,7 +248,10 @@ export function CfgPanel() {
     const requestId = ++cfgRequestRef.current;
     if (!entryPc) return;
     void api.cfg({ entryPc }).then((result) => {
-      if (requestId === cfgRequestRef.current) setCfg(result);
+      if (requestId !== cfgRequestRef.current) return;
+      setCfg(result);
+      cfgRef.current = result; // 与 state 保持同步，跟随 effect 读 ref
+      setCfgError(result.blocks.length === 0 ? '当前函数没有可显示的基本块' : null);
     });
   };
 
@@ -290,7 +310,7 @@ export function CfgPanel() {
         <label className="cfg-toggle"><input type="checkbox" checked={followCurrent} onChange={(event) => setFollowCurrent(event.target.checked)} /> 跟随当前函数</label>
         <label className="cfg-toggle"><input type="checkbox" checked={heatMode} onChange={(event) => setHeatMode(event.target.checked)} /> 热力模式</label>
         <span className="cfg-function-name" title={cfg?.function?.name}>{cfg?.function?.name ?? ''}</span>
-        <Input aria-label="搜索块地址或反汇编" placeholder="Search address / disasm…" value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') locateSearch(); }} style={{ width: 190 }} />
+        <Input aria-label="搜索块地址或反汇编" placeholder="搜索地址 / 反汇编…" value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') locateSearch(); }} style={{ width: 190 }} />
         <div className="toolbar-sep" />
         <IconButton title="放大" onClick={() => setZoom((value) => Math.min(MAX_ZOOM, value + 0.2))}><Icon.Forward /></IconButton>
         <span className="dim cfg-zoom">{(zoom * 100).toFixed(0)}%</span>
@@ -301,6 +321,7 @@ export function CfgPanel() {
         <span className="dim cfg-stats">{cfg ? `${cfg.blocks.length} blocks · ${cfg.edges.length} edges` : ''}</span>
       </div>
       <div ref={canvasRef} className="cfg-canvas" onWheel={onWheel} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}>
+        {cfgError ? <Empty>{cfgError}</Empty> : <>
         <svg width="100%" height="100%">
           <defs><marker id="cfg-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--text-tertiary)" /></marker></defs>
           <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
@@ -328,6 +349,7 @@ export function CfgPanel() {
         <div className="cfg-terminator-legend">
           {TERMINATORS.map(({ type, label }) => <span key={type}><i className={`cfg-legend-${type}`} />{label}</span>)}
         </div>
+        </>}
       </div>
     </div>
   );

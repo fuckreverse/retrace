@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTraceStore } from '@/store/traceStore';
 import { useTaskStore, selectRunningTasks } from '@/store/taskStore';
-import { subscribeDataSource, type DataSource } from '@/api/service';
+import { subscribeDataSource, api, type DataSource } from '@/api/service';
 import { selectTab } from '@/lib/tabRouting';
 
 /** 后台任务运行指示器：spinner + 数量 + 聚合进度条，点击跳转 Analysis 面板。 */
@@ -52,15 +52,36 @@ export function StatusBar() {
   const [source, setSource] = useState<DataSource>(useTraceStore.getState().dataSource);
   const bookmarks = useTraceStore((s) => s.bookmarks);
   const searchResults = useTraceStore((s) => s.searchResults);
+  // 当前指令 PC 与所在函数（逆向工作流高频信息）
+  const [pc, setPc] = useState<string | null>(null);
+  const [fnName, setFnName] = useState<string | null>(null);
 
   // 数据源变化实时联动（live ↔ mock）：降级到 mock 不再静默，
   // 避免用户把 mock 假数据当成真实分析结果。
   useEffect(() => subscribeDataSource(setSource), []);
 
+  // cur 变化时一次性拉取 PC 与调用栈：disasm 取当前指令 PC，
+  // callStack 取栈底帧（最外层函数）作为所在函数。cancelled 标志防竞态。
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([api.disasm(cur, 1), api.callStack(cur)])
+      .then(([dis, frames]) => {
+        if (cancelled) return;
+        setPc(dis.rows[0]?.pc ?? null);
+        setFnName(frames[frames.length - 1]?.func_name ?? null);
+      })
+      .catch(() => { if (!cancelled) { setPc(null); setFnName(null); } });
+    return () => { cancelled = true; };
+  }, [cur]);
+
   return (
     <div className="statusbar">
       <span className="sb-item">arch <b className="mono">{info?.arch ?? '—'}</b></span>
       <span className="sb-item">inst <b className="mono">#{cur}</b> / {total.toLocaleString()}</span>
+      <span className="sb-item" title={pc ?? undefined}>pc <b className="mono">{pc ?? '—'}</b></span>
+      <span className="sb-item">
+        fn <b className="mono sb-fn" title={fnName ?? undefined}>{fnName ?? '—'}</b>
+      </span>
       <span className="sb-item">书签 <b>{bookmarks.size}</b></span>
       {searchResults.length > 0 && (
         <span className="sb-item">搜索命中 <b>{searchResults.length}</b></span>

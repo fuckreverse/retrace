@@ -7,6 +7,7 @@ import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { CallFrame } from '@/types/tenet';
+import { copyText } from '@/lib/clipboard';
 import { Empty } from '@/components/ui';
 import './lists.css';
 
@@ -37,20 +38,31 @@ export function CallStackPanel() {
               >
                 <span className="frame-marker">{i === frames.length - 1 ? '▸' : '·'}</span>
                 <span className={clsx('frame-name mono', f.func_name.startsWith('-[') && 'objc-name')}>{f.func_name}</span>
+                <span className="frame-pc dim mono">{f.func_pc}</span>
                 <span className="frame-at dim mono">@{f.call_inst_id}</span>
               </div>
             </ContextMenu.Trigger>
             <ContextMenu.Portal>
               <ContextMenu.Content className="ctx-menu">
+                <ContextMenu.Item
+                  className="ctx-item"
+                  onSelect={() => void copyText(
+                    frames.map((fr) => `${'  '.repeat(fr.depth)}${fr.func_name}`).join('\n'),
+                    '调用栈',
+                  )}
+                >
+复制整个调用栈
+</ContextMenu.Item>
+                <ContextMenu.Separator className="ctx-sep" />
                 <ContextMenu.Item className="ctx-item" onSelect={() => navigateTo(f.call_inst_id)}>
-                  Navigate to Call Site
-                </ContextMenu.Item>
-                <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.func_name)}>
-                  Copy Function Name
-                </ContextMenu.Item>
-                <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(String(f.call_inst_id))}>
-                  Copy Call Inst ID
-                </ContextMenu.Item>
+跳转到调用点
+</ContextMenu.Item>
+                <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(f.func_name, '函数名')}>
+复制函数名
+</ContextMenu.Item>
+                <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(String(f.call_inst_id), '调用点指令号')}>
+复制调用点指令号
+</ContextMenu.Item>
               </ContextMenu.Content>
             </ContextMenu.Portal>
           </ContextMenu.Root>

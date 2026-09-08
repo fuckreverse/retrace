@@ -6,6 +6,8 @@ import { clsx } from 'clsx';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
+import { copyText } from '@/lib/clipboard';
+import { openInHexDump } from '@/lib/hexLink';
 import type { RegsResult } from '@/types/tenet';
 import './registers.css';
 
@@ -17,7 +19,6 @@ const SPECIAL = ['fp', 'lr', 'sp', 'pc'];
 
 export function RegistersPanel() {
   const cur = useTraceStore((s) => s.currentInst);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
   const [regs, setRegs] = useState<RegsResult | null>(null);
   const [prev, setPrev] = useState<RegsResult | null>(null);
   const [written, setWritten] = useState<Set<string>>(new Set());
@@ -46,18 +47,22 @@ export function RegistersPanel() {
     return (
       <ContextMenu.Root key={name}>
         <ContextMenu.Trigger asChild>
-          <div className={clsx('reg-cell', isWrite && 'reg-write', changed && !isWrite && 'reg-changed')}>
+          <div
+            className={clsx('reg-cell', isWrite && 'reg-write', changed && !isWrite && 'reg-changed')}
+            // 双击寄存器 cell 直接复制值（快捷操作，与右键 Copy Value 等价）
+            onDoubleClick={() => void copyText(val, '寄存器值')}
+          >
             <span className="reg-name">{name}</span>
             <span className="reg-val mono">{val}</span>
           </div>
         </ContextMenu.Trigger>
         <ContextMenu.Portal>
           <ContextMenu.Content className="ctx-menu">
-            <ContextMenu.Item className="ctx-item" onSelect={() => setHexAddr(val)}>
-              Open Value in Hex Dump
+            <ContextMenu.Item className="ctx-item" onSelect={() => openInHexDump(val)}>
+              在 Hex Dump 打开该值
             </ContextMenu.Item>
-            <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(val)}>
-              Copy Value
+            <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(val, '寄存器值')}>
+              复制值
             </ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Portal>

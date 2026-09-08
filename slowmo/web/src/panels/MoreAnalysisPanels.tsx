@@ -31,8 +31,8 @@ export function ConstantsPanel() {
   return (
     <div className="list-panel">
       <div className="list-toolbar">
-        <Input placeholder="Filter constants…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} constants</span>
+        <Input placeholder="过滤常量…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
+        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} 个常量</span>
       </div>
       <div className="list-scroll">
         <table className="data-table">

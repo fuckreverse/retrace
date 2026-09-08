@@ -35,7 +35,7 @@ export function PatternsPanel() {
         {['All', 'Crypto', 'AntiDebug', 'Other'].map((c) => (
           <Chip key={c} active={cat === c} onClick={() => setCat(c)}>{c}</Chip>
         ))}
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} matches</span>
+        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} 处命中</span>
       </div>
       <div className="list-scroll">
         <table className="data-table">
@@ -74,8 +74,8 @@ export function StringsPanel() {
   return (
     <div className="list-panel">
       <div className="list-toolbar">
-        <Input placeholder="Filter strings…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
-        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} strings</span>
+        <Input placeholder="过滤字符串…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
+        <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} 条字符串</span>
       </div>
       <div className="list-scroll">
         <table className="data-table">
@@ -111,7 +111,7 @@ export function ObjcPanel() {
   return (
     <div className="list-panel">
       <div className="list-toolbar">
-        <Input placeholder="Filter class/selector…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
+        <Input placeholder="过滤类 / selector…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 200 }} />
         <span className="list-count" style={{ marginLeft: 'auto' }}>{filtered.length} messages</span>
       </div>
       <div className="list-scroll">
@@ -292,7 +292,7 @@ export function CallGraphPanel() {
         <Chip active={view === 'graph'} onClick={() => setView('graph')}>Graph</Chip>
         <Chip active={view === 'table'} onClick={() => setView('table')}>Table</Chip>
         {view === 'graph' && <>
-          <Input aria-label="搜索函数" placeholder="Search function…" value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') locateSearch(); }} style={{ width: 160 }} />
+          <Input aria-label="搜索函数" placeholder="搜索函数…" value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') locateSearch(); }} style={{ width: 160 }} />
           <div className="toolbar-sep" />
           <IconButton title="放大" onClick={() => setZoom((z) => Math.min(4, z + 0.2))}><Icon.Forward /></IconButton>
           <span className="dim" style={{ width: 46, textAlign: 'center' }}>{(zoom * 100).toFixed(0)}%</span>

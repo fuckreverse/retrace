@@ -30,6 +30,11 @@
 .inst-search .input {
   padding-left: 28px;
 }
+.inst-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
 .inst-search-nav {
   display: flex;
   align-items: center;
@@ -60,6 +65,8 @@
   cursor: pointer;
   border-left: 2px solid transparent;
 }
+/* 行悬停反馈：使用主题 hover 变量，明暗主题均自适应；
+   特异性 (0,2,0) 高于状态类（.inst-cur 等 (0,1,0)），悬停时覆盖底色 */
 .inst-row:hover { background: var(--bg-hover); }
 .inst-row > span {
   min-width: 0;

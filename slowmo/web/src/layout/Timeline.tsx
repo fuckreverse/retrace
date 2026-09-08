@@ -17,6 +17,8 @@ export function Timeline() {
   const cur = useTraceStore((s) => s.currentInst);
   const bookmarks = useTraceStore((s) => s.bookmarks);
   const taintFwd = useTraceStore((s) => s.taintForward);
+  const taintBwd = useTraceStore((s) => s.taintBackward);
+  const producerChain = useTraceStore((s) => s.producerChain);
   const searchResults = useTraceStore((s) => s.searchResults);
   const viewportStart = useTraceStore((s) => s.viewportStart);
   const viewportEnd = useTraceStore((s) => s.viewportEnd);
@@ -82,6 +84,13 @@ export function Timeline() {
       ctx.strokeRect(vx1 + 0.5, 0.5, viewportWidth - 1, h - 1);
     }
 
+    // 生产链(橙色)：位于前向污点泳道上方，避免与绿色/金色混淆
+    ctx.fillStyle = cssVar('--hl-imm') || '#ffa657';
+    producerChain.forEach((id) => {
+      const x = (id / total) * w;
+      ctx.fillRect(x, h * 0.6, 1.5, h * 0.08);
+    });
+
     // 污点覆盖(绿色标记)
     ctx.fillStyle = cssVar('--hl-read') || '#3fb950';
     taintFwd.forEach((id) => {
@@ -89,11 +98,18 @@ export function Timeline() {
       ctx.fillRect(x, h * 0.68, 1.5, h * 0.14);
     });
 
-    // 搜索命中(金色)
+    // 反向污点(紫色)：紧邻前向污点下方，搜索泳道上方
+    ctx.fillStyle = cssVar('--hl-call') || '#a371f7';
+    taintBwd.forEach((id) => {
+      const x = (id / total) * w;
+      ctx.fillRect(x, h * 0.82, 1.5, h * 0.08);
+    });
+
+    // 搜索命中(金色)：下移至时间线底部，为反向污点腾出泳道
     ctx.fillStyle = cssVar('--warning') || '#d29922';
     searchResults.forEach((id) => {
       const x = (id / total) * w;
-      ctx.fillRect(x, h * 0.84, 1.5, h * 0.12);
+      ctx.fillRect(x, h * 0.9, 1.5, h * 0.1);
     });
 
     // 书签(青)
@@ -133,7 +149,10 @@ export function Timeline() {
     ctx.beginPath();
     ctx.arc(cx, h / 2, 3, 0, Math.PI * 2);
     ctx.fill();
-  }, [total, cur, bookmarks, taintFwd, searchResults, viewportStart, viewportEnd, windows, hover]);
+  }, [
+    total, cur, bookmarks, taintFwd, taintBwd, producerChain,
+    searchResults, viewportStart, viewportEnd, windows, hover,
+  ]);
 
   const instAtClientX = useCallback((clientX: number) => {
     const rect = ref.current?.getBoundingClientRect();
@@ -216,8 +235,9 @@ export function Timeline() {
     const windowStat = windows.find(
       (win) => instId >= win.window_start && instId <= win.window_end,
     );
+    // 书签检测半径 ±6px：三角形太小，±3px 命中区过窄难以 hover
     const bookmark = [...bookmarks].some(
-      (id) => Math.abs((id / Math.max(1, total)) * rect.width - x) <= 3,
+      (id) => Math.abs((id / Math.max(1, total)) * rect.width - x) <= 6,
     );
     setHover({ x, instId, instCount: windowStat?.inst_count, bookmark });
   };
@@ -230,6 +250,21 @@ export function Timeline() {
       onPointerLeave={() => { if (!dragging.current) setHover(null); }}
     >
       <canvas ref={ref} />
+      {/* 泳道图例：色块颜色与 canvas 绘制保持一致 */}
+      <div className="timeline-legend">
+        <span><i style={{ background: 'var(--accent)' }} />密度热力</span>
+        <span><i style={{ background: 'var(--accent)', borderRadius: 0, clipPath: 'polygon(50% 0, 100% 100%, 0 100%)' }} />书签</span>
+        <span><i style={{ background: 'var(--hl-read)' }} />污点(前向)</span>
+        <span><i style={{ background: 'var(--hl-imm)' }} />生产链</span>
+        <span><i style={{ background: 'var(--hl-call)' }} />污点(反向)</span>
+        <span><i style={{ background: 'var(--warning)' }} />搜索命中</span>
+        <span>
+          <i style={{
+            background: 'rgba(255, 255, 255, 0.08)',
+            border: '1px solid rgba(255, 255, 255, 0.35)',
+          }} />视口
+        </span>
+      </div>
       {hover && (
         <div className="timeline-tooltip" style={{ left: hover.x }}>
           <span>inst_id: {hover.instId}</span>

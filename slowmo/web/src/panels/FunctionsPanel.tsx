@@ -1,12 +1,14 @@
 /**
  * Functions 面板 —— 函数列表 + 排序 + 过滤。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { FunctionEntry } from '@/types/tenet';
+import { copyText } from '@/lib/clipboard';
+import { openInHexDump } from '@/lib/hexLink';
 import { Input } from '@/components/ui';
 import './lists.css';
 
@@ -17,12 +19,33 @@ export function FunctionsPanel() {
   const [filter, setFilter] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('calls');
   const [asc, setAsc] = useState(false);
+  // 点击选中的函数（仅本地视图状态，用于行高亮）
+  const [selectedPc, setSelectedPc] = useState<string | null>(null);
+  // 当前指令所在函数（栈底帧），由 cur 反向联动得出
+  const [currentFuncPc, setCurrentFuncPc] = useState<string | null>(null);
   const navigateTo = useTraceStore((s) => s.navigateTo);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
+  const cur = useTraceStore((s) => s.currentInst);
+  const tbodyRef = useRef<HTMLTableSectionElement | null>(null);
 
   useEffect(() => {
     api.functions().then(setFuncs);
   }, []);
+
+  // 反向联动：cur 变化时查调用栈，取栈底帧的 func_pc 作为"当前所在函数"
+  useEffect(() => {
+    let cancelled = false;
+    api.callStack(cur)
+      .then((frames) => {
+        if (cancelled) return;
+        // 栈底帧（最后一项）即当前正在执行的函数
+        const top = frames.length > 0 ? frames[frames.length - 1] : undefined;
+        setCurrentFuncPc(top ? top.func_pc : null);
+      })
+      .catch(() => {
+        if (!cancelled) setCurrentFuncPc(null);
+      });
+    return () => { cancelled = true; };
+  }, [cur]);
 
   const rows = useMemo(() => {
     let r = funcs.filter((f) => f.name.toLowerCase().includes(filter.toLowerCase()));
@@ -34,6 +57,16 @@ export function FunctionsPanel() {
     });
     return r;
   }, [funcs, filter, sortKey, asc]);
+
+  // 当前所在函数行变化时滚动到可视区，避免手动翻找
+  // （放在 rows 之后声明：依赖数组在渲染期求值，且过滤/排序变化后行可能重建）
+  useEffect(() => {
+    if (!currentFuncPc || !tbodyRef.current) return;
+    const el = tbodyRef.current.querySelector<HTMLTableRowElement>(
+      `tr[data-pc="${CSS.escape(currentFuncPc)}"]`,
+    );
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [currentFuncPc, rows]);
 
   const toggleSort = (k: SortKey) => {
     if (k === sortKey) setAsc(!asc);
@@ -48,8 +81,8 @@ export function FunctionsPanel() {
   return (
     <div className="list-panel">
       <div className="list-toolbar">
-        <span className="list-count">Discovered {funcs.length} functions</span>
-        <Input placeholder="Filter…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 160, marginLeft: 'auto' }} />
+        <span className="list-count">已识别 {funcs.length} 个函数</span>
+        <Input placeholder="过滤…" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 160, marginLeft: 'auto' }} />
       </div>
       <div className="list-scroll">
         <table className="data-table">
@@ -60,11 +93,16 @@ export function FunctionsPanel() {
               <th className="sortable" style={{ width: 64, textAlign: 'right' }} onClick={() => toggleSort('insts')}>Insts {sortKey === 'insts' && (asc ? '▲' : '▼')}</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody ref={tbodyRef}>
             {rows.map((f) => (
               <ContextMenu.Root key={f.pc}>
                 <ContextMenu.Trigger asChild>
-                  <tr onClick={() => void gotoFunc(f.pc)} onDoubleClick={() => setHexAddr(f.pc)}>
+                  <tr
+                    data-pc={f.pc}
+                    className={clsx(f.pc === selectedPc && 'row-selected', f.pc === currentFuncPc && 'row-current')}
+                    onClick={() => { setSelectedPc(f.pc); void gotoFunc(f.pc); }}
+                    onDoubleClick={() => openInHexDump(f.pc)}
+                  >
                     <td className={clsx('mono', f.name.startsWith('-[') && 'objc-name')}>{f.name}</td>
                     <td className="mono num">{f.calls}</td>
                     <td className="mono num dim">{f.insts}</td>
@@ -73,17 +111,17 @@ export function FunctionsPanel() {
                 <ContextMenu.Portal>
                   <ContextMenu.Content className="ctx-menu">
                     <ContextMenu.Item className="ctx-item" onSelect={() => void gotoFunc(f.pc)}>
-                      Navigate to Function
+                      跳转到函数
                     </ContextMenu.Item>
-                    <ContextMenu.Item className="ctx-item" onSelect={() => setHexAddr(f.pc)}>
-                      Open in Hex Dump
+                    <ContextMenu.Item className="ctx-item" onSelect={() => openInHexDump(f.pc)}>
+                      在 Hex Dump 打开
                     </ContextMenu.Item>
                     <ContextMenu.Separator className="ctx-sep" />
-                    <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.name)}>
-                      Copy Function Name
+                    <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(f.name, '函数名')}>
+                      复制函数名
                     </ContextMenu.Item>
-                    <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(f.pc)}>
-                      Copy Address
+                    <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(f.pc, '地址')}>
+                      复制地址
                     </ContextMenu.Item>
                   </ContextMenu.Content>
                 </ContextMenu.Portal>

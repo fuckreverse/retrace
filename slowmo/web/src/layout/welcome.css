@@ -69,6 +69,7 @@
 /* ---- Content grid (drop zone + recent list) ---- */
 .welcome-content {
   display: flex;
+  flex-wrap: wrap; /* 允许换行：浏览器模式下连接后端卡片独占一行 */
   gap: var(--space-8);
   max-width: 720px;
   width: 100%;
@@ -135,6 +136,76 @@
   background: var(--warning-soft, rgba(210, 153, 34, 0.15));
   color: var(--warning, #d29922);
   border: 1px solid var(--warning, #d29922);
+}
+
+/* ---- 浏览器模式：连接本机后端 ----
+ * 低调卡片，风格与 welcome-drop-zone 协调 */
+.welcome-connect {
+  flex-basis: 100%; /* 独占一行（配合 .welcome-content 的 flex-wrap） */
+  margin-top: 0; /* 行间由 gap 控制 */
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  width: 100%;
+}
+
+.welcome-connect-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.welcome-connect-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: stretch;
+}
+
+.welcome-connect-port {
+  width: 110px;
+  padding: 0 var(--space-3);
+  height: 32px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+.welcome-connect-port:focus {
+  border-color: var(--accent-border);
+}
+
+.welcome-connect-btn {
+  height: 32px;
+  padding: 0 var(--space-5);
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: #fff;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+.welcome-connect-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.welcome-connect-btn:disabled {
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+}
+
+.welcome-connect-hint {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
 }
 
 .welcome-drop-icon {

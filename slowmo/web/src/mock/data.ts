@@ -316,15 +316,22 @@ export function mockCfg(): CfgResult {
     'conditional_branch', 'call', 'return',
   ];
   const nBlocks = 7;
+  // 块地址基与 mockInst 完全对齐：mockInst 的 pc 公式中 `-0x100000000n + IMAGE_BASE`
+  // 相互抵消，实际指令 pc = FUNCS[func].pc + 偏移(0x0~0xFC，4 字节对齐)。
+  // 这里步进 0x24 字节、每块覆盖 9 条指令（end_pc 为块内最后一条指令的 pc，闭区间），
+  // 7 块恰好连续铺满 FUNCS[1] 的 [pc, pc+0xFC] 整个地址范围（末块收尾多覆盖 1 条），
+  // 保证 FUNCS[1] 范围内任意指令的 pc 都能被 CfgPanel.blockForPc 命中。
+  const BLOCK_STRIDE = 0x24;
   for (let i = 0; i < nBlocks; i++) {
-    const pc = FUNCS[1].pc + BigInt(i * 0x20) - 0x100000000n + IMAGE_BASE;
+    const pc = FUNCS[1].pc + BigInt(i * BLOCK_STRIDE);
+    const endPc = i === nBlocks - 1 ? pc + BigInt(BLOCK_STRIDE) : pc + 0x20n;
     blocks.push({
       pc: hex(pc),
       x: 60 + (i % 3) * 240,
       y: 40 + Math.floor(i / 3) * 150,
       width: 200,
       height: 90,
-      end_pc: hex(pc + 8n),
+      end_pc: hex(endPc),
       executions: 1 + Math.floor(r() * 500),
       terminator: terminators[i],
       disasm: [
@@ -358,7 +365,8 @@ export function mockCfg(): CfgResult {
     format: 'json',
     scope: 'function',
     function: {
-      entry_pc: hex(FUNCS[1].pc - 0x100000000n + IMAGE_BASE),
+      // 与块基址一致：mockInst 中 `-0x100000000n + IMAGE_BASE` 相互抵消，实际入口即 FUNCS[1].pc
+      entry_pc: hex(FUNCS[1].pc),
       name: FUNCS[1].name,
       total_calls: 37,
     },
@@ -373,12 +381,16 @@ export function mockCallStack(instId: number): CallFrame[] {
   const r = rng(instId);
   const depth = 1 + Math.floor(r() * 4);
   const frames: CallFrame[] = [];
+  // 以当前 instId 为基准逐帧回退：每帧回退 97~193 条指令（rng 确定性抖动），
+  // 保证各帧 call_inst_id 严格递减、互不相同且均 < instId，并随 instId 变化。
+  let cur = instId;
   for (let i = 0; i < depth; i++) {
+    cur -= 97 + Math.floor(r() * 97);
     const f = FUNCS[Math.floor(r() * FUNCS.length)];
     frames.push({
       func_name: f.name,
       func_pc: hex(f.pc - 0x100000000n + IMAGE_BASE),
-      call_inst_id: Math.max(0, instId - Math.floor(r() * 2000) - i * 100),
+      call_inst_id: Math.max(0, cur),
       depth: i,
     });
   }

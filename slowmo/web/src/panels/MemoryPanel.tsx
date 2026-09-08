@@ -6,13 +6,14 @@ import { clsx } from 'clsx';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
+import { copyText } from '@/lib/clipboard';
+import { openInHexDump } from '@/lib/hexLink';
 import type { MemAccess } from '@/types/tenet';
 import { Empty } from '@/components/ui';
 import './memory.css';
 
 export function MemoryPanel() {
   const cur = useTraceStore((s) => s.currentInst);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
   const [accesses, setAccesses] = useState<MemAccess[]>([]);
 
   useEffect(() => {
@@ -32,29 +33,29 @@ export function MemoryPanel() {
       {accesses.map((a, i) => (
         <ContextMenu.Root key={i}>
           <ContextMenu.Trigger asChild>
-            <div className="mem-row" onDoubleClick={() => setHexAddr(a.addr)}>
+            <div className="mem-row" onDoubleClick={() => openInHexDump(a.addr)}>
               <span className={clsx('mem-type', a.type === 'READ' ? 'mem-read' : 'mem-write')}>
                 {a.type}
               </span>
               <span className="mem-field">
-                addr <span className="mono mem-addr" onClick={() => setHexAddr(a.addr)}>{a.addr}</span>
+                addr <span className="mono mem-addr" onClick={() => openInHexDump(a.addr)}>{a.addr}</span>
               </span>
               <span className="mem-field">size <span className="mono">{a.size}</span></span>
               <span className="mem-field">val <span className="mono mem-valcol">{a.value}</span></span>
-              <button className="mem-hex-btn" onClick={() => setHexAddr(a.addr)}>Hex</button>
+              <button className="mem-hex-btn" onClick={() => openInHexDump(a.addr)}>Hex</button>
             </div>
           </ContextMenu.Trigger>
           <ContextMenu.Portal>
             <ContextMenu.Content className="ctx-menu">
-              <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(a.addr)}>
-                Copy Address
+              <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(a.addr, '内存地址')}>
+                复制地址
               </ContextMenu.Item>
-              <ContextMenu.Item className="ctx-item" onSelect={() => navigator.clipboard?.writeText(a.value)}>
-                Copy Value
+              <ContextMenu.Item className="ctx-item" onSelect={() => void copyText(a.value, '内存值')}>
+                复制值
               </ContextMenu.Item>
               <ContextMenu.Separator className="ctx-sep" />
-              <ContextMenu.Item className="ctx-item" onSelect={() => setHexAddr(a.addr)}>
-                Open in Hex Dump
+              <ContextMenu.Item className="ctx-item" onSelect={() => openInHexDump(a.addr)}>
+                在 Hex Dump 打开
               </ContextMenu.Item>
             </ContextMenu.Content>
           </ContextMenu.Portal>

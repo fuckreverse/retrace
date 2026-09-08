@@ -9,12 +9,18 @@ import { useTraceStore } from '@/store/traceStore';
 import { api } from '@/api/service';
 import type { InstRow } from '@/types/tenet';
 import { Icon } from '@/components/icons';
-import { IconButton, Input } from '@/components/ui';
+import { IconButton, Input, Chip } from '@/components/ui';
 import { selectTab } from '@/lib/tabRouting';
+import { copyText } from '@/lib/clipboard';
+import { openInHexDump } from '@/lib/hexLink';
+import { followCall, followReturn } from '@/lib/nav';
 import { useSettingsStore } from '@/store/settingsStore';
 import './instructions.css';
 
-const TAINT_FORWARD_REGS = [
+interface TaintReg { name: string; index: number; }
+
+/** 无操作数寄存器时的回退污点寄存器列表 */
+const DEFAULT_TAINT_REGS: TaintReg[] = [
   { name: 'x0', index: 0 },
   { name: 'x1', index: 1 },
   { name: 'x2', index: 2 },
@@ -24,7 +30,46 @@ const TAINT_FORWARD_REGS = [
   { name: 'x20', index: 20 },
   { name: 'x21', index: 21 },
   { name: 'lr', index: 30 },
-] as const;
+];
+
+// 操作数中的 AArch64 寄存器（word 边界，形如 "x0, [sp, #0x10]"；
+// 立即数 #0x10 中的 "x10" 前是数字字符、不构成边界，不会误匹配）
+const OPERAND_REG_RE = /\b(x[0-9]{1,2}|w[0-9]{1,2}|xzr|wzr|lr|fp|sp|nzcv)\b/g;
+
+/** 寄存器别名归一化并映射 regIndex（wN→xN、lr→30、fp→29、sp/xzr→31）；nzcv 无独立 regIndex，不参与污点。 */
+function normalizeTaintReg(raw: string): TaintReg | null {
+  const lower = raw.toLowerCase();
+  if (lower === 'nzcv') return null;
+  if (lower === 'xzr' || lower === 'wzr') return { name: 'xzr', index: 31 };
+  if (lower === 'lr') return { name: 'x30', index: 30 };
+  if (lower === 'fp') return { name: 'x29', index: 29 };
+  if (lower === 'sp') return { name: 'sp', index: 31 };
+  const m = /^[xw]([0-9]{1,2})$/.exec(lower);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n <= 30) return { name: `x${n}`, index: n };
+  }
+  return null;
+}
+
+/** 从操作数字符串按出现顺序提取实际出现的寄存器（去重、wN 归一化为 xN）。 */
+function extractOperandRegs(operands: string | undefined): TaintReg[] {
+  if (!operands) return [];
+  const seen = new Set<string>();
+  const out: TaintReg[] = [];
+  for (const m of operands.matchAll(OPERAND_REG_RE)) {
+    const reg = normalizeTaintReg(m[1]);
+    if (!reg || seen.has(reg.name)) continue;
+    seen.add(reg.name);
+    out.push(reg);
+  }
+  return out;
+}
+
+/** 助记符过滤：内存访问 / 分支（前缀匹配，兼容 "b.eq" 这类条件后缀形式） */
+const MNEMONIC_MEM_RE = /^(ldr|str|ldp|stp|ldurb|sturb|ldur|stur|ldrb|strb|ldrh|strh|ldrs|cas|swp)/;
+const MNEMONIC_BRANCH_RE = /^(b\.|b|bl|br|blr|ret|cbz|cbnz|tbz|tbnz)/;
+type InstFilter = 'all' | 'mem' | 'branch';
 
 const ROW_H_FALLBACK = 22; // 与 tokens.css 默认 --row-h 一致，CSS 变量不可用时兜底
 const OVERSCAN = 12;
@@ -55,9 +100,9 @@ export function InstructionsPanel() {
   const searchCurrent = useTraceStore((s) => s.searchCurrent);
   const navigateTo = useTraceStore((s) => s.navigateTo);
   const toggleBookmark = useTraceStore((s) => s.toggleBookmark);
-  const setHexAddr = useTraceStore((s) => s.setHexAddr);
   const setViewport = useTraceStore((s) => s.setViewport);
   const setTaintFwd = useTraceStore((s) => s.setTaintForward);
+  // setHexAddr 不再直接使用：Hex 联动统一走 lib/hexLink 的 openInHexDump
   const searchNext = useTraceStore((s) => s.searchNext);
   const searchPrev = useTraceStore((s) => s.searchPrev);
   const clearSearch = useTraceStore((s) => s.clearSearch);
@@ -70,6 +115,10 @@ export function InstructionsPanel() {
   const [rows, setRows] = useState<Map<number, InstRow>>(new Map());
   const [searchInput, setSearchInput] = useState('');
   const [taintBusy, setTaintBusy] = useState<number | null>(null);
+  // 最近一次正向污点的规模反馈（工具栏展示，可手动清除高亮）
+  const [lastTaint, setLastTaint] = useState<{ reg: string; count: number } | null>(null);
+  // 助记符过滤 chips（与线程过滤一致：跳过渲染、不改变虚拟滚动坐标）
+  const [filter, setFilter] = useState<InstFilter>('all');
   const [rowH, setRowH] = useState(ROW_H_FALLBACK);
 
   // density 变化时（含首帧）重新读取实际生效的行高，保持与 CSS 一致
@@ -142,12 +191,12 @@ export function InstructionsPanel() {
     try {
       // 真实调用后端 SearchForward（对齐 GUI Search 弹窗语义：从当前游标开始
       // 正向线性扫描反汇编文本，子串匹配 mnemonic+operands）。
-      const hits = await api.searchForward(q, 0);
+      const hits = await api.searchForward(q, cur);
       setSearch(q, hits);
     } finally {
       setSearching(false);
     }
-  }, [searchInput, clearSearch, setSearch]);
+  }, [searchInput, cur, clearSearch, setSearch]);
 
   const rowClass = (id: number) => {
     if (id === cur) return 'inst-cur';
@@ -159,11 +208,13 @@ export function InstructionsPanel() {
   };
 
   /** 从指定指令和寄存器开始运行后端 taint_forward pass。 */
-  const runTaintForward = useCallback(async (instId: number, regIndex: number) => {
+  const runTaintForward = useCallback(async (instId: number, regIndex: number, regName: string) => {
     setTaintBusy(instId);
     try {
       const steps = await api.taintForward(regIndex, instId);
       setTaintFwd(steps.map((s) => s.inst_id));
+      // 污点完成后的规模反馈（执行新污点时覆盖旧值）
+      setLastTaint({ reg: regName, count: steps.length });
     } finally {
       setTaintBusy(null);
     }
@@ -172,6 +223,8 @@ export function InstructionsPanel() {
   const runTaintBackward = useCallback((instId: number) => {
     navigateTo(instId);
     selectTab('center-bottom', 'backtaint');
+    // 通知 BackwardTaintPanel（跨面板契约：监听同名自定义事件）
+    window.dispatchEvent(new CustomEvent('tenet:backward-taint', { detail: { instId } }));
   }, [navigateTo]);
 
   const threadFilterActive = useTraceStore((s) => s.threadFilterIds.length > 0);
@@ -181,6 +234,14 @@ export function InstructionsPanel() {
   const visible: number[] = [];
   for (let i = first; i < last; i++) {
     if (threadFilterActive && !includesFn(i)) continue;
+    // 助记符过滤：行未加载（row 为 undefined）时不过滤，避免过滤态下大片空白
+    if (filter !== 'all') {
+      const row = rows.get(i);
+      if (row) {
+        const mnem = row.mnemonic ?? '';
+        if (filter === 'mem' ? !MNEMONIC_MEM_RE.test(mnem) : !MNEMONIC_BRANCH_RE.test(mnem)) continue;
+      }
+    }
     visible.push(i);
   }
 
@@ -196,6 +257,11 @@ export function InstructionsPanel() {
             onKeyDown={(e) => e.key === 'Enter' && doSearch()}
             style={{ width: 220 }}
           />
+        </div>
+        <div className="inst-filter">
+          <Chip active={filter === 'all'} onClick={() => setFilter('all')}>全部</Chip>
+          <Chip active={filter === 'mem'} onClick={() => setFilter('mem')}>内存访问</Chip>
+          <Chip active={filter === 'branch'} onClick={() => setFilter('branch')}>分支</Chip>
         </div>
         {searchResults.length > 0 && (
           <div className="inst-search-nav">
@@ -215,6 +281,16 @@ export function InstructionsPanel() {
         )}
         {searching && <span className="dim mono" style={{ marginLeft: 8 }}>搜索中…</span>}
         {taintBusy != null && <span className="dim mono" style={{ marginLeft: 8 }}>污点分析中…</span>}
+        {lastTaint && (
+          <>
+            <span className="mono dim" style={{ marginLeft: 8 }}>
+              污点 {lastTaint.reg}: {lastTaint.count} 条
+            </span>
+            <IconButton title="清除污点高亮" onClick={() => { setTaintFwd([]); setLastTaint(null); }}>
+              <Icon.Trash />
+            </IconButton>
+          </>
+        )}
       </div>
 
       <div
@@ -235,10 +311,12 @@ export function InstructionsPanel() {
                 hasBookmark={bookmarks.has(id)}
                 onClick={() => navigateTo(id)}
                 onBookmark={() => toggleBookmark(id)}
-                onHex={() => row && setHexAddr(row.pc)}
-                onTaint={(regIndex) => runTaintForward(id, regIndex)}
-                onBackwardTaint={() => runTaintBackward(id)}
-              />
+                onHex={() => row && openInHexDump(row.pc)}
+                onTaint={(regIndex, regName) => runTaintForward(id, regIndex, regName)}
+onBackwardTaint={() => runTaintBackward(id)}
+onFollowCall={row && /^bl\b/.test(row.mnemonic ?? '') ? () => void followCall(id) : undefined}
+onFollowReturn={row && /^ret\b/.test(row.mnemonic ?? '') ? () => void followReturn(id) : undefined}
+/>
             );
           })}
         </div>
@@ -248,7 +326,7 @@ export function InstructionsPanel() {
 }
 
 function InstRowView({
-  id, row, top, cls, hasBookmark, onClick, onBookmark, onHex, onTaint, onBackwardTaint,
+id, row, top, cls, hasBookmark, onClick, onBookmark, onHex, onTaint, onBackwardTaint, onFollowCall, onFollowReturn,
 }: {
   id: number;
   row?: InstRow;
@@ -258,9 +336,16 @@ function InstRowView({
   onClick: () => void;
   onBookmark: () => void;
   onHex: () => void;
-  onTaint: (regIndex: number) => void;
-  onBackwardTaint: () => void;
+onTaint: (regIndex: number, regName: string) => void;
+onBackwardTaint: () => void;
+/** 当前指令是 bl 时提供（跳到被调函数首次执行点） */
+onFollowCall?: () => void;
+/** 当前指令是 ret 时提供（跳回调用点下一条指令） */
+onFollowReturn?: () => void;
 }) {
+// 污点子菜单寄存器：优先取该行操作数中实际出现的寄存器，为空则回退默认列表
+  const extracted = extractOperandRegs(row?.operands);
+  const taintRegs = extracted.length > 0 ? extracted : DEFAULT_TAINT_REGS;
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>
@@ -280,20 +365,22 @@ function InstRowView({
       </ContextMenu.Trigger>
       <ContextMenu.Portal>
         <ContextMenu.Content className="ctx-menu">
-          <ContextMenu.Item className="ctx-item" onSelect={onClick}>Navigate Here</ContextMenu.Item>
+          <ContextMenu.Item className="ctx-item" onSelect={onClick}>跳转到此处</ContextMenu.Item>
+{onFollowCall && <ContextMenu.Item className="ctx-item" onSelect={onFollowCall}>跳转到被调函数</ContextMenu.Item>}
+{onFollowReturn && <ContextMenu.Item className="ctx-item" onSelect={onFollowReturn}>返回调用点</ContextMenu.Item>}
           <ContextMenu.Item className="ctx-item" onSelect={onBookmark}>
-            {hasBookmark ? 'Remove Bookmark' : 'Add Bookmark'}
+            {hasBookmark ? '移除书签' : '添加书签'}
           </ContextMenu.Item>
           <ContextMenu.Separator className="ctx-sep" />
           <ContextMenu.Sub>
-            <ContextMenu.SubTrigger className="ctx-item">Taint Forward From…</ContextMenu.SubTrigger>
+            <ContextMenu.SubTrigger className="ctx-item">正向污点：从此寄存器…</ContextMenu.SubTrigger>
             <ContextMenu.Portal>
               <ContextMenu.SubContent className="ctx-menu">
-                {TAINT_FORWARD_REGS.map((reg) => (
+                {taintRegs.map((reg) => (
                   <ContextMenu.Item
                     key={reg.name}
                     className="ctx-item"
-                    onSelect={() => onTaint(reg.index)}
+                    onSelect={() => onTaint(reg.index, reg.name)}
                   >
                     {reg.name}
                   </ContextMenu.Item>
@@ -301,14 +388,14 @@ function InstRowView({
               </ContextMenu.SubContent>
             </ContextMenu.Portal>
           </ContextMenu.Sub>
-          <ContextMenu.Item className="ctx-item" onSelect={onBackwardTaint}>Backward Taint from Here</ContextMenu.Item>
-          <ContextMenu.Item className="ctx-item" onSelect={onHex}>Open PC in Hex Dump</ContextMenu.Item>
+          <ContextMenu.Item className="ctx-item" onSelect={onBackwardTaint}>从此处反向污点</ContextMenu.Item>
+          <ContextMenu.Item className="ctx-item" onSelect={onHex}>在 Hex Dump 打开 PC</ContextMenu.Item>
           <ContextMenu.Separator className="ctx-sep" />
-          <ContextMenu.Item className="ctx-item" onSelect={() => row && navigator.clipboard?.writeText(row.pc)}>
-            Copy Address
+          <ContextMenu.Item className="ctx-item" onSelect={() => row && void copyText(row.pc, '地址')}>
+            复制地址
           </ContextMenu.Item>
-          <ContextMenu.Item className="ctx-item" onSelect={() => row && navigator.clipboard?.writeText(`${row.mnemonic} ${row.operands}`)}>
-            Copy Disassembly
+          <ContextMenu.Item className="ctx-item" onSelect={() => row && void copyText(`${row.mnemonic} ${row.operands}`, '反汇编')}>
+            复制反汇编
           </ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Portal>
