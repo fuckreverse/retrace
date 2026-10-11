@@ -284,7 +284,16 @@ static constexpr uint32_t XREF_BLOB_VERSION_V1 = 1u;
 
 // ─── XrefBitmapLoader ────────────────────────────────────────────────────────
 
+XrefBitmapLoader::~XrefBitmapLoader() {
+    if (file_) std::fclose(file_);
+}
+
 bool XrefBitmapLoader::open(const std::filesystem::path& p) {
+    std::lock_guard<std::mutex> lk(file_mutex_);
+    if (file_) {
+        std::fclose(file_);
+        file_ = nullptr;
+    }
     path = p;
     valid = false;
     table.clear();
