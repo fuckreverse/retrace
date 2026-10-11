@@ -25,143 +25,206 @@
       "name": "QBDI",
       "version": "bundled",
       "license": "Apache-2.0",
-      "license_files": ["../../../../../LICENSE.txt"]
+      "license_files": [
+        "third-party/qbdi/LICENSE.txt"
+      ]
     },
     {
       "name": "LLVM",
       "version": "19.1.5",
       "license": "Apache-2.0 WITH LLVM-exception",
-      "license_files": ["../../../../../LICENSE.txt"]
+      "license_files": [
+        "third-party/llvm/LICENSE.TXT"
+      ]
     },
     {
       "name": "Capstone",
       "version": "5.0.x",
       "license": "BSD-3-Clause",
-      "libraries": ["libcapstone.*.dylib"],
-      "license_files": ["../../../_deps/capstone-src/LICENSE.TXT"]
+      "libraries": [
+        "libcapstone.*.dylib"
+      ],
+      "license_files": [
+        "../../../_deps/capstone-src/LICENSE.TXT"
+      ]
     },
     {
       "name": "RocksDB",
       "version": "9.4.0",
       "license": "Apache-2.0",
-      "license_files": ["../../../_deps/rocksdb-src/LICENSE.Apache", "../../../_deps/rocksdb-src/LICENSE.leveldb"]
+      "license_files": [
+        "../../../_deps/rocksdb-src/LICENSE.Apache",
+        "../../../_deps/rocksdb-src/LICENSE.leveldb"
+      ]
     },
     {
       "name": "CRoaring",
       "version": "4.1.1",
       "license": "Apache-2.0 OR MIT",
-      "license_files": ["../../../_deps/roaring-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/roaring-src/LICENSE"
+      ]
     },
     {
       "name": "FTXUI",
       "version": "5.0.0",
       "license": "MIT",
-      "license_files": ["../../../_deps/ftxui-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/ftxui-src/LICENSE"
+      ]
     },
     {
       "name": "oneTBB",
       "version": "2023.0.0",
       "license": "Apache-2.0",
-      "license_files": ["../../../_deps/onetbb-src/LICENSE.txt"]
+      "license_files": [
+        "../../../_deps/onetbb-src/LICENSE.txt"
+      ]
     },
     {
       "name": "fmt",
       "version": "10.2.1",
       "license": "MIT",
-      "license_files": ["../../../_deps/fmt-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/fmt-src/LICENSE"
+      ]
     },
     {
       "name": "nlohmann/json",
       "version": "3.11.3",
       "license": "MIT",
-      "license_files": ["../../../_deps/nlohmann_json-src/LICENSE.MIT"]
+      "license_files": [
+        "../../../_deps/nlohmann_json-src/LICENSE.MIT"
+      ]
     },
     {
       "name": "FlatBuffers",
       "version": "25.2.10",
       "license": "Apache-2.0",
-      "license_files": ["../../../_deps/flatbuffers-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/flatbuffers-src/LICENSE"
+      ]
     },
     {
       "name": "uWebSockets",
       "version": "20.73.0",
       "license": "Apache-2.0",
-      "license_files": ["../../../_deps/uwebsockets-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/uwebsockets-src/LICENSE"
+      ]
     },
     {
       "name": "uSockets",
       "version": "0.8.8",
       "license": "Apache-2.0",
-      "license_files": ["../../../_deps/usockets-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/usockets-src/LICENSE"
+      ]
     },
     {
       "name": "ankerl::unordered_dense",
       "version": "4.4.0",
       "license": "MIT",
-      "license_files": ["../../../_deps/unordered_dense-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/unordered_dense-src/LICENSE"
+      ]
     },
     {
       "name": "zstd",
       "version": "1.5.6",
       "license": "BSD-3-Clause",
-      "license_files": ["../../../_deps/zstd-src/LICENSE"]
+      "license_files": [
+        "../../../_deps/zstd-src/LICENSE"
+      ]
     },
     {
       "name": "mimalloc",
       "version": "2.1.7",
       "license": "MIT",
-      "libraries": ["libmimalloc*.dylib"],
-      "license_files": ["../../../_deps/mimalloc-src/LICENSE"]
+      "libraries": [
+        "libmimalloc*.dylib"
+      ],
+      "license_files": [
+        "../../../_deps/mimalloc-src/LICENSE"
+      ]
     },
     {
       "name": "Triton",
       "version": "1.0.1599",
       "license": "Apache-2.0",
-      "libraries": ["libtriton.dylib"],
-      "license_files": ["../../../../../LICENSE.txt"],
+      "libraries": [
+        "libtriton.dylib"
+      ],
+      "license_files": [
+        "third-party/triton/LICENSE.txt"
+      ],
       "attribution": "Copyright Jonathan Salwan (University of Bordeaux, Quarkslab)"
     },
     {
       "name": "Z3",
       "version": "4.15.4",
       "license": "MIT",
-      "libraries": ["libz3.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/z3/LICENSE.txt"]
+      "libraries": [
+        "libz3.*.dylib"
+      ],
+      "license_files": [
+        "third-party/z3/LICENSE.txt"
+      ]
     },
     {
       "name": "YARA",
       "version": "4.5.5",
       "license": "BSD-3-Clause",
-      "libraries": ["libyara.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/yara/COPYING"]
+      "libraries": [
+        "libyara.*.dylib"
+      ],
+      "license_files": [
+        "third-party/yara/COPYING"
+      ]
     },
     {
       "name": "OpenSSL",
       "version": "3.x",
       "license": "Apache-2.0",
-      "libraries": ["libcrypto.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/openssl@3/LICENSE.txt"]
+      "libraries": [
+        "libcrypto.*.dylib"
+      ],
+      "license_files": [
+        "third-party/openssl/LICENSE.txt"
+      ]
     },
     {
       "name": "libmagic",
       "version": "5.46",
       "license": "BSD-2-Clause",
-      "libraries": ["libmagic.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/libmagic/COPYING"]
+      "libraries": [
+        "libmagic.*.dylib"
+      ],
+      "license_files": [
+        "third-party/libmagic/COPYING"
+      ]
     },
     {
       "name": "Jansson",
       "version": "2.15.0",
       "license": "MIT",
-      "libraries": ["libjansson.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/jansson/LICENSE"]
+      "libraries": [
+        "libjansson.*.dylib"
+      ],
+      "license_files": [
+        "third-party/jansson/LICENSE"
+      ]
     },
     {
       "name": "LZ4",
       "version": "1.10.0",
       "license": "BSD-2-Clause",
-      "libraries": ["liblz4.*.dylib"],
-      "license_files": ["/opt/homebrew/opt/lz4/LICENSE"]
+      "libraries": [
+        "liblz4.*.dylib"
+      ],
+      "license_files": [
+        "third-party/lz4/LICENSE"
+      ]
     }
   ]
 }

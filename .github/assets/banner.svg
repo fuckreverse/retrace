@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="420" viewBox="0 0 1600 420" role="img" aria-label="Retrace — record what a binary actually executed, replay it in slow motion">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0a0f1e"/>
+      <stop offset="1" stop-color="#16213d"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="0.5" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1d2b4a" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#8b9db8"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="420" fill="url(#bg)"/>
+  <rect width="1600" height="420" fill="url(#grid)" opacity="0.4"/>
+
+  <!-- decorative trace waveform (bottom-left) -->
+  <g fill="none" opacity="0.35">
+    <polyline points="90,368 170,368 170,404 288,404 288,368 348,368 348,386 408,386 408,368 496,368 496,404 584,404 584,368 664,368 664,386 730,386 730,368 810,368" stroke="#22d3ee" stroke-width="3"/>
+    <polyline points="90,332 190,332 190,404 300,404 300,368 360,368 360,350 430,350 430,404 540,404 540,386 610,386 610,404 700,404" stroke="#f59e0b" stroke-width="2" opacity="0.5"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="88" y="168" font-family="system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="118" font-weight="800" fill="#f0f6fc" letter-spacing="2">Retrace</text>
+  <rect x="94" y="192" width="300" height="6" rx="3" fill="url(#accent)"/>
+
+  <text x="90" y="248" font-family="system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="31" fill="#9fb0c9">Record what a binary actually executed.</text>
+  <text x="90" y="290" font-family="system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="31" fill="#9fb0c9">Replay it in slow motion.</text>
+
+  <!-- feature chips -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19">
+    <rect x="90" y="316" width="86" height="38" rx="10" fill="#101a30" stroke="#33415c"/>
+    <text x="133" y="341" text-anchor="middle" fill="#cbd5e1">QBDI</text>
+    <rect x="188" y="316" width="98" height="38" rx="10" fill="#101a30" stroke="#33415c"/>
+    <text x="237" y="341" text-anchor="middle" fill="#cbd5e1">Frida</text>
+    <rect x="298" y="316" width="172" height="38" rx="10" fill="#101a30" stroke="#33415c"/>
+    <text x="384" y="341" text-anchor="middle" fill="#cbd5e1">iOS · Android</text>
+    <rect x="482" y="316" width="124" height="38" rx="10" fill="#101a30" stroke="#33415c"/>
+    <text x="544" y="341" text-anchor="middle" fill="#cbd5e1">AArch64</text>
+  </g>
+
+  <!-- pipeline: dashcam -> trace.bin -> slowmo -->
+  <!-- dashcam box -->
+  <rect x="880" y="95" width="180" height="120" rx="18" fill="#111827" stroke="#f59e0b" stroke-width="2"/>
+  <g fill="none" stroke="#f59e0b" stroke-width="2.5">
+    <rect x="916" y="118" width="34" height="24" rx="5"/>
+    <circle cx="933" cy="130" r="8"/>
+    <path d="M950 122l12 8-12 8z" fill="#f59e0b" stroke="none"/>
+  </g>
+  <text x="970" y="180" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="33" font-weight="700" fill="#fbbf24">dashcam</text>
+  <text x="970" y="204" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#8b9db8">record</text>
+
+  <line x1="1072" y1="155" x2="1101" y2="155" stroke="#8b9db8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- trace.bin chip -->
+  <rect x="1113" y="127" width="140" height="56" rx="10" fill="#0d1526" stroke="#33415c" stroke-width="2"/>
+  <text x="1183" y="162" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="23" fill="#e2e8f0">trace.bin</text>
+  <text x="1183" y="212" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#5b6b85">zstd · self-contained</text>
+
+  <line x1="1265" y1="155" x2="1294" y2="155" stroke="#8b9db8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- slowmo box -->
+  <rect x="1306" y="95" width="180" height="120" rx="18" fill="#111827" stroke="#22d3ee" stroke-width="2"/>
+  <g fill="none" stroke="#22d3ee" stroke-width="2.5">
+    <circle cx="1348" cy="128" r="10"/>
+    <line x1="1356" y1="136" x2="1368" y2="148"/>
+  </g>
+  <text x="1400" y="180" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="33" font-weight="700" fill="#67e8f9">slowmo</text>
+  <text x="1400" y="204" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#8b9db8">analyze</text>
+
+  <!-- pipeline captions -->
+  <text x="970" y="248" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#5b6b85">QBDI · ObjC · JNI · syscalls</text>
+  <text x="1396" y="248" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#5b6b85">taint · CFG · patterns · MCP</text>
+
+  <!-- sample trace listing (right-bottom) -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#7dd3fc" opacity="0.55">
+    <text x="880" y="300">0x1001b2c0  add x0, x0, #1     ; x0: 0x29 → 0x2a</text>
+    <text x="880" y="330">0x1001b2c4  stp x29, x30, [sp, #0x30]</text>
+    <text x="880" y="360">0x1001b2c8  bl 0x1002a4e0      ; objc_msgSend</text>
+    <text x="880" y="390">0x1001b2cc  svc #0x80          ; write</text>
+  </g>
+</svg>

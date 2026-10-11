@@ -1,0 +1,86 @@
+name: Website
+
+# Website pipeline — tests and builds the Astro documentation site on every
+# change under website/, and deploys to Cloudflare Pages from main.
+#
+# Deploy requires two repository secrets (Settings → Secrets → Actions):
+#   CLOUDFLARE_API_TOKEN     — a token with Cloudflare Pages: Edit permission
+#   CLOUDFLARE_ACCOUNT_ID    — the Cloudflare account id
+#
+# The production Pages project is `tenet-website` with production branch
+# `dev-next` (see website/CLAUDE.md); deploys pass `--branch dev-next` to
+# match the manual `wrangler pages deploy` flow used so far.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'website/**'
+      - '.github/workflows/website.yml'
+  pull_request:
+    paths:
+      - 'website/**'
+      - '.github/workflows/website.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test & build site
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        # Reads the packageManager field pinned in website/package.json.
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: website
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        working-directory: website
+        run: pnpm test
+
+      - name: Build
+        working-directory: website
+        run: pnpm build
+
+      - name: Upload site build
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-dist
+          path: website/dist
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Cloudflare Pages
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download site build
+        uses: actions/download-artifact@v4
+        with:
+          name: website-dist
+          path: dist
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name tenet-website --branch dev-next

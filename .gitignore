@@ -29,8 +29,10 @@ slowmo/web/src-tauri/gen/schemas/
 slowmo/web/src-tauri/binaries/
 
 # patched QBDI clone, per-platform build trees and static libs
-# (produced by scripts/prepare-qbdi.sh)
-third-party/
+# (produced by scripts/prepare-qbdi.sh) — anchored to repo root so the
+# vendored license texts under slowmo/web/src-tauri/licenses/third-party/
+# stay tracked
+/third-party/
 
 # Tenet product website: dependencies, generated output, local config, and test artifacts
 website/node_modules/
