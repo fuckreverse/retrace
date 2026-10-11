@@ -10,6 +10,7 @@
 #endif
 
 #include <rocksdb/table.h>
+#include <rocksdb/convenience.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
 #include <rocksdb/slice_transform.h>
@@ -77,6 +78,18 @@ static constexpr uint32_t INDEX_SCHEMA_VERSION = 13;
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 namespace {
+
+// Some supported builds omit LZ4. RocksDB rejects unsupported compression
+// when opening a column family, so use the same available codec everywhere.
+rocksdb::CompressionType index_compression() {
+    static const auto codec = [] {
+        const auto supported = rocksdb::GetSupportedCompressions();
+        return std::find(supported.begin(), supported.end(), rocksdb::kLZ4Compression)
+                   != supported.end()
+            ? rocksdb::kLZ4Compression : rocksdb::kNoCompression;
+    }();
+    return codec;
+}
 
 // Encode uint64 as big-endian key (for correct RocksDB sort order).
 // Returns a Slice pointing to the caller-provided 8-byte buffer.
@@ -408,7 +421,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
         auto mem_block_cache = rocksdb::NewLRUCache(512 * 1024 * 1024);
         auto make_mem_cf_opts = [&mem_block_cache]() {
             rocksdb::ColumnFamilyOptions o;
-            o.compression = rocksdb::kLZ4Compression;
+            o.compression = index_compression();
             o.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
                 rocksdb::NewFixedPrefixTransform(8));  // page(8) only
             rocksdb::BlockBasedTableOptions tbl;
@@ -424,7 +437,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
         // for consistent read performance.
         auto make_index_cf_opts = [&mem_block_cache]() {
             rocksdb::ColumnFamilyOptions o;
-            o.compression = rocksdb::kLZ4Compression;
+            o.compression = index_compression();
             rocksdb::BlockBasedTableOptions tbl;
             tbl.block_size = 16 * 1024;
             tbl.block_cache = mem_block_cache;  // share cache with MEM CFs
@@ -452,7 +465,7 @@ Result<TraceIndex> TraceIndex::open_or_build(
         // META CF: small key-value metadata only (no blobs). Keep target SST
         // size <= 128 MB so we never hit macOS pread's 2 GB EINVAL limit.
         rocksdb::ColumnFamilyOptions meta_cf_opts;
-        meta_cf_opts.compression = rocksdb::kLZ4Compression;
+        meta_cf_opts.compression = index_compression();
         meta_cf_opts.target_file_size_base = 128 * 1024 * 1024;  // 128 MB
 
         std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
@@ -784,7 +797,7 @@ Result<TraceIndex> TraceIndex::build(
     // so a small shared cache is sufficient.
     auto mem_build_block_cache = rocksdb::NewLRUCache(128 * 1024 * 1024);
     rocksdb::ColumnFamilyOptions mem_write_cf_opts;
-    mem_write_cf_opts.compression = rocksdb::kLZ4Compression;
+    mem_write_cf_opts.compression = index_compression();
     mem_write_cf_opts.prefix_extractor =
         std::shared_ptr<const rocksdb::SliceTransform>(
             rocksdb::NewFixedPrefixTransform(8));  // page(8) only — optimal for SeekForPrev
@@ -808,7 +821,7 @@ Result<TraceIndex> TraceIndex::build(
 
     // OFFSET/ANCHOR/CODE_BYTES: LZ4 compression + 16KB blocks (matches default table_opts)
     rocksdb::ColumnFamilyOptions index_cf_opts;
-    index_cf_opts.compression = rocksdb::kLZ4Compression;
+    index_cf_opts.compression = index_compression();
     {
         rocksdb::BlockBasedTableOptions tbl;
         tbl.block_size = 16 * 1024;
@@ -820,7 +833,7 @@ Result<TraceIndex> TraceIndex::build(
     // META CF: small metadata keys only. 128 MB SST ceiling keeps DB::Open
     // working even after many write cycles (avoids macOS pread 2 GB limit).
     rocksdb::ColumnFamilyOptions meta_cf_opts;
-    meta_cf_opts.compression = rocksdb::kLZ4Compression;
+    meta_cf_opts.compression = index_compression();
     meta_cf_opts.target_file_size_base = 128 * 1024 * 1024;  // 128 MB
 
     std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs = {
@@ -1411,7 +1424,7 @@ struct ShardResult {
         // SstFileWriter needs Options that match the CF's table format.
         // All CFs use LZ4 compression for reduced disk usage.
         rocksdb::Options sst_opts;
-        sst_opts.compression = rocksdb::kLZ4Compression;
+        sst_opts.compression = index_compression();
 
         CfWriter offset_w(sst_opts, &result.offset_ssts, "offset", shard_idx, sst_dir);
         // Enable dedup for anchor_w: multiple ANCHOR records can share the same
@@ -1755,7 +1768,7 @@ struct ShardResult {
                                new_end.base());
 
             rocksdb::Options code_sst_opts;
-            code_sst_opts.compression = rocksdb::kLZ4Compression;
+            code_sst_opts.compression = index_compression();
             rocksdb::SstFileWriter code_w(rocksdb::EnvOptions(), code_sst_opts);
             auto code_path = sst_dir / ("code_s" + std::to_string(shard_idx) + ".sst");
             auto s = code_w.Open(code_path.string());

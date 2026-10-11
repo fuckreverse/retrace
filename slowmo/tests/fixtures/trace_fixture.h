@@ -115,7 +115,7 @@ inline std::unique_ptr<TraceEnv> make_env(
     // ── Open TraceReader ────────────────────────────────────────────────
     auto reader_result = TraceReader::open(trace_path);
     if (!reader_result) {
-        std::filesystem::remove_all(temp_dir);
+        std::fprintf(stderr, "TraceReader::open failed: %s\n", reader_result.error().message.c_str());
         return nullptr;
     }
     env->reader = std::make_unique<TraceReader>(std::move(*reader_result));
@@ -123,7 +123,7 @@ inline std::unique_ptr<TraceEnv> make_env(
     // ── Build TraceIndex (RocksDB, cached in temp_dir) ──────────────────
     auto index_result = TraceIndex::open_or_build(*env->reader, nullptr);
     if (!index_result) {
-        std::filesystem::remove_all(temp_dir);
+        std::fprintf(stderr, "TraceIndex::open_or_build failed: %s\n", index_result.error().message.c_str());
         return nullptr;
     }
     env->index = std::make_unique<TraceIndex>(std::move(*index_result));

@@ -555,6 +555,12 @@ add_library(tenet_lib STATIC
 # Project sources use C++20 designated initializers. Keep third-party projects
 # at their own language standard while propagating this requirement to clients.
 target_compile_features(tenet_lib PUBLIC cxx_std_20)
+if(MSVC)
+    # Preserve UTF-8 command-line arguments (including Catch2 test filters)
+    # and narrow filesystem paths instead of converting through the host ACP.
+    target_sources(tenet_lib INTERFACE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/common/utf8.manifest")
+endif()
 
 target_include_directories(tenet_lib BEFORE PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
