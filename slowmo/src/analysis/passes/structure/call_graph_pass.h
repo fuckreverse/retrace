@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "analysis/pass_manager.h"
 #include <cstdint>
 #include <string>
