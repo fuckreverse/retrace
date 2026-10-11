@@ -65,7 +65,7 @@ if ! git log --oneline -1 | grep -q "\[retrace\]"; then
         git apply "$p"
     done
     git add -A
-    git commit --quiet -m "[retrace] apply local patch series ($(ls "${PATCH_DIR}"/*.patch | xargs -n1 basename | tr '\n' ' '))"
+    git -c user.name="Retrace build" -c user.email="build@retrace.invalid" commit --quiet -m "[retrace] apply local patch series ($(ls "${PATCH_DIR}"/*.patch | xargs -n1 basename | tr '\n' ' '))"
 else
     echo "==> Patches already applied (retrace commit on top of ${PIN_SHA})."
 fi

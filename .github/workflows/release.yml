@@ -12,7 +12,8 @@ name: Release
 #      third-party license notices are collected/validated.
 #   2. The Tenet Tauri desktop app (.dmg / .AppImage / .deb / .rpm / .msi / .exe)
 #      bundling the tenet backend as sidecar.
-#   3. A GitHub Release gathering all artifacts with generated notes.
+#   3. qbditrace shared libraries for Android arm64-v8a and iOS arm64.
+#   4. A GitHub Release gathering all artifacts with generated notes.
 #
 # Feature flags mirror retrace.yml: Linux/macOS build with YARA+WS enabled and
 # Triton disabled (no Triton package on runners); Windows core-only
@@ -53,11 +54,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf libyara-dev
+            ninja-build ccache patchelf libyara-dev liblz4-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja ccache yara
+        run: brew install ninja ccache yara lz4
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -94,6 +95,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-cli-${{ matrix.platform }}-${{ hashFiles('slowmo/web/src-tauri/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        working-directory: slowmo/web
+        run: pnpm install --frozen-lockfile
 
       - name: Fetch cargo dependencies
         run: cargo fetch --locked --manifest-path slowmo/web/src-tauri/Cargo.toml
@@ -160,7 +165,7 @@ jobs:
           done
           [ -n "${triple_bin}" ] || { echo "sidecar binary not found"; exit 1; }
           mkdir -p pkg/tenet/lib
-          cp "${binaries}/${triple_bin}" pkg/tenet/tenet
+          cp "${triple_bin}" pkg/tenet/tenet
           chmod +x pkg/tenet/tenet
           if [ -d "${binaries}/lib" ] && [ -n "$(ls -A "${binaries}/lib" 2>/dev/null)" ]; then
             cp -R "${binaries}/lib/." pkg/tenet/lib/
@@ -249,13 +254,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf libyara-dev \
+            ninja-build ccache patchelf libyara-dev liblz4-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev libssl-dev file
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja ccache yara
+        run: brew install ninja ccache yara lz4
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -351,10 +356,109 @@ jobs:
             slowmo/web/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
 
+  qbditrace:
+    name: qbditrace (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: android-arm64-v8a
+            target: android
+          - os: macos-14
+            platform: ios-arm64
+            target: ios
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Set up Android SDK
+        if: matrix.target == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Install pinned Android NDK
+        if: matrix.target == 'android'
+        run: |
+          sdkmanager 'ndk;27.2.12479018'
+          echo "NDK_PATH=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Cache patched QBDI static libraries
+        id: qbdi-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            third-party/qbdi/${{ matrix.target }}/libQBDI.a
+            third-party/qbdi/${{ matrix.target }}/libqbdi-llvm.a
+            third-party/qbdi/${{ matrix.target }}/include
+            third-party/qbdi/${{ matrix.target }}/build-include
+          key: qbdi-mobile-v1-${{ matrix.platform }}-ndk27c-${{ hashFiles('patches/qbdi/**', 'scripts/prepare-qbdi.sh') }}
+
+      - name: Build patched QBDI
+        if: steps.qbdi-cache.outputs.cache-hit != 'true'
+        run: bash scripts/prepare-qbdi.sh ${{ matrix.target }}
+
+      - name: Fetch zstd sources
+        run: |
+          cmake -S dashcam -B dashcam/build -G Ninja \
+            -DQBDITRACE_BUILD_DYLIB=OFF -DQBDITRACE_BUILD_TESTS=OFF
+
+      - name: Build Android shared library
+        if: matrix.target == 'android'
+        run: |
+          bash dashcam/build-dashcam-android.sh
+          file libqbditrace.so
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h -d libqbditrace.so
+
+      - name: Build iOS dynamic library
+        if: matrix.target == 'ios'
+        run: |
+          bash dashcam/build-dashcam-ios.sh
+          codesign --force --sign - libqbditrace.dylib
+          file libqbditrace.dylib
+          xcrun lipo -verify_arch arm64 libqbditrace.dylib
+          otool -L libqbditrace.dylib
+
+      - name: Package mobile library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist pkg/qbditrace
+          if [ '${{ matrix.target }}' = android ]; then
+            lib=libqbditrace.so
+          else
+            lib=libqbditrace.dylib
+          fi
+          mkdir -p pkg/qbditrace/licenses
+          pin=$(awk 'NR == 1 {print $1; exit}' patches/qbdi/PIN)
+          curl --fail --location --retry 3 "https://raw.githubusercontent.com/QBDI/QBDI/${pin}/LICENSE.txt" -o pkg/qbditrace/licenses/QBDI.txt
+          curl --fail --location --retry 3 "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-19.1.5/llvm/LICENSE.TXT" -o pkg/qbditrace/licenses/LLVM.txt
+          curl --fail --location --retry 3 "https://raw.githubusercontent.com/gabime/spdlog/v1.15.0/LICENSE" -o pkg/qbditrace/licenses/spdlog.txt
+          cp dashcam/_deps/zstd-src/LICENSE pkg/qbditrace/licenses/zstd-LICENSE
+          cp dashcam/_deps/zstd-src/COPYING pkg/qbditrace/licenses/zstd-COPYING
+          cp "$lib" dist/
+          cp "$lib" LICENSE dashcam/README.md pkg/qbditrace/
+          cp dashcam/TraceFormat.h pkg/qbditrace/
+          tar -czf "dist/retrace-qbditrace-${{ matrix.platform }}.tar.gz" -C pkg qbditrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qbditrace-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [tenet-cli, desktop]
+    needs: [tenet-cli, desktop, qbditrace]
     runs-on: ubuntu-latest
     permissions:
       contents: write
