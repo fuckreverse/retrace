@@ -275,3 +275,26 @@ TEST_CASE("XrefPass handles v7 (non-v5) format with FPR diffs", "[unit][pass][xr
     REQUIRE(xr.has_pc(rt_pc(0x1004)));
     REQUIRE(xr.has_pc(rt_pc(0x1008)));
 }
+
+TEST_CASE("PassManager releases plain-reference results while preserving shared ownership",
+          "[unit][pass][xref][lifetime]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_anchor(ms);
+    }, "xref_result_lifetime");
+    REQUIRE(env != nullptr);
+
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    const auto& result = pm->require("xref").get<XrefResult>();
+    REQUIRE(result.inst_ids_at(rt_pc(0x1000)).size() == 1);
+
+    auto owned = pm->require_shared("xref");
+    std::weak_ptr<const PassResult> weak = owned;
+    pm.reset();
+    REQUIRE_FALSE(weak.expired());
+    owned.reset();
+    REQUIRE(weak.expired());
+}
