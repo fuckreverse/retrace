@@ -53,9 +53,9 @@ namespace {
 
 /// Connect a TCP socket to host:port.  Returns fd or -1 on failure.
 platform::socket_t tcp_connect(const std::string& host, uint16_t port) {
+    platform::ensure_sockets_initialized();
     platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (!platform::socket_valid(fd)) return platform::kInvalidSocket;
-    platform::ensure_sockets_initialized();
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -320,7 +320,7 @@ struct SseClient {
 private:
     std::string read_until_endpoint(std::chrono::milliseconds timeout) {
         auto start = std::chrono::steady_clock::now();
-    platform::set_nonblocking(fd);
+        platform::set_nonblocking(fd);
         std::string acc;
         char chunk[2048];
 
@@ -581,9 +581,9 @@ struct McpHttpEnv {
 
 /// Pick a free ephemeral port by binding to port 0 and reading back the assignment.
 static uint16_t pick_port() {
+    platform::ensure_sockets_initialized();
     platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (!platform::socket_valid(fd)) return 19200;  // fallback
-    platform::ensure_sockets_initialized();
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = 0;  // let OS pick
