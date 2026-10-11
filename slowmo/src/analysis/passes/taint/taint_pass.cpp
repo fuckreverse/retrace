@@ -412,8 +412,15 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         std::make_shared<ankerl::unordered_dense::map<uint64_t, uint64_t>>();
     bool use_learned_map = (xref != nullptr);
 
-    auto step_fn = [pc_to_written_regs, use_learned_map, &config](
+    auto step_fn = [pc_to_written_regs, use_learned_map, &config, &ctx](
                        const InstView& inst, uint64_t inst_id, TaintResult& result) -> bool {
+        const auto info = classify_inst_heuristic(inst, ctx.decoder(), ctx.code_table());
+        const uint64_t taint_before = result.tainted_regs;
+        uint64_t read_mask = 0;
+        for (uint8_t i = 0; i < info.n_read; i++) {
+            read_mask |= 1ULL << info.read_regs[i];
+        }
+
         // ─── XRef acceleration: skip if instruction cannot affect taint ─
         // Quick check: a pure control-flow instruction (B, NOP) with no
         // reg_diffs and no mem_accesses cannot propagate taint → skip.
@@ -432,14 +439,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                 uint64_t written_mask = pcwr_it->second;
                 bool touches_tainted = (written_mask & result.tainted_regs) != 0;
                 if (!touches_tainted) {
-                    bool src_tainted = false;
-                    for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                        auto diff = inst.reg_diff(i);
-                        if ((result.tainted_regs >> diff.index) & 1) {
-                            src_tainted = true;
-                            break;
-                        }
-                    }
+                    bool src_tainted = (read_mask & taint_before) != 0;
                     bool mem_tainted = false;
                     if (config.taint_from_memory) {
                         for (uint8_t m = 0; m < inst.mem_access_count; m++) {
@@ -465,23 +465,11 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         }
 
         // ─── Determine which source registers are tainted ─────────────
-        // In heuristic mode, we infer data flow from reg_diffs: since we
-        // can't know precisely which reg_diff entries are "read" operands
-        // without Triton, we conservatively treat any other tainted
-        // reg_diff entry (or the register's own prior taint, for
-        // read-modify-write patterns) as a potential source.
-        bool any_src_tainted = (result.tainted_regs != 0);
-        uint8_t tainted_sources[64];
-        uint8_t n_tainted_sources = 0;
-        if (any_src_tainted) {
-            uint64_t tmp = result.tainted_regs;
-            while (tmp) {
-                uint8_t bit = static_cast<uint8_t>(__builtin_ctzll(tmp));
-                tainted_sources[n_tainted_sources++] = bit;
-                tmp &= tmp - 1;
-            }
-        }
-
+        // Read the pre-instruction snapshot so writes to one destination do
+        // not become inputs to another destination of the same instruction.
+        const uint64_t source_mask = info.has_decoded_operands
+            ? (taint_before & read_mask) : taint_before;
+        bool any_src_tainted = source_mask != 0;
         // Check memory sources — overlap-aware, so a read that partially
         // overlaps a previously-tainted store is still recognized (this
         // matches BackwardTaintPass's memory-overlap semantics rather than
@@ -519,22 +507,18 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             // tainted, it becomes untainted (killed).
             bool has_tainted_input = false;
 
-            // Heuristic: if any other reg in the diff set is tainted, it
-            // might be a source operand (e.g., ADD X1, X2, X3 where X2 is
-            // tainted).
-            for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
-                if (i == j) continue;
-                auto src = inst.reg_diff(j);
-                if ((result.tainted_regs >> src.index) & 1) {
-                    has_tainted_input = true;
-                    break;
+            if (info.has_decoded_operands) {
+                has_tainted_input = source_mask != 0;
+            } else {
+                // With no opcode, preserve the conservative reg_diff fallback.
+                for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
+                    if (i == j) continue;
+                    if ((taint_before >> inst.reg_diff(j).index) & 1) {
+                        has_tainted_input = true;
+                        break;
+                    }
                 }
-            }
-
-            // Read-modify-write self-reference (e.g., X1 = X1 + something):
-            // conservatively keep taint if the reg was already tainted.
-            if (!has_tainted_input && was_tainted) {
-                has_tainted_input = true;
+                if (was_tainted) has_tainted_input = true;
             }
 
             // Memory source contributes taint
@@ -558,16 +542,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                             step.add_src_mem(tainted_mem_sources[mi]);
                     } else {
                         step.type = PropagationType::RegToReg;
-                        for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
-                            if (i == j) continue;
-                            auto src = inst.reg_diff(j);
-                            if ((result.tainted_regs >> src.index) & 1) {
-                                step.src_reg_mask |= (1ULL << src.index);
-                            }
-                        }
-                        if (step.src_reg_mask == 0 && was_tainted) {
-                            step.src_reg_mask |= (1ULL << reg_idx);  // self-reference
-                        }
+                        step.src_reg_mask = source_mask;
                         if (mem_source_tainted) {
                             for (uint8_t mi = 0; mi < n_tainted_mem; mi++)
                                 step.add_src_mem(tainted_mem_sources[mi]);
@@ -598,25 +573,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
                 if (mem.type & 2) {  // write
-                    bool tainted_store = false;
-                    uint8_t store_sources[34];
-                    uint8_t n_store_sources = 0;
-                    for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-                        auto diff = inst.reg_diff(i);
-                        if ((result.tainted_regs >> diff.index) & 1) {
-                            tainted_store = true;
-                            if (n_store_sources < 34) {
-                                store_sources[n_store_sources++] = diff.index;
-                            }
-                        }
-                    }
-                    if (!tainted_store && any_src_tainted) {
-                        tainted_store = true;
-                        std::memcpy(store_sources, tainted_sources, n_tainted_sources);
-                        n_store_sources = n_tainted_sources;
-                    }
-
-                    if (tainted_store) {
+                    if (any_src_tainted) {
                         result.tainted_memory.add(mem.addr);
 
                         PropagationStep step;
@@ -625,8 +582,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                         step.type = PropagationType::RegToMem;
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
-                        for (uint8_t si = 0; si < n_store_sources; si++)
-                            step.src_reg_mask |= (1ULL << store_sources[si]);
+                        step.src_reg_mask = source_mask;
                         step.triton_resolved = false;
                         emit_step(result, config, std::move(step));
                     }

@@ -1,6 +1,7 @@
 #include "core/instruction_decoder.h"
 #include "common/types.h"
 #include <capstone/capstone.h>
+#include <mutex>
 #include <cstring>
 #include <cstdio>
 

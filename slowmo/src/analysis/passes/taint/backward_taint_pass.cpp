@@ -448,15 +448,10 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
 // ═══════════════════════════════════════════════════════════════════════════
 
 static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
-    // Heuristic: uses reg_diff entries to infer written registers.
-    // All reg_diff entries are treated as writes; those not in the destination set
-    // become potential source dependencies (overapproximation).
-    //
-    // This is the exact same inference TaintPass's heuristic (forward) engine
-    // uses — shared once as classify_inst_heuristic() in taint_common.h so
-    // both directions agree on what a "write" vs. "potential source" means.
-    auto classify = [](const InstView& inst) -> InstructionInfo {
-        return classify_inst_heuristic(inst);
+    // Share decoded source operands with forward taint, retaining the
+    // conservative reg_diff fallback when instruction bytes are unavailable.
+    auto classify = [&ctx](const InstView& inst) -> InstructionInfo {
+        return classify_inst_heuristic(inst, ctx.decoder(), ctx.code_table());
     };
 
     return run_backward_taint_common(ctx, config, classify, "heuristic");

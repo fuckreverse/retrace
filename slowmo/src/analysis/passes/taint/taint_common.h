@@ -18,6 +18,7 @@
 
 #include "common/types.h"
 #include "io/trace_reader.h"
+#include "core/instruction_decoder.h"
 
 #include <cstdint>
 
@@ -124,6 +125,9 @@ struct TaintInstructionInfo {
     /// bytes available for Triton lookup). Callers should skip such insts.
     bool valid = true;
 
+    /// Capstone recovered actual source operands rather than reg_diff guesses.
+    bool has_decoded_operands = false;
+
     void add_written(uint8_t reg_id) {
         if (n_written < kTaintMaxInfoRegs) written_regs[n_written++] = reg_id;
     }
@@ -139,10 +143,11 @@ struct TaintInstructionInfo {
 };
 
 /// Heuristic classifier: uses reg_diff entries to infer written registers.
-/// All reg_diff entries are treated as both a write AND (conservatively) a
-/// potential read/source — this is an overapproximation used when Triton
-/// semantics aren't available. Callers filter out actual dst_regs downstream.
-inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst) {
+/// Capstone supplies read operands when code is available; otherwise reg_diff
+/// entries are conservatively treated as potential sources as well as writes.
+inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst,
+                                                   InstructionDecoder& decoder,
+                                                   const CodeTable& code_table) {
     TaintInstructionInfo info;
 
     for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
@@ -153,9 +158,19 @@ inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst) {
         }
     }
 
-    // Overapproximation: treat the same reg_diff set as potential sources.
-    for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-        info.add_read(inst.reg_diff(i).index);
+    // reg_diff records writes, not input operands. Decode the opcode so an
+    // unchanged source register still propagates taint, while a constant
+    // overwrite terminates it. Retain conservative inference for missing code.
+    auto decoded = decoder.decode(inst.pc, code_table);
+    if (decoded && decoded->mnemonic_sv() != ".word") {
+        info.has_decoded_operands = true;
+        for (uint8_t i = 0; i < decoded->regs_read_count; i++) {
+            info.add_read(decoded->regs_read[i]);
+        }
+    } else {
+        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
+            info.add_read(inst.reg_diff(i).index);
+        }
     }
 
     // Heuristic mode has no semantic memory-access info; always consider
