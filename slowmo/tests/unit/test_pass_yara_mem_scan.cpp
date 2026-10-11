@@ -12,7 +12,7 @@
  *   - find_default_rules_dirs() returns a non-empty, plausible candidate
  *     list anchored on the executable path (not just cwd).
  *   - Pass runs without error when TENET_HAS_YARA and the bundled
- *     tools/tenet/rules/ directory is discoverable.
+ *     slowmo/rules/ directory is discoverable.
  *   - YaraMemScanResult::total() is callable and non-negative.
  *   - pages_scanned / bytes_scanned are populated after the run.
  *   - rules_loaded > 0 and rule_search_dirs is populated on success.
@@ -122,7 +122,7 @@ TEST_CASE("YaraMemScanPass: runs successfully and discovers the bundled rules",
     SECTION("by_category() does not crash") {
         REQUIRE_NOTHROW(res.by_category(PatternCategory::Crypto));
     }
-    SECTION("rules_loaded > 0 — bundled tools/tenet/rules/*.yar were found") {
+    SECTION("rules_loaded > 0 — bundled slowmo/rules/*.yar were found") {
         // This is the key regression test for the exe-relative rule lookup:
         // if find_default_rules_dirs() regresses back to cwd-only lookup,
         // ctest (which may run from an arbitrary directory) would find zero

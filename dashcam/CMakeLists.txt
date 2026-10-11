@@ -21,49 +21,51 @@
 #
 # Daily development (incremental build):
 #
-#   cd tools/qbditrace/build && ninja -j$(nproc)
+#   cd dashcam/build && ninja -j$(nproc)
 #
 # First-time setup (host tests):
 #
-#   cd tools/qbditrace && mkdir build && cd build
+#   cd dashcam && mkdir build && cd build
 #   cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF
 #   ninja -j$(nproc)
 #   ctest --output-on-failure
 #
 # iOS dylib cross-compile (from repo root):
 #
-#   bash tools/qbditrace/build-qbditrace-ios.sh
+#   bash scripts/prepare-qbdi.sh ios   # once: patched QBDI static libs
+#   bash dashcam/build-dashcam-ios.sh
 #
 # Or manually:
 #
-#   cmake -S tools/qbditrace -B tools/qbditrace/build-ios \
-#         -DCMAKE_TOOLCHAIN_FILE=cmake/config/ios.toolchain.cmake \
+#   cmake -S dashcam -B dashcam/build-ios \
+#         -DCMAKE_TOOLCHAIN_FILE=$PWD/third-party/qbdi/src/cmake/config/ios.toolchain.cmake \
 #         -DPLATFORM=OS64 \
-#         -DQBDI_INCLUDE_DIR=$PWD/include \
-#         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-ios/include;$PWD/build-ios/include-static" \
-#         -DQBDI_STATIC_LIB=$PWD/build-ios/libQBDI.a \
+#         -DQBDI_INCLUDE_DIR=$PWD/third-party/qbdi/ios/include \
+#         -DQBDI_BUILD_INCLUDE_DIR=$PWD/third-party/qbdi/ios/build-include \
+#         -DQBDI_STATIC_LIB=$PWD/third-party/qbdi/ios/libQBDI.a \
 #         -DQBDITRACE_BUILD_DYLIB=ON \
 #         -DQBDITRACE_BUILD_TESTS=OFF
-#   cmake --build tools/qbditrace/build-ios
+#   cmake --build dashcam/build-ios
 #
 # Android .so cross-compile (from repo root):
 #
-#   bash tools/qbditrace/build-qbditrace-android.sh
+#   bash scripts/prepare-qbdi.sh android   # once: patched QBDI static libs
+#   bash dashcam/build-dashcam-android.sh
 #
-# Or manually (zstd must be prebuilt for arm64, e.g. build-android/libzstd.a —
+# Or manually (zstd must be prebuilt for arm64, e.g. dashcam/build-android/libzstd.a —
 # passing it via QBDITRACE_ZSTD_STATIC_LIB avoids FetchContent clobbering the
-# shared host-built zstd under tenet/_deps):
+# shared host-built zstd under slowmo/_deps):
 #
-#   cmake -S tools/qbditrace -B tools/qbditrace/build-android -G Ninja \
+#   cmake -S dashcam -B dashcam/build-android -G Ninja \
 #         -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
 #         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 \
-#         -DQBDI_INCLUDE_DIR=$PWD/include \
-#         -DQBDI_BUILD_INCLUDE_DIR="$PWD/build-android/include;$PWD/build-android/include-static" \
-#         -DQBDI_STATIC_LIB=$PWD/build-android/libQBDI.a \
-#         -DQBDITRACE_ZSTD_STATIC_LIB=$PWD/build-android/libzstd.a \
+#         -DQBDI_INCLUDE_DIR=$PWD/third-party/qbdi/android/include \
+#         -DQBDI_BUILD_INCLUDE_DIR=$PWD/third-party/qbdi/android/build-include \
+#         -DQBDI_STATIC_LIB=$PWD/third-party/qbdi/android/libQBDI.a \
+#         -DQBDITRACE_ZSTD_STATIC_LIB=$PWD/dashcam/build-android/libzstd.a \
 #         -DQBDITRACE_BUILD_DYLIB=ON \
 #         -DQBDITRACE_BUILD_TESTS=OFF
-#   cmake --build tools/qbditrace/build-android
+#   cmake --build dashcam/build-android
 
 cmake_minimum_required(VERSION 3.16)
 project(qbditrace C CXX)
@@ -81,7 +83,7 @@ option(QBDITRACE_ENABLE_ZSTD "Enable zstd compression for trace output" ON)
 # ---------------------------------------------------------------------------
 # FetchContent shared cache (same pattern as tenet)
 # ---------------------------------------------------------------------------
-# All FetchContent sources are cached under tools/qbditrace/_deps/.  This
+# All FetchContent sources are cached under dashcam/_deps/.  This
 # directory is shared across all build trees (build/, build-host-test/, etc.)
 # so dependencies are downloaded once and never re-cloned.
 #
@@ -137,7 +139,9 @@ if(QBDITRACE_BUILD_DYLIB)
   if(NOT QBDI_INCLUDE_DIR OR NOT QBDI_STATIC_LIB)
     message(FATAL_ERROR
       "QBDITRACE_BUILD_DYLIB requires -DQBDI_INCLUDE_DIR and -DQBDI_STATIC_LIB. "
-      "See the comment header of this CMakeLists for an example invocation.")
+      "Run scripts/prepare-qbdi.sh <ios|android> to build patched QBDI into "
+      "third-party/qbdi/<platform>/, or see the comment header of this "
+      "CMakeLists for a manual invocation.")
   endif()
 
   add_library(qbditrace SHARED
@@ -294,7 +298,7 @@ if(QBDITRACE_BUILD_TESTS)
   #
   # To enable the tenet joint tests, pass:
   #   -DQBDITRACE_BUILD_TESTS_INTEGRATION=ON
-  #   -DTENET_BUILD_DIR=<path/to/tenet/build>   (e.g. tools/tenet/build)
+  #   -DTENET_BUILD_DIR=<path/to/tenet/build>   (e.g. slowmo/build)
   #
   # TENET_BUILD_DIR imports tenet_lib and its Catch2 from the existing tenet
   # build tree without re-running tenet's own cmake or rebuilding from source.
@@ -372,7 +376,7 @@ if(QBDITRACE_BUILD_TESTS)
             INTERFACE_INCLUDE_DIRECTORIES "${_tenet_inc_dirs}")
 
         # tenet_lib depends on several 3rd-party libs already built.
-        # Paths match the actual layout of tools/tenet/_deps/.
+        # Paths match the actual layout of slowmo/_deps/.
         set(_tenet_extra_libs "")
 
         # rocksdb

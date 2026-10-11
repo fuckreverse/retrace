@@ -10,7 +10,7 @@
 #
 # Prerequisites:
 #   - macOS arm64 QBDI static libs in ../../build-macos/ (libQBDI.a, libqbdi-llvm.a)
-#   - tenet binary at ../../tools/tenet/build/tenet
+#   - tenet binary at ../../slowmo/build/tenet
 #
 # Usage:
 #   sh run_benchmark.sh [options]
@@ -30,9 +30,9 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
+TRACE_DIR="${ROOT}/dashcam"
 BUILD="${ROOT}/build-macos"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TENET="${ROOT}/slowmo/build/tenet"
 OUTDIR="/tmp/qbditrace-bench"
 SEED="0x1234567890ABCDEF"
 FILTER=""
@@ -69,7 +69,7 @@ fi
 
 if [ ! -x "${TENET}" ]; then
   echo "WARNING: tenet not found at ${TENET}; decode step will be skipped"
-  echo "Build it with: cd tools/tenet/build && ninja"
+  echo "Build it with: cd slowmo/build && ninja"
   DECODE="none"
 fi
 

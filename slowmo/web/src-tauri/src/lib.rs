@@ -30,7 +30,7 @@ struct BackendPorts {
 ///
 /// `level` is a best-effort classification parsed from the line text (tenet's
 /// own logger emits lines like `[+  0.123s  42.1MB] INFO  [mcp] message`,
-/// see `tools/tenet/src/common/logger.h`); anything unrecognised falls back
+/// see `slowmo/src/common/logger.h`); anything unrecognised falls back
 /// to `"info"` for stdout and `"error"` for the `Error`/non-zero-exit cases.
 #[derive(Clone, serde::Serialize)]
 struct BackendLogLine {
@@ -43,7 +43,7 @@ struct BackendLogLine {
 
 /// One structured progress update from the `tenet` sidecar, parsed from a
 /// `TENET-PROGRESS {json}` line the backend emits when started with
-/// `--progress-json` (see tools/tenet/src/main.cpp). Forwarded to the
+/// `--progress-json` (see slowmo/src/main.cpp). Forwarded to the
 /// webview as a `backend-progress` event so the loading screen can show
 /// real index-build progress — the WS service only comes up *after* the
 /// index is built, so this stderr channel is the only live signal during

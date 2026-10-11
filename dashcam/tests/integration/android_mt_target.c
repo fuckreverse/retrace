@@ -1,7 +1,7 @@
 /*
  * mt_target.c — Android multi-thread qbditrace e2e target (Frida-driven).
  *
- * Unlike tools/qbditrace/tests/integration/test_harness.c (which dlopen's
+ * Unlike dashcam/tests/integration/test_harness.c (which dlopen's
  * libqbditrace.so and drives configure/run_call itself), this target does
  * NOT call any qbditrace API. It is driven entirely by the Frida agent
  * (qbditrace.js) via --trace-threads: the agent installs a pthread_create

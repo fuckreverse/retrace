@@ -17,7 +17,7 @@ tenet 使用 macOS 原生 Instruments 工具链进行性能分析，通过 `os_s
 ### 1. 构建（保留调试符号）
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ninja -j$(nproc)
 ```
@@ -166,11 +166,11 @@ cmake .. -DTENET_ENABLE_PROFILING=OFF
 
 ## 性能基准
 
-项目自带基准测试套件，用于回归检测。基准脚本只复用固定的 `tools/tenet/build/`，不会创建额外 build 目录；运行前应按所需特性配置该目录：
+项目自带基准测试套件，用于回归检测。基准脚本只复用固定的 `slowmo/build/`，不会创建额外 build 目录；运行前应按所需特性配置该目录：
 
 ```bash
 # 运行综合基准（增量构建并生成 synthetic perf traces）
-cd tools/tenet
+cd slowmo
 bash bench/run_benchmark.sh --scale 1M --output /tmp/tenet-bench.json
 
 # 对真实 trace 测量所有 Pass 的增量耗时
@@ -338,7 +338,7 @@ ctest -R perf --output-on-failure
 每次修改 Pass 后必须先跑对应单元测试确保无回归：
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 ninja -j$(nproc) test_pass_objc test_pass_objc_crypto
 ./tests/test_pass_objc           # 应 ALL PASSED
 ./tests/test_pass_objc_crypto    # 应 ALL PASSED
@@ -349,7 +349,7 @@ ninja -j$(nproc) test_pass_objc test_pass_objc_crypto
 tenet 的 CLI 分析模式就是无头模式——传入分析参数（如 `--objc`、`--taint`、`--pattern` 等）时直接走 `batch_analysis` 路径，不启动 TUI 或任何服务，输出 JSON 到 stdout 后退出。这是测量单个 Pass 真实端到端耗时的标准方式：
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 
 # 无头模式跑 ObjC 分析（含 index 加载 + pass 执行 + JSON 序列化）
 time ./tenet --objc /path/to/trace.bin > /dev/null
@@ -376,7 +376,7 @@ time ./tenet --objc /path/to/trace.bin > /dev/null
 用于测量所有 Pass 的增量耗时，一次运行出全量数据：
 
 ```bash
-cd tools/tenet
+cd slowmo
 cmake --build build --target bench_all_passes -j$(sysctl -n hw.ncpu)
 
 # 保留 index，临时移走 Pass cache；运行结束后恢复原缓存
@@ -399,7 +399,7 @@ done
 当 `time` 命令显示优化空间但不确定瓶颈在哪时，用 Instruments 采样：
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -j$(nproc)
 
 # 无头模式 + Time Profiler（只测 pass 执行，不含 TUI、RPC/MCP/WS 服务开销）
@@ -419,7 +419,7 @@ open objc-opt.trace
 
 ```bash
 # 切换到 RelWithDebInfo 测性能（在已有 build 目录重新 cmake，不新建目录）
-cd tools/tenet/build
+cd slowmo/build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ninja -j$(nproc) tenet
 ```

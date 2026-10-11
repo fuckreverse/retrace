@@ -13,7 +13,7 @@
  *   2. Perf validation  (--suite perf)   : large-scale, parametric (1M..200M inst)
  *
  * Build:
- *   clang++ -std=c++17 -O2 -I../../qbditrace -o gen_test_traces gen_test_traces.cpp
+ *   clang++ -std=c++17 -O2 -I../../dashcam -o gen_test_traces gen_test_traces.cpp
  *
  * Usage:
  *   ./gen_test_traces --suite unit  --outdir ./traces/unit

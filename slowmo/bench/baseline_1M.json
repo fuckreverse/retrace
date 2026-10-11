@@ -6,7 +6,7 @@
   "measurement": {
     "runs": 3,
     "statistic": "median",
-    "build_directory": "tools/tenet/build",
+    "build_directory": "slowmo/build",
     "build_type": "RelWithDebInfo",
     "features": {
       "triton": true,

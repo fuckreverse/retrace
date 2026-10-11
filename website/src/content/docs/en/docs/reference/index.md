@@ -6,7 +6,7 @@ sidebar:
 
 The binary trace format is the contract between any capture engine and Tenet. As long as a tool emits a compliant `.bin` file, Tenet can analyze it—QBDITrace is the official implementation, not the only option.
 
-The authoritative C definition is `tools/qbditrace/TraceFormat.h`. This document restates the format for implementors of custom collectors.
+The authoritative C definition is `dashcam/TraceFormat.h`. This document restates the format for implementors of custom collectors.
 
 ## File header
 

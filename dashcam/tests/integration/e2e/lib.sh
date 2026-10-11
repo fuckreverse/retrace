@@ -10,9 +10,9 @@
 #
 # Environment this file expects to already be set by run_pass_e2e.sh:
 #   ROOT       - repo root (abs path)
-#   TRACE_DIR  - tools/qbditrace
-#   BUILD      - tools/qbditrace/../../build-macos (QBDI static libs)
-#   TENET      - tools/tenet/build/tenet binary
+#   TRACE_DIR  - dashcam
+#   BUILD      - dashcam/../../build-macos (QBDI static libs)
+#   TENET      - slowmo/build/tenet binary
 #   HARNESS    - compiled multi-scenario harness binary (built once by
 #                run_pass_e2e.sh via build_harness_once(), see below)
 #

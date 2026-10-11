@@ -9,10 +9,10 @@
 sh cmake/config/config-macOS-AARCH64.sh && ninja QBDI_static qbdi-llvm
 
 # 一键运行全部 22 个 target
-sh tools/qbditrace/benchmark/advanced/run_advanced.sh
+sh dashcam/benchmark/advanced/run_advanced.sh
 
 # 只跑混淆组 + tenet 分析
-sh tools/qbditrace/benchmark/advanced/run_advanced.sh --group B --tenet ./build/tenet
+sh dashcam/benchmark/advanced/run_advanced.sh --group B --tenet ./build/tenet
 ```
 
 ## 目录结构
@@ -144,7 +144,7 @@ sh run_advanced.sh --tenet ./build/tenet --tenet-passes pattern,cfg,taint
 混淆二进制。这些二进制可与手工实现的混淆版本做对比分析。
 
 ```sh
-sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
+sh dashcam/benchmark/advanced/build_ollvm.sh
 # 编译约 30 分钟，生成 /tmp/pluto-obfuscator/bin/clang
 # 随后对各 target 分别应用 CFF/BCF/SUB/ALL 编译
 ```

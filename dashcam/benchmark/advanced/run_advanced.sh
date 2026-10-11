@@ -10,7 +10,7 @@
 #
 # Prerequisites:
 #   - macOS arm64 QBDI static libs in build-macos/ (libQBDI.a, libqbdi-llvm.a)
-#   - tenet binary at ../../../tools/tenet/build/tenet
+#   - tenet binary at ../../../slowmo/build/tenet
 #
 # Usage:
 #   sh run_advanced.sh [options]
@@ -33,9 +33,9 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 BENCH_DIR="$(cd "${HERE}/.." && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
+TRACE_DIR="${ROOT}/dashcam"
 BUILD="${ROOT}/build-macos"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TENET="${ROOT}/slowmo/build/tenet"
 OUTDIR="/tmp/qbditrace-advanced"
 SEED="0x1234567890ABCDEF"
 GROUP=""
@@ -77,7 +77,7 @@ fi
 
 if [ ! -x "${TENET}" ]; then
   echo "WARNING: tenet not found at ${TENET}; decode step will be skipped"
-  echo "Build it with: cd tools/tenet/build && ninja"
+  echo "Build it with: cd slowmo/build && ninja"
   DECODE="none"
 fi
 
@@ -256,7 +256,7 @@ except Exception as e:
   echo "  Reports saved to: ${REPORT_DIR}/"
 else
   echo "═══ [4/4] Tenet analysis ═══"
-  echo "  (skipped — build tenet first: cd tools/tenet/build && ninja)"
+  echo "  (skipped — build tenet first: cd slowmo/build && ninja)"
 fi
 
 echo ""

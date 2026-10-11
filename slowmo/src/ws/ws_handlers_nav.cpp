@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/ws_handlers_nav.cpp
+// slowmo/src/ws/ws_handlers_nav.cpp
 //
 // Navigation, bookmark, trace-info, and search WebSocket handlers.
 // SearchForward computes on a worker thread and only sends on the uWS loop;

@@ -219,7 +219,7 @@ Collector 可按记录类型覆写回调：
 
 ## Pass 详解与使用入口
 
-以下按分类逐一说明每个 pass 的作用、CLI 入口、MCP 工具与 TUI 对应。Tauri 前端（`tools/tenet/web/`）通过 WS 或 MCP 服务消费同一套后端结果，具体页面组织由前端实现决定。
+以下按分类逐一说明每个 pass 的作用、CLI 入口、MCP 工具与 TUI 对应。Tauri 前端（`slowmo/web/`）通过 WS 或 MCP 服务消费同一套后端结果，具体页面组织由前端实现决定。
 
 > **约定**：CLI 指令以 `./tenet trace.bin <option>` 为前缀；MCP 工具名用 `mono` 格式；TUI 统一在 Results 面板（`A` 键呼出）中浏览。
 

@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/tenet_ws_service.h
+// slowmo/src/ws/tenet_ws_service.h
 #pragma once
 
 #include "service/tenet_service.h"

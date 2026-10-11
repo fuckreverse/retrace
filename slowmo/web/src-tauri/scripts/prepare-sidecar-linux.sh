@@ -3,7 +3,7 @@
 # prepare-sidecar-linux.sh —— 为 Tauri Linux 打包准备 tenet C++ 后端 sidecar。
 #
 # 做的事情：
-#   1. 在 tools/tenet/build（固定目录，不新建）里按指定配置增量编译 tenet。
+#   1. 在 slowmo/build（固定目录，不新建）里按指定配置增量编译 tenet。
 #   2. 用 ldd 递归解析 ELF 依赖，把所有「非系统」共享库复制到
 #      src-tauri/binaries/lib/ 下。
 #   3. 用 patchelf 为 sidecar 和被复制的 .so 设置相对 RPATH，同时兼容
@@ -12,7 +12,7 @@
 #   5. 按 Tauri externalBin 规则输出 tenet-<target-triple>。
 #
 # 用法：
-#   bash tools/tenet/web/src-tauri/scripts/prepare-sidecar-linux.sh [--debug|--release]
+#   bash slowmo/web/src-tauri/scripts/prepare-sidecar-linux.sh [--debug|--release]
 #
 # 默认构建类型为 RelWithDebInfo；--debug 选择 Debug，--release 选择 Release。
 # 幂等：每次运行都会重新生成 src-tauri/binaries/ 下的 sidecar、依赖和许可证。
@@ -24,7 +24,7 @@ set -euo pipefail
 # ── 路径 ──────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_TAURI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TENET_DIR="$(cd "${SRC_TAURI_DIR}/../.." && pwd)"   # tools/tenet
+TENET_DIR="$(cd "${SRC_TAURI_DIR}/../.." && pwd)"   # slowmo
 BUILD_DIR="${TENET_DIR}/build"
 BIN_OUT_DIR="${SRC_TAURI_DIR}/binaries"
 LIB_OUT_DIR="${BIN_OUT_DIR}/lib"
@@ -72,7 +72,7 @@ echo "    BUILD_TYPE  = ${BUILD_TYPE}"
 # ── 1. 编译 tenet（复用固定 build 目录，禁止新建其他 build 目录）─────────────
 if [[ ! -d "${BUILD_DIR}" ]]; then
   echo "错误：固定构建目录 ${BUILD_DIR} 不存在。" >&2
-  echo "请先按 CLAUDE.md 的说明初始化 tools/tenet/build，再重新运行本脚本；" >&2
+  echo "请先按 CLAUDE.md 的说明初始化 slowmo/build，再重新运行本脚本；" >&2
   echo "本脚本不会创建 build-linux、build-release 等新目录。" >&2
   exit 1
 fi

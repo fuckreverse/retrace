@@ -6,7 +6,7 @@
 #
 # Steps:
 #   1. Incrementally build bench_tenet and gen_test_traces in the canonical
-#      tools/tenet/build directory
+#      slowmo/build directory
 #   2. Generate perf traces at specified scale
 #   3. Run benchmark harness
 #   4. Output JSON results
@@ -67,7 +67,7 @@ echo "[1/3] Building bench_tenet..."
 # feature set is needed; this script never creates another build tree.
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
     echo "Error: canonical build directory is not configured: ${BUILD_DIR}" >&2
-    echo "Configure tools/tenet/build first (for profiling, use RelWithDebInfo)." >&2
+    echo "Configure slowmo/build first (for profiling, use RelWithDebInfo)." >&2
     exit 1
 fi
 

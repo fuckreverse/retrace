@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/schema/tenet_ws.fbs
+// slowmo/src/ws/schema/tenet_ws.fbs
 //
 // FlatBuffers schema for TenetWSService binary WebSocket protocol.
 // Compiled by flatc into tenet_ws_generated.h (C++) and tenet_ws_generated.ts (TypeScript).

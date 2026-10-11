@@ -5,7 +5,7 @@
  *
  * Deliberately exercises the signal shapes tenet's profile- and
  * memory-analysis passes look for, so their pass-level e2e
- * (tools/qbditrace/tests/integration/e2e/pass_profile.sh and
+ * (dashcam/tests/integration/e2e/pass_profile.sh and
  * pass_memory.sh) can run against a real recorded trace instead of a
  * hand-built fixture:
  *

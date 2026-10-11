@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/tenet_ws_service.cpp
+// slowmo/src/ws/tenet_ws_service.cpp
 #include "ws/tenet_ws_service.h"
 #include "common/logger.h"
 #include "io/mcp/mcp_server.h"  // TenetMcpService — in-process tool dispatcher

@@ -13,7 +13,7 @@
 //                   (falls back to system temp)
 //
 // This mirrors the Rust `dirs::config_dir()` used by the Tauri frontend
-// (tools/tenet/web/src-tauri/src/lib.rs) closely enough that both processes
+// (slowmo/web/src-tauri/src/lib.rs) closely enough that both processes
 // agree on where settings/recent.json live.
 
 #include <cstdlib>

@@ -39,12 +39,12 @@
 
 > tenet 必须使用固定构建目录。不要创建 `build-xxx`，也不要删除 `_deps/`。
 
-- 默认构建目录：`tools/tenet/build/`
-- 无 Triton 构建目录：`tools/tenet/build-no-triton/`
+- 默认构建目录：`slowmo/build/`
+- 无 Triton 构建目录：`slowmo/build-no-triton/`
 - 如果 `build/` 被误删，只重建这个固定目录，不要再新开别的 build 树。
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 cmake ..
 ninja -j$(nproc)
 ```
@@ -68,7 +68,7 @@ ninja -j$(nproc)
 ## 快速开始
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 ninja -j$(nproc)
 
 # 交互浏览（macOS 默认 GUI）
@@ -93,7 +93,7 @@ ninja -j$(nproc)
 ./tenet trace.bin --mcp-http 127.0.0.1:10444
 ./tenet trace.bin --mcp-hub 127.0.0.1:10444
 # Hub JSON WebSocket: ws://127.0.0.1:10444/ws/<instance-id>
-# IDAPython 入口: tools/tenet/python/tenet_ida.py
+# IDAPython 入口: slowmo/python/tenet_ida.py
 ```
 
 ## 常见工作流
@@ -133,7 +133,7 @@ ninja -j$(nproc)
 ## 目录结构
 
 ```text
-tools/tenet/
+slowmo/
 ├── CMakeLists.txt
 ├── README.md
 ├── DESIGN.md
@@ -169,7 +169,7 @@ tools/tenet/
 ## 与 qbditrace 的关系
 
 - `qbditrace` 负责录制 trace，`tenet` 负责离线读取和分析。
-- 两者通过 `tools/qbditrace/TraceFormat.h` 约定的二进制格式协作。
+- 两者通过 `dashcam/TraceFormat.h` 约定的二进制格式协作。
 - tenet 接受 trace 版本 `>= 4`（当前完整支持到 v7）；缺少 `REG_DIFF` 的 sampling trace 仍可做 PC 流分析，缺少 `HAS_CODE` 时需 `--image` 回填，否则反汇编相关能力降级。
 - 详细格式见 [`docs/trace-format.md`](docs/trace-format.md)。
 

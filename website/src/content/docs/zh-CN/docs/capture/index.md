@@ -13,17 +13,17 @@ QBDITrace 是面向 iOS / Android AArch64 的参考捕获引擎。它在目标�
 ### iOS
 
 ```bash
-bash tools/qbditrace/build-qbditrace-ios.sh
-ldid -S tools/qbditrace/build-ios/libqbditrace.dylib
-scp -P 2222 tools/qbditrace/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
+bash dashcam/build-dashcam-ios.sh
+ldid -S dashcam/build-ios/libqbditrace.dylib
+scp -P 2222 dashcam/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
 ```
 
 ### Android
 
 ```bash
 export NDK_PATH=/path/to/android-ndk
-bash tools/qbditrace/build-qbditrace-android.sh
-adb push tools/qbditrace/build-android/libqbditrace.so /data/local/tmp/
+bash dashcam/build-dashcam-android.sh
+adb push dashcam/build-android/libqbditrace.so /data/local/tmp/
 ```
 
 ### Hook 模式与 Invoke 模式

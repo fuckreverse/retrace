@@ -14,7 +14,7 @@
  *   sort_array(arr, 8);   // bubble sort
  *
  * Build:
- *   clang++ -std=c++17 -O2 -I../../tools/qbditrace -o gen_trace gen_trace.cpp
+ *   clang++ -std=c++17 -O2 -I../../dashcam -o gen_trace gen_trace.cpp
  *
  * Run:
  *   ./gen_trace demo_trace.bin

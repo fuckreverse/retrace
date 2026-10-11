@@ -13,17 +13,17 @@ QBDITrace is the reference capture engine for iOS and Android AArch64. It runs i
 ### iOS
 
 ```bash
-bash tools/qbditrace/build-qbditrace-ios.sh
-ldid -S tools/qbditrace/build-ios/libqbditrace.dylib
-scp -P 2222 tools/qbditrace/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
+bash dashcam/build-dashcam-ios.sh
+ldid -S dashcam/build-ios/libqbditrace.dylib
+scp -P 2222 dashcam/build-ios/libqbditrace.dylib root@localhost:/var/jb/usr/lib/
 ```
 
 ### Android
 
 ```bash
 export NDK_PATH=/path/to/android-ndk
-bash tools/qbditrace/build-qbditrace-android.sh
-adb push tools/qbditrace/build-android/libqbditrace.so /data/local/tmp/
+bash dashcam/build-dashcam-android.sh
+adb push dashcam/build-android/libqbditrace.so /data/local/tmp/
 ```
 
 ### Hook and Invoke modes

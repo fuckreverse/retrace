@@ -66,7 +66,7 @@ def _find_tenet_binary() -> Optional[str]:
         return found
 
     # 3. Relative to this file (development layout)
-    this_dir = Path(__file__).parent.parent.parent  # tools/tenet/python → tools/tenet
+    this_dir = Path(__file__).parent.parent.parent  # slowmo/python → slowmo
     for candidate in [
         this_dir / "build" / "tenet",
         this_dir / "build-no-triton" / "tenet",

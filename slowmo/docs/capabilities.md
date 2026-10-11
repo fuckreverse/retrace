@@ -51,7 +51,7 @@ mindmap
 
 ### Tauri Web 前端
 
-- 图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供；`tenet` 可执行文件本身是纯后端，不再创建原生窗口。
+- 图形化体验由 `slowmo/web/` 中独立的 Tauri 桌面应用提供；`tenet` 可执行文件本身是纯后端，不再创建原生窗口。
 - Tauri 的 Rust shell 以 `--ws-port <port> <trace_path> --mcp-hub` 启动和管理 `tenet` 子进程，同时开启 WS 服务与 MCP Hub；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。
 - MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径并行且相互独立，不是 Web UI 的 fallback。
 - 主要能力包括指令列表、寄存器、内存、调用栈、函数列表、Hex Dump、CFG 和分析结果视图。

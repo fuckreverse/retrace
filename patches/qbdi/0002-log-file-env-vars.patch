@@ -1,0 +1,59 @@
+diff --git a/src/Utility/LogSys.cpp b/src/Utility/LogSys.cpp
+index 125e503..f3bedef 100644
+--- a/src/Utility/LogSys.cpp
++++ b/src/Utility/LogSys.cpp
+@@ -15,6 +15,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include <cstdlib>
+ #include <utility>
+ 
+ #include "Engine/LLVMCPU.h"
+@@ -43,9 +44,44 @@ namespace {
+ class Logger {
+ public:
+   Logger(void) {
+-    setDefaultLogger();
++    // On iOS/frida-spawn'd processes the parent cannot capture stderr, so a
++    // hard QBDI_ABORT() (which logs CRITICAL then spdlog::shutdown()+abort())
++    // leaves no diagnostic trail. To make abort sites observable without
++    // touching tooling business logic, honor two environment variables read at
++    // library load time:
++    //   QBDI_LOG_FILE      -> redirect all logs to this file (truncated)
++    //   QBDI_LOG_PRIORITY  -> "DEBUG"|"INFO"|"WARNING"|"ERROR" (default INFO)
++    // The file sink is flushed by spdlog::shutdown() inside QBDI_ABORT, so the
++    // CRITICAL line that precedes the abort is guaranteed to hit disk.
++    const char *logFile = std::getenv("QBDI_LOG_FILE");
++    if (logFile != nullptr && logFile[0] != '\0') {
++      setFile(std::string(logFile), /* truncate */ true);
++    } else {
++      setDefaultLogger();
++    }
+     spdlog::set_pattern("%^[%l] (%!) %s:%#%$ %v");
+-    spdlog::set_level(spdlog::level::info);
++
++    spdlog::level::level_enum lvl = spdlog::level::info;
++    if (const char *prio = std::getenv("QBDI_LOG_PRIORITY")) {
++      if (std::string(prio) == "DEBUG") {
++        lvl = spdlog::level::debug;
++      } else if (std::string(prio) == "WARNING") {
++        lvl = spdlog::level::warn;
++      } else if (std::string(prio) == "ERROR") {
++        lvl = spdlog::level::err;
++      }
++    }
++    spdlog::set_level(lvl);
++    // Flush on every message at the active level. When QBDI_LOG_FILE is set for
++    // post-mortem diagnostics, a hang/abort can interrupt the process before
++    // spdlog's internal buffer is written; flushing at the active level (down to
++    // DEBUG when requested) guarantees the last lines before the freeze reach
++    // disk. Without an explicit log file we keep the cheap critical-only flush.
++    if (logFile != nullptr && logFile[0] != '\0') {
++      spdlog::flush_on(lvl);
++    } else {
++      spdlog::flush_on(spdlog::level::critical);
++    }
+   }
+ 
+   Logger(const Logger &) = delete;

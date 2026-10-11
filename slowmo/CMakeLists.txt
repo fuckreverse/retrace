@@ -536,7 +536,7 @@ target_include_directories(tenet_lib BEFORE PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     # Access qbditrace TraceFormat.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../qbditrace
+    ${CMAKE_CURRENT_SOURCE_DIR}/../dashcam
     # FTXUI headers
     ${ftxui_SOURCE_DIR}/include
     # Ensure our FetchContent'd fmt headers take priority over system headers

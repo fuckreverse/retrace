@@ -128,8 +128,8 @@ Tenet 内置 IDAPython Bridge，通过 Hub 将静态反汇编与动态 Trace 光
 将插件入口和 Python package 复制到 IDA 用户插件目录：
 
 ```bash
-cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
-cp -R tools/tenet/python/tenet ~/.idapro/plugins/
+cp slowmo/python/tenet_ida.py ~/.idapro/plugins/
+cp -R slowmo/python/tenet ~/.idapro/plugins/
 ```
 
 如果 IDA 用户目录不同，请使用 IDA 显示的用户插件目录。重启 IDA 并打开匹配的二进制；在 Tenet 后端以 `--mcp-hub` 启动该 Trace，或由 Tauri 桌面应用启动对应 sidecar 后，运行 **Tenet: Connect** 插件动作。普通不带 `--mcp-hub` 的 TUI/CLI 会话不会自动提供 Hub。

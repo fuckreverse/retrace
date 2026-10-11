@@ -1,4 +1,4 @@
-// tools/tenet/src/service/tenet_service.h
+// slowmo/src/service/tenet_service.h
 #pragma once
 
 #include "common/types.h"

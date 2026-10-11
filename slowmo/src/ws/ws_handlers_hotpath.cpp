@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/ws_handlers_hotpath.cpp
+// slowmo/src/ws/ws_handlers_hotpath.cpp
 //
 // Performance-critical WebSocket handlers that run synchronously on the uWS
 // event loop thread (no async dispatch): FetchRows, GetRegs, ReadMemory.

@@ -17,7 +17,7 @@
 # Requirements:
 #   - macOS arm64
 #   - QBDI static libs at <repo>/build-macos/{libQBDI.a,libqbdi-llvm.a}
-#   - tenet binary at <repo>/tools/tenet/build/tenet
+#   - tenet binary at <repo>/slowmo/build/tenet
 #
 # Usage:
 #   sh run_pass_e2e.sh              # run all suites
@@ -30,15 +30,15 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
+TRACE_DIR="${ROOT}/dashcam"
 BUILD="${ROOT}/build-macos"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TENET="${ROOT}/slowmo/build/tenet"
 HARNESS="/tmp/e2e_pass_harness"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 [ -f "${BUILD}/libQBDI.a" ] || die "libQBDI.a not found at ${BUILD}/ (see CLAUDE.md build instructions)"
-[ -x "${TENET}" ] || die "tenet not found at ${TENET} (cd tools/tenet/build && ninja)"
+[ -x "${TENET}" ] || die "tenet not found at ${TENET} (cd slowmo/build && ninja)"
 
 # shellcheck source=./lib.sh
 . "${HERE}/lib.sh"

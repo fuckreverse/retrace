@@ -6,7 +6,7 @@ sidebar:
 
 二进制 Trace 格式是任何采集引擎与 Tenet 之间的契约。只要工具生成合规的 `.bin` 文件，Tenet 即可分析——QBDITrace 是官方实现，但不是唯一选择。
 
-权威 C 定义位于 `tools/qbditrace/TraceFormat.h`。本文档为自定义采集器的实现者重新陈述该格式。
+权威 C 定义位于 `dashcam/TraceFormat.h`。本文档为自定义采集器的实现者重新陈述该格式。
 
 ## 文件头
 

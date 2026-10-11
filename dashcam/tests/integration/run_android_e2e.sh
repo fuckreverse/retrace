@@ -18,20 +18,20 @@
 # Prerequisites:
 #   - adb + a connected rooted Android arm64 device
 #   - NDK (NDK_PATH or ANDROID_SDK_ROOT, or Homebrew android-ndk)
-#   - libqbditrace.so at tools/qbditrace/build-android/ (build-qbditrace-android.sh)
-#   - tenet at tools/tenet/build/tenet
+#   - libqbditrace.so at dashcam/build-android/ (build-dashcam-android.sh)
+#   - tenet at slowmo/build/tenet
 #   - frida (host CLI + python module) + frida-server running on device
 #
 # Usage (from repo root):
-#   bash tools/qbditrace/tests/integration/run_android_e2e.sh
+#   bash dashcam/tests/integration/run_android_e2e.sh
 #
 # Exit code: 0 = all pass, non-zero = failure count.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TRACE_DIR="${ROOT}/dashcam"
+TENET="${ROOT}/slowmo/build/tenet"
 SO="${TRACE_DIR}/build-android/libqbditrace.so"
 RUNNER="${TRACE_DIR}/qbditrace_runner.py"
 DEV_TMP=/data/local/tmp
@@ -59,7 +59,7 @@ NM="${TOOLCHAIN}/${HOST_TAG}/bin/llvm-nm"
 [[ -x "${CC}" ]] || { echo "ERROR: NDK clang not found at ${CC}"; exit 1; }
 
 # ─── preflight ──────────────────────────────────────────────────────────────
-[[ -f "${SO}" ]]    || { echo "ERROR: ${SO} missing (run build-qbditrace-android.sh)"; exit 1; }
+[[ -f "${SO}" ]]    || { echo "ERROR: ${SO} missing (run build-dashcam-android.sh)"; exit 1; }
 [[ -x "${TENET}" ]] || { echo "ERROR: tenet not built (${TENET})"; exit 1; }
 command -v frida >/dev/null || { echo "ERROR: frida not installed on host"; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "ERROR: no adb device"; exit 1; }

@@ -115,7 +115,7 @@ tenet --dump text trace.bin --limit 100
 |---|---|---|
 | Triton 驱动的精确污点语义 | Triton | 构建时 `TENET_ENABLE_TRITON=ON`；否则污点工具使用启发式回退 |
 | YARA 内存扫描（`yara_mem_scan`） | libyara | 构建时 `TENET_ENABLE_YARA=ON` |
-| Tauri 桌面应用 | Tauri / Web 前端工具链 | 在 `tools/tenet/web/` 中独立构建 |
+| Tauri 桌面应用 | Tauri / Web 前端工具链 | 在 `slowmo/web/` 中独立构建 |
 | Trace 压缩（现代默认） | zstd | qbditrace 中 `QBDITRACE_ENABLE_ZSTD=ON` |
 | 并行索引 / 任务调度 | Intel oneTBB | `TENET_ENABLE_TBB=ON`，默认启用 |
 

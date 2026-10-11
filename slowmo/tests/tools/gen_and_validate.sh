@@ -14,7 +14,7 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TENET_DIR="${ROOT}/tools/tenet"
+TENET_DIR="${ROOT}/slowmo"
 BUILD_DIR="${TENET_DIR}/build"
 TRACES_DIR="${HERE}/../traces"
 GENERATOR="${BUILD_DIR}/gen_test_traces"

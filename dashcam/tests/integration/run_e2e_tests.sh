@@ -10,7 +10,7 @@
 # Requirements:
 #   - macOS arm64
 #   - QBDI static libs at <repo>/build-macos/{libQBDI.a,libqbdi-llvm.a}
-#   - tenet binary at <repo>/tools/tenet/build/tenet
+#   - tenet binary at <repo>/slowmo/build/tenet
 #
 # Usage:
 #   sh run_e2e_tests.sh          # run all scenarios
@@ -22,9 +22,9 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
+TRACE_DIR="${ROOT}/dashcam"
 BUILD="${ROOT}/build-macos"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TENET="${ROOT}/slowmo/build/tenet"
 
 FAST=0
 if [ "${1}" = "--fast" ]; then FAST=1; fi

@@ -4,7 +4,7 @@ sidebar:
   order: 2
 ---
 
-Tenet Desktop 是位于 `tools/tenet/web/` 的独立 Tauri 桌面应用，而不是 `tenet` 可执行文件中的原生 GUI。打开 trace 时，应用会拉起纯后端 `tenet` 作为 sidecar，实际参数包含 `--ws-port <port> <trace> --mcp-hub`。React 前端通过 WebSocket 使用 FlatBuffers 二进制协议访问后端；MCP Hub 则同时为外部工具提供实例协调能力。
+Tenet Desktop 是位于 `slowmo/web/` 的独立 Tauri 桌面应用，而不是 `tenet` 可执行文件中的原生 GUI。打开 trace 时，应用会拉起纯后端 `tenet` 作为 sidecar，实际参数包含 `--ws-port <port> <trace> --mcp-hub`。React 前端通过 WebSocket 使用 FlatBuffers 二进制协议访问后端；MCP Hub 则同时为外部工具提供实例协调能力。
 
 Desktop 当前支持 macOS 和 Linux。Windows 版后端默认关闭 `TENET_ENABLE_WS`，因为所用 uSockets 事件循环尚未接入 IOCP；因此 Tauri Desktop 目前无法连接 Windows 版 `tenet` 后端。
 

@@ -189,7 +189,7 @@ Tenet **没有** `--profile` CLI 标志。以下 Instruments 工具链是给 Ten
 - **CPU Counters** —— 暴露 IPC、cache miss 率、分支预测失败率；
 - **os_signpost** —— `TENET_ZONE_NAMED(...)` 打在 Instruments 中以 "Points of Interest" 出现，按 Pass 名标记。
 
-命令与方法论见随产品提供的 `tools/tenet/docs/profiling.md` 指南（Instruments、signpost 标记、基准测试套件）。
+命令与方法论见随产品提供的 `slowmo/docs/profiling.md` 指南（Instruments、signpost 标记、基准测试套件）。
 
 ## 推荐工作流
 

@@ -3,7 +3,7 @@
 # prepare-sidecar.sh —— 为 Tauri 打包准备 tenet C++ 后端 sidecar 二进制。
 #
 # 做的事情：
-#   1. 在 tools/tenet/build（固定目录，不新建）里以 Release 配置编译 tenet。
+#   1. 在 slowmo/build（固定目录，不新建）里以 Release 配置编译 tenet。
 #   2. 递归解析 tenet 的动态库依赖，把所有「非系统」dylib（Triton/yara/lz4/
 #      mimalloc 及其间接依赖 z3/capstone/openssl/libmagic/jansson 等）复制到
 #      src-tauri/binaries/lib/ 下。
@@ -24,9 +24,9 @@
 #      bundle.externalBin 打包进 .app/Contents/MacOS/。
 #
 # 用法：
-#   bash tools/tenet/web/src-tauri/scripts/prepare-sidecar.sh [--debug|--release]
+#   bash slowmo/web/src-tauri/scripts/prepare-sidecar.sh [--debug|--release]
 #
-# 默认构建类型为 RelWithDebInfo（与 tools/tenet/build 的默认配置一致，
+# 默认构建类型为 RelWithDebInfo（与 slowmo/build 的默认配置一致，
 # 增量编译快、运行性能约为 Debug 的 2-3×）。
 #   --debug   切到 Debug（-O0 -g，最快编译，最慢运行）
 #   --release 切到 Release（-O3 + ThinLTO + -mcpu，最慢编译，最快运行，发布用）
@@ -44,7 +44,7 @@ set -euo pipefail
 # ── 路径 ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_TAURI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TENET_DIR="$(cd "${SRC_TAURI_DIR}/../.." && pwd)"   # tools/tenet
+TENET_DIR="$(cd "${SRC_TAURI_DIR}/../.." && pwd)"   # slowmo
 BUILD_DIR="${TENET_DIR}/build"
 BIN_OUT_DIR="${SRC_TAURI_DIR}/binaries"
 LIB_OUT_DIR="${BIN_OUT_DIR}/lib"

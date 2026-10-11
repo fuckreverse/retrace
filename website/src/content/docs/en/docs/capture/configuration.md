@@ -10,19 +10,19 @@ The only supported way to run QBDITrace is through `qbditrace_runner.py`. Do **n
 
 ```bash
 # Trace a function by offset in the main executable
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xEE91EC \
     --output /var/mobile/Documents/trace.bin
 
 # Trace an exported symbol
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry _CCCrypt \
     --output /var/mobile/Documents/cccrypt.bin
 
 # Trace a function inside a specific framework module
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --module SomeFramework \
     --entry 0x1234 \
@@ -72,7 +72,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # Snapshot the module's writable data segment before tracing
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --snapshot-range 0x100010000 0x100012000 \
@@ -87,7 +87,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # Clear a 4-byte cache flag at module offset +0x1abc
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --patch +0x1abc:00000000 \
@@ -119,7 +119,7 @@ When `--invoke` is used, `--arg-count` is inferred from `--args` and `--trace-mo
 
 ```bash
 # Invoke CCCrypt with full typed arguments
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry _CCCrypt \
     --invoke \
@@ -148,7 +148,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 `--java-entry fully.qualified.Class.method` uses a Java method as the trace trigger instead of hooking a native entry. The agent hooks the Java method (via `Java.perform`); when the app calls it, the arguments are materialized and the native entry is invoked inside the VM. Java `int`/`long` become immediates, `String` becomes a UTF-8 buffer, and other objects are passed as jobject handles. Requires `--android`; mutually exclusive with `--invoke`.
 
 ```bash
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --android \
     --module libnative.so \
@@ -180,7 +180,7 @@ Use the two-phase scout workflow to reduce trace size when the target contains l
 
 ```bash
 # Phase 1: run a lightweight scout trace (bare PC stream)
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --sampling \
@@ -190,7 +190,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 ./tenet --suggest-excludes /var/mobile/Documents/scout.bin
 
 # Phase 3: run the full trace with exclude ranges confirmed
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 12000-13500 \

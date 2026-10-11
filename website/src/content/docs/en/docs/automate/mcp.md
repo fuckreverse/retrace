@@ -128,8 +128,8 @@ Tenet includes an IDAPython bridge that keeps static disassembly and the dynamic
 Copy the entry point and its Python package into IDA's user plugin directory:
 
 ```bash
-cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
-cp -R tools/tenet/python/tenet ~/.idapro/plugins/
+cp slowmo/python/tenet_ida.py ~/.idapro/plugins/
+cp -R slowmo/python/tenet ~/.idapro/plugins/
 ```
 
 If your IDA user directory differs, use the directory reported by IDA for user plugins. Restart IDA and open the matching binary. After the Tenet backend starts that trace with `--mcp-hub`, or the Tauri desktop application launches its sidecar, run the **Tenet: Connect** plugin action. An ordinary TUI/CLI session without `--mcp-hub` does not automatically provide a Hub.

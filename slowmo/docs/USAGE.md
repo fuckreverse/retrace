@@ -109,7 +109,7 @@ adb forward tcp:27042 tcp:27042
 使用脚本（推荐，在仓库根目录执行）：
 
 ```bash
-bash tools/qbditrace/build-qbditrace-ios.sh
+bash dashcam/build-dashcam-ios.sh
 ```
 
 产物：仓库根目录下的 `libqbditrace.dylib`
@@ -132,7 +132,7 @@ scp -P 2222 libqbditrace.dylib root@localhost:/var/jb/usr/lib/
 
 ```bash
 export NDK_PATH=/path/to/android-ndk-rXXX
-bash tools/qbditrace/build-qbditrace-android.sh
+bash dashcam/build-dashcam-android.sh
 ```
 
 产物：仓库根目录下的 `libqbditrace.so`
@@ -151,7 +151,7 @@ adb shell chmod 644 /data/local/tmp/libqbditrace.so
 **首次构建：**
 
 ```bash
-cd tools/tenet
+cd slowmo
 mkdir build && cd build
 cmake ..                  # 默认 RelWithDebInfo，兼顾运行与增量编译速度
 ninja -j$(nproc)
@@ -167,7 +167,7 @@ ninja -j$(nproc)
 **增量构建（日常开发）：**
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 ninja -j$(nproc)          # 改单个 .cpp 通常 3-4 秒
 ```
 
@@ -192,7 +192,7 @@ ninja -j$(nproc)          # 改单个 .cpp 通常 3-4 秒
 
 ```bash
 # 在 build-no-triton/ 目录（不要在 build/ 里关掉，避免重触依赖）
-mkdir -p tools/tenet/build-no-triton && cd tools/tenet/build-no-triton
+mkdir -p slowmo/build-no-triton && cd slowmo/build-no-triton
 cmake .. -DTENET_ENABLE_TRITON=OFF
 ninja -j$(nproc)
 ```
@@ -221,19 +221,19 @@ tenet --dump jsonl trace.bin
 
 ```bash
 # 录制主模块中某个函数（使用 IDA 静态偏移）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xEE91EC \
     --output /var/mobile/Documents/trace.bin
 
 # 录制导出符号
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry _CCCrypt \
     --output /var/mobile/Documents/trace.bin
 
 # 录制特定 framework 中的函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --module SomeFramework \
     --entry 0x1234 \
@@ -246,7 +246,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # Android native 库函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --android \
     --module libnative.so \
@@ -255,7 +255,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 # Java 方法作为触发器：hook Java 层 native bridge，参数自动物化
 # （int/long → 立即数，String → UTF-8 字符串，对象 → jobject handle）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --android \
     --module libnative.so \
@@ -270,7 +270,7 @@ adb pull /data/local/tmp/trace.bin ./trace.bin
 ### 3.3 Attach 已运行进程
 
 ```bash
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --attach \
     --entry 0xABC \
@@ -281,14 +281,14 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 捕获 5 次调用（生成 5 个 trace 文件）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-mode 5 \
     --output /var/mobile/Documents/trace.bin
 
 # 无限捕获（Ctrl+C 停止）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-mode multi \
@@ -299,24 +299,24 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 启用 v5 PC-delta 模式（文件体积通常减少 40%–60%）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --entry 0xABC --pc-delta \
     --output /var/mobile/Documents/trace.bin
 
 # 启用 v7 FPR/NEON 录制（密码学分析时有用）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --entry 0xABC --fpr \
     --output /var/mobile/Documents/trace.bin
 
 # 调整 ring buffer（默认 64 MiB，大函数可能需要更大）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --ring-bytes $((256 * 1024 * 1024)) \
     --output /var/mobile/Documents/trace.bin
 
 # 调整 ANCHOR 间隔（默认 1024 条指令，越小定位越快，文件越大）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --anchor-interval 512 \
@@ -324,7 +324,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 # 排除噪声区间（静态偏移，格式 START-END 或 START:SIZE，最多 8 个）
 # 排除区域原生执行不产生 trace 记录
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 0x1000-0x2000 --exclude-range 0x3000:0x400 \
@@ -332,7 +332,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 # Pre-trace 内存 patch：清除缓存/标志以获取完整 trace
 # +偏移 = 模块基址偏移，绝对地址也支持。trace 后自动恢复原始字节
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --patch +0x1abc:00000000 \
@@ -342,7 +342,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 ### 3.6 后台录制
 
 ```bash
-nohup python3 tools/qbditrace/qbditrace_runner.py \
+nohup python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-mode multi \
@@ -403,12 +403,12 @@ tenet --stats trace.bin
 
 ### 5.1 Tauri Web 前端（跨平台图形化入口）
 
-图形化体验由 `tools/tenet/web/` 中独立的 Tauri 桌面应用提供。Tauri 的 Rust shell 以 `--ws-port <port> --progress-json <trace_path> --mcp-hub` 通过 sidecar 启动和管理 `tenet` 后端子进程（`--progress-json` 让索引构建等早期阶段以 `TENET-PROGRESS` 行上报进度，驱动 loading 页进度条，详见 `ui-layer.md`）；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
+图形化体验由 `slowmo/web/` 中独立的 Tauri 桌面应用提供。Tauri 的 Rust shell 以 `--ws-port <port> --progress-json <trace_path> --mcp-hub` 通过 sidecar 启动和管理 `tenet` 后端子进程（`--progress-json` 让索引构建等早期阶段以 `TENET-PROGRESS` 行上报进度，驱动 loading 页进度条，详见 `ui-layer.md`）；React/TypeScript 浏览器端仅连接 `ws://127.0.0.1:<port>`，使用 FlatBuffers 二进制协议。并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
 
 开发模式使用仓库中已有脚本：
 
 ```bash
-cd tools/tenet/web
+cd slowmo/web
 pnpm tauri:dev
 ```
 
@@ -421,7 +421,7 @@ Tauri 前端提供时间轴、指令、寄存器、内存/Hex Dump、函数与�
 ### 5.2 TUI 模式（SSH / 无图形界面）
 
 ```bash
-cd tools/tenet/build
+cd slowmo/build
 ./tenet --tui /path/to/trace.bin
 ```
 
@@ -555,7 +555,7 @@ TUI 提供终端内的多面板浏览体验，通过键盘操作，并与 Tauri 
 
 ```bash
 # Step 1：录制 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --entry 0xABC \
     --output /var/mobile/Documents/crypt.bin
 
@@ -579,7 +579,7 @@ scp -P 2222 root@localhost:/var/mobile/Documents/crypt.bin ./crypt.bin
 
 ```bash
 # 录制（包含 ObjC 消息）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --entry 0xABC \
     --output /var/mobile/Documents/objc.bin
 
@@ -634,13 +634,13 @@ Hub WebSocket 使用 JSON-RPC/MCP 文本帧并按 URL 中的 `instance-id` 固�
 
 ```bash
 # 将入口脚本放入 IDA 用户插件目录；确保同级可导入 tenet Python 包
-cp tools/tenet/python/tenet_ida.py ~/.idapro/plugins/
+cp slowmo/python/tenet_ida.py ~/.idapro/plugins/
 
 # 启动 Tauri 前端或 Hub 后，在 IDA 中执行：
 # Edit → Plugins → Tenet Trace Bridge → Connect
 ```
 
-插件会通过 `10444` 自动发现并匹配 trace 实例、同步 IDA image base，并提供双向导航与寄存器查询。完整包部署时需同时让 `tools/tenet/python/tenet/ida/` 位于 IDA 的 Python 搜索路径。
+插件会通过 `10444` 自动发现并匹配 trace 实例、同步 IDA image base，并提供双向导航与寄存器查询。完整包部署时需同时让 `slowmo/python/tenet/ida/` 位于 IDA 的 Python 搜索路径。
 
 **JSON-RPC（本地脚本接入）：**
 
@@ -726,7 +726,7 @@ cat /tmp/pcring.txt
 
 | 文档 | 主题 |
 |------|------|
-| [`qbditrace/README.md`](../../qbditrace/README.md) | tracer 详细设计、C ABI 参考、Benchmark 套件 |
+| [`qbditrace/README.md`](../../dashcam/README.md) | tracer 详细设计、C ABI 参考、Benchmark 套件 |
 | [`docs/capabilities.md`](capabilities.md) | tenet 全部能力按场景的导航地图 |
 | [`docs/trace-format.md`](trace-format.md) | 二进制格式完整规范（v4/v5/v7/flags） |
 | [`docs/analysis-layer.md`](analysis-layer.md) | 30 个 Pass 的分类、依赖和调度 |

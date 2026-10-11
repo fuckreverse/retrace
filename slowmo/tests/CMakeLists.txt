@@ -21,7 +21,7 @@ include(Catch)
 # Test fixtures are headers; expose them to all test targets.
 set(TENET_TEST_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}"           # for #include "fixtures/..."
-    "${CMAKE_CURRENT_SOURCE_DIR}/../qbditrace"  # for TraceFormat.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/../dashcam"  # for TraceFormat.h
 )
 
 # ─── Helper: add a Catch2 test executable ───────────────────────────────────

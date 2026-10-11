@@ -1,40 +1,53 @@
 #!/bin/bash
-# build-qbditrace-ios.sh — Build libqbditrace.dylib for iOS arm64 with zstd
+# build-dashcam-ios.sh — Build libqbditrace.dylib for iOS arm64 with zstd
 #
-# Usage (from the QBDI repo root):
-#   bash tools/qbditrace/build-qbditrace-ios.sh
+# Usage (from the Retrace repo root):
+#   bash dashcam/build-dashcam-ios.sh
 #
 # Prerequisites:
-#   - build-ios/libQBDI.a and build-ios/libqbdi-llvm.a already built
-#   - tools/tenet/_deps/zstd-src/ exists (shared FetchContent cache)
+#   - scripts/prepare-qbdi.sh ios has been run (patched QBDI static libs
+#     cached under third-party/qbdi/ios/)
+#   - zstd source cache exists (dashcam/_deps/ or slowmo/_deps/, produced by
+#     a prior host cmake configure; fetched on demand otherwise)
 #
 # Output: libqbditrace.dylib in the repo root (ready for deployment)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 cd "${REPO_ROOT}"
 
+QBDI_CACHE="third-party/qbdi/ios"
+
 # Validate prerequisites
-if [[ ! -f build-ios/libQBDI.a ]]; then
-    echo "ERROR: build-ios/libQBDI.a not found. Build QBDI for iOS first." >&2
+if [[ ! -f "${QBDI_CACHE}/libQBDI.a" ]]; then
+    echo "ERROR: ${QBDI_CACHE}/libQBDI.a not found." >&2
+    echo "       Run: bash scripts/prepare-qbdi.sh ios" >&2
     exit 1
 fi
-if [[ ! -f build-ios/libqbdi-llvm.a ]]; then
-    echo "ERROR: build-ios/libqbdi-llvm.a not found. Build QBDI for iOS first." >&2
+if [[ ! -f "${QBDI_CACHE}/libqbdi-llvm.a" ]]; then
+    echo "ERROR: ${QBDI_CACHE}/libqbdi-llvm.a not found." >&2
+    echo "       Run: bash scripts/prepare-qbdi.sh ios" >&2
     exit 1
 fi
 
-ZSTD_SRC="tools/tenet/_deps/zstd-src/lib"
-if [[ ! -f "${ZSTD_SRC}/zstd.h" ]]; then
-    echo "ERROR: zstd source not found at ${ZSTD_SRC}. Run tenet cmake first." >&2
+# zstd sources: prefer dashcam's own FetchContent cache, fall back to the
+# shared slowmo cache (either one is a pristine zstd checkout).
+ZSTD_SRC=""
+for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib; do
+    if [[ -f "${cand}/zstd.h" ]]; then ZSTD_SRC="${cand}"; break; fi
+done
+if [[ -z "${ZSTD_SRC}" ]]; then
+    echo "ERROR: zstd source not found (looked in dashcam/_deps and slowmo/_deps)." >&2
+    echo "       Run a host cmake configure first: cd dashcam && mkdir -p build && cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF" >&2
     exit 1
 fi
 
 # Step 1: Cross-compile zstd for iOS arm64 (if not already built)
-ZSTD_LIB="build-ios/libzstd.a"
+ZSTD_LIB="dashcam/build-ios/libzstd.a"
 if [[ ! -f "${ZSTD_LIB}" ]]; then
     echo "==> Building libzstd.a for iOS arm64..."
+    mkdir -p dashcam/build-ios
     TMPDIR=$(mktemp -d)
     xcrun --sdk iphoneos clang -arch arm64 -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 \
         -I"${ZSTD_SRC}" -I"${ZSTD_SRC}/common" \
@@ -56,10 +69,10 @@ fi
 echo "==> Building libqbditrace.dylib (with zstd compression)..."
 xcrun --sdk iphoneos clang++ -arch arm64 -std=c++17 -O3 -DNDEBUG -dynamiclib \
     -DQBDITRACE_HAVE_ZSTD=1 \
-    -Iinclude -Ibuild-ios/include -Ibuild-ios/include-static \
-    -Itools/qbditrace -I"${ZSTD_SRC}" \
-    tools/qbditrace/QBDITrace.cpp \
-    build-ios/libQBDI.a build-ios/libqbdi-llvm.a "${ZSTD_LIB}" \
+    -I"${QBDI_CACHE}/include" -I"${QBDI_CACHE}/build-include" \
+    -Idashcam -I"${ZSTD_SRC}" \
+    dashcam/QBDITrace.cpp \
+    "${QBDI_CACHE}/libQBDI.a" "${QBDI_CACHE}/libqbdi-llvm.a" "${ZSTD_LIB}" \
     -framework Foundation -framework CoreFoundation \
     -o libqbditrace.dylib
 

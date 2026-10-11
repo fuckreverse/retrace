@@ -35,7 +35,7 @@ export interface BackendPorts {
 /**
  * 后端实时进度事件载荷（Rust 侧 `backend-progress`，由 sidecar 的
  * `TENET-PROGRESS` 行解析而来，见 src-tauri/src/lib.rs 与
- * tools/tenet/src/main.cpp 的 --progress-json）。仅在 loading 阶段消费：
+ * slowmo/src/main.cpp 的 --progress-json）。仅在 loading 阶段消费：
  * WS 服务要到索引建完才启动，这段窗口期的进度只能靠这条侧信道。
  */
 export interface BackendProgress {

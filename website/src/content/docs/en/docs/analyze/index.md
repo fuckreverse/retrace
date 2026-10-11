@@ -115,7 +115,7 @@ tenet --dump text trace.bin --limit 100
 |---|---|---|
 | Triton-backed taint semantics | Triton | `TENET_ENABLE_TRITON=ON`; otherwise taint tools use their heuristic fallback |
 | YARA memory scan (`yara_mem_scan`) | libyara | `TENET_ENABLE_YARA=ON` at build time |
-| Tauri desktop application | Tauri / Web frontend toolchain | Built separately under `tools/tenet/web/` |
+| Tauri desktop application | Tauri / Web frontend toolchain | Built separately under `slowmo/web/` |
 | Trace compression (modern default) | zstd | `QBDITRACE_ENABLE_ZSTD=ON` in qbditrace |
 | Parallel indexing / task scheduling | Intel oneTBB | `TENET_ENABLE_TBB=ON`, default on |
 

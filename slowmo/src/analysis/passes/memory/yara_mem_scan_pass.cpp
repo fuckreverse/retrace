@@ -38,7 +38,7 @@ namespace tenet {
 //
 // Resolving relative to the *executable's own path* is robust to all of the
 // above, mirroring how `tenet/rules/` sits next to the build output
-// (`tools/tenet/build/tenet` -> `tools/tenet/rules/`).
+// (`slowmo/build/tenet` -> `slowmo/rules/`).
 namespace {
 
 /// Best-effort absolute path to the running executable. Returns an empty

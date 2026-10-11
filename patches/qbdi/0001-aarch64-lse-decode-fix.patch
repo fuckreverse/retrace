@@ -1,0 +1,31 @@
+diff --git a/src/Utility/AARCH64/System_darwin.cpp b/src/Utility/AARCH64/System_darwin.cpp
+index 5c77a5e..3f3e9b7 100644
+--- a/src/Utility/AARCH64/System_darwin.cpp
++++ b/src/Utility/AARCH64/System_darwin.cpp
+@@ -104,6 +104,26 @@ const std::vector<std::string> getHostCPUFeatures() {
+   std::vector<std::string> mattrs = {};
+   llvm::StringMap<bool> features = llvm::sys::getHostCPUFeatures();
+ 
++  // ARMv8.1-A Large System Extensions (LSE) atomics:
++  // cas/casa/casal/casb/cash/swp*/ldadd*/ldset*/ldclr*/ldeor*/ldsmax*/ldsmin*/
++  // ldumax*/ldumin*.
++  //
++  // Why this is needed: on Darwin AArch64 hosts mis-detected as pre-v8.1
++  // (e.g. A11/iPhone X: host_info() reports CPU_SUBTYPE_ARM64_V8, mapped to
++  // "cyclone", nominally ARMv8.0 with no LSE), Apple's system libraries
++  // (e.g. libsystem_pthread's _pthread_mutex_firstfit_lock_slow) are built
++  // with LSE and contain `casa` (encoding 0xc8ec....). When execution falls
++  // through to such code, the LLVM disassembler — configured without +lse —
++  // cannot decode `casa`, getInstruction() returns Fail, and Engine::patch()
++  // aborts with "Disassembly error" (Engine.cpp:298).
++  //
++  // Enabling +lse only affects DECODING capability; it never forces these
++  // instructions to be emitted. On a genuine ARMv8.0 device the system
++  // libraries never contain LSE atomics, so this flag is inert there. Hence
++  // it is safe to enable unconditionally on this platform. (Done before the
++  // QBDI_FIXUP_FEATURES env fixup so an explicit "-lse" can still override.)
++  features["lse"] = true;
++
+   const char *fixupFeatures = getenv("QBDI_FIXUP_FEATURES");
+   if (fixupFeatures != nullptr) {
+     llvm::SubtargetFeatures addFeatures(fixupFeatures);

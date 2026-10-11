@@ -1,4 +1,4 @@
-// tools/tenet/src/ws/ws_handlers_analysis.cpp
+// slowmo/src/ws/ws_handlers_analysis.cpp
 //
 // Pass management and data query WebSocket handlers.
 // analysis_mutex_ only serializes heavy analysis jobs (pass execution / MCP

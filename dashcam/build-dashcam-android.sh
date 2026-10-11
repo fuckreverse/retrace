@@ -1,29 +1,31 @@
 #!/bin/bash
-# build-qbditrace-android.sh — Build libqbditrace.so for Android arm64 with zstd
+# build-dashcam-android.sh — Build libqbditrace.so for Android arm64 with zstd
 #
-# Usage (from the QBDI repo root):
-#   bash tools/qbditrace/build-qbditrace-android.sh
+# Usage (from the Retrace repo root):
+#   bash dashcam/build-dashcam-android.sh
 #
 # The script drives the standard CMake NDK toolchain into the fixed build
-# directory tools/qbditrace/build-android/ (never create other build dirs —
+# directory dashcam/build-android/ (never create other build dirs —
 # see CLAUDE.md). zstd is cross-compiled once with the NDK clang and cached
-# at build-android/libzstd.a (source reused from tools/tenet/_deps/zstd-src/;
-# it must NOT go through FetchContent — the shared <name>-build dir would
-# clobber tenet's host-built zstd).
+# at dashcam/build-android/libzstd.a (source reused from the shared
+# FetchContent cache; it must NOT go through FetchContent — the shared
+# <name>-build dir would clobber the host-built zstd).
 #
 # Prerequisites:
-#   - build-android/libQBDI.a already built (via cmake/config/config-android-aarch64.sh)
+#   - scripts/prepare-qbdi.sh android has been run (patched QBDI static
+#     libs cached under third-party/qbdi/android/)
 #   - NDK_PATH or ANDROID_SDK_ROOT environment variable set
-#   - tools/tenet/_deps/zstd-src/ exists (shared FetchContent cache)
+#   - zstd source cache exists (dashcam/_deps/ or slowmo/_deps/)
 #
 # Output: libqbditrace.so in the repo root (ready for deployment)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 cd "${REPO_ROOT}"
 
-BUILD_DIR="tools/qbditrace/build-android"
+BUILD_DIR="dashcam/build-android"
+QBDI_CACHE="third-party/qbdi/android"
 
 # ---------------------------------------------------------------------------
 # Resolve NDK path
@@ -64,18 +66,26 @@ echo "==> Using NDK: ${NDK_PATH}"
 # ---------------------------------------------------------------------------
 # Validate prerequisites
 # ---------------------------------------------------------------------------
-if [[ ! -f build-android/libQBDI.a ]]; then
-    echo "ERROR: build-android/libQBDI.a not found." >&2
-    echo "       Build QBDI for Android first:" >&2
-    echo "         mkdir -p build-android && cd build-android" >&2
-    echo "         bash ../cmake/config/config-android-aarch64.sh" >&2
-    echo "         ninja" >&2
+if [[ ! -f "${QBDI_CACHE}/libQBDI.a" ]]; then
+    echo "ERROR: ${QBDI_CACHE}/libQBDI.a not found." >&2
+    echo "       Run: bash scripts/prepare-qbdi.sh android" >&2
+    exit 1
+fi
+if [[ ! -f "${QBDI_CACHE}/libqbdi-llvm.a" ]]; then
+    echo "ERROR: ${QBDI_CACHE}/libqbdi-llvm.a not found." >&2
+    echo "       Run: bash scripts/prepare-qbdi.sh android" >&2
     exit 1
 fi
 
-ZSTD_SRC="tools/tenet/_deps/zstd-src/lib"
-if [[ ! -f "${ZSTD_SRC}/zstd.h" ]]; then
-    echo "ERROR: zstd source not found at ${ZSTD_SRC}. Run tenet cmake first." >&2
+# zstd sources: prefer dashcam's own FetchContent cache, fall back to the
+# shared slowmo cache.
+ZSTD_SRC=""
+for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib; do
+    if [[ -f "${cand}/zstd.h" ]]; then ZSTD_SRC="${cand}"; break; fi
+done
+if [[ -z "${ZSTD_SRC}" ]]; then
+    echo "ERROR: zstd source not found (looked in dashcam/_deps and slowmo/_deps)." >&2
+    echo "       Run a host cmake configure first: cd dashcam && mkdir -p build && cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF" >&2
     exit 1
 fi
 
@@ -105,9 +115,10 @@ fi
 # ---------------------------------------------------------------------------
 # Step 1: Cross-compile zstd for Android arm64 (cached at build-android/libzstd.a)
 # ---------------------------------------------------------------------------
-ZSTD_LIB="build-android/libzstd.a"
+ZSTD_LIB="dashcam/build-android/libzstd.a"
 if [[ ! -f "${ZSTD_LIB}" ]]; then
     echo "==> Building libzstd.a for Android arm64..."
+    mkdir -p "${BUILD_DIR}"
     TMPDIR=$(mktemp -d)
     "${CC}" -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 -fPIC \
         -I"${ZSTD_SRC}" -I"${ZSTD_SRC}/common" \
@@ -131,19 +142,17 @@ fi
 # Configure (CMake NDK toolchain) into the fixed build dir
 # ---------------------------------------------------------------------------
 # QBDI_BUILD_INCLUDE_DIR accepts a semicolon list; both layouts are produced
-# by QBDI's own android configure.
-QBDI_BUILD_INC="${REPO_ROOT}/build-android/include"
-[[ -d "${REPO_ROOT}/build-android/include-static" ]] && \
-    QBDI_BUILD_INC="${QBDI_BUILD_INC};${REPO_ROOT}/build-android/include-static"
+# by prepare-qbdi.sh's copy step.
+QBDI_BUILD_INC="${REPO_ROOT}/${QBDI_CACHE}/build-include"
 
 echo "==> Configuring ${BUILD_DIR} (CMake NDK toolchain, API ${API_LEVEL})..."
-cmake -S tools/qbditrace -B "${BUILD_DIR}" -G Ninja \
+cmake -S dashcam -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM="${API_LEVEL}" \
-    -DQBDI_INCLUDE_DIR="${REPO_ROOT}/include" \
+    -DQBDI_INCLUDE_DIR="${REPO_ROOT}/${QBDI_CACHE}/include" \
     -DQBDI_BUILD_INCLUDE_DIR="${QBDI_BUILD_INC}" \
-    -DQBDI_STATIC_LIB="${REPO_ROOT}/build-android/libQBDI.a" \
+    -DQBDI_STATIC_LIB="${REPO_ROOT}/${QBDI_CACHE}/libQBDI.a" \
     -DQBDITRACE_ZSTD_STATIC_LIB="${REPO_ROOT}/${ZSTD_LIB}" \
     -DQBDITRACE_ZSTD_INCLUDE_DIR="${REPO_ROOT}/${ZSTD_SRC}" \
     -DQBDITRACE_BUILD_DYLIB=ON \

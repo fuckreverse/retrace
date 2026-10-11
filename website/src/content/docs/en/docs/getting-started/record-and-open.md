@@ -12,7 +12,7 @@ This tutorial uses iOS; for Android capture, see the corresponding [platform gui
 ## Record
 
 ```bash
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
   --target com.example.app \
   --entry 0xEE91EC \
   --output /var/mobile/Documents/trace.bin

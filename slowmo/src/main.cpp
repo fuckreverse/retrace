@@ -417,7 +417,7 @@ if (!trace_lock && lock_holder.pid != 0) {
     }
 
     // TUI is the only native interactive frontend. The graphical frontend is
-    // the separate Tauri application in tools/tenet/web/.
+    // the separate Tauri application in slowmo/web/.
     TuiApp app(service);
     return app.run();
 }

@@ -8,7 +8,7 @@
  *           hundreds of loops, deep nesting — stress-tests graph algorithms.
  *
  * Build:
- *   clang++ -std=c++17 -O2 -I../../tools/qbditrace -o gen_gb_trace gen_gb_trace.cpp
+ *   clang++ -std=c++17 -O2 -I../../dashcam -o gen_gb_trace gen_gb_trace.cpp
  *
  * Usage:
  *   ./gen_gb_trace <output.trace> [target_size_gb] [--complex-cfg]

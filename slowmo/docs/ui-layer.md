@@ -6,7 +6,7 @@
 
 | 入口 | 文件 | 触发方式 | 适用场景 |
 |------|------|----------|----------|
-| Tauri 前端 | `tools/tenet/web/` | 独立启动 Tauri 应用，通过 sidecar 拉起 `tenet` 子进程 | 图形化浏览、大 trace 交互分析 |
+| Tauri 前端 | `slowmo/web/` | 独立启动 Tauri 应用，通过 sidecar 拉起 `tenet` 子进程 | 图形化浏览、大 trace 交互分析 |
 | TUI | `src/tui/` | `--tui` | 终端环境、远程 SSH |
 | CLI 批处理 | `src/cli_options.cpp` + `src/batch_analysis.cpp` | 任意分析选项 | 批量分析、导出、脚本化 |
 | RPC | `src/io/rpc_server.cpp` | `--rpc [[host:]port]` | TCP JSON-RPC；默认 loopback，可自定义 host |
@@ -35,7 +35,7 @@ flowchart TD
 
 ## Tauri 前端（Web UI）
 
-图形化体验由 `tools/tenet/web/` 下的独立 Tauri 桌面应用提供。Tauri 的 Rust shell 位于 `web/src-tauri/`，Web 前端位于 `web/src/`，使用 React + TypeScript；`web/src/layout/` 等目录实现窗口框架、侧边栏、标签页、时间线与对话框等交互组件。
+图形化体验由 `slowmo/web/` 下的独立 Tauri 桌面应用提供。Tauri 的 Rust shell 位于 `web/src-tauri/`，Web 前端位于 `web/src/`，使用 React + TypeScript；`web/src/layout/` 等目录实现窗口框架、侧边栏、标签页、时间线与对话框等交互组件。
 
 ### 进程与通信模型
 
@@ -61,9 +61,9 @@ Tauri 是 `tenet` 进程之外的客户端，而不是 `main.cpp` 中的 UI 分�
 
 - 多面板浏览、CFG 与调用图可视化、寄存器/内存查看、pass 参数输入和结果展示均由 Tauri / Web 前端实现。
 - 后端通过 `TenetService` 和 `PassManager` 维护统一的导航与分析语义；`src/ws/` 向 Web UI 暴露结构化接口，`src/io/mcp/` 则向 AI 工具、IDA 插件等外部客户端提供独立接入能力。
-- 前端不复制分析算法；新增图形交互应修改 `tools/tenet/web/`，Web UI 所需的新后端数据应扩展 WS 接口。
+- 前端不复制分析算法；新增图形交互应修改 `slowmo/web/`，Web UI 所需的新后端数据应扩展 WS 接口。
 
-原生 ImGui + Metal + SDL3 GUI、整个 `src/gui/` 目录及 `TENET_ENABLE_GUI` CMake 选项均已完全移除。历史上的多面板、CFG、寄存器/内存等能力正在 Tauri 前端中重新实现；具体交互设计不在本文档范围内，以 `tools/tenet/web/` 中的实现为准。
+原生 ImGui + Metal + SDL3 GUI、整个 `src/gui/` 目录及 `TENET_ENABLE_GUI` CMake 选项均已完全移除。历史上的多面板、CFG、寄存器/内存等能力正在 Tauri 前端中重新实现；具体交互设计不在本文档范围内，以 `slowmo/web/` 中的实现为准。
 
 ### 跨平台状态
 

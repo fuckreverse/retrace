@@ -1,6 +1,6 @@
 /**
  * Tenet 数据模型 —— 对齐后端 MCP 工具返回结构。
- * 来源：tools/tenet/src/io/mcp/mcp_tools_*.cpp 与 src/common/*.h
+ * 来源：slowmo/src/io/mcp/mcp_tools_*.cpp 与 src/common/*.h
  * 地址均为 rebase 后的展示地址(hex string)。
  */
 

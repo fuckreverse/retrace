@@ -189,7 +189,7 @@ Tenet has **no `--profile` CLI flag**. The Instruments workflow below is a macOS
 - **CPU Counters** expose IPC, cache miss rates, branch misprediction;
 - **os_signpost** intervals from `TENET_ZONE_NAMED(...)` appear as "Points of Interest" in Instruments, labeled with pass names.
 
-For profiling commands and methodology, see the bundled `tools/tenet/docs/profiling.md` guide (Instruments, signpost marks, and benchmark suites).
+For profiling commands and methodology, see the bundled `slowmo/docs/profiling.md` guide (Instruments, signpost marks, and benchmark suites).
 
 ## Recommended workflow
 

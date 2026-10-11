@@ -1,4 +1,4 @@
-// tools/tenet/src/service/tenet_service.cpp
+// slowmo/src/service/tenet_service.cpp
 #include "service/tenet_service.h"
 #include "common/progress_manager.h"
 #include "io/trace_reader.h"

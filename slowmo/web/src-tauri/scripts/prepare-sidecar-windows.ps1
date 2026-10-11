@@ -3,7 +3,7 @@
 prepare-sidecar-windows.ps1 —— 为 Tauri Windows 打包准备 tenet C++ 后端 sidecar。
 
 阶段：
-  1. 复用 tools/tenet/build 固定目录，以指定配置增量编译 tenet target。
+  1. 复用 slowmo/build 固定目录，以指定配置增量编译 tenet target。
   2. 确定 Tauri target triple，并复制最终 tenet.exe。
   3. 用 dumpbin（若可用）解析依赖，同时扫描 build 目录中的 DLL；把非系统 DLL
      复制到 binaries 根目录，与 sidecar 同级。
@@ -65,7 +65,7 @@ Write-Host "    BUILD_DIR  = $BuildDir"
 Write-Host "    BUILD_TYPE = $BuildType"
 
 if (-not (Test-Path -LiteralPath $BuildDir -PathType Container)) {
-    throw "错误：固定构建目录 $BuildDir 不存在。请先按仓库约定初始化 tools/tenet/build；本脚本不会创建其他 build 目录。"
+    throw "错误：固定构建目录 $BuildDir 不存在。请先按仓库约定初始化 slowmo/build；本脚本不会创建其他 build 目录。"
 }
 
 # ── 1. 编译 tenet（复用固定 build 目录，禁止新建）──────────────────────────

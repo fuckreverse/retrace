@@ -5,7 +5,7 @@
 # Prerequisites:
 #   - macOS arm64 QBDI static libs built into ../../../build-macos:
 #       sh cmake/config/config-macOS-AARCH64.sh && ninja QBDI_static qbdi-llvm
-#   - tenet binary at ../../../tools/tenet/build/tenet
+#   - tenet binary at ../../../slowmo/build/tenet
 #
 # What it does:
 #   1. builds the tracer + test target + harness into one executable
@@ -17,9 +17,9 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "${HERE}/../../../.." && pwd -P)"
-TRACE_DIR="${ROOT}/tools/qbditrace"
+TRACE_DIR="${ROOT}/dashcam"
 BUILD="${ROOT}/build-macos"
-TENET="${ROOT}/tools/tenet/build/tenet"
+TENET="${ROOT}/slowmo/build/tenet"
 OUT="/tmp/qbditrace-test.bin"
 SEED="${1:-0x1234}"
 
@@ -68,7 +68,7 @@ echo "=== [2/3] running (seed=${SEED}) ==="
 echo "=== [3/3] dumping trace via tenet ==="
 if [ ! -x "${TENET}" ]; then
   echo "WARNING: tenet not found at ${TENET}; skipping decode"
-  echo "Build it with: cd tools/tenet/build && ninja"
+  echo "Build it with: cd slowmo/build && ninja"
 else
   echo "--- decoded trace (record structure) ---"
   # tenet --dump text supports all format versions (v4/v5/v7, compressed or not).

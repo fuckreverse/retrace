@@ -10,19 +10,19 @@ QBDITrace 唯一支持的使用方式是通过 `qbditrace_runner.py`。**禁止*
 
 ```bash
 # 按偏移 trace 主模块内某个函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xEE91EC \
     --output /var/mobile/Documents/trace.bin
 
 # 按导出符号名 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry _CCCrypt \
     --output /var/mobile/Documents/cccrypt.bin
 
 # trace 某个 framework 模块内的函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --module SomeFramework \
     --entry 0x1234 \
@@ -72,7 +72,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 在 trace 前快照模块的可写数据段
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --snapshot-range 0x100010000 0x100012000 \
@@ -87,7 +87,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 清零模块偏移 +0x1abc 处的 4 字节缓存标志
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --patch +0x1abc:00000000 \
@@ -119,7 +119,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 主动调用 CCCrypt 并传入完整参数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry _CCCrypt \
     --invoke \
@@ -148,7 +148,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 `--java-entry fully.qualified.Class.method` 以 Java 方法作为 trace 触发器，替代 hook native 入口。agent 通过 `Java.perform` hook 该 Java 方法；App 调用时自动物化参数并在 VM 内调用 native 入口。Java `int`/`long` 转立即数，`String` 转 UTF-8 缓冲，其余对象以 jobject handle 传递。需要 `--android`；与 `--invoke` 互斥。
 
 ```bash
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --android \
     --module libnative.so \
@@ -180,7 +180,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 ```bash
 # 阶段 1：运行轻量侦察 trace（裸 PC 流）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --sampling \
@@ -190,7 +190,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 ./tenet --suggest-excludes /var/mobile/Documents/scout.bin
 
 # 阶段 3：确认排除范围后运行完整 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 12000-13500 \

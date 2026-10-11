@@ -6,7 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const agentPath = path.resolve(__dirname, '../../qbditrace.js');
+const agentPath = path.resolve(__dirname, '../../dashcam.js');
 const context = vm.createContext({
   console,
   recv() {},

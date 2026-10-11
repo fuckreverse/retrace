@@ -5,7 +5,7 @@
 本文档是 **tenet 分析器**与 **qbditrace 记录器**之间的接口契约。
 tenet 依赖 `TraceFormat.h`（支持 v4/v5/v6/v7/v8/v9）定义的格式读取 `.bin` trace 文件。
 
-**权威来源**：`tools/qbditrace/TraceFormat.h`。本文档是该头文件的人类可读解释，
+**权威来源**：`dashcam/TraceFormat.h`。本文档是该头文件的人类可读解释，
 并标注 tenet 特有的处理策略和未来增强方向。如有冲突，以 `.h` 文件为准。
 
 ---
@@ -691,10 +691,10 @@ Phase 1-4），任何跳过指令的统计采样都会直接破坏边计数和�
 REGDIFF/MEM/SEQEVENTS 后 26 MB → 再加 `enable_pc_delta`（v5，INST 头 16B→6B）后 9.6 MB，
 体积降至约 17%，且 `cfg`/`loop` pass 在瘦身后的 trace 上精确复现了 199876~199877 次的循环边计数。
 
-**使用方式**：见 `tools/qbditrace/qbditrace_runner.py --sampling`（一键应用
+**使用方式**：见 `dashcam/qbditrace_runner.py --sampling`（一键应用
 `record=QBDITRACE_REC_SAMPLING` + `enable_pc_delta=1` + 较大的 `anchor_interval`），配合
 `tenet --suggest-excludes`（基于 `loop` pass 结果生成候选 `--exclude-range` 建议，见
-`tools/tenet/src/batch_analysis.cpp` 的 `run_suggest_excludes`）或 `tenet --run-pass loop` 人工
+`slowmo/src/batch_analysis.cpp` 的 `run_suggest_excludes`）或 `tenet --run-pass loop` 人工
 检查循环明细。
 
 ---

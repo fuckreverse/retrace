@@ -99,7 +99,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 ### 交互模式
 
-- **Tauri 前端**：独立的 Tauri + React/TypeScript 桌面应用位于 `tools/tenet/web/`。Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动 `tenet`，浏览器端 Web UI 仅通过 `ws://127.0.0.1:<port>` 的 FlatBuffers WebSocket 完成多面板浏览与可视化；并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，不是 Web UI 的回退链路。它不是 `main.cpp` 内部的分支。
+- **Tauri 前端**：独立的 Tauri + React/TypeScript 桌面应用位于 `slowmo/web/`。Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动 `tenet`，浏览器端 Web UI 仅通过 `ws://127.0.0.1:<port>` 的 FlatBuffers WebSocket 完成多面板浏览与可视化；并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，不是 Web UI 的回退链路。它不是 `main.cpp` 内部的分支。
 - **TUI**：`tenet` 自带的终端交互入口，适合 SSH 和远程分析。
 
 `tenet` 可执行文件本身是纯分析后端，不创建原生图形窗口；原生 ImGui + Metal + SDL3 GUI 及 `TENET_ENABLE_GUI` 已移除。
@@ -170,7 +170,7 @@ tenet 的核心不是“一个大上下文对象”，而是一组职责稳定�
 
 ### 新增一个前端能力
 
-- **Tauri 前端**：可视化、面板与交互在 `tools/tenet/web/` 实现；Web UI 所需的新后端数据应在 `src/ws/` 增加接口，`src/io/mcp/` 则服务 AI 工具、IDA 插件等外部客户端。
+- **Tauri 前端**：可视化、面板与交互在 `slowmo/web/` 实现；Web UI 所需的新后端数据应在 `src/ws/` 增加接口，`src/io/mcp/` 则服务 AI 工具、IDA 插件等外部客户端。
 - **TUI**：在 `tui/panels/` 或 `tui_app.cpp` 增加面板或命令。
 - **CLI**：在 `batch_analysis.cpp` 追加结果序列化逻辑。
 - **服务模式**：在 `rpc_server.cpp`、`src/ws/` 或 `src/io/mcp/` 加新接口。

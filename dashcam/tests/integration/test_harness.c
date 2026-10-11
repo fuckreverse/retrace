@@ -23,8 +23,8 @@
  * executed and traced per run, keeping every produced trace small and
  * focused on the pass(es) under test.
  *
- * Build/run: see tools/qbditrace/tests/integration/run_macos.sh (core scenario)
- *            tools/qbditrace/tests/integration/e2e/run_pass_e2e.sh (all scenarios)
+ * Build/run: see dashcam/tests/integration/run_macos.sh (core scenario)
+ *            dashcam/tests/integration/e2e/run_pass_e2e.sh (all scenarios)
  */
 
 #include <dlfcn.h>

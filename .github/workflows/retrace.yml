@@ -1,11 +1,14 @@
-name: Tenet Cross-Platform Build
+name: Retrace Cross-Platform Build
 
-# Builds and tests the `tenet` trace analyzer (tools/tenet) on Linux, macOS,
-# and Windows. This is independent of the top-level QBDI engine CI
-# (linux.yml/macos.yml/windows.yml), which only covers the QBDI core library
-# and its AArch64/X86 execution engine — tenet is a separate CMake project
-# that consumes qbditrace's TraceFormat.h header-only contract and does not
-# link against QBDI itself.
+# Builds and tests the Retrace components on Linux, macOS, and Windows:
+#   - `slowmo`  (trace analyzer) on all three OS
+#   - `dashcam` (recorder) host-test build on Linux/macOS — the recorder
+#     dylib/.so itself only targets iOS/Android and is built locally via
+#     scripts/prepare-qbdi.sh + dashcam/build-dashcam-*.sh (needs patched
+#     QBDI static libs + Apple SDK / NDK, out of CI scope for now)
+#
+# slowmo is a separate CMake project that consumes dashcam's TraceFormat.h
+# header-only contract and does not link against QBDI itself.
 #
 # Coverage matrix:
 #   - ubuntu-latest   (x86_64)  — YARA + WS enabled; Triton disabled (no Triton/
@@ -22,17 +25,18 @@ name: Tenet Cross-Platform Build
 on:
   push:
     branches:
-      - master
-      - dev-next
+      - main
     paths:
-      - 'tools/tenet/**'
-      - 'tools/qbditrace/**'
-      - '.github/workflows/tenet.yml'
+      - 'slowmo/**'
+      - 'dashcam/**'
+      - 'patches/**'
+      - '.github/workflows/retrace.yml'
   pull_request:
     paths:
-      - 'tools/tenet/**'
-      - 'tools/qbditrace/**'
-      - '.github/workflows/tenet.yml'
+      - 'slowmo/**'
+      - 'dashcam/**'
+      - 'patches/**'
+      - '.github/workflows/retrace.yml'
   workflow_dispatch:
 
 jobs:
@@ -55,18 +59,18 @@ jobs:
         id: cache-ccache
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-tenet-linux-${{ github.run_number }}
+          key: ccache-slowmo-linux-${{ github.run_number }}
           restore-keys: |
-            ccache-tenet-linux-
+            ccache-slowmo-linux-
 
-      - name: Cache tenet third-party (_deps)
+      - name: Cache slowmo third-party (_deps)
         uses: actions/cache@v4
         with:
-          path: tools/tenet/_deps
-          key: tenet-deps-v2-linux-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+          path: slowmo/_deps
+          key: slowmo-deps-v2-linux-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
 
       - name: Configure
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: |
           mkdir -p build
           cmake -S . -B build -G Ninja \
@@ -79,11 +83,11 @@ jobs:
             -DTENET_BUILD_TESTS=ON
 
       - name: Build
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: ninja -C build -j$(nproc)
 
       - name: Test
-        working-directory: tools/tenet/build
+        working-directory: slowmo/build
         run: ctest --output-on-failure -j$(nproc)
 
   macos:
@@ -103,18 +107,18 @@ jobs:
         id: cache-ccache
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-tenet-macos-${{ github.run_number }}
+          key: ccache-slowmo-macos-${{ github.run_number }}
           restore-keys: |
-            ccache-tenet-macos-
+            ccache-slowmo-macos-
 
-      - name: Cache tenet third-party (_deps)
+      - name: Cache slowmo third-party (_deps)
         uses: actions/cache@v4
         with:
-          path: tools/tenet/_deps
-          key: tenet-deps-v2-macos-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+          path: slowmo/_deps
+          key: slowmo-deps-v2-macos-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
 
       - name: Configure
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: |
           mkdir -p build
           cmake -S . -B build -G Ninja \
@@ -127,11 +131,11 @@ jobs:
             -DTENET_BUILD_TESTS=ON
 
       - name: Build
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: ninja -C build -j$(sysctl -n hw.ncpu)
 
       - name: Test
-        working-directory: tools/tenet/build
+        working-directory: slowmo/build
         run: ctest --output-on-failure -j$(sysctl -n hw.ncpu)
 
   windows:
@@ -150,21 +154,21 @@ jobs:
         id: cache-sccache
         with:
           path: C:\Users\runneradmin\AppData\Local\Mozilla\sccache
-          key: sccache-tenet-win-${{ github.run_number }}
+          key: sccache-slowmo-win-${{ github.run_number }}
           restore-keys: |
-            sccache-tenet-win-
+            sccache-slowmo-win-
 
       - name: Install sccache
         run: choco install sccache --no-progress -y
 
-      - name: Cache tenet third-party (_deps)
+      - name: Cache slowmo third-party (_deps)
         uses: actions/cache@v4
         with:
-          path: tools/tenet/_deps
-          key: tenet-deps-v2-win-${{ hashFiles('tools/tenet/CMakeLists.txt', 'tools/tenet/tests/CMakeLists.txt') }}
+          path: slowmo/_deps
+          key: slowmo-deps-v2-win-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
 
       - name: Configure
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: |
           New-Item -ItemType Directory -Force build | Out-Null
           cmake -S . -B build -G Ninja `
@@ -177,14 +181,14 @@ jobs:
             -DTENET_BUILD_TESTS=ON
 
       - name: Build
-        working-directory: tools/tenet
+        working-directory: slowmo
         run: ninja -C build
 
       - name: Test
-        working-directory: tools/tenet/build
+        working-directory: slowmo/build
         run: ctest --output-on-failure -C RelWithDebInfo
 
-  qbditrace-host:
+  dashcam-host:
     # qbditrace's host-test build (QBDITRACE_BUILD_DYLIB=OFF) is the desktop
     # cross-platform surface — the tracer dylib/.so itself only ever targets
     # iOS/Android (see ios.yml/android.yml) and is out of scope here.
@@ -210,11 +214,11 @@ jobs:
       - name: Cache qbditrace third-party (_deps)
         uses: actions/cache@v4
         with:
-          path: tools/qbditrace/_deps
-          key: qbditrace-deps-v2-${{ runner.os }}-${{ hashFiles('tools/qbditrace/CMakeLists.txt') }}
+          path: dashcam/_deps
+          key: qbditrace-deps-v2-${{ runner.os }}-${{ hashFiles('dashcam/CMakeLists.txt') }}
 
       - name: Configure
-        working-directory: tools/qbditrace
+        working-directory: dashcam
         run: |
           mkdir -p build
           cmake -S . -B build -G Ninja \
@@ -224,9 +228,35 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        working-directory: tools/qbditrace
+        working-directory: dashcam
         run: ninja -C build
 
       - name: Test
-        working-directory: tools/qbditrace/build
+        working-directory: dashcam/build
         run: ctest --output-on-failure
+
+  qbdi-patches:
+    # Verifies the patch series in patches/qbdi/ still applies cleanly
+    # against upstream QBDI at the pinned commit (patches/qbdi/PIN).
+    # Catch bitrot early when re-basing the pin or editing patches.
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Clone QBDI at pinned commit
+        run: |
+          PIN_SHA="$(awk '{print $1}' patches/qbdi/PIN)"
+          git clone --filter=blob:none https://github.com/QBDI/QBDI.git qbdi
+          cd qbdi
+          git checkout "${PIN_SHA}"
+
+      - name: Apply patch series
+        run: |
+          cd qbdi
+          for p in ../patches/qbdi/*.patch; do
+            echo "applying $(basename "$p")"
+            git apply --check "$p"
+            git apply "$p"
+          done
+          echo "patch series applies cleanly"

@@ -156,7 +156,7 @@ THREAD 标记分隔线程边界），tenet 端按线程重建并分析。
 ## 文件结构
 
 ```
-tools/qbditrace/
+dashcam/
 ├── TraceFormat.h           二进制格式契约（writer 与 decoder 共用）
 ├── QBDITrace.h            公共 C ABI、配置结构与实时统计页契约
 ├── RingBuffer.h           thread-local 缓冲 + 后台 writer 线程
@@ -181,10 +181,10 @@ tools/qbditrace/
 `build-ios/libqbdi-llvm.a`。从仓库根目录执行：
 
 ```sh
-bash tools/qbditrace/build-qbditrace-ios.sh
+bash dashcam/build-dashcam-ios.sh
 ```
 
-脚本会复用 `tools/tenet/_deps/zstd-src/`，按需生成 `build-ios/libzstd.a`，并在
+脚本会复用 `slowmo/_deps/zstd-src/`，按需生成 `build-ios/libzstd.a`，并在
 仓库根目录输出带分块 zstd 压缩能力的 `libqbditrace.dylib`。部署到越狱设备：
 
 ```sh
@@ -199,13 +199,13 @@ ssh vphone 'ldid -S /var/jb/usr/lib/libqbditrace.dylib'
 
 ```sh
 export NDK_PATH=/path/to/android-ndk
-bash tools/qbditrace/build-qbditrace-android.sh
+bash dashcam/build-dashcam-android.sh
 adb push libqbditrace.so /data/local/tmp/libqbditrace.so
 ```
 
-脚本驱动 CMake NDK toolchain 在固定目录 `tools/qbditrace/build-android/` 内构建
+脚本驱动 CMake NDK toolchain 在固定目录 `dashcam/build-android/` 内构建
 （不会另建 build 目录）。zstd 用 NDK clang 交叉编译一次并缓存在
-`build-android/libzstd.a`（复用 `tools/tenet/_deps/zstd-src` 源码；不走
+`build-android/libzstd.a`（复用 `slowmo/_deps/zstd-src` 源码；不走
 FetchContent，避免覆盖共享缓存里 tenet 的 host 版 zstd）。
 脚本默认使用 Android API 24（可通过 `ANDROID_API_LEVEL` 覆盖），并输出仓库根目录下的
 `libqbditrace.so`。运行 loader 时加 `--android`；默认 dylib 路径会切换为
@@ -213,10 +213,10 @@ FetchContent，避免覆盖共享缓存里 tenet 的 host 版 zstd）。
 
 ### 1.3 编译 host tests
 
-固定 host 构建目录为 `tools/qbditrace/build/`，不要另建 build目录：
+固定 host 构建目录为 `dashcam/build/`，不要另建 build目录：
 
 ```sh
-cd tools/qbditrace/build
+cd dashcam/build
 cmake .. -G Ninja -DQBDITRACE_BUILD_DYLIB=OFF
 ninja
 ctest --output-on-failure
@@ -252,61 +252,61 @@ qbditrace 的 trace 语义是**模块级**的：
 
 ```sh
 # 基本用法：trace 主模块内某个函数（按 IDA 偏移）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xEE91EC \
     --output /var/mobile/Documents/trace.bin
 
 # 按导出符号名 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry _CCCrypt \
     --output /var/mobile/Documents/cccrypt.bin
 
 # trace 某个 framework 模块内的函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --module SomeFramework \
     --entry 0x1234 \
     --output /var/mobile/Documents/trace.bin
 
 # attach 已运行进程
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --attach \
     --entry 0xABC \
     --output /var/mobile/Documents/trace.bin
 
 # 多次 trace（捕获 5 次调用）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-mode 5 \
     --output /var/mobile/Documents/trace.bin
 
 # 启用 GCD block tracing
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-gcd \
     --output /var/mobile/Documents/trace.bin
 
 # 设置超时（30 秒后自动退出）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --timeout 30 \
     --output /var/mobile/Documents/trace.bin
 
 # 排除内存校验循环（静态偏移 0x12000-0x13500），大幅减少 trace 体积
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 12000-13500 \
     --output /var/mobile/Documents/trace.bin
 
 # 排除多个区域（最多 8 个）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 12000-13500 \
@@ -315,7 +315,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 # ── 采样侦察模式（先摸清执行情况，再决定排除哪些区域） ──────
 # 步骤 1：先跑一次 --sampling，产出一个体积小得多的裸 PC 流 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --sampling \
@@ -329,7 +329,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 
 # 步骤 3：静态确认建议的地址范围确实是无关代码（如 memset/CRC/反调试延时），
 #         然后把确认过的范围传给正式的完整 trace
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --exclude-range 100292230-100292268 \
@@ -339,14 +339,14 @@ python3 tools/qbditrace/qbditrace_runner.py \
 # 在 trace 开始前修改目标进程内存（清除缓存/标志/修改常量），trace 完成后自动恢复
 
 # 用偏移地址（+前缀）清零 4 字节缓存标志，确保 trace 走完整计算路径
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --patch +0x1abc:00000000 \
     --output /var/mobile/Documents/trace.bin
 
 # 多个 patch 叠加使用（绝对地址 + 偏移地址混用）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry 0xABC \
     --patch +0x1abc:00000000 \
@@ -357,7 +357,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 # 直接调用目标函数并 trace，无需等待 App 触发
 
 # 传入 buffer + length，主动调用加密函数
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry 0xEE91EC \
     --invoke \
@@ -365,7 +365,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --output /var/mobile/Documents/trace.bin
 
 # 用导出符号名 + 完整参数调用 CCCrypt
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry _CCCrypt \
     --invoke \
@@ -374,7 +374,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
     --output /var/mobile/Documents/cccrypt.bin
 
 # ObjC 类型参数（iOS）
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --entry 0x1234 \
     --invoke \
@@ -384,7 +384,7 @@ python3 tools/qbditrace/qbditrace_runner.py \
 # ── Java entry 触发模式（Android） ──────────────────────
 # hook Java 方法作为 trace 触发器：Java 参数自动物化为 native 指针，
 # 调用发生时用真实 Java 层输入直接 run_call native 入口
-python3 tools/qbditrace/qbditrace_runner.py \
+python3 dashcam/qbditrace_runner.py \
     --target com.example.app --attach \
     --android \
     --module libnative.so \
@@ -545,7 +545,7 @@ Python loader 天然支持后台运行（不依赖 TTY）：
 
 ```sh
 # 配合 nohup 后台运行
-nohup python3 tools/qbditrace/qbditrace_runner.py \
+nohup python3 dashcam/qbditrace_runner.py \
     --target com.example.app \
     --entry 0xABC \
     --trace-mode multi \
@@ -762,8 +762,8 @@ cfg.anchor_interval = 1 << 20;         // 放大 ANCHOR 间隔（不需要精确
 ### 5.1 基础 benchmark
 
 ```sh
-sh tools/qbditrace/benchmark/run_benchmark.sh           # 全量运行
-sh tools/qbditrace/benchmark/run_benchmark.sh --filter tea  # 只跑 TEA 相关
+sh dashcam/benchmark/run_benchmark.sh           # 全量运行
+sh dashcam/benchmark/run_benchmark.sh --filter tea  # 只跑 TEA 相关
 ```
 
 基础集包含 7 类 target（Simple / Branchy / Loopy / Recursive / CFF-like / Crypto /
@@ -784,13 +784,13 @@ Large），主要验证 tracer 的正确性、性能 overhead 和格式完整性
 
 ```sh
 # 一键全量：build → trace → decode → 可选 tenet 分析
-sh tools/qbditrace/benchmark/advanced/run_advanced.sh
+sh dashcam/benchmark/advanced/run_advanced.sh
 
 # 只跑 Group B（混淆），并启用 tenet 分析
-sh tools/qbditrace/benchmark/advanced/run_advanced.sh --group B --tenet /path/to/tenet
+sh dashcam/benchmark/advanced/run_advanced.sh --group B --tenet /path/to/tenet
 
 # 单个 target + 完整解码
-sh tools/qbditrace/benchmark/advanced/run_advanced.sh --filter aes_cff_mba --decode-all
+sh dashcam/benchmark/advanced/run_advanced.sh --filter aes_cff_mba --decode-all
 ```
 
 高级集的设计细节见 [`benchmark/advanced/README.md`](benchmark/advanced/README.md)。
@@ -802,7 +802,7 @@ sh tools/qbditrace/benchmark/advanced/run_advanced.sh --filter aes_cff_mba --dec
 ### 5.3 可选：真实 OLLVM 编译
 
 ```sh
-sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
+sh dashcam/benchmark/advanced/build_ollvm.sh
 ```
 
 ## 二进制格式速览
@@ -838,7 +838,7 @@ sh tools/qbditrace/benchmark/advanced/build_ollvm.sh
   PC-delta 组合）。v6 OLD_VALUE 只保留读取契约，writer 已移除。
 - zstd 构建下默认设置 `HF_BLOCK_COMPRESSED`，记录按 1 MiB 独立 frame 压缩并带尾部
   索引；`HF_COMPRESSED` 单流格式仅为历史读取兼容，当前 writer 不产生。
-- 完整字段、结构大小和兼容策略见 `tools/tenet/docs/trace-format.md`；若与本文冲突，
+- 完整字段、结构大小和兼容策略见 `slowmo/docs/trace-format.md`；若与本文冲突，
   以 `TraceFormat.h` 为准。
 
 ## 诊断与环境变量

@@ -4,7 +4,7 @@ sidebar:
   order: 2
 ---
 
-Tenet Desktop is a standalone Tauri application in `tools/tenet/web/`, not a native GUI embedded in the `tenet` executable. When a trace is opened, the app launches the headless `tenet` backend as a sidecar with arguments that include `--ws-port <port> <trace> --mcp-hub`. The React frontend accesses the backend over WebSocket using the FlatBuffers binary protocol, while MCP Hub also provides instance coordination for external tools.
+Tenet Desktop is a standalone Tauri application in `slowmo/web/`, not a native GUI embedded in the `tenet` executable. When a trace is opened, the app launches the headless `tenet` backend as a sidecar with arguments that include `--ws-port <port> <trace> --mcp-hub`. The React frontend accesses the backend over WebSocket using the FlatBuffers binary protocol, while MCP Hub also provides instance coordination for external tools.
 
 Desktop currently supports macOS and Linux. The Windows backend disables `TENET_ENABLE_WS` by default because the uSockets event loop used by the project does not yet have an IOCP backend; consequently, Tauri Desktop cannot currently connect to the Windows `tenet` backend.
 

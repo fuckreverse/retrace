@@ -4,7 +4,7 @@
  * target_crypto.c
  *
  * Deliberately exercises the signal shapes tenet's crypto-analysis passes
- * look for, so their pass-level e2e (tools/qbditrace/tests/integration/e2e/
+ * look for, so their pass-level e2e (dashcam/tests/integration/e2e/
  * pass_crypto.sh) can run against a real recorded trace instead of a
  * hand-built fixture:
  *
