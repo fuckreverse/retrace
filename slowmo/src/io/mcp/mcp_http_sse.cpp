@@ -379,8 +379,7 @@ void McpHttpSseTransport::listener_loop() {
         if (!platform::socket_valid(client_fd)) continue;
 
         // Set a receive timeout on client fd so handler threads don't block forever
-        struct timeval recv_tv{5, 0};  // 5 second timeout
-        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+        platform::set_recv_timeout(client_fd, 5000);
 
         // Spawn a per-client thread
         std::lock_guard<std::mutex> lk(clients_mutex_);

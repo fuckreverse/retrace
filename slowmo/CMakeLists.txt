@@ -548,6 +548,10 @@ add_library(tenet_lib STATIC
     src/cli/trace_dump.cpp
 )
 
+# Project sources use C++20 designated initializers. Keep third-party projects
+# at their own language standard while propagating this requirement to clients.
+target_compile_features(tenet_lib PUBLIC cxx_std_20)
+
 target_include_directories(tenet_lib BEFORE PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include

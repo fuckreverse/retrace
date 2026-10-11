@@ -625,10 +625,8 @@ void McpHubTransport::listener_loop() {
         ::inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
         std::string client_id = fmt::format("{}:{}", ip_buf, ntohs(client_addr.sin_port));
 
-        struct timeval recv_tv{10, 0};
-        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
-        int ka = 1;
-        ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        platform::set_recv_timeout(client_fd, 10000);
+        platform::set_keepalive(client_fd);
 
         {
             std::lock_guard<std::mutex> lk(clients_mutex_);
@@ -1617,8 +1615,7 @@ bool McpWorkerTransport::connect_to_hub() {
     }
 
     // Keepalive
-    int ka = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+    platform::set_keepalive(fd);
 
     install_socket(fd);
     return true;

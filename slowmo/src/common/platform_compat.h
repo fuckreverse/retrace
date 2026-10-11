@@ -192,6 +192,12 @@ inline bool set_reuseaddr(socket_t s) {
 /// SO_RCVTIMEO — receive timeout in milliseconds. POSIX takes a
 /// `struct timeval`; Winsock takes a plain DWORD milliseconds count, so
 /// the two aren't just a pointer-cast apart — the payload differs too.
+inline bool set_keepalive(socket_t s) {
+    int enabled = 1;
+    return ::setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
+                       reinterpret_cast<const char*>(&enabled), sizeof(enabled)) == 0;
+}
+
 inline bool set_recv_timeout(socket_t s, int timeout_ms) {
 #if defined(_WIN32)
     DWORD tv = static_cast<DWORD>(timeout_ms);
