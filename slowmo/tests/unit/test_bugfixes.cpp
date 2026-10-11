@@ -478,7 +478,7 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
     });
 
     std::atomic<uint64_t> last_progress_inst{0};
-    si.start(trace_path, *index_result,
+    si.start(trace_path.string(), *index_result,
              [&](uint64_t inst_count, uint64_t file_bytes) {
                  last_progress_inst.store(inst_count, std::memory_order_relaxed);
              },
@@ -578,7 +578,7 @@ TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
         .idle_timeout_ms = 1000,
         .max_inst_count = 0,
     });
-    REQUIRE(si.start(trace_path, *index_result));
+    REQUIRE(si.start(trace_path.string(), *index_result));
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
     qbditrace::qbditrace_capicall_head_v8_t call{};
