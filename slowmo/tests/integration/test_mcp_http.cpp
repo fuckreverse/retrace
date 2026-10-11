@@ -26,12 +26,7 @@
 
 #include <fmt/core.h>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
+#include "common/platform_compat.h"
 
 #include <chrono>
 #include <thread>
@@ -50,26 +45,27 @@ using json = nlohmann::json;
 namespace {
 
 /// Connect a TCP socket to host:port with retries.  Returns fd or -1 on failure.
-int tcp_connect(const std::string& host, uint16_t port, int retries = 3) {
+platform::socket_t tcp_connect(const std::string& host, uint16_t port, int retries = 3) {
+    platform::ensure_sockets_initialized();
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
     for (int attempt = 0; attempt <= retries; ++attempt) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return -1;
+        platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (!platform::socket_valid(fd)) return platform::kInvalidSocket;
         if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
             return fd;
-        ::close(fd);
+        platform::close_socket(fd);
         if (attempt < retries)
             std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempt)));
     }
-    return -1;
+    return platform::kInvalidSocket;
 }
 
 /// Send a full HTTP request string over `fd`.
-void http_send(int fd, const std::string& request) {
+void http_send(platform::socket_t fd, const std::string& request) {
     const char* p = request.data();
     size_t remaining = request.size();
     while (remaining > 0) {
@@ -87,7 +83,7 @@ struct HttpResponse {
     std::string body;
 };
 
-HttpResponse http_read_response(int fd,
+HttpResponse http_read_response(platform::socket_t fd,
                                 std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
     HttpResponse resp;
     std::string raw;
@@ -111,9 +107,8 @@ HttpResponse http_read_response(int fd,
         auto elapsed = std::chrono::steady_clock::now() - start;
         if (elapsed > timeout) break;
 
-        struct pollfd pfd{fd, POLLIN, 0};
         int remaining_ms = static_cast<int>((timeout - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)).count());
-        int pr = ::poll(&pfd, 1, std::min(remaining_ms, 1000));
+        int pr = platform::poll_one(fd, platform::kPollIn, std::min(remaining_ms, 1000));
         if (pr < 0) break;
         if (pr == 0) continue;
 
@@ -196,15 +191,15 @@ HttpResponse http_read_response(int fd,
 
 HttpResponse http_get(const std::string& host, uint16_t port, const std::string& path) {
     for (int attempt = 0; attempt < 3; ++attempt) {
-        int fd = tcp_connect(host, port);
-        if (fd < 0) continue;
+        platform::socket_t fd = tcp_connect(host, port);
+        if (!platform::socket_valid(fd)) continue;
 
         std::string req = "GET " + path + " HTTP/1.1\r\n"
                           "Host: " + host + "\r\n"
                           "Connection: close\r\n\r\n";
         http_send(fd, req);
         auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
-        ::close(fd);
+        platform::close_socket(fd);
         if (resp.status != 0) return resp;
         std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
     }
@@ -216,8 +211,8 @@ HttpResponse http_post(const std::string& host, uint16_t port,
                        const std::string& extra_headers = "",
                        std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
     for (int attempt = 0; attempt < 3; ++attempt) {
-        int fd = tcp_connect(host, port);
-        if (fd < 0) continue;
+        platform::socket_t fd = tcp_connect(host, port);
+        if (!platform::socket_valid(fd)) continue;
 
         std::string req = "POST " + path + " HTTP/1.1\r\n"
                           "Host: " + host + "\r\n"
@@ -227,7 +222,7 @@ HttpResponse http_post(const std::string& host, uint16_t port,
                           "Connection: close\r\n\r\n" + body;
         http_send(fd, req);
         auto resp = http_read_response(fd, timeout);
-        ::close(fd);
+        platform::close_socket(fd);
         if (resp.status != 0) return resp;
         std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
     }
@@ -238,8 +233,8 @@ HttpResponse http_delete(const std::string& host, uint16_t port,
                          const std::string& path,
                          const std::string& extra_headers = "") {
     for (int attempt = 0; attempt < 3; ++attempt) {
-        int fd = tcp_connect(host, port);
-        if (fd < 0) continue;
+        platform::socket_t fd = tcp_connect(host, port);
+        if (!platform::socket_valid(fd)) continue;
 
         std::string req = "DELETE " + path + " HTTP/1.1\r\n"
                           "Host: " + host + "\r\n"
@@ -247,7 +242,7 @@ HttpResponse http_delete(const std::string& host, uint16_t port,
                           "Connection: close\r\n\r\n";
         http_send(fd, req);
         auto resp = http_read_response(fd, std::chrono::milliseconds(3000));
-        ::close(fd);
+        platform::close_socket(fd);
         if (resp.status != 0) return resp;
         std::this_thread::sleep_for(std::chrono::milliseconds(20 * (1 << attempt)));
     }

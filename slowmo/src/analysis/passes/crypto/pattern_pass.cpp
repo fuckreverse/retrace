@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 #include "analysis/passes/crypto/pattern_pass.h"
 #include "analysis/trace_collector.h"
 #include "io/trace_reader.h"
@@ -796,7 +797,7 @@ bool PatternPass::load_rules() {
     int file_count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(rules_dir_)) {
         if (entry.path().extension() == ".yar" || entry.path().extension() == ".yara") {
-            FILE* fp = fopen(entry.path().c_str(), "r");
+            FILE* fp = tenet::platform::open_file(entry.path(), "r");
             if (!fp) continue;
 
             int errors = yr_compiler_add_file(compiler, fp, nullptr, entry.path().filename().c_str());

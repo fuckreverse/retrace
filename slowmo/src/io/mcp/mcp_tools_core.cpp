@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 // Tool registrations: trace, query, taint, graph
 // These are the "core" tools that operate on the trace data model directly.
 
@@ -509,7 +510,7 @@ void TenetMcpService::register_taint_tools() {
 
             std::vector<uint8_t> tainted;
             for (uint64_t m = result.tainted_regs; m; m &= m - 1)
-                tainted.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+                tainted.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
             output["tainted_regs_final"] = tainted;
 
             size_t steps_offset = args.value("steps_offset", size_t(0));
@@ -584,7 +585,7 @@ void TenetMcpService::register_taint_tools() {
 
             std::vector<uint8_t> involved;
             for (uint64_t m = result.all_involved_regs; m; m &= m - 1)
-                involved.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+                involved.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
             output["involved_regs"] = involved;
 
             size_t events_offset = args.value("events_offset", size_t(0));

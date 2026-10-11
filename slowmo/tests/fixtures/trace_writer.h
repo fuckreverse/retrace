@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 /*
  * trace_writer.h — Reusable synthetic AArch64 trace writer for Tenet tests.
  *
@@ -197,7 +198,7 @@ struct TraceWriter {
         bool     old_unknown;   // set QBDITRACE_MF_OLD_UNKNOWN in flags
     };
 
-    bool open(const char* path) { fp = fopen(path, "wb"); return fp != nullptr; }
+    bool open(const std::filesystem::path& path) { fp = tenet::platform::open_file(path, "wb"); return fp != nullptr; }
     void close() { if (fp) fclose(fp); fp = nullptr; }
     uint64_t rt(uint64_t static_pc) { return static_pc + module_slide; }
 

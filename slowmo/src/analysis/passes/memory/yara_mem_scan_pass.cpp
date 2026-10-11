@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 #include "yara_mem_scan_pass.h"
 
 #include "analysis/pass_manager.h"
@@ -208,7 +209,7 @@ bool YaraMemScanPass::load_rules(const std::vector<std::filesystem::path>& defau
             return;
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
             if (entry.path().extension() != ".yar") continue;
-            FILE* f = fopen(entry.path().c_str(), "r");
+            FILE* f = tenet::platform::open_file(entry.path(), "r");
             if (!f) continue;
             int err = yr_compiler_add_file(compiler, f, nullptr,
                                            entry.path().filename().c_str());
@@ -228,7 +229,7 @@ bool YaraMemScanPass::load_rules(const std::vector<std::filesystem::path>& defau
         }
         searched.push_back(fpath.string());
         if (!std::filesystem::exists(fpath)) return;
-        FILE* f = fopen(fpath.c_str(), "r");
+        FILE* f = tenet::platform::open_file(fpath, "r");
         if (!f) return;
         int err = yr_compiler_add_file(compiler, f, nullptr,
                                        fpath.filename().c_str());

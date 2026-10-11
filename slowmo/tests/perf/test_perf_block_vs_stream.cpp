@@ -1,3 +1,5 @@
+#include "common/platform_compat.h"
+#include "common/platform_file.h"
 /*
  * test_perf_block_vs_stream.cpp — Comparative benchmark: block-compressed
  * (on-demand LRU decompression) vs stream-compressed (decompress to temp file).
@@ -85,7 +87,7 @@ static fs::path create_stream_compressed_trace(
     REQUIRE(!ZSTD_isError(compressed_size));
 
     auto out_path = dir / out_name;
-    FILE* fp = fopen(out_path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(out_path, "wb");
     REQUIRE(fp != nullptr);
     fwrite(&hdr, kHdrSize, 1, fp);
     fwrite(zbuf.data(), compressed_size, 1, fp);
@@ -110,7 +112,7 @@ static fs::path create_block_compressed_trace(
     size_t body_size = data.size() - kHdrSize;
 
     auto out_path = dir / out_name;
-    FILE* fp = fopen(out_path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(out_path, "wb");
     REQUIRE(fp != nullptr);
     fwrite(&hdr, kHdrSize, 1, fp);
 
@@ -165,7 +167,7 @@ struct PerfTempDir {
     explicit PerfTempDir(const char* name) {
         path = fs::temp_directory_path() /
                (std::string("tenet_perf_") + name + "_" +
-                std::to_string(getpid()));
+                std::to_string(tenet::platform::current_pid()));
         fs::remove_all(path);
         fs::create_directories(path);
     }

@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "analysis/passes/taint/taint_source_annotation_pass.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
 #include "analysis/passes/platform/objc_pass.h"
@@ -320,7 +321,7 @@ PassResult TaintSourceAnnotationPass::run(PassContext& ctx) {
         if (!ev.src_regs_empty()) {
             all_srcs_covered = true;
             for (uint64_t m = ev.src_regs_mask; m; m &= m - 1) {
-                uint8_t sr = static_cast<uint8_t>(__builtin_ctzll(m));
+                uint8_t sr = static_cast<uint8_t>(tenet::platform::trailing_zeros(m));
                 // Is there another contributing event that writes sr with
                 // inst_id < ev.inst_id?  Using reg_earliest_writer (minimum
                 // inst_id) ensures this works even when ev itself also writes sr

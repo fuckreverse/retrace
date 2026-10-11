@@ -3,15 +3,15 @@
 #include "io/index_builder.h"
 #include "io/trace_reader.h"
 
-#include <sys/stat.h>
+#include <filesystem>
 #include <filesystem>
 #include <chrono>
 #include <thread>
 #include <cassert>
 #include <cstring>
 #include <optional>
-#include <fcntl.h>
-#include <unistd.h>
+
+
 
 namespace tenet {
 
@@ -134,9 +134,10 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
     // Track last known file size to detect new data
     uint64_t last_file_size = 0;
     {
-        struct stat st{};
-        if (::stat(trace_path.c_str(), &st) == 0) {
-            last_file_size = static_cast<uint64_t>(st.st_size);
+        std::error_code ec;
+        auto size = std::filesystem::file_size(trace_path, ec);
+        if (!ec) {
+            last_file_size = size;
             file_bytes_seen_.store(last_file_size, std::memory_order_relaxed);
         }
     }
@@ -157,10 +158,9 @@ void StreamingIndex::tail_thread_func(const std::string& trace_path, TraceIndex*
         if (stop_requested_.load(std::memory_order_relaxed)) break;
 
         // Check current file size
-        struct stat st{};
-        if (::stat(trace_path.c_str(), &st) != 0) continue;
-
-        uint64_t current_size = static_cast<uint64_t>(st.st_size);
+        std::error_code ec;
+        uint64_t current_size = std::filesystem::file_size(trace_path, ec);
+        if (ec) continue;
         file_bytes_seen_.store(current_size, std::memory_order_relaxed);
 
         if (current_size <= last_file_size) {

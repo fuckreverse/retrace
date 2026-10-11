@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 /*
  * test_io_block_compressed.cpp — Unit tests for block-compressed trace
  * (HF_BLOCK_COMPRESSED) support.
@@ -139,7 +140,7 @@ static std::filesystem::path create_block_compressed_trace(
     size_t body_size = data.size() - kHdrSize;
 
     auto out_path = dir / out_name;
-    FILE* fp = fopen(out_path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(out_path, "wb");
     REQUIRE(fp != nullptr);
 
     // Write header
@@ -897,7 +898,7 @@ TEST_CASE("TraceReader: block-compressed trace rejected without zstd",
     hdr->flags |= qbditrace::QBDITRACE_HF_BLOCK_COMPRESSED;
 
     auto fake = dir / "fake_block_compressed.trace";
-    FILE* fp = fopen(fake.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(fake, "wb");
     REQUIRE(fp != nullptr);
     fwrite(data.data(), data.size(), 1, fp);
     fclose(fp);

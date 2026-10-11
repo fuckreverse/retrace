@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "batch_analysis.h"
 #include "common/progress_manager.h"
 
@@ -207,7 +208,7 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
     {
         uint64_t remaining = result.tainted_regs;
         while (remaining) {
-            tainted.push_back(static_cast<uint8_t>(__builtin_ctzll(remaining)));
+            tainted.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(remaining)));
             remaining &= remaining - 1;
         }
     }
@@ -235,7 +236,7 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
             if (s.src_reg_mask != 0) {
                 json src_arr = json::array();
                 for (uint64_t m = s.src_reg_mask; m; m &= m - 1)
-                    src_arr.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+                    src_arr.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
                 step_json["src_regs"] = std::move(src_arr);
             }
             if (s.src_mem_count > 0 || !s.src_mem_addrs_overflow.empty()) {
@@ -270,7 +271,7 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
         if (ev.src_reg_mask != 0) {
             json src_arr = json::array();
             for (uint64_t m = ev.src_reg_mask; m; m &= m - 1)
-                src_arr.push_back(static_cast<uint8_t>(__builtin_ctzll(m)));
+                src_arr.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
             ev_json["src_regs"] = std::move(src_arr);
         }
         events_arr.push_back(std::move(ev_json));
@@ -605,7 +606,7 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
     {
         uint64_t remaining = result.all_involved_regs;
         while (remaining) {
-            involved.push_back(static_cast<uint8_t>(__builtin_ctzll(remaining)));
+            involved.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(remaining)));
             remaining &= remaining - 1;
         }
     }

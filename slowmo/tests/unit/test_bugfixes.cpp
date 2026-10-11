@@ -1,3 +1,5 @@
+#include "common/platform_compat.h"
+#include "common/platform_file.h"
 /*
  * test_bugfixes.cpp — Targeted regression tests for 4 bug fixes:
  *
@@ -35,7 +37,7 @@ namespace {
 /// This avoids dependency on system binaries (which may be fat/universal on macOS).
 /// Returns the path to the created file.
 static std::string create_minimal_macho(const std::filesystem::path& path) {
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(path, "wb");
     REQUIRE(fp != nullptr);
 
     // MachHeader64 (32 bytes)
@@ -82,7 +84,7 @@ static std::string create_minimal_macho(const std::filesystem::path& path) {
 
 TEST_CASE("ImageFallback destructor releases mmap", "[bugfix][code_table]") {
     auto temp_dir = std::filesystem::temp_directory_path() /
-                    ("tenet_test_macho_" + std::to_string(getpid()));
+                    ("tenet_test_macho_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto bin_path = temp_dir / "test.macho";
     create_minimal_macho(bin_path);
@@ -109,7 +111,7 @@ TEST_CASE("ImageFallback destructor releases mmap", "[bugfix][code_table]") {
 
 TEST_CASE("ImageFallback move constructor transfers ownership", "[bugfix][code_table]") {
     auto temp_dir = std::filesystem::temp_directory_path() /
-                    ("tenet_test_macho_move_" + std::to_string(getpid()));
+                    ("tenet_test_macho_move_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto bin_path = temp_dir / "test.macho";
     create_minimal_macho(bin_path);
@@ -131,7 +133,7 @@ TEST_CASE("ImageFallback move constructor transfers ownership", "[bugfix][code_t
 
 TEST_CASE("ImageFallback move assignment releases old mmap", "[bugfix][code_table]") {
     auto temp_dir = std::filesystem::temp_directory_path() /
-                    ("tenet_test_macho_assign_" + std::to_string(getpid()));
+                    ("tenet_test_macho_assign_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto bin_path = temp_dir / "test.macho";
     create_minimal_macho(bin_path);
@@ -154,7 +156,7 @@ TEST_CASE("ImageFallback move assignment releases old mmap", "[bugfix][code_tabl
 
 TEST_CASE("ImageFallback re-load releases previous mmap", "[bugfix][code_table]") {
     auto temp_dir = std::filesystem::temp_directory_path() /
-                    ("tenet_test_macho_reload_" + std::to_string(getpid()));
+                    ("tenet_test_macho_reload_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto bin_path = temp_dir / "test.macho";
     create_minimal_macho(bin_path);
@@ -434,7 +436,7 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
     // append more records, verify inst_count is correct.
     // The old += 6 advance would miscount because records are much larger than 6 bytes.
 
-    std::string dir_name = "tenet_test_streaming_" + std::to_string(getpid());
+    std::string dir_name = "tenet_test_streaming_" + std::to_string(tenet::platform::current_pid());
     auto temp_dir = std::filesystem::temp_directory_path() / dir_name;
     std::filesystem::remove_all(temp_dir);
     std::filesystem::create_directories(temp_dir);
@@ -486,7 +488,7 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
     {
         // Re-open the file in append mode and write more records.
         // We need to write raw bytes (same format as TraceWriter but appending).
-        FILE* fp = std::fopen(trace_path.c_str(), "ab");
+        FILE* fp = tenet::platform::open_file(trace_path, "ab");
         REQUIRE(fp != nullptr);
 
         // Write APPENDED_INSTS instructions with varying record sizes.
@@ -552,7 +554,7 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
 TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
           "[bugfix][streaming_index][v8]") {
     const auto temp_dir = std::filesystem::temp_directory_path() /
-        ("tenet_test_streaming_v8_" + std::to_string(getpid()));
+        ("tenet_test_streaming_v8_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::remove_all(temp_dir);
     std::filesystem::create_directories(temp_dir);
     const auto trace_path = temp_dir / "streaming_v8.trace";
@@ -583,7 +585,7 @@ TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
     call.kind = qbditrace::QBDITRACE_REC_CAPICALL;
     call.str_count = 1;
     {
-        FILE* fp = std::fopen(trace_path.c_str(), "ab");
+        FILE* fp = tenet::platform::open_file(trace_path, "ab");
         REQUIRE(fp != nullptr);
         REQUIRE(std::fwrite(&call, sizeof(call), 1, fp) == 1);
         std::fclose(fp);
@@ -594,7 +596,7 @@ TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
     REQUIRE(si.inst_count() == 0);
 
     {
-        FILE* fp = std::fopen(trace_path.c_str(), "ab");
+        FILE* fp = tenet::platform::open_file(trace_path, "ab");
         REQUIRE(fp != nullptr);
         qbditrace::qbditrace_capicall_str_t string_header{};
         string_header.str_len = 3;

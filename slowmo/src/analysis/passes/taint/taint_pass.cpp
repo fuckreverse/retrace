@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/taint_common.h"
 #include "analysis/passes/structure/xref_pass.h"
@@ -236,7 +237,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
 
     // Set initial taint sources (iterate bitmask)
     for (uint64_t mask = config.source_regs; mask; mask &= mask - 1) {
-        uint8_t reg_idx = static_cast<uint8_t>(__builtin_ctzll(mask));
+        uint8_t reg_idx = static_cast<uint8_t>(tenet::platform::trailing_zeros(mask));
         triton->taint_register(reg_idx);
     }
 
@@ -294,7 +295,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         // ─── Detect newly tainted registers (bitwise diff: O(1)) ──────
         uint64_t new_taint = after_mask & ~before_mask;
         while (new_taint) {
-            uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(new_taint));
+            uint8_t reg = static_cast<uint8_t>(tenet::platform::trailing_zeros(new_taint));
             new_taint &= new_taint - 1;  // clear lowest set bit
 
             PropagationStep step;
@@ -324,7 +325,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         if (config.emit_kill_events) {
             uint64_t killed = before_mask & ~after_mask;
             while (killed) {
-                uint8_t prev = static_cast<uint8_t>(__builtin_ctzll(killed));
+                uint8_t prev = static_cast<uint8_t>(tenet::platform::trailing_zeros(killed));
                 killed &= killed - 1;
 
                 PropagationStep step;

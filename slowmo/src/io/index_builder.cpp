@@ -1,3 +1,5 @@
+#include "common/platform_file.h"
+#include "common/compiler_compat.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "common/logger.h"
@@ -82,7 +84,7 @@ namespace {
 inline rocksdb::Slice encode_u64_to(uint64_t v, char buf[8]) {
     // Use __builtin_bswap64 (single REV instruction on ARM64)
 #if defined(__GNUC__) || defined(__clang__)
-    uint64_t be = __builtin_bswap64(v);
+    uint64_t be = tenet::platform::byte_swap64(v);
 #else
     uint64_t be = 0;
     for (int i = 7; i >= 0; --i) {
@@ -2586,7 +2588,7 @@ void TraceIndex::save_pass_blob(std::string_view pass_name,
     auto tmp_path   = final_path;
     tmp_path += ".tmp";
 
-    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    FILE* f = tenet::platform::open_file(tmp_path, "wb");
     if (!f) {
         LOG_WARN_M(::tenet::log::Module::Io, "save_pass_blob '{}': cannot open '{}' for write",
                  pass_name, tmp_path.string());
@@ -2654,7 +2656,7 @@ bool TraceIndex::load_pass_blob(std::string_view pass_name,
     if (ec || fsize_u == 0) return false;
     size_t fsize = static_cast<size_t>(fsize_u);
 
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = tenet::platform::open_file(path, "rb");
     if (!f) return false;
 
     // Peek at the first 4 bytes to detect the zstd magic.

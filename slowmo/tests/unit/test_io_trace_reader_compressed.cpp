@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 /*
  * test_io_trace_reader_compressed.cpp — Unit tests for compressed trace (HF_COMPRESSED)
  *
@@ -105,7 +106,7 @@ static std::filesystem::path create_compressed_trace(
 
     // Write compressed trace
     auto out_path = dir / "compressed.trace";
-    FILE* fp = fopen(out_path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(out_path, "wb");
     REQUIRE(fp != nullptr);
     fwrite(&hdr, kHdrSize, 1, fp);
     fwrite(compressed.data(), compressed_size, 1, fp);
@@ -316,7 +317,7 @@ TEST_CASE("TraceReader: compressed trace rejected when zstd not available",
     hdr->flags |= qbditrace::QBDITRACE_HF_COMPRESSED;
 
     auto fake_compressed = dir / "fake_compressed.trace";
-    FILE* fp = fopen(fake_compressed.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(fake_compressed, "wb");
     REQUIRE(fp != nullptr);
     fwrite(data.data(), data.size(), 1, fp);
     fclose(fp);

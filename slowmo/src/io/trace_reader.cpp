@@ -1,10 +1,11 @@
+#include "common/compiler_compat.h"
 #include "io/trace_reader.h"
 #include "common/Profiling.h"
 #include "common/logger.h"
 #include "common/platform_mmap.h"
 
 #include <fmt/format.h>
-#include <unistd.h>
+#include "common/platform_file.h"
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
@@ -507,21 +508,18 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     size_t compressed_size = raw_size - kHeaderSize;
 
     // Create a temp file for the decompressed trace.
-    auto temp_dir = reader.path_.parent_path();
-    auto temp_template = temp_dir / ".tenet-decomp-XXXXXX";
-    std::string temp_str = temp_template.string();
-    int tmp_fd = ::mkstemp(temp_str.data());
+    std::filesystem::path temp_path;
+    int tmp_fd = platform::create_temp_file(reader.path_.parent_path(), temp_path);
     if (tmp_fd < 0) {
-        // Fallback: try /tmp if the source directory is read-only
-        temp_str = "/tmp/.tenet-decomp-XXXXXX";
-        tmp_fd = ::mkstemp(temp_str.data());
+        std::error_code ec;
+        auto directory = std::filesystem::temp_directory_path(ec);
+        if (!ec) tmp_fd = platform::create_temp_file(directory, temp_path);
     }
     if (tmp_fd < 0) {
         return Error(ErrorCode::MmapFailed,
-                     std::string("Failed to create temp file for decompression: ") +
-                     strerror(errno));
+                     std::string("Failed to create temp file for decompression: ") + strerror(errno));
     }
-    std::filesystem::path temp_path(temp_str);
+    std::string temp_str = temp_path.string();
 
     fmt::print(stderr, "Decompressing trace to {}\n", temp_str);
     LOG_INFO_M(::tenet::log::Module::Io, "decompressing compressed trace ({:.2f} MB) to {}",
@@ -531,8 +529,8 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     qbditrace::qbditrace_file_header_t hdr;
     std::memcpy(&hdr, src, kHeaderSize);
     hdr.flags &= ~static_cast<uint64_t>(qbditrace::QBDITRACE_HF_COMPRESSED);
-    if (::write(tmp_fd, &hdr, kHeaderSize) != static_cast<ssize_t>(kHeaderSize)) {
-        ::close(tmp_fd);
+    if (!platform::write_file(tmp_fd, &hdr, kHeaderSize)) {
+        platform::close_file(tmp_fd);
         std::filesystem::remove(temp_path);
         return Error(ErrorCode::MmapFailed, "Failed to write header to temp file");
     }
@@ -540,7 +538,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     // Streaming decompression using ZSTD_DCtx.
     ZSTD_DCtx* dctx = ZSTD_createDCtx();
     if (!dctx) {
-        ::close(tmp_fd);
+        platform::close_file(tmp_fd);
         std::filesystem::remove(temp_path);
         return Error(ErrorCode::MmapFailed, "ZSTD_createDCtx failed");
     }
@@ -564,8 +562,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
             break;
         }
         if (out.pos > 0) {
-            ssize_t written = ::write(tmp_fd, out_buf.get(), out.pos);
-            if (written != static_cast<ssize_t>(out.pos)) {
+            if (!platform::write_file(tmp_fd, out_buf.get(), out.pos)) {
                 err_msg = std::string("write to temp file failed: ") +
                           strerror(errno);
                 ok = false;
@@ -589,7 +586,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
 
     if (!ok) {
         fmt::print(stderr, "\n  Decompression failed: {}\n", err_msg);
-        ::close(tmp_fd);
+        platform::close_file(tmp_fd);
         std::filesystem::remove(temp_path);
         return Error(ErrorCode::MmapFailed, err_msg);
     }
@@ -598,7 +595,7 @@ Result<TraceReader> TraceReader::decompress_to_temp(
     LOG_INFO_M(::tenet::log::Module::Io, "decompression complete: {:.2f} MB", total_written / (1024.0 * 1024.0));
 
     // Close the writer, then map the completed decompressed file read-only.
-    ::close(tmp_fd);
+    platform::close_file(tmp_fd);
     std::string map_error;
     auto decompressed_mapping = platform::MappedFile::open(temp_str, &map_error);
     if (!decompressed_mapping.valid()) {
@@ -848,7 +845,7 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
     // Prefetch hint — only useful in mmap mode; harmless in block mode
     // (the address may be in a different decompressed block anyway).
     if (!reader_->is_block_mode() && rec_size < remaining) {
-        __builtin_prefetch(ptr + rec_size, 0, 1);
+        tenet::platform::prefetch(ptr + rec_size, 0, 1);
     }
 
     offset_ += rec_size;

@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "core/memory_model.h"
 #include "common/Profiling.h"
 #include "common/logger.h"
@@ -110,8 +111,8 @@ static TLPageCache& tl_page_cache() {
 static inline rocksdb::Slice encode_key_to(uint64_t page_addr, uint16_t page_offset,
                                             uint64_t inst_id, char buf[18]) {
 #if defined(__GNUC__) || defined(__clang__)
-    uint64_t pa_be = __builtin_bswap64(page_addr);
-    uint64_t id_be = __builtin_bswap64(inst_id);
+    uint64_t pa_be = tenet::platform::byte_swap64(page_addr);
+    uint64_t id_be = tenet::platform::byte_swap64(inst_id);
 #else
     uint64_t pa_be = 0, id_be = 0;
     for (int i = 7; i >= 0; --i) pa_be = (pa_be << 8) | ((page_addr >> (i*8)) & 0xFF);
@@ -589,7 +590,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                            all_data, bytes_in_first_page, !is_write);
 
                 // Second page (cross-page boundary — rare)
-                if (__builtin_expect(bytes_in_first_page < total_size, 0)) {
+                if (tenet::platform::likely(bytes_in_first_page < total_size, 0)) {
                     uint8_t remaining = total_size - bytes_in_first_page;
                     emit_entry(page_of(acc_addr + bytes_in_first_page), 0,
                                all_data + bytes_in_first_page, remaining, !is_write);

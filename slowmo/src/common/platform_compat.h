@@ -319,7 +319,7 @@ inline pid_t_compat current_pid() {
 #if defined(_WIN32)
     return ::GetCurrentProcessId();
 #else
-    return ::getpid();
+    return tenet::platform::current_pid();
 #endif
 }
 

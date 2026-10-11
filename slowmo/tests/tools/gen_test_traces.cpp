@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 /*
  * gen_test_traces.cpp — Synthetic trace generator for Tenet unit tests & perf validation
  *
@@ -865,7 +866,7 @@ int main(int argc, char* argv[]) {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         // Get file size
-        FILE* f = fopen(fname.c_str(), "rb");
+        FILE* f = tenet::platform::open_file(fname, "rb");
         long sz = 0;
         if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); fclose(f); }
 
@@ -900,7 +901,7 @@ int main(int argc, char* argv[]) {
                     tc.generate(fname.c_str(), scale);
                     auto t1 = std::chrono::high_resolution_clock::now();
                     double ms_val = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    FILE* f = fopen(fname.c_str(), "rb");
+                    FILE* f = tenet::platform::open_file(fname, "rb");
                     long sz = 0;
                     if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); fclose(f); }
                     printf("[unit] %-25s → %s  (%.1f ms, %ld bytes)\n",
@@ -919,7 +920,7 @@ int main(int argc, char* argv[]) {
                     tc.generate(fname.c_str(), scale);
                     auto t1 = std::chrono::high_resolution_clock::now();
                     double ms_val = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    FILE* f = fopen(fname.c_str(), "rb");
+                    FILE* f = tenet::platform::open_file(fname, "rb");
                     long sz = 0;
                     if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); fclose(f); }
                     printf("[perf] %-25s → %s  (%.1f ms, %.2f MB)\n",

@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "rpc_server.h"
 
 #include "io/trace_reader.h"
@@ -595,7 +596,7 @@ void TenetRpcService::register_methods() {
         {
             uint64_t mask = taint.tainted_regs;
             while (mask) {
-                int bit = __builtin_ctzll(mask);
+                int bit = tenet::platform::trailing_zeros(mask);
                 if (bit < 34) tainted_regs.push_back(kRegNames[bit]);
                 mask &= mask - 1;
             }

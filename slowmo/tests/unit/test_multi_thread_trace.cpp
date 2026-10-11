@@ -25,7 +25,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include <unistd.h>
+#include "common/platform_compat.h"
 #include <filesystem>
 
 #include "fixtures/trace_fixture.h"
@@ -197,7 +197,7 @@ TEST_CASE("MultiThread: thread chunk table survives index cache reload",
     // into a stable directory that survives until this test's end.
     std::filesystem::path stable_dir =
         std::filesystem::temp_directory_path() /
-        ("tenet_mt_cache_" + std::to_string(::getpid()));
+        ("tenet_mt_cache_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::remove_all(stable_dir);
     std::filesystem::create_directories(stable_dir);
     std::filesystem::path trace_path = stable_dir / "mt_v4_cached.trace";
