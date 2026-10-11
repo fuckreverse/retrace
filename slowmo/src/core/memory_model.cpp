@@ -590,7 +590,7 @@ void MemoryModel::build(BuildProgressFn progress_fn) {
                            all_data, bytes_in_first_page, !is_write);
 
                 // Second page (cross-page boundary — rare)
-                if (tenet::platform::likely(bytes_in_first_page < total_size, 0)) {
+                if (TENET_EXPECT(bytes_in_first_page < total_size, 0)) {
                     uint8_t remaining = total_size - bytes_in_first_page;
                     emit_entry(page_of(acc_addr + bytes_in_first_page), 0,
                                all_data + bytes_in_first_page, remaining, !is_write);

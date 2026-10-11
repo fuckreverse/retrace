@@ -29,9 +29,9 @@ TEST_CASE("critical_path: empty forward result yields empty intersection",
           "[unit][pass][critical_path]") {
     TaintResult forward;  // tainted_inst_ids empty
     BackwardTaintResult backward;
-    backward.contributing_inst_ids.add(1ULL);
-    backward.contributing_inst_ids.add(2ULL);
-    backward.contributing_inst_ids.add(3ULL);
+    backward.contributing_inst_ids.add(uint64_t{1});
+    backward.contributing_inst_ids.add(uint64_t{2});
+    backward.contributing_inst_ids.add(uint64_t{3});
 
     auto cp = backward.critical_path(forward);
     REQUIRE(cp.isEmpty());
@@ -40,8 +40,8 @@ TEST_CASE("critical_path: empty forward result yields empty intersection",
 TEST_CASE("critical_path: empty backward result yields empty intersection",
           "[unit][pass][critical_path]") {
     TaintResult forward;
-    forward.tainted_inst_ids.add(1ULL);
-    forward.tainted_inst_ids.add(2ULL);
+    forward.tainted_inst_ids.add(uint64_t{1});
+    forward.tainted_inst_ids.add(uint64_t{2});
     BackwardTaintResult backward;  // contributing_inst_ids empty
 
     auto cp = backward.critical_path(forward);
@@ -51,13 +51,13 @@ TEST_CASE("critical_path: empty backward result yields empty intersection",
 TEST_CASE("critical_path: disjoint sets yield empty intersection",
           "[unit][pass][critical_path]") {
     TaintResult forward;
-    forward.tainted_inst_ids.add(1ULL);
-    forward.tainted_inst_ids.add(2ULL);
-    forward.tainted_inst_ids.add(3ULL);
+    forward.tainted_inst_ids.add(uint64_t{1});
+    forward.tainted_inst_ids.add(uint64_t{2});
+    forward.tainted_inst_ids.add(uint64_t{3});
 
     BackwardTaintResult backward;
-    backward.contributing_inst_ids.add(10ULL);
-    backward.contributing_inst_ids.add(11ULL);
+    backward.contributing_inst_ids.add(uint64_t{10});
+    backward.contributing_inst_ids.add(uint64_t{11});
 
     auto cp = backward.critical_path(forward);
     REQUIRE(cp.isEmpty());
@@ -66,16 +66,16 @@ TEST_CASE("critical_path: disjoint sets yield empty intersection",
 TEST_CASE("critical_path: partial overlap keeps only shared instruction IDs",
           "[unit][pass][critical_path]") {
     TaintResult forward;
-    forward.tainted_inst_ids.add(1ULL);
-    forward.tainted_inst_ids.add(2ULL);
-    forward.tainted_inst_ids.add(3ULL);
-    forward.tainted_inst_ids.add(4ULL);
+    forward.tainted_inst_ids.add(uint64_t{1});
+    forward.tainted_inst_ids.add(uint64_t{2});
+    forward.tainted_inst_ids.add(uint64_t{3});
+    forward.tainted_inst_ids.add(uint64_t{4});
 
     BackwardTaintResult backward;
-    backward.contributing_inst_ids.add(3ULL);
-    backward.contributing_inst_ids.add(4ULL);
-    backward.contributing_inst_ids.add(5ULL);
-    backward.contributing_inst_ids.add(6ULL);
+    backward.contributing_inst_ids.add(uint64_t{3});
+    backward.contributing_inst_ids.add(uint64_t{4});
+    backward.contributing_inst_ids.add(uint64_t{5});
+    backward.contributing_inst_ids.add(uint64_t{6});
 
     auto cp = backward.critical_path(forward);
     REQUIRE(cp.cardinality() == 2);
@@ -104,12 +104,12 @@ TEST_CASE("critical_path: identical sets yield full intersection",
 TEST_CASE("critical_path: does not mutate the inputs",
           "[unit][pass][critical_path]") {
     TaintResult forward;
-    forward.tainted_inst_ids.add(1ULL);
-    forward.tainted_inst_ids.add(2ULL);
+    forward.tainted_inst_ids.add(uint64_t{1});
+    forward.tainted_inst_ids.add(uint64_t{2});
 
     BackwardTaintResult backward;
-    backward.contributing_inst_ids.add(2ULL);
-    backward.contributing_inst_ids.add(3ULL);
+    backward.contributing_inst_ids.add(uint64_t{2});
+    backward.contributing_inst_ids.add(uint64_t{3});
 
     auto cp = backward.critical_path(forward);
     REQUIRE(cp.cardinality() == 1);

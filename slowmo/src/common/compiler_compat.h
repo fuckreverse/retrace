@@ -51,5 +51,11 @@ inline void prefetch(const void* address, int, int) {
     (void)address;
 #endif
 }
-inline bool likely(bool condition, int) { return condition; }
+
 } // namespace tenet::platform
+
+#if defined(_MSC_VER)
+#define TENET_EXPECT(condition, expected) (condition)
+#else
+#define TENET_EXPECT(condition, expected) __builtin_expect((condition), (expected))
+#endif

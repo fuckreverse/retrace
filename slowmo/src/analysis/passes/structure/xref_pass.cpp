@@ -200,11 +200,11 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 }
                 prev_pc = pc;
 
-                if (tenet::platform::likely(pc == last_pc, 1)) {
+                if (TENET_EXPECT(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
                     auto& bm_slot = out.pc_bitmaps[pc];
-                    if (tenet::platform::likely(bm_slot == nullptr, 0)) {
+                    if (TENET_EXPECT(bm_slot == nullptr, 0)) {
                         bm_slot = roaring64_bitmap_create();
                     }
                     last_pc = pc;
