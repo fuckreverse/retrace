@@ -34,7 +34,7 @@
 #include <functional>
 #include <chrono>
 #include <algorithm>
-#include <sys/stat.h>
+#include <filesystem>
 
 #include "fixtures/trace_writer.h"
 
@@ -808,7 +808,7 @@ static uint64_t parse_scale(const char* s) {
 }
 
 static void ensure_dir(const char* dir) {
-    mkdir(dir, 0755);
+    std::filesystem::create_directories(dir);
 }
 
 static void print_usage() {
