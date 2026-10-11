@@ -31,6 +31,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SCCACHE_DIR: C:\Users\runneradmin\AppData\Local\Mozilla\sccache
+
 jobs:
   tenet-cli:
     name: tenet CLI (${{ matrix.platform }})
@@ -40,10 +43,13 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x86_64
+            cache_platform: linux
           - os: macos-14
             platform: macos-arm64
+            cache_platform: macos
           - os: windows-latest
             platform: windows-x86_64
+            cache_platform: win
     runs-on: ${{ matrix.os }}
     steps:
       - name: checkout
@@ -104,13 +110,18 @@ jobs:
         run: cargo fetch --locked --manifest-path slowmo/web/src-tauri/Cargo.toml
 
       - name: Cache slowmo third-party (_deps)
-        uses: actions/cache@v4
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
           path: slowmo/_deps
-          key: slowmo-deps-v2-${{ runner.os }}-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
+          key: slowmo-release-deps-v1-${{ matrix.platform }}-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
+          restore-keys: |
+            slowmo-release-deps-v1-${{ matrix.platform }}-
+            slowmo-deps-v2-${{ matrix.cache_platform }}-
 
       - name: Cache compiler cache
-        uses: actions/cache@v4
+        id: compiler-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/ccache
@@ -119,7 +130,8 @@ jobs:
           key: ccache-release-${{ matrix.platform }}-${{ github.run_number }}
           restore-keys: |
             ccache-release-${{ matrix.platform }}-
-            ccache-slowmo-${{ matrix.platform }}-
+            ccache-slowmo-${{ matrix.cache_platform }}-
+            sccache-slowmo-${{ matrix.cache_platform }}-
 
       - name: Configure slowmo
         shell: bash
@@ -206,6 +218,23 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Save compiler cache
+        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/Library/Caches/ccache
+            C:\Users\runneradmin\AppData\Local\Mozilla\sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Save release dependencies
+        if: always() && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: slowmo/_deps
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
+
   desktop:
     name: Desktop app (${{ matrix.platform }})
     strategy:
@@ -214,10 +243,13 @@ jobs:
         include:
           - os: macos-14
             platform: macos-arm64
+            cache_platform: macos
           - os: ubuntu-latest
             platform: linux-x86_64
+            cache_platform: linux
           - os: windows-latest
             platform: windows-x86_64
+            cache_platform: win
     runs-on: ${{ matrix.os }}
     steps:
       - name: checkout
@@ -275,13 +307,18 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Cache slowmo third-party (_deps)
-        uses: actions/cache@v4
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
           path: slowmo/_deps
-          key: slowmo-deps-v2-${{ runner.os }}-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
+          key: slowmo-release-deps-v1-${{ matrix.platform }}-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
+          restore-keys: |
+            slowmo-release-deps-v1-${{ matrix.platform }}-
+            slowmo-deps-v2-${{ matrix.cache_platform }}-
 
       - name: Cache compiler cache
-        uses: actions/cache@v4
+        id: compiler-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/ccache
@@ -290,7 +327,8 @@ jobs:
           key: ccache-desktop-${{ matrix.platform }}-${{ github.run_number }}
           restore-keys: |
             ccache-desktop-${{ matrix.platform }}-
-            ccache-slowmo-${{ matrix.platform }}-
+            ccache-slowmo-${{ matrix.cache_platform }}-
+            sccache-slowmo-${{ matrix.cache_platform }}-
 
       - name: Configure slowmo
         shell: bash
@@ -356,6 +394,23 @@ jobs:
             slowmo/web/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
 
+      - name: Save compiler cache
+        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/Library/Caches/ccache
+            C:\Users\runneradmin\AppData\Local\Mozilla\sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Save release dependencies
+        if: always() && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: slowmo/_deps
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
+
   qbditrace:
     name: qbditrace (${{ matrix.platform }})
     strategy:
@@ -396,7 +451,7 @@ jobs:
 
       - name: Cache patched QBDI static libraries
         id: qbdi-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             third-party/qbdi/${{ matrix.target }}/libQBDI.a
@@ -408,6 +463,17 @@ jobs:
       - name: Build patched QBDI
         if: steps.qbdi-cache.outputs.cache-hit != 'true'
         run: bash scripts/prepare-qbdi.sh ${{ matrix.target }}
+
+      - name: Save patched QBDI static libraries
+        if: steps.qbdi-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            third-party/qbdi/${{ matrix.target }}/libQBDI.a
+            third-party/qbdi/${{ matrix.target }}/libqbdi-llvm.a
+            third-party/qbdi/${{ matrix.target }}/include
+            third-party/qbdi/${{ matrix.target }}/build-include
+          key: ${{ steps.qbdi-cache.outputs.cache-primary-key }}
 
       - name: Fetch zstd sources
         run: |

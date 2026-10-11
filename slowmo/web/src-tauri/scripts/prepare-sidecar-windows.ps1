@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 prepare-sidecar-windows.ps1 —— 为 Tauri Windows 打包准备 tenet C++ 后端 sidecar。
 
