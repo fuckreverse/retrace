@@ -94,7 +94,7 @@ static void test_header_first_then_chunks(void) {
 
     // Find PAYLOAD_DATA somewhere after the header
     bool found = false;
-    for (size_t i = 6; i < data.size(); i++) {
+    for (size_t i = 6; i + 12 <= data.size(); i++) {
         if (memcmp(data.data() + i, "PAYLOAD_DATA", 12) == 0) {
             found = true;
             break;

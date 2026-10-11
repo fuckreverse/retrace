@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
+# Embed MSVC debug information in object files so parallel builds and sccache
+# do not contend for a shared compiler PDB. CMP0141 must be set before project().
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
+
 project(tenet VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -204,6 +211,13 @@ if(NOT TENET_USE_SYSTEM_ROCKSDB)
     set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(rocksdb)
+    # RocksDB 9.4 globally injects ccache, wrapping our configured launcher
+    # (including sccache on Windows). Use the project launcher only.
+    get_property(_rocksdb_compile_launcher GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+    if(_rocksdb_compile_launcher STREQUAL "ccache")
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "")
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "")
+    endif()
 else()
     find_package(RocksDB REQUIRED)
 endif()

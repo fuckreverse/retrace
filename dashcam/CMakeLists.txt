@@ -235,6 +235,16 @@ if(QBDITRACE_BUILD_TESTS)
   target_link_libraries(test_ring_buffer PRIVATE Threads::Threads)
   add_test(NAME ring_buffer COMMAND test_ring_buffer)
 
+  # These standalone tests use assert(), including writer startup. Keep their
+  # checks active even when dependencies default the build to Release.
+  foreach(test_target test_trace_format test_ring_buffer)
+    if(MSVC)
+      target_compile_options(${test_target} PRIVATE /UNDEBUG)
+    else()
+      target_compile_options(${test_target} PRIVATE -UNDEBUG)
+    endif()
+  endforeach()
+
   # ── Catch2 unit tests ───────────────────────────────────────────────────────
   # These require Catch2 3.x.  If tenet is available as a sibling CMake project
   # it already fetches Catch2 — we can borrow its target when present.

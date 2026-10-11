@@ -37,7 +37,8 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
-        # Reads the packageManager field pinned in website/package.json.
+        with:
+          package_json_file: website/package.json
 
       - name: Install Node.js
         uses: actions/setup-node@v4

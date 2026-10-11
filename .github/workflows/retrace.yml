@@ -246,7 +246,8 @@ jobs:
 
       - name: Clone QBDI at pinned commit
         run: |
-          PIN_SHA="$(awk '{print $1}' patches/qbdi/PIN)"
+          PIN_SHA="$(awk 'NR == 1 {print $1; exit}' patches/qbdi/PIN)"
+          [[ "${PIN_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid QBDI PIN" >&2; exit 1; }
           git clone --filter=blob:none https://github.com/QBDI/QBDI.git qbdi
           cd qbdi
           git checkout "${PIN_SHA}"
