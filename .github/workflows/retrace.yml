@@ -55,7 +55,7 @@ jobs:
             ninja-build ccache pkg-config libyara-dev libz-dev
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         id: cache-ccache
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -64,7 +64,8 @@ jobs:
             ccache-slowmo-linux-
 
       - name: Cache slowmo third-party (_deps)
-        uses: actions/cache@v4
+        id: cache-deps
+        uses: actions/cache/restore@v4
         with:
           path: slowmo/_deps
           key: slowmo-deps-v2-linux-${{ hashFiles('slowmo/CMakeLists.txt', 'slowmo/tests/CMakeLists.txt') }}
@@ -89,6 +90,20 @@ jobs:
       - name: Test
         working-directory: slowmo/build
         run: ctest --output-on-failure -j$(nproc)
+
+      - name: Save ccache
+        if: always() && steps.cache-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.cache-ccache.outputs.cache-primary-key }}
+
+      - name: Save slowmo third-party (_deps)
+        if: always() && steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: slowmo/_deps
+          key: ${{ steps.cache-deps.outputs.cache-primary-key }}
 
   macos:
     runs-on: macos-14

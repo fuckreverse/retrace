@@ -79,10 +79,10 @@ TEST_CASE("critical_path: partial overlap keeps only shared instruction IDs",
 
     auto cp = backward.critical_path(forward);
     REQUIRE(cp.cardinality() == 2);
-    REQUIRE(cp.contains(3ULL));
-    REQUIRE(cp.contains(4ULL));
-    REQUIRE_FALSE(cp.contains(1ULL));
-    REQUIRE_FALSE(cp.contains(5ULL));
+    REQUIRE(cp.contains(uint64_t{3}));
+    REQUIRE(cp.contains(uint64_t{4}));
+    REQUIRE_FALSE(cp.contains(uint64_t{1}));
+    REQUIRE_FALSE(cp.contains(uint64_t{5}));
 }
 
 TEST_CASE("critical_path: identical sets yield full intersection",
@@ -201,8 +201,8 @@ TEST_CASE("critical_path: end-to-end chain matches forward ∩ backward taint",
     // ── Critical path: forward ∩ backward ───────────────────────────────
     auto cp = bwd_result.critical_path(fwd_result);
 
-    REQUIRE(cp.contains(1ULL));
-    REQUIRE(cp.contains(3ULL));
-    REQUIRE_FALSE(cp.contains(0ULL));
-    REQUIRE_FALSE(cp.contains(2ULL));
+    REQUIRE(cp.contains(uint64_t{1}));
+    REQUIRE(cp.contains(uint64_t{3}));
+    REQUIRE_FALSE(cp.contains(uint64_t{0}));
+    REQUIRE_FALSE(cp.contains(uint64_t{2}));
 }

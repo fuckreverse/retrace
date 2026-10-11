@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "common/platform_mmap.h"
 #include "common/types.h"
 #include "TraceFormat.h"

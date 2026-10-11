@@ -1,6 +1,8 @@
 // slowmo/src/service/tenet_service.h
 #pragma once
 
+#include <algorithm>
+
 #include "common/types.h"
 #include "common/instruction_row.h"
 #include "analysis/pass_manager.h"
