@@ -251,6 +251,20 @@ function Find-DllByName {
         return $null
     }
 
+    # Use redistributable CRT files, rather than compiler tool-directory DLLs.
+    if ($Name -match '^(?i)(MSVCP140(?:_[a-z0-9_]+)?|VCRUNTIME140(?:_[a-z0-9_]+)?|CONCRT140)\.dll$') {
+        if ([string]::IsNullOrWhiteSpace($env:VCToolsRedistDir)) {
+            throw 'Visual C++ redistributable directory is missing; use a VS developer shell.'
+        }
+        $redistArch = if ($TargetTriple -like 'aarch64-*') { 'arm64' } elseif ($TargetTriple -like 'i686-*') { 'x86' } else { 'x64' }
+        $redistRoot = Join-Path $env:VCToolsRedistDir $redistArch
+        $redistDll = Get-ChildItem -LiteralPath $redistRoot -Filter $Name -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $redistDll) {
+            throw "Redistributable runtime DLL not found: $Name ($redistRoot)"
+        }
+        return $redistDll.FullName
+    }
+
     $localCandidate = Join-Path $ReferrerDirectory $Name
     if ((Test-Path -LiteralPath $localCandidate -PathType Leaf) -and -not (Test-IsSystemDllPath -Path $localCandidate)) {
         return [System.IO.Path]::GetFullPath($localCandidate)

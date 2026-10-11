@@ -190,7 +190,7 @@ jobs:
           mkdir -p dist
           tar -czf "dist/retrace-tenet-${{ matrix.platform }}.tar.gz" -C pkg tenet
           echo "--- bundle contents ---"
-          tar -tzf "dist/retrace-tenet-${{ matrix.platform }}.tar.gz" | head -30
+          tar -tzf "dist/retrace-tenet-${{ matrix.platform }}.tar.gz" | sed -n '1,30p'
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -504,7 +504,7 @@ jobs:
           bash dashcam/build-dashcam-ios.sh
           codesign --force --sign - libqbditrace.dylib
           file libqbditrace.dylib
-          xcrun lipo -verify_arch arm64 libqbditrace.dylib
+          xcrun lipo libqbditrace.dylib -verify_arch arm64
           otool -L libqbditrace.dylib
 
       - name: Package mobile library
