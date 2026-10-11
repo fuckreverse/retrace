@@ -211,6 +211,17 @@ jobs:
           Compress-Archive -Path pkg/tenet -DestinationPath "dist/retrace-tenet-${{ matrix.platform }}.zip"
           Get-ChildItem dist
 
+      - name: Check packaged CLI startup (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: pkg/tenet/tenet --help
+
+      - name: Check packaged CLI startup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./pkg/tenet/tenet.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged CLI failed: $LASTEXITCODE" }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

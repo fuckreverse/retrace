@@ -121,16 +121,20 @@ for f in libQBDI.a libqbdi-llvm.a; do
     cp -f "${found}" "${OUT_DIR}/${f}"
 done
 
-# Headers: QBDI's cmake generates include/ (public) plus include-shared/ and
-# include-static/ (Version.h, Config.h) inside the build dir.
+# QBDI generates Version.h and architecture headers in build/include/,
+# and the static-library Config.h in build/include-static/.
 mkdir -p "${OUT_DIR}/include" "${OUT_DIR}/build-include/QBDI"
 cp -R "${SRC_DIR}/include/." "${OUT_DIR}/include/"
 if [[ -d "${BUILD_DIR}/include-static" ]]; then
     cp -R "${BUILD_DIR}/include-static/." "${OUT_DIR}/build-include/"
 fi
-if [[ -f "${BUILD_DIR}/include-shared/QBDI/Version.h" ]]; then
-    cp -f "${BUILD_DIR}/include-shared/QBDI/Version.h" "${OUT_DIR}/build-include/QBDI/"
-fi
+cp -R "${BUILD_DIR}/include/." "${OUT_DIR}/build-include/"
+for header in Config.h Version.h State.h Options.h; do
+    [[ -f "${OUT_DIR}/build-include/QBDI/${header}" ]] || {
+        echo "ERROR: missing generated QBDI header ${header}" >&2
+        exit 1
+    }
+done
 
 echo "==> QBDI ${PLATFORM} ready:"
 ls "${OUT_DIR}"
