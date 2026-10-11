@@ -80,7 +80,7 @@ fi
 # zstd sources: prefer dashcam's own FetchContent cache, fall back to the
 # shared slowmo cache.
 ZSTD_SRC=""
-for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib; do
+for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib dashcam/build/_deps/zstd-src/lib; do
     if [[ -f "${cand}/zstd.h" ]]; then ZSTD_SRC="${cand}"; break; fi
 done
 if [[ -z "${ZSTD_SRC}" ]]; then

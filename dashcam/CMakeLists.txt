@@ -89,11 +89,11 @@ option(QBDITRACE_ENABLE_ZSTD "Enable zstd compression for trace output" ON)
 #
 # If tenet's _deps/ already has the source (e.g. zstd, Catch2), the
 # FETCHCONTENT_UPDATES_DISCONNECTED flag skips network checks entirely.
-include(FetchContent)
 if(NOT DEFINED FETCHCONTENT_BASE_DIR OR FETCHCONTENT_BASE_DIR STREQUAL "")
   set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_deps" CACHE PATH
       "Shared FetchContent source cache (shared across all build trees)" FORCE)
 endif()
+include(FetchContent)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
     "Skip network update check for already-downloaded FetchContent packages" FORCE)
 
