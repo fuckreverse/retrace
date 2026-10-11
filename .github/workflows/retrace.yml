@@ -155,6 +155,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    env:
+      SCCACHE_DIR: C:\Users\runneradmin\AppData\Local\Mozilla\sccache
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -174,7 +176,10 @@ jobs:
             sccache-slowmo-win-
 
       - name: Install sccache
-        run: choco install sccache --no-progress -y
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Verify sccache
+        run: sccache --version
 
       - name: Cache slowmo third-party (_deps)
         id: cache-deps
