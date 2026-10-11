@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 # do not contend for a shared compiler PDB. CMP0141 must be set before project().
 if(POLICY CMP0141)
     cmake_policy(SET CMP0141 NEW)
+    # Older dependency CMakeLists reset policies; keep this default for them.
+    set(CMAKE_POLICY_DEFAULT_CMP0141 NEW)
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 endif()
 
