@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #pragma once
 
 #include "analysis/pass_manager.h"
@@ -83,19 +84,19 @@ struct BackwardTaintEvent {
     template <typename Fn>
     void for_each_dst_reg(Fn&& fn) const {
         for (uint64_t m = dst_regs_mask; m; m &= m - 1)
-            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+            fn(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     }
     /// Iterate over all set source registers.  Fn receives uint8_t reg_id.
     template <typename Fn>
     void for_each_src_reg(Fn&& fn) const {
         for (uint64_t m = src_regs_mask; m; m &= m - 1)
-            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+            fn(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     }
     /// Iterate over all set sink tags.  Fn receives uint8_t tag index.
     template <typename Fn>
     void for_each_sink_tag(Fn&& fn) const {
         for (uint64_t m = sink_tags_mask; m; m &= m - 1)
-            fn(static_cast<uint8_t>(__builtin_ctzll(m)));
+            fn(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     }
 
     /// Build a vector of destination register IDs (for serialization / JSON).
@@ -172,7 +173,7 @@ struct BackwardTaintResult {
     uint64_t all_involved_regs = 0;
 
     /// Count of involved registers.
-    int involved_reg_count() const { return __builtin_popcountll(all_involved_regs); }
+    int involved_reg_count() const { return tenet::platform::population_count(all_involved_regs); }
 
     /// All memory addresses that were part of load-store chains.
     roaring::Roaring64Map involved_mem_addrs;

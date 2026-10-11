@@ -1,3 +1,4 @@
+#include "common/platform_compat.h"
 /*
  * test_pass_trace_diff.cpp — Unit tests for tenet::TraceDiffPass
  *
@@ -24,7 +25,7 @@ static std::filesystem::path write_linear_trace(
         uint64_t x0_val = 0)
 {
     auto dir = std::filesystem::temp_directory_path() /
-               (std::string("tenet_td_") + name + "_" + std::to_string(getpid()));
+               (std::string("tenet_td_") + name + "_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(dir);
     auto path = dir / (std::string(name) + ".trace");
 
@@ -52,7 +53,7 @@ static std::filesystem::path write_divergent_trace(
         uint64_t base_pc = 0x1000)
 {
     auto dir = std::filesystem::temp_directory_path() /
-               (std::string("tenet_td_") + name + "_" + std::to_string(getpid()));
+               (std::string("tenet_td_") + name + "_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(dir);
     auto path = dir / (std::string(name) + ".trace");
 
@@ -176,7 +177,7 @@ TEST_CASE("TraceDiff: cross-file divergence with resync", "[unit][pass][trace_di
     //        0x1018, 0x101C (resynced — same as trace A positions 6,7)
 
     auto path_b_dir = std::filesystem::temp_directory_path() /
-                      (std::string("tenet_td_resync_") + std::to_string(getpid()));
+                      (std::string("tenet_td_resync_") + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(path_b_dir);
     auto path_b = path_b_dir / "td_resync_b.trace";
 
@@ -271,7 +272,7 @@ TEST_CASE("TraceDiff: permanent divergence (no resync)", "[unit][pass][trace_dif
     // No matching PC in the divergent region → permanent divergence
 
     auto path_b_dir = std::filesystem::temp_directory_path() /
-                      (std::string("tenet_td_perm_") + std::to_string(getpid()));
+                      (std::string("tenet_td_perm_") + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(path_b_dir);
     auto path_b = path_b_dir / "td_perm_b.trace";
 
@@ -351,7 +352,7 @@ TEST_CASE("TraceDiff: register value diff at same PC", "[unit][pass][trace_diff]
 {
     // Both traces execute at the same PCs, but x0 has different values
     auto path_b_dir = std::filesystem::temp_directory_path() /
-                      (std::string("tenet_td_regv_") + std::to_string(getpid()));
+                      (std::string("tenet_td_regv_") + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(path_b_dir);
     auto path_b = path_b_dir / "td_regv_b.trace";
 
@@ -435,7 +436,7 @@ TEST_CASE("TraceDiff: resync requires multiple window-doubling retries",
     // attempt 3 covers [0,32). Place the matching PC at trace-A offset 20
     // (only reachable in attempt 3) to force the full retry sequence.
     auto path_b_dir = std::filesystem::temp_directory_path() /
-                      (std::string("tenet_td_multiretry_") + std::to_string(getpid()));
+                      (std::string("tenet_td_multiretry_") + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(path_b_dir);
     auto path_b = path_b_dir / "td_multiretry_b.trace";
 
@@ -522,7 +523,7 @@ TEST_CASE("TraceDiff: max_diffs truncation", "[unit][pass][trace_diff]")
 {
     // Create traces where every instruction has a register diff
     auto path_b_dir = std::filesystem::temp_directory_path() /
-                      (std::string("tenet_td_trunc_") + std::to_string(getpid()));
+                      (std::string("tenet_td_trunc_") + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(path_b_dir);
     auto path_b = path_b_dir / "td_trunc_b.trace";
 

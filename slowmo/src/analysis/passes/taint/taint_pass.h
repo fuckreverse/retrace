@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #pragma once
 
 #include "analysis/pass_manager.h"
@@ -216,7 +217,7 @@ struct TaintResult {
 
     /// Number of currently tainted registers.
     uint32_t tainted_reg_count() const {
-        return static_cast<uint32_t>(__builtin_popcountll(tainted_regs));
+        return static_cast<uint32_t>(tenet::platform::population_count(tainted_regs));
     }
 
     bool is_memory_addr_tainted(uint64_t addr) const {

@@ -365,12 +365,10 @@ void McpHttpTransport::listener_loop() {
         // tool handlers (taint, algorithm_summary, etc.) may legitimately block
         // for tens of seconds before the response is ready — a send timeout
         // would disconnect the client mid-computation.
-        struct timeval recv_tv{10, 0};
-        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+        platform::set_recv_timeout(client_fd, 10000);
         // TCP keepalive: keeps the connection alive when the server is computing
         // a long-running pass (the connection goes idle from the network's view).
-        int ka = 1;
-        ::setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        platform::set_keepalive(client_fd);
 
         // Spawn a per-client thread
         std::lock_guard<std::mutex> lk(clients_mutex_);

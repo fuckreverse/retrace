@@ -66,8 +66,40 @@ bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan();
 
 // ─── PassManager ──────────────────────────────────────────────────────────
 
+namespace {
+// Per-thread keepalive table used by PassManager::require() so it can keep
+// returning a plain `const PassResult&` (source-compatible with the ~100
+// existing call sites) while staying safe against a *different* thread
+// concurrently invalidating/re-running the same pass and replacing
+// PassEntry::result_ptr.
+//
+// Keyed by PassEntry* so that unrelated passes required from the same
+// thread (e.g. `require("cfg_layout")` immediately followed by
+// `require("cfg")`, both used together afterwards — see batch_analysis.cpp
+// run_export_cfg()) each get their own keepalive slot instead of clobbering
+// one another. A single shared thread_local variable would silently
+// invalidate the first reference as soon as the second require() ran.
+//
+// Drop this thread's entries when their manager is destroyed. Otherwise
+// results (and open files they own) survive until thread exit. The lifetime
+// flag also permits managers in static storage to be destroyed after TLS.
+thread_local bool g_require_keepalive_alive = false;
+struct RequireKeepaliveCache {
+    std::unordered_map<const void*, std::shared_ptr<const PassResult>> entries;
+    RequireKeepaliveCache() { g_require_keepalive_alive = true; }
+    ~RequireKeepaliveCache() { g_require_keepalive_alive = false; }
+};
+thread_local RequireKeepaliveCache g_require_keepalive;
+}  // namespace
+
 PassManager::PassManager() = default;
-PassManager::~PassManager() = default;
+PassManager::~PassManager() {
+    if (g_require_keepalive_alive) {
+        for (const auto& entry : entries_) {
+            g_require_keepalive.entries.erase(entry.get());
+        }
+    }
+}
 
 void PassManager::init_infra() {
     // All IO/Core pointers must be set before calling this.
@@ -144,27 +176,7 @@ bool PassManager::is_memory_pressure() const {
 
 // ─── Lock-free fast path + CAS claiming ──────────────────────────────────
 
-namespace {
-// Per-thread keepalive table used by PassManager::require() so it can keep
-// returning a plain `const PassResult&` (source-compatible with the ~100
-// existing call sites) while staying safe against a *different* thread
-// concurrently invalidating/re-running the same pass and replacing
-// PassEntry::result_ptr.
-//
-// Keyed by PassEntry* so that unrelated passes required from the same
-// thread (e.g. `require("cfg_layout")` immediately followed by
-// `require("cfg")`, both used together afterwards — see batch_analysis.cpp
-// run_export_cfg()) each get their own keepalive slot instead of clobbering
-// one another. A single shared thread_local variable would silently
-// invalidate the first reference as soon as the second require() ran.
-//
-// This table only grows to the number of distinct passes actually required
-// from a given thread (bounded by the pass catalog size — a few dozen), so
-// it is not a meaningful leak. Entries are naturally refreshed (not
-// accumulated) on every require() of the same pass.
-thread_local std::unordered_map<const void*, std::shared_ptr<const PassResult>>
-    g_require_keepalive;
-}  // namespace
+
 
 const PassResult& PassManager::require(std::string_view pass_name) {
     auto* entry = find_entry(pass_name);
@@ -172,7 +184,7 @@ const PassResult& PassManager::require(std::string_view pass_name) {
 
     // NOTE on lifetime: the returned reference stays valid at least until
     // this thread calls require()/require_shared() again for the *same*
-    // pass (see g_require_keepalive above) — every existing in-tree caller
+    // pass, or destroys this manager (see g_require_keepalive above). Every caller
     // either uses the reference immediately or (as in run_export_cfg) keeps
     // references to two *different* passes alive simultaneously, which the
     // per-entry keepalive slots handle correctly. Callers that need to keep
@@ -189,7 +201,7 @@ const PassResult& PassManager::require(std::string_view pass_name) {
     auto refresh_and_return = [entry]() -> const PassResult& {
         auto ptr = std::atomic_load_explicit(&entry->result_ptr, std::memory_order_acquire);
         const PassResult& ref = *ptr;
-        g_require_keepalive[entry] = std::move(ptr);
+        g_require_keepalive.entries[entry] = std::move(ptr);
         return ref;
     };
 

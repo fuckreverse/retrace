@@ -10,7 +10,7 @@ namespace tenet {
 
 class TraceIndex;
 class TraceCollector;
-class AnalysisRange;
+struct AnalysisRange;
 
 /// Declarative collector requirement — a pass declares what scan data it needs.
 struct ScanDeclaration {

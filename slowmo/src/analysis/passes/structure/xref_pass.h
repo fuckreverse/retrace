@@ -37,6 +37,7 @@ namespace tenet {
 // The file is written once at analysis time; subsequent runs load from it.
 
 struct XrefBitmapLoader {
+    ~XrefBitmapLoader();
     // Offset table entry (24 bytes, packed)
     struct Entry {
         uint64_t pc;

@@ -33,12 +33,7 @@
 
 #include <fmt/core.h>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
+#include "common/platform_compat.h"
 
 #include <chrono>
 #include <thread>
@@ -57,22 +52,23 @@ using json = nlohmann::json;
 namespace {
 
 /// Connect a TCP socket to host:port.  Returns fd or -1 on failure.
-int tcp_connect(const std::string& host, uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+platform::socket_t tcp_connect(const std::string& host, uint16_t port) {
+    platform::ensure_sockets_initialized();
+    platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!platform::socket_valid(fd)) return platform::kInvalidSocket;
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return -1;
+        platform::close_socket(fd);
+        return platform::kInvalidSocket;
     }
     return fd;
 }
 
 /// Send a full HTTP request string over `fd`.
-void http_send(int fd, const std::string& request) {
+void http_send(platform::socket_t fd, const std::string& request) {
     const char* p = request.data();
     size_t remaining = request.size();
     while (remaining > 0) {
@@ -85,7 +81,7 @@ void http_send(int fd, const std::string& request) {
 
 /// Read from socket until a specific delimiter or timeout.
 /// Returns the accumulated data.
-std::string http_recv_until(int fd, const std::string& delimiter,
+std::string http_recv_until(platform::socket_t fd, const std::string& delimiter,
                             std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     std::string buf;
     buf.reserve(4096);
@@ -93,8 +89,7 @@ std::string http_recv_until(int fd, const std::string& delimiter,
     char chunk[1024];
 
     // Set non-blocking so we can poll with a timeout
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    platform::set_nonblocking(fd);
 
     while (true) {
         ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
@@ -112,7 +107,7 @@ std::string http_recv_until(int fd, const std::string& delimiter,
     }
 
     // Restore blocking mode
-    ::fcntl(fd, F_SETFL, flags);
+    platform::set_blocking(fd);
     return buf;
 }
 
@@ -124,8 +119,8 @@ struct HttpResponse {
 
 HttpResponse http_get(const std::string& host, uint16_t port, const std::string& path) {
     HttpResponse resp;
-    int fd = tcp_connect(host, port);
-    if (fd < 0) return resp;
+    platform::socket_t fd = tcp_connect(host, port);
+    if (!platform::socket_valid(fd)) return resp;
 
     std::string req = "GET " + path + " HTTP/1.1\r\n"
                       "Host: " + host + "\r\n"
@@ -139,7 +134,7 @@ HttpResponse http_get(const std::string& host, uint16_t port, const std::string&
         if (n <= 0) break;
         raw.append(buf, static_cast<size_t>(n));
     }
-    ::close(fd);
+    platform::close_socket(fd);
 
     // Parse status
     size_t sp1 = raw.find(' ');
@@ -158,8 +153,8 @@ HttpResponse http_get(const std::string& host, uint16_t port, const std::string&
 HttpResponse http_post(const std::string& host, uint16_t port,
                        const std::string& path, const std::string& body) {
     HttpResponse resp;
-    int fd = tcp_connect(host, port);
-    if (fd < 0) return resp;
+    platform::socket_t fd = tcp_connect(host, port);
+    if (!platform::socket_valid(fd)) return resp;
 
     std::string req = "POST " + path + " HTTP/1.1\r\n"
                       "Host: " + host + "\r\n"
@@ -174,7 +169,7 @@ HttpResponse http_post(const std::string& host, uint16_t port,
         if (n <= 0) break;
         raw.append(buf, static_cast<size_t>(n));
     }
-    ::close(fd);
+    platform::close_socket(fd);
 
     size_t sp1 = raw.find(' ');
     size_t sp2 = raw.find(' ', sp1 + 1);
@@ -191,7 +186,7 @@ HttpResponse http_post(const std::string& host, uint16_t port,
 /// SSE session: connects via GET /sse, extracts endpoint, provides send_rpc() +
 /// recv_sse_event().
 struct SseClient {
-    int fd = -1;
+    platform::socket_t fd = platform::kInvalidSocket;
     std::string session_id;
     std::string messages_path;  // e.g. "/messages?sid=<uuid>"
     std::string host;
@@ -204,10 +199,10 @@ struct SseClient {
         // Retry connect a few times in case the server is still settling
         for (int attempt = 0; attempt < 5; attempt++) {
             fd = tcp_connect(host, port);
-            if (fd >= 0) break;
+            if (platform::socket_valid(fd)) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        if (fd < 0) return false;
+        if (!platform::socket_valid(fd)) return false;
 
         std::string req = "GET /sse HTTP/1.1\r\n"
                           "Host: " + host + "\r\n"
@@ -237,8 +232,8 @@ struct SseClient {
     json send_rpc(const json& request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
         // POST to /messages?sid=... on a separate connection
-        int post_fd = tcp_connect(host, port);
-        if (post_fd < 0) return nullptr;
+        platform::socket_t post_fd = tcp_connect(host, port);
+        if (!platform::socket_valid(post_fd)) return nullptr;
 
         std::string body = request.dump();
         std::string http_req = "POST " + messages_path + " HTTP/1.1\r\n"
@@ -252,8 +247,9 @@ struct SseClient {
         std::string ack = http_recv_until(post_fd, "\r\n\r\n", std::chrono::milliseconds(3000));
         // Also consume any body the server sends with the 202
         char leftover[256];
-        ::recv(post_fd, leftover, sizeof(leftover), MSG_DONTWAIT);
-        ::close(post_fd);
+        platform::set_nonblocking(post_fd);
+        ::recv(post_fd, leftover, sizeof(leftover), 0);
+        platform::close_socket(post_fd);
 
         // Brief pause to let the server enqueue the SSE event
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -297,11 +293,8 @@ struct SseClient {
                 deadline - std::chrono::steady_clock::now());
             if (remaining.count() <= 0) break;
 
-            struct pollfd pfd{};
-            pfd.fd = fd;
-            pfd.events = POLLIN;
             int poll_ms = static_cast<int>(std::min(remaining.count(), int64_t(1000)));
-            int pr = ::poll(&pfd, 1, poll_ms);
+            int pr = platform::poll_one(fd, platform::kPollIn, poll_ms);
             if (pr <= 0) {
                 if (pr == 0) continue;  // timeout on this poll iteration
                 break;  // error
@@ -319,7 +312,7 @@ struct SseClient {
     }
 
     void close_connection() {
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (platform::socket_valid(fd)) { platform::close_socket(fd); fd = platform::kInvalidSocket; }
     }
 
     ~SseClient() { close_connection(); }
@@ -327,8 +320,7 @@ struct SseClient {
 private:
     std::string read_until_endpoint(std::chrono::milliseconds timeout) {
         auto start = std::chrono::steady_clock::now();
-        int flags = ::fcntl(fd, F_GETFL, 0);
-        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        platform::set_nonblocking(fd);
         std::string acc;
         char chunk[2048];
 
@@ -342,7 +334,7 @@ private:
                     // Store leftover in buffer
                     size_t ep_end = acc.find("\n\n", acc.find("event: endpoint"));
                     buffer = acc.substr(ep_end + 2);
-                    ::fcntl(fd, F_SETFL, flags);
+                    platform::set_blocking(fd);
                     return acc.substr(0, ep_end + 2);
                 }
             } else if (n == 0) {
@@ -353,7 +345,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
-        ::fcntl(fd, F_SETFL, flags);
+        platform::set_blocking(fd);
         return acc;
     }
 };
@@ -589,20 +581,21 @@ struct McpHttpEnv {
 
 /// Pick a free ephemeral port by binding to port 0 and reading back the assignment.
 static uint16_t pick_port() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 19200;  // fallback
+    platform::ensure_sockets_initialized();
+    platform::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!platform::socket_valid(fd)) return 19200;  // fallback
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = 0;  // let OS pick
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
+        platform::close_socket(fd);
         return 19200;
     }
-    socklen_t len = sizeof(addr);
+    platform::socklen_compat_t len = sizeof(addr);
     ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
     uint16_t port = ntohs(addr.sin_port);
-    ::close(fd);
+    platform::close_socket(fd);
     return port;
 }
 
@@ -680,8 +673,8 @@ TEST_CASE("MCP HTTP SSE: SSE session + initialize + tools/list", "[integration][
 
     // ── notifications/initialized (no response expected) ──────────────
     // Send it but don't expect a response
-    int post_fd = tcp_connect("127.0.0.1", ctx.port);
-    REQUIRE(post_fd >= 0);
+    platform::socket_t post_fd = tcp_connect("127.0.0.1", ctx.port);
+    REQUIRE(platform::socket_valid(post_fd));
     json notif = {{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}};
     std::string body = notif.dump();
     std::string http_req = "POST " + client.messages_path + " HTTP/1.1\r\n"
@@ -691,7 +684,7 @@ TEST_CASE("MCP HTTP SSE: SSE session + initialize + tools/list", "[integration][
                            "Connection: close\r\n\r\n" + body;
     http_send(post_fd, http_req);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    ::close(post_fd);
+    platform::close_socket(post_fd);
 
     // ── tools/list ────────────────────────────────────────────────────
     auto list_resp = client.send_rpc(make_rpc("tools/list", 2));

@@ -1,3 +1,5 @@
+#include "common/platform_file.h"
+#include "common/compiler_compat.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
@@ -198,11 +200,11 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 }
                 prev_pc = pc;
 
-                if (__builtin_expect(pc == last_pc, 1)) {
+                if (TENET_EXPECT(pc == last_pc, 1)) {
                     roaring64_bitmap_add_bulk(last_bm, &last_ctx, inst_id);
                 } else {
                     auto& bm_slot = out.pc_bitmaps[pc];
-                    if (__builtin_expect(bm_slot == nullptr, 0)) {
+                    if (TENET_EXPECT(bm_slot == nullptr, 0)) {
                         bm_slot = roaring64_bitmap_create();
                     }
                     last_pc = pc;
@@ -282,12 +284,21 @@ static constexpr uint32_t XREF_BLOB_VERSION_V1 = 1u;
 
 // ─── XrefBitmapLoader ────────────────────────────────────────────────────────
 
+XrefBitmapLoader::~XrefBitmapLoader() {
+    if (file_) std::fclose(file_);
+}
+
 bool XrefBitmapLoader::open(const std::filesystem::path& p) {
+    std::lock_guard<std::mutex> lk(file_mutex_);
+    if (file_) {
+        std::fclose(file_);
+        file_ = nullptr;
+    }
     path = p;
     valid = false;
     table.clear();
 
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = tenet::platform::open_file(path, "rb");
     if (!f) return false;
 
     // Read header
@@ -315,7 +326,7 @@ bool XrefBitmapLoader::open(const std::filesystem::path& p) {
 
 FILE* XrefBitmapLoader::ensure_open() const {
     if (!file_) {
-        file_ = std::fopen(path.c_str(), "rb");
+        file_ = tenet::platform::open_file(path, "rb");
     }
     return file_;
 }
@@ -513,7 +524,7 @@ bool xref_write_bitmaps_file(
     // Write file
     auto tmp_path = bitmaps_path;
     tmp_path += ".tmp";
-    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    FILE* f = tenet::platform::open_file(tmp_path, "wb");
     if (!f) return false;
 
     auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };

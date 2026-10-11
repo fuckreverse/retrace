@@ -1,3 +1,5 @@
+#include "common/platform_compat.h"
+#include "common/platform_file.h"
 /*
  * test_io_trace_reader_special.cpp — Unit tests for special record types and edge cases
  *
@@ -512,7 +514,7 @@ TEST_CASE("TraceReader::open: magic mismatch → error",
           "[unit][io][trace_reader_special]") {
     // Write a file with wrong magic
     auto temp_dir = std::filesystem::temp_directory_path()
-                  / ("tenet_test_bad_magic_" + std::to_string(getpid()));
+                  / ("tenet_test_bad_magic_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto path = temp_dir / "bad_magic.trace";
 
@@ -522,7 +524,7 @@ TEST_CASE("TraceReader::open: magic mismatch → error",
         hdr.version = QBDITRACE_VERSION;
         hdr.arch    = qbditrace::QBDITRACE_ARCH_AARCH64;
         hdr.num_gpr = 34;
-        FILE* fp = fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         fwrite(&hdr, sizeof(hdr), 1, fp);
         // add a minimal anchor record so file is not too small
@@ -545,13 +547,13 @@ TEST_CASE("TraceReader::open: magic mismatch → error",
 TEST_CASE("TraceReader::open: file too small (< 536 bytes) → error",
           "[unit][io][trace_reader_special]") {
     auto temp_dir = std::filesystem::temp_directory_path()
-                  / ("tenet_test_too_small_" + std::to_string(getpid()));
+                  / ("tenet_test_too_small_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto path = temp_dir / "too_small.trace";
 
     {
         // Write only 16 bytes — too small for a 536-byte header
-        FILE* fp = fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         uint8_t buf[16] = { 'Q', 'B', 'D', 'T', 4, 0, 0, 0 };
         fwrite(buf, 16, 1, fp);
@@ -569,7 +571,7 @@ TEST_CASE("TraceReader::open: file too small (< 536 bytes) → error",
 TEST_CASE("TraceReader::open: unknown version → error",
           "[unit][io][trace_reader_special]") {
     auto temp_dir = std::filesystem::temp_directory_path()
-                  / ("tenet_test_bad_version_" + std::to_string(getpid()));
+                  / ("tenet_test_bad_version_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::remove_all(temp_dir);  // pre-clean any leftover
     std::filesystem::create_directories(temp_dir);
     auto path = temp_dir / "bad_version.trace";
@@ -585,7 +587,7 @@ TEST_CASE("TraceReader::open: unknown version → error",
         hdr.num_gpr = 34;
         hdr.flags   = qbditrace::QBDITRACE_HF_REG_DIFF | qbditrace::QBDITRACE_HF_HAS_CODE;
         strncpy(hdr.module_name, "bad_version", sizeof(hdr.module_name) - 1);
-        FILE* fp = fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         fwrite(&hdr, sizeof(hdr), 1, fp);
         // Add a minimal anchor record so file is not too small
@@ -609,7 +611,7 @@ TEST_CASE("TraceReader::open: v5 version tag without HF_PC_DELTA flag → error"
           "[unit][io][trace_reader_special]") {
     // version == 5 but HF_PC_DELTA not set: inconsistent, should be rejected.
     auto temp_dir = std::filesystem::temp_directory_path()
-                  / ("tenet_test_v5_no_flag_" + std::to_string(getpid()));
+                  / ("tenet_test_v5_no_flag_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto path = temp_dir / "v5_no_flag.trace";
 
@@ -620,7 +622,7 @@ TEST_CASE("TraceReader::open: v5 version tag without HF_PC_DELTA flag → error"
         hdr.arch    = qbditrace::QBDITRACE_ARCH_AARCH64;
         hdr.num_gpr = 34;
         hdr.flags   = qbditrace::QBDITRACE_HF_REG_DIFF;  // HF_PC_DELTA intentionally absent
-        FILE* fp = fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         fwrite(&hdr, sizeof(hdr), 1, fp);
         fclose(fp);
@@ -638,7 +640,7 @@ TEST_CASE("TraceReader::open: v6 version tag without HF_OLD_VALUE flag → error
           "[unit][io][trace_reader_special]") {
     // version == 6 but HF_OLD_VALUE not set: inconsistent, should be rejected.
     auto temp_dir = std::filesystem::temp_directory_path()
-                  / ("tenet_test_v6_no_flag_" + std::to_string(getpid()));
+                  / ("tenet_test_v6_no_flag_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(temp_dir);
     auto path = temp_dir / "v6_no_flag.trace";
 
@@ -649,7 +651,7 @@ TEST_CASE("TraceReader::open: v6 version tag without HF_OLD_VALUE flag → error
         hdr.arch    = qbditrace::QBDITRACE_ARCH_AARCH64;
         hdr.num_gpr = 34;
         hdr.flags   = qbditrace::QBDITRACE_HF_REG_DIFF;  // HF_OLD_VALUE intentionally absent
-        FILE* fp = fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         fwrite(&hdr, sizeof(hdr), 1, fp);
         fclose(fp);

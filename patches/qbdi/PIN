@@ -1,6 +1,1 @@
-QBDI upstream commit the patch series is based on.
-Used by scripts/prepare-qbdi.sh and the patch-check CI job.
-
-Format: single line "<40-hex sha> <subject>", from upstream QBDI dev-next.
-
 3318580550215a0c7a64e9c2476e02eb5fc55f14 Merge pull request #334 from agustingianni/fix-darwin-aarch64-cpu-features

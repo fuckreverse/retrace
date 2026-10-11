@@ -61,7 +61,11 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install ninja sccache --no-progress -y
+        run: choco install ninja --no-progress -y
+
+      - name: Install sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
@@ -255,7 +259,11 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install ninja sccache --no-progress -y
+        run: choco install ninja --no-progress -y
+
+      - name: Install sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'

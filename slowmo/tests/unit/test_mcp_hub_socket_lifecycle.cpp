@@ -2,8 +2,7 @@
 
 #include "io/mcp/mcp_hub.h"
 
-#include <sys/socket.h>
-#include <unistd.h>
+#include "common/platform_compat.h"
 
 #include <algorithm>
 
@@ -13,11 +12,11 @@ using namespace tenet;
 namespace tenet {
 
 struct McpWorkerTransportTestAccess {
-    static void install_socket(McpWorkerTransport& worker, int fd) {
+    static void install_socket(McpWorkerTransport& worker, platform::socket_t fd) {
         worker.install_socket(fd);
     }
 
-    static int current_socket_fd(const McpWorkerTransport& worker) {
+    static platform::socket_t current_socket_fd(const McpWorkerTransport& worker) {
         return worker.current_socket_fd();
     }
 
@@ -38,14 +37,32 @@ struct McpWorkerTransportTestAccess {
 
 namespace {
 
-int make_socketpair(int fds[2]) {
-    return ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+int make_socketpair(platform::socket_t fds[2]) {
+    platform::ensure_sockets_initialized();
+    auto listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!platform::socket_valid(listener)) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    platform::socklen_compat_t length = sizeof(address);
+    bool ok = ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0
+           && ::listen(listener, 1) == 0
+           && ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+    if (ok) {
+        fds[0] = ::socket(AF_INET, SOCK_STREAM, 0);
+        ok = platform::socket_valid(fds[0])
+          && ::connect(fds[0], reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+        if (ok) { fds[1] = ::accept(listener, nullptr, nullptr); ok = platform::socket_valid(fds[1]); }
+    }
+    platform::close_socket(listener);
+    if (!ok) { platform::close_socket(fds[0]); platform::close_socket(fds[1]); }
+    return ok ? 0 : -1;
 }
 
 }  // namespace
 
 TEST_CASE("mcp hub instance send is blocked by close lifecycle", "[unit][mcp][hub]") {
-    int fds[2] = {-1, -1};
+    platform::socket_t fds[2] = {platform::kInvalidSocket, platform::kInvalidSocket};
     REQUIRE(make_socketpair(fds) == 0);
 
     HubInstance inst;
@@ -64,11 +81,11 @@ TEST_CASE("mcp hub instance send is blocked by close lifecycle", "[unit][mcp][hu
     REQUIRE_FALSE(inst.matches_socket(fds[0]));
     REQUIRE_FALSE(inst.send(json{{"type", "ping"}}));
 
-    ::close(fds[1]);
+    platform::close_socket(fds[1]);
 }
 
 TEST_CASE("mcp worker transport socket lifecycle helpers are synchronized", "[unit][mcp][hub]") {
-    int fds[2] = {-1, -1};
+    platform::socket_t fds[2] = {platform::kInvalidSocket, platform::kInvalidSocket};
     REQUIRE(make_socketpair(fds) == 0);
 
     McpWorkerTransport worker([](const json& msg) { return msg; },
@@ -86,10 +103,10 @@ TEST_CASE("mcp worker transport socket lifecycle helpers are synchronized", "[un
 
     McpWorkerTransportTestAccess::shutdown_connection(worker);
     McpWorkerTransportTestAccess::close_connection(worker);
-    REQUIRE(McpWorkerTransportTestAccess::current_socket_fd(worker) == -1);
+    REQUIRE(McpWorkerTransportTestAccess::current_socket_fd(worker) == platform::kInvalidSocket);
     REQUIRE_FALSE(McpWorkerTransportTestAccess::send_json(worker, json{{"type", "bye"}}));
 
-    ::close(fds[1]);
+    platform::close_socket(fds[1]);
 }
 
 TEST_CASE("mcp hub websocket registry isolates worker generations", "[unit][mcp][hub]") {
@@ -111,9 +128,9 @@ TEST_CASE("mcp hub websocket registry isolates worker generations", "[unit][mcp]
     std::sort(new_fds.begin(), new_fds.end());
     std::sort(hub_fds.begin(), hub_fds.end());
 
-    REQUIRE(old_fds == std::vector<int>{11});
-    REQUIRE(new_fds == std::vector<int>{22});
-    REQUIRE(hub_fds == std::vector<int>{33});
+    REQUIRE(old_fds == std::vector<platform::socket_t>{11});
+    REQUIRE(new_fds == std::vector<platform::socket_t>{22});
+    REQUIRE(hub_fds == std::vector<platform::socket_t>{33});
     REQUIRE(registry.has_session(11));
     REQUIRE(registry.has_session(22));
     REQUIRE(registry.has_session(33));
@@ -123,7 +140,7 @@ TEST_CASE("mcp hub websocket registry isolates worker generations", "[unit][mcp]
 
     REQUIRE(registry.sessions_for_instance(old_worker).empty());
     REQUIRE(registry.hub_local_sessions().empty());
-    REQUIRE(registry.sessions_for_instance(new_worker) == std::vector<int>{22});
+    REQUIRE(registry.sessions_for_instance(new_worker) == std::vector<platform::socket_t>{22});
     REQUIRE_FALSE(registry.has_session(11));
     REQUIRE(registry.has_session(22));
     REQUIRE_FALSE(registry.has_session(33));

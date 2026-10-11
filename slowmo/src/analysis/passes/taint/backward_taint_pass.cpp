@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "analysis/passes/taint/backward_taint_pass.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/taint_common.h"
@@ -112,7 +113,7 @@ static PassResult run_backward_taint_common(
     {
         uint64_t remaining = config.sink_regs;
         while (remaining) {
-            uint8_t r = static_cast<uint8_t>(__builtin_ctzll(remaining));
+            uint8_t r = static_cast<uint8_t>(tenet::platform::trailing_zeros(remaining));
             remaining &= remaining - 1;
             if (should_exclude_reg(r, config)) continue;
             SinkTag tag;
@@ -154,7 +155,7 @@ static PassResult run_backward_taint_common(
             state.active_regs_mask != 0) {
             uint64_t best_jump = 0;
             for (uint64_t m = state.active_regs_mask; m; m &= m - 1) {
-                uint8_t reg = static_cast<uint8_t>(__builtin_ctzll(m));
+                uint8_t reg = static_cast<uint8_t>(tenet::platform::trailing_zeros(m));
                 uint64_t writer = index.find_last_writer_of(reg, current_id, reader);
                 if (writer > best_jump) {
                     best_jump = writer;
@@ -309,7 +310,7 @@ static PassResult run_backward_taint_common(
 
             // Per-sink attribution via bitmask iteration
             for (uint64_t m = resolved_tags_mask; m; m &= m - 1) {
-                uint8_t t = static_cast<uint8_t>(__builtin_ctzll(m));
+                uint8_t t = static_cast<uint8_t>(tenet::platform::trailing_zeros(m));
                 if (t < result.per_sink_inst_ids.size()) {
                     result.per_sink_inst_ids[t].add(current_id);
                 }
@@ -448,15 +449,10 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
 // ═══════════════════════════════════════════════════════════════════════════
 
 static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardTaintConfig& config) {
-    // Heuristic: uses reg_diff entries to infer written registers.
-    // All reg_diff entries are treated as writes; those not in the destination set
-    // become potential source dependencies (overapproximation).
-    //
-    // This is the exact same inference TaintPass's heuristic (forward) engine
-    // uses — shared once as classify_inst_heuristic() in taint_common.h so
-    // both directions agree on what a "write" vs. "potential source" means.
-    auto classify = [](const InstView& inst) -> InstructionInfo {
-        return classify_inst_heuristic(inst);
+    // Share decoded source operands with forward taint, retaining the
+    // conservative reg_diff fallback when instruction bytes are unavailable.
+    auto classify = [&ctx](const InstView& inst) -> InstructionInfo {
+        return classify_inst_heuristic(inst, ctx.decoder(), ctx.code_table());
     };
 
     return run_backward_taint_common(ctx, config, classify, "heuristic");
@@ -484,21 +480,21 @@ PassResult BackwardTaintPass::run(PassContext& ctx) {
 
 std::vector<uint8_t> BackwardTaintEvent::dst_regs_list() const {
     std::vector<uint8_t> v;
-    v.reserve(__builtin_popcountll(dst_regs_mask));
+    v.reserve(tenet::platform::population_count(dst_regs_mask));
     for_each_dst_reg([&](uint8_t r) { v.push_back(r); });
     return v;
 }
 
 std::vector<uint8_t> BackwardTaintEvent::src_regs_list() const {
     std::vector<uint8_t> v;
-    v.reserve(__builtin_popcountll(src_regs_mask));
+    v.reserve(tenet::platform::population_count(src_regs_mask));
     for_each_src_reg([&](uint8_t r) { v.push_back(r); });
     return v;
 }
 
 std::vector<uint8_t> BackwardTaintEvent::sink_tags_list() const {
     std::vector<uint8_t> v;
-    v.reserve(__builtin_popcountll(sink_tags_mask));
+    v.reserve(tenet::platform::population_count(sink_tags_mask));
     for_each_sink_tag([&](uint8_t t) { v.push_back(t); });
     return v;
 }

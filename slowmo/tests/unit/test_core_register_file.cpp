@@ -1,3 +1,4 @@
+#include "common/platform_compat.h"
 /*
  * test_core_register_file.cpp — Unit tests for tenet::RegisterFile
  *
@@ -28,7 +29,7 @@ std::unique_ptr<TraceEnv> make_env_without_checkpoints(
         std::function<void(TraceWriter&)> gen,
         const char* name = "test") {
     std::string dir_name = std::string("tenet_test_cold_") + name + "_" +
-                           std::to_string(getpid()) + "_" +
+                           std::to_string(tenet::platform::current_pid()) + "_" +
                            std::to_string(reinterpret_cast<uintptr_t>(&gen));
     auto temp_dir = std::filesystem::temp_directory_path() / dir_name;
     std::filesystem::remove_all(temp_dir);

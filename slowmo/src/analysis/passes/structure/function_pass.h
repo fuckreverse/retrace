@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
 #include "infra/scan_orchestrator.h"

@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
+# Embed MSVC debug information in object files so parallel builds and sccache
+# do not contend for a shared compiler PDB. CMP0141 must be set before project().
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+    # Older dependency CMakeLists reset policies; keep this default for them.
+    set(CMAKE_POLICY_DEFAULT_CMP0141 NEW)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
+
 project(tenet VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -189,6 +198,10 @@ if(NOT TENET_USE_SYSTEM_ROCKSDB)
     set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
+    # Runner CPUs vary, and _deps caches include compiled objects. RocksDB's
+    # default uses -march=native (or /arch:AVX2), which is unsafe to reuse on
+    # another runner or ship in a portable CLI bundle.
+    set(PORTABLE 1 CACHE STRING "Build RocksDB for baseline CPU compatibility" FORCE)
     # LZ4 is picked up via find_package(lz4)/pkg-config on Linux/macOS (both
     # typically ship it or make it trivial to apt/brew install). RocksDB's
     # Windows CMake path instead expects LZ4_INCLUDE/LZ4_LIB_DEBUG/
@@ -204,6 +217,13 @@ if(NOT TENET_USE_SYSTEM_ROCKSDB)
     set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(rocksdb)
+    # RocksDB 9.4 globally injects ccache, wrapping our configured launcher
+    # (including sccache on Windows). Use the project launcher only.
+    get_property(_rocksdb_compile_launcher GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+    if(_rocksdb_compile_launcher STREQUAL "ccache")
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "")
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "")
+    endif()
 else()
     find_package(RocksDB REQUIRED)
 endif()
@@ -531,6 +551,16 @@ add_library(tenet_lib STATIC
     src/cli_options.cpp
     src/cli/trace_dump.cpp
 )
+
+# Project sources use C++20 designated initializers. Keep third-party projects
+# at their own language standard while propagating this requirement to clients.
+target_compile_features(tenet_lib PUBLIC cxx_std_20)
+if(MSVC)
+    # Preserve UTF-8 command-line arguments (including Catch2 test filters)
+    # and narrow filesystem paths instead of converting through the host ACP.
+    target_sources(tenet_lib INTERFACE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/common/utf8.manifest")
+endif()
 
 target_include_directories(tenet_lib BEFORE PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src

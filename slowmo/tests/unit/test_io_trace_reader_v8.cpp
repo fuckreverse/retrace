@@ -1,3 +1,4 @@
+#include "common/platform_file.h"
 /*
  * test_io_trace_reader_v8.cpp — Unit tests for v8 (HF_WIDE_API_ID) trace format support
  *
@@ -15,7 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <unistd.h>
+#include "common/platform_compat.h"
 
 #include "fixtures/trace_fixture.h"
 #include "common/types.h"
@@ -436,7 +437,7 @@ TEST_CASE("TraceReader v8: ObjC selector payload and three retval sources step c
 TEST_CASE("TraceReader v8: accepts composed PC delta and FPR flags",
           "[unit][io][trace_reader_v8]") {
     auto dir = std::filesystem::temp_directory_path() /
-        ("tenet_v8_composed_" + std::to_string(getpid()));
+        ("tenet_v8_composed_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(dir);
     auto path = dir / "composed.trace";
     qbditrace::qbditrace_file_header_t hdr{};
@@ -446,7 +447,7 @@ TEST_CASE("TraceReader v8: accepts composed PC delta and FPR flags",
     hdr.num_gpr = QBDITRACE_AARCH64_NUM_GPR;
     hdr.flags = QBDITRACE_HF_CALL_META | QBDITRACE_HF_PC_DELTA |
                 QBDITRACE_HF_HAS_FPR;
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(path, "wb");
     REQUIRE(fp != nullptr);
     REQUIRE(std::fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
     std::fclose(fp);
@@ -454,6 +455,7 @@ TEST_CASE("TraceReader v8: accepts composed PC delta and FPR flags",
     REQUIRE(result.has_value());
     REQUIRE(result->header().has_call_meta());
     REQUIRE(result->header().has_fpr());
+    result->close();
     std::filesystem::remove_all(dir);
 }
 
@@ -468,7 +470,7 @@ TEST_CASE("TraceReader v8: rejects CALL_META outside v8 and v8 without it",
     };
     for (size_t i = 0; i < std::size(cases); ++i) {
         auto dir = std::filesystem::temp_directory_path() /
-            ("tenet_v8_bad_flags_" + std::to_string(getpid()) + "_" + std::to_string(i));
+            ("tenet_v8_bad_flags_" + std::to_string(tenet::platform::current_pid()) + "_" + std::to_string(i));
         std::filesystem::create_directories(dir);
         auto path = dir / "bad.trace";
         qbditrace::qbditrace_file_header_t hdr{};
@@ -477,7 +479,7 @@ TEST_CASE("TraceReader v8: rejects CALL_META outside v8 and v8 without it",
         hdr.arch = QBDITRACE_ARCH_AARCH64;
         hdr.num_gpr = QBDITRACE_AARCH64_NUM_GPR;
         hdr.flags = cases[i].flags;
-        FILE* fp = std::fopen(path.c_str(), "wb");
+        FILE* fp = tenet::platform::open_file(path, "wb");
         REQUIRE(fp != nullptr);
         REQUIRE(std::fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
         std::fclose(fp);
@@ -489,7 +491,7 @@ TEST_CASE("TraceReader v8: rejects CALL_META outside v8 and v8 without it",
 TEST_CASE("TraceReader v8: truncated retval record is clamped to remaining bytes",
           "[unit][io][trace_reader_v8]") {
     auto dir = std::filesystem::temp_directory_path() /
-        ("tenet_v8_truncated_retval_" + std::to_string(getpid()));
+        ("tenet_v8_truncated_retval_" + std::to_string(tenet::platform::current_pid()));
     std::filesystem::create_directories(dir);
     auto path = dir / "truncated.trace";
     qbditrace::qbditrace_file_header_t hdr{};
@@ -501,7 +503,7 @@ TEST_CASE("TraceReader v8: truncated retval record is clamped to remaining bytes
     qbditrace::qbditrace_retval_t rv{};
     rv.kind = QBDITRACE_REC_RETVAL;
     rv.record_size = 0xFFFF;
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    FILE* fp = tenet::platform::open_file(path, "wb");
     REQUIRE(fp != nullptr);
     REQUIRE(std::fwrite(&hdr, sizeof(hdr), 1, fp) == 1);
     REQUIRE(std::fwrite(&rv, 16, 1, fp) == 1);
@@ -515,6 +517,7 @@ TEST_CASE("TraceReader v8: truncated retval record is clamped to remaining bytes
     REQUIRE(raw_record_size((*it).raw_ptr, result->header(), 16) == 16);
     ++it;
     REQUIRE(it == result->end());
+    result->close();
     std::filesystem::remove_all(dir);
 }
 

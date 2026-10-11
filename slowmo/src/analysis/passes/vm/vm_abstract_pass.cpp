@@ -1,3 +1,4 @@
+#include "common/compiler_compat.h"
 #include "analysis/passes/vm/vm_abstract_pass.h"
 #include "analysis/passes/structure/loop_pass.h"
 #include "analysis/passes/structure/cfg_pass.h"
@@ -767,11 +768,11 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                                 case Op::bswap: {
                                     uint8_t w = step_def.imm ? static_cast<uint8_t>(step_def.imm) : 8u;
                                     if (w >= 8) {
-                                        val = __builtin_bswap64(val);
+                                        val = tenet::platform::byte_swap64(val);
                                     } else if (w == 4) {
-                                        val = __builtin_bswap32(static_cast<uint32_t>(val));
+                                        val = tenet::platform::byte_swap32(static_cast<uint32_t>(val));
                                     } else if (w == 2) {
-                                        val = __builtin_bswap16(static_cast<uint16_t>(val));
+                                        val = tenet::platform::byte_swap16(static_cast<uint16_t>(val));
                                     }
                                     break;
                                 }
@@ -1092,9 +1093,9 @@ PassResult VMAbstractPass::run(PassContext& ctx) {
                         }
                         case Op::bswap: {
                             uint8_t w = ds.imm ? static_cast<uint8_t>(ds.imm) : 8u;
-                            if (w >= 8)      val = __builtin_bswap64(val);
-                            else if (w == 4) val = __builtin_bswap32(static_cast<uint32_t>(val));
-                            else if (w == 2) val = __builtin_bswap16(static_cast<uint16_t>(val));
+                            if (w >= 8)      val = tenet::platform::byte_swap64(val);
+                            else if (w == 4) val = tenet::platform::byte_swap32(static_cast<uint32_t>(val));
+                            else if (w == 2) val = tenet::platform::byte_swap16(static_cast<uint16_t>(val));
                             break;
                         }
                         case Op::neg:   val = static_cast<uint64_t>(-static_cast<int64_t>(val)); break;
