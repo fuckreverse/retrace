@@ -689,9 +689,9 @@ const std::vector<ApiSignature>& SyscallInterceptCollector::known_android_apis()
             .name          = "AES_cbc_encrypt",
             .category      = ApiCategory::BoringSSL,
             .arg_count     = 6,
+            .iv_ptr_arg    = 4,    // x4 = ivec
             .data_ptr_arg  = 0,    // x0 = in
             .data_len_arg  = 2,    // x2 = length
-            .iv_ptr_arg    = 4,    // x4 = ivec
             .operation_arg = 5,    // x5 = enc
         },
         // ── BoringSSL / OpenSSL KDF ───────────────────────────────────────
