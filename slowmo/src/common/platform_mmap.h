@@ -85,7 +85,10 @@ public:
         // this codebase are UTF-8; use the *W API with a manual conversion to
         // avoid pulling in extra dependencies.
         std::wstring wpath = utf8_to_wide(path);
-        HANDLE fh = ::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        // Live traces keep growing while mapped; permit append writers and
+        // the same rename/delete lifecycle available with POSIX mappings.
+        HANDLE fh = ::CreateFileW(wpath.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (fh == INVALID_HANDLE_VALUE) {
             if (out_error) *out_error = "CreateFileW failed (err=" + std::to_string(::GetLastError()) + ")";

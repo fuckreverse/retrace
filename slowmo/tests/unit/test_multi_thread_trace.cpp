@@ -224,6 +224,8 @@ TEST_CASE("MultiThread: thread chunk table survives index cache reload",
     REQUIRE(index.thread_chunks().size() == 3);
     REQUIRE(index.thread_at(4) == 200);
 
+    index.close();
+    reader.close();
     std::filesystem::remove_all(stable_dir);
 }
 

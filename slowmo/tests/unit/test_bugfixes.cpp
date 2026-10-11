@@ -548,6 +548,7 @@ TEST_CASE("StreamingIndex counts INST records correctly for v4 trace with variab
 
     // Cleanup
     index_result->close();
+    reader_result->close();
     std::filesystem::remove_all(temp_dir);
 }
 
@@ -614,5 +615,6 @@ TEST_CASE("StreamingIndex retries a v8 C API record split across polls",
     REQUIRE(si.inst_count() == 1);
 
     index_result->close();
+    reader_result->close();
     std::filesystem::remove_all(temp_dir);
 }

@@ -455,6 +455,7 @@ TEST_CASE("TraceReader v8: accepts composed PC delta and FPR flags",
     REQUIRE(result.has_value());
     REQUIRE(result->header().has_call_meta());
     REQUIRE(result->header().has_fpr());
+    result->close();
     std::filesystem::remove_all(dir);
 }
 
@@ -516,6 +517,7 @@ TEST_CASE("TraceReader v8: truncated retval record is clamped to remaining bytes
     REQUIRE(raw_record_size((*it).raw_ptr, result->header(), 16) == 16);
     ++it;
     REQUIRE(it == result->end());
+    result->close();
     std::filesystem::remove_all(dir);
 }
 
