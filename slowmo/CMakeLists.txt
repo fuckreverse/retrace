@@ -198,6 +198,10 @@ if(NOT TENET_USE_SYSTEM_ROCKSDB)
     set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
     set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
+    # Runner CPUs vary, and _deps caches include compiled objects. RocksDB's
+    # default uses -march=native (or /arch:AVX2), which is unsafe to reuse on
+    # another runner or ship in a portable CLI bundle.
+    set(PORTABLE 1 CACHE STRING "Build RocksDB for baseline CPU compatibility" FORCE)
     # LZ4 is picked up via find_package(lz4)/pkg-config on Linux/macOS (both
     # typically ship it or make it trivial to apt/brew install). RocksDB's
     # Windows CMake path instead expects LZ4_INCLUDE/LZ4_LIB_DEBUG/
