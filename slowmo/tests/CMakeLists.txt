@@ -48,7 +48,13 @@ function(tenet_add_test target_name source_file)
     # Catch2 test discovery: registers each TEST_CASE as a CTest entry.
     # PRE_TEST mode defers discovery to ctest run-time so configure-stage
     # doesn't need the binary to already be built (avoids _NOT_BUILT entries).
-    catch_discover_tests(${target_name} DISCOVERY_MODE PRE_TEST)
+    if(target_name MATCHES "^test_perf_")
+        # Timing checks need an idle runner, including when ctest uses -j.
+        catch_discover_tests(${target_name} DISCOVERY_MODE PRE_TEST
+            PROPERTIES RUN_SERIAL TRUE)
+    else()
+        catch_discover_tests(${target_name} DISCOVERY_MODE PRE_TEST)
+    endif()
 endfunction()
 
 # ─── Unit tests: core layer ─────────────────────────────────────────────────

@@ -438,8 +438,8 @@ TEST_CASE("Block vs Stream: 500K memory trace", "[perf][block_vs_stream]") {
 }
 
 TEST_CASE("Block-compressed: open latency scaling", "[perf][block_vs_stream]") {
-    // Test that block-compressed open time doesn't grow linearly with trace size
-    // (unlike stream-compressed which must decompress everything).
+    // Block open reads block metadata; stream open decompresses the full trace.
+    // Compare their median latency across increasing trace sizes.
     PerfTempDir dir("bvs_scaling");
 
     const uint64_t sizes[] = { 100000, 300000, 500000 };
@@ -464,23 +464,23 @@ TEST_CASE("Block-compressed: open latency scaling", "[perf][block_vs_stream]") {
             uncomp_path, dir.path,
             ("block_" + std::to_string(n) + ".trace").c_str());
 
-        // Measure stream open
-        {
-            Timer t;
-            t.start();
-            auto r = TraceReader::open(stream_path);
-            stream_open_ms.push_back(t.elapsed_ms());
-            REQUIRE(r.has_value());
-        }
-
-        // Measure block open
-        {
-            Timer t;
-            t.start();
-            auto r = TraceReader::open(block_path);
-            block_open_ms.push_back(t.elapsed_ms());
-            REQUIRE(r.has_value());
-        }
+        auto median_open = [](const std::filesystem::path& path) {
+            std::vector<double> samples;
+            for (int attempt = 0; attempt < 7; ++attempt) {
+                Timer t;
+                t.start();
+                auto r = TraceReader::open(path);
+                auto elapsed = t.elapsed_ms();
+                REQUIRE(r.has_value());
+                if (attempt > 0) samples.push_back(elapsed); // warm the filesystem cache
+            }
+            std::sort(samples.begin(), samples.end());
+            return (samples[2] + samples[3]) / 2;
+        };
+        stream_open_ms.push_back(median_open(stream_path));
+        block_open_ms.push_back(median_open(block_path));
+        INFO("trace size: " << n);
+        CHECK(block_open_ms.back() < stream_open_ms.back());
     }
 
     // Report scaling
@@ -491,16 +491,13 @@ TEST_CASE("Block-compressed: open latency scaling", "[perf][block_vs_stream]") {
              << (stream_open_ms[i] / std::max(block_open_ms[i], 0.001)) << "x");
     }
 
-    // Stream open should grow roughly linearly; block should stay roughly constant.
-    // Assert that the block open for the largest trace is at most 2x the smallest.
-    // (Stream open for 500K is typically 5-10x the 100K open.)
+    // Report growth for diagnosis. Metadata grows with the number of blocks,
+    // so its growth ratio need not be lower than full decompression's ratio.
     double block_growth = block_open_ms[2] / std::max(block_open_ms[0], 0.001);
     double stream_growth = stream_open_ms[2] / std::max(stream_open_ms[0], 0.001);
     INFO("  Block open growth (500K/100K): " << block_growth << "x");
     INFO("  Stream open growth (500K/100K): " << stream_growth << "x");
 
-    // Block open should scale sub-linearly compared to stream
-    CHECK(block_growth < stream_growth);
 }
 
 #else // !TENET_HAS_ZSTD
