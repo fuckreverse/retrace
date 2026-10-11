@@ -148,27 +148,29 @@ struct TraceWriter {
         inst_hdr.pc = runtime_pc;
         fwrite(&inst_hdr, sizeof(inst_hdr), 1, fp);
         
-        // Write reg diffs (9 bytes each: u8 index + u64 value)
+        // Write reg diffs as the on-disk qbditrace_regdiff_t struct
+        // (16 bytes: 1B reg_index + 7B padding + 8B value).  Writing the
+        // struct wholesale (rather than field-by-field) is what guarantees
+        // the decoder sees the exact same layout, including padding.
         for (auto& d : diffs) {
-            fwrite(&d.index, 1, 1, fp);
-            fwrite(&d.value, 8, 1, fp);
+            qbditrace_regdiff_t rd = {};
+            rd.reg_index = d.index;
+            rd.value = d.value;
+            fwrite(&rd, sizeof(rd), 1, fp);
         }
-        
-        // Write memory accesses (26 bytes each)
+
+        // Write memory accesses as the on-disk qbditrace_memacc_t struct
+        // (32 bytes: mem_type/mem_flags/size + 4B padding + addr + value +
+        // value_hi).
         for (auto& m : mems) {
-            uint8_t mem_type = m.type;
-            uint8_t mem_flags = 0;
-            uint16_t mem_size = m.size;
-            uint64_t addr = m.addr;
-            uint64_t value = m.value;
-            uint64_t value_hi = 0;
-            
-            fwrite(&mem_type, 1, 1, fp);
-            fwrite(&mem_flags, 1, 1, fp);
-            fwrite(&mem_size, 2, 1, fp);
-            fwrite(&addr, 8, 1, fp);
-            fwrite(&value, 8, 1, fp);
-            fwrite(&value_hi, 8, 1, fp);
+            qbditrace_memacc_t ma = {};
+            ma.mem_type = m.type;
+            ma.mem_flags = 0;
+            ma.size = m.size;
+            ma.addr = m.addr;
+            ma.value = m.value;
+            ma.value_hi = 0;  // <=8-byte accesses store the whole value in `value`
+            fwrite(&ma, sizeof(ma), 1, fp);
         }
         
         inst_count++;
