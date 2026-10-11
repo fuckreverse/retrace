@@ -82,15 +82,8 @@ namespace {
 // Returns a Slice pointing to the caller-provided 8-byte buffer.
 // *** Zero heap allocation — critical for millions of calls during index build. ***
 inline rocksdb::Slice encode_u64_to(uint64_t v, char buf[8]) {
-    // Use __builtin_bswap64 (single REV instruction on ARM64)
-#if defined(__GNUC__) || defined(__clang__)
+    // Native byte swap on each supported compiler (REV on ARM64).
     uint64_t be = tenet::platform::byte_swap64(v);
-#else
-    uint64_t be = 0;
-    for (int i = 7; i >= 0; --i) {
-        be = (be << 8) | ((v >> (i * 8)) & 0xFF);
-    }
-#endif
     std::memcpy(buf, &be, 8);
     return rocksdb::Slice(buf, 8);
 }

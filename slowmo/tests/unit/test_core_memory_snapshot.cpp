@@ -39,6 +39,8 @@ void check_snapshot_fallback(MemoryModel& memory, uint64_t base) {
     const auto got = memory.read(base, 4, 1);
     const auto got_at_zero = memory.read(base, 4, 0);
     const auto missing_at_zero = memory.read(missing, 1, 0);
+    const auto missing_after_start = memory.read(missing, 16, 1);
+    const auto missing_region = memory.read_region(missing, 16, 1);
 
     // Assert
     const std::vector<uint8_t> want{0x10, 0x20, 0x30, 0x40};
@@ -51,6 +53,11 @@ void check_snapshot_fallback(MemoryModel& memory, uint64_t base) {
         CHECK(got_at_zero.data[i] == want[i]);
     }
     CHECK_FALSE(missing_at_zero.known[0]);
+    for (size_t i = 0; i < 16; ++i) {
+        CHECK_FALSE(missing_after_start.known[i]);
+        CHECK_FALSE(missing_region.known[i]);
+    }
+    CHECK(missing_region.known_count == 0);
     CHECK(memory.has_snapshot());
 }
 

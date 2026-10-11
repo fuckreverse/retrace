@@ -110,14 +110,8 @@ static TLPageCache& tl_page_cache() {
 // millions of std::string constructions during a typical session.
 static inline rocksdb::Slice encode_key_to(uint64_t page_addr, uint16_t page_offset,
                                             uint64_t inst_id, char buf[18]) {
-#if defined(__GNUC__) || defined(__clang__)
     uint64_t pa_be = tenet::platform::byte_swap64(page_addr);
     uint64_t id_be = tenet::platform::byte_swap64(inst_id);
-#else
-    uint64_t pa_be = 0, id_be = 0;
-    for (int i = 7; i >= 0; --i) pa_be = (pa_be << 8) | ((page_addr >> (i*8)) & 0xFF);
-    for (int i = 7; i >= 0; --i) id_be = (id_be << 8) | ((inst_id >> (i*8)) & 0xFF);
-#endif
     std::memcpy(buf, &pa_be, 8);
     buf[8] = static_cast<char>((page_offset >> 8) & 0xFF);
     buf[9] = static_cast<char>(page_offset & 0xFF);
@@ -1206,9 +1200,9 @@ size_t MemoryModel::index_read_range(const PageWriteIndex& idx,
                                       uint64_t search_id,
                                       uint8_t* out_data,
                                       bool* out_known) noexcept {
-    if (idx.empty() || count == 0) return 0;
-
+    if (count == 0) return 0;
     std::memset(out_known, 0, count * sizeof(bool));
+    if (idx.empty()) return 0;
     size_t known_count = 0;
 
     // The last byte offset in the range.
