@@ -244,6 +244,17 @@
         "third-party/msvc-runtime/LICENSE.txt"
       ],
       "attribution": "Microsoft Corporation. Runtime files are copied from the Visual Studio redistributable directory."
+    },
+    {
+      "name": "libuv",
+      "version": "1.51.0",
+      "license": "MIT",
+      "platforms": [
+        "win32"
+      ],
+      "license_files": [
+        "third-party/libuv/LICENSE"
+      ]
     }
   ]
 }

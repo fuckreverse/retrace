@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,8 @@ def _component_is_bundled(component: dict[str, Any], libraries: list[str]) -> bo
     Windows (or on a mac without those Homebrew formulae installed) even
     when the library in question isn't part of this bundle at all.
     """
+    if component.get("platforms") and sys.platform not in component["platforms"]:
+        return False
     patterns = component.get("libraries")
     if not patterns:
         return True

@@ -121,14 +121,8 @@ endif()
 option(TENET_BUILD_TESTS "Build unit tests" ON)
 option(TENET_ENABLE_PYTHON "Build Python bindings via pybind11" OFF)
 option(TENET_ENABLE_RPC "Build JSON-RPC TCP loopback server" ON)
-# uWebSockets/uSockets' bundled event loop only has POSIX epoll/kqueue
-# backends (see the TENET_ENABLE_WS block below) — no Windows IOCP backend
-# is wired up yet, so default WS OFF on Windows until that's ported.
-if(WIN32)
-    option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" OFF)
-else()
-    option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
-endif()
+# Windows uses libuv's IOCP/poll support; POSIX builds keep epoll/kqueue.
+option(TENET_ENABLE_WS "Build WebSocket service (uWebSockets + FlatBuffers)" ON)
 option(TENET_ENABLE_PROFILING "Enable os_signpost profiling instrumentation (macOS only, visible in Instruments)" ON)
 option(TENET_ENABLE_TBB "Enable Intel oneTBB for parallel algorithms and task scheduling" ON)
 
@@ -321,14 +315,6 @@ if(TENET_ENABLE_WS)
 endif()
 
 # ── uWebSockets + uSockets (WebSocket transport for WS service) ──────────────
-if(TENET_ENABLE_WS AND WIN32)
-    message(FATAL_ERROR
-        "TENET_ENABLE_WS=ON is not supported on Windows yet: uSockets' bundled "
-        "event loop (src/eventing/epoll_kqueue.c) only implements POSIX "
-        "epoll/kqueue backends, with no libuv/IOCP backend wired into this "
-        "build. Use -DTENET_ENABLE_WS=OFF (the Windows default) until that "
-        "port lands.")
-endif()
 if(TENET_ENABLE_WS)
     FetchContent_Declare(
         uwebsockets
@@ -344,10 +330,25 @@ if(TENET_ENABLE_WS)
     )
     FetchContent_MakeAvailable(uwebsockets usockets)
 
-    # uSockets — build as a static C library (no SSL, no libuv)
+    # Use uSockets' upstream libuv backend on Windows.
+    if(WIN32)
+        FetchContent_Declare(libuv
+            GIT_REPOSITORY https://github.com/libuv/libuv.git
+            GIT_TAG v1.51.0
+            GIT_SHALLOW TRUE)
+        set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(libuv)
+        set(USOCKETS_EVENT_LOOP ${usockets_SOURCE_DIR}/src/eventing/libuv.c)
+    else()
+        set(USOCKETS_EVENT_LOOP ${usockets_SOURCE_DIR}/src/eventing/epoll_kqueue.c)
+    endif()
+
+    # uSockets — static C library, without TLS.
     file(GLOB USOCKETS_SRCS
         ${usockets_SOURCE_DIR}/src/*.c
-        ${usockets_SOURCE_DIR}/src/eventing/epoll_kqueue.c
+        ${USOCKETS_EVENT_LOOP}
         ${usockets_SOURCE_DIR}/src/crypto/openssl.c
     )
     # Remove SSL source if present (we don't need TLS)
@@ -356,14 +357,23 @@ if(TENET_ENABLE_WS)
     add_library(usockets STATIC ${USOCKETS_SRCS})
     target_include_directories(usockets PUBLIC ${usockets_SOURCE_DIR}/src)
     target_compile_definitions(usockets PUBLIC LIBUS_NO_SSL=1)
-    # Link zlib for permessage-deflate
-    find_package(ZLIB REQUIRED)
-    target_link_libraries(usockets PUBLIC ZLIB::ZLIB)
+    target_compile_features(usockets PRIVATE c_std_11)
+    if(WIN32)
+        target_compile_definitions(usockets PUBLIC LIBUS_USE_LIBUV=1)
+        target_link_libraries(usockets PUBLIC uv_a)
+    else()
+        find_package(ZLIB REQUIRED)
+        target_link_libraries(usockets PUBLIC ZLIB::ZLIB)
+    endif()
 
     # uWebSockets — header-only C++ wrapper
     add_library(uwebsockets INTERFACE)
     target_include_directories(uwebsockets INTERFACE ${uwebsockets_SOURCE_DIR}/src)
     target_link_libraries(uwebsockets INTERFACE usockets)
+    if(WIN32)
+        # The desktop's FlatBuffers channel does not use permessage-deflate.
+        target_compile_definitions(uwebsockets INTERFACE UWS_NO_ZLIB=1)
+    endif()
 endif()
 
 # ankerl::unordered_dense - fast flat hash map for LRU cache hot path

@@ -17,7 +17,7 @@ name: Release
 #
 # Feature flags mirror retrace.yml: Linux/macOS build with YARA+WS enabled and
 # Triton disabled (no Triton package on runners); Windows core-only
-# (Triton/YARA/WS default OFF).
+# (Triton/YARA OFF, WS enabled through libuv).
 #
 # Tag builds restore the _deps/ccache caches warmed by CI runs on main
 # (GitHub falls back to the default-branch cache scope for tag refs).
@@ -140,7 +140,7 @@ jobs:
           extra_flags=(-DTENET_ENABLE_TRITON=OFF -DTENET_ENABLE_YARA=ON -DTENET_ENABLE_WS=ON)
           launcher=ccache
           if [ "$RUNNER_OS" = "Windows" ]; then
-            extra_flags=()
+            extra_flags=(-DTENET_ENABLE_TRITON=OFF -DTENET_ENABLE_YARA=OFF -DTENET_ENABLE_WS=ON)
             launcher=sccache
           fi
           cmake -S slowmo -B slowmo/build -G Ninja \
@@ -348,7 +348,7 @@ jobs:
           extra_flags=(-DTENET_ENABLE_TRITON=OFF -DTENET_ENABLE_YARA=ON -DTENET_ENABLE_WS=ON)
           launcher=ccache
           if [ "$RUNNER_OS" = "Windows" ]; then
-            extra_flags=()
+            extra_flags=(-DTENET_ENABLE_TRITON=OFF -DTENET_ENABLE_YARA=OFF -DTENET_ENABLE_WS=ON)
             launcher=sccache
           fi
           cmake -S slowmo -B slowmo/build -G Ninja \
@@ -368,13 +368,22 @@ jobs:
 
       # Reuses the same sidecar pipeline as the CLI job, then packages the
       # Tauri app (.dmg / .AppImage + .deb + .rpm / .msi + NSIS .exe).
+      - name: Build desktop sidecar
+        working-directory: slowmo/web
+        run: pnpm sidecar --release
+
+      - name: Verify real trace data over desktop WebSocket
+        shell: bash
+        run: |
+          cmake --build slowmo/build --target gen_test_traces
+          python -m pip install flatbuffers==25.2.10 websocket-client==1.8.0
+          python scripts/check-release-websocket.py
+
       - name: Build desktop app
         working-directory: slowmo/web
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: |
-          pnpm sidecar --release
-          pnpm exec tauri build
+        run: pnpm exec tauri build
 
       - name: Upload artifact (macOS)
         if: runner.os == 'macOS'
