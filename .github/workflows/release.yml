@@ -16,8 +16,8 @@ name: Release
 #   4. A GitHub Release gathering all artifacts with generated notes.
 #
 # Feature flags mirror retrace.yml: Linux/macOS build with YARA+WS enabled and
-# Triton disabled (no Triton package on runners); Windows core-only
-# (Triton/YARA OFF, WS enabled through libuv).
+# Triton disabled (no Triton package on runners); Windows keeps YARA OFF
+# and enables the desktop WebSocket channel through libuv.
 #
 # Tag builds restore the _deps/ccache caches warmed by CI runs on main
 # (GitHub falls back to the default-branch cache scope for tag refs).
