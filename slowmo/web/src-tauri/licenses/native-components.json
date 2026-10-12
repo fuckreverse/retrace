@@ -225,6 +225,36 @@
       "license_files": [
         "third-party/lz4/LICENSE"
       ]
+    },
+    {
+      "name": "Microsoft Visual C++ Runtime",
+      "version": "v14 (Visual Studio 2026)",
+      "license": "Microsoft Visual C++ Runtime Software License Terms",
+      "libraries": [
+        "MSVCP140.dll",
+        "MSVCP140_1.dll",
+        "MSVCP140_2.dll",
+        "MSVCP140_atomic_wait.dll",
+        "MSVCP140_codecvt_ids.dll",
+        "VCRUNTIME140.dll",
+        "VCRUNTIME140_1.dll",
+        "CONCRT140.dll"
+      ],
+      "license_files": [
+        "third-party/msvc-runtime/LICENSE.txt"
+      ],
+      "attribution": "Microsoft Corporation. Runtime files are copied from the Visual Studio redistributable directory."
+    },
+    {
+      "name": "libuv",
+      "version": "1.51.0",
+      "license": "MIT",
+      "platforms": [
+        "win32"
+      ],
+      "license_files": [
+        "third-party/libuv/LICENSE"
+      ]
     }
   ]
 }

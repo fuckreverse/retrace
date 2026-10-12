@@ -35,9 +35,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/tenet"],
+    "externalBin": [
+      "binaries/tenet"
+    ],
     "resources": {
-      "binaries/lib/*": "lib/",
       "binaries/licenses": "licenses"
     },
     "publisher": "Tenet Developer",

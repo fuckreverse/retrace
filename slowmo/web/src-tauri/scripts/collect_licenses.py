@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,8 @@ def _component_is_bundled(component: dict[str, Any], libraries: list[str]) -> bo
     Windows (or on a mac without those Homebrew formulae installed) even
     when the library in question isn't part of this bundle at all.
     """
+    if component.get("platforms") and sys.platform not in component["platforms"]:
+        return False
     patterns = component.get("libraries")
     if not patterns:
         return True
@@ -126,7 +129,13 @@ def build_native_notices(components: list[dict[str, Any]], manifest_dir: Path, o
 
 
 def _run_json(command: list[str], cwd: Path) -> Any:
-    result = subprocess.run(command, cwd=cwd, check=True, capture_output=True, text=True)
+    executable = shutil.which(command[0])
+    if executable is None:
+        raise FileNotFoundError(f"Required license tool not found: {command[0]}")
+    # Resolve Windows .cmd launchers explicitly, and decode Node/Cargo JSON
+    # as UTF-8 rather than the host's legacy code page.
+    result = subprocess.run([executable, *command[1:]], cwd=cwd, check=True,
+                            capture_output=True, text=True, encoding="utf-8")
     return json.loads(result.stdout)
 
 

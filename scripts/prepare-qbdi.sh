@@ -65,7 +65,7 @@ if ! git log --oneline -1 | grep -q "\[retrace\]"; then
         git apply "$p"
     done
     git add -A
-    git commit --quiet -m "[retrace] apply local patch series ($(ls "${PATCH_DIR}"/*.patch | xargs -n1 basename | tr '\n' ' '))"
+    git -c user.name="Retrace build" -c user.email="build@retrace.invalid" commit --quiet -m "[retrace] apply local patch series ($(ls "${PATCH_DIR}"/*.patch | xargs -n1 basename | tr '\n' ' '))"
 else
     echo "==> Patches already applied (retrace commit on top of ${PIN_SHA})."
 fi
@@ -121,16 +121,20 @@ for f in libQBDI.a libqbdi-llvm.a; do
     cp -f "${found}" "${OUT_DIR}/${f}"
 done
 
-# Headers: QBDI's cmake generates include/ (public) plus include-shared/ and
-# include-static/ (Version.h, Config.h) inside the build dir.
+# QBDI generates Version.h and architecture headers in build/include/,
+# and the static-library Config.h in build/include-static/.
 mkdir -p "${OUT_DIR}/include" "${OUT_DIR}/build-include/QBDI"
 cp -R "${SRC_DIR}/include/." "${OUT_DIR}/include/"
 if [[ -d "${BUILD_DIR}/include-static" ]]; then
     cp -R "${BUILD_DIR}/include-static/." "${OUT_DIR}/build-include/"
 fi
-if [[ -f "${BUILD_DIR}/include-shared/QBDI/Version.h" ]]; then
-    cp -f "${BUILD_DIR}/include-shared/QBDI/Version.h" "${OUT_DIR}/build-include/QBDI/"
-fi
+cp -R "${BUILD_DIR}/include/." "${OUT_DIR}/build-include/"
+for header in Config.h Version.h State.h Options.h; do
+    [[ -f "${OUT_DIR}/build-include/QBDI/${header}" ]] || {
+        echo "ERROR: missing generated QBDI header ${header}" >&2
+        exit 1
+    }
+done
 
 echo "==> QBDI ${PLATFORM} ready:"
 ls "${OUT_DIR}"

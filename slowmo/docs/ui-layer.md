@@ -67,7 +67,7 @@ Tauri 是 `tenet` 进程之外的客户端，而不是 `main.cpp` 中的 UI 分�
 
 ### 跨平台状态
 
-Tauri 前端与 `tenet` 后端面向 Windows、Linux、macOS 的 x86_64 / arm64 构建。Windows 和 Linux 的 sidecar 准备脚本已提供；但 Windows 上 `TENET_ENABLE_WS` 当前默认关闭，而浏览器端 Web UI 仅实现 FlatBuffers WebSocket 通道，因此 Windows Web UI 暂时无法连接后端获取实时数据。这是需要后续补齐 Windows WS 支持的已知限制，不存在 MCP HTTP 回退。Windows / Linux CI 正在持续运行，尚未在真实物理机上完成完整人工验收。
+Tauri 前端与 `tenet` 后端面向 Windows、Linux、macOS 的 x86_64 / arm64 构建。Windows 和 Linux 的 sidecar 准备脚本已提供。`TENET_ENABLE_WS` 在三平台默认开启，Windows 使用 libuv 驱动 uSockets；浏览器端通过 FlatBuffers WebSocket 读取后端数据。Windows / Linux CI 正在持续运行，尚未在真实物理机上完成完整人工验收。
 
 ## TUI
 

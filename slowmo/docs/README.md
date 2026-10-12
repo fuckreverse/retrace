@@ -67,7 +67,7 @@ flowchart TD
 - 图形化体验由 `slowmo/web/` 中独立的 Tauri（Rust shell + React/TypeScript）桌面应用提供。Rust sidecar 以 `--ws-port <port> <trace_path> --mcp-hub` 启动 `tenet`；浏览器端 Web UI 仅连接 `ws://127.0.0.1:<port>` 并使用 FlatBuffers 二进制协议。
 - sidecar 并行启动的 MCP Hub 面向 AI 工具、IDAPython 插件等外部客户端，与 Web UI 渲染路径无关，也不是其 fallback。
 - 后端与 Tauri 前端以 Windows（x86_64/arm64）、Linux（x86_64/arm64）、macOS（x86_64/arm64）为构建运行目标。三平台 CI 已建立，但尚未在真实 Windows/Linux 物理机上完成完整人工验收。
-- Windows 默认关闭 `TENET_ENABLE_WS`，因此 Windows Web UI 暂时无法连接后端获取实时数据；这是待补齐 WS 支持的已知限制，不存在 MCP HTTP 过渡方案。
+- `TENET_ENABLE_WS` 在三平台默认开启；Windows 使用 libuv 驱动 uSockets，Web UI 通过 FlatBuffers WebSocket 读取后端数据。
 
 ## 推荐阅读路径
 

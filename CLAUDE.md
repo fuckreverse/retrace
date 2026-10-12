@@ -112,7 +112,7 @@ bash dashcam/build-dashcam-android.sh
   - **Release**：`-O3` + ThinLTO + `-mcpu=apple-m1`；最慢编译（LTO re-link），最快运行（发布/性能剖析用）
 - `TENET_ENABLE_TRITON=ON/OFF` — Triton 精确污点（默认 ON，需预装 libTriton；Windows 默认 OFF）
 - `TENET_ENABLE_YARA=ON/OFF` — YARA 模式匹配（需系统 yara；Windows 默认 OFF）
-- `TENET_ENABLE_WS=ON/OFF` — WebSocket 服务（uWebSockets + FlatBuffers；macOS/Linux 默认 ON，**Windows 默认 OFF**——Tauri 前端在 Windows 上暂时无法通过 WS 获取实时数据，是已知遗留问题）
+- `TENET_ENABLE_WS=ON/OFF` — WebSocket 服务（uWebSockets + FlatBuffers；三平台默认 ON；Windows 使用 libuv，macOS/Linux 使用 epoll/kqueue）
 - `TENET_BUILD_TESTS=ON/OFF` — 单元测试（测试 target 永久关闭 LTO，保证链接快）
 - `TENET_ENABLE_TBB=ON/OFF` — Intel oneTBB 并行算法与任务调度（默认 ON；IndexBuilder `parallel_sort`、PassManager `task_group` DAG 调度、Scan Fusion 单遍广播）
 - `FETCHCONTENT_BASE_DIR` — 第三方源码共享缓存目录（默认 `slowmo/_deps/`，**勿修改**）

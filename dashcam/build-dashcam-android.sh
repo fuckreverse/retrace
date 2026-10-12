@@ -80,7 +80,7 @@ fi
 # zstd sources: prefer dashcam's own FetchContent cache, fall back to the
 # shared slowmo cache.
 ZSTD_SRC=""
-for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib; do
+for cand in dashcam/_deps/zstd-src/lib slowmo/_deps/zstd-src/lib dashcam/build/_deps/zstd-src/lib; do
     if [[ -f "${cand}/zstd.h" ]]; then ZSTD_SRC="${cand}"; break; fi
 done
 if [[ -z "${ZSTD_SRC}" ]]; then
@@ -119,20 +119,16 @@ ZSTD_LIB="dashcam/build-android/libzstd.a"
 if [[ ! -f "${ZSTD_LIB}" ]]; then
     echo "==> Building libzstd.a for Android arm64..."
     mkdir -p "${BUILD_DIR}"
-    TMPDIR=$(mktemp -d)
-    "${CC}" -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 -fPIC \
-        -I"${ZSTD_SRC}" -I"${ZSTD_SRC}/common" \
-        -c "${ZSTD_SRC}"/common/*.c "${ZSTD_SRC}"/compress/*.c "${ZSTD_SRC}"/decompress/*.c \
-        -o "${TMPDIR}/" 2>/dev/null || \
-    (cd "${TMPDIR}" && for f in "${REPO_ROOT}/${ZSTD_SRC}"/common/*.c \
+    ZSTD_TMP_DIR=$(mktemp -d)
+    (cd "${ZSTD_TMP_DIR}" && for f in "${REPO_ROOT}/${ZSTD_SRC}"/common/*.c \
                                   "${REPO_ROOT}/${ZSTD_SRC}"/compress/*.c \
                                   "${REPO_ROOT}/${ZSTD_SRC}"/decompress/*.c; do
-        "${CC}" -O3 -DNDEBUG -DZSTD_MULTITHREAD=0 -fPIC \
+        "${CC}" -O3 -DNDEBUG -fPIC \
             -I"${REPO_ROOT}/${ZSTD_SRC}" -I"${REPO_ROOT}/${ZSTD_SRC}/common" \
             -c "$f" || exit 1
     done)
-    "${AR}" rcs "${ZSTD_LIB}" "${TMPDIR}"/*.o
-    rm -rf "${TMPDIR}"
+    "${AR}" rcs "${ZSTD_LIB}" "${ZSTD_TMP_DIR}"/*.o
+    rm -rf "${ZSTD_TMP_DIR}"
     echo "    -> ${ZSTD_LIB} ($(du -h "${ZSTD_LIB}" | cut -f1))"
 else
     echo "==> Using cached ${ZSTD_LIB}"
@@ -148,7 +144,9 @@ QBDI_BUILD_INC="${REPO_ROOT}/${QBDI_CACHE}/build-include"
 echo "==> Configuring ${BUILD_DIR} (CMake NDK toolchain, API ${API_LEVEL})..."
 cmake -S dashcam -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DANDROID_ABI=arm64-v8a \
+    -DANDROID_STL=c++_static \
     -DANDROID_PLATFORM="${API_LEVEL}" \
     -DQBDI_INCLUDE_DIR="${REPO_ROOT}/${QBDI_CACHE}/include" \
     -DQBDI_BUILD_INCLUDE_DIR="${QBDI_BUILD_INC}" \
