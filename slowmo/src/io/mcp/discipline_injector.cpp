@@ -15,26 +15,26 @@ const char* DisciplineInjector::full_rules() {
     return
         "═══ TENET ANALYSIS DISCIPLINE (Auto-injected) ═══\n"
         "\n"
-        "R1: NEVER claim a register/memory value without checking via regstate/memread.\n"
+        "R1: NEVER claim a register/memory value without checking via get_regs/memread.\n"
         "R2: NEVER conclude an algorithm identification without at least 2 independent evidence sources.\n"
         "R3: ALWAYS use hypothesis_add BEFORE claiming something is true.\n"
         "R4: ALWAYS verify evidence via verify_evidence BEFORE marking it as verified.\n"
         "R5: When taint shows propagation, CONFIRM the actual values at source and sink.\n"
         "R6: Do NOT assume function names or purposes — verify via disasm + call_context.\n"
         "R7: If loop_semantics reports \"Feistel\" or \"SPN\", cross-check with constants_scan.\n"
-        "R8: Memory addresses are RUNTIME addresses (contain ASLR slide). Always note the slide.\n"
-        "R9: If you find yourself making claims without tool calls, STOP and use tools to verify.\n"
+        "R8: PCs use image_base rebasing (trace_info/set_image_base); memory addresses are runtime addresses.\n"
+        "R9: Before bulk raw queries or scripts, use analysis_guide to find specialized analysis tools.\n"
         "\n"
         "═══ END DISCIPLINE BLOCK ═══";
 }
 
 const char* DisciplineInjector::short_reminder(int index) {
     static const char* reminders[] = {
-        "\xe2\x9a\xa1 Reminder: Verify claims with tools. Don't assume \xe2\x80\x94 check regstate/memread.",
+        "\xe2\x9a\xa1 Reminder: Verify claims with tools. Don't assume \xe2\x80\x94 check get_regs/memread.",
         "\xe2\x9a\xa1 Reminder: Use hypothesis_add before drawing conclusions.",
         "\xe2\x9a\xa1 Reminder: Evidence must be verified (verify_evidence) before concluding.",
         "\xe2\x9a\xa1 Reminder: Cross-check algorithm IDs with at least 2 sources (constants + patterns + loops).",
-        "\xe2\x9a\xa1 Reminder: All addresses include ASLR slide. Static addr = runtime - slide."
+        "\xe2\x9a\xa1 Reminder: Use analysis_guide before bulk raw queries or scripts; prefer specialized analysis tools."
     };
     return reminders[index % kNumReminders];
 }

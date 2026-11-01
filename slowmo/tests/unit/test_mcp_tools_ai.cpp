@@ -74,6 +74,42 @@ static McpTestEnv make_mcp_env() {
     return result;
 }
 
+TEST_CASE("analysis_guide discovers tools without running analysis", "[unit][mcp][guide]") {
+    auto ctx = make_mcp_env();
+    auto overview = ctx.mcp->call_tool("analysis_guide");
+    REQUIRE(overview.at("routes").size() == 8);
+    for (const auto& route : overview.at("routes")) {
+        REQUIRE_FALSE(route.at("tools").empty());
+        auto detail = ctx.mcp->call_tool("analysis_guide", {{"topic", route.at("topic")}});
+        REQUIRE(detail.at("routes").size() == 1);
+        const auto& tools = detail.at("routes").front().at("tools");
+        REQUIRE(tools.size() == route.at("tools").size());
+        for (size_t i = 0; i < tools.size(); ++i) {
+            CHECK(tools[i].at("name") == route.at("tools")[i]);
+            CHECK_FALSE(tools[i].at("description").get<std::string>().empty());
+            CHECK(tools[i].at("inputSchema").at("type") == "object");
+        }
+    }
+    auto vm = ctx.mcp->call_tool("analysis_guide", {{"topic", "vm"}});
+    const auto& tools = vm.at("routes").front().at("tools");
+    REQUIRE(tools.size() == 5);
+    CHECK(tools[0].at("name") == "vm_abstract");
+    CHECK(tools[1].at("name") == "vm_summary");
+    CHECK(tools[4].at("name") == "vm_backward_slice");
+    REQUIRE_THROWS_WITH(ctx.mcp->call_tool("analysis_guide", {{"topic", "unknown"}}),
+                        "Unknown analysis topic: unknown");
+}
+
+TEST_CASE("analysis discipline names real state tools and distinguishes PC addresses", "[unit][mcp][guide]") {
+    DisciplineInjector discipline(1, 2);
+    auto short_rule = discipline.on_tool_call("disasm");
+    CHECK(short_rule.find("get_regs/memread") != std::string::npos);
+    auto full = discipline.on_tool_call("disasm");
+    CHECK(full.find("regstate") == std::string::npos);
+    CHECK(full.find("image_base") != std::string::npos);
+    CHECK(full.find("analysis_guide") != std::string::npos);
+}
+
 TEST_CASE("progress_tasks exposes the shared structured progress snapshot",
           "[unit][mcp][progress]") {
     auto ctx = make_mcp_env();

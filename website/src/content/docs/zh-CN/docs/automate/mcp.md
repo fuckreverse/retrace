@@ -13,6 +13,16 @@ Tenet 提供两种推荐入口：
 | stdio | `--mcp` | 一个客户端直接拉起一个 Tenet 进程和一份 Trace |
 | MCP Hub | `--mcp-hub` | Tauri 桌面应用启动的后端 sidecar 自动接入、同时打开多份 Trace、固定端口连接 |
 
+## 选择分析工具
+
+先调用 `trace_info`，再通过 `analysis_guide()` 查看按任务分类的精简工具导航。
+使用 `analysis_guide(topic="vm")` 获取该类工具的当前说明与参数 schema；其他分类为
+`overview`、`crypto`、`dataflow`、`memory`、`execution`、`threads`、`evidence`。
+Hub 模式先调用 `list_instances`，向导航及后续调用传入 `instance`。
+导航本身不运行分析 Pass。批量读取原始数据或编写脚本前，优先选择专用搜索、时间线、污点和图分析；
+脚本用于工具未覆盖的分析或有限结果的后处理。若返回 `status="processing"`，
+等待 `retry_after_ms` 后重试原调用。
+
 ## stdio：单 Trace
 
 ```bash

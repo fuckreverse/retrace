@@ -259,6 +259,8 @@ trace 不一定包含所有执行点的 code bytes，尤其是某些临界区场
 
 ## 6b. MCP 子系统：面向 AI 的服务层
 
+工具选择指引通过三个入口提供：`initialize.result.instructions` 给出专用分析优先、异步重试、分页和地址约定；`analysis_guide()` 返回按任务分类的精简导航，`analysis_guide(topic="vm")` 等返回该类工具的当前描述和参数 schema（不触发分析 Pass）；基础查询工具的描述提示对应的时间线、搜索、污点和图分析替代入口。导航从已注册 schema 生成详情，Hub 模式沿用目标实例路由与 `instance` 参数约定。脚本适用于工具未覆盖的分析或有限结果的后处理。
+
 `src/io/mcp/` 是一套独立于 RPC 的、面向 AI 客户端的服务实现，比 RPC 复杂得多，核心类是 `TenetMcpService`。完整设计见 [`ui-layer.md`](ui-layer.md) 的 MCP 服务章节，这里只列出 IO 层视角下的组成：
 
 | 文件 | 核心类型 | 作用 |

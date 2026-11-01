@@ -28,6 +28,47 @@ static constexpr const char* MCP_PROTOCOL_VERSION = "2025-03-26";
 static constexpr const char* MCP_SERVER_NAME = "tenet-trace-analyzer";
 static constexpr const char* MCP_SERVER_VERSION = "1.0.0";
 
+// Shared by initialization and analysis_guide so clients receive the same policy.
+static constexpr const char* ANALYSIS_INSTRUCTIONS =
+    "Start with trace_info (in Hub mode, list_instances first and pass instance). "
+    "Use analysis_guide to choose specialized tools before bulk disasm/get_regs/memread "
+    "queries or writing a script to reconstruct an existing analysis. "
+    "Prefer server-side search, timelines, taint, graphs and VM queries for supported tasks; "
+    "use raw queries for focused inspection and evidence checks. "
+    "Use scripts for unsupported analysis or processing bounded tool results, explaining the gap. "
+    "A processing response is not failure: wait retry_after_ms and retry the same call; "
+    "use progress_tasks to inspect progress. Respect pagination and narrow queries first. "
+    "PCs use image_base rebasing; memory addresses remain runtime addresses. "
+    "Verify algorithm candidates with independent evidence before concluding.";
+
+struct AnalysisRoute {
+    const char* topic;
+    const char* when;
+    std::vector<std::string> tools;
+};
+
+static const std::vector<AnalysisRoute>& analysis_routes() {
+    static const std::vector<AnalysisRoute> routes = {
+        {"overview", "Understand an unfamiliar trace, locate functions and execution hotspots.",
+         {"trace_info", "functions", "find_function", "xref", "call_graph"}},
+        {"crypto", "Identify crypto/algorithms: start with algorithm_summary, then cross-check candidates.",
+         {"algorithm_summary", "pattern_scan", "constants_scan", "loop_semantics", "objc_crypto", "syscall_intercept"}},
+        {"dataflow", "Find where a value came from or where input propagates; avoid manually walking instructions.",
+         {"taint_backward", "taint_forward", "critical_path", "dataflow_graph", "taint_source_annotation"}},
+        {"memory", "Find bytes/strings, reconstruct memory or find its writers; avoid dumping and scanning locally.",
+         {"mem_search", "memory_strings", "strings_scan", "mem_write_history", "memory_snapshot", "entropy_analysis", "yara_mem_scan"}},
+        {"execution", "Inspect register changes, callers, loops or instruction mix; avoid repeated point queries.",
+         {"reg_timeline", "call_context", "loops", "loop_semantics", "trace_fold", "window_stats", "cfg_export", "trace_diff"}},
+        {"vm", "Analyze virtualized code: vm_abstract needs static hints; then vm_summary before targeted queries. VM slicing needs vm_registers hints.",
+         {"vm_abstract", "vm_summary", "vm_steps_query", "vm_reg_timeline", "vm_backward_slice"}},
+        {"threads", "Inspect thread activity, filter execution or locate shared-memory hand-offs.",
+         {"threads", "thread_filter", "cross_thread_dataflow"}},
+        {"evidence", "Check concrete values and record/verify hypotheses before drawing conclusions.",
+         {"get_regs", "memread", "disasm", "verify_evidence", "hypothesis_add", "hypothesis_evidence", "hypothesis_conclude", "batch_query"}}
+    };
+    return routes;
+}
+
 // ─── Helper: log to the Mcp module ─────────────────────────────────────────
 //
 // All MCP diagnostics go through the shared tenet::log system (module=Mcp)
@@ -128,6 +169,18 @@ TenetMcpService::~TenetMcpService() {
 }
 
 void TenetMcpService::register_tool(McpToolSchema schema, McpToolHandler handler) {
+    // Put task alternatives in the advertised schema, including for clients that
+    // discover individual tools without retaining initialization instructions.
+    static const std::unordered_map<std::string, std::string> alternatives = {
+        {"trace_info", " Start here, then use analysis_guide to select analysis tools for your task."},
+        {"disasm", " For larger questions use find_function/call_context, cfg_export, taint_backward or loop_semantics first; inspect a small evidence window here."},
+        {"get_regs", " For changes across a range use reg_timeline; for value provenance use taint_backward."},
+        {"memread", " For locating bytes/strings use mem_search/memory_strings; for provenance use mem_write_history or taint_backward."},
+        {"search_pc", " For hotspots use xref; for callers use call_context/call_graph."},
+        {"vm_abstract", " After completion use vm_summary and targeted vm_steps_query/vm_reg_timeline/vm_backward_slice instead of exporting all steps for scripts."}
+    };
+    auto hint = alternatives.find(schema.name);
+    if (hint != alternatives.end()) schema.description += hint->second;
     tool_handlers_[schema.name] = std::move(handler);
     tool_schemas_.push_back(std::move(schema));
 }
@@ -247,6 +300,7 @@ json TenetMcpService::process_message(const json& msg) {
             {"id", msg_id},
             {"result", {
                 {"protocolVersion", MCP_PROTOCOL_VERSION},
+                {"instructions", ANALYSIS_INSTRUCTIONS},
                 {"capabilities", {
                     {"tools", {{"listChanged", false}}}
                 }},
@@ -413,6 +467,36 @@ void TenetMcpService::register_all_tools() {
     register_evidence_tools();
     register_batch_tools();
     register_hypothesis_tools();
+
+    register_tool(
+        {"analysis_guide",
+         "Choose the best trace analysis tools for a task before writing scripts or repeatedly querying raw instructions/state. "
+         "Without topic returns a compact task-to-tool map; with topic returns current tool descriptions and input schemas. "
+         "Topics: overview, crypto, dataflow, memory, execution, vm, threads, evidence. Does not run analysis passes.",
+         {{"type", "object"}, {"properties", {
+             {"topic", {{"type", "string"},
+                        {"enum", json::array({"overview", "crypto", "dataflow", "memory", "execution", "vm", "threads", "evidence"})}}}
+         }}}},
+        [this](const json& args) -> json {
+            const auto topic = args.value("topic", std::string{});
+            json routes = json::array();
+            for (const auto& route : analysis_routes()) {
+                if (!topic.empty() && topic != route.topic) continue;
+                json tools = json::array();
+                for (const auto& name : route.tools) {
+                    for (const auto& schema : tool_schemas_) {
+                        if (schema.name != name) continue;
+                        if (topic.empty()) tools.push_back(name);
+                        else tools.push_back({{"name", name}, {"description", schema.description},
+                                              {"inputSchema", schema.input_schema}});
+                        break;
+                    }
+                }
+                routes.push_back({{"topic", route.topic}, {"when", route.when}, {"tools", std::move(tools)}});
+            }
+            if (routes.empty()) throw std::runtime_error("Unknown analysis topic: " + topic);
+            return {{"instructions", ANALYSIS_INSTRUCTIONS}, {"routes", std::move(routes)}};
+        });
 
     register_tool(
         {"progress_tasks",

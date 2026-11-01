@@ -686,6 +686,9 @@ TEST_CASE("MCP HTTP: initialize + session management", "[integration][mcp][http]
     CHECK(body["jsonrpc"] == "2.0");
     CHECK(body["id"] == 1);
     CHECK(body["result"]["protocolVersion"] == "2025-03-26");
+    const auto instructions = body.at("result").at("instructions").get<std::string>();
+    CHECK(instructions.find("analysis_guide") != std::string::npos);
+    CHECK(instructions.find("retry_after_ms") != std::string::npos);
     CHECK(body["result"]["serverInfo"]["name"] == "tenet-trace-analyzer");
 
     // Subsequent request WITHOUT session header should fail
@@ -743,6 +746,14 @@ TEST_CASE("MCP HTTP: tools/list", "[integration][mcp][http]") {
     std::unordered_set<std::string> tool_names;
     for (auto& t : tools) {
         tool_names.insert(t["name"].get<std::string>());
+    }
+    CHECK(tool_names.count("analysis_guide") == 1);
+    for (const auto& tool : tools) {
+        const auto name = tool.at("name").get<std::string>();
+        const auto description = tool.at("description").get<std::string>();
+        if (name == "get_regs") CHECK(description.find("reg_timeline") != std::string::npos);
+        if (name == "memread") CHECK(description.find("mem_search") != std::string::npos);
+        if (name == "disasm") CHECK(description.find("taint_backward") != std::string::npos);
     }
     CHECK(tool_names.count("trace_info") == 1);
     CHECK(tool_names.count("disasm") == 1);

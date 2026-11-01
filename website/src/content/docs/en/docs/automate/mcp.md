@@ -13,6 +13,17 @@ Tenet has two recommended entry points:
 | stdio | `--mcp` | One client launching one Tenet process for one trace |
 | MCP Hub | `--mcp-hub` | Automatic connection by backend sidecars launched by the Tauri desktop application, multiple open traces, and one stable endpoint |
 
+## Choosing analysis tools
+
+Start with `trace_info`, then call `analysis_guide()` for a compact task-to-tool map.
+Use `analysis_guide(topic="vm")` (or `overview`, `crypto`, `dataflow`, `memory`,
+`execution`, `threads`, `evidence`) for current descriptions and input schemas.
+In Hub mode, call `list_instances` first and pass `instance` to the guide and subsequent calls.
+The guide does not run analysis passes. Prefer specialized searches, timelines,
+taint and graphs before bulk raw queries or scripts; use scripts for unsupported
+analysis or bounded result processing. If a tool returns `status="processing"`,
+wait `retry_after_ms` and retry the same call.
+
 ## stdio: one trace
 
 ```bash
