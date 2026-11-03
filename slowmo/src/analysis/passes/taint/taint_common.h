@@ -64,25 +64,19 @@ struct TaintRegFilter {
 /// region to be correctly linked during taint propagation.
 inline bool mem_ranges_overlap(uint64_t a_addr, uint64_t a_size,
                                 uint64_t b_addr, uint64_t b_size) {
-    uint64_t a_end = a_addr + a_size;
-    uint64_t b_end = b_addr + b_size;
-    return a_addr < b_end && b_addr < a_end;
+    if (!a_size || !b_size) return false;
+    return a_addr <= b_addr ? b_addr - a_addr < a_size : a_addr - b_addr < b_size;
 }
 
 /// Whether any byte in [addr, addr+size) is present in a tainted-address set.
 /// `Set` only needs to support `.contains(uint64_t)` (e.g. roaring::Roaring64Map).
 ///
-/// Taint state is tracked as a set of individually-tainted *byte addresses*
-/// (each store adds its start address, see TaintPass::track_memory_sinks),
-/// not as explicit [addr,size) ranges. So "does this read overlap a tainted
-/// store" reduces to "is the store's start address inside the read range" —
-/// checking each byte offset in the (typically <= 16 byte) read is exact and
-/// cheap, and is what makes forward-taint's memory handling as precise as
-/// BackwardTaintPass's explicit range-overlap check.
+/// The set contains every currently tainted byte, including interior bytes of
+/// stores. Clean overwrites remove the corresponding bytes.
 template <typename Set>
 inline bool mem_range_hits_tainted_set(const Set& tainted, uint64_t addr, uint64_t size) {
     if (size == 0) return tainted.contains(addr);
-    for (uint64_t off = 0; off < size; off++) {
+    for (uint64_t off = 0; off < size && off <= UINT64_MAX - addr; off++) {
         if (tainted.contains(addr + off)) return true;
     }
     return false;

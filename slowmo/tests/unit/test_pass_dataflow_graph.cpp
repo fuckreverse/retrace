@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fixtures/trace_fixture.h"
+#include "common/progress_manager.h"
 #include "analysis/passes/profile/dataflow_graph_pass.h"
 
 using namespace tenet;
@@ -313,4 +314,124 @@ TEST_CASE("DataflowGraphPass: register and memory edges coexist into the same co
     SECTION("both edge kinds are present without one clobbering the other") {
         REQUIRE(producers.size() >= 2);
     }
+}
+
+TEST_CASE("DataflowGraphPass preserves every live producer through nested overwrites",
+          "[unit][pass][dataflow_graph][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        tw.emit(ms, 0x1000, enc::str_imm(0, 10, 0), {}, {{2, 16, 0x2000, 1}});
+        tw.emit(ms, 0x1004, enc::str_imm(1, 10, 0), {}, {{2, 4, 0x2004, 2}});
+        tw.emit(ms, 0x1008, enc::ldr_imm(2, 10, 0), {{2, 1}}, {{1, 8, 0x2008, 1}});
+        tw.emit(ms, 0x100C, enc::ldr_imm(3, 10, 0), {{3, 2}}, {{1, 8, 0x2000, 2}});
+        // A shorter store at the same base must retain the old tail too.
+        tw.emit(ms, 0x1010, enc::str_imm(1, 10, 0), {}, {{2, 4, 0x2000, 3}});
+        tw.emit(ms, 0x1014, enc::ldr_imm(4, 10, 0), {{4, 4}}, {{1, 16, 0x2000, 4}});
+        tw.emit_anchor(ms);
+    }, "dfg_partial_ranges");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<DataflowGraphPass>());
+    const auto& raw = pm->require("dataflow_graph");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<DataflowGraphResult>();
+    REQUIRE(find_mem_edge(result, 0, 2));
+    REQUIRE_FALSE(find_mem_edge(result, 1, 2));
+    REQUIRE(find_mem_edge(result, 0, 3));
+    REQUIRE(find_mem_edge(result, 1, 3));
+    REQUIRE(find_mem_edge(result, 0, 5));
+    REQUIRE(find_mem_edge(result, 1, 5));
+    REQUIRE(find_mem_edge(result, 4, 5));
+}
+
+TEST_CASE("DataflowGraphPass cache respects node limits and never saves truncation",
+          "[unit][pass][dataflow_graph][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        for (uint64_t i = 0; i < 5002; ++i)
+            tw.emit(ms, 0x1000, enc::nop(), {}, {});
+        tw.emit_anchor(ms);
+    }, "dfg_cache_limits");
+    REQUIRE(env);
+    {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<DataflowGraphPass>());
+        const auto& raw = pm->require("dataflow_graph");
+        REQUIRE(raw.ok());
+        REQUIRE(raw.get<DataflowGraphResult>().nodes.size() == 5000);
+        REQUIRE(raw.get<DataflowGraphResult>().truncated);
+    }
+    std::string blob;
+    REQUIRE_FALSE(env->index->load_pass_blob("dataflow_graph", blob));
+    for (uint64_t limit : {6000ULL, 2ULL}) {
+        auto pm = make_pm(*env);
+        DataflowGraphConfig cfg; cfg.max_nodes = limit;
+        pm->register_pass(std::make_unique<DataflowGraphPass>(cfg));
+        const auto& raw = pm->require("dataflow_graph");
+        REQUIRE(raw.ok());
+        REQUIRE(raw.get<DataflowGraphResult>().nodes.size() == std::min(limit, uint64_t(5002)));
+        REQUIRE(raw.get<DataflowGraphResult>().truncated == (limit < 5002));
+    }
+}
+
+TEST_CASE("DataflowGraphPass cancellation does not publish a partial cache",
+          "[unit][pass][dataflow_graph][regression]") {
+    auto env = make_store_then_load();
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    AnalysisRange range;
+    PassContext ctx(*pm, range);
+    DataflowGraphPass pass;
+    pm->cancel_all();
+    REQUIRE_FALSE(pass.run(ctx).ok());
+    std::string blob;
+    REQUIRE_FALSE(env->index->load_pass_blob("dataflow_graph", blob));
+    pm->reset_cancel();
+    const auto raw = pass.run(ctx);
+    REQUIRE(raw.ok());
+    REQUIRE(raw.get<DataflowGraphResult>().nodes.size() == 2);
+}
+
+TEST_CASE("DataflowGraphPass custom node cap bypasses a complete default cache",
+          "[unit][pass][dataflow_graph][regression]") {
+    auto env = make_store_then_load();
+    REQUIRE(env);
+    {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<DataflowGraphPass>());
+        REQUIRE(pm->require("dataflow_graph").ok());
+    }
+    std::string blob;
+    REQUIRE(env->index->load_pass_blob("dataflow_graph", blob));
+    auto pm = make_pm(*env);
+    DataflowGraphConfig cfg; cfg.max_nodes = 1;
+    pm->register_pass(std::make_unique<DataflowGraphPass>(cfg));
+    const auto& raw = pm->require("dataflow_graph");
+    REQUIRE(raw.ok());
+    REQUIRE(raw.get<DataflowGraphResult>().nodes.size() == 1);
+    REQUIRE(raw.get<DataflowGraphResult>().truncated);
+}
+
+TEST_CASE("DataflowGraphPass discards cancellation during scanning",
+          "[unit][pass][dataflow_graph][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        for (int i = 0; i < 2000; ++i) tw.emit(ms, 0x1000, enc::nop(), {}, {});
+        tw.emit_anchor(ms);
+    }, "dfg_cancel_mid_scan");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    bool cancelled = false;
+    auto subscription = ProgressManager::global().subscribe([&](const ProgressTask& task) {
+        if (!cancelled && task.id == "pass:dataflow_graph" && task.progress > 0 && task.progress < 1) {
+            cancelled = true;
+            pm->cancel_all();
+        }
+    });
+    pm->register_pass(std::make_unique<DataflowGraphPass>());
+    REQUIRE_FALSE(pm->require("dataflow_graph").ok());
+    REQUIRE(cancelled);
+    std::string blob;
+    REQUIRE_FALSE(env->index->load_pass_blob("dataflow_graph", blob));
 }

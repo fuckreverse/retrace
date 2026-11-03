@@ -35,6 +35,7 @@ struct DataflowNode {
 // ─── Result ───────────────────────────────────────────────────────────────
 
 struct DataflowGraphResult {
+    bool truncated = false; // max_nodes stopped the scan before the range ended.
     std::vector<DataflowNode> nodes;
     std::vector<DFGEdge> edges;
     ankerl::unordered_dense::map<uint64_t, size_t> inst_to_node;  // inst_id → node index
@@ -55,11 +56,11 @@ struct DataflowGraphResult {
     // ─── Query helpers ──────────────────────────────────────────────────
 
     /// Get all incoming edges (data producers) for the given instruction.
-    /// O(1) via the adjacency index.
+    /// O(degree) to copy the matching edges; O(1) index lookup.
     std::vector<DFGEdge> producers_of(uint64_t inst_id) const;
 
     /// Get all outgoing edges (data consumers) for the given instruction.
-    /// O(1) via the adjacency index.
+    /// O(degree) to copy the matching edges; O(1) index lookup.
     std::vector<DFGEdge> consumers_of(uint64_t inst_id) const;
 
     /// Export the graph as Graphviz DOT format.

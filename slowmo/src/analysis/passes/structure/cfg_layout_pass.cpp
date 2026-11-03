@@ -39,7 +39,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t CFLY_BLOB_MAGIC   = 0x43464C59u;  // "CFLY"
-static constexpr uint32_t CFLY_BLOB_VERSION = 1u;
+static constexpr uint32_t CFLY_BLOB_VERSION = 2u;
 
 std::string cfg_layout_serialize(const CFGLayoutResult& res) {
     ByteWriter w;

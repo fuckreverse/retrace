@@ -77,15 +77,15 @@ struct LoopResult {
 ///
 /// Algorithm (LLVM LoopInfo-style, adapted for dynamic CFG):
 ///   1. Depend on "cfg" pass to get the basic block graph with edge counts.
-///   2. Build a dominator tree on the block graph using the Semi-NCA algorithm.
+///   2. Build a dominator tree on the block graph using Cooper's iterative algorithm.
 ///   3. Identify back-edges: an edge (u → v) where v dominates u.
 ///   4. For each back-edge, compute the natural loop body via reverse BFS
 ///      from u to v within the dominator tree.
-///   5. Compute nesting by checking loop containment (fast set intersection).
+///   5. Compute nesting by visiting loop-body membership.
 ///
-/// Complexity: O(|V| + |E|) where V = basic blocks, E = CFG edges.
-///   Typically V is in the thousands and E in the tens of thousands,
-///   making this 1000x+ faster than full trace scans for large traces.
+/// Dominance queries take O(1) after an O(V) DFS of the dominator tree.
+/// The iterative dominator fixed point and per-header natural-loop traversal
+/// are not worst-case linear; space includes all emitted loop-body memberships.
 ///
 /// Result type: LoopResult
 class LoopPass final : public AnalysisPass {
@@ -95,9 +95,9 @@ public:
         return "Loop detection via dominator tree on CFG (LLVM-style)";
     }
 
-std::vector<std::string_view> dependencies() const override {
-return { "cfg" };  // Depends on CFG pass (which has no dependencies)
-}
+    std::vector<std::string_view> dependencies() const override {
+        return {"cfg"}; // CFG depends on xref.
+    }
 
     PassResult run(PassContext& ctx) override;
     float estimated_cost() const override { return 2.0f; }  // Much cheaper now

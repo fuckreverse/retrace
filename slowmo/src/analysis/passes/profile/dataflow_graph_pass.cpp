@@ -5,6 +5,7 @@
 #include "core/instruction_decoder.h"
 
 #include "common/byte_codec.h"
+#include "common/memory_ranges.h"
 #include <fmt/core.h>
 #include <algorithm>
 #include <array>
@@ -16,7 +17,7 @@ namespace tenet {
 //
 // Blob format (all little-endian):
 //   u32  magic   = 0x44464752 ("DFGR")
-//   u32  version = 2
+//   u32  version = 3
 //   u64  num_nodes
 //   for each DataflowNode:
 //     u64  inst_id, pc
@@ -32,6 +33,7 @@ namespace tenet {
 //
 // Version history:
 //   v1: register-only edges (via_mem_addr always 0).
+//   v3: resolves every live byte-range producer; invalidates earlier incomplete graphs.
 //   v2: adds memory dependency edges (store → load, via_mem_addr != 0).
 //       Wire format is unchanged (via_mem_addr was always serialized); the
 //       version bump exists purely so older v1 blobs — produced before
@@ -41,7 +43,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t DFGR_BLOB_MAGIC   = 0x44464752u;  // "DFGR"
-static constexpr uint32_t DFGR_BLOB_VERSION = 2u;
+static constexpr uint32_t DFGR_BLOB_VERSION = 3u;
 
 std::string dataflow_graph_serialize(const DataflowGraphResult& res) {
     ByteWriter w;
@@ -218,6 +220,8 @@ std::string DataflowGraphResult::to_json() const {
     std::string out;
     out += "{\n";
 
+    out += fmt::format("  \"truncated\": {},\n", truncated);
+
     // Nodes
     out += "  \"nodes\": [\n";
     for (size_t i = 0; i < nodes.size(); ++i) {
@@ -267,6 +271,7 @@ std::string DataflowGraphResult::to_json() const {
 // ─── Pass implementation ──────────────────────────────────────────────────
 
 PassResult DataflowGraphPass::run(PassContext& ctx) {
+    if (ctx.cancelled()) return PassResult::failed("cancelled by user");
     auto& reader     = ctx.reader();
     auto& index      = ctx.index();
     auto& code_table = ctx.code_table();
@@ -278,9 +283,10 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     uint64_t end   = std::min(config_.end_inst_id, range.end_inst_id);
 
     // ─── Fast path: load from persisted cache ─────────────────────────────
-    // Only cache when using the full trace with default config range.
-    bool is_default_range = (config_.start_inst_id == 0 && config_.end_inst_id == UINT64_MAX);
-    if (ctx.range().is_full_trace() && is_default_range) {
+    // Only cache complete full-trace results with the default configuration.
+    bool cacheable_config = (config_.start_inst_id == 0 && config_.end_inst_id == UINT64_MAX
+                             && config_.max_nodes == DataflowGraphConfig{}.max_nodes);
+    if (ctx.range().is_full_trace() && cacheable_config) {
         std::string blob;
         if (index.load_pass_blob("dataflow_graph", blob)) {
             DataflowGraphResult cached;
@@ -308,21 +314,9 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     std::array<uint64_t, AARCH64_GPR_COUNT> last_writer;
     last_writer.fill(NO_WRITER);
 
-    // ─── Memory dependency tracking ────────────────────────────────────────
-    // Tracks live (non-fully-shadowed) store intervals as start_addr →
-    // {end_addr, inst_id}, ordered by start address. On each load, we find
-    // the interval with the greatest inst_id whose byte range overlaps the
-    // load (same overlap test as BackwardTaintPass:
-    //   store_start < load_end && load_start < store_end
-    // ) and add a single edge from that instruction — the most recent write
-    // is the effective source of the loaded bytes. On each store, any
-    // existing interval fully covered by the new write is dropped (its bytes
-    // can never be observed again) to keep the map small.
-    struct MemWriteEntry {
-        uint64_t end_addr;
-        uint64_t inst_id;
-    };
-    std::map<uint64_t, MemWriteEntry> mem_writes;  // start_addr → {end_addr, inst_id}
+    // Latest writer for each disjoint byte range. Partial overwrites split
+    // intervals; a load can depend on multiple live producers.
+    MemoryRanges<uint64_t> mem_writes;
 
     uint64_t nodes_added = 0;
     uint64_t total = end - start;
@@ -343,12 +337,11 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
 
-        if (ctx.cancelled()) {
-            break;
-        }
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
 
         // Enforce max_nodes to keep graph sizes practical
         if (nodes_added >= config_.max_nodes) {
+            result.truncated = true;
             break;
         }
 
@@ -414,35 +407,17 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
                 bool is_write = (mem.type & 0x02) != 0;
                 if (is_write || mem.addr == 0 || mem.size == 0) continue;
 
-                uint64_t load_start = mem.addr;
-                uint64_t load_end   = mem.addr + mem.size;
-
-                // Scan backward from the first store starting at/after
-                // load_end; once a store starts at or before load_start, no
-                // earlier (smaller start_addr) store can overlap further
-                // right, so it's safe to stop after examining it.
-                uint64_t best_writer = NO_WRITER;
-                auto it_mw = mem_writes.upper_bound(load_end);
-                while (it_mw != mem_writes.begin()) {
-                    --it_mw;
-                    uint64_t store_start = it_mw->first;
-                    uint64_t store_end   = it_mw->second.end_addr;
-                    bool overlaps = store_start < load_end && load_start < store_end;
-                    if (overlaps &&
-                        (best_writer == NO_WRITER || it_mw->second.inst_id > best_writer)) {
-                        best_writer = it_mw->second.inst_id;
-                    }
-                    if (store_start <= load_start) break;  // no earlier store can start later
-                }
-
-                if (best_writer != NO_WRITER && result.inst_to_node.count(best_writer) > 0) {
-                    DFGEdge edge;
-                    edge.from_inst_id = best_writer;
-                    edge.to_inst_id   = inst_id;
-                    edge.via_reg      = 0;
-                    edge.via_mem_addr = mem.addr;
-                    result.edges.push_back(edge);
-                }
+                ankerl::unordered_dense::set<uint64_t> producers;
+                mem_writes.visit(mem.addr, mem.size,
+                    [&](uint64_t, uint64_t, uint64_t writer) {
+                        if (producers.insert(writer).second) {
+                            DFGEdge edge;
+                            edge.from_inst_id = writer;
+                            edge.to_inst_id = inst_id;
+                            edge.via_mem_addr = mem.addr;
+                            result.edges.push_back(edge);
+                        }
+                    });
             }
 
             // Writes: record this instruction as the latest writer for the
@@ -454,19 +429,7 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
                 bool is_write = (mem.type & 0x02) != 0;
                 if (!is_write || mem.addr == 0 || mem.size == 0) continue;
 
-                uint64_t store_start = mem.addr;
-                uint64_t store_end   = mem.addr + mem.size;
-
-                auto it_lo = mem_writes.lower_bound(store_start);
-                for (auto it_e = it_lo; it_e != mem_writes.end() && it_e->first < store_end; ) {
-                    if (it_e->second.end_addr <= store_end) {
-                        it_e = mem_writes.erase(it_e);
-                    } else {
-                        ++it_e;
-                    }
-                }
-
-                mem_writes[store_start] = MemWriteEntry{store_end, inst_id};
+                mem_writes.assign(mem.addr, mem.size, inst_id);
             }
         }
 
@@ -492,8 +455,10 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     // Build O(1) adjacency index for producer/consumer queries.
     result.build_adjacency();
 
+    if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+
     // ─── Persist to cache ─────────────────────────────────────────────────
-    if (ctx.range().is_full_trace() && is_default_range) {
+    if (ctx.range().is_full_trace() && cacheable_config && !result.truncated) {
         std::string blob = dataflow_graph_serialize(result);
         if (!blob.empty()) {
             index.save_pass_blob("dataflow_graph", blob.data(), blob.size());

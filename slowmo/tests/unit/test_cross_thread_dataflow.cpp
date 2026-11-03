@@ -225,3 +225,60 @@ TEST_CASE("CrossThreadDataflow: single-thread trace yields empty result",
     CHECK(r.edges.empty());
     CHECK(r.channels.empty());
 }
+
+TEST_CASE("cross_thread_dataflow resolves offset reads and partial overwrites",
+          "[unit][pass][cross_thread_dataflow][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit_thread(100);
+        tw.emit(ms, 0x1000, enc::str_imm(0, 10, 0), {}, {{2, 8, 0x2000, 1}});
+        tw.emit_thread(200);
+        tw.emit(ms, 0x1004, enc::str_imm(1, 10, 0), {}, {{2, 4, 0x2004, 2}});
+        tw.emit_thread(300);
+        tw.emit(ms, 0x1008, enc::ldr_imm(2, 10, 0), {{2, 3}}, {{1, 8, 0x2000, 3}});
+        tw.emit_anchor(ms);
+    }, "cross_thread_partial");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ThreadPass>());
+    CrossThreadDataflowConfig cfg;
+    cfg.max_tracked_addrs = 0; // documented unlimited setting
+    pm->register_pass(std::make_unique<CrossThreadDataflowPass>(cfg));
+    const auto& raw = pm->require("cross_thread_dataflow");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<CrossThreadDataflowResult>();
+    REQUIRE(result.edges.size() == 2);
+    REQUIRE(result.edges[0].from_thread == 100);
+    REQUIRE(result.edges[0].addr == 0x2000);
+    REQUIRE(result.edges[0].size == 4);
+    REQUIRE(result.edges[1].from_thread == 200);
+    REQUIRE(result.edges[1].addr == 0x2004);
+    REQUIRE(result.edges[1].size == 4);
+}
+
+TEST_CASE("cross_thread_dataflow budget never retains an overwritten writer",
+          "[unit][pass][cross_thread_dataflow][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit_thread(100);
+        tw.emit(ms, 0x1000, enc::str_imm(0, 10, 0), {}, {{2, 8, 0x2000, 1}});
+        tw.emit_thread(200);
+        tw.emit(ms, 0x1004, enc::str_imm(1, 10, 0), {}, {{2, 4, 0x2004, 2}});
+        tw.emit_thread(300);
+        tw.emit(ms, 0x1008, enc::ldr_imm(2, 10, 0), {{2, 2}}, {{1, 4, 0x2004, 2}});
+        tw.emit(ms, 0x100C, enc::ldr_imm(3, 10, 0), {{3, 1}}, {{1, 4, 0x2000, 1}});
+        tw.emit_anchor(ms);
+    }, "cross_thread_cap");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<ThreadPass>());
+    CrossThreadDataflowConfig cfg; cfg.max_tracked_addrs = 1;
+    pm->register_pass(std::make_unique<CrossThreadDataflowPass>(cfg));
+    const auto& raw = pm->require("cross_thread_dataflow");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<CrossThreadDataflowResult>();
+    REQUIRE(result.edges.size() == 1);
+    REQUIRE(result.edges[0].from_thread == 100);
+    REQUIRE(result.edges[0].to_inst_id == 3);
+    REQUIRE(result.edges[0].size == 4);
+}

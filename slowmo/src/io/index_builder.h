@@ -171,7 +171,7 @@ public:
 
     /// Find the most recent instruction before `before_id` that wrote `reg_idx`.
     /// Uses the REG_WRITES inverted index: O(log N) via RocksDB SeekForPrev.
-    /// Returns the inst_id of the last writer, or 0 if no writer exists.
+    /// Returns the inst_id of the last writer, or UINT64_MAX if no writer exists.
     /// Falls back to linear scan (offset_of + iterate) when REG_WRITES CF is absent
     /// (e.g., old cache rebuilt before this CF was introduced).
     uint64_t find_last_writer_of(uint8_t reg_idx, uint64_t before_id,

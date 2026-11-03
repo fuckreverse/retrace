@@ -1,5 +1,6 @@
 #include "analysis/passes/structure/loop_pass.h"
 #include "analysis/passes/structure/cfg_pass.h"
+#include "analysis/passes/structure/xref_pass.h"
 #include "io/index_builder.h"
 
 #include <fmt/core.h>
@@ -37,7 +38,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t LOOP_BLOB_MAGIC   = 0x4C4F4F50u;  // "LOOP"
-static constexpr uint32_t LOOP_BLOB_VERSION = 1u;
+static constexpr uint32_t LOOP_BLOB_VERSION = 2u;
 
 std::string loop_serialize(const LoopResult& res) {
     ByteWriter w;
@@ -135,20 +136,9 @@ bool loop_deserialize(const std::string& blob, LoopResult& out) {
 }  // anonymous namespace (loop serialization)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Semi-NCA Dominator Tree Implementation
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Based on:
-//   - Loukas Georgiadis: "Linear-Time Algorithms for Dominators and Related
-//     Problems" (PhD thesis, Princeton, 2005)
-//   - MaskRay's implementation for LLVM
-//   - Keith D. Cooper et al: "A Simple, Fast Dominance Algorithm" (simplified
-//     version used here for clarity, with Semi-NCA complexity)
-//
-// We use the simpler iterative algorithm from Cooper et al. since the graph
-// sizes (typically < 10K blocks, < 50K edges) make the difference between
-// O(V*alpha(V)) and O(V^2) worst-case negligible, while being much simpler
-// to implement correctly.
+// Cooper iterative dominator computation, followed by a DFS interval index.
+// The fixed point is not worst-case linear; individual dominance queries are
+// O(1), and natural-loop discovery visits each merged header's body once.
 
 namespace {
 
@@ -176,7 +166,8 @@ struct CompactCFG {
 };
 
 /// Build compact CFG from CFGResult.
-CompactCFG build_compact_cfg(const CFGResult& cfg) {
+CompactCFG build_compact_cfg(const CFGResult& cfg, const XrefResult& xref,
+                             uint64_t first_pc = UINT64_MAX) {
     CompactCFG g;
 
     // Assign IDs to blocks (sorted by start_pc for determinism)
@@ -204,8 +195,45 @@ CompactCFG build_compact_cfg(const CFGResult& cfg) {
         g.edge_counts[g.edge_key(from, to)] = edge.taken_count;
     }
 
-    // Entry node = first block (lowest start_pc, since map is ordered)
-    g.entry_node = 0;
+    // A virtual root connects the first executed block of every component.
+    // Address order has no relationship to execution entry (ASLR, callees,
+    // backward branches, and filtered/disconnected traces).
+    std::vector<bool> seen(g.num_nodes, false);
+    uint32_t seen_count = 0;
+    g.entry_node = g.num_nodes++;
+    g.successors.emplace_back();
+    g.predecessors.emplace_back();
+    auto add_component = [&](uint32_t n) {
+        if (seen[n]) return;
+        g.successors[g.entry_node].push_back(n);
+        g.predecessors[n].push_back(g.entry_node);
+        std::vector<uint32_t> pending{n};
+        seen[n] = true;
+        ++seen_count;
+        while (!pending.empty()) {
+            const auto u = pending.back();
+            pending.pop_back();
+            for (auto v : g.successors[u]) {
+                if (!seen[v]) {
+                    seen[v] = true;
+                    ++seen_count;
+                    pending.push_back(v);
+                }
+            }
+        }
+    };
+    // The indexed range entry usually reaches the entire graph. Avoid
+    // loading every block's execution bitmap merely to rediscover that root.
+    auto first = g.pc_to_id.find(first_pc);
+    if (first != g.pc_to_id.end()) add_component(first->second);
+    if (seen_count < g.entry_node) {
+        std::vector<std::pair<uint64_t, uint32_t>> order;
+        for (uint32_t n = 0; n < g.entry_node; ++n) {
+            if (!seen[n]) order.emplace_back(xref.first_inst_id_at(g.id_to_pc[n]), n);
+        }
+        std::sort(order.begin(), order.end());
+        for (const auto& item : order) add_component(item.second);
+    }
 
     return g;
 }
@@ -319,19 +347,30 @@ std::vector<uint32_t> compute_idom(const CompactCFG& g, const DFSInfo& dfs) {
     return idom;
 }
 
-/// Check if 'dom' dominates 'node' using the idom tree.
-bool dominates(const std::vector<uint32_t>& idom, uint32_t dom, uint32_t node) {
-    if (dom == node) return true;
-    const uint32_t UNDEF = UINT32_MAX;
-    uint32_t current = node;
-    // Walk up the dominator tree
-    while (current != UNDEF && current != dom) {
-        uint32_t next = idom[current];
-        if (next == current) break;  // Reached entry
-        current = next;
+// DFS intervals on the dominator tree make each dominance test O(1).
+struct DominanceIndex {
+    std::vector<uint32_t> enter, leave;
+    DominanceIndex(const std::vector<uint32_t>& idom, uint32_t root)
+        : enter(idom.size(), UINT32_MAX), leave(idom.size(), UINT32_MAX) {
+        std::vector<std::vector<uint32_t>> children(idom.size());
+        for (uint32_t n = 0; n < idom.size(); ++n) {
+            if (idom[n] != UINT32_MAX && idom[n] != n) children[idom[n]].push_back(n);
+        }
+        std::vector<std::pair<uint32_t, bool>> work{{root, false}};
+        uint32_t clock = 0;
+        while (!work.empty()) {
+            auto [n, exiting] = work.back(); work.pop_back();
+            if (exiting) { leave[n] = clock++; continue; }
+            enter[n] = clock++;
+            work.emplace_back(n, true);
+            for (auto child : children[n]) work.emplace_back(child, false);
+        }
     }
-    return current == dom;
-}
+    bool dominates(uint32_t dom, uint32_t node) const {
+        return enter[dom] != UINT32_MAX && enter[node] != UINT32_MAX &&
+               enter[dom] <= enter[node] && leave[node] <= leave[dom];
+    }
+};
 
 /// Find natural loop body for a back-edge (latch → header).
 /// The natural loop body is the set of nodes from which the header can be
@@ -341,9 +380,9 @@ bool dominates(const std::vector<uint32_t>& idom, uint32_t dom, uint32_t node) {
 /// Algorithm: reverse BFS from latch, staying within nodes dominated by header.
 std::vector<uint32_t> find_loop_body(
     const CompactCFG& g,
-    const std::vector<uint32_t>& idom,
+    const DominanceIndex& dominance,
     uint32_t header,
-    uint32_t latch)
+    const std::vector<uint32_t>& latches)
 {
     // The loop body includes at minimum the header and latch
     std::vector<uint32_t> body;
@@ -352,16 +391,13 @@ std::vector<uint32_t> find_loop_body(
     in_body.insert(header);
     body.push_back(header);
 
-    if (header == latch) {
-        // Self-loop
-        return body;
-    }
-
-    // BFS backwards from latch, adding predecessors until we reach header
+    // Seed every latch of this header, then traverse the shared body once.
     std::queue<uint32_t> worklist;
-    if (in_body.insert(latch).second) {
-        body.push_back(latch);
-        worklist.push(latch);
+    for (auto latch : latches) {
+        if (in_body.insert(latch).second) {
+            body.push_back(latch);
+            worklist.push(latch);
+        }
     }
 
     while (!worklist.empty()) {
@@ -369,6 +405,7 @@ std::vector<uint32_t> find_loop_body(
         worklist.pop();
 
         for (uint32_t pred : g.predecessors[node]) {
+            if (!dominance.dominates(header, pred)) continue;
             if (in_body.insert(pred).second) {
                 body.push_back(pred);
                 worklist.push(pred);
@@ -385,6 +422,7 @@ struct GraphLoop {
     uint32_t latch;              // Latch (back-edge source) node ID
     uint64_t iteration_count;    // Edge taken count of back-edge
     std::vector<uint32_t> body;  // All node IDs in the loop body
+    std::vector<uint32_t> latches;
     uint32_t nesting_depth = 0;  // Computed later
 };
 
@@ -425,7 +463,12 @@ PassResult LoopPass::run(PassContext& ctx) {
     ctx.progress(0.1f, fmt::format("Loop pass: building compact CFG ({} blocks, {} edges)...",
                                     cfg.blocks.size(), cfg.edges.size()));
 
-    CompactCFG g = build_compact_cfg(cfg);
+    const auto first_offset = index.offset_of_with_pc(range.start_inst_id, ctx.reader());
+    const auto first_record = ctx.reader().record_at(first_offset.offset, first_offset.seed_pc);
+    const auto* first_block = first_record.kind == RecordKind::Inst
+        ? cfg.block_containing(first_record.as_inst().pc) : nullptr;
+    CompactCFG g = build_compact_cfg(cfg, ctx.require<XrefResult>("xref"),
+                                    first_block ? first_block->start_pc : UINT64_MAX);
     if (g.num_nodes == 0) {
         ctx.progress(1.0f, "Loop pass: empty graph");
         return PassResult::success(LoopResult{});
@@ -443,6 +486,8 @@ PassResult LoopPass::run(PassContext& ctx) {
 
     if (ctx.cancelled()) return PassResult::failed("Cancelled");
 
+    DominanceIndex dominance(idom, g.entry_node);
+
     // ── Step 5: Find back-edges ──────────────────────────────────────────
     // A back-edge is (u → v) where v dominates u.
     ctx.progress(0.5f, "Loop pass: identifying back-edges...");
@@ -450,7 +495,7 @@ PassResult LoopPass::run(PassContext& ctx) {
     std::vector<GraphLoop> graph_loops;
     for (uint32_t u = 0; u < g.num_nodes; u++) {
         for (uint32_t v : g.successors[u]) {
-            if (dominates(idom, v, u)) {
+            if (dominance.dominates(v, u)) {
                 // (u → v) is a back-edge, v is loop header, u is latch
                 GraphLoop loop;
                 loop.header = v;
@@ -460,8 +505,7 @@ PassResult LoopPass::run(PassContext& ctx) {
                 auto it = g.edge_counts.find(g.edge_key(u, v));
                 loop.iteration_count = (it != g.edge_counts.end()) ? it->second : 1;
 
-                // Find natural loop body
-                loop.body = find_loop_body(g, idom, v, u);
+                loop.latches.push_back(u);
 
                 graph_loops.push_back(std::move(loop));
             }
@@ -492,14 +536,7 @@ PassResult LoopPass::run(PassContext& ctx) {
         } else {
             auto& existing = merged_loops[it->second];
             existing.iteration_count += loop.iteration_count;
-            // Merge body
-            ankerl::unordered_dense::set<uint32_t> body_set(
-                existing.body.begin(), existing.body.end());
-            for (uint32_t n : loop.body) {
-                if (body_set.insert(n).second) {
-                    existing.body.push_back(n);
-                }
-            }
+            existing.latches.insert(existing.latches.end(), loop.latches.begin(), loop.latches.end());
             // Keep the most recent latch (largest RPO = closest to header)
             if (dfs.rpo[loop.latch] != UINT32_MAX &&
                 (dfs.rpo[existing.latch] == UINT32_MAX ||
@@ -509,26 +546,27 @@ PassResult LoopPass::run(PassContext& ctx) {
         }
     }
 
+    for (auto& loop : merged_loops) {
+        if (ctx.cancelled()) return PassResult::failed("Cancelled");
+        loop.body = find_loop_body(g, dominance, loop.header, loop.latches);
+    }
+
     // ── Step 7: Compute nesting depths ────────────────────────────────────
     ctx.progress(0.7f, "Loop pass: computing nesting depths...");
 
-    // Build body sets for fast containment check
-    std::vector<ankerl::unordered_dense::set<uint32_t>> body_sets;
-    body_sets.reserve(merged_loops.size());
-    for (const auto& loop : merged_loops) {
-        body_sets.emplace_back(loop.body.begin(), loop.body.end());
+    // Count enclosing loops by visiting their bodies, rather than testing
+    // every pair of loops. Cost is linear in total loop-body membership.
+    ankerl::unordered_dense::map<uint32_t, size_t> loop_headers;
+    for (size_t i = 0; i < merged_loops.size(); ++i) {
+        loop_headers[merged_loops[i].header] = i;
     }
-
-    // Loop A is nested inside loop B if A.header ∈ B.body && A != B
-    for (size_t i = 0; i < merged_loops.size(); i++) {
-        uint32_t depth = 0;
-        for (size_t j = 0; j < merged_loops.size(); j++) {
-            if (i == j) continue;
-            if (body_sets[j].contains(merged_loops[i].header)) {
-                depth++;
+    for (size_t j = 0; j < merged_loops.size(); ++j) {
+        for (auto node : merged_loops[j].body) {
+            auto it = loop_headers.find(node);
+            if (it != loop_headers.end() && it->second != j) {
+                ++merged_loops[it->second].nesting_depth;
             }
         }
-        merged_loops[i].nesting_depth = depth;
     }
 
     // ── Step 8: Convert to LoopResult ─────────────────────────────────────

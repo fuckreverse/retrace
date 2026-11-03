@@ -282,3 +282,18 @@ TEST_CASE("TraceIndex offset_of_with_pc: large trace with many instructions",
         }
     }
 }
+
+TEST_CASE("TraceIndex last writer distinguishes instruction zero from not found",
+          "[unit][io][index_query][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 42), {{0, 42}}, {});
+        tw.emit(ms, 0x1004, enc::movz(1, 7), {{1, 7}}, {});
+        tw.emit_anchor(ms);
+    }, "index_writer_zero");
+    REQUIRE(env);
+    REQUIRE(env->index->find_last_writer_of(0, 1, *env->reader) == 0);
+    REQUIRE(env->index->find_last_writer_of(1, 1, *env->reader) == UINT64_MAX);
+    REQUIRE(env->index->find_last_writer_of(0, 0, *env->reader) == UINT64_MAX);
+    REQUIRE(env->index->find_last_writer_of(1, 2, *env->reader) == 1);
+}

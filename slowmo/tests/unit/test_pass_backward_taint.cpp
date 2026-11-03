@@ -169,13 +169,8 @@ TEST_CASE("BackwardTaintPass: max_steps limits the search depth",
     //   inst 0: x1 = 0x42
     //   inst 1: x0 = x1  (records x1 in diff as source)
     //
-    // With sink_inst_id=2, sink_reg=x0:
-    //   - Loop: current_id=2, decrement to 1, steps=1 → examine inst 1
-    //           If max_steps=1: break after incrementing steps to 1 (BEFORE processing)
-    //   - So max_steps=1 actually means "allow 1 decrement then break" → 0 insts examined
-    //   - max_steps=2: examine inst 1, decrement again to 0, steps=2 → break → 1 inst examined
-    //
-    // We use max_steps=2 (examine inst 1 only, stop before inst 0).
+    // With sink_inst_id=2, one step examines inst 1, then stops before
+    // the producer at inst 0. The limit counts examined instructions.
     auto env = make_two_hop();
     REQUIRE(env != nullptr);
 
@@ -184,10 +179,7 @@ TEST_CASE("BackwardTaintPass: max_steps limits the search depth",
     BackwardTaintConfig cfg;
     cfg.sink_inst_id = 2;
     cfg.add_sink_reg(0);
-    // max_steps=2: the loop does: decrement (→1), steps++ (1), check (1<2 ok),
-    //   process inst 1 → contributing; decrement (→0), steps++ (2), check (2>=2) → break.
-    // So inst 1 IS found, inst 0 is NOT (loop exits before examining it).
-    cfg.max_steps = 2;
+    cfg.max_steps = 1;
     cfg.use_index_acceleration = false;
     cfg.build_dataflow_graph = false;
 
@@ -397,4 +389,81 @@ TEST_CASE("BackwardTaintPass: result is empty for inst_id with no register write
     SECTION("contributing count is 0") {
         REQUIRE(res.contributing_count() == 0);
     }
+}
+
+TEST_CASE("BackwardTaintPass preserves partial stores and memory graph producers",
+          "[unit][pass][backward_taint][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        tw.emit(ms, 0x1000, enc::str_imm(1, 10, 0), {}, {{2, 8, 0x2000, 1}});
+        tw.emit(ms, 0x1004, 0xB9000542u /*str w2,[x10,#4]*/, {}, {{2, 4, 0x2004, 2}});
+        tw.emit(ms, 0x1008, enc::ldr_imm(0, 10, 0), {{0, 3}}, {{1, 8, 0x2000, 3}});
+        tw.emit_anchor(ms);
+    }, "backward_partial");
+    REQUIRE(env);
+    for (bool accelerated : {false, true}) {
+        auto pm = make_pm(*env);
+        BackwardTaintConfig cfg;
+        cfg.sink_inst_id = 3;
+        cfg.add_sink_reg(0);
+        cfg.use_index_acceleration = accelerated;
+        pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+        const auto& raw = pm->require("backward_taint");
+        REQUIRE(raw.ok());
+        const auto& result = raw.get<BackwardTaintResult>();
+        REQUIRE(result.is_contributing(0));
+        REQUIRE(result.is_contributing(1));
+        REQUIRE(result.is_contributing(2));
+        for (uint64_t writer : {0ULL, 1ULL}) {
+            REQUIRE(std::any_of(result.dataflow_edges.begin(), result.dataflow_edges.end(),
+                [=](const auto& edge) {
+                    return edge.from_inst_id == writer && edge.to_inst_id == 2 && edge.via_mem_addr;
+                }));
+        }
+    }
+}
+
+TEST_CASE("BackwardTaintPass acceleration includes writer zero and max_steps is inclusive",
+          "[unit][pass][backward_taint][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 42), {{0, 42}}, {});
+        tw.emit_anchor(ms);
+    }, "backward_zero");
+    REQUIRE(env);
+    for (bool accelerated : {false, true}) {
+        auto pm = make_pm(*env);
+        BackwardTaintConfig cfg;
+        cfg.sink_inst_id = 1;
+        cfg.add_sink_reg(0);
+        cfg.max_steps = 1;
+        cfg.use_index_acceleration = accelerated;
+        pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+        const auto& raw = pm->require("backward_taint");
+        REQUIRE(raw.ok());
+        REQUIRE(raw.get<BackwardTaintResult>().is_contributing(0));
+    }
+}
+
+TEST_CASE("BackwardTaintPass one wide store resolves all overlapping sinks",
+          "[unit][pass][backward_taint][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::str_imm(1, 10, 0), {}, {{2, 16, 0x2000, 1}});
+        tw.emit_anchor(ms);
+    }, "backward_wide_multi_sink");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    BackwardTaintConfig cfg;
+    cfg.sink_inst_id = 1;
+    cfg.sink_mem_addrs = {0x2000, 0x2008};
+    pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+    const auto& raw = pm->require("backward_taint");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<BackwardTaintResult>();
+    REQUIRE(result.per_sink_inst_ids.size() == 2);
+    REQUIRE(result.per_sink_inst_ids[0].contains(uint64_t(0)));
+    REQUIRE(result.per_sink_inst_ids[1].contains(uint64_t(0)));
 }

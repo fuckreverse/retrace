@@ -219,3 +219,36 @@ TEST_CASE("TaintPass propagates through function calls", "[unit][pass][taint]") 
         REQUIRE(tr.call_crossings >= 1);
     }
 }
+
+TEST_CASE("TaintPass tracks interior bytes and kills clean partial overwrites",
+          "[unit][pass][taint][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(10, 0x2000), {{10, 0x2000}}, {});
+        tw.emit(ms, 0x1004, enc::str_imm(0, 10, 0), {}, {{2, 8, 0x2000, 1}});
+        // Reuse the clean-store PC so learned-PC acceleration must also kill.
+        tw.emit(ms, 0x1020, enc::movz(10, 0x3000), {{10, 0x3000}}, {});
+        tw.emit(ms, 0x1008, 0xB9000541u /*str w1,[x10,#4]*/, {}, {{2, 4, 0x3004, 0}});
+        tw.emit(ms, 0x1024, enc::movz(10, 0x2000), {{10, 0x2000}}, {});
+        tw.emit(ms, 0x100C, 0xB9400542u /*ldr w2,[x10,#4]*/, {{2, 1}}, {{1, 4, 0x2004, 1}});
+        tw.emit(ms, 0x1008, 0xB9000541u, {}, {{2, 4, 0x2004, 0}});
+        tw.emit(ms, 0x1010, 0xB9400543u /*ldr w3,[x10,#4]*/, {{3, 0}}, {{1, 4, 0x2004, 0}});
+        tw.emit(ms, 0x1014, 0xB9400144u /*ldr w4,[x10]*/, {{4, 1}}, {{1, 4, 0x2000, 1}});
+        tw.emit_anchor(ms);
+    }, "taint_partial_overwrite");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    TaintConfig cfg;
+    cfg.add_source_reg(0);
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<TaintPass>(cfg));
+    const auto& raw = pm->require("taint");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<TaintResult>();
+    REQUIRE(result.is_tainted(2));
+    REQUIRE_FALSE(result.is_tainted(3));
+    REQUIRE(result.is_tainted(4));
+    REQUIRE(result.tainted_memory.contains(uint64_t(0x2003)));
+    REQUIRE_FALSE(result.tainted_memory.contains(uint64_t(0x2004)));
+}

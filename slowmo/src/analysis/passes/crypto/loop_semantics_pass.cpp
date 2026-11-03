@@ -48,7 +48,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t LSMN_BLOB_MAGIC   = 0x4C534D4Eu;  // "LSMN"
-static constexpr uint32_t LSMN_BLOB_VERSION = 2u;
+static constexpr uint32_t LSMN_BLOB_VERSION = 3u;
 
 std::string loop_semantics_serialize(const LoopSemanticsResult& res) {
     ByteWriter w;

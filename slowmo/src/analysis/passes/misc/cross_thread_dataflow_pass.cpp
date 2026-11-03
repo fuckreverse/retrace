@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <fmt/core.h>
 #include <unordered_map>
+#include <set>
 
 namespace tenet {
 
@@ -24,32 +25,32 @@ void CrossThreadDataflowPass::Collector::on_inst(uint64_t inst_id,
         auto ma = inst.mem_access(i);
         if (ma.size == 0) continue;
         if (ma.type & 0x2) {  // write
-            if (addrs.size() < cfg.max_tracked_addrs || addrs.count(ma.addr)) {
-                auto& st = addrs[ma.addr];
+            // Even when the budget is exhausted, kill the overwritten bytes
+            // so a later read can never be attributed to a stale writer.
+            addrs.erase(ma.addr, ma.size);
+            if (cfg.max_tracked_addrs && addrs.size() > cfg.max_tracked_addrs)
+                addrs.limit(cfg.max_tracked_addrs);
+            if (cfg.max_tracked_addrs == 0 || addrs.size() < cfg.max_tracked_addrs) {
+                AddrState st;
                 st.writer_inst = inst_id;
                 st.writer_thread = cur_thread;
-                st.consumed_threads.clear();
-                // Self-consume: the writer obviously "knows" the value.
                 st.consumed_threads.insert(cur_thread);
+                addrs.assign(ma.addr, ma.size, st);
             }
         } else if (ma.type & 0x1) {  // read
-            auto it = addrs.find(ma.addr);
-            if (it == addrs.end()) continue;
-            auto& st = it->second;
-            if (st.writer_thread != cur_thread &&
-                !st.consumed_threads.count(cur_thread) &&
-                result.edges.size() < cfg.max_edges) {
+            addrs.visit(ma.addr, ma.size, [&](uint64_t first, uint64_t last, AddrState& st) {
+                if (st.writer_thread == cur_thread || st.consumed_threads.count(cur_thread) ||
+                    result.edges.size() >= cfg.max_edges) return;
                 CrossThreadEdge edge;
                 edge.from_inst_id = st.writer_inst;
-                edge.to_inst_id   = inst_id;
-                edge.from_thread  = st.writer_thread;
-                edge.to_thread    = cur_thread;
-                edge.addr         = ma.addr;
-                edge.size         = static_cast<uint8_t>(
-                    std::min<uint64_t>(ma.size, 255));
+                edge.to_inst_id = inst_id;
+                edge.from_thread = st.writer_thread;
+                edge.to_thread = cur_thread;
+                edge.addr = first;
+                edge.size = static_cast<uint8_t>(std::min<uint64_t>(last - first, 254) + 1);
                 result.edges.push_back(edge);
                 st.consumed_threads.insert(cur_thread);
-            }
+            });
         }
     }
 }
@@ -76,11 +77,7 @@ PassResult CrossThreadDataflowPass::run(PassContext& ctx) {
         return PassResult::success(std::move(result));
     }
 
-    // Order edges by consumer (to_inst_id) — the order data arrived.
-    std::sort(result.edges.begin(), result.edges.end(),
-              [](const CrossThreadEdge& a, const CrossThreadEdge& b) {
-                  return a.to_inst_id < b.to_inst_id;
-              });
+    // The sequential collector already emits edges in consumer order.
 
     // Aggregate by (addr, from_thread, to_thread).
     struct ChannelKey {
@@ -129,11 +126,11 @@ PassResult CrossThreadDataflowPass::run(PassContext& ctx) {
               });
 
     // Distinct thread pairs.
-    ankerl::unordered_dense::set<uint64_t> pairs;
+    std::set<std::pair<uint64_t, uint64_t>> pairs;
     for (const auto& e : result.edges) {
         uint64_t lo = std::min(e.from_thread, e.to_thread);
         uint64_t hi = std::max(e.from_thread, e.to_thread);
-        pairs.insert((hi << 32) ^ (lo & 0xFFFFFFFFULL));
+        pairs.emplace(lo, hi);
     }
     result.thread_pair_count = pairs.size();
 

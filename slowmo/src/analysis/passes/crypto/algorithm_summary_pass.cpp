@@ -166,7 +166,7 @@ static constexpr uint32_t ALGO_BLOB_MAGIC   = 0x414C474Fu;  // "ALGO"
 //     written right after key_inst_ids. Old v1 blobs are still readable
 //     (just missing those two fields, which default to Unknown/false) so a
 //     stale cache from before this change doesn't need to be invalidated.
-static constexpr uint32_t ALGO_BLOB_VERSION = 2u;
+static constexpr uint32_t ALGO_BLOB_VERSION = 3u;
 
 std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
     // Pre-compute json string
@@ -202,7 +202,7 @@ bool algorithm_summary_deserialize(const std::string& blob, AlgorithmSummaryResu
 
     if (r.u32() != ALGO_BLOB_MAGIC) return false;
     uint32_t version = r.u32();
-    if (version != 1u && version != 2u) return false;
+    if (version != ALGO_BLOB_VERSION) return false;
 
     if (!r.str(out.summary_text)) return false;
 

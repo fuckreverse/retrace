@@ -2303,6 +2303,7 @@ std::vector<uint64_t> TraceIndex::thread_ids() const {
 
 uint64_t TraceIndex::find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
                                          const TraceReader& reader) const {
+    if (before_id == 0) return UINT64_MAX;
     // ── Fast path: REG_WRITES inverted index ──────────────────────────────
     // Key format: u16(reg_idx) big-endian (2 bytes) + u64(inst_id) big-endian (8 bytes).
     // SeekForPrev on key=(reg, before_id - 1) → largest entry ≤ that key.
@@ -2345,28 +2346,16 @@ uint64_t TraceIndex::find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
         }
 
         // No writer found in index
-        return 0;
+        return UINT64_MAX;
     }
 
     // ── Fallback: linear scan (old index without REG_WRITES CF) ──────────
-    // Limit scan to the last 50K instructions to bound worst-case cost.
-    uint64_t scan_start = (before_id > 50000) ? before_id - 50000 : 0;
-    uint64_t start_offset = 0;
-    if (scan_start > 0) {
-        start_offset = offset_of(scan_start, reader);
-    }
-
-    uint64_t last_writer_id = 0;
-    uint64_t inst_id = scan_start;
-
-    auto it_start = (start_offset > 0)
-        ? TraceReader::Iterator(&reader, start_offset)
-        : reader.begin();
-
-    for (auto it = it_start; it != reader.end(); ++it) {
+    // Scan the complete prefix: a distance cap would silently omit valid writers.
+    uint64_t last_writer_id = UINT64_MAX;
+    uint64_t inst_id = 0;
+    for (auto it = reader.begin(); it != reader.end(); ++it) {
         auto rec = *it;
         if (rec.kind != RecordKind::Inst) continue;
-        inst_id++;
         if (inst_id >= before_id) break;
         auto inst = rec.as_inst();
         for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
@@ -2375,6 +2364,7 @@ uint64_t TraceIndex::find_last_writer_of(uint8_t reg_idx, uint64_t before_id,
                 last_writer_id = inst_id;
             }
         }
+        inst_id++;
     }
     return last_writer_id;
 }

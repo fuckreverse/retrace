@@ -477,3 +477,68 @@ TEST_CASE("LoopPass no loops in linear trace", "[unit][pass][loop]") {
         REQUIRE(lr.max_nesting_depth == 0);
     }
 }
+
+TEST_CASE("LoopPass uses executed entry instead of lowest address",
+          "[unit][pass][loop][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        // The low-address exit executes last, and cannot reach the loop.
+        tw.emit(ms, 0x1000, enc::b(0x10), {{33, tw.rt(0x1010)}}, {});
+        for (int i = 0; i < 3; ++i) {
+            tw.emit(ms, 0x1010, enc::add_imm(0, 0, 1), {{0, uint64_t(i+1)}, {33, tw.rt(0x1014)}}, {});
+            tw.emit(ms, 0x1014, enc::b_ge(0x800 - 0x1014),
+                    {{33, tw.rt(i == 2 ? 0x800 : 0x1010)}}, {}, i == 2 ? 0x6 : 0x8);
+        }
+        tw.emit(ms, 0x800, enc::ret(), {{33, 0}}, {});
+        tw.emit_anchor(ms);
+    }, "loop_high_entry");
+    REQUIRE(env);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::make_unique<CFGPass>());
+    pm->register_pass(std::make_unique<LoopPass>());
+    const auto& raw = pm->require("loop");
+    REQUIRE(raw.ok());
+    const auto& result = raw.get<LoopResult>();
+    REQUIRE(result.loops.size() == 1);
+    REQUIRE(result.loops.front().header_pc == env->reader->header().module_slide + 0x1010);
+    const auto& body = result.loops.front().body_pcs;
+    REQUIRE(std::find(body.begin(), body.end(), env->reader->header().module_slide + 0x800) == body.end());
+}
+
+TEST_CASE("LoopPass finds loops in disconnected executed components",
+          "[unit][pass][loop][regression]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        for (uint64_t pc : {0x2000ULL, 0x2004ULL, 0x1000ULL, 0x1004ULL})
+            tw.emit(ms, pc, enc::nop(), {}, {});
+        tw.emit_anchor(ms);
+    }, "loop_disconnected");
+    REQUIRE(env);
+    struct GraphPass final : AnalysisPass {
+        CFGResult graph;
+        std::string_view name() const override { return "cfg"; }
+        std::string_view description() const override { return "synthetic disconnected CFG"; }
+        std::vector<std::string_view> dependencies() const override { return {"xref"}; }
+        PassResult run(PassContext&) override { return PassResult::success(graph); }
+    };
+    auto graph = std::make_unique<GraphPass>();
+    const uint64_t slide = env->reader->header().module_slide;
+    for (auto pc : {0x1000ULL, 0x1004ULL, 0x2000ULL, 0x2004ULL}) {
+        BasicBlock block{};
+        block.start_pc = block.end_pc = slide + pc;
+        block.instructions.push_back(slide + pc);
+        graph->graph.blocks.emplace(slide + pc, block);
+    }
+    for (uint64_t base : {0x1000ULL, 0x2000ULL}) {
+        graph->graph.edges.push_back({slide + base, slide + base + 4, 1, false});
+        graph->graph.edges.push_back({slide + base + 4, slide + base, 1, false});
+    }
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<XrefPass>());
+    pm->register_pass(std::move(graph));
+    pm->register_pass(std::make_unique<LoopPass>());
+    const auto& raw = pm->require("loop");
+    REQUIRE(raw.ok());
+    REQUIRE(raw.get<LoopResult>().loops.size() == 2);
+}

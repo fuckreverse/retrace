@@ -344,8 +344,17 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
                 if (mem.type & 2) {  // write
-                    if (triton->is_memory_tainted(mem.addr, mem.size)) {
-                        result.tainted_memory.add(mem.addr);
+                    bool any_byte_tainted = false;
+                    for (uint64_t off = 0; off < mem.size && off <= UINT64_MAX - mem.addr; ++off) {
+                        const auto addr = mem.addr + off;
+                        if (triton->is_memory_tainted(addr, 1)) {
+                            result.tainted_memory.add(addr);
+                            any_byte_tainted = true;
+                        } else {
+                            result.tainted_memory.remove(addr);
+                        }
+                    }
+                    if (any_byte_tainted) {
 
                         PropagationStep step;
                         step.inst_id = inst_id;
@@ -434,7 +443,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         // are NOT currently tainted, AND it doesn't read any tainted register,
         // we can skip it. We only skip if the PC doesn't touch any tainted
         // register at all — conservative w.r.t. kill semantics.
-        if (use_learned_map) {
+        if (use_learned_map && inst.mem_access_count == 0) {
             auto pcwr_it = pc_to_written_regs->find(inst.pc);
             if (pcwr_it != pc_to_written_regs->end()) {
                 uint64_t written_mask = pcwr_it->second;
@@ -574,8 +583,12 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
                 auto mem = inst.mem_access(m);
                 if (mem.type & 2) {  // write
-                    if (any_src_tainted) {
-                        result.tainted_memory.add(mem.addr);
+                    const bool tainted = any_src_tainted || mem_source_tainted;
+                    for (uint64_t off = 0; off < mem.size && off <= UINT64_MAX - mem.addr; ++off) {
+                        if (tainted) result.tainted_memory.add(mem.addr + off);
+                        else result.tainted_memory.remove(mem.addr + off);
+                    }
+                    if (tainted) {
 
                         PropagationStep step;
                         step.inst_id = inst_id;

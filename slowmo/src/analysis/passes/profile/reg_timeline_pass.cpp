@@ -171,7 +171,7 @@ PassResult run_indexed_single_reg(PassContext& ctx, const RegTimelineConfig& cfg
     ctx.progress(0.0f, "RegTimeline: walking REG_WRITES index...");
 
     // Walk backwards from `end`, collecting write points, then reverse.
-    // We stop once find_last_writer_of() returns 0 (no earlier writer) or
+    // We stop once find_last_writer_of() returns UINT64_MAX (no earlier writer) or
     // the writer falls before `start`.
     struct RawWrite { uint64_t inst_id; uint64_t pc; uint64_t new_value; };
     std::vector<RawWrite> writes;
@@ -185,36 +185,9 @@ PassResult run_indexed_single_reg(PassContext& ctx, const RegTimelineConfig& cfg
     const uint64_t total_span = (end > start) ? (end - start) : 1;
     uint64_t iterations = 0;
 
-    // NOTE on the inst_id==0 ambiguity: find_last_writer_of() returns 0 both
-    // to mean "no earlier writer exists" AND as a legitimately valid inst_id
-    // (the very first instruction in the trace, when trace indexing is
-    // 0-based). We disambiguate below by explicitly checking whether
-    // instruction 0 itself wrote `target` before treating a 0 return as
-    // "search exhausted".
-    bool checked_inst_zero = (start > 0);  // no need to special-case if start > 0
     while (cursor > start) {
         uint64_t writer_id = index.find_last_writer_of(target, cursor, reader);
-
-        if (writer_id == 0) {
-            // Ambiguous: could be "not found" or "found at inst_id 0".
-            // Resolve by directly inspecting instruction 0 (only once).
-            if (!checked_inst_zero) {
-                checked_inst_zero = true;
-                auto off0 = index.offset_of_with_pc(0, reader);
-                auto rec0 = reader.record_at(off0.offset, off0.seed_pc);
-                if (rec0.kind == RecordKind::Inst) {
-                    auto inst0 = rec0.as_inst();
-                    for (uint8_t d = 0; d < inst0.reg_diff_count; d++) {
-                        auto diff = inst0.reg_diff(d);
-                        if (diff.index == target) {
-                            writes.push_back({0, inst0.pc, diff.value});
-                            break;
-                        }
-                    }
-                }
-            }
-            break;
-        }
+        if (writer_id == UINT64_MAX) break;
         if (writer_id < start) break;
 
         // Resolve the instruction at writer_id to get its PC and the new

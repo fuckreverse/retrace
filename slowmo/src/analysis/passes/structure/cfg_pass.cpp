@@ -39,7 +39,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t CFG_BLOB_MAGIC   = 0x43464700u;  // "CFG\0"
-static constexpr uint32_t CFG_BLOB_VERSION = 1u;
+static constexpr uint32_t CFG_BLOB_VERSION = 2u;
 
 std::string cfg_serialize(const CFGResult& res) {
     ByteWriter w;
@@ -290,6 +290,17 @@ bool CFGPass::build_blocks(PassContext& ctx) {
         block_leaders.insert(sorted_pcs[0]);
     }
 
+    // The trace can begin inside an address-sorted instruction run.
+    const auto first_offset = ctx.index().offset_of_with_pc(ctx.range().start_inst_id, ctx.reader());
+    const auto first_record = ctx.reader().record_at(first_offset.offset, first_offset.seed_pc);
+    if (first_record.kind == RecordKind::Inst && xref->has_pc(first_record.as_inst().pc))
+        block_leaders.insert(first_record.as_inst().pc);
+    // Runtime targets include indirect branches and returns, whose targets
+    // cannot be recovered from the branch encoding alone.
+    for (const auto& transition : xref->pc_transitions) {
+        if (xref->has_pc(transition.to_pc)) block_leaders.insert(transition.to_pc);
+    }
+
     // Cache: PC → TerminatorKind for instructions that are terminators.
     ankerl::unordered_dense::map<uint64_t, TerminatorKind> terminator_cache;
 
@@ -337,7 +348,8 @@ bool CFGPass::build_blocks(PassContext& ctx) {
     };
 
     for (uint64_t pc : sorted_pcs) {
-        if (block_leaders.count(pc)) {
+        if (!in_block || block_leaders.count(pc) ||
+            pc - current_block.end_pc != 4 || terminator_cache.count(current_block.end_pc)) {
             if (in_block) {
                 finalize_block(current_block);
             }

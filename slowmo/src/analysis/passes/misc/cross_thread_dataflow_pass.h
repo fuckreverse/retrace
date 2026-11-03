@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/pass_manager.h"
+#include "common/memory_ranges.h"
 #include "analysis/trace_collector.h"
 #include "common/dataflow_types.h"
 #include <cstdint>
@@ -63,15 +64,14 @@ struct CrossThreadDataflowResult {
 // ─── Config ────────────────────────────────────────────────────────────────
 
 struct CrossThreadDataflowConfig {
-    /// Cap on distinct tracked addresses (memory). Once exceeded, new
-    /// addresses are ignored (bounds RAM on huge traces). 0 = no cap.
+    /// Cap on tracked disjoint memory intervals. Once exceeded, new
+    /// intervals are ignored; overlapping stale bytes are invalidated. 0 = no cap.
     uint64_t max_tracked_addrs = 1u << 20;  // 1M
 
     /// Cap on emitted edges. Scanning stops adding hand-offs once reached.
     uint64_t max_edges = 1u << 20;  // 1M
 
-    /// Minimum access size granularity: accesses are matched byte-exact via
-    /// per-address page map; no configuration needed beyond the caps.
+    /// Reads match all overlapping written byte intervals, including offset reads.
 };
 
 // ─── CrossThreadDataflowPass ───────────────────────────────────────────────
@@ -119,10 +119,7 @@ private:
     // Collector state (built during the unified scan). Defined inline so the
     // unique_ptr destructor instantiated in other TUs sees a complete type.
     struct Collector final : public TraceCollector {
-        // Per-address write state. Addresses are tracked exactly; overlapping
-        // accesses (different base addresses covering the same byte) are
-        // treated as separate locations — matching MemoryModel's coarse
-        // granularity is unnecessary for hand-off detection.
+        // Each disjoint interval carries the last writer of its bytes.
         struct AddrState {
             uint64_t writer_inst = 0;
             uint64_t writer_thread = 0;
@@ -155,7 +152,7 @@ private:
         CrossThreadDataflowResult result;
         uint64_t cur_thread = 0;
 
-        ankerl::unordered_dense::map<uint64_t, AddrState> addrs;
+        MemoryRanges<AddrState> addrs;
     };
 
     std::unique_ptr<Collector> collector_;

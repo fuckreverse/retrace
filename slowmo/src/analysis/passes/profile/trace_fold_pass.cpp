@@ -34,7 +34,7 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t TFLD_BLOB_MAGIC   = 0x54464C44u;  // "TFLD"
-static constexpr uint32_t TFLD_BLOB_VERSION = 2u;
+static constexpr uint32_t TFLD_BLOB_VERSION = 3u;
 
 std::string trace_fold_serialize(const TraceFoldResult& res) {
     ByteWriter w;

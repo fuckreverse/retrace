@@ -58,6 +58,7 @@ function(tenet_add_test target_name source_file)
 endfunction()
 
 # ─── Unit tests: core layer ─────────────────────────────────────────────────
+tenet_add_test(test_common_memory_ranges unit/test_common_memory_ranges.cpp)
 tenet_add_test(test_common_lru_cache       unit/test_common_lru_cache.cpp)
 tenet_add_test(test_common_progress_manager unit/test_common_progress_manager.cpp)
 tenet_add_test(test_io_trace_reader        unit/test_io_trace_reader.cpp)
