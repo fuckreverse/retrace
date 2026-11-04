@@ -654,3 +654,29 @@ TEST_CASE("TraceDiff: empty trace_b_path = same-trace mode", "[unit][pass][trace
         REQUIRE(td.has_divergence());
     }
 }
+
+TEST_CASE("TraceDiff compares memory access type and size", "[unit][pass][trace_diff]") {
+    for (bool change_type : {false, true}) {
+        auto env = make_env([change_type](TraceWriter& tw) {
+            tw.write_header();
+            MachineState ms;
+            for (int i = 0; i < 2; ++i) {
+                const uint8_t type = (i && change_type) ? 2 : 1;
+                const uint8_t size = (i && !change_type) ? 4 : 8;
+                tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}},
+                        {{type, size, 0x9000, 7}});
+            }
+        }, "td_memory_kind");
+        REQUIRE(env != nullptr);
+        auto pm = make_pm(*env);
+        TraceDiffConfig cfg;
+        cfg.trace_a_end = 1;
+        cfg.trace_b_start = 1;
+        cfg.trace_b_end = 2;
+        pm->register_pass(std::make_unique<TraceDiffPass>(cfg));
+        const auto& r = pm->require("trace_diff").get<TraceDiffResult>();
+        REQUIRE(r.segments.size() == 1);
+        REQUIRE(r.segments.front().start_type == DiffType::MemoryValue);
+        REQUIRE(r.segments.front().start_detail.find(change_type ? "type=" : "size=") != std::string::npos);
+    }
+}

@@ -714,10 +714,16 @@ return rv;
 
         // Constructor with a pre-seeded `current_pc` for v5 mid-stream seek.
         Iterator(const TraceReader* reader, uint64_t offset, uint64_t seed_pc)
-            : reader_(reader), offset_(offset), current_pc_(seed_pc) {
+            : reader_(reader), offset_(offset), current_pc_(seed_pc), seed_offset_(offset), resolved_seed_(true) {
             // Random-access callers without a thread identity retain the
             // legacy tid=0 behavior. Thread-aware offset lookup supplies its
             // own seed through a sequential iterator at a THREAD boundary.
+            thread_pcs_.emplace(0, seed_pc);
+        }
+
+        Iterator(const TraceReader* reader, uint64_t offset, uint64_t seed_pc,
+                 const ThreadReader* thread_reader)
+            : reader_(reader), offset_(offset), current_pc_(seed_pc), seed_offset_(offset), resolved_seed_(true), thread_reader_(thread_reader) {
             thread_pcs_.emplace(0, seed_pc);
         }
 
@@ -757,6 +763,9 @@ return rv;
         uint64_t current_thread_id() const { return current_thread_id_; }
 
     private:
+        uint64_t seed_offset_ = UINT64_MAX;
+        mutable bool resolved_seed_ = false;
+        mutable uint64_t decoded_offset_ = UINT64_MAX;
         mutable std::unordered_map<uint64_t, uint64_t> thread_pcs_;
         const ThreadReader* thread_reader_ = nullptr;
     };

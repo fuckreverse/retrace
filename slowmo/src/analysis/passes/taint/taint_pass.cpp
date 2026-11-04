@@ -1,6 +1,7 @@
 #include "common/compiler_compat.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/taint_common.h"
+#include "analysis/control_dependencies.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "io/trace_reader.h"
 #include "io/index_builder.h"
@@ -21,6 +22,10 @@ namespace tenet {
 static void emit_step(TaintResult& result, const TaintConfig& config,
                       PropagationStep step) {
     uint64_t inst_id = step.inst_id;
+    if (!result.compact_navigation && result.steps.size() + result.events.size() >= 65536) {
+        result.compact_navigation = true;
+        result.inst_id_to_event.clear(); result.inst_id_to_steps.clear();
+    }
 
     // Always record in tainted_inst_ids
     result.tainted_inst_ids.add(inst_id);
@@ -32,17 +37,18 @@ static void emit_step(TaintResult& result, const TaintConfig& config,
         legacy.pc = step.pc;
         legacy.dst_reg = step.dst_reg;
         legacy.src_reg_mask = step.src_reg_mask;
+        legacy.src_simd_mask = step.src_simd_mask;
         legacy.is_memory_source = (step.type == PropagationType::MemToReg ||
                                    step.type == PropagationType::MemToMem);
         legacy.is_memory_sink = (step.type == PropagationType::RegToMem ||
                                  step.type == PropagationType::MemToMem);
-        result.inst_id_to_event[inst_id] = result.events.size();
+        if (!result.compact_navigation) result.inst_id_to_event[inst_id] = result.events.size();
         result.events.push_back(std::move(legacy));
     }
 
     // Emit detailed PropagationStep
     if (config.emit_propagation_steps) {
-        result.inst_id_to_steps[inst_id].push_back(result.steps.size());
+        if (!result.compact_navigation) result.inst_id_to_steps[inst_id].push_back(result.steps.size());
         result.steps.push_back(std::move(step));
     }
 }
@@ -129,7 +135,7 @@ static PassResult run_taint_scan_common(PassContext& ctx, const TaintConfig& con
 
     uint64_t start = config.source_inst_id > 0 ? config.source_inst_id : range.start_inst_id;
     uint64_t end = std::min(range.end_inst_id, index.inst_count());
-    if (end == 0) end = index.inst_count();
+    if (start > end) return PassResult::failed("Taint source is outside analysis range");
 
     // Pre-build stop_pc set for O(1) lookup in the hot loop
     ankerl::unordered_dense::set<uint64_t> stop_pc_set(config.stop_pcs.begin(),
@@ -137,8 +143,19 @@ static PassResult run_taint_scan_common(PassContext& ctx, const TaintConfig& con
 
     TaintResult result;
     result.config = config;
+    result.events.set_resident_budget(ctx.memory_budget_bytes() / 4);
+    result.steps.set_resident_budget(ctx.memory_budget_bytes() / 4);
+    result.quality.engine = method_label;
     result.tainted_regs = config.source_regs;
+    result.tainted_simd = config.include_simd ? config.source_simd_regs : 0;
+    result.thread_taint[index.thread_at(start)] = {result.tainted_regs, result.tainted_simd};
 
+    std::unique_ptr<ControlDependencies> control;
+    roaring::Roaring64Map tainted_branches;
+    if (config.include_control) {
+        control = std::make_unique<ControlDependencies>(ctx);
+        result.quality.unresolved_control_joins = control->unresolved_joins;
+    }
     // Initialize tainted memory from config
     for (uint64_t addr : config.source_mem_addrs) {
         result.tainted_memory.add(addr);
@@ -148,15 +165,15 @@ static PassResult run_taint_scan_common(PassContext& ctx, const TaintConfig& con
     uint64_t total = end - start;
 
     // Seek directly to start position using index (avoid scanning prefix)
-    uint64_t start_offset = 0;
+    uint64_t start_offset = 0, seed_pc = 0;
     uint64_t scan_inst_id = 0;
     if (start > 0) {
         auto [off, pc] = index.offset_of_with_pc(start, reader);
-        start_offset = off;
+        start_offset = off; seed_pc = pc;
         scan_inst_id = start;
     }
 
-    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset, seed_pc) : reader.begin();
     uint64_t inst_id = scan_inst_id;
 
     // Hint to the OS that we'll be reading sequentially (improves mmap readahead)
@@ -167,22 +184,49 @@ static PassResult run_taint_scan_common(PassContext& ctx, const TaintConfig& con
         if (rec.kind != RecordKind::Inst) continue;
 
         auto inst = rec.as_inst();
+        const auto tid = index.thread_at(inst_id);
+        auto& thread = result.thread_taint[tid];
+        result.tainted_regs = thread.gpr; result.tainted_simd = thread.simd;
 
         // ─── Stop condition check ─────────────────────────────────────
         auto stop = check_stop_conditions(result, stop_pc_set, inst.pc, processed,
                                            config.max_instructions, config.max_taint_width);
         if (!stop.empty()) {
             result.stop_reason = std::move(stop);
+            result.quality.truncated = true;
+            result.quality.termination_reason = result.stop_reason;
             break;
         }
 
-        if (ctx.cancelled()) {
-            result.stop_reason = "cancelled by user";
+        if (ctx.cancelled() || ((processed & 4095) == 0 && ctx.memory_pressure())) {
+            result.stop_reason = ctx.cancelled() ? "cancelled by user" : "RSS limit exceeded";
+            result.quality.truncated = true;
+            result.quality.termination_reason = result.stop_reason;
             break;
         }
 
+        result.active_control_inst = UINT64_MAX;
+        if (control && inst_id < control->parents.size()) {
+            const auto parent = control->parents[inst_id];
+            if (parent != UINT64_MAX && tainted_branches.contains(parent)) result.active_control_inst = parent;
+            if (control->branch(inst.pc)) {
+                const auto d = ctx.decoder().decode(inst.pc, ctx.code_table());
+                uint64_t sources = 0;
+                if (d) for (uint8_t i = 0; i < d->regs_read_count; ++i)
+                    if (result.is_tainted(d->regs_read[i])) sources |= 1ULL << d->regs_read[i];
+                if (sources || result.active_control_inst != UINT64_MAX) {
+                    tainted_branches.add(inst_id);
+                    PropagationStep step; step.inst_id = inst_id; step.pc = inst.pc;
+                    step.type = PropagationType::Control; step.src_reg_mask = sources;
+                    step.control_inst_id = result.active_control_inst;
+                    emit_step(result, config, std::move(step));
+                }
+            }
+        }
         // ─── Per-instruction taint update (engine-specific) ────────────
+        ++result.quality.instructions_examined;
         bool skipped = step_fn(inst, inst_id, result);
+        thread.gpr = result.tainted_regs; thread.simd = result.tainted_simd;
         if (skipped) {
             result.instructions_skipped_xref++;
         }
@@ -252,6 +296,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         // Get opcode bytes from code table
         auto opcode_opt = code_table.opcode_at(inst.pc);
         if (!opcode_opt) {
+            ++result.quality.missing_code;
             return false;
         }
 
@@ -287,6 +332,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
         // Process instruction through Triton's taint engine
         bool ok = triton->process_instruction(inst.pc, opcode_bytes, 4);
         if (!ok) {
+            ++result.quality.undecoded_instructions;
             return false;
         }
 
@@ -360,6 +406,7 @@ static PassResult run_triton_taint(PassContext& ctx, const TaintConfig& config) 
                         step.inst_id = inst_id;
                         step.pc = inst.pc;
                         step.type = PropagationType::RegToMem;
+                        step.control_inst_id = result.active_control_inst;
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
                         step.triton_resolved = true;
@@ -425,16 +472,21 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
     auto step_fn = [pc_to_written_regs, use_learned_map, &config, &ctx](
                        const InstView& inst, uint64_t inst_id, TaintResult& result) -> bool {
         const auto info = classify_inst_heuristic(inst, ctx.decoder(), ctx.code_table());
+        result.quality.missing_code += info.missing_code;
+        result.quality.undecoded_instructions += info.undecoded;
+        result.quality.unsupported_register_instructions += info.unsupported_registers ||
+            (!config.include_simd && (info.simd_reads || info.simd_writes));
         const uint64_t taint_before = result.tainted_regs;
         uint64_t read_mask = 0;
         for (uint8_t i = 0; i < info.n_read; i++) {
-            read_mask |= 1ULL << info.read_regs[i];
+            if (info.read_regs[i] != IDX_NZCV || config.include_flags)
+                read_mask |= 1ULL << info.read_regs[i];
         }
 
         // ─── XRef acceleration: skip if instruction cannot affect taint ─
         // Quick check: a pure control-flow instruction (B, NOP) with no
         // reg_diffs and no mem_accesses cannot propagate taint → skip.
-        if (inst.reg_diff_count == 0 && inst.mem_access_count == 0) {
+        if (info.n_written == 0 && info.simd_writes == 0 && inst.mem_access_count == 0) {
             return true;  // skipped
         }
 
@@ -443,7 +495,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         // are NOT currently tainted, AND it doesn't read any tainted register,
         // we can skip it. We only skip if the PC doesn't touch any tainted
         // register at all — conservative w.r.t. kill semantics.
-        if (use_learned_map && inst.mem_access_count == 0) {
+        if (result.active_control_inst == UINT64_MAX && use_learned_map && inst.mem_access_count == 0 && info.simd_reads == 0 && info.simd_writes == 0) {
             auto pcwr_it = pc_to_written_regs->find(inst.pc);
             if (pcwr_it != pc_to_written_regs->end()) {
                 uint64_t written_mask = pcwr_it->second;
@@ -470,16 +522,16 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
 
         // ─── Learn which registers this PC writes ─────────────────────
         uint64_t& written_mask = (*pc_to_written_regs)[inst.pc];
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            written_mask |= (1ULL << inst.reg_diff(i).index);
-        }
+        for (uint8_t i = 0; i < info.n_written; i++)
+            written_mask |= 1ULL << info.written_regs[i];
 
         // ─── Determine which source registers are tainted ─────────────
         // Read the pre-instruction snapshot so writes to one destination do
         // not become inputs to another destination of the same instruction.
         const uint64_t source_mask = info.has_decoded_operands
             ? (taint_before & read_mask) : taint_before;
-        bool any_src_tainted = source_mask != 0;
+        const uint32_t simd_sources = config.include_simd ? (result.tainted_simd & (info.has_decoded_operands ? info.simd_reads : UINT32_MAX)) : 0;
+        bool any_src_tainted = source_mask != 0 || simd_sources != 0 || result.active_control_inst != UINT64_MAX;
         // Check memory sources — overlap-aware, so a read that partially
         // overlaps a previously-tainted store is still recognized (this
         // matches BackwardTaintPass's memory-overlap semantics rather than
@@ -501,12 +553,11 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
         }
 
         // ─── Process each written register ────────────────────────────
-        for (uint8_t i = 0; i < inst.reg_diff_count; i++) {
-            auto diff = inst.reg_diff(i);
-            uint8_t reg_idx = diff.index;
+        for (uint8_t i = 0; i < info.n_written; i++) {
+            uint8_t reg_idx = info.written_regs[i];
 
             // Skip SP/PC/NZCV unless explicitly included
-            if (reg_idx == IDX_NZCV) continue;
+            if (reg_idx == IDX_NZCV && !config.include_flags) continue;
             if (reg_idx == IDX_SP) continue;
             if (reg_idx == IDX_PC) continue;
 
@@ -516,13 +567,16 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             // If a register is overwritten and NONE of its sources are
             // tainted, it becomes untainted (killed).
             bool has_tainted_input = false;
+            const bool writeback = info.has_decoded_operands && reg_idx == info.writeback_reg;
+            const uint64_t reg_sources = writeback ? (taint_before & info.writeback_reads) : source_mask;
+            const bool memory_input = !writeback && mem_source_tainted;
 
             if (info.has_decoded_operands) {
-                has_tainted_input = source_mask != 0;
+                has_tainted_input = reg_sources != 0 || (!writeback && simd_sources != 0) || result.active_control_inst != UINT64_MAX;
             } else {
                 // With no opcode, preserve the conservative reg_diff fallback.
                 for (uint8_t j = 0; j < inst.reg_diff_count; j++) {
-                    if (i == j) continue;
+                    if (inst.reg_diff(j).index == reg_idx) continue;
                     if ((taint_before >> inst.reg_diff(j).index) & 1) {
                         has_tainted_input = true;
                         break;
@@ -531,8 +585,9 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                 if (was_tainted) has_tainted_input = true;
             }
 
+            if (!writeback && simd_sources) has_tainted_input = true;
             // Memory source contributes taint
-            if (!has_tainted_input && mem_source_tainted) {
+            if (!has_tainted_input && memory_input) {
                 has_tainted_input = true;
             }
 
@@ -543,17 +598,19 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                     PropagationStep step;
                     step.inst_id = inst_id;
                     step.pc = inst.pc;
+                    step.control_inst_id = result.active_control_inst;
                     step.dst_reg = reg_idx;
                     step.triton_resolved = false;
 
-                    if (mem_source_tainted && !any_src_tainted) {
+                    if (memory_input && reg_sources == 0 && simd_sources == 0) {
                         step.type = PropagationType::MemToReg;
                         for (uint8_t mi = 0; mi < n_tainted_mem; mi++)
                             step.add_src_mem(tainted_mem_sources[mi]);
                     } else {
                         step.type = PropagationType::RegToReg;
-                        step.src_reg_mask = source_mask;
-                        if (mem_source_tainted) {
+                        step.src_reg_mask = reg_sources;
+                        step.src_simd_mask = writeback ? 0 : simd_sources;
+                        if (memory_input) {
                             for (uint8_t mi = 0; mi < n_tainted_mem; mi++)
                                 step.add_src_mem(tainted_mem_sources[mi]);
                         }
@@ -578,6 +635,23 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
             }
         }
 
+        if (config.include_simd) for (uint32_t bits = info.simd_writes; bits; bits &= bits - 1) {
+            const uint8_t reg = static_cast<uint8_t>(tenet::platform::trailing_zeros(bits));
+            const uint32_t bit = uint32_t(1) << reg;
+            const bool was = (result.tainted_simd & bit) != 0;
+            const bool now = any_src_tainted || mem_source_tainted;
+            if (now) result.tainted_simd |= bit; else result.tainted_simd &= ~bit;
+            if ((!was && now) || (was && !now && config.emit_kill_events)) {
+                PropagationStep step; step.inst_id = inst_id; step.pc = inst.pc; step.dst_reg = 34 + reg;
+                step.control_inst_id = result.active_control_inst;
+                step.type = !now ? PropagationType::Kill : (mem_source_tainted ? PropagationType::MemToReg : PropagationType::RegToReg);
+                step.src_reg_mask = source_mask; step.src_simd_mask = simd_sources;
+                if (mem_source_tainted) for (uint8_t m = 0; m < n_tainted_mem; ++m) step.add_src_mem(tainted_mem_sources[m]);
+                if (!now) ++result.kill_events_count;
+                emit_step(result, config, std::move(step));
+            }
+        }
+
         // ─── Memory sinks (RegToMem) ─────────────────────────────────
         if (config.track_memory_sinks && inst.mem_access_count > 0) {
             for (uint8_t m = 0; m < inst.mem_access_count; m++) {
@@ -597,6 +671,7 @@ static PassResult run_heuristic_taint(PassContext& ctx, const TaintConfig& confi
                         step.dst_mem_addr = mem.addr;
                         step.dst_mem_size = static_cast<uint8_t>(mem.size);
                         step.src_reg_mask = source_mask;
+                        step.src_simd_mask = simd_sources;
                         step.triton_resolved = false;
                         emit_step(result, config, std::move(step));
                     }
@@ -636,7 +711,7 @@ PassResult TaintPass::run(PassContext& ctx) {
 #ifdef TENET_HAS_TRITON
     {
         auto probe = create_triton_bridge();
-        if (probe->is_available()) {
+        if (probe->is_available() && !config_.include_flags && !config_.include_simd && ctx.index().thread_ids().size() <= 1) {
             return run_triton_taint(ctx, config_);
         }
     }

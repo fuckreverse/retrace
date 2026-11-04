@@ -5,6 +5,7 @@
 #include "io/trace_reader.h"
 #include <vector>
 #include <string_view>
+#include <string>
 #include <functional>
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,9 @@ class TraceIndex;  // forward declaration
 class TraceCollector {
 public:
     virtual ~TraceCollector() = default;
+    virtual void abort() noexcept {}
+    virtual size_t resident_bytes() const { return 0; }
+    virtual void set_memory_budget(size_t) {}
 
     /// Called once before the scan starts. Return false to skip this collector.
     virtual bool begin(uint64_t start_inst_id, uint64_t end_inst_id) {
@@ -155,7 +159,14 @@ public:
         std::sort(include_thread_ids_.begin(), include_thread_ids_.end());
     }
 
+    void set_memory_limits(double rss_mb, size_t collector_bytes) {
+        rss_limit_mb_ = rss_mb; collector_budget_ = collector_bytes;
+    }
+    const std::string& error() const { return error_; }
 private:
+    double rss_limit_mb_ = 0;
+    size_t collector_budget_ = 0;
+    std::string error_;
     /// Check if a PC is in any excluded range. Inline for hot-path performance.
     bool is_pc_excluded(uint64_t pc) const {
         for (const auto& [start, end] : exclude_pc_ranges_) {

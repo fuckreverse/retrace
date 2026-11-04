@@ -1,4 +1,5 @@
 #pragma once
+#include "common/chunked_vector.h"
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
@@ -47,6 +48,7 @@ struct XrefBitmapLoader {
 
     std::filesystem::path  path;          // xref_bitmaps.bin path
     std::vector<Entry>     table;         // loaded offset table, sorted by pc
+    std::shared_ptr<void> scratch_owner; // keeps non-persistent streamed indexes alive
     bool                   valid = false; // true if file exists and table loaded
 
     /// Try to open and parse the offset table from the file.
@@ -112,7 +114,7 @@ struct XrefResult {
     /// Non-sequential PC transitions observed during scan.
     /// Transient — NOT serialized; empty when loaded from cache.
     /// When non-empty, CFGPass builds edges from this without its own scan.
-    std::vector<PCTransition> pc_transitions;
+    ChunkedVector<PCTransition> pc_transitions;
 
     /// Lazy loader for full-trace results (non-null = use file-backed storage).
     std::shared_ptr<XrefBitmapLoader> lazy_loader;

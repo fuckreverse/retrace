@@ -290,6 +290,9 @@ private:
     mutable std::mutex session_state_mutex_;
     std::unordered_map<std::string, std::string> session_default_instance_;
 
+    // Serialize configured taint queries while checking/replacing cached
+    // results; background execution itself remains non-blocking.
+    std::mutex taint_config_mutex_;
     std::atomic<int> tool_call_count_{0};
 
     HypothesisLedger ledger_;

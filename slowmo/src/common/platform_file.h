@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdio>
+#include <cstdint>
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
@@ -16,6 +17,15 @@
 #include <unistd.h>
 #endif
 namespace tenet::platform {
+inline int seek_file(FILE* file, uint64_t offset) {
+    if (offset > uint64_t(INT64_MAX)) { errno = EOVERFLOW; return -1; }
+#if defined(_WIN32)
+    return ::_fseeki64(file, static_cast<__int64>(offset), SEEK_SET);
+#else
+    return ::fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+#endif
+}
+
 inline FILE* open_file(const std::filesystem::path& path, const char* mode) {
 #if defined(_WIN32)
     std::wstring wide_mode(mode, mode + std::char_traits<char>::length(mode));

@@ -109,6 +109,42 @@ flowchart TD
 - 实现在 `TraceScanEngine`（覆盖大多数 pass）和 `XrefPass` 的自定义扫描器中。
 - 典型用法：先录制完整 trace，再在离线分析时逐步排除噪声区间。
 
+### 结果范围与缓存正确性
+
+- `AnalysisRange::is_full_trace()` 仅在指令区间覆盖全 trace，且没有 PC 排除或线程过滤时返回 true。过滤结果不能读取或覆盖全量 persisted cache。
+- 分析缓存使用 `<index_dir>/pass_cache/v3/`。旧目录中的结果可能混入历史过滤结果，因此不自动迁移；首次分析会重算，底层 trace 索引保持可复用。
+- `dataflow_graph` 的寄存器 producer 按 producer thread 隔离，内存 producer 共享；线程切换不构成寄存器依赖。
+- `reg_timeline` 使用零基编号和半开区间 `[start_inst_id, end_inst_id)`。单寄存器和全部寄存器模式遵循同一边界规则，首条旧值包含 anchor 之后的中间写入。MCP 的 `end_inst_id=0` 表示 trace 末尾。
+- 算法汇总仅在结构相同、采样执行区间重叠、producer thread 相同且匹配候选唯一时，把循环证据附加到具名算法；关联不明确时保留独立结构候选。常量及同一指令位置的重复执行不会重复提高对应证据的分数。置信度仍是启发式评分。
+
+### 指令语义与结果质量
+
+`InstructionDecoder` 保留 trace 的 GPR 编号，并额外提供 SIMD 读写掩码：b/h/s/d/q/v 的同编号别名映射到同一 vN。读写集合包含 NZCV、访存基址写回；单 lane 写入保留对旧向量的依赖。比较别名 CMP/CMN/TST 的显式寄存器统一按读取处理，避免底层解码器将操作数误标为目的寄存器。
+
+`dataflow_graph` 支持 GPR 与 SIMD 的寄存器级依赖；图中的编号 0–33 保持原意，34–65 表示 v0–v31。向量依赖是整寄存器粒度，不表示精确 lane/bit 依赖。未知指令保留为不透明 producer，仍使用 trace 中实际记录的寄存器写入和访存，避免把后续读取错误连接到已被覆盖的旧 producer。
+
+前后向污点默认保持 NZCV 排除规则。使用 CLI `--taint-include-flags`（同时适用于 `--taint` 与 `--backward-taint`），或 MCP `taint_forward` / `taint_backward` 的 `include_flags: true`，可开启 CMP→NZCV→CSEL/ADC 等显式数据依赖。该模式使用保守的解码操作数引擎；现有 Triton bridge 的 NZCV 映射不足以承诺精确标志位语义，因此不用于此模式。反向追踪 NZCV 时不使用仅含 reg_diff 的 REG_WRITES 索引跳转。
+
+污点及数据流结果包含 `quality`：引擎、实际检查的指令数、缺码、解码失败、不支持的寄存器语义、截断及原因。统计范围是 `visited_instructions`，不把索引跳过的指令算作已验证；`has_gaps=false` 也不等于位级精确性证明。CLI/MCP（以及前向污点 RPC）输出这些字段，数据流缓存保留同样的质量信息。
+
+前后向污点以 producer thread 隔离寄存器状态，共享内存污点；反向 sink 是半开边界之前的寄存器状态，边界落在线程切换处时使用前一条指令的线程。多线程使用解码操作数引擎，寄存器写索引跳跃仅用于适用的单线程场景。
+
+CLI `--taint-simd` / MCP `include_simd` 开启整向量传播，34–65 对应 v0–v31；MCP 同时接受 v/q/d/sN 名称。向量 lane 写入保留旧值依赖，支持 GPR↔SIMD 及向量内存传播，不承诺 lane/bit 精度。
+
+CLI `--taint-control` / MCP `include_control` 开启动态控制依赖，并自动包含 NZCV。基于观测到的同线程控制流、编码的条件分支两侧及后支配关系建立控制父节点，按线程和调用深度管理作用域。缺少可确认汇合点时延伸到虚拟出口，并增加 `unresolved_control_joins`；这是保守动态模型，不代替完整静态 CFG。结果输出控制来源及反向控制边。
+
+### 大结果与资源控制
+
+默认分析工作预算 64 MiB，CLI `--analysis-memory-mb` 可调整（0 禁用），`--rss-limit-mb` 是可选进程 RSS 停止阈值。预算不是整个进程的硬上限：trace 映射、RocksDB、解码缓存及嵌套对象分配另占内存。RSS 阈值周期检查，可能短时超出。
+
+污点事件、DFG 节点/边、函数事件及字符串写事件采用分块存储；超过 resident prefix 后写匿名临时文件映射，生命周期结束自动清理。大 DFG 使用映射 CSR，污点导航使用排序事件二分查找，避免为每条事件建立额外哈希表。落盘函数结果避免再次构造全量连续序列化缓冲。
+
+xref 先聚合压缩位图，实际缓冲超过预算后使用有界归并排序；位图按 PC 写出、按需加载。受限预算下外部排序可能慢于无限制内存路径，这是明确的内存/时间取舍。取消或扫描预算失败会清理 collector 并标记 Failed，不发布部分成功缓存。启用扫描资源限制时，collector 融合扫描采用顺序路径，避免未受限的并行分片克隆；独立 pass 仍可由调度器并行执行。
+
+反向污点按有界窗口顺序解码后倒序读取，复制记录字节避免依赖压缩块缓存的指针生命周期；密集寄存器写降低索引跳跃频率。v5 稀疏索引 seed 已是完整 PC，不再重复加首条 delta；重复解引用或未解引用即递增也保持 PC 状态。
+
+熵分析使用完整区域直方图，不能平均页面熵；时间线以增量字节更新维护直方图，采样点与 MemoryModel 的半开指令边界一致。区域/时间线工作集超预算时返回明确失败。
+
 ### TraceCollector 接口
 
 Collector 可按记录类型覆写回调：

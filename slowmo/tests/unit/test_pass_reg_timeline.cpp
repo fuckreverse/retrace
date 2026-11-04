@@ -248,3 +248,89 @@ TEST_CASE("RegTimelinePass: empty trace returns empty result",
         REQUIRE(res.write_counts[0] == 0);
     }
 }
+
+TEST_CASE("RegTimeline modes agree on zero-based half-open ranges", "[unit][pass][reg_timeline]") {
+    auto env = make_timeline_trace();
+    REQUIRE(env != nullptr);
+    for (uint64_t start : {0ULL, 2ULL, 3ULL}) {
+        std::vector<RegTimelineEntry> all;
+        for (uint8_t target : {uint8_t(0xff), uint8_t(0)}) {
+            auto pm = make_pm(*env);
+            RegTimelineConfig cfg;
+            cfg.target_reg = target;
+            cfg.start_inst_id = start;
+            cfg.end_inst_id = 4;
+            pm->register_pass(std::make_unique<RegTimelinePass>(cfg));
+            const auto& r = pm->require("reg_timeline").get<RegTimelineResult>();
+            std::vector<RegTimelineEntry> selected;
+            for (const auto& e : r.entries) {
+                REQUIRE(e.inst_id >= start);
+                REQUIRE(e.inst_id < 4);
+                if (e.reg_index == 0) selected.push_back(e);
+            }
+            if (target == 0xff) all = selected;
+            else {
+                REQUIRE(selected.size() == all.size());
+                for (size_t i = 0; i < all.size(); ++i) {
+                    REQUIRE(selected[i].inst_id == all[i].inst_id);
+                    REQUIRE(selected[i].pc == all[i].pc);
+                    REQUIRE(selected[i].old_value == all[i].old_value);
+                    REQUIRE(selected[i].new_value == all[i].new_value);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("RegTimeline first old value includes writes since anchor", "[unit][pass][reg_timeline]") {
+    auto env = make_timeline_trace();
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    RegTimelineConfig cfg;
+    cfg.target_reg = 0;
+    cfg.start_inst_id = 4;
+    pm->register_pass(std::make_unique<RegTimelinePass>(cfg));
+    const auto& r = pm->require("reg_timeline").get<RegTimelineResult>();
+    REQUIRE(r.entries.size() == 1);
+    REQUIRE(r.entries.front().old_value == 0x30);
+}
+
+TEST_CASE("RegTimeline limit returns earliest writes in either mode", "[unit][pass][reg_timeline]") {
+    auto env = make_timeline_trace();
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    RegTimelineConfig cfg;
+    cfg.target_reg = 0;
+    cfg.max_entries = 1;
+    pm->register_pass(std::make_unique<RegTimelinePass>(cfg));
+    const auto& r = pm->require("reg_timeline").get<RegTimelineResult>();
+    REQUIRE(r.entries.size() == 1);
+    REQUIRE(r.entries.front().inst_id == 0);
+}
+
+TEST_CASE("RegTimeline restores thread-local old values after switches", "[unit][pass][reg_timeline]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState a, b;
+        a.x(0) = 10; b.x(0) = 100;
+        tw.emit_thread(100); tw.emit_anchor(a);
+        // The fixture auto-anchor at inst 0 contains post-write values;
+        // use a no-op before testing the first register transition.
+        tw.emit(a, 0x0ffc, enc::nop(), {{33, tw.rt(0x1000)}}, {});
+        tw.emit(a, 0x1000, enc::add_imm(0, 0, 1), {{0, 11}, {33, tw.rt(0x1004)}}, {});
+        tw.emit_thread(200); tw.emit_anchor(b);
+        tw.emit(b, 0x2000, enc::add_imm(0, 0, 1), {{0, 101}, {33, tw.rt(0x2004)}}, {});
+        tw.emit_thread(100); tw.emit_anchor(a);
+        tw.emit(a, 0x1004, enc::add_imm(0, 0, 1), {{0, 12}, {33, tw.rt(0x1008)}}, {});
+    }, "timeline_threads");
+    REQUIRE(env != nullptr);
+    for (uint8_t target : {uint8_t(0xff), uint8_t(0)}) {
+        auto pm = make_pm(*env);
+        RegTimelineConfig cfg; cfg.target_reg = target;
+        pm->register_pass(std::make_unique<RegTimelinePass>(cfg));
+        const auto& r = pm->require("reg_timeline").get<RegTimelineResult>();
+        std::vector<uint64_t> old;
+        for (const auto& e : r.entries) if (e.reg_index == 0) old.push_back(e.old_value);
+        REQUIRE(old == std::vector<uint64_t>{10, 100, 11});
+    }
+}

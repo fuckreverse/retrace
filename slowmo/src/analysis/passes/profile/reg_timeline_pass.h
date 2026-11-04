@@ -12,7 +12,7 @@ namespace tenet {
 struct RegTimelineConfig {
     /// Which register to track (0-33). If 0xFF, track all modified registers.
     uint8_t target_reg = 0xFF;
-    /// Optional range restriction.
+    /// Optional zero-based, half-open instruction range [start, end).
     uint64_t start_inst_id = 0;
     uint64_t end_inst_id = UINT64_MAX;
     /// Maximum number of timeline entries to collect (0 = unlimited).

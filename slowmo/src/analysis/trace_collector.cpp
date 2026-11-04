@@ -1,5 +1,6 @@
 #include "analysis/trace_collector.h"
 #include "io/index_builder.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <thread>
@@ -27,6 +28,7 @@ struct ScanShard {
     uint64_t file_end;
     uint64_t start_inst_id;
     uint64_t end_inst_id;
+    uint64_t seed_thread = 0;
 };
 
 /// Scan a shard and broadcast INST records to a set of collector clones.
@@ -55,7 +57,7 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
     // Thread include filter (multi-thread traces). THREAD records switch the
     // active producer thread; instructions of excluded threads are skipped.
     const bool has_thread_filter = !include_thread_ids.empty();
-    uint64_t cur_thread = 0;
+    uint64_t cur_thread = shard.seed_thread;
 
     while (offset < end_offset) {
         const uint8_t* ptr = thread_reader.data_at(offset);
@@ -157,12 +159,14 @@ void scan_shard_collectors(const ScanShard& shard, uint32_t num_gpr,
 
 uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
     uint64_t end = std::min(end_inst_id, inst_count_);
-    if (end == 0) end = inst_count_;
+    if (start_inst_id >= end) return 0;
 
     // Initialize collectors
     std::vector<TraceCollector*> active;
     active.reserve(collectors_.size());
+    error_.clear();
     for (auto* c : collectors_) {
+        c->set_memory_budget(collector_budget_);
         if (c->begin(start_inst_id, end)) {
             active.push_back(c);
         }
@@ -276,13 +280,26 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
             break;
         }
 
+        if ((inst_id & 1023) == 0) {
+            if (cancel_fn_ && cancel_fn_()) error_ = "trace scan cancelled";
+            if (rss_limit_mb_ > 0 && log::rss_mb() > rss_limit_mb_)
+                error_ = "trace scan exceeded RSS limit";
+            for (auto* c : active) if (collector_budget_ && c->resident_bytes() > collector_budget_)
+                error_ = std::string(c->name()) + ": collector memory budget exceeded";
+            if (!error_.empty()) break;
+        }
         if (cancelled) break;
     }
 
-    // Finalize collectors
+    if (cancelled) error_ = "trace scan cancelled";
+    // Partial collectors must never finalize/persist a successful result.
     for (auto* c : active) {
+        if (!error_.empty()) break;
         c->end();
+        if (rss_limit_mb_ > 0 && log::rss_mb() > rss_limit_mb_) error_ = "trace scan finalization exceeded RSS limit";
+        if (collector_budget_ && c->resident_bytes() > collector_budget_) error_ = std::string(c->name()) + ": finalization memory budget exceeded";
     }
+    if (!error_.empty()) for (auto* c : active) c->abort();
 
     reader_.advise_random();
     return processed;
@@ -291,7 +308,7 @@ uint64_t TraceScanEngine::run(uint64_t start_inst_id, uint64_t end_inst_id) {
 uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst_id,
                                        unsigned num_threads) {
     uint64_t end = std::min(end_inst_id, inst_count_);
-    if (end == 0) end = inst_count_;
+    if (start_inst_id >= end) return 0;
 
     // ─── Classify collectors into parallel vs sequential ──────────────────
     std::vector<TraceCollector*> par_collectors;
@@ -311,7 +328,7 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
     bool is_v8 = (reader_.header().flags & qbditrace::QBDITRACE_HF_CALL_META) != 0;
 
     // Fallback to sequential if: no parallel collectors, no index, small trace, or v5/v7 format
-    if (par_collectors.empty() || index_ == nullptr ||
+    if (rss_limit_mb_ > 0 || collector_budget_ > 0 || par_collectors.empty() || index_ == nullptr ||
         inst_count_ < 50000 || is_v5 || is_v7) {
         return run(start_inst_id, end_inst_id);
     }
@@ -350,6 +367,7 @@ uint64_t TraceScanEngine::run_parallel(uint64_t start_inst_id, uint64_t end_inst
         s.file_start = start_offset;
         s.file_end = end_offset;
         s.start_inst_id = shard_start;
+        s.seed_thread = index_->thread_at(shard_start);
         s.end_inst_id = shard_end;
         shards.push_back(s);
     }

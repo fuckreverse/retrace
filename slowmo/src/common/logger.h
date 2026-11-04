@@ -58,6 +58,7 @@
 #  include <mach/mach.h>
 #elif defined(__linux__)
 #  include <sys/resource.h>
+#  include <unistd.h>
 #elif defined(_WIN32)
 #  include <windows.h>
 #  include <psapi.h>
@@ -311,6 +312,12 @@ inline double rss_mb() {
         return static_cast<double>(info.resident_size) / (1024.0 * 1024.0);
     }
 #elif defined(__linux__)
+    if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+        unsigned long long pages = 0, resident = 0;
+        const bool ok = std::fscanf(f, "%llu %llu", &pages, &resident) == 2;
+        std::fclose(f);
+        if (ok) return double(resident) * sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+    }
     struct rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
         // Linux: ru_maxrss is in kilobytes

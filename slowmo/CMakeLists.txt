@@ -731,3 +731,8 @@ if(TENET_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+add_executable(bench_analysis_scale bench/bench_analysis_scale.cpp)
+target_link_libraries(bench_analysis_scale PRIVATE tenet_lib ${TENET_MIMALLOC_TARGET})
+target_include_directories(bench_analysis_scale PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+set_target_properties(bench_analysis_scale PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)

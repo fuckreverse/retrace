@@ -681,8 +681,10 @@ RecordView TraceReader::Iterator::operator*() const {
         int16_t delta;
         std::memcpy(&delta, &hdr->pc_delta, sizeof(delta));  // LE decode
         auto& running_pc = thread_pcs_[current_thread_id_];
-        const uint64_t new_pc = running_pc + static_cast<int64_t>(delta);
+        const uint64_t new_pc = decoded_offset_ == offset_ ? current_pc_ :
+            (resolved_seed_ && seed_offset_ == offset_ ? current_pc_ : running_pc + static_cast<int64_t>(delta));
         rv.resolved_pc = new_pc;
+        decoded_offset_ = offset_; resolved_seed_ = false;
         running_pc = new_pc;
         current_pc_ = new_pc;
     } else if (rv.kind == RecordKind::Anchor && use_pc_delta) {
@@ -702,6 +704,8 @@ TraceReader::Iterator& TraceReader::Iterator::operator++() {
     // mutex contention on the shared BlockCacheReader.
 
     if (offset_ >= reader_->logical_size_) return *this;
+    // Advancing without dereferencing must still maintain producer/PC state.
+    if ((reader_->header_.flags & qbditrace::QBDITRACE_HF_PC_DELTA) != 0) (void)operator*();
     const size_t remaining = static_cast<size_t>(reader_->logical_size_ - offset_);
     const uint8_t* ptr = read_at(offset_);
     auto kind = static_cast<RecordKind>(ptr[0]);

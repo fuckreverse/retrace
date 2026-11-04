@@ -20,6 +20,7 @@ uint64_t ScanOrchestrator::execute_scan(const AnalysisRange& range,
 
     // Create the shared scan engine
     TraceScanEngine engine(reader_, inst_count_, index_);
+    engine.set_memory_limits(rss_limit_mb_, collector_budget_);
 
     // Apply exclude PC ranges from AnalysisRange
     if (!range.exclude_pc_ranges.empty()) {
@@ -61,6 +62,7 @@ uint64_t ScanOrchestrator::execute_scan(const AnalysisRange& range,
         processed = engine.run_parallel(range.start_inst_id, range.end_inst_id);
     }
 
+    error_ = engine.error();
     scanned_ = true;
     return processed;
 }
@@ -75,6 +77,7 @@ TraceCollector* ScanOrchestrator::collector_for(std::string_view pass_name) cons
 void ScanOrchestrator::reset() {
     declarations_.clear();
     scanned_ = false;
+    error_.clear();
 }
 
 }  // namespace tenet

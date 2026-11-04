@@ -20,6 +20,8 @@ PassResult run_linear_scan(PassContext& ctx, const RegTimelineConfig& cfg,
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     const uint8_t target = cfg.target_reg;
+    const bool multi_thread = index.thread_ids().size() > 1;
+    ankerl::unordered_dense::map<uint64_t, std::unique_ptr<ThreadIsolatedCursor>> thread_cursors;
 
     RegTimelineResult result;
     result.entries.reserve(track_all ? 65536 : 16384);
@@ -83,9 +85,9 @@ PassResult run_linear_scan(PassContext& ctx, const RegTimelineConfig& cfg,
         if (rec.kind != RecordKind::Inst) continue;
 
         auto inst = rec.as_inst();
-        inst_id++;
+        const auto current_id = inst_id++;
 
-        if (inst_id < start) {
+        if (current_id < start) {
             // Still need to track state for accurate old_values
             for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
                 auto diff = inst.reg_diff(d);
@@ -95,19 +97,31 @@ PassResult run_linear_scan(PassContext& ctx, const RegTimelineConfig& cfg,
             }
             continue;
         }
-        if (inst_id > end) break;
+        if (current_id >= end) break;
 
-        // Process reg diffs
+        const auto tid = index.thread_at(current_id);
+        const bool visible = !ctx.range().is_pc_excluded(inst.pc) &&
+            (ctx.range().include_thread_ids.empty() ||
+             std::find(ctx.range().include_thread_ids.begin(), ctx.range().include_thread_ids.end(), tid) !=
+                 ctx.range().include_thread_ids.end());
+        const RegState* before = nullptr;
+        if (multi_thread && visible) {
+            auto& cursor = thread_cursors[tid];
+            if (!cursor) cursor = std::make_unique<ThreadIsolatedCursor>(reader, index, tid);
+            before = &cursor->advance_to(current_id);
+        }
+
+        // Hidden instructions still update reconstructed register state.
         for (uint8_t d = 0; d < inst.reg_diff_count; d++) {
             auto diff = inst.reg_diff(d);
             if (diff.index >= 34) continue;
 
-            if (track_all || diff.index == target) {
+            if (visible && (track_all || diff.index == target)) {
                 RegTimelineEntry entry;
-                entry.inst_id = inst_id;
+                entry.inst_id = current_id;
                 entry.pc = inst.pc;
                 entry.reg_index = diff.index;
-                entry.old_value = current_regs[diff.index];
+                entry.old_value = before ? before->gpr[diff.index] : current_regs[diff.index];
                 entry.new_value = diff.value;
 
                 result.entries.push_back(entry);
@@ -167,6 +181,8 @@ PassResult run_indexed_single_reg(PassContext& ctx, const RegTimelineConfig& cfg
     auto& reader = ctx.reader();
     auto& index = ctx.index();
     const uint8_t target = cfg.target_reg;
+    const bool multi_thread = index.thread_ids().size() > 1;
+    ankerl::unordered_dense::map<uint64_t, std::unique_ptr<ThreadIsolatedCursor>> thread_cursors;
 
     ctx.progress(0.0f, "RegTimeline: walking REG_WRITES index...");
 
@@ -176,12 +192,8 @@ PassResult run_indexed_single_reg(PassContext& ctx, const RegTimelineConfig& cfg
     struct RawWrite { uint64_t inst_id; uint64_t pc; uint64_t new_value; };
     std::vector<RawWrite> writes;
 
-    // find_last_writer_of(reg, before_id, ...) finds the largest writer with
-    // inst_id STRICTLY LESS than before_id. The caller's range [start, end]
-    // is inclusive of `end` (matches the linear-scan path's `inst_id <= end`
-    // semantics), so seed the cursor at end+1 to make the first lookup able
-    // to return a writer at exactly inst_id == end.
-    uint64_t cursor = (end < UINT64_MAX) ? end + 1 : end;
+    // Instruction ranges are zero-based and half-open: [start, end).
+    uint64_t cursor = end;
     const uint64_t total_span = (end > start) ? (end - start) : 1;
     uint64_t iterations = 0;
 
@@ -227,32 +239,22 @@ PassResult run_indexed_single_reg(PassContext& ctx, const RegTimelineConfig& cfg
     RegTimelineResult result;
     result.entries.reserve(writes.size());
 
-    // old_value for entry i is the new_value of entry i-1 (or, for the
-    // first entry, the value at the start of the range as reconstructed
-    // from the nearest anchor — sparse registers are usually still 0/unset
-    // at trace start, and an anchor lookup here would cost another O(log N)
-    // random read per single-reg query, which is not worth it for a value
-    // that is purely informational; default to 0 like an uninitialized GPR).
-    uint64_t prev_value = 0;
-    if (!writes.empty()) {
-        auto anchor_info = index.nearest_anchor_before(writes.front().inst_id);
-        if (anchor_info.file_offset > 0) {
-            auto anchor_rec = reader.record_at(anchor_info.file_offset);
-            if (anchor_rec.kind == RecordKind::Anchor) {
-                auto anchor = anchor_rec.as_anchor(reader.header().num_gpr);
-                if (target < reader.header().num_gpr && target < 34) {
-                    prev_value = anchor.gpr_values[target];
-                }
-            }
-        }
-    }
-
+    // Reconstruct the first value at the actual range boundary, including
+    // writes between the nearest anchor and the first selected instruction.
+    uint64_t prev_value = writes.empty() ? 0
+        : ctx.regfile().state_before(writes.front().inst_id).gpr[target];
     for (const auto& w : writes) {
         RegTimelineEntry entry;
         entry.inst_id = w.inst_id;
         entry.pc = w.pc;
         entry.reg_index = target;
         entry.old_value = prev_value;
+        if (multi_thread) {
+            const auto tid = index.thread_at(w.inst_id);
+            auto& cursor = thread_cursors[tid];
+            if (!cursor) cursor = std::make_unique<ThreadIsolatedCursor>(reader, index, tid);
+            entry.old_value = cursor->advance_to(w.inst_id).gpr[target];
+        }
         entry.new_value = w.new_value;
         result.entries.push_back(entry);
         prev_value = w.new_value;
@@ -281,8 +283,8 @@ PassResult RegTimelinePass::run(PassContext& ctx) {
         return PassResult::failed("Empty trace");
     }
 
-    const uint64_t start = cfg_.start_inst_id;
-    const uint64_t end = std::min(cfg_.end_inst_id, total_insts);
+    const uint64_t start = std::max(cfg_.start_inst_id, ctx.range().start_inst_id);
+    const uint64_t end = std::min({cfg_.end_inst_id, ctx.range().end_inst_id, total_insts});
     if (start >= end) {
         return PassResult::success(RegTimelineResult{});
     }
@@ -294,7 +296,8 @@ PassResult RegTimelinePass::run(PassContext& ctx) {
     // all — a large win on big traces when the register is written
     // sparsely. "All registers" mode must still visit every instruction,
     // since any of them may write any register.
-    if (!track_all && cfg_.target_reg < 34) {
+    if (!track_all && cfg_.target_reg < 34 && cfg_.max_entries == 0 &&
+        ctx.range().exclude_pc_ranges.empty() && ctx.range().include_thread_ids.empty()) {
         return run_indexed_single_reg(ctx, cfg_, start, end);
     }
 

@@ -37,6 +37,8 @@ static inline void add_reg_read(DecodedInst& d, uint8_t idx) {
     }
     if (d.regs_read_count < d.regs_read.size()) {
         d.regs_read[d.regs_read_count++] = idx;
+    } else {
+        d.register_access_overflow = true;
     }
 }
 
@@ -48,6 +50,34 @@ static inline void add_reg_written(DecodedInst& d, uint8_t idx) {
     }
     if (d.regs_written_count < d.regs_written.size()) {
         d.regs_written[d.regs_written_count++] = idx;
+    } else {
+        d.register_access_overflow = true;
+    }
+}
+
+// Capstone gives each scalar/vector alias its own ID. Keep this separate
+// from the trace's GPR numbering, which is shared by existing consumers.
+static uint8_t simd_index(arm64_reg reg) {
+    if (reg >= ARM64_REG_B0 && reg <= ARM64_REG_B31) return reg - ARM64_REG_B0;
+    if (reg >= ARM64_REG_H0 && reg <= ARM64_REG_H31) return reg - ARM64_REG_H0;
+    if (reg >= ARM64_REG_S0 && reg <= ARM64_REG_S31) return reg - ARM64_REG_S0;
+    if (reg >= ARM64_REG_D0 && reg <= ARM64_REG_D31) return reg - ARM64_REG_D0;
+    if (reg >= ARM64_REG_Q0 && reg <= ARM64_REG_Q31) return reg - ARM64_REG_Q0;
+    if (reg >= ARM64_REG_V0 && reg <= ARM64_REG_V31) return reg - ARM64_REG_V0;
+    return 0xff;
+}
+
+static void add_access(DecodedInst& d, arm64_reg reg, bool read, bool write) {
+    const auto gpr = cs_reg_to_index(reg);
+    const auto simd = simd_index(reg);
+    if (gpr != 0xff) {
+        if (read) add_reg_read(d, gpr);
+        if (write) add_reg_written(d, gpr);
+    } else if (simd != 0xff) {
+        if (read) d.simd_reads |= uint32_t(1) << simd;
+        if (write) d.simd_writes |= uint32_t(1) << simd;
+    } else if (reg != ARM64_REG_INVALID && reg != ARM64_REG_XZR && reg != ARM64_REG_WZR) {
+        d.untracked_register_access = true;
     }
 }
 
@@ -106,7 +136,7 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
     struct TLSEntry { uint32_t opcode = ~0u; DecodedInst inst; };
     static thread_local TLSEntry tls_last;
 
-    if (tls_last.opcode == opcode && !is_pc_relative_mnemonic(tls_last.inst.mnemonic_sv())) {
+    if (tls_last.inst.size != 0 && tls_last.opcode == opcode && !is_pc_relative_mnemonic(tls_last.inst.mnemonic_sv())) {
         auto copy = tls_last.inst;
         copy.pc = pc;
         return copy;
@@ -170,44 +200,55 @@ std::optional<DecodedInst> InstructionDecoder::decode(uint64_t pc, uint32_t opco
     d.op_str[sizeof(d.op_str) - 1] = '\0';
     d.size = static_cast<uint8_t>(insn[0].size);
 
-    // Extract register read/write info from Capstone detail
+    d.decoded = true;
     if (insn[0].detail) {
-        cs_detail* detail = insn[0].detail;
-        // Implicit reads
-        for (uint8_t i = 0; i < detail->regs_read_count; i++) {
-            uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(detail->regs_read[i]));
-            add_reg_read(d, idx);
+        // cs_regs_access includes implicit and explicit operands. In
+        // particular, writeback bases and NZCV must not disappear merely
+        // because the trace omits unchanged register values.
+        // Capstone's AArch64 alias metadata may retain the underlying
+        // arithmetic destination access on operand 0 of CMP/CMN/TST. Those
+        // aliases read their explicit operands and only define NZCV.
+        const bool compare_alias = insn[0].id == ARM64_INS_CMP ||
+            insn[0].id == ARM64_INS_CMN || insn[0].id == ARM64_INS_TST;
+        cs_regs reads{}, writes{};
+        uint8_t nread = 0, nwrite = 0;
+        if (cs_regs_access(handle, &insn[0], reads, &nread, writes, &nwrite) == CS_ERR_OK) {
+            for (uint8_t i = 0; i < nread; ++i)
+                add_access(d, static_cast<arm64_reg>(reads[i]), true, false);
+            for (uint8_t i = 0; i < nwrite; ++i) {
+                const auto reg = static_cast<arm64_reg>(writes[i]);
+                if (!compare_alias || reg == ARM64_REG_NZCV) add_access(d, reg, false, true);
+            }
+        } else {
+            d.untracked_register_access = true;
         }
-        // Implicit writes
-        for (uint8_t i = 0; i < detail->regs_write_count; i++) {
-            uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(detail->regs_write[i]));
-            add_reg_written(d, idx);
-        }
-        // Explicit operand reads/writes
-        if (detail->arm64.op_count > 0) {
-            for (int i = 0; i < detail->arm64.op_count; i++) {
-                cs_arm64_op& op = detail->arm64.operands[i];
-                if (op.type == ARM64_OP_REG) {
-                    uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(op.reg));
-                    if (idx == 0xFF) continue;
-                    if (op.access & CS_AC_READ) {
-                        add_reg_read(d, idx);
-                    }
-                    if (op.access & CS_AC_WRITE) {
-                        add_reg_written(d, idx);
-                    }
-                } else if (op.type == ARM64_OP_MEM) {
-                    if (op.mem.base != ARM64_REG_INVALID) {
-                        uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(op.mem.base));
-                        add_reg_read(d, idx);
-                    }
-                    if (op.mem.index != ARM64_REG_INVALID) {
-                        uint8_t idx = cs_reg_to_index(static_cast<arm64_reg>(op.mem.index));
-                        add_reg_read(d, idx);
+        const auto& arm = insn[0].detail->arm64;
+        if (arm.update_flags) add_reg_written(d, IDX_NZCV);
+        if (arm.cc != ARM64_CC_INVALID && arm.cc != ARM64_CC_AL && arm.cc != ARM64_CC_NV)
+            add_reg_read(d, IDX_NZCV);
+        for (uint8_t i = 0; i < arm.op_count; ++i) {
+            const auto& op = arm.operands[i];
+            if (op.type == ARM64_OP_REG) {
+                const auto reg = static_cast<arm64_reg>(op.reg);
+                const bool written = !compare_alias && (op.access & CS_AC_WRITE) != 0;
+                // Inserting one lane preserves the other lanes, so the old
+                // vector remains a producer at our whole-register granularity.
+                const bool partial = written && op.vector_index >= 0 && simd_index(reg) != 0xff;
+                add_access(d, reg, compare_alias || (op.access & CS_AC_READ) != 0 || partial, written);
+            } else if (op.type == ARM64_OP_MEM) {
+                add_access(d, static_cast<arm64_reg>(op.mem.base), true, arm.writeback);
+                add_access(d, static_cast<arm64_reg>(op.mem.index), true, false);
+                if (arm.writeback) {
+                    d.writeback_reg = cs_reg_to_index(static_cast<arm64_reg>(op.mem.base));
+                    for (auto reg : {op.mem.base, op.mem.index}) {
+                        const auto idx = cs_reg_to_index(static_cast<arm64_reg>(reg));
+                        if (idx != 0xff) d.writeback_reads |= 1ULL << idx;
                     }
                 }
             }
         }
+    } else {
+        d.untracked_register_access = true;
     }
 
     cs_free(insn, count);

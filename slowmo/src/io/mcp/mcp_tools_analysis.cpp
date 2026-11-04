@@ -683,7 +683,7 @@ void TenetMcpService::register_search_tools() {
           {"properties", {
               {"reg_index",     {{"type", json::array({"integer", "string"})}, {"description", "Register: integer index (0-33) OR name string ('x0','lr','sp', etc.)"}}},
               {"start_inst_id", {{"type", "integer"}, {"description", "Start from this instruction"}, {"default", 0}}},
-              {"end_inst_id",   {{"type", "integer"}, {"description", "End at this instruction (0=end)"}, {"default", 0}}},
+              {"end_inst_id",   {{"type", "integer"}, {"description", "Exclusive end instruction ID (0=end of trace)"}, {"default", 0}}},
               {"offset",        {{"type", "integer"}, {"description", "Pagination: skip first N entries"}, {"default", 0}}},
               {"limit",         {{"type", "integer"}, {"description", "Pagination: max entries per page (max 2000)"}, {"default", 500}}}
           }},
@@ -694,6 +694,7 @@ void TenetMcpService::register_search_tools() {
             cfg.target_reg = target_reg;
             cfg.start_inst_id = args.value("start_inst_id", uint64_t(0));
             cfg.end_inst_id = args.value("end_inst_id", uint64_t(0));
+            if (cfg.end_inst_id == 0) cfg.end_inst_id = UINT64_MAX;
             cfg.max_entries = 0; // fetch all; pagination happens in output stage
 
             pm_->register_pass(std::make_unique<RegTimelinePass>(std::move(cfg)));

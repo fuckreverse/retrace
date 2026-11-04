@@ -418,6 +418,7 @@ inline uint8_t FunctionCollector::lookup_pc_kind(uint64_t pc) const {
 bool FunctionCollector::begin(uint64_t /*start_inst_id*/, uint64_t /*end_inst_id*/) {
     // ── Reset all state ───────────────────────────────────────────────────
     result_ = FunctionResult{};
+    if (memory_budget_) result_.call_events.set_resident_budget(memory_budget_ / 4);
     call_stack_.clear();
     tail_candidates_.clear();
     ret_pc_refcount_.clear();
@@ -902,7 +903,7 @@ void FunctionCollector::end() {
     // All are Phase-1/2 scratch — neither FunctionResult nor the caller needs
     // them after end() returns.  Swap-with-empty is the only reliable way to
     // free the underlying heap block (clear() leaves capacity intact).
-    { std::vector<BranchEvent>       tmp; tmp.swap(branch_events_); }
+    branch_events_.clear();
     { std::vector<TailCallCandidate> tmp; tmp.swap(tail_candidates_); }
     { std::vector<StackFrame>        tmp; tmp.swap(call_stack_); }
     {
@@ -933,7 +934,7 @@ void FunctionPass::declare_scan(ScanOrchestrator& orch, PassContext& ctx) {
         ctx.progress(kPhase1End + p2_pct * (kPhase2End - kPhase1End),
                      "Function analysis: building call graph...");
     });
-    collector_->set_cancel_fn([&ctx]() { return ctx.cancelled(); });
+    collector_->set_cancel_fn([&ctx]() { return ctx.cancelled() || ctx.memory_pressure(); });
 
     orch.declare({name(), collector_.get(), /*wants_parallel=*/false});
 }
@@ -1011,7 +1012,7 @@ PassResult FunctionPass::run(PassContext& ctx) {
     result.return_site_map_.rehash(0);
 
     // ─── Persist result for future sessions ───────────────────────────────
-    if (range.is_full_trace()) {
+    if (range.is_full_trace() && result.call_events.spilled_bytes() == 0) {
         ctx.progress(kPostEnd, "Function analysis: serialising...");
         std::string blob = function_serialize(result);
         if (!blob.empty()) {

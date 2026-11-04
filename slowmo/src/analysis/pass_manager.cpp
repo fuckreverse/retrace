@@ -62,6 +62,9 @@ bool PassContext::cancelled() const {
 }
 void PassContext::cancel() { manager_.cancel_all(); }
 
+size_t PassContext::memory_budget_bytes() const { return manager_.analysis_memory_budget(); }
+bool PassContext::memory_pressure() const { return manager_.is_memory_pressure(); }
+
 bool PassContext::no_parallel_scan() const { return manager_.no_parallel_scan(); }
 
 // ─── PassManager ──────────────────────────────────────────────────────────
@@ -291,6 +294,20 @@ std::shared_ptr<const PassResult> PassManager::require_shared(std::string_view p
 }
 
 void PassManager::execute_pass(PassEntry* entry) {
+    try { execute_pass_impl(entry); }
+    catch (const std::exception& e) {
+        {
+            std::lock_guard<std::mutex> lk(entry->mtx);
+            std::atomic_store_explicit(&entry->result_ptr,
+                std::make_shared<const PassResult>(PassResult::failed(e.what())), std::memory_order_release);
+            entry->state.store(PassState::Failed, std::memory_order_release);
+        }
+        entry->cv.notify_all();
+        ProgressManager::global().fail(pass_task_id(entry->pass->name()), e.what());
+    }
+}
+
+void PassManager::execute_pass_impl(PassEntry* entry) {
     TENET_ZONE;
     TENET_ZONE_TEXT("pass: {}", entry->pass->name());
 
@@ -385,9 +402,11 @@ void PassManager::execute_pass(PassEntry* entry) {
     // In run_all() path, the scan was already done in Phase 2.
     if (entry->pass->has_scan() && !entry->scan_executed) {
         ScanOrchestrator orch(*reader_, index_->inst_count(), index_);
+        orch.set_memory_limits(rss_limit_mb_, analysis_memory_budget_);
         entry->pass->declare_scan(orch, ctx);
         if (orch.has_declarations()) {
             orch.execute_scan(range_, cancelled_, no_parallel_scan_);
+            if (!orch.error().empty()) throw std::runtime_error(orch.error());
         }
         entry->scan_executed = true;
     }
@@ -597,7 +616,22 @@ void PassManager::run_all(size_t num_threads) {
             LOG_INFO_M(::tenet::log::Module::Analysis,
                 "PassManager: executing unified scan with {} collector(s)",
                 scan_orchestrator_->has_declarations() ? "multiple" : "0");
-            scan_orchestrator_->execute_scan(range_, cancelled_, no_parallel_scan_);
+            scan_orchestrator_->set_memory_limits(rss_limit_mb_, analysis_memory_budget_);
+            std::string scan_error;
+            try {
+                scan_orchestrator_->execute_scan(range_, cancelled_, no_parallel_scan_);
+                scan_error = scan_orchestrator_->error();
+            } catch (const std::exception& e) { scan_error = e.what(); }
+            if (!scan_error.empty()) {
+                for (auto& entry : entries_) {
+                    if (!scan_orchestrator_->collector_for(entry->pass->name())) continue;
+                    std::lock_guard<std::mutex> lk(entry->mtx);
+                    std::atomic_store_explicit(&entry->result_ptr,
+                        std::make_shared<const PassResult>(PassResult::failed(scan_error)), std::memory_order_release);
+                    entry->state.store(PassState::Failed, std::memory_order_release);
+                    entry->cv.notify_all();
+                }
+            }
             for (auto& entry : entries_) {
                 if (entry->state.load(std::memory_order_acquire) == PassState::NotRun &&
                     scan_orchestrator_->collector_for(entry->pass->name()) != nullptr) {

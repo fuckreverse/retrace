@@ -1,5 +1,8 @@
 #include "common/compiler_compat.h"
 #pragma once
+#include "common/chunked_vector.h"
+
+#include "common/analysis_quality.h"
 
 #include "analysis/pass_manager.h"
 #include <cstdint>
@@ -34,6 +37,7 @@ enum class PropagationType : uint8_t {
     Call,           // Taint crosses into callee via argument registers
     Return,         // Taint returns from callee via X0
     Kill,           // Taint explicitly removed (register fully overwritten)
+    Control,        // Explicit runtime branch-control dependence
 };
 
 // ─── Propagation step (detailed event) ────────────────────────────────────
@@ -42,6 +46,7 @@ enum class PropagationType : uint8_t {
 struct PropagationStep {
     uint64_t inst_id;
     uint64_t pc;
+    uint64_t control_inst_id = UINT64_MAX;
     PropagationType type;
 
     /// Destination: what became tainted (or untainted for Kill).
@@ -53,6 +58,7 @@ struct PropagationStep {
     /// Zero heap allocation — replaces the old std::vector<uint8_t> src_regs.
     /// For 34 AArch64 GPRs, a single uint64_t covers all (bits 0-33).
     uint64_t src_reg_mask = 0;
+    uint32_t src_simd_mask = 0;
 
     /// Source memory addresses: still a vector because memory addresses are
     /// arbitrary 64-bit values that don't fit a bitmask.  However, most
@@ -94,6 +100,13 @@ struct PropagationStep {
 // ─── Taint analysis configuration ─────────────────────────────────────────
 
 struct TaintConfig {
+    /// Track explicit NZCV data dependencies (e.g. CMP -> CSEL/ADC).
+    /// This is not implicit control-flow taint. Uses the operand-based engine.
+    bool include_flags = false;
+    bool include_simd = false;
+    bool include_control = false;
+    uint32_t source_simd_regs = 0;
+
     // ─── Source specification ─────────────────────────────────────────
 
     /// Initial taint sources: register indices that start tainted.
@@ -101,8 +114,12 @@ struct TaintConfig {
     uint64_t source_regs = 0;
 
     /// Convenience: add a source register.
-    void add_source_reg(uint8_t reg) { source_regs |= (1ULL << reg); }
-    bool has_source_reg(uint8_t reg) const { return (source_regs >> reg) & 1; }
+    void add_source_reg(uint8_t reg) {
+        if (reg < 34) source_regs |= 1ULL << reg;
+        else if (reg < 66) { source_simd_regs |= uint32_t(1) << (reg - 34); include_simd = true; }
+        else throw std::out_of_range("Unsupported taint register");
+    }
+    bool has_source_reg(uint8_t reg) const { return reg < 34 ? (source_regs >> reg) & 1 : reg < 66 && ((source_simd_regs >> (reg - 34)) & 1); }
 
     /// Source instruction ID: start taint propagation from this instruction.
     /// If 0, starts from the beginning of the analysis range.
@@ -159,6 +176,7 @@ struct TaintConfig {
 
     /// Include Kill events in the output (register untainted).
     bool emit_kill_events = true;
+    bool operator==(const TaintConfig&) const = default;
 };
 
 // ─── Legacy taint event (backward compat) ─────────────────────────────────
@@ -169,27 +187,34 @@ struct TaintEvent {
     uint64_t pc;
     uint8_t dst_reg;       // register that became tainted
     uint64_t src_reg_mask; // bitmask: bit N = register N contributed taint
+    uint32_t src_simd_mask = 0;
     bool is_memory_source; // taint came from memory
     bool is_memory_sink;   // taint was stored to memory
 
     /// Legacy helper: check if a specific register was a source.
-    bool has_src_reg(uint8_t reg) const { return (src_reg_mask >> reg) & 1; }
+    bool has_src_reg(uint8_t reg) const { return reg < 34 ? (src_reg_mask >> reg) & 1 : reg < 66 && ((src_simd_mask >> (reg - 34)) & 1); }
 };
 
 // ─── Taint analysis pass result ───────────────────────────────────────────
 
 struct TaintResult {
+    AnalysisQuality quality;
     TaintConfig config;
+    bool compact_navigation = false;
 
     /// Legacy events (always populated for backward compat).
-    std::vector<TaintEvent> events;
+    ChunkedVector<TaintEvent> events;
 
     /// Detailed propagation steps (populated when config.emit_propagation_steps).
-    std::vector<PropagationStep> steps;
+    ChunkedVector<PropagationStep> steps;
 
     /// Current taint state at the end of analysis: which regs are tainted.
     /// Bitmask: bit N set means register N is tainted.
     uint64_t tainted_regs = 0;
+    uint32_t tainted_simd = 0;
+    uint64_t active_control_inst = UINT64_MAX;
+    struct ThreadTaint { uint64_t gpr = 0; uint32_t simd = 0; };
+    ankerl::unordered_dense::map<uint64_t, ThreadTaint> thread_taint;
 
     /// Memory addresses that are currently tainted.
     roaring::Roaring64Map tainted_memory;
@@ -212,12 +237,12 @@ struct TaintResult {
     std::string stop_reason;
 
     bool is_tainted(uint8_t reg) const {
-        return (tainted_regs >> reg) & 1;
+        return reg < 34 ? (tainted_regs >> reg) & 1 : reg < 66 && ((tainted_simd >> (reg - 34)) & 1);
     }
 
     /// Number of currently tainted registers.
     uint32_t tainted_reg_count() const {
-        return static_cast<uint32_t>(tenet::platform::population_count(tainted_regs));
+        return static_cast<uint32_t>(tenet::platform::population_count(tainted_regs) + tenet::platform::population_count(tainted_simd));
     }
 
     bool is_memory_addr_tainted(uint64_t addr) const {
@@ -230,16 +255,29 @@ struct TaintResult {
 
     const TaintEvent* event_at(uint64_t inst_id) const {
         if (!tainted_inst_ids.contains(inst_id)) return nullptr;
-        auto it = inst_id_to_event.find(inst_id);
-        if (it == inst_id_to_event.end()) return nullptr;
-        return &events[it->second];
+        if (!compact_navigation) {
+            auto it = inst_id_to_event.find(inst_id);
+            return it == inst_id_to_event.end() ? nullptr : &events[it->second];
+        }
+        auto it = std::upper_bound(events.begin(), events.end(), inst_id,
+            [](uint64_t id, const TaintEvent& e) { return id < e.inst_id; });
+        if (it == events.begin()) return nullptr;
+        --it; return it->inst_id == inst_id ? &*it : nullptr;
     }
 
     /// Get all propagation steps at a given instruction.
     const std::vector<size_t>* steps_at(uint64_t inst_id) const {
-        auto it = inst_id_to_steps.find(inst_id);
-        if (it == inst_id_to_steps.end()) return nullptr;
-        return &it->second;
+        if (!compact_navigation) {
+            auto it = inst_id_to_steps.find(inst_id);
+            return it == inst_id_to_steps.end() ? nullptr : &it->second;
+        }
+        static thread_local std::vector<size_t> selected;
+        selected.clear();
+        auto it = std::lower_bound(steps.begin(), steps.end(), inst_id,
+            [](const PropagationStep& s, uint64_t id) { return s.inst_id < id; });
+        for (; it != steps.end() && it->inst_id == inst_id; ++it)
+            selected.push_back(static_cast<size_t>(it - steps.begin()));
+        return selected.empty() ? nullptr : &selected;
     }
 
     uint64_t tainted_memory_count() const {
@@ -274,7 +312,7 @@ struct TaintResult {
 /// - Detailed PropagationStep event emission
 class TaintPass final : public AnalysisPass {
 public:
-    explicit TaintPass(TaintConfig config) : config_(std::move(config)) {}
+    explicit TaintPass(TaintConfig config) : config_(std::move(config)) { if (config_.include_control) config_.include_flags = true; }
 
     std::string_view name() const override { return "taint"; }
     std::string_view description() const override {

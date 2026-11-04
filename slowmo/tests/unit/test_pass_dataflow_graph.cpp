@@ -435,3 +435,107 @@ TEST_CASE("DataflowGraphPass discards cancellation during scanning",
     std::string blob;
     REQUIRE_FALSE(env->index->load_pass_blob("dataflow_graph", blob));
 }
+
+TEST_CASE("Dataflow graph isolates thread registers but shares memory", "[unit][pass][dataflow_graph]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState a, b;
+        a.sp() = b.sp() = 0x160000000;
+        tw.emit_thread(100);
+        tw.emit_anchor(a);
+        tw.emit(a, 0x1000, enc::movz(0, 7), {{0, 7}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(a, 0x1004, enc::str_imm(0, 2, 0), {{33, tw.rt(0x1008)}}, {{MEM_WRITE, 8, 0x9000, 7}});
+        tw.emit_thread(200);
+        tw.emit_anchor(b);
+        tw.emit(b, 0x2000, enc::add_imm(1, 0, 1), {{1, 1}, {33, tw.rt(0x2004)}}, {});
+        tw.emit(b, 0x2004, enc::ldr_imm(3, 2, 0), {{3, 7}, {33, tw.rt(0x2008)}}, {{MEM_READ, 8, 0x9000, 7}});
+        tw.emit_thread(100);
+        tw.emit_anchor(a);
+        tw.emit(a, 0x1008, enc::add_imm(1, 0, 1), {{1, 8}, {33, tw.rt(0x100c)}}, {});
+    }, "dfg_thread_registers");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<DataflowGraphPass>());
+    const auto& r = pm->require("dataflow_graph").get<DataflowGraphResult>();
+    bool resumed = false;
+    for (const auto& e : r.edges) {
+        if (e.via_mem_addr == 0) {
+            REQUIRE(env->index->thread_at(e.from_inst_id) == env->index->thread_at(e.to_inst_id));
+            if (e.from_inst_id == 0 && e.to_inst_id == 4 && e.via_reg == 0) resumed = true;
+        }
+    }
+    REQUIRE(resumed);
+    REQUIRE(find_mem_edge(r, 1, 3) != nullptr);
+}
+
+TEST_CASE("Dataflow graph connects SIMD aliases, lane updates and scalar extraction", "[unit][pass][dataflow_graph][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, 0x9e670020u, {{33, tw.rt(0x1004)}}, {}); // fmov d0, x1
+        tw.emit(ms, 0x1004, 0x4e181ca0u, {{33, tw.rt(0x1008)}}, {}); // ins v0.d[1], x5
+        tw.emit(ms, 0x1008, 0x4e284860u, {{33, tw.rt(0x100c)}}, {}); // aese v0.16b, v3.16b
+        tw.emit(ms, 0x100c, 0x4e083c04u, {{4, 7}, {33, tw.rt(0x1010)}}, {}); // umov x4, v0.d[0]
+    }, "dfg_simd_chain");
+    REQUIRE(env != nullptr);
+    for (int reload = 0; reload < 2; ++reload) {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<DataflowGraphPass>());
+        const auto& r = pm->require("dataflow_graph").get<DataflowGraphResult>();
+        for (uint64_t to = 1; to < 4; ++to) {
+            bool found = false;
+            for (const auto& e : r.producers_of(to))
+                if (e.from_inst_id == to - 1 && e.via_reg == kDataflowSimdBase && e.via_mem_addr == 0) found = true;
+            REQUIRE(found);
+        }
+        REQUIRE(r.quality.instructions_examined == 4);
+        REQUIRE_FALSE(r.quality.has_gaps());
+        REQUIRE(r.to_dot().find("v0") != std::string::npos);
+        const auto json = nlohmann::json::parse(r.to_json());
+        REQUIRE(json.at("quality").at("engine") == "capstone");
+    }
+}
+
+TEST_CASE("Dataflow unknown instructions remain opaque producers and report gaps", "[unit][pass][dataflow_graph][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 1), {{0, 1}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, 0xffffffffu, {{0, 2}, {33, tw.rt(0x1008)}}, {});
+        tw.emit(ms, 0x1008, enc::add_imm(1, 0, 1), {{1, 3}, {33, tw.rt(0x100c)}}, {});
+    }, "dfg_opaque_producer");
+    REQUIRE(env != nullptr);
+    for (int reload = 0; reload < 2; ++reload) {
+        auto pm = make_pm(*env);
+        pm->register_pass(std::make_unique<DataflowGraphPass>());
+        const auto& r = pm->require("dataflow_graph").get<DataflowGraphResult>();
+        REQUIRE(r.nodes.size() == 3);
+        REQUIRE(r.quality.undecoded_instructions == 1);
+        REQUIRE(r.quality.has_gaps());
+        bool opaque_producer = false;
+        for (const auto& e : r.producers_of(2)) {
+            if (e.via_reg == 0 && e.via_mem_addr == 0) {
+                REQUIRE(e.from_inst_id == 1);
+                opaque_producer = true;
+            }
+        }
+        REQUIRE(opaque_producer);
+    }
+}
+
+TEST_CASE("Dataflow reports missing instruction bytes and node limits", "[unit][pass][dataflow_graph][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 1), {{0, 1}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::add_imm(1, 0, 1), {{1, 2}, {33, tw.rt(0x1008)}}, {});
+    }, "dfg_missing_code");
+    REQUIRE(env != nullptr);
+    env->code_table = CodeTable{};
+    auto pm = make_pm(*env);
+    DataflowGraphConfig cfg; cfg.max_nodes = 1;
+    pm->register_pass(std::make_unique<DataflowGraphPass>(cfg));
+    const auto& r = pm->require("dataflow_graph").get<DataflowGraphResult>();
+    REQUIRE(r.quality.missing_code == 1);
+    REQUIRE(r.quality.truncated);
+    REQUIRE(r.truncated);
+    REQUIRE(r.quality.termination_reason == "max_nodes reached");
+    REQUIRE(r.quality.to_json().at("has_gaps") == true);
+}

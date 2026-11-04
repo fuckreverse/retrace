@@ -4,6 +4,9 @@
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/structure/xref_pass.h"
 #include "io/mcp/mcp_server.h"
+#include "io/mcp/mcp_helpers.h"
+#include <chrono>
+#include <thread>
 #include "service/tenet_service.h"
 
 using namespace Catch::Matchers;
@@ -176,4 +179,80 @@ TEST_CASE("mcp core: search_pc nearest_inst_id uses backend nearest lookup",
     REQUIRE(paged.at("has_more") == true);
     REQUIRE(paged.at("next_offset") == 3);
     REQUIRE(paged.at("nearest_inst_id") == 4);
+}
+
+TEST_CASE("mcp reg_timeline defaults to the whole trace", "[unit][mcp][core]") {
+    auto ctx = make_core_env();
+    json r;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        try {
+            r = ctx.mcp->call_tool("reg_timeline", {{"reg_index", 0}});
+            break;
+        } catch (const PassNotReady&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    REQUIRE(r.is_object());
+    REQUIRE(r.at("total_writes") == 2);
+    REQUIRE(r.at("timeline").at(0).at("inst_id") == 0);
+    REQUIRE(r.at("timeline").at(1).at("inst_id") == 1);
+}
+
+TEST_CASE("mcp taint exposes explicit flag mode and analysis quality", "[unit][mcp][semantics]") {
+    for (bool backward : {false, true}) {
+        auto ctx = make_core_env();
+        const std::string tool = backward ? "taint_backward" : "taint_forward";
+        const json args = backward
+            ? json{{"sink_inst_id", 2}, {"sink_reg", 0}, {"include_flags", true}}
+            : json{{"reg_index", 0}, {"include_flags", true}};
+        json r;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            try {
+                r = ctx.mcp->call_tool(tool, args);
+                break;
+            } catch (const PassNotReady&) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        REQUIRE(r.is_object());
+        REQUIRE(r.at("include_flags") == true);
+        REQUIRE(r.at("quality").at("engine") == "heuristic");
+        REQUIRE(r.at("quality").at("coverage_scope") == "visited_instructions");
+        REQUIRE(r.at("quality").contains("has_gaps"));
+        REQUIRE(r.at("quality").contains("unsupported_register_instructions"));
+    }
+}
+
+TEST_CASE("mcp taint changing flag mode recomputes the cached analysis", "[unit][mcp][semantics]") {
+    auto ctx = make_core_env();
+    for (bool flags : {false, true, false}) {
+        json r;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            try {
+                r = ctx.mcp->call_tool("taint_forward", {{"reg_index", 0}, {"include_flags", flags}});
+                break;
+            } catch (const PassNotReady&) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        REQUIRE(r.at("include_flags") == flags);
+    }
+}
+
+TEST_CASE("mcp taint accepts SIMD aliases and normalizes control flags", "[unit][mcp][semantics]") {
+    for (bool backward : {false,true}) {
+        auto ctx=make_core_env();
+        for(bool control : {false,true,false}) {
+            json args=backward ? json{{"sink_inst_id",2},{"sink_reg","q0"}} : json{{"reg_index","v0"}};
+            args["include_simd"]=true;args["include_control"]=control;
+            json r;
+            for(int attempt=0;attempt<200;++attempt) {
+                try {r=ctx.mcp->call_tool(backward?"taint_backward":"taint_forward",args);break;}
+                catch(const PassNotReady&) {std::this_thread::sleep_for(std::chrono::milliseconds(5));}
+            }
+            REQUIRE(r.at("include_simd")==true);REQUIRE(r.at("include_control")==control);
+            REQUIRE(r.at("include_flags")==control);
+            REQUIRE(r.at("quality").contains("unresolved_control_joins"));
+        }
+    }
 }

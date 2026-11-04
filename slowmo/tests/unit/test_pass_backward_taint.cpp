@@ -467,3 +467,55 @@ TEST_CASE("BackwardTaintPass one wide store resolves all overlapping sinks",
     REQUIRE(result.per_sink_inst_ids[0].contains(uint64_t(0)));
     REQUIRE(result.per_sink_inst_ids[1].contains(uint64_t(0)));
 }
+
+TEST_CASE("Backward taint follows flag definitions omitted from REG_WRITES", "[unit][pass][backward_taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 1), {{0, 1}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, 0xf100041fu, {{33, tw.rt(0x1008)}}, {}); // cmp x0, #1
+        tw.emit(ms, 0x1008, 0x9a840062u, {{2, 7}, {33, tw.rt(0x100c)}}, {}); // csel x2, x3, x4, eq
+    }, "backward_flag_chain");
+    REQUIRE(env != nullptr);
+    for (bool flags : {false, true}) {
+        auto pm = make_pm(*env);
+        BackwardTaintConfig cfg; cfg.sink_inst_id = 3; cfg.add_sink_reg(2); cfg.include_flags = flags;
+        pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+        const auto& r = pm->require("backward_taint").get<BackwardTaintResult>();
+        REQUIRE(r.is_contributing(2));
+        REQUIRE(r.is_contributing(1) == flags);
+        REQUIRE(r.is_contributing(0) == flags);
+        if (flags) REQUIRE_FALSE(r.quality.has_gaps());
+    }
+}
+
+TEST_CASE("Backward taint exposes traversal limits", "[unit][pass][backward_taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::movz(0, 1), {{0, 1}, {33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::add_imm(1, 0, 1), {{1, 2}, {33, tw.rt(0x1008)}}, {});
+    }, "backward_quality_limit");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    BackwardTaintConfig cfg; cfg.sink_inst_id = 2; cfg.add_sink_reg(1);
+    cfg.max_steps = 1; cfg.include_flags = true;
+    pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+    const auto& r = pm->require("backward_taint").get<BackwardTaintResult>();
+    REQUIRE(r.quality.truncated);
+    REQUIRE(r.quality.termination_reason == "max_steps reached");
+}
+
+TEST_CASE("Backward taint base writeback does not depend on loaded memory", "[unit][pass][backward_taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::str_imm(2, 3, 0), {{33, tw.rt(0x1004)}}, {{2, 8, 0x9000, 7}});
+        tw.emit(ms, 0x1004, 0xf8408420u, {{0, 7}, {1, 0x9008}, {33, tw.rt(0x1008)}}, {{1, 8, 0x9000, 7}});
+    }, "backward_writeback_sources");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    BackwardTaintConfig cfg; cfg.sink_inst_id = 2; cfg.add_sink_reg(1); cfg.include_flags = true;
+    pm->register_pass(std::make_unique<BackwardTaintPass>(cfg));
+    const auto& r = pm->require("backward_taint").get<BackwardTaintResult>();
+    REQUIRE(r.is_contributing(1));
+    REQUIRE_FALSE(r.is_contributing(0));
+    REQUIRE(r.involved_mem_addrs.isEmpty());
+}

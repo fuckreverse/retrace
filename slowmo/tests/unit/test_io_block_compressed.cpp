@@ -28,6 +28,7 @@
 #include "io/trace_reader.h"
 #include "io/block_cache_reader.h"
 #include "io/index_builder.h"
+#include "io/reverse_trace_window.h"
 #include "core/register_file.h"
 #include "common/types.h"
 
@@ -749,6 +750,22 @@ TEST_CASE("BlockCacheReader: init recovers on corrupt footer magic",
     REQUIRE(cache.was_recovered());
     REQUIRE(cache.block_count() > 0);
     REQUIRE_FALSE(cache.recovery_message().empty());
+}
+
+TEST_CASE("Reverse windows own records across compressed cache eviction", "[unit][io][block_compressed]") {
+    TempDir td("reverse_compressed");
+    auto plain=write_trace_n_insts(td.path,"reverse",5000);
+    auto compressed=create_block_compressed_trace(plain,td.path,"reverse.block",4096);
+    auto opened=TraceReader::open(compressed); REQUIRE(opened.has_value());
+    auto reader=std::move(*opened);
+    auto indexed=TraceIndex::open_or_build(reader,nullptr); REQUIRE(indexed.has_value());
+    auto index=std::move(*indexed);
+    ReverseTraceWindow window(reader,index,1000,65536);
+    for(uint64_t i=5000;i-- > 0;) {
+        const auto record=window.at(i).as_inst();
+        REQUIRE(record.pc==0x5000+i*4); REQUIRE(record.reg_diff(0).value==i);
+    }
+    REQUIRE(window.buffered_bytes()<=65536);
 }
 
 TEST_CASE("BlockCacheReader: init fails on file too small for footer",

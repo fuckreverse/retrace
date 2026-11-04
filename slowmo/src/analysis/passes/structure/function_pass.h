@@ -1,4 +1,5 @@
 #pragma once
+#include "common/chunked_vector.h"
 
 #include <functional>
 
@@ -41,7 +42,7 @@ struct FunctionInfo {
 /// Result of function analysis.
 struct FunctionResult {
     /// All call events in order.
-    std::vector<CallEvent> call_events;
+    ChunkedVector<CallEvent> call_events;
 
     /// Functions by entry PC.
     ankerl::unordered_dense::map<uint64_t, FunctionInfo> functions;
@@ -146,6 +147,17 @@ public:
     void set_full_mode(bool full) { full_mode_ = full; }
 
     std::string_view name() const override { return "FunctionCollector"; }
+    void abort() noexcept override { branch_events_.clear(); result_ = FunctionResult{}; call_stack_.clear(); tail_candidates_.clear(); }
+    size_t memory_budget_ = 0;
+    size_t resident_bytes() const override {
+        return branch_events_.resident_capacity_bytes() + result_.call_events.resident_capacity_bytes() +
+            result_.functions.size() * (sizeof(FunctionInfo) + 64);
+    }
+    void set_memory_budget(size_t bytes) override {
+        memory_budget_ = bytes;
+        if (bytes && branch_events_.empty()) branch_events_.set_resident_budget(bytes / 4);
+    }
+
 
     bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
     void on_inst(uint64_t inst_id, const InstView& inst) override;
@@ -241,7 +253,7 @@ private:
     // ── Phase-1 output ──────────────────────────────────────────────────
     // Compact event stream: only CALL/RET/BRANCH instructions are recorded.
     // Typically 2-5% of total instruction count.
-    std::vector<BranchEvent> branch_events_;
+    ChunkedVector<BranchEvent> branch_events_;
 
     // SP state maintained during Phase 1 (to attach to BranchEvent records).
     uint64_t phase1_sp_      = 0;

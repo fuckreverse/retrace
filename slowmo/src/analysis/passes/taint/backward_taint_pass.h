@@ -1,5 +1,8 @@
 #include "common/compiler_compat.h"
 #pragma once
+#include "common/chunked_vector.h"
+
+#include "common/analysis_quality.h"
 
 #include "analysis/pass_manager.h"
 #include "common/dataflow_types.h"
@@ -40,6 +43,10 @@ struct SinkTag {
 struct BackwardTaintEvent {
     uint64_t inst_id;
     uint64_t pc;
+    uint64_t thread_id = 0;
+    uint64_t control_inst_id = UINT64_MAX;
+    bool control_branch = false;
+    uint32_t dst_simd_mask = 0, src_simd_mask = 0;
 
     /// Bitmask: bit i set → register i is a destination (defined by this instruction).
     uint64_t dst_regs_mask = 0;
@@ -68,27 +75,29 @@ struct BackwardTaintEvent {
 
     // ── Bitmask helper methods ──────────────────────────────────────────
 
-    bool has_dst_reg(uint8_t r) const { return (dst_regs_mask >> r) & 1; }
-    bool has_src_reg(uint8_t r) const { return (src_regs_mask >> r) & 1; }
+    bool has_dst_reg(uint8_t r) const { return r < 34 ? (dst_regs_mask >> r) & 1 : r < 66 && ((dst_simd_mask >> (r - 34)) & 1); }
+    bool has_src_reg(uint8_t r) const { return r < 34 ? (src_regs_mask >> r) & 1 : r < 66 && ((src_simd_mask >> (r - 34)) & 1); }
     bool has_sink_tag(uint8_t t) const { return (sink_tags_mask >> t) & 1; }
 
-    bool dst_regs_empty() const { return dst_regs_mask == 0; }
-    bool src_regs_empty() const { return src_regs_mask == 0; }
+    bool dst_regs_empty() const { return dst_regs_mask == 0 && dst_simd_mask == 0; }
+    bool src_regs_empty() const { return src_regs_mask == 0 && src_simd_mask == 0; }
     bool sink_tags_empty() const { return sink_tags_mask == 0; }
 
-    void add_dst_reg(uint8_t r) { dst_regs_mask |= (1ULL << r); }
-    void add_src_reg(uint8_t r) { src_regs_mask |= (1ULL << r); }
+    void add_dst_reg(uint8_t r) { if (r < 34) dst_regs_mask |= 1ULL << r; else if (r < 66) dst_simd_mask |= uint32_t(1) << (r - 34); }
+    void add_src_reg(uint8_t r) { if (r < 34) src_regs_mask |= 1ULL << r; else if (r < 66) src_simd_mask |= uint32_t(1) << (r - 34); }
     void add_sink_tag(uint8_t t) { sink_tags_mask |= (1ULL << t); }
 
     /// Iterate over all set destination registers.  Fn receives uint8_t reg_id.
     template <typename Fn>
     void for_each_dst_reg(Fn&& fn) const {
+        for (uint32_t m = dst_simd_mask; m; m &= m - 1) fn(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
         for (uint64_t m = dst_regs_mask; m; m &= m - 1)
             fn(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     }
     /// Iterate over all set source registers.  Fn receives uint8_t reg_id.
     template <typename Fn>
     void for_each_src_reg(Fn&& fn) const {
+        for (uint32_t m = src_simd_mask; m; m &= m - 1) fn(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
         for (uint64_t m = src_regs_mask; m; m &= m - 1)
             fn(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     }
@@ -111,6 +120,13 @@ struct BackwardTaintEvent {
 
 /// Backward taint analysis configuration.
 struct BackwardTaintConfig {
+    /// Track explicit NZCV data dependencies (e.g. CMP -> CSEL/ADC).
+    /// This is not implicit control-flow taint. Uses the operand-based engine.
+    bool include_flags = false;
+    bool include_simd = false;
+    bool include_control = false;
+    uint32_t sink_simd_regs = 0;
+
     /// The sink instruction ID: where backward propagation starts.
     uint64_t sink_inst_id = 0;
 
@@ -118,8 +134,12 @@ struct BackwardTaintConfig {
     /// Bitmask: bit i is set if register i is a sink (AArch64 has 34 GPRs, fits in 64 bits).
     uint64_t sink_regs = 0;
 
-    void add_sink_reg(uint8_t reg) { sink_regs |= (1ULL << reg); }
-    bool has_sink_reg(uint8_t reg) const { return (sink_regs >> reg) & 1; }
+    void add_sink_reg(uint8_t reg) {
+        if (reg < 34) sink_regs |= 1ULL << reg;
+        else if (reg < 66) { sink_simd_regs |= uint32_t(1) << (reg - 34); include_simd = true; }
+        else throw std::out_of_range("Unsupported taint register");
+    }
+    bool has_sink_reg(uint8_t reg) const { return reg < 34 ? (sink_regs >> reg) & 1 : reg < 66 && ((sink_simd_regs >> (reg - 34)) & 1); }
 
     /// Optionally: sink memory address(es) to trace back.
     std::vector<uint64_t> sink_mem_addrs;
@@ -156,14 +176,17 @@ struct BackwardTaintConfig {
     /// instead of stepping backward one instruction at a time.
     /// Disable only for debugging or when REG_WRITES CF is absent.
     bool use_index_acceleration = true;
+    bool operator==(const BackwardTaintConfig&) const = default;
 };
 
 /// Backward taint analysis pass result.
 struct BackwardTaintResult {
+    AnalysisQuality quality;
     BackwardTaintConfig config;
+    bool compact_navigation = false;
 
     /// All backward taint events, ordered from sink → earliest contributing instruction.
-    std::vector<BackwardTaintEvent> events;
+    ChunkedVector<BackwardTaintEvent> events;
 
     /// All instruction IDs that contribute to the sink value (the "backward slice").
     roaring::Roaring64Map contributing_inst_ids;
@@ -171,9 +194,11 @@ struct BackwardTaintResult {
     /// All registers that were part of the backward dependency chain at any point.
     /// Bitmask: bit i is set if register i was involved.
     uint64_t all_involved_regs = 0;
+    uint32_t all_involved_simd = 0;
+    void record_reg(uint8_t r) { if (r < 34) all_involved_regs |= 1ULL << r; else if (r < 66) all_involved_simd |= uint32_t(1) << (r - 34); }
 
     /// Count of involved registers.
-    int involved_reg_count() const { return tenet::platform::population_count(all_involved_regs); }
+    int involved_reg_count() const { return tenet::platform::population_count(all_involved_regs) + tenet::platform::population_count(all_involved_simd); }
 
     /// All memory addresses that were part of load-store chains.
     roaring::Roaring64Map involved_mem_addrs;
@@ -183,7 +208,7 @@ struct BackwardTaintResult {
 
     /// Dataflow dependency graph: edges between contributing instructions.
     /// Only populated if config.build_dataflow_graph == true.
-    std::vector<DataflowEdge> dataflow_edges;
+    ChunkedVector<DataflowEdge> dataflow_edges;
 
     /// Per-sink tags for attribution.
     std::vector<SinkTag> sink_tags;
@@ -198,9 +223,13 @@ struct BackwardTaintResult {
 
     /// Get event at a given instruction, or nullptr.
     const BackwardTaintEvent* event_at(uint64_t inst_id) const {
-        auto it = inst_id_to_event_.find(inst_id);
-        if (it == inst_id_to_event_.end()) return nullptr;
-        return &events[it->second];
+        if (!compact_navigation) {
+            auto it = inst_id_to_event_.find(inst_id);
+            return it == inst_id_to_event_.end() ? nullptr : &events[it->second];
+        }
+        auto it = std::lower_bound(events.begin(), events.end(), inst_id,
+            [](const BackwardTaintEvent& e, uint64_t id) { return e.inst_id > id; });
+        return it != events.end() && it->inst_id == inst_id ? &*it : nullptr;
     }
 
     /// Total contributing instructions count.
@@ -262,7 +291,7 @@ struct BackwardTaintResult {
 class BackwardTaintPass final : public AnalysisPass {
 public:
     explicit BackwardTaintPass(BackwardTaintConfig config)
-        : config_(std::move(config)) {}
+        : config_(std::move(config)) { if (config_.include_control) config_.include_flags = true; }
 
     std::string_view name() const override { return "backward_taint"; }
     std::string_view description() const override {

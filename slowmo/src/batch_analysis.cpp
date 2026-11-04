@@ -143,6 +143,7 @@ static const char* propagation_type_str(PropagationType t) {
         case PropagationType::Immediate: return "Immediate";
         case PropagationType::Call:      return "Call";
         case PropagationType::Return:    return "Return";
+        case PropagationType::Control:   return "Control";
         case PropagationType::Kill:      return "Kill";
     }
     return "Unknown";
@@ -187,6 +188,10 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
         output["config"]["stop_pcs"] = std::move(stop_arr);
     }
 
+    output["quality"] = result.quality.to_json();
+    output["config"]["include_flags"] = result.config.include_flags;
+    output["config"]["include_simd"] = result.config.include_simd;
+    output["config"]["include_control"] = result.config.include_control;
     // Statistics
     output["statistics"] = {
         {"events_count", result.events.size()},
@@ -212,6 +217,7 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
             remaining &= remaining - 1;
         }
     }
+    for (uint32_t m = result.tainted_simd; m; m &= m - 1) tainted.push_back(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     output["tainted_regs_final"] = tainted;
 
     // Propagation steps (detailed, limit to 1000)
@@ -226,6 +232,8 @@ static int run_taint(PassManager& pm, uint8_t reg_index) {
                 {"type", propagation_type_str(s.type)},
                 {"triton_resolved", s.triton_resolved}
             };
+            step_json["src_simd_mask"] = s.src_simd_mask;
+            step_json["control_inst_id"] = s.control_inst_id == UINT64_MAX ? json(nullptr) : json(s.control_inst_id);
             if (s.dst_reg != 0xFF) {
                 step_json["dst_reg"] = s.dst_reg;
             }
@@ -600,6 +608,10 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
     };
     output["contributing_count"] = result.contributing_count();
     output["max_depth"] = result.max_depth;
+    output["quality"] = result.quality.to_json();
+    output["config"]["include_flags"] = result.config.include_flags;
+    output["config"]["include_simd"] = result.config.include_simd;
+    output["config"]["include_control"] = result.config.include_control;
 
     // All involved registers
     std::vector<uint8_t> involved;
@@ -610,6 +622,7 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
             remaining &= remaining - 1;
         }
     }
+    for (uint32_t m = result.all_involved_simd; m; m &= m - 1) involved.push_back(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
     output["involved_regs"] = involved;
 
     // Events (limit to first 500 for JSON output readability)
@@ -621,7 +634,9 @@ static int run_backward_taint(PassManager& pm, uint64_t sink_id, uint8_t sink_re
             {"inst_id", ev.inst_id},
             {"pc", fmt::format("0x{:X}", ev.pc)},
             {"dst_reg", ev.dst_reg},
-            {"src_regs", ev.src_regs_list()}
+            {"src_regs", ev.src_regs_list()},
+            {"thread_id", ev.thread_id},
+            {"control_inst_id", ev.control_inst_id == UINT64_MAX ? json(nullptr) : json(ev.control_inst_id)}
         };
         if (ev.loads_from_memory) {
             json addrs = json::array();
@@ -676,6 +691,8 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     }
 
     PassManager pm;
+    pm.set_analysis_memory_budget(static_cast<size_t>(opts.analysis_memory_mb) << 20);
+    pm.set_rss_limit_mb(opts.rss_limit_mb);
     pm.set_reader(&reader);
     pm.set_index(&index);
     pm.set_code_table(&code_table);
@@ -720,6 +737,9 @@ int tenet::run_batch_analysis(const CliOptions& opts,
         TaintConfig taint_cfg;
         taint_cfg.add_source_reg(opts.taint_reg_index);
         taint_cfg.source_inst_id = opts.taint_source_inst_id;
+        taint_cfg.include_control = opts.taint_include_control;
+        taint_cfg.include_flags = opts.taint_include_flags || opts.taint_include_control;
+        taint_cfg.include_simd |= opts.taint_include_simd;
         taint_cfg.source_mem_addrs = opts.taint_source_mem_addrs;
         taint_cfg.max_taint_width = opts.taint_max_width;
         taint_cfg.propagate_through_calls = !opts.taint_no_calls;
@@ -759,6 +779,9 @@ int tenet::run_batch_analysis(const CliOptions& opts,
     // --backward-taint needs BackwardTaintPass
     if (opts.opt_backward_taint || opts.opt_critical_path) {
         BackwardTaintConfig bt_cfg;
+        bt_cfg.include_control = opts.taint_include_control;
+        bt_cfg.include_flags = opts.taint_include_flags || opts.taint_include_control;
+        bt_cfg.include_simd |= opts.taint_include_simd;
         bt_cfg.sink_inst_id = opts.backward_taint_sink_id;
         bt_cfg.add_sink_reg(opts.backward_taint_reg);
         bt_cfg.propagate_through_memory = true;

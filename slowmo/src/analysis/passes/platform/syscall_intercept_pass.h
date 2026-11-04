@@ -222,6 +222,7 @@ public:
                                uint32_t target_os = 0);
 
     std::string_view name() const override { return "SyscallInterceptCollector"; }
+    size_t resident_bytes() const override { return result_.calls.capacity() * sizeof(InterceptedCall); }
 
     bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
     void on_inst(uint64_t inst_id, const InstView& inst) override;

@@ -12,6 +12,7 @@
  * Run:  ctest -R 'exclude_range' --output-on-failure
  */
 #include <catch2/catch_test_macros.hpp>
+#include <fstream>
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/structure/xref_pass.h"
@@ -149,4 +150,100 @@ TEST_CASE("Exclude range: register state unaffected by exclusion",
     // state_after(4): inst 4 writes x0=0x50
     auto s4 = regfile.state_after(4);
     REQUIRE(s4.gpr[0] == 0x50ULL);
+}
+
+TEST_CASE("Filtered xref does not read or overwrite full-trace cache", "[unit][exclude_range][cache]") {
+    auto env = make_exclude_trace();
+    REQUIRE(env != nullptr);
+    auto full = make_pm(*env);
+    full->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(full->require("xref").get<XrefResult>().total_indexed == 5);
+
+    auto filtered = make_pm(*env);
+    AnalysisRange range;
+    range.exclude_pc_ranges.push_back({rt_pc(0x2000), rt_pc(0x2008)});
+    REQUIRE_FALSE(range.is_full_trace());
+    filtered->set_range(range);
+    filtered->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(filtered->require("xref").get<XrefResult>().total_indexed == 3);
+
+    auto again = make_pm(*env);
+    again->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(again->require("xref").get<XrefResult>().total_indexed == 5);
+    range.exclude_pc_ranges.clear();
+    range.include_thread_ids = {123};
+    REQUIRE_FALSE(range.is_full_trace());
+}
+
+TEST_CASE("Filtered xref cannot seed the full-trace cache", "[unit][exclude_range][cache]") {
+    auto env = make_exclude_trace();
+    REQUIRE(env != nullptr);
+    auto filtered = make_pm(*env);
+    AnalysisRange range;
+    range.exclude_pc_ranges.push_back({rt_pc(0x2000), rt_pc(0x2008)});
+    filtered->set_range(range);
+    filtered->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(filtered->require("xref").get<XrefResult>().total_indexed == 3);
+    auto full = make_pm(*env);
+    full->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(full->require("xref").get<XrefResult>().total_indexed == 5);
+}
+
+TEST_CASE("Xref thread filtering respects cache and instruction bounds", "[unit][exclude_range][cache]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState a, b;
+        tw.emit_thread(100); tw.emit_anchor(a);
+        tw.emit(a, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+        tw.emit_thread(200); tw.emit_anchor(b);
+        tw.emit(b, 0x2000, enc::nop(), {{33, tw.rt(0x2004)}}, {});
+        tw.emit(b, 0x2004, enc::nop(), {{33, tw.rt(0x2008)}}, {});
+    }, "xref_filtered_threads");
+    REQUIRE(env != nullptr);
+    auto full = make_pm(*env);
+    full->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(full->require("xref").get<XrefResult>().total_indexed == 3);
+    for (bool bound : {false, true}) {
+        auto pm = make_pm(*env);
+        AnalysisRange range;
+        range.include_thread_ids = {200};
+        if (bound) range.end_inst_id = 2;
+        pm->set_range(range);
+        pm->register_pass(std::make_unique<XrefPass>());
+        const auto& r = pm->require("xref").get<XrefResult>();
+        REQUIRE(r.total_indexed == (bound ? 1 : 2));
+        REQUIRE_FALSE(r.has_pc(rt_pc(0x1000)));
+        for (const auto& edge : r.pc_transitions) REQUIRE(edge.from_pc != rt_pc(0x1000));
+    }
+}
+
+TEST_CASE("Xref empty half-open range does not scan the trace", "[unit][exclude_range]") {
+    auto env = make_exclude_trace();
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    AnalysisRange range;
+    range.end_inst_id = 0;
+    pm->set_range(range);
+    pm->register_pass(std::make_unique<XrefPass>());
+    REQUIRE(pm->require("xref").get<XrefResult>().total_indexed == 0);
+}
+
+TEST_CASE("Legacy pass cache generation is never reused", "[unit][exclude_range][cache]") {
+    auto env = make_exclude_trace();
+    REQUIRE(env != nullptr);
+    const auto legacy_dir = env->index->db_path() / "pass_cache";
+    std::filesystem::create_directories(legacy_dir);
+    {
+        std::ofstream old(legacy_dir / "legacy_probe.bin", std::ios::binary);
+        old << "old filtered result";
+    }
+    std::filesystem::create_directories(legacy_dir / "v2");
+    { std::ofstream stale(legacy_dir / "v2" / "legacy_probe.bin"); stale << "old PC seed result"; }
+    std::string blob;
+    REQUIRE_FALSE(env->index->load_pass_blob("legacy_probe", blob));
+    const std::string fresh = "new result";
+    env->index->save_pass_blob("legacy_probe", fresh.data(), fresh.size());
+    REQUIRE(env->index->load_pass_blob("legacy_probe", blob));
+    REQUIRE(blob == fresh);
+    REQUIRE(env->index->pass_blob_file_path("legacy_probe").parent_path() == legacy_dir / "v3");
 }

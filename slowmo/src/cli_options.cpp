@@ -63,6 +63,11 @@ static void print_usage(const char* prog) {
   fmt::print(stderr, "                            Repeatable. Exits after deletion.\n");
     fmt::print(stderr, "  --export-cfg <file.dot>   Export annotated CFG as Graphviz DOT\n");
     fmt::print(stderr, "  --taint <reg_index>       Run taint analysis from register index\n");
+    fmt::print(stderr, "  --taint-simd             Track whole SIMD registers (indices 34-65)\n");
+    fmt::print(stderr, "  --taint-control          Track dynamic implicit control dependencies\n");
+    fmt::print(stderr, "  --analysis-memory-mb N   Working/resident-prefix budget (default 64 MiB)\n");
+    fmt::print(stderr, "  --rss-limit-mb N         Abort analysis when process RSS exceeds N MiB\n");
+    fmt::print(stderr, "  --taint-include-flags    Track explicit NZCV dependencies (forward/backward)\n");
     fmt::print(stderr, "  --taint-inst <inst_id>    Start taint from specific instruction ID\n");
     fmt::print(stderr, "  --taint-mem <addr>        Add memory address as taint source (hex)\n");
     fmt::print(stderr, "  --taint-stop-pc <addr>    Stop taint at this PC (hex, repeatable)\n");
@@ -207,6 +212,16 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--taint" && i + 1 < argc) {
             opts.opt_taint = true;
             opts.taint_reg_index = static_cast<uint8_t>(std::stoul(argv[++i]));
+        } else if (arg == "--taint-simd") {
+            opts.taint_include_simd = true;
+        } else if (arg == "--taint-control") {
+            opts.taint_include_control = true;
+        } else if (arg == "--analysis-memory-mb" && i + 1 < argc) {
+            opts.analysis_memory_mb = std::max<uint64_t>(1, std::stoull(argv[++i]));
+        } else if (arg == "--rss-limit-mb" && i + 1 < argc) {
+            opts.rss_limit_mb = std::stod(argv[++i]);
+        } else if (arg == "--taint-include-flags") {
+            opts.taint_include_flags = true;
         } else if (arg == "--taint-inst" && i + 1 < argc) {
             opts.taint_source_inst_id = std::stoull(argv[++i]);
         } else if (arg == "--taint-mem" && i + 1 < argc) {

@@ -3,266 +3,134 @@
 #include "io/index_builder.h"
 #include "core/memory_model.h"
 #include "common/entropy.h"
-#include "infra/page_stats.h"
-
-#include <cmath>
-#include <cstring>
+#include "common/memory_ranges.h"
 #include <algorithm>
+#include <array>
+#include <cmath>
 
 namespace tenet {
-
-// ─── Shannon entropy: delegated to common/entropy.h ─────────────────────
-
 float EntropyPass::compute_entropy(const uint8_t* data, size_t len) {
-    return tenet::shannon_entropy(data, len);
+    return shannon_entropy(data, len);
 }
-
-// ─── Batch memory read (16 bytes at a time) ───────────────────────────────
-//
-// Optimization: Instead of calling byte_at() once per byte (each call creates
-// a new RocksDB Iterator + seek), we use memory.read(addr, 16, at_inst_id)
-// which reads 16 bytes in one RocksDB seek.
-//
-// For a 4096-byte region: 4096 seeks → 256 seeks (16× fewer).
-// For the timeline (cfg_.size × sample_points): reduction is multiplicative.
-
-static void batch_read_region(MemoryModel& memory, uint64_t base_addr, uint32_t size,
-                              uint64_t at_inst_id,
-                              std::vector<uint8_t>& out_data,
-                              std::vector<bool>& out_known,
-                              uint32_t& known_count) {
-    out_data.resize(size, 0);
-    out_known.resize(size, false);
-    known_count = 0;
-
-    // Read in 16-byte chunks using memory.read()
-    for (uint32_t offset = 0; offset < size; offset += 16) {
-        uint8_t chunk_size = static_cast<uint8_t>(std::min(uint32_t(16), size - offset));
-        auto result = memory.read(base_addr + offset, chunk_size, at_inst_id);
-
-        for (uint8_t i = 0; i < chunk_size; i++) {
-            if (result.known[i]) {
-                out_data[offset + i] = result.data[i];
-                out_known[offset + i] = true;
-                known_count++;
-            }
-        }
-    }
+namespace {
+using Histogram = std::array<uint32_t, 256>;
+float entropy(const Histogram& h, uint32_t n) {
+    if (!n) return 0;
+    double sum = 0;
+    for (auto c : h) if (c) sum += double(c) * std::log2(double(c));
+    return static_cast<float>(std::log2(double(n)) - sum / n);
 }
-
-// ─── Main pass execution ──────────────────────────────────────────────────
-
+EntropyResult::Classification classify(float e, uint32_t n, uint32_t size) {
+    if (n < 8) return EntropyResult::Unknown;
+    if (e > 7.5f) return EntropyResult::Encrypted;
+    if (e > 6.f) return EntropyResult::Compressed;
+    if (e < 4.f) return EntropyResult::Plaintext;
+    return size <= 64 ? EntropyResult::KeyMaterial : EntropyResult::Compressed;
+}
+}
 PassResult EntropyPass::run(PassContext& ctx) {
-    if (cfg_.addr == 0 && cfg_.size == 0) {
-        return PassResult::failed("Entropy analysis requires addr and size");
-    }
-
+    if (!cfg_.size || !cfg_.block_size || (cfg_.compute_timeline && !cfg_.timeline_interval) ||
+        uint64_t(cfg_.size - 1) > UINT64_MAX - cfg_.addr)
+        return PassResult::failed("Entropy requires a nonempty, non-overflowing region and nonzero intervals");
+    const uint64_t working_bytes = uint64_t(cfg_.size) * (cfg_.compute_timeline ? 4 : 2) +
+        ((uint64_t(cfg_.size) + cfg_.block_size - 1) / cfg_.block_size) * sizeof(EntropyBlock);
+    if (ctx.memory_budget_bytes() && working_bytes > ctx.memory_budget_bytes())
+        return PassResult::failed("Entropy region exceeds analysis memory budget");
+    if (ctx.memory_pressure()) return PassResult::failed("Entropy RSS limit exceeded");
     auto& memory = ctx.memory();
-    auto& index = ctx.index();
-
-    const uint64_t at_id = (cfg_.at_inst_id > 0)
-        ? cfg_.at_inst_id : index.inst_count();
-
-    // ── Fast path: if region is page-aligned and covers full pages,
-    //    use pre-computed PageStats entropy instead of re-reading memory.
-    {
-        auto& page_stats = ctx.page_stats();
-        const uint64_t page_size = 4096;
-        bool is_page_aligned = (cfg_.addr % page_size == 0) && (cfg_.size % page_size == 0);
-
-        if (is_page_aligned && !cfg_.compute_timeline) {
-            page_stats.ensure_built();
-
-            EntropyResult result;
-            result.addr = cfg_.addr;
-            result.region_size = cfg_.size;
-
-            // Aggregate entropy from all covered pages
-            double total_entropy_sum = 0.0;
-            uint32_t page_count = 0;
-            uint64_t total_known = 0;
-
-            for (uint64_t offset = 0; offset < cfg_.size; offset += page_size) {
-                uint64_t page_addr = ((cfg_.addr + offset) >> 12) << 12;
-                const PageSummary* ps = page_stats.page(page_addr);
-                if (ps && ps->entropy >= 0.0) {
-                    total_entropy_sum += ps->entropy;
-                    page_count++;
-                    total_known += 4096;  // conservative estimate
-                }
-            }
-
-            result.known_bytes = static_cast<uint32_t>(total_known);
-
-            if (page_count > 0) {
-                result.overall_entropy = static_cast<float>(total_entropy_sum / page_count);
-
-                // Classify based on overall entropy
-                if (total_known < 8) {
-                    result.classification = EntropyResult::Unknown;
-                } else if (result.overall_entropy > 7.5f) {
-                    result.classification = EntropyResult::Encrypted;
-                } else if (result.overall_entropy > 6.0f) {
-                    result.classification = EntropyResult::Compressed;
-                } else if (result.overall_entropy < 4.0f) {
-                    result.classification = EntropyResult::Plaintext;
-                } else if (cfg_.size <= 64) {
-                    result.classification = EntropyResult::KeyMaterial;
-                } else {
-                    result.classification = EntropyResult::Compressed;
-                }
-
-                // Per-block entropy from pages
-                for (uint64_t offset = 0; offset < cfg_.size; offset += cfg_.block_size) {
-                    uint64_t page_addr = ((cfg_.addr + offset) >> 12) << 12;
-                    const PageSummary* ps = page_stats.page(page_addr);
-                    EntropyBlock block;
-                    block.offset = static_cast<uint64_t>(offset);
-                    block.size = std::min(cfg_.block_size, cfg_.size - static_cast<uint32_t>(offset));
-                    block.is_known = (ps && ps->entropy >= 0.0);
-                    block.entropy = ps ? static_cast<float>(ps->entropy) : 0.0f;
-                    result.blocks.push_back(block);
-                }
-
-                ctx.progress(1.0f, "Entropy: complete (PageStats fast path)");
-                return PassResult::success(std::move(result));
-            }
-            // If no page stats available, fall through to slow path
-        }
-    }
-
+    auto& reader = ctx.reader();
+    const uint64_t at = cfg_.at_inst_id ? std::min(cfg_.at_inst_id, ctx.index().inst_count()) : ctx.index().inst_count();
     EntropyResult result;
-    result.addr = cfg_.addr;
-    result.region_size = cfg_.size;
-
-    ctx.progress(0.0f, "Entropy: reading memory region (batch 16B)...");
-
-    // ── Batch-read the region (16× fewer RocksDB seeks than byte_at()) ──
-    std::vector<uint8_t> region_data;
-    std::vector<bool> region_known;
-    uint32_t known_count = 0;
-
-    batch_read_region(memory, cfg_.addr, cfg_.size, at_id,
-                      region_data, region_known, known_count);
-
-    result.known_bytes = known_count;
-
-    if (known_count == 0) {
-        result.overall_entropy = 0.0f;
-        result.classification = EntropyResult::Unknown;
-        return PassResult::success(std::move(result));
-    }
-
-    ctx.progress(0.3f, "Entropy: computing per-block entropy...");
-
-    // Compute per-block entropy
-    for (uint32_t offset = 0; offset < cfg_.size; offset += cfg_.block_size) {
-        uint32_t block_len = std::min(cfg_.block_size, cfg_.size - offset);
-
-        // Collect known bytes in this block
-        std::vector<uint8_t> block_bytes;
-        block_bytes.reserve(block_len);
-        bool all_known = true;
-        for (uint32_t i = 0; i < block_len; i++) {
-            if (region_known[offset + i]) {
-                block_bytes.push_back(region_data[offset + i]);
-            } else {
-                all_known = false;
-            }
+    result.addr = cfg_.addr; result.region_size = cfg_.size;
+    // One bulk historical reconstruction. Averaging page entropies would be
+    // incorrect, and final-page statistics cannot answer historical queries.
+    auto region = memory.read_region(cfg_.addr, cfg_.size, at);
+    Histogram total{};
+    for (uint32_t offset = 0; offset < cfg_.size;) {
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+        if (ctx.memory_pressure()) return PassResult::failed("Entropy RSS limit exceeded");
+        const auto n = std::min(cfg_.block_size, cfg_.size - offset);
+        Histogram h{}; uint32_t known = 0;
+        for (uint32_t i = 0; i < n; ++i) if (region.known[offset + i]) {
+            ++h[region.data[offset + i]]; ++total[region.data[offset + i]]; ++known;
         }
-
-        EntropyBlock block;
-        block.offset = offset;
-        block.size = block_len;
-        block.is_known = all_known;
-        block.entropy = block_bytes.empty() ? 0.0f
-            : compute_entropy(block_bytes.data(), block_bytes.size());
-        result.blocks.push_back(block);
+        result.blocks.push_back({offset, n, entropy(h, known), known == n});
+        result.known_bytes += known;
+        offset += n;
     }
-
-    // Compute overall entropy (only known bytes)
-    std::vector<uint8_t> known_bytes_vec;
-    known_bytes_vec.reserve(known_count);
-    for (uint32_t i = 0; i < cfg_.size; i++) {
-        if (region_known[i]) known_bytes_vec.push_back(region_data[i]);
-    }
-    result.overall_entropy = compute_entropy(known_bytes_vec.data(), known_bytes_vec.size());
-
-    // Classify
-    if (known_count < 8) {
-        result.classification = EntropyResult::Unknown;
-    } else if (result.overall_entropy > 7.5f) {
-        result.classification = EntropyResult::Encrypted;
-    } else if (result.overall_entropy > 6.0f) {
-        result.classification = EntropyResult::Compressed;
-    } else if (result.overall_entropy < 4.0f) {
-        result.classification = EntropyResult::Plaintext;
-    } else if (cfg_.size <= 64) {
-        result.classification = EntropyResult::KeyMaterial;
-    } else {
-        result.classification = EntropyResult::Compressed;
-    }
-
-    ctx.progress(0.6f, "Entropy: detecting transitions...");
-
-    // Compute entropy timeline if requested
+    result.overall_entropy = entropy(total, result.known_bytes);
+    result.classification = classify(result.overall_entropy, result.known_bytes, cfg_.size);
     if (cfg_.compute_timeline) {
-        auto write_history = memory.write_history(cfg_.addr, static_cast<uint8_t>(std::min(cfg_.size, 8u)));
-
-        uint32_t sample_count = 0;
-        float prev_entropy = 0.0f;
-
-        // Hoist vector allocations out of the loop so that the underlying
-        // heap storage is reused across iterations instead of being
-        // allocated/freed on every sample point.
-        // batch_read_region() calls resize() internally, which is a no-op
-        // when capacity is already sufficient.
-        std::vector<uint8_t> sample_data;
-        std::vector<bool> sample_known;
-        std::vector<uint8_t> known_sample;
-        sample_data.reserve(cfg_.size);
-        sample_known.reserve(cfg_.size);
-        known_sample.reserve(cfg_.size);
-
-        for (uint64_t writer_id : write_history) {
-            if (++sample_count % cfg_.timeline_interval != 0) continue;
-
-            if (ctx.cancelled()) {
-                return PassResult::failed("cancelled by user");
+        // Seed only the configure-time snapshot. Replay every intersecting
+        // access, not just writes overlapping the first eight region bytes.
+        auto initial = memory.read_region(cfg_.addr, cfg_.size, 0);
+        auto data = std::move(initial.data);
+        auto known = std::move(initial.known);
+        Histogram h{}; uint32_t count = 0;
+        for (uint32_t i = 0; i < cfg_.size; ++i) if (known[i]) { ++h[data[i]]; ++count; }
+        uint64_t writes = 0, inst_id = 0, pending = UINT64_MAX;
+        float previous = 0.f;
+        auto sample = [&]() {
+            if (pending == UINT64_MAX) return;
+            const auto e = entropy(h, count);
+            result.timeline.push_back({pending, e, count});
+            if (previous > .01f && std::abs(e - previous) > 2.f)
+                result.transitions.push_back({pending, previous, e, e - previous});
+            previous = e; pending = UINT64_MAX;
+        };
+        auto update = [&](const MemAccessView& m, bool observation, bool old) {
+            if (!m.size) return false;
+            const auto last = MemoryRanges<int>::last_byte(m.addr, m.size);
+            const auto lo = std::max(m.addr, cfg_.addr);
+            const auto hi = std::min(last, cfg_.addr + cfg_.size - 1);
+            if (lo > hi) return false;
+            for (auto addr = lo;; ++addr) {
+                const auto src = addr - m.addr;
+                const auto dst = static_cast<size_t>(addr - cfg_.addr);
+                if (src >= 16 && !observation && known[dst]) { --h[data[dst]]; known[dst] = false; --count; }
+                if (src < 16 && (!observation || !known[dst])) {
+                    const uint64_t value = src < 8 ? (old ? m.old_value : m.value) : (old ? m.old_value_hi : m.value_hi);
+                    const auto byte = static_cast<uint8_t>(value >> (8 * (src % 8)));
+                    if (known[dst]) --h[data[dst]];
+                    else { known[dst] = true; ++count; }
+                    data[dst] = byte; ++h[byte];
+                }
+                if (addr == hi) break;
             }
-
-            // ── Batch-read region at this snapshot point ──
-            uint32_t sample_known_count = 0;
-
-            batch_read_region(memory, cfg_.addr, cfg_.size, writer_id,
-                              sample_data, sample_known, sample_known_count);
-
-            // Collect only known bytes for entropy calculation
-            known_sample.clear();
-            for (uint32_t i = 0; i < cfg_.size; i++) {
-                if (sample_known[i]) known_sample.push_back(sample_data[i]);
+            return true;
+        };
+        auto tr = reader.create_thread_reader(2);
+        for (auto it = reader.begin(tr); it != reader.end(tr) && inst_id <= at; ++it) {
+            const auto rec = *it;
+            if (rec.kind != RecordKind::Inst) continue;
+            if ((inst_id & 4095) == 0) {
+                if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+                if (ctx.memory_pressure()) return PassResult::failed("Entropy RSS limit exceeded");
+                if (ctx.memory_budget_bytes() && working_bytes + result.timeline.capacity()*sizeof(EntropyTimelineEntry) +
+                    result.transitions.capacity()*sizeof(EntropyResult::Transition) > ctx.memory_budget_bytes())
+                    return PassResult::failed("Entropy timeline exceeds analysis memory budget");
             }
-
-            float ent = known_sample.empty() ? 0.0f
-                : compute_entropy(known_sample.data(), known_sample.size());
-
-            EntropyTimelineEntry te;
-            te.inst_id = writer_id;
-            te.overall_entropy = ent;
-            te.known_bytes = sample_known_count;
-            result.timeline.push_back(te);
-
-            // Detect transitions
-            float delta = ent - prev_entropy;
-            if (std::abs(delta) > 2.0f && prev_entropy > 0.01f) {
-                result.transitions.push_back({writer_id, prev_entropy, ent, delta});
+            const auto inst = rec.as_inst();
+            // First observations are visible before this instruction in the
+            // memory model. Defer the preceding sample until they are known.
+            for (uint8_t i = 0; i < inst.mem_access_count; ++i) {
+                const auto m = inst.mem_access(i);
+                if ((m.type & 1) && !(m.type & 2)) update(m, true, false);
+                if ((m.type & 2) && m.has_old_value) update(m, true, true);
             }
-            prev_entropy = ent;
+            sample();
+            if (inst_id == at) break;
+            bool touched = false;
+            for (uint8_t i = 0; i < inst.mem_access_count; ++i) {
+                const auto m = inst.mem_access(i);
+                if (m.type & 2) touched |= update(m, false, false);
+            }
+            if (touched && ++writes % cfg_.timeline_interval == 0) pending = inst_id + 1;
+            ++inst_id;
         }
+        sample();
     }
-
-    ctx.progress(1.0f, "Entropy: complete");
+    ctx.progress(1.f, "Entropy: complete (bulk snapshot + incremental histogram)");
     return PassResult::success(std::move(result));
 }
-
-}  // namespace tenet
+} // namespace tenet

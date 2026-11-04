@@ -252,3 +252,81 @@ TEST_CASE("TaintPass tracks interior bytes and kills clean partial overwrites",
     REQUIRE(result.tainted_memory.contains(uint64_t(0x2003)));
     REQUIRE_FALSE(result.tainted_memory.contains(uint64_t(0x2004)));
 }
+
+TEST_CASE("Forward taint can follow CMP to CSEL through flags", "[unit][pass][taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, 0xf100041fu, {{33, tw.rt(0x1004)}}, {}); // cmp x0, #1, no reg_diff for NZCV
+        tw.emit(ms, 0x1004, 0x9a840062u, {{2, 7}, {33, tw.rt(0x1008)}}, {}); // csel x2, x3, x4, eq
+    }, "taint_flag_chain");
+    REQUIRE(env != nullptr);
+    for (bool flags : {false, true}) {
+        auto pm = make_pm(*env);
+        TaintConfig cfg; cfg.add_source_reg(0); cfg.include_flags = flags;
+        cfg.use_xref_acceleration = false;
+        pm->register_pass(std::make_unique<TaintPass>(cfg));
+        const auto& r = pm->require("taint").get<TaintResult>();
+        REQUIRE(r.is_tainted(2) == flags);
+        if (flags) {
+            REQUIRE(r.is_tainted(IDX_NZCV));
+            REQUIRE(r.quality.engine == "heuristic");
+            REQUIRE(r.quality.instructions_examined == 2);
+            REQUIRE_FALSE(r.quality.has_gaps());
+        }
+    }
+}
+
+TEST_CASE("Forward taint reports unsupported SIMD and early termination", "[unit][pass][taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, 0x6e221c20u, {{33, tw.rt(0x1004)}}, {});
+        tw.emit(ms, 0x1004, enc::nop(), {{33, tw.rt(0x1008)}}, {});
+    }, "taint_quality");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    TaintConfig cfg; cfg.add_source_reg(0); cfg.include_flags = true;
+    cfg.max_instructions = 1; cfg.use_xref_acceleration = false;
+    pm->register_pass(std::make_unique<TaintPass>(cfg));
+    const auto& r = pm->require("taint").get<TaintResult>();
+    REQUIRE(r.quality.unsupported_register_instructions == 1);
+    REQUIRE(r.quality.truncated);
+    REQUIRE(r.quality.termination_reason == "max_instructions reached");
+    REQUIRE(r.quality.has_gaps());
+}
+
+TEST_CASE("Forward taint keeps load values separate from base writeback", "[unit][pass][taint][semantics]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, 0xf8408420u, {{0, 7}, {1, 0x9008}, {33, tw.rt(0x1004)}},
+                {{1, 8, 0x9000, 7}}); // ldr x0, [x1], #8
+    }, "taint_writeback_sources");
+    REQUIRE(env != nullptr);
+    auto pm = make_pm(*env);
+    TaintConfig cfg; cfg.source_mem_addrs = {0x9000}; cfg.include_flags = true;
+    cfg.use_xref_acceleration = false;
+    pm->register_pass(std::make_unique<TaintPass>(cfg));
+    const auto& r = pm->require("taint").get<TaintResult>();
+    REQUIRE(r.is_tainted(0));
+    REQUIRE_FALSE(r.is_tainted(1));
+}
+
+TEST_CASE("Forward taint distinguishes missing bytes from undecodable bytes", "[unit][pass][taint][semantics]") {
+    for (bool missing : {false, true}) {
+        auto env = make_env([](TraceWriter& tw) {
+            tw.write_header(); MachineState ms;
+            tw.emit(ms, 0x1000, 0xffffffffu, {{1, 7}, {33, tw.rt(0x1004)}}, {});
+        }, "taint_decode_gaps");
+        REQUIRE(env != nullptr);
+        if (missing) env->code_table = CodeTable{};
+        auto pm = make_pm(*env);
+        TaintConfig cfg; cfg.add_source_reg(0); cfg.include_flags = true;
+        cfg.use_xref_acceleration = false;
+        pm->register_pass(std::make_unique<TaintPass>(cfg));
+        const auto& raw = pm->require("taint");
+        REQUIRE(raw.ok());
+        const auto& r = raw.get<TaintResult>();
+        REQUIRE(r.quality.missing_code == (missing ? 1 : 0));
+        REQUIRE(r.quality.undecoded_instructions == (missing ? 0 : 1));
+        REQUIRE(r.quality.has_gaps());
+    }
+}

@@ -4,6 +4,7 @@
 #include "io/trace_reader.h"
 #include <atomic>
 #include <string_view>
+#include <string>
 #include <vector>
 
 namespace tenet {
@@ -40,6 +41,8 @@ public:
                           const std::atomic<bool>& cancel_token,
                           bool no_parallel = false);
 
+    void set_memory_limits(double rss_mb, size_t collector_bytes) { rss_limit_mb_ = rss_mb; collector_budget_ = collector_bytes; }
+    const std::string& error() const { return error_; }
     /// Get collector for a pass name (pass reads results after scan)
     TraceCollector* collector_for(std::string_view pass_name) const;
 
@@ -55,6 +58,9 @@ private:
 
     std::vector<ScanDeclaration> declarations_;
     bool scanned_ = false;
+    double rss_limit_mb_ = 0;
+    size_t collector_budget_ = 0;
+    std::string error_;
 };
 
 }  // namespace tenet

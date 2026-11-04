@@ -10,6 +10,9 @@
 #include <cstring>
 
 #include "common/byte_codec.h"
+#include "common/external_sort.h"
+#include <fstream>
+#include <array>
 
 // Pull CRoaring C API types into our namespace
 using roaring::api::roaring64_bitmap_t;
@@ -66,6 +69,7 @@ struct Shard {
     uint64_t start_inst_id;   // inst_id of the first INST record in this shard
     uint64_t end_inst_id;     // one-past-last inst_id for this shard
     uint64_t seed_pc = 0;     // v5 only: absolute PC at file_start (from index)
+    uint64_t seed_thread = 0; // producer owning the first instruction
 };
 
 // ─── Per-shard scan result ───────────────────────────────────────────────────
@@ -129,10 +133,14 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 bool is_v5, bool is_v6, bool is_v7, bool is_v8, ShardResult& out,
                 const TraceReader::ThreadReader& thread_reader,
                 const std::atomic<bool>& cancelled,
-                const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges = {}) {
+                const std::vector<std::pair<uint64_t, uint64_t>>& exclude_ranges = {},
+                const std::vector<uint64_t>& include_threads = {}) {
     uint64_t offset = shard.file_start;
     const uint64_t end_offset = shard.file_end;
     uint64_t inst_id = shard.start_inst_id;
+    uint64_t current_thread = shard.seed_thread;
+    bool thread_included = include_threads.empty() ||
+        std::find(include_threads.begin(), include_threads.end(), current_thread) != include_threads.end();
 
     // Pre-compute sizes to avoid branching in the inner loop.
     const size_t inst_hdr_sz = inst_header_size(is_v5, is_v7);
@@ -159,7 +167,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
     // For each INST: running_pc += pc_delta.  For each ANCHOR: running_pc = anchor.pc.
     uint64_t running_pc = shard.seed_pc;
 
-    while (offset < end_offset) {
+    while (offset < end_offset && inst_id < shard.end_inst_id) {
         // Check for cancellation every 64K instructions to allow
         // prompt shutdown without measurably impacting scan throughput.
         if ((inst_id & 0xFFFF) == 0 &&
@@ -183,7 +191,7 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
             }
 
             // Skip excluded PC ranges
-            bool excluded = false;
+            bool excluded = !thread_included;
             if (has_excludes) {
                 for (const auto& [s, e] : exclude_ranges) {
                     if (pc >= s && pc < e) { excluded = true; break; }
@@ -223,6 +231,13 @@ void scan_shard(const Shard& shard, uint32_t num_gpr,
                 + n_mem      * memacc_sz;
             inst_id++;
         } else {
+            if (kind == qbditrace::QBDITRACE_REC_THREAD) {
+                const auto* thread = reinterpret_cast<const qbditrace::qbditrace_thread_head_t*>(ptr);
+                current_thread = thread->thread_id;
+                thread_included = include_threads.empty() ||
+                    std::find(include_threads.begin(), include_threads.end(), current_thread) != include_threads.end();
+                prev_pc = UINT64_MAX; // a context switch is not a control-flow edge
+            }
             // For v5 traces, resync running_pc from ANCHOR records.
             if (is_v5 && kind == 1) { // ANCHOR
                 const auto* a_hdr = reinterpret_cast<const qbditrace::qbditrace_anchor_head_t*>(ptr);
@@ -343,7 +358,7 @@ std::vector<uint64_t> XrefBitmapLoader::load_inst_ids(uint64_t pc) const {
     if (!f) return {};
 
     // Seek to bitmap_bytes field
-    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0) return {};
+    if (tenet::platform::seek_file(f, it->bitmap_offset) != 0) return {};
 
     uint64_t bm_bytes = 0;
     if (std::fread(&bm_bytes, 8, 1, f) != 1 || bm_bytes == 0) return {};
@@ -368,7 +383,7 @@ roaring::Roaring64Map XrefBitmapLoader::load_bitmap(uint64_t pc) const {
     FILE* f = ensure_open();
     if (!f) return {};
 
-    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0) return {};
+    if (tenet::platform::seek_file(f, it->bitmap_offset) != 0) return {};
 
     uint64_t bm_bytes = 0;
     if (std::fread(&bm_bytes, 8, 1, f) != 1 || bm_bytes == 0) return {};
@@ -397,7 +412,7 @@ uint64_t XrefBitmapLoader::first_inst_id(uint64_t pc) const {
     FILE* f = ensure_open();
     if (!f) return UINT64_MAX;
 
-    if (std::fseek(f, static_cast<long>(it->bitmap_offset), SEEK_SET) != 0)
+    if (tenet::platform::seek_file(f, it->bitmap_offset) != 0)
         return UINT64_MAX;
 
     uint64_t bm_bytes = 0;
@@ -667,6 +682,143 @@ bool xref_deserialize_v1(const std::string& blob, XrefResult& out) {
 
 // ─── XrefPass::run ───────────────────────────────────────────────────────────
 
+namespace {
+struct XrefOccurrence {
+    uint64_t pc, id;
+    bool operator<(const XrefOccurrence& o) const { return pc < o.pc || (pc == o.pc && id < o.id); }
+};
+struct XrefTransition {
+    uint64_t from, to, count = 1;
+    bool operator<(const XrefTransition& o) const { return from < o.from || (from == o.from && to < o.to); }
+};
+PassResult stream_xref(PassContext& ctx) {
+    auto& reader = ctx.reader(); auto& index = ctx.index(); const auto& range = ctx.range();
+    const auto end = std::min(range.end_inst_id, index.inst_count());
+    auto check = [&]() {
+        if (ctx.cancelled()) throw std::runtime_error("xref cancelled");
+        if (ctx.memory_pressure()) throw std::runtime_error("xref exceeded RSS limit");
+    };
+    const size_t run_bytes = std::max<size_t>(4096, ctx.memory_budget_bytes() / 4);
+    ExternalSorter<XrefOccurrence> occurrences(run_bytes, check);
+    ExternalSorter<XrefTransition> transitions(run_bytes, check);
+    auto scratch = occurrences.scratch;
+    ankerl::unordered_dense::map<uint64_t, roaring::Roaring64Map> compact;
+    PCTransitionMap compact_edges;
+    bool external = false;
+    const size_t check_stride = std::clamp<size_t>(run_bytes / 128, 64, 4096);
+    auto spill_compact = [&]() {
+        for (const auto& [pc, ids] : compact) for (auto inst : ids) occurrences.add({pc, inst});
+        for (const auto& [edge, count] : compact_edges) transitions.add({edge.first, edge.second, count});
+        compact.clear(); compact_edges.clear(); external = true;
+    };
+    uint64_t id = range.start_inst_id, previous_pc = UINT64_MAX, previous_tid = UINT64_MAX;
+    if (id >= end) return PassResult::success(XrefResult{});
+    auto off = index.offset_of_with_pc(id, reader);
+    auto tr = reader.create_thread_reader(2);
+    auto it = TraceReader::Iterator(&reader, off.offset, off.seed_pc, &tr);
+    for (; it != reader.end() && id < end; ++it) {
+        auto rec = *it;
+        if (rec.kind != RecordKind::Inst) continue;
+        if ((id & 65535) == 0) { check(); ctx.progress(float(id - range.start_inst_id) / (end - range.start_inst_id) * .6f); }
+        const auto inst = rec.as_inst(); const auto tid = index.thread_at(id);
+        if (tid != previous_tid) { previous_tid = tid; previous_pc = UINT64_MAX; }
+        const bool visible = !range.is_pc_excluded(inst.pc) && (range.include_thread_ids.empty() ||
+            std::find(range.include_thread_ids.begin(), range.include_thread_ids.end(), tid) != range.include_thread_ids.end());
+        if (visible) {
+            if (external) occurrences.add({inst.pc, id});
+            else compact[inst.pc].add(id);
+            if (previous_pc != UINT64_MAX && previous_pc + 4 != inst.pc) {
+                if (external) transitions.add({previous_pc, inst.pc});
+                else ++compact_edges[{previous_pc, inst.pc}];
+            }
+            if (!external && (id % check_stride == 0)) {
+                size_t bytes = compact_edges.size() * 64 + compact.size() * 128;
+                for (const auto& [_, ids] : compact) bytes += ids.getSizeInBytes(true) * 2;
+                if (bytes > run_bytes * 2) spill_compact();
+            }
+            previous_pc = inst.pc;
+        }
+        ++id;
+    }
+    XrefResult result;
+    result.pc_transitions.set_resident_budget(run_bytes);
+    ChunkedVector<XrefBitmapLoader::Entry> table;
+    table.set_resident_budget(run_bytes);
+    const auto body_path = scratch->path / "bitmaps.body";
+    std::ofstream body(body_path, std::ios::binary);
+    if (!body) throw std::runtime_error("Cannot create xref bitmap body");
+    roaring::Roaring64Map bitmap;
+    uint64_t pc = UINT64_MAX, body_bytes = 0;
+    auto flush = [&]() {
+        if (pc == UINT64_MAX) return;
+        bitmap.runOptimize();
+        const auto count = bitmap.cardinality();
+        const uint64_t bytes = bitmap.getSizeInBytes(true);
+        std::vector<char> encoded(static_cast<size_t>(bytes)); bitmap.write(encoded.data(), true);
+        table.push_back({pc, count, body_bytes});
+        body.write(reinterpret_cast<const char*>(&bytes), 8); body.write(encoded.data(), encoded.size());
+        if (!body) throw std::runtime_error("xref bitmap write failed");
+        result.pc_exec_count[pc] = count; result.total_indexed += count;
+        body_bytes += 8 + bytes; bitmap = roaring::Roaring64Map{};
+        check();
+    };
+    if (external) {
+        occurrences.finish([&](const XrefOccurrence& o) {
+            if (o.pc != pc) { flush(); pc = o.pc; }
+            bitmap.add(o.id);
+        });
+        flush();
+    } else {
+        std::vector<uint64_t> pcs; pcs.reserve(compact.size());
+        for (const auto& [key, _] : compact) pcs.push_back(key);
+        std::sort(pcs.begin(), pcs.end());
+        for (auto key : pcs) { pc = key; bitmap = std::move(compact.at(key)); flush(); }
+        compact.clear();
+        for (const auto& [edge, count] : compact_edges) transitions.add({edge.first, edge.second, count});
+        compact_edges.clear();
+    }
+    body.close();
+    result.unique_pc_count = table.size();
+    const auto bitmap_path = scratch->path / "xref_bitmaps.bin";
+    std::ofstream out(bitmap_path, std::ios::binary);
+    auto put = [&](auto v) { out.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+    put(XRBI_MAGIC); put(XRBI_VERSION); put(result.total_indexed);
+    put(uint64_t(table.size())); put(uint64_t(table.size()));
+    for (auto e : table) { put(e.pc); put(e.exec_count); put(e.bitmap_offset + 32 + table.size() * 24); }
+    std::ifstream input(body_path, std::ios::binary);
+    std::array<char, 65536> buf;
+    while (input) { check(); input.read(buf.data(), buf.size()); out.write(buf.data(), input.gcount()); }
+    if (!input.eof() || !out) throw std::runtime_error("xref bitmap assembly failed");
+    out.close(); std::filesystem::remove(body_path);
+    XrefTransition last{}; uint64_t count = 0;
+    auto flush_transition = [&]() {
+        if (count) result.pc_transitions.push_back({last.from, last.to, static_cast<uint32_t>(std::min<uint64_t>(count, UINT32_MAX))});
+    };
+    transitions.finish([&](const XrefTransition& t) {
+        if (count && (t.from != last.from || t.to != last.to)) { flush_transition(); count = 0; }
+        last = t; count += t.count;
+    });
+    flush_transition();
+    auto loader = std::make_shared<XrefBitmapLoader>();
+    std::filesystem::path final_path = bitmap_path;
+    if (range.is_full_trace()) {
+        final_path = index.pass_blob_file_path("xref_bitmaps");
+        auto pending = final_path; pending += ".stream.tmp";
+        std::filesystem::copy_file(bitmap_path, pending, std::filesystem::copy_options::overwrite_existing);
+        // No header is published before the entire new bitmap file is present.
+        std::error_code ec; std::filesystem::rename(pending, final_path, ec);
+        if (ec) { std::filesystem::remove(final_path); std::filesystem::rename(pending, final_path); }
+        const auto header = xref_serialize_header(result);
+        index.save_pass_blob("xref", header.data(), header.size());
+        const auto path = final_path.string(); index.save_pass_blob("xref_bitmaps_path", path.data(), path.size());
+    } else loader->scratch_owner = scratch;
+    if (!loader->open(final_path)) throw std::runtime_error("Cannot reopen streamed xref index");
+    result.lazy_loader = std::move(loader);
+    ctx.progress(1.f, "Xref complete (bounded external sort)");
+    return PassResult::success(std::move(result));
+}
+} // namespace
+
 PassResult XrefPass::run(PassContext& ctx) {
     auto& reader = ctx.reader();
     auto& index = ctx.index();
@@ -717,10 +869,13 @@ PassResult XrefPass::run(PassContext& ctx) {
         }
     }
 
+    if (ctx.memory_budget_bytes() && index.inst_count() > ctx.memory_budget_bytes() / 16)
+        return stream_xref(ctx);
+
     uint64_t total_insts = index.inst_count();
     uint64_t start = range.start_inst_id;
     uint64_t end = std::min(range.end_inst_id, total_insts);
-    if (end == 0) end = total_insts;
+    if (start >= end) return PassResult::success(XrefResult{});
 
     const uint32_t num_gpr = reader.header().num_gpr;
     const uint64_t file_size = reader.file_size();
@@ -770,6 +925,7 @@ PassResult XrefPass::run(PassContext& ctx) {
         s.file_start = start_offset;
         s.file_end = end_offset;
         s.start_inst_id = shard_start_id;
+        s.seed_thread = index.thread_at(shard_start_id);
         s.end_inst_id = shard_end_id;
 
         // For v5: seed_pc from offset_of_with_pc() is the PC *after* applying the
@@ -821,19 +977,20 @@ const bool xref_is_v8 = (reader.header().flags & qbditrace::QBDITRACE_HF_CALL_ME
     // Get cancellation flag reference for shard threads.
     const std::atomic<bool>& cancel_flag = ctx.global_cancel_flag();
     const auto& excludes = range.exclude_pc_ranges;
+    const auto& includes = range.include_thread_ids;
 
     for (size_t i = 1; i < shards.size(); i++) {
         threads.emplace_back([&shards, &shard_results, &thread_readers,
-                              &cancel_flag, &excludes, num_gpr,
+                              &cancel_flag, &excludes, &includes, num_gpr,
                               xref_is_v5, xref_is_v6, xref_is_v7, xref_is_v8, i]() {
             scan_shard(shards[i], num_gpr, xref_is_v5, xref_is_v6,
                        xref_is_v7, xref_is_v8, shard_results[i],
-                       thread_readers[i], cancel_flag, excludes);
+                       thread_readers[i], cancel_flag, excludes, includes);
         });
     }
 
     // Shard 0 runs on this thread
-    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, xref_is_v8, shard_results[0], thread_readers[0], cancel_flag, excludes);
+    scan_shard(shards[0], num_gpr, xref_is_v5, xref_is_v6, xref_is_v7, xref_is_v8, shard_results[0], thread_readers[0], cancel_flag, excludes, includes);
 
     ctx.progress(0.7f, "Xref: merging shards...");
 
@@ -959,7 +1116,7 @@ const bool xref_is_v8 = (reader.header().flags & qbditrace::QBDITRACE_HF_CALL_ME
         index.save_pass_blob("xref", header_blob.data(), header_blob.size());
 
         // Derive the bitmaps file path via the newly-added pass_blob_file_path()
-        // helper, which returns <db_path>/pass_cache/xref_bitmaps.bin.
+        // helper, which returns the current generation's xref_bitmaps.bin.
         std::filesystem::path bm_path = index.pass_blob_file_path("xref_bitmaps");
         if (!bm_path.empty()) {
             if (xref_write_bitmaps_file(bm_path, result)) {

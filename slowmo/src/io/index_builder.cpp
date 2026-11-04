@@ -2151,7 +2151,8 @@ TraceIndex::OffsetResult TraceIndex::offset_of_with_pc(uint64_t inst_id, const T
         auto kind = static_cast<RecordKind>(ptr[0]);
 
         if (kind == RecordKind::Inst) {
-            if (is_v5) {
+            if (is_v5 && !(value.size() >= 16 && current_id == base_id)) {
+                // Sparse v12+ seeds already contain the base instruction PC.
                 // Accumulate pc_delta BEFORE checking if we've reached the target,
                 // so running_pc holds the absolute PC of the instruction at current_offset.
                 int16_t delta;
@@ -2542,7 +2543,9 @@ namespace {
 
 /// Returns the pass_cache directory for this index.
 std::filesystem::path pass_cache_dir(const std::filesystem::path& db_path) {
-    return db_path / "pass_cache";
+    // Older caches may contain filtered results stored under full-trace keys.
+    // Retire that entire generation, including downstream derived results.
+    return db_path / "pass_cache" / "v3";
 }
 
 /// Returns the file path for a given pass name.

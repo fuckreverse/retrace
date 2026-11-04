@@ -450,14 +450,12 @@ void TenetMcpService::register_taint_tools() {
     // -- taint_forward
     register_tool(
         {"taint_forward",
-         "Perform precise forward taint analysis using Triton semantic engine. "
-         "Starting from a register (or memory address) at a specific instruction, "
-         "trace data flow forward through the execution. Returns the complete "
-         "propagation chain. This is EXACT taint -- handles implicit operands, "
-         "sub-register aliases, conditional execution correctly. "
-         "Runs in-process with zero startup overhead. "
-         "Supports pagination of the steps list via steps_offset/steps_limit "
-         "(use has_more_steps + next_steps_offset to continue).",
+         "Trace register and memory dependencies forward from an input. "
+         "Uses Triton when available, otherwise conservative decoded operands. "
+         "Returns quality metadata for missing or unsupported semantics. "
+         "include_flags enables explicit NZCV dependencies via the operand engine; "
+         "optional include_control/include_simd extend the dependency model. "
+         "Supports steps_offset/steps_limit pagination.",
          {{"type", "object"},
           {"properties", {
               {"reg_index",              {{"type", json::array({"integer", "string"})}, {"description", "Register to taint: integer index (0=x0,29=fp,30=lr,31=sp,33=pc) OR name string ('x0','lr','sp','pc')"}}},
@@ -465,6 +463,9 @@ void TenetMcpService::register_taint_tools() {
               {"mem_addrs",              {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Additional memory addresses to taint (hex)"}}},
               {"stop_pcs",               {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Stop at these PCs (hex)"}}},
               {"max_width",              {{"type", "integer"}, {"description", "Stop when taint exceeds N registers"}, {"default", 0}}},
+              {"include_simd", {{"type", "boolean"}, {"description", "Track whole SIMD registers (v0-v31, aliases d/q/s accepted)"}, {"default", false}}},
+              {"include_control", {{"type", "boolean"}, {"description", "Track dynamic implicit control dependencies; unresolved joins reported in quality"}, {"default", false}}},
+              {"include_flags", {{"type", "boolean"}, {"description", "Track explicit NZCV dependencies (CMP/CSEL/ADC); uses conservative operands"}, {"default", false}}},
               {"propagate_through_calls", {{"type", "boolean"}, {"description", "Follow taint into function calls"}, {"default", true}}},
               {"steps_offset",           {{"type", "integer"}, {"description", "Pagination: skip first N steps"}, {"default", 0}}},
               {"steps_limit",            {{"type", "integer"}, {"description", "Pagination: max steps per page (max 2000)"}, {"default", 1000}}}
@@ -473,10 +474,14 @@ void TenetMcpService::register_taint_tools() {
         [this](const json& args) -> json {
             if (!pm_) throw std::runtime_error("PassManager not available");
 
+            std::lock_guard<std::mutex> config_lock(taint_config_mutex_);
             TaintConfig cfg;
-            cfg.add_source_reg(parse_reg(args.at("reg_index")));
+            cfg.add_source_reg(parse_taint_reg(args.at("reg_index")));
             cfg.source_inst_id = args.value("inst_id", uint64_t(0));
             cfg.propagate_through_calls = args.value("propagate_through_calls", true);
+            cfg.include_control = args.value("include_control", false);
+            cfg.include_flags = args.value("include_flags", false) || cfg.include_control;
+            cfg.include_simd = args.value("include_simd", false) || cfg.include_simd;
             cfg.max_taint_width = args.value("max_width", uint32_t(0));
 
             if (args.contains("mem_addrs")) {
@@ -491,10 +496,17 @@ void TenetMcpService::register_taint_tools() {
             }
 
             tenet::register_pass_by_name(*pm_, "xref");
-            pm_->register_pass(std::make_unique<TaintPass>(std::move(cfg)));
+            if (pm_->state("taint") == PassManager::PassState::Completed) {
+                const auto cached = pm_->require_shared("taint");
+                if (cached && cached->ok() && cached->get<TaintResult>().config != cfg)
+                    pm_->invalidate("taint");
+            }
+            pm_->register_pass(std::make_unique<TaintPass>(cfg));
             const auto& raw = require_pass_nb(pm_, "taint");
             if (!raw.ok()) throw std::runtime_error("Taint pass failed: " + raw.error_message);
             const auto& result = raw.get<TaintResult>();
+            if (result.config != cfg)
+                throw PassNotReady("taint", 0.0f, "Previous configuration completed; retry requested analysis");
 
             json output;
             output["statistics"] = {
@@ -506,12 +518,20 @@ void TenetMcpService::register_taint_tools() {
                 {"call_crossings", result.call_crossings}
             };
 
+            output["quality"] = result.quality.to_json();
+            output["include_flags"] = result.config.include_flags;
+            output["include_simd"] = result.config.include_simd;
+            output["include_control"] = result.config.include_control;
             if (!result.stop_reason.empty()) output["stop_reason"] = result.stop_reason;
 
             std::vector<uint8_t> tainted;
             for (uint64_t m = result.tainted_regs; m; m &= m - 1)
                 tainted.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
+            for (uint32_t m = result.tainted_simd; m; m &= m - 1) tainted.push_back(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
             output["tainted_regs_final"] = tainted;
+            output["thread_taint_final"] = json::array();
+            for (const auto& [tid, state] : result.thread_taint)
+                output["thread_taint_final"].push_back({{"thread_id", tid}, {"gpr_mask", state.gpr}, {"simd_mask", state.simd}});
 
             size_t steps_offset = args.value("steps_offset", size_t(0));
             size_t steps_limit = std::min(args.value("steps_limit", size_t(1000)), size_t(2000));
@@ -526,6 +546,8 @@ void TenetMcpService::register_taint_tools() {
                     {"type", propagation_type_str(s.type)},
                     {"triton_resolved", s.triton_resolved}
                 };
+                step["src_simd_mask"] = s.src_simd_mask;
+                if (s.control_inst_id != UINT64_MAX) step["control_inst_id"] = s.control_inst_id;
                 if (s.dst_reg != 0xFF) step["dst_reg"] = s.dst_reg;
                 if (s.dst_mem_addr != 0) {
                     step["dst_mem"] = fmt::format("0x{:X}", s.dst_mem_addr);
@@ -547,7 +569,8 @@ void TenetMcpService::register_taint_tools() {
     // -- taint_backward
     register_tool(
         {"taint_backward",
-         "Perform precise backward taint analysis (reverse data-flow). "
+         "Trace conservative backward register and memory dependencies. "
+         "Returns quality metadata; enable include_flags for explicit NZCV data flow. "
          "Starting from a register at a specific instruction (the 'sink'), "
          "walk backward to find all instructions that contributed to "
          "computing that value. Resolves memory-mediated dependencies. "
@@ -557,6 +580,9 @@ void TenetMcpService::register_taint_tools() {
           {"properties", {
               {"sink_inst_id",  {{"type", "integer"}, {"description", "Instruction ID where the value is observed"}}},
               {"sink_reg",      {{"type", json::array({"integer", "string"})}, {"description", "Sink register: integer index OR name string ('x0','lr','sp', etc.)"}}},
+              {"include_simd", {{"type", "boolean"}, {"description", "Track whole SIMD registers (v0-v31, aliases d/q/s accepted)"}, {"default", false}}},
+              {"include_control", {{"type", "boolean"}, {"description", "Track dynamic implicit control dependencies; unresolved joins reported in quality"}, {"default", false}}},
+              {"include_flags", {{"type", "boolean"}, {"description", "Track explicit NZCV dependencies via conservative operands"}, {"default", false}}},
               {"max_steps",     {{"type", "integer"}, {"description", "Max backward walk steps (0=unlimited)"}, {"default", 10000}}},
               {"events_offset", {{"type", "integer"}, {"description", "Pagination: skip first N events"}, {"default", 0}}},
               {"events_limit",  {{"type", "integer"}, {"description", "Pagination: max events per page (max 2000)"}, {"default", 500}}}
@@ -565,27 +591,43 @@ void TenetMcpService::register_taint_tools() {
         [this](const json& args) -> json {
             if (!pm_) throw std::runtime_error("PassManager not available");
 
+            std::lock_guard<std::mutex> config_lock(taint_config_mutex_);
             BackwardTaintConfig cfg;
             cfg.sink_inst_id = args.at("sink_inst_id").get<uint64_t>();
-            cfg.add_sink_reg(parse_reg(args.at("sink_reg")));
+            cfg.include_control = args.value("include_control", false);
+            cfg.include_flags = args.value("include_flags", false) || cfg.include_control;
+            cfg.include_simd = args.value("include_simd", false) || cfg.include_simd;
+            cfg.add_sink_reg(parse_taint_reg(args.at("sink_reg")));
             cfg.propagate_through_memory = true;
             cfg.build_dataflow_graph = true;
             cfg.per_sink_tags = true;
             uint64_t max_steps = args.value("max_steps", uint64_t(10000));
             if (max_steps > 0) cfg.max_steps = max_steps;
 
-            pm_->register_pass(std::make_unique<BackwardTaintPass>(std::move(cfg)));
+            if (pm_->state("backward_taint") == PassManager::PassState::Completed) {
+                const auto cached = pm_->require_shared("backward_taint");
+                if (cached && cached->ok() && cached->get<BackwardTaintResult>().config != cfg)
+                    pm_->invalidate("backward_taint");
+            }
+            pm_->register_pass(std::make_unique<BackwardTaintPass>(cfg));
             const auto& raw = require_pass_nb(pm_, "backward_taint");
             if (!raw.ok()) throw std::runtime_error("Backward taint failed: " + raw.error_message);
             const auto& result = raw.get<BackwardTaintResult>();
+            if (result.config != cfg)
+                throw PassNotReady("backward_taint", 0.0f, "Previous configuration completed; retry requested analysis");
 
             json output;
             output["contributing_count"] = result.contributing_count();
             output["max_depth"] = result.max_depth;
+            output["quality"] = result.quality.to_json();
+            output["include_flags"] = result.config.include_flags;
+            output["include_simd"] = result.config.include_simd;
+            output["include_control"] = result.config.include_control;
 
             std::vector<uint8_t> involved;
             for (uint64_t m = result.all_involved_regs; m; m &= m - 1)
                 involved.push_back(static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
+            for (uint32_t m = result.all_involved_simd; m; m &= m - 1) involved.push_back(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
             output["involved_regs"] = involved;
 
             size_t events_offset = args.value("events_offset", size_t(0));
@@ -601,6 +643,9 @@ void TenetMcpService::register_taint_tools() {
                     {"dst_reg", ev.dst_reg},
                     {"src_regs", ev.src_regs_list()}
                 };
+                ev_json["thread_id"] = ev.thread_id;
+                if (ev.control_inst_id != UINT64_MAX) ev_json["control_inst_id"] = ev.control_inst_id;
+                ev_json["control_branch"] = ev.control_branch;
                 if (ev.loads_from_memory) {
                     json addrs = json::array();
                     for (auto a : ev.src_mem_addrs) addrs.push_back(fmt::format("0x{:X}", a));

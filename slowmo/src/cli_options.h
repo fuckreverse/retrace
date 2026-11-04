@@ -43,6 +43,11 @@ struct CliOptions {
     bool taint_no_calls = false;
     bool taint_no_xref = false;
     bool taint_no_kills = false;
+    bool taint_include_flags = false;
+    bool taint_include_simd = false;
+    bool taint_include_control = false;
+    uint64_t analysis_memory_mb = 64;
+    double rss_limit_mb = 0;
     bool opt_strings = false;
     bool opt_pattern = false;
     bool opt_constants = false;

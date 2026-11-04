@@ -33,6 +33,7 @@ namespace tenet {
 //
 // Version history:
 //   v1: register-only edges (via_mem_addr always 0).
+//   v4: isolates register producers by thread.
 //   v3: resolves every live byte-range producer; invalidates earlier incomplete graphs.
 //   v2: adds memory dependency edges (store → load, via_mem_addr != 0).
 //       Wire format is unchanged (via_mem_addr was always serialized); the
@@ -43,12 +44,13 @@ namespace tenet {
 namespace {
 
 static constexpr uint32_t DFGR_BLOB_MAGIC   = 0x44464752u;  // "DFGR"
-static constexpr uint32_t DFGR_BLOB_VERSION = 3u;
+static constexpr uint32_t DFGR_BLOB_VERSION = 5u;
 
 std::string dataflow_graph_serialize(const DataflowGraphResult& res) {
     ByteWriter w;
     w.u32(DFGR_BLOB_MAGIC);
     w.u32(DFGR_BLOB_VERSION);
+    w.str(res.quality.to_json().dump());
     w.u64(static_cast<uint64_t>(res.nodes.size()));
 
     for (const auto& n : res.nodes) {
@@ -78,6 +80,13 @@ bool dataflow_graph_deserialize(const std::string& blob, DataflowGraphResult& ou
 
     if (r.u32() != DFGR_BLOB_MAGIC)   return false;
     if (r.u32() != DFGR_BLOB_VERSION) return false;
+    std::string quality_json;
+    if (!r.str(quality_json)) return false;
+    try {
+        out.quality = AnalysisQuality::from_json(nlohmann::json::parse(quality_json));
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    }
 
     uint64_t n_nodes = r.u64();
     out.nodes.reserve(static_cast<size_t>(n_nodes));
@@ -135,6 +144,8 @@ static std::string reg_name(uint8_t idx) {
     if (idx == IDX_SP)   return "sp";
     if (idx == IDX_NZCV) return "nzcv";
     if (idx == IDX_PC)   return "pc";
+    if (idx >= kDataflowSimdBase && idx < kDataflowRegisterCount)
+        return fmt::format("v{}", idx - kDataflowSimdBase);
     return fmt::format("r{}", idx);
 }
 
@@ -142,6 +153,11 @@ static std::string reg_name(uint8_t idx) {
 
 std::vector<DFGEdge> DataflowGraphResult::producers_of(uint64_t inst_id) const {
     std::vector<DFGEdge> result;
+    if (compact_adjacency) {
+        const auto node = node_index(inst_id); if (node == SIZE_MAX) return result;
+        for (auto i = incoming_offsets[node]; i < incoming_offsets[node + 1]; ++i) result.push_back(edges[incoming_edges[i]]);
+        return result;
+    }
     auto it = incoming_edge_idx_.find(inst_id);
     if (it == incoming_edge_idx_.end()) return result;
     result.reserve(it->second.size());
@@ -153,6 +169,11 @@ std::vector<DFGEdge> DataflowGraphResult::producers_of(uint64_t inst_id) const {
 
 std::vector<DFGEdge> DataflowGraphResult::consumers_of(uint64_t inst_id) const {
     std::vector<DFGEdge> result;
+    if (compact_adjacency) {
+        const auto node = node_index(inst_id); if (node == SIZE_MAX) return result;
+        for (auto i = outgoing_offsets[node]; i < outgoing_offsets[node + 1]; ++i) result.push_back(edges[outgoing_edges[i]]);
+        return result;
+    }
     auto it = outgoing_edge_idx_.find(inst_id);
     if (it == outgoing_edge_idx_.end()) return result;
     result.reserve(it->second.size());
@@ -221,6 +242,8 @@ std::string DataflowGraphResult::to_json() const {
     out += "{\n";
 
     out += fmt::format("  \"truncated\": {},\n", truncated);
+
+    out += "  \"quality\": " + quality.to_json().dump() + ",\n";
 
     // Nodes
     out += "  \"nodes\": [\n";
@@ -307,12 +330,15 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
     }
 
     DataflowGraphResult result;
+    result.quality.engine = "capstone";
+    result.nodes.set_resident_budget(ctx.memory_budget_bytes() / 4);
+    result.edges.set_resident_budget(ctx.memory_budget_bytes() / 4);
 
     // last_writer[reg] = inst_id of the instruction that most recently wrote `reg`.
     // We use UINT64_MAX as the sentinel meaning "no writer seen yet".
     constexpr uint64_t NO_WRITER = UINT64_MAX;
-    std::array<uint64_t, AARCH64_GPR_COUNT> last_writer;
-    last_writer.fill(NO_WRITER);
+    using RegisterWriters = std::array<uint64_t, kDataflowRegisterCount>;
+    ankerl::unordered_dense::map<uint64_t, RegisterWriters> thread_writers;
 
     // Latest writer for each disjoint byte range. Partial overwrites split
     // intervals; a load can depend on multiple live producers.
@@ -323,14 +349,16 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
 
     // Seek directly to start position using index (avoid scanning prefix)
     uint64_t start_offset = 0;
+    uint64_t seed_pc = 0;
     uint64_t scan_inst_id = 0;
     if (start > 0) {
-        auto [off, pc] = index.offset_of_with_pc(start, reader);
-        start_offset = off;
+        auto offset = index.offset_of_with_pc(start, reader);
+        start_offset = offset.offset;
+        seed_pc = offset.seed_pc;
         scan_inst_id = start;
     }
 
-    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset) : reader.begin();
+    auto it_begin = (start > 0) ? TraceReader::Iterator(&reader, start_offset, seed_pc) : reader.begin();
     uint64_t inst_id = scan_inst_id;
 
     for (auto it = it_begin; it != reader.end() && inst_id < end; ++it) {
@@ -338,48 +366,83 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
         if (rec.kind != RecordKind::Inst) continue;
 
         if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+        if ((nodes_added & 4095) == 0 && ctx.memory_pressure()) {
+            result.truncated = result.quality.truncated = true;
+            result.quality.termination_reason = "RSS limit exceeded"; break;
+        }
 
         // Enforce max_nodes to keep graph sizes practical
         if (nodes_added >= config_.max_nodes) {
             result.truncated = true;
+            result.quality.truncated = true;
+            result.quality.termination_reason = "max_nodes reached";
             break;
         }
 
         auto inst = rec.as_inst();
+        const auto tid = index.thread_at(inst_id);
+        if (range.is_pc_excluded(inst.pc) ||
+            (!range.include_thread_ids.empty() &&
+             std::find(range.include_thread_ids.begin(), range.include_thread_ids.end(), tid) ==
+                 range.include_thread_ids.end())) {
+            ++inst_id;
+            continue;
+        }
+        auto [writers_it, inserted] = thread_writers.try_emplace(tid);
+        if (inserted) writers_it->second.fill(NO_WRITER);
+        auto& last_writer = writers_it->second;
+        ++result.quality.instructions_examined;
         auto opcode = code_table.opcode_at(inst.pc);
-        if (!opcode) {
-            inst_id++;
-            continue;
-        }
+        auto decoded = opcode ? decoder.decode(inst.pc, *opcode) : std::nullopt;
+        if (!opcode) ++result.quality.missing_code;
+        else if (!decoded || !decoded->decoded) ++result.quality.undecoded_instructions;
+        if (decoded && (decoded->untracked_register_access || decoded->register_access_overflow))
+            ++result.quality.unsupported_register_instructions;
 
-        auto decoded = decoder.decode(inst.pc, *opcode);
-        if (!decoded) {
-            inst_id++;
-            continue;
-        }
-
-        // Build the node
         DataflowNode node;
         node.inst_id = inst_id;
         node.pc = inst.pc;
-        node.mnemonic = std::string(decoded->mnemonic_sv());
-        node.regs_read.assign(decoded->regs_read.begin(),
-                              decoded->regs_read.begin() + decoded->regs_read_count);
-        node.regs_written.assign(decoded->regs_written.begin(),
-                                 decoded->regs_written.begin() + decoded->regs_written_count);
+        node.mnemonic = decoded ? std::string(decoded->mnemonic_sv()) : "unknown";
+        if (decoded && decoded->decoded) {
+            node.regs_read.assign(decoded->regs_read.begin(),
+                                  decoded->regs_read.begin() + decoded->regs_read_count);
+            node.regs_written.assign(decoded->regs_written.begin(),
+                                     decoded->regs_written.begin() + decoded->regs_written_count);
+            for (uint8_t reg = 0; reg < 32; ++reg) {
+                if (decoded->simd_reads & (uint32_t(1) << reg))
+                    node.regs_read.push_back(kDataflowSimdBase + reg);
+                if (decoded->simd_writes & (uint32_t(1) << reg))
+                    node.regs_written.push_back(kDataflowSimdBase + reg);
+            }
+        }
+        // Unknown instructions still define recorded destinations. Keeping
+        // an opaque producer prevents a later use from pointing at an older,
+        // overwritten value; runtime memory dependencies remain available.
+        for (uint8_t i = 0; i < inst.reg_diff_count; ++i) {
+            const auto reg = inst.reg_diff(i).index;
+            if (reg < AARCH64_GPR_COUNT && reg != IDX_PC &&
+                std::find(node.regs_written.begin(), node.regs_written.end(), reg) == node.regs_written.end())
+                node.regs_written.push_back(reg);
+        }
+        for (uint8_t i = 0; i < inst.fpr_diff_count; ++i) {
+            const auto reg = inst.fpr_diff(i).index;
+            const auto id = static_cast<uint8_t>(kDataflowSimdBase + reg);
+            if (reg < 32 && std::find(node.regs_written.begin(), node.regs_written.end(), id) == node.regs_written.end())
+                node.regs_written.push_back(id);
+        }
 
         size_t node_idx = result.nodes.size();
-        result.inst_to_node[inst_id] = node_idx;
+        if (node_idx < 65536) result.inst_to_node[inst_id] = node_idx;
+        else result.inst_to_node.clear();
 
         // Create edges for each register read: last_writer[reg] → this inst
-        for (uint8_t i = 0; i < decoded->regs_read_count; ++i) {
-            uint8_t reg = decoded->regs_read[i];
-            if (reg >= AARCH64_GPR_COUNT) continue;
+        for (uint8_t reg : node.regs_read) {
+            if (reg >= kDataflowRegisterCount) continue;
 
             uint64_t writer = last_writer[reg];
             if (writer != NO_WRITER) {
                 // Only create an edge if the producer is also in the graph
-                if (result.inst_to_node.count(writer) > 0) {
+                {
                     DFGEdge edge;
                     edge.from_inst_id = writer;
                     edge.to_inst_id   = inst_id;
@@ -390,9 +453,8 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
         }
 
         // Update last_writer for each register written
-        for (uint8_t i = 0; i < decoded->regs_written_count; ++i) {
-            uint8_t reg = decoded->regs_written[i];
-            if (reg >= AARCH64_GPR_COUNT) continue;
+        for (uint8_t reg : node.regs_written) {
+            if (reg >= kDataflowRegisterCount) continue;
             last_writer[reg] = inst_id;
         }
 
@@ -453,7 +515,7 @@ PassResult DataflowGraphPass::run(PassContext& ctx) {
                              result.nodes.size(), result.edges.size()));
 
     // Build O(1) adjacency index for producer/consumer queries.
-    result.build_adjacency();
+    result.build_adjacency([&]() { return ctx.cancelled() || ctx.memory_pressure(); });
 
     if (ctx.cancelled()) return PassResult::failed("cancelled by user");
 

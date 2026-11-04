@@ -148,6 +148,7 @@ public:
         : code_table_(code_table), config_(config) {}
 
     std::string_view name() const override { return "MemoryStringCollector"; }
+    size_t resident_bytes() const override { return call_sites_.capacity() * sizeof(CallSite); }
 
     bool begin(uint64_t start_inst_id, uint64_t end_inst_id) override;
     void on_inst(uint64_t inst_id, const InstView& inst) override;

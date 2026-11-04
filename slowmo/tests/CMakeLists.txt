@@ -176,3 +176,5 @@ target_include_directories(gen_test_traces PRIVATE ${TENET_TEST_INCLUDES})
 # Same fast-build treatment as the test targets above.
 set_target_properties(gen_test_traces PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 target_compile_options(gen_test_traces PRIVATE $<$<NOT:$<CONFIG:Debug>>:${TENET_TEST_OPT_FLAG}>)
+
+tenet_add_test(test_analysis_optimization unit/test_analysis_optimization.cpp)

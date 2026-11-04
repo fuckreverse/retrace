@@ -176,3 +176,68 @@ TEST_CASE("InstructionDecoder tracks registers read and written", "[unit][core][
     }
     REQUIRE(writes_x2);
 }
+
+TEST_CASE("InstructionDecoder includes NZCV and memory writeback dependencies", "[unit][core][decoder]") {
+    InstructionDecoder dec;
+    REQUIRE(dec.init());
+    auto reads = [](const DecodedInst& d, uint8_t r) {
+        return std::find(d.regs_read.begin(), d.regs_read.begin() + d.regs_read_count, r) != d.regs_read.begin() + d.regs_read_count;
+    };
+    auto writes = [](const DecodedInst& d, uint8_t r) {
+        return std::find(d.regs_written.begin(), d.regs_written.begin() + d.regs_written_count, r) != d.regs_written.begin() + d.regs_written_count;
+    };
+    const auto cmp = dec.decode(0x1000, 0xf100041fu); // cmp x0, #1
+    REQUIRE(cmp->decoded);
+    REQUIRE(reads(*cmp, 0));
+    REQUIRE(writes(*cmp, IDX_NZCV));
+    REQUIRE_FALSE(writes(*cmp, 0));
+    for (auto opcode : {0xab01001fu, 0xea01001fu}) { // CMN and TST register aliases
+        const auto alias = dec.decode(0x1000, opcode);
+        REQUIRE(reads(*alias, 0));
+        REQUIRE(reads(*alias, 1));
+        REQUIRE_FALSE(writes(*alias, 0));
+        REQUIRE(writes(*alias, IDX_NZCV));
+    }
+    const auto csel = dec.decode(0x1004, 0x9a840062u); // csel x2, x3, x4, eq
+    REQUIRE(reads(*csel, IDX_NZCV));
+    REQUIRE(writes(*csel, 2));
+    const auto adc = dec.decode(0x1008, 0x9a0700c5u); // adc x5, x6, x7
+    REQUIRE(reads(*adc, IDX_NZCV));
+    for (const auto opcode : {0xf8408420u, 0xf8008c20u}) { // post-index load / pre-index store
+        const auto d = dec.decode(0x100c, opcode);
+        REQUIRE(d->decoded);
+        REQUIRE(reads(*d, 1));
+        REQUIRE(writes(*d, 1));
+    }
+}
+
+TEST_CASE("InstructionDecoder tracks SIMD aliases and partial lane writes", "[unit][core][decoder]") {
+    InstructionDecoder dec;
+    REQUIRE(dec.init());
+    const auto eor = dec.decode(0x1000, 0x6e221c20u); // eor v0.16b, v1.16b, v2.16b
+    REQUIRE(eor->decoded);
+    REQUIRE(eor->simd_reads == ((1u << 1) | (1u << 2)));
+    REQUIRE(eor->simd_writes == 1);
+    const auto aes = dec.decode(0x1004, 0x4e284860u); // aese v0.16b, v3.16b
+    REQUIRE((aes->simd_reads & 9) == 9); // old v0 and round key v3
+    REQUIRE(aes->simd_writes == 1);
+    const auto scalar = dec.decode(0x1008, 0x9e670020u); // fmov d0, x1
+    REQUIRE(scalar->simd_writes == 1); // d0 aliases v0
+    const auto lane = dec.decode(0x100c, 0x4e181ca0u); // ins v0.d[1], x5
+    REQUIRE(lane->simd_writes == 1);
+    REQUIRE((lane->simd_reads & 1) == 1); // preserve untouched lanes
+    const auto extract = dec.decode(0x1010, 0x4e083c04u); // umov x4, v0.d[0]
+    REQUIRE(extract->simd_reads == 1);
+}
+
+TEST_CASE("InstructionDecoder exposes invalid opcodes including cache sentinel", "[unit][core][decoder]") {
+    InstructionDecoder dec;
+    REQUIRE(dec.init());
+    for (auto opcode : {0xffffffffu, 0xffffffffu}) {
+        const auto d = dec.decode(0x1000, opcode);
+        REQUIRE(d.has_value());
+        REQUIRE_FALSE(d->decoded);
+        REQUIRE(d->mnemonic_sv() == ".word");
+        REQUIRE(d->opcode == opcode);
+    }
+}

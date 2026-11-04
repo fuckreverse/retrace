@@ -30,6 +30,7 @@
  * Run:  ctest -R 'algorithm_summary' --output-on-failure
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "fixtures/trace_fixture.h"
 #include "analysis/passes/structure/xref_pass.h"
@@ -153,27 +154,12 @@ TEST_CASE("AlgorithmSummaryPass: trace with no crypto signal produces zero "
     REQUIRE(res.summary_json["data_sources"]["pattern"] == true);
 }
 
-// ─── Cross-detector merge: pattern + constant + loop → one candidate ───────
+// ─── Unrelated evidence must stay separate ───────────────────────────────
 
-TEST_CASE("AlgorithmSummaryPass: AES known constant + SPN-classified loop "
-          "merge into a single AES candidate, without absorbing an "
-          "unrelated SM4 constant",
+TEST_CASE("AlgorithmSummaryPass: SPN loop stays separate from later AES and SM4 constants",
           "[unit][pass][algorithm_summary]") {
-    // Two independent detectors contribute evidence here, phrased
-    // differently:
-    //   1. PatternPass constant-materialization -> algorithm "AES"
-    //      (AES_RCON9 = 0x1B000000, a real entry in the known-constant db).
-    //   2. LoopSemanticsPass SPNRound classification -> loop_kind_algorithm_hint
-    //      "SPN-based cipher" (structural shape only, no algorithm name).
-    // Before the AlgorithmFamily refactor these landed in 2 separate
-    // accumulator buckets keyed by exact string, merged only by fragile
-    // substring scans; the fix must collapse them into ONE candidate with
-    // family == AES via the structural (family, AlgorithmStructure) lookup
-    // in Phase 1c, not string matching.
-    //
-    // A second, unrelated SM4 constant (SM4_FK0) is also present, to prove
-    // the merge does NOT indiscriminately fold every SPN-family constant
-    // into the same bucket — AES and SM4 must remain distinct candidates.
+    // A structural loop and later constants have no overlapping execution
+    // evidence. Neither named family may absorb that unrelated loop.
     auto env = make_env([](TraceWriter& tw) {
         tw.anchor_interval = 256;
         tw.write_header();
@@ -237,20 +223,23 @@ TEST_CASE("AlgorithmSummaryPass: AES known constant + SPN-classified loop "
     const auto* aes = find_candidate(res, AlgorithmFamily::AES);
     REQUIRE(aes != nullptr);
     REQUIRE_FALSE(aes->is_speculative);
-    // Evidence must reference both the known constant and the loop.
+    // Named evidence remains separate from the unrelated loop.
     REQUIRE(aes->evidence.find("AES") != std::string::npos);
     bool has_loop_evidence = aes->evidence.find("SPNRound") != std::string::npos ||
                               aes->evidence.find("Cross-referenced") != std::string::npos;
-    REQUIRE(has_loop_evidence);
+    REQUIRE_FALSE(has_loop_evidence);
 
     const auto* sm4 = find_candidate(res, AlgorithmFamily::SM4);
     REQUIRE(sm4 != nullptr);
     REQUIRE_FALSE(sm4->is_speculative);
 
-    // Critically: AES and SM4 must NOT have been merged into one candidate
-    // even though both are SPN-shaped — the SPN loop evidence attaches to
-    // only whichever accumulator existed first, and the two constants stay
-    // in their own family-keyed buckets regardless.
+    REQUIRE(sm4->evidence.find("Cross-referenced") == std::string::npos);
+    bool standalone_loop = false;
+    for (const auto& candidate : res.candidates) {
+        if (candidate.family == AlgorithmFamily::Unknown &&
+            candidate.evidence.find("SPNRound") != std::string::npos) standalone_loop = true;
+    }
+    REQUIRE(standalone_loop);
     REQUIRE(aes != sm4);
     REQUIRE(aes->name != sm4->name);
 }
@@ -403,7 +392,7 @@ TEST_CASE("AlgorithmSummaryPass: candidates are sorted by confidence descending"
         REQUIRE(res.candidates[i - 1].confidence >= res.candidates[i].confidence);
     }
     // The confirmed SHA-256 (High-confidence known constant) candidate must
-    // rank strictly above the speculative hot-function entry.
+    // rank above speculative entries even when deduplicated scores tie.
     const auto* sha256 = find_candidate(res, AlgorithmFamily::SHA256);
     REQUIRE(sha256 != nullptr);
     REQUIRE(res.candidates.front().family == AlgorithmFamily::SHA256);
@@ -469,4 +458,80 @@ TEST_CASE("AlgorithmSummaryPass: result is cached and reload preserves "
         }
         REQUIRE(found_speculative);
     }
+}
+
+namespace {
+template <typename T>
+class EvidencePass final : public AnalysisPass {
+public:
+    EvidencePass(std::string name, T result) : name_(std::move(name)), result_(std::move(result)) {}
+    std::string_view name() const override { return name_; }
+    std::string_view description() const override { return "Controlled detector evidence"; }
+    std::vector<std::string_view> dependencies() const override { return {}; }
+    PassResult run(PassContext&) override { return PassResult::success(std::move(result_)); }
+private:
+    std::string name_;
+    T result_;
+};
+}
+
+TEST_CASE("Algorithm summary associates only unique overlapping loop evidence",
+          "[unit][pass][algorithm_summary]") {
+    const bool ambiguous = GENERATE(false, true);
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header();
+        MachineState ms;
+        for (int i = 0; i < 4; ++i)
+            tw.emit(ms, 0x1000 + 4*i, enc::nop(), {{33, tw.rt(0x1004 + 4*i)}}, {});
+    }, "algorithm_local_evidence");
+    REQUIRE(env != nullptr);
+    PatternResult patterns;
+    patterns.matches.push_back({"AES instruction", PatternCategory::Crypto, PatternConfidence::High,
+                                0, 0, rt_pc(0x1000), "", {}, {}});
+    if (ambiguous)
+        patterns.matches.push_back({"SM4 instruction", PatternCategory::Crypto, PatternConfidence::High,
+                                    1, 1, rt_pc(0x1004), "", {}, {}});
+    LoopSemanticsResult loops;
+    LoopSemanticInfo loop;
+    loop.header_pc = rt_pc(0x1000);
+    loop.kind = LoopKind::SPNRound;
+    loop.confidence = 0.8f;
+    loop.sample_iter_start = 0; // zero is a valid instruction, not an absent sample
+    loop.sample_iter_end = 3;
+    loops.loop_semantics.push_back(loop);
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<EvidencePass<PatternResult>>("pattern", std::move(patterns)));
+    pm->register_pass(std::make_unique<EvidencePass<LoopSemanticsResult>>("loop_semantics", std::move(loops)));
+    pm->register_pass(std::make_unique<EvidencePass<FunctionResult>>("function", FunctionResult{}));
+    pm->register_pass(std::make_unique<EvidencePass<CallGraphResult>>("call_graph", CallGraphResult{}));
+    pm->register_pass(std::make_unique<AlgorithmSummaryPass>());
+    const auto& r = pm->require("algorithm_summary").get<AlgorithmSummaryResult>();
+    const auto* aes = find_candidate(r, AlgorithmFamily::AES);
+    REQUIRE(aes != nullptr);
+    REQUIRE((aes->evidence.find("Cross-referenced") != std::string::npos) == !ambiguous);
+    REQUIRE(r.candidates.size() == (ambiguous ? 3 : 1));
+    if (!ambiguous) REQUIRE(aes->estimated_end == 3);
+}
+
+TEST_CASE("Algorithm summary repeated execution does not inflate pattern confidence",
+          "[unit][pass][algorithm_summary]") {
+    auto env = make_env([](TraceWriter& tw) {
+        tw.write_header(); MachineState ms;
+        tw.emit(ms, 0x1000, enc::nop(), {{33, tw.rt(0x1004)}}, {});
+    }, "algorithm_repeat_score");
+    REQUIRE(env != nullptr);
+    PatternResult patterns;
+    for (int i = 0; i < 10; ++i)
+        patterns.matches.push_back({"AES instruction", PatternCategory::Crypto, PatternConfidence::High,
+                                    0, 0, rt_pc(0x1000), "", {}, {}});
+    auto pm = make_pm(*env);
+    pm->register_pass(std::make_unique<EvidencePass<PatternResult>>("pattern", std::move(patterns)));
+    pm->register_pass(std::make_unique<EvidencePass<FunctionResult>>("function", FunctionResult{}));
+    pm->register_pass(std::make_unique<EvidencePass<CallGraphResult>>("call_graph", CallGraphResult{}));
+    pm->register_pass(std::make_unique<EvidencePass<LoopSemanticsResult>>("loop_semantics", LoopSemanticsResult{}));
+    pm->register_pass(std::make_unique<AlgorithmSummaryPass>());
+    const auto& r = pm->require("algorithm_summary").get<AlgorithmSummaryResult>();
+    const auto* aes = find_candidate(r, AlgorithmFamily::AES);
+    REQUIRE(aes != nullptr);
+    REQUIRE(aes->confidence == 0.4f);
 }

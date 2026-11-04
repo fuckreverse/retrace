@@ -27,6 +27,15 @@ struct DecodedInst {
     uint8_t regs_read_count = 0;
     uint8_t regs_written_count = 0;
 
+    // All scalar/vector aliases (b/h/s/d/q/vN) share the same vN producer.
+    uint32_t simd_reads = 0;
+    uint32_t simd_writes = 0;
+    uint8_t writeback_reg = 0xff;
+    uint64_t writeback_reads = 0;
+    bool untracked_register_access = false;
+    bool register_access_overflow = false;
+    bool decoded = false;
+
     // Convenience accessors returning string_view (no allocation)
     std::string_view mnemonic_sv() const { return std::string_view(mnemonic); }
     std::string_view op_str_sv() const { return std::string_view(op_str); }
@@ -58,7 +67,8 @@ public:
     bool init();
 
     /// Decode a single instruction at the given PC with the given opcode bytes.
-    /// Returns nullopt if Capstone fails to decode.
+    /// Returns nullopt if unavailable; undecodable opcodes return a .word
+    /// placeholder with decoded=false so callers can report a coverage gap.
     std::optional<DecodedInst> decode(uint64_t pc, uint32_t opcode);
 
     /// Decode using the CodeTable (convenience wrapper).

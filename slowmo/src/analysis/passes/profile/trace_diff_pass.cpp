@@ -91,7 +91,7 @@ std::vector<InstDataDiff> compare_inst_data(const InstView& a, const InstView& b
         for (uint8_t i = 0; i < a.mem_access_count; ++i) {
             auto ma = a.mem_access(i);
             auto mb = b.mem_access(i);
-            if (ma.addr != mb.addr || ma.value != mb.value || ma.size != mb.size) {
+            if (ma.addr != mb.addr || ma.value != mb.value || ma.size != mb.size || ma.type != mb.type) {
                 mem_differs = true;
                 break;
             }
@@ -105,9 +105,12 @@ std::vector<InstDataDiff> compare_inst_data(const InstView& a, const InstView& b
             if (i < a.mem_access_count && i < b.mem_access_count) {
                 auto ma = a.mem_access(i);
                 auto mb = b.mem_access(i);
-                if (ma.addr != mb.addr || ma.value != mb.value) {
+                if (ma.addr != mb.addr || ma.value != mb.value ||
+                    ma.size != mb.size || ma.type != mb.type) {
                     if (!detail.empty()) detail += ", ";
-                    detail += fmt::format("[{:#x}](A={:#x} B={:#x})", ma.addr, ma.value, mb.value);
+                    detail += fmt::format("[{:#x}](A={:#x}, size={}, type={}; B={:#x}, size={}, type={})",
+                                          ma.addr, ma.value, ma.size, ma.type,
+                                          mb.value, mb.size, mb.type);
                 }
             }
         }

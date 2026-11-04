@@ -298,3 +298,19 @@ TEST_CASE("dump_trace jsonl limit and no-regs/no-mem", "[unit][cli][dump]") {
     REQUIRE(s.find("fpr_diffs") == std::string::npos);
     REQUIRE(s.find("mem_accesses") == std::string::npos);
 }
+
+TEST_CASE("parse_args enables explicit flags for taint analysis", "[unit][cli][semantics]") {
+    const char* argv[] = {"tenet", "--taint-include-flags", "--taint", "0", "sample.trace"};
+    const auto opts = parse_args(static_cast<int>(sizeof(argv) / sizeof(argv[0])),
+                                 const_cast<char**>(argv));
+    REQUIRE(opts.parse_status == 0);
+    REQUIRE(opts.taint_include_flags);
+    REQUIRE(opts.opt_taint);
+}
+
+TEST_CASE("parse_args enables vector control taint and analysis resource limits", "[unit][cli][semantics]") {
+    const char* argv[]={"tenet","--taint-simd","--taint-control","--analysis-memory-mb","8","--rss-limit-mb","512","sample.trace"};
+    auto opts=parse_args(int(sizeof(argv)/sizeof(argv[0])),const_cast<char**>(argv));
+    REQUIRE(opts.parse_status==0);REQUIRE(opts.taint_include_simd);REQUIRE(opts.taint_include_control);
+    REQUIRE(opts.analysis_memory_mb==8);REQUIRE(opts.rss_limit_mb==512);
+}

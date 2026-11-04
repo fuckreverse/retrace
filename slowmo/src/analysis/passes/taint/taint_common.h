@@ -39,16 +39,19 @@ inline bool is_abi_arg_reg(uint8_t reg) {
 // ─── Register exclusion rule ────────────────────────────────────────────────
 
 /// Whether `reg_idx` should be excluded from taint/data-flow tracking.
-/// NZCV is always excluded (it's a flags register, not a data value).
+/// NZCV is tracked only when explicit flag dependencies are requested.
 /// SP/PC are excluded unless the caller explicitly opts in (most analyses
 /// care about general-purpose data flow, not stack-pointer/control-flow
 /// bookkeeping).
 struct TaintRegFilter {
     bool include_sp = false;
     bool include_pc = false;
+    bool include_flags = false;
+    bool include_simd = false;
 
     bool should_exclude(uint8_t reg_idx) const {
-        if (reg_idx == IDX_NZCV) return true;
+        if (reg_idx >= 66 || (reg_idx >= 34 && !include_simd)) return true;
+        if (reg_idx == IDX_NZCV && !include_flags) return true;
         if (reg_idx == IDX_SP && !include_sp) return true;
         if (reg_idx == IDX_PC && !include_pc) return true;
         return false;
@@ -121,12 +124,22 @@ struct TaintInstructionInfo {
 
     /// Capstone recovered actual source operands rather than reg_diff guesses.
     bool has_decoded_operands = false;
+    bool missing_code = false;
+    bool undecoded = false;
+    bool unsupported_registers = false;
+    uint32_t simd_reads = 0, simd_writes = 0;
+    uint8_t writeback_reg = 0xff;
+    uint64_t writeback_reads = 0;
 
     void add_written(uint8_t reg_id) {
+        if (writes_reg(reg_id)) return;
         if (n_written < kTaintMaxInfoRegs) written_regs[n_written++] = reg_id;
+        else unsupported_registers = true;
     }
     void add_read(uint8_t reg_id) {
+        for (uint8_t i = 0; i < n_read; ++i) if (read_regs[i] == reg_id) return;
         if (n_read < kTaintMaxInfoRegs) read_regs[n_read++] = reg_id;
+        else unsupported_registers = true;
     }
 
     bool writes_reg(uint8_t reg_id) const {
@@ -136,7 +149,7 @@ struct TaintInstructionInfo {
     }
 };
 
-/// Heuristic classifier: uses reg_diff entries to infer written registers.
+/// Operand classifier: merges decoded definitions with recorded writes.
 /// Capstone supplies read operands when code is available; otherwise reg_diff
 /// entries are conservatively treated as potential sources as well as writes.
 inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst,
@@ -156,8 +169,18 @@ inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst,
     // unchanged source register still propagates taint, while a constant
     // overwrite terminates it. Retain conservative inference for missing code.
     auto decoded = decoder.decode(inst.pc, code_table);
-    if (decoded && decoded->mnemonic_sv() != ".word") {
+    info.missing_code = !code_table.opcode_at(inst.pc).has_value();
+    info.undecoded = !info.missing_code && (!decoded || !decoded->decoded);
+    if (decoded && decoded->decoded) {
         info.has_decoded_operands = true;
+        info.writeback_reg = decoded->writeback_reg;
+        info.writeback_reads = decoded->writeback_reads;
+        info.unsupported_registers = decoded->untracked_register_access || decoded->register_access_overflow;
+        info.simd_reads = decoded->simd_reads; info.simd_writes = decoded->simd_writes;
+        for (uint8_t i = 0; i < decoded->regs_written_count; ++i)
+            info.add_written(decoded->regs_written[i]);
+        const auto mn = decoded->mnemonic_sv();
+        info.is_bl_site = mn == "bl" || mn == "blr";
         for (uint8_t i = 0; i < decoded->regs_read_count; i++) {
             info.add_read(decoded->regs_read[i]);
         }
@@ -167,6 +190,11 @@ inline TaintInstructionInfo classify_inst_heuristic(const InstView& inst,
         }
     }
 
+    for (uint8_t i = 0; i < inst.fpr_diff_count; ++i) {
+        const auto reg = inst.fpr_diff(i).index;
+        if (reg < 32) info.simd_writes |= uint32_t(1) << reg;
+        else info.unsupported_registers = true;
+    }
     // Heuristic mode has no semantic memory-access info; always consider
     // memory reads possible and let the caller inspect inst.mem_access().
     info.has_memory_reads = true;

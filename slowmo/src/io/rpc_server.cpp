@@ -590,6 +590,8 @@ void TenetRpcService::register_methods() {
         const auto& taint = raw.get<TaintResult>();
         json r;
         r["instructions_processed"] = taint.instructions_processed;
+        r["quality"] = taint.quality.to_json();
+        r["include_flags"] = taint.config.include_flags;
 
         // Tainted registers (final state)
         json tainted_regs = json::array();

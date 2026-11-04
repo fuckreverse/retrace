@@ -3,7 +3,9 @@
 #include "analysis/passes/taint/backward_taint_pass.h"
 #include "analysis/passes/taint/taint_pass.h"
 #include "analysis/passes/taint/taint_common.h"
+#include "analysis/control_dependencies.h"
 #include "io/trace_reader.h"
+#include "io/reverse_trace_window.h"
 #include "io/index_builder.h"
 #include "io/code_table.h"
 #include "core/triton_bridge.h"
@@ -21,12 +23,14 @@ using json = nlohmann::json;
 // BackwardTaintPass can't drift out of sync on what counts as "data".
 
 // Maximum registers we track (AArch64 has 34 GPRs; 64 gives headroom).
-static constexpr uint8_t MAX_TRACKED_REGS = 64;
+static constexpr uint8_t MAX_TRACKED_REGS = 66;
 
 static bool should_exclude_reg(uint8_t reg_idx, const BackwardTaintConfig& config) {
     TaintRegFilter filter;
     filter.include_sp = config.include_sp;
     filter.include_pc = config.include_pc;
+    filter.include_flags = config.include_flags;
+    filter.include_simd = config.include_simd;
     return filter.should_exclude(reg_idx);
 }
 
@@ -40,29 +44,37 @@ static bool should_exclude_reg(uint8_t reg_idx, const BackwardTaintConfig& confi
 //                 Partial writes resolve only the bytes they overwrite.
 
 struct PropagationState {
-    uint64_t reg_to_sinks[MAX_TRACKED_REGS] = {};
-    uint64_t active_regs_mask = 0;
-
+    struct Registers {
+        uint64_t tags[66]{};
+        uint64_t active_regs_mask = 0;
+        uint32_t active_simd_mask = 0;
+    };
+    ankerl::unordered_dense::map<uint64_t, Registers> threads;
+    uint64_t current_thread = 0;
+    size_t active_count = 0;
     MemoryRanges<uint64_t> mem_to_sinks;
-
-    bool has_reg(uint8_t r) const { return (active_regs_mask >> r) & 1; }
-    bool empty() const { return active_regs_mask == 0 && mem_to_sinks.empty(); }
-
-    void add_reg(uint8_t r, uint64_t tags_mask) {
-        reg_to_sinks[r] |= tags_mask;
-        active_regs_mask |= (1ULL << r);
+    Registers* selected = nullptr;
+    void select_thread(uint64_t tid) { current_thread = tid; selected = &threads.try_emplace(tid).first->second; }
+    Registers& regs() { if (!selected) select_thread(current_thread); return *selected; }
+    bool has_reg(uint8_t r) { return r < 66 && regs().tags[r] != 0; }
+    bool empty() const { return active_count == 0 && mem_to_sinks.empty(); }
+    void add_reg(uint8_t r, uint64_t tags) {
+        if (r >= 66 || !tags) return;
+        auto& t = regs(); if (!t.tags[r]) ++active_count;
+        t.tags[r] |= tags;
+        if (r < 34) t.active_regs_mask |= 1ULL << r;
+        else t.active_simd_mask |= uint32_t(1) << (r - 34);
     }
-
-    void add_mem(uint64_t addr, uint64_t size, uint64_t tags_mask) {
-        mem_to_sinks.update(addr, size, [=](uint64_t& tags) { tags |= tags_mask; });
-    }
-
     void remove_reg(uint8_t r) {
-        reg_to_sinks[r] = 0;
-        active_regs_mask &= ~(1ULL << r);
+        auto& t = regs(); if (t.tags[r]) --active_count;
+        t.tags[r] = 0;
+        if (r < 34) t.active_regs_mask &= ~(1ULL << r);
+        else t.active_simd_mask &= ~(uint32_t(1) << (r - 34));
     }
-
-    uint64_t get_reg_tags(uint8_t r) const { return reg_to_sinks[r]; }
+    uint64_t get_reg_tags(uint8_t r) { return regs().tags[r]; }
+    void add_mem(uint64_t addr, uint64_t size, uint64_t tags) {
+        mem_to_sinks.update(addr, size, [=](uint64_t& value) { value |= tags; });
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -98,9 +110,21 @@ static PassResult run_backward_taint_common(
 
     BackwardTaintResult result;
     result.config = config;
+    result.events.set_resident_budget(ctx.memory_budget_bytes() / 4);
+    result.dataflow_edges.set_resident_budget(ctx.memory_budget_bytes() / 4);
+    result.quality.engine = method_label;
+    const bool multi_thread = index.thread_ids().size() > 1;
 
+    std::unique_ptr<ControlDependencies> control;
+    std::unordered_map<uint64_t, uint64_t> needed_controls;
+    if (config.include_control) {
+        control = std::make_unique<ControlDependencies>(ctx);
+        result.quality.unresolved_control_joins = control->unresolved_joins;
+    }
     // ── Initialize per-sink tags from config ─────────────────────────────
     PropagationState state;
+    const auto sink_point = config.sink_inst_id ? std::min(config.sink_inst_id - 1, index.inst_count() ? index.inst_count() - 1 : 0) : 0;
+    state.select_thread(index.thread_at(sink_point));
     MemoryRanges<std::vector<uint64_t>> memory_consumers;
     uint8_t tag_idx = 0;
     {
@@ -109,6 +133,7 @@ static PassResult run_backward_taint_common(
             uint8_t r = static_cast<uint8_t>(tenet::platform::trailing_zeros(remaining));
             remaining &= remaining - 1;
             if (should_exclude_reg(r, config)) continue;
+            if (tag_idx >= 64) return PassResult::failed("at most 64 sinks are supported");
             SinkTag tag;
             tag.kind = SinkTag::Register;
             tag.reg_id = r;
@@ -116,6 +141,12 @@ static PassResult run_backward_taint_common(
             state.add_reg(r, 1ULL << tag_idx);
             tag_idx++;
         }
+    }
+    if (config.include_simd) for (uint32_t m = config.sink_simd_regs; m; m &= m - 1) {
+        if (tag_idx >= 64) return PassResult::failed("at most 64 sinks are supported");
+        const uint8_t reg = 34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m));
+        SinkTag tag; tag.kind = SinkTag::Register; tag.reg_id = reg;
+        result.sink_tags.push_back(tag); state.add_reg(reg, 1ULL << tag_idx++);
     }
     for (uint64_t addr : config.sink_mem_addrs) {
         if (tag_idx >= 64) return PassResult::failed("at most 64 sinks are supported");
@@ -134,21 +165,24 @@ static PassResult run_backward_taint_common(
         return PassResult::success(std::move(result));
     }
 
-    uint64_t current_id = config.sink_inst_id;
+    uint64_t current_id = std::min(config.sink_inst_id, index.inst_count());
+    ReverseTraceWindow reverse_window(reader, index);
     uint64_t steps = 0;
     uint64_t total_estimated = std::min(current_id,
         config.max_steps > 0 ? config.max_steps : current_id);
 
     uint64_t index_jumps = 0;
     uint64_t index_skipped = 0;
+    uint64_t dense_index_hits = 0;
 
     // ── Main backward traversal loop ─────────────────────────────────────
-    while (current_id > 0 && !state.empty()) {
+    while (current_id > 0 && (!state.empty() || !needed_controls.empty())) {
         // ── REG_WRITES Index Acceleration ─────────────────────────────────
-        if (config.use_index_acceleration && state.mem_to_sinks.empty() &&
-            state.active_regs_mask != 0) {
+        if ((dense_index_hits < 64 || (steps & 4095) == 0) && !config.include_control && !multi_thread && !state.regs().active_simd_mask && config.use_index_acceleration && state.mem_to_sinks.empty() &&
+            state.regs().active_regs_mask != 0 &&
+            !(config.include_flags && (state.regs().active_regs_mask & (1ULL << IDX_NZCV)))) {
             uint64_t best_jump = UINT64_MAX;
-            for (uint64_t m = state.active_regs_mask; m; m &= m - 1) {
+            for (uint64_t m = state.regs().active_regs_mask; m; m &= m - 1) {
                 uint8_t reg = static_cast<uint8_t>(tenet::platform::trailing_zeros(m));
                 uint64_t writer = index.find_last_writer_of(reg, current_id, reader);
                 if (writer != UINT64_MAX && (best_jump == UINT64_MAX || writer > best_jump)) {
@@ -160,6 +194,7 @@ static PassResult run_backward_taint_common(
                 break;  // No writer found → done
             }
 
+            if (current_id - best_jump <= 4) ++dense_index_hits; else dense_index_hits = 0;
             if (best_jump < current_id) {
                 uint64_t skipped = current_id - best_jump - 1;
                 index_skipped += skipped;
@@ -169,22 +204,40 @@ static PassResult run_backward_taint_common(
         }
 
         current_id--;
-        if (config.max_steps > 0 && steps >= config.max_steps) break;
+        if (config.max_steps > 0 && steps >= config.max_steps) {
+            result.quality.truncated = true;
+            result.quality.termination_reason = "max_steps reached";
+            break;
+        }
         steps++;
         if (config.max_tainted_insts > 0 &&
-            result.contributing_inst_ids.cardinality() >= config.max_tainted_insts) break;
-        if (ctx.cancelled()) {
-            return PassResult::failed("cancelled by user");
+            result.contributing_inst_ids.cardinality() >= config.max_tainted_insts) {
+            result.quality.truncated = true;
+            result.quality.termination_reason = "max_tainted_insts reached";
+            break;
+        }
+        if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+        if ((steps & 4095) == 0 && ctx.memory_pressure()) {
+            result.quality.truncated = true; result.quality.termination_reason = "RSS limit exceeded"; break;
         }
 
-        auto [offset, seed_pc] = index.offset_of_with_pc(current_id, reader);
-        auto rec = reader.record_at(offset, seed_pc);
+        auto rec = reverse_window.at(current_id);
         if (rec.kind != RecordKind::Inst) continue;
 
         auto inst = rec.as_inst();
+        state.select_thread(index.thread_at(current_id));
 
         // ── Classify instruction via strategy ────────────────────────────
+        ++result.quality.instructions_examined;
         auto info = classify(inst);
+        result.quality.missing_code += info.missing_code;
+        result.quality.undecoded_instructions += info.undecoded;
+        result.quality.unsupported_register_instructions += info.unsupported_registers ||
+            (!config.include_simd && (info.simd_reads || info.simd_writes));
+        if (config.include_simd) {
+            for (uint32_t m = info.simd_reads; m; m &= m - 1) info.add_read(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
+            for (uint32_t m = info.simd_writes; m; m &= m - 1) info.add_written(34 + static_cast<uint8_t>(tenet::platform::trailing_zeros(m)));
+        }
         if (!info.valid) continue;
 
         // --- Multi-definition: check ALL written registers vs needed set ---
@@ -192,7 +245,12 @@ static PassResult run_backward_taint_common(
         BackwardTaintEvent event;
         event.inst_id = current_id;
         event.pc = inst.pc;
+        event.thread_id = state.current_thread;
         uint64_t resolved_tags_mask = 0;
+        if (auto c = needed_controls.find(current_id); c != needed_controls.end()) {
+            contributes = true; event.control_branch = true;
+            resolved_tags_mask = c->second; needed_controls.erase(c);
+        }
 
         for (uint8_t i = 0; i < info.n_written; i++) {
             uint8_t wr_reg = info.written_regs[i];
@@ -209,10 +267,12 @@ static PassResult run_backward_taint_common(
                 resolved_tags_mask |= state.get_reg_tags(wr_reg);
 
                 state.remove_reg(wr_reg);
-                result.all_involved_regs |= (1ULL << wr_reg);
+                result.record_reg(wr_reg);
             }
         }
 
+        const bool only_writeback = contributes && info.has_decoded_operands &&
+            info.writeback_reg != 0xff && event.dst_simd_mask == 0 && event.dst_regs_mask == (1ULL << info.writeback_reg);
         if (contributes) {
             // Add all READ registers as new needed (source operands).
             //
@@ -233,12 +293,13 @@ static PassResult run_backward_taint_common(
             // load/store chains that a step-by-step trace clearly crosses.
             for (uint8_t i = 0; i < info.n_read; i++) {
                 uint8_t sr_reg = info.read_regs[i];
+                if (only_writeback && (sr_reg >= 34 || !(info.writeback_reads & (1ULL << sr_reg)))) continue;
                 if (should_exclude_reg(sr_reg, config)) continue;
                 if (info.is_bl_site && sr_reg == kTaintRegLR) continue;
 
                 event.add_src_reg(sr_reg);
                 state.add_reg(sr_reg, resolved_tags_mask);
-                result.all_involved_regs |= (1ULL << sr_reg);
+                result.record_reg(sr_reg);
             }
         }
 
@@ -276,7 +337,7 @@ static PassResult run_backward_taint_common(
                     if (should_exclude_reg(sr_reg, config)) continue;
                     if (!event.has_src_reg(sr_reg)) event.add_src_reg(sr_reg);
                     state.add_reg(sr_reg, store_tags);
-                    result.all_involved_regs |= (1ULL << sr_reg);
+                    result.record_reg(sr_reg);
                 }
                 result.involved_mem_addrs.add(mem.addr);
             }
@@ -284,7 +345,8 @@ static PassResult run_backward_taint_common(
 
         // In reverse execution, resolve writes before introducing reads of
         // the same instruction. This also supports memory-to-memory transfers.
-        if (contributes && config.propagate_through_memory && info.has_memory_reads) {
+        if (contributes && config.propagate_through_memory && info.has_memory_reads &&
+            (!only_writeback || event.stores_to_memory)) {
             for (uint8_t m = 0; m < inst.mem_access_count; ++m) {
                 auto mem = inst.mem_access(m);
                 if (mem.type & 2) continue;
@@ -301,9 +363,20 @@ static PassResult run_backward_taint_common(
 
         // --- Record event ---
         if (contributes) {
+            if (control && current_id < control->parents.size()) {
+                const auto parent = control->parents[current_id];
+                if (parent != UINT64_MAX) {
+                    needed_controls[parent] |= resolved_tags_mask;
+                    event.control_inst_id = parent;
+                    if (config.build_dataflow_graph) result.dataflow_edges.emplace_back(parent, current_id, 0xff, 0);
+                }
+            }
             event.sink_tags_mask = resolved_tags_mask;
             result.contributing_inst_ids.add(current_id);
-            result.inst_id_to_event_[current_id] = result.events.size();
+            if (result.events.size() >= 65536 && !result.compact_navigation) {
+                result.compact_navigation = true; result.inst_id_to_event_.clear();
+            }
+            if (!result.compact_navigation) result.inst_id_to_event_[current_id] = result.events.size();
 
             // Per-sink attribution via bitmask iteration
             for (uint64_t m = resolved_tags_mask; m; m &= m - 1) {
@@ -328,13 +401,16 @@ static PassResult run_backward_taint_common(
     // Memory edges were emitted while resolving byte ranges above.
     // Reconstruct register fan-out in time proportional to events and edges.
     if (config.build_dataflow_graph && result.events.size() > 1) {
-        ankerl::unordered_dense::map<uint8_t, std::vector<uint64_t>> reg_consumer;
+        ankerl::unordered_dense::map<uint64_t, ankerl::unordered_dense::map<uint8_t, std::vector<uint64_t>>> thread_consumers;
 
         for (size_t i = 0; i < result.events.size(); i++) {
-            if ((i % 1000) == 0 && ctx.cancelled()) {
-                return PassResult::failed("cancelled by user");
+            if ((i % 1000) == 0) {
+                if (ctx.cancelled()) return PassResult::failed("cancelled by user");
+                if (ctx.memory_pressure()) return PassResult::failed("Backward graph RSS limit exceeded");
             }
+            result.events.cool_before(i);
             const auto& ev = result.events[i];
+            auto& reg_consumer = thread_consumers[ev.thread_id];
 
             ev.for_each_dst_reg([&](uint8_t dr) {
                 auto cit = reg_consumer.find(dr);
@@ -388,6 +464,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
         auto opcode_opt = code_table.opcode_at(inst.pc);
         if (!opcode_opt) {
             info.valid = false;
+            info.missing_code = true;
             return info;
         }
 
@@ -399,6 +476,7 @@ static PassResult run_triton_backward_taint(PassContext& ctx, const BackwardTain
         auto sem_result = bridge_ptr->query_semantics(inst.pc, opcode_bytes, 4);
         if (!sem_result) {
             info.valid = false;
+            info.undecoded = true;
             return info;
         }
 
@@ -448,14 +526,14 @@ static PassResult run_heuristic_backward_taint(PassContext& ctx, const BackwardT
 // --- BackwardTaintPass dispatch --------------------------------------------
 
 PassResult BackwardTaintPass::run(PassContext& ctx) {
-    if (config_.sink_inst_id == 0 && config_.sink_regs == 0 && config_.sink_mem_addrs.empty()) {
+    if (config_.sink_inst_id == 0 && config_.sink_regs == 0 && config_.sink_simd_regs == 0 && config_.sink_mem_addrs.empty()) {
         return PassResult::failed("BackwardTaintPass: no sink specified");
     }
 
 #ifdef TENET_HAS_TRITON
     {
         auto probe = create_triton_bridge();
-        if (probe->is_available()) {
+        if (probe->is_available() && !config_.include_flags && !config_.include_simd && ctx.index().thread_ids().size() <= 1) {
             return run_triton_backward_taint(ctx, config_);
         }
     }
@@ -515,7 +593,7 @@ std::string BackwardTaintResult::to_dot() const {
         if (edge.via_mem_addr != 0) {
             label = fmt::format("mem:0x{:X}", edge.via_mem_addr);
         } else {
-            label = fmt::format("x{}", edge.via_reg);
+            label = edge.via_reg == 0xff ? "control" : edge.via_reg >= 34 ? fmt::format("v{}", edge.via_reg - 34) : fmt::format("x{}", edge.via_reg);
         }
         dot += fmt::format("  n{} -> n{} [label=\"{}\"];\n",
                            edge.from_inst_id, edge.to_inst_id, label);

@@ -75,7 +75,11 @@ struct AnalysisRange {
     /// state reconstruction is unaffected) — they are simply not delivered to passes.
     std::vector<std::pair<uint64_t, uint64_t>> exclude_pc_ranges;
 
-    bool is_full_trace() const { return start_inst_id == 0 && end_inst_id == UINT64_MAX; }
+    // Persisted full-trace results are valid only for an unfiltered trace.
+    bool is_full_trace() const {
+        return start_inst_id == 0 && end_inst_id == UINT64_MAX &&
+               exclude_pc_ranges.empty() && include_thread_ids.empty();
+    }
 
     /// Check if a PC falls within any excluded range.
     bool is_pc_excluded(uint64_t pc) const {
@@ -150,6 +154,8 @@ public:
 
     /// Whether parallel trace scanning is disabled at runtime.
     bool no_parallel_scan() const;
+    size_t memory_budget_bytes() const;
+    bool memory_pressure() const;
 
 private:
     PassManager& manager_;
@@ -260,6 +266,8 @@ public:
 
     /// Check if memory pressure is high (RSS > limit).
     bool is_memory_pressure() const;
+    void set_analysis_memory_budget(size_t bytes) { analysis_memory_budget_ = bytes; }
+    size_t analysis_memory_budget() const { return analysis_memory_budget_; }
 
     // ─── Execution ─────────────────────────────────────────────────────
 
@@ -415,6 +423,7 @@ private:
 
     /// Internal: execute a pass (assumes we own execution via CAS).
     void execute_pass(PassEntry* entry);
+    void execute_pass_impl(PassEntry* entry);
     bool try_complete_from_cache(PassEntry* entry);
 
     /// Dynamic ready-queue scheduler used by run_all when num_threads > 1.
@@ -444,6 +453,7 @@ private:
     bool no_parallel_scan_ = false;
 
     AnalysisRange range_;
+    size_t analysis_memory_budget_ = 64u << 20;
     double rss_limit_mb_ = 0.0;  // 0 = no limit (default)
     mutable std::mutex registry_mutex_;  // protects entries_/name_map_ during registration
 

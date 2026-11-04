@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <set>
 #include <ankerl/unordered_dense.h>
 
 namespace tenet {
@@ -162,11 +163,10 @@ namespace {
 
 static constexpr uint32_t ALGO_BLOB_MAGIC   = 0x414C474Fu;  // "ALGO"
 // v1: original format.
-// v2: adds per-candidate `family` (u8) and `is_speculative` (u8) fields,
-//     written right after key_inst_ids. Old v1 blobs are still readable
-//     (just missing those two fields, which default to Unknown/false) so a
-//     stale cache from before this change doesn't need to be invalidated.
-static constexpr uint32_t ALGO_BLOB_VERSION = 3u;
+// v2: adds per-candidate family and is_speculative fields.
+// v4: requires local, unambiguous loop evidence and deduplicates confidence.
+// Older conclusions must be recomputed even though the wire layout is unchanged.
+static constexpr uint32_t ALGO_BLOB_VERSION = 4u;
 
 std::string algorithm_summary_serialize(const AlgorithmSummaryResult& res) {
     // Pre-compute json string
@@ -267,6 +267,7 @@ struct EvidenceAccumulator {
     std::vector<std::string> evidence_lines;
     std::vector<uint64_t> pcs;
     std::vector<uint64_t> inst_ids;
+    std::vector<std::pair<uint64_t, uint64_t>> evidence_ranges;
     uint64_t min_inst_id = UINT64_MAX;
     uint64_t max_inst_id = 0;
 
@@ -291,7 +292,8 @@ struct EvidenceAccumulator {
         pcs.push_back(pc);
     }
 
-    void add_inst_range(uint64_t start, uint64_t end) {
+    void add_inst_range(uint64_t start, uint64_t end, bool named_evidence = true) {
+        if (named_evidence) evidence_ranges.emplace_back(start, end);
         if (start < min_inst_id) min_inst_id = start;
         if (end > max_inst_id) max_inst_id = end;
         inst_ids.push_back(start);
@@ -476,6 +478,7 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
 
     // ── 1a. Pattern matches ──────────────────────────────────────────────
     if (pattern_res) {
+        std::set<std::pair<std::string, uint64_t>> seen_patterns;
         for (const auto& m : pattern_res->matches) {
             if (m.category != PatternCategory::Crypto &&
                 m.category != PatternCategory::KeySchedule)
@@ -486,6 +489,10 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
             // a family if one is embedded, else groups by the literal name
             // (e.g. distinct "XOR loop" occurrences all share one bucket,
             // same as before).
+            // Known constants are also exposed as PatternMatch entries by
+            // PatternPass. Count them once, through the constants below.
+            if (m.category == PatternCategory::KeySchedule &&
+                m.pattern_name.starts_with("Known constant:")) continue;
             auto& ea = route(m.pattern_name);
 
             std::string conf_str;
@@ -494,8 +501,10 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
                 case PatternConfidence::Medium: conf_str = "medium"; break;
                 case PatternConfidence::Low:    conf_str = "low"; break;
             }
+            const bool first_site = seen_patterns.emplace(m.pattern_name, m.anchor_pc).second;
             ea.add_evidence(
                 fmt::format("Pattern match \"{}\" ({} confidence)", m.pattern_name, conf_str),
+                !first_site ? 0.0f :
                 (m.confidence == PatternConfidence::High)   ? 0.40f :
                 (m.confidence == PatternConfidence::Medium) ? 0.25f : 0.10f);
             ea.add_pc(m.anchor_pc);
@@ -512,10 +521,12 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
             // Count how many distinct known constants for this algorithm
             // first, so we can skip routing/creating an accumulator entirely
             // when there's nothing to report.
-            size_t known_count = 0;
+            std::unordered_set<uint64_t> known_values;
             for (size_t idx : indices) {
-                if (const_res->constants[idx].known_match) ++known_count;
+                const auto& c = const_res->constants[idx];
+                if (c.known_match) known_values.insert(c.value);
             }
+            const size_t known_count = known_values.size();
             if (known_count == 0) continue;
 
             // algo_name here is already a canonical name from pattern_pass's
@@ -559,29 +570,36 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
                 ls->iteration_count, ls->confidence * 100.0f);
             float boost = ls->confidence * 0.30f;
 
-            // (a) Is there already a named accumulator whose family matches
-            // this loop's structure? If so, this loop IS that algorithm's
-            // round function — merge directly instead of creating a
-            // separate "SPN-based cipher" bucket next to e.g. "AES".
+            // Shape alone cannot identify a cipher. Require named evidence
+            // in this sampled iteration, and refuse an ambiguous match.
             EvidenceAccumulator* target = nullptr;
-            if (structure != AlgorithmStructure::Unknown) {
+            bool ambiguous = false;
+            if (structure != AlgorithmStructure::Unknown &&
+                ls->sample_iter_end > ls->sample_iter_start) {
                 for (auto& [key, ea] : accum) {
-                    if (ea.family != AlgorithmFamily::Unknown &&
-                        algorithm_family_structure(ea.family) == structure) {
-                        target = &ea;
-                        break;
-                    }
+                    if (ea.family == AlgorithmFamily::Unknown ||
+                        algorithm_family_structure(ea.family) != structure) continue;
+                    const bool overlaps = std::any_of(ea.evidence_ranges.begin(), ea.evidence_ranges.end(),
+                        [&](const auto& interval) {
+                            return interval.first < ls->sample_iter_end &&
+                                   interval.second >= ls->sample_iter_start &&
+                                   index.thread_at(interval.first) == index.thread_at(ls->sample_iter_start);
+                        });
+                    if (!overlaps) continue;
+                    if (target) { ambiguous = true; break; }
+                    target = &ea;
                 }
             }
+            if (ambiguous) target = nullptr;
             if (target) {
                 target->add_evidence(std::move(evidence_line), boost);
                 target->add_pc(ls->header_pc);
-                if (ls->sample_iter_start != 0) {
-                    target->add_inst_range(ls->sample_iter_start, ls->sample_iter_end);
+                if (ls->sample_iter_end > ls->sample_iter_start) {
+                    target->add_inst_range(ls->sample_iter_start, ls->sample_iter_end, false);
                 }
                 target->add_evidence(
-                    "Cross-referenced: loop structure matches constant/pattern identification",
-                    0.15f);
+                    "Cross-referenced: matching loop structure and overlapping execution evidence",
+                    0.0f);
                 continue;
             }
 
@@ -595,8 +613,8 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
             if (ea.algorithm_name.empty()) ea.algorithm_name = display;
             ea.add_evidence(std::move(evidence_line), boost);
             ea.add_pc(ls->header_pc);
-            if (ls->sample_iter_start != 0) {
-                ea.add_inst_range(ls->sample_iter_start, ls->sample_iter_end);
+            if (ls->sample_iter_end > ls->sample_iter_start) {
+                ea.add_inst_range(ls->sample_iter_start, ls->sample_iter_end, false);
             }
         }
     }
@@ -678,10 +696,11 @@ PassResult AlgorithmSummaryPass::run(PassContext& ctx) {
         result.candidates.push_back(ea.build());
     }
 
-    // Sort by confidence descending, then by name for stability
+    // Sort by confidence, prefer corroborated evidence on ties, then name.
     std::sort(result.candidates.begin(), result.candidates.end(),
               [](const AlgorithmCandidate& a, const AlgorithmCandidate& b) {
                   if (a.confidence != b.confidence) return a.confidence > b.confidence;
+                  if (a.is_speculative != b.is_speculative) return !a.is_speculative;
                   return a.name < b.name;
               });
 

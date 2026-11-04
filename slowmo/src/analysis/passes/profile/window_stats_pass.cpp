@@ -187,6 +187,7 @@ public:
     }
 
     std::string_view name() const override { return "WindowStatsCollector"; }
+    size_t resident_bytes() const override { return result_.windows.capacity() * sizeof(WindowSnapshot) + pc_cache_.size() * (sizeof(OpcodeInfo) + 32) + (unique_pcs_.size() + unique_mem_addrs_.size()) * 24; }
 
     bool begin(uint64_t /*start*/, uint64_t /*end*/) override {
         result_ = WindowStatsResult{};

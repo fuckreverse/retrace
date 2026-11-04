@@ -78,6 +78,7 @@ struct ThreadResult {
 class ThreadCollector final : public TraceCollector {
 public:
     std::string_view name() const override { return "thread_collector"; }
+    size_t resident_bytes() const override { return result.switch_events.capacity() * sizeof(ThreadSwitchEvent) + result.spans.capacity() * sizeof(ThreadSpan) + result.threads.size() * (sizeof(ThreadInfo) + 64); }
 
     bool begin(uint64_t start, uint64_t end) override {
         (void)start; (void)end;

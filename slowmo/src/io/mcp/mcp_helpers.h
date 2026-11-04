@@ -130,6 +130,7 @@ inline const char* propagation_type_str(PropagationType t) {
         case PropagationType::Immediate: return "Immediate";
         case PropagationType::Call:      return "Call";
         case PropagationType::Return:    return "Return";
+        case PropagationType::Control:   return "Control";
         case PropagationType::Kill:      return "Kill";
     }
     return "Unknown";
@@ -200,6 +201,23 @@ inline uint8_t parse_reg(const nlohmann::json& val) {
         return static_cast<uint8_t>(idx);
     }
     throw std::runtime_error("reg_index must be an integer or register name string");
+}
+
+inline uint8_t parse_taint_reg(const nlohmann::json& value) {
+    if (value.is_number_integer()) {
+        const auto n = value.get<int>();
+        if (n >= 0 && n < 66) return static_cast<uint8_t>(n);
+    }
+    if (value.is_string()) {
+        const auto s = value.get<std::string>();
+        if (s.size() > 1 && (s[0] == 'v' || s[0] == 'q' || s[0] == 'd' || s[0] == 's')) {
+            size_t used = 0;
+            try { const auto n = std::stoul(s.substr(1), &used);
+                if (used == s.size() - 1 && n < 32) return static_cast<uint8_t>(34 + n);
+            } catch (const std::exception&) {}
+        }
+    }
+    return parse_reg(value);
 }
 
 }  // namespace tenet

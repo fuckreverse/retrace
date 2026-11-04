@@ -1,4 +1,5 @@
 #pragma once
+#include "common/chunked_vector.h"
 
 #include "analysis/pass_manager.h"
 #include "analysis/trace_collector.h"
@@ -183,15 +184,18 @@ private:
             }
         }
 
+        void abort() noexcept override { events_.clear(); }
+        size_t resident_bytes() const override { return events_.resident_capacity_bytes(); }
+        void set_memory_budget(size_t bytes) override { if (bytes && events_.empty()) events_.set_resident_budget(bytes / 2); }
         void end() override {}
 
-        const std::vector<WriteEvent>& events() const { return events_; }
-        std::vector<WriteEvent> take_events() { return std::move(events_); }
+        const ChunkedVector<WriteEvent>& events() const { return events_; }
+        ChunkedVector<WriteEvent> take_events() { return std::move(events_); }
 
     private:
         uint64_t range_start_;
         uint64_t range_end_;
-        std::vector<WriteEvent> events_;
+        ChunkedVector<WriteEvent> events_;
     };
 
     std::unique_ptr<WriteEventCollector> collector_;
